@@ -28,7 +28,7 @@ Run mypy consistently and prevent regressions
 Make sure all developers on your codebase run mypy the same way.
 One way to ensure this is adding a small script with your mypy
 invocation to your codebase, or adding your mypy invocation to
-existing tools you use to run tests, like ``tox``.
+existing tools you use to run tests.
 
 * Make sure everyone runs mypy with the same options. Checking a mypy
   :ref:`configuration file <config-file>` into your codebase is the
@@ -51,7 +51,7 @@ A simple CI script could look something like this:
     python3 -m pip install mypy==1.8
     # Run your standardised mypy invocation, e.g.
     mypy my_project
-    # This could also look like `scripts/run_mypy.sh`, `tox run -e mypy`, `make mypy`, etc
+    # This could also look like `scripts/run_mypy.sh`, `uv run mypy`, `make mypy`, etc
 
 Ignoring errors from certain modules
 ------------------------------------

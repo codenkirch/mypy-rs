@@ -27,32 +27,23 @@ git clone git@github.com:<your_username>/mypy.git
 cd mypy
 ```
 
-#### (3) Create then activate a virtual environment
+#### (3) Install the development environment with uv
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
+uv sync
 ```
 
-```bash
-# For Windows use
-python -m venv venv
-. venv/Scripts/activate
+This creates a `.venv` environment and installs mypy in editable mode together
+with the test requirements.
 
-# For more details, see https://docs.python.org/3/library/venv.html#creating-virtual-environments
-```
-
-#### (4) Install the test requirements and the project
+#### (4) Run commands through uv
 
 ```bash
-python -m pip install -r test-requirements.txt
-python -m pip install -e .
-hash -r  # This resets shell PATH cache, not necessary on Windows
+uv run python --version
 ```
 
 > **Note**
-> You'll need Python 3.10 or higher to install all requirements listed in
-> test-requirements.txt
+> You'll need Python 3.10 or higher to install the development environment.
 
 ### Running tests
 
@@ -65,63 +56,64 @@ However, if you wish to do so, you can run the full test suite
 like this:
 
 ```bash
-python runtests.py
+uv run test
 ```
 
 Some useful commands for running specific tests include:
 
 ```bash
 # Use mypy to check mypy's own code
-python runtests.py self
+uv run test self
 # or equivalently:
-python -m mypy --config-file mypy_self_check.ini -p mypy
+uv run python -m mypy --config-file mypy_self_check.ini -p mypy
 
 # Run a single test from the test suite (uses pytest substring expression matching)
-python runtests.py test_name
+uv run test test_name
 # or equivalently:
-pytest -n0 -k test_name
+uv run pytest -n0 -k test_name
 
 # Run all test cases in the "test-data/unit/check-dataclasses.test" file
-python runtests.py check-dataclasses.test
+uv run test check-dataclasses.test
 # or equivalently:
-pytest mypy/test/testcheck.py::TypeCheckSuite::check-dataclasses.test
+uv run pytest mypy/test/testcheck.py::TypeCheckSuite::check-dataclasses.test
 
 # Run the formatters and linters
-python runtests.py lint
+uv run lint
 ```
 
 For an in-depth guide on running and writing tests,
 see [the README in the test-data directory](test-data/unit/README.md).
 
-#### Using `tox`
+#### Development command entry points
 
-You can also use [`tox`](https://tox.wiki/en/latest/) to run tests and other commands.
-`tox` handles setting up test environments for you.
+The uv environment installs project-specific command entry points that mirror
+the main development checks.
 
 ```bash
 # Run tests
-tox run -e py
+uv run test
 
-# Run tests using some specific Python version
-tox run -e py311
+# Run pytest directly with custom arguments
+uv run pytest -n0 -k 'test_name'
 
-# Run a specific command
-tox run -e lint
+# Run linting
+uv run lint
 
-# Run a single test from the test suite
-tox run -e py -- -n0 -k 'test_name'
+# Run formatting hooks
+uv run format
 
-# Run all test cases in the "test-data/unit/check-dataclasses.test" file using
-# Python 3.11 specifically
-tox run -e py311 -- mypy/test/testcheck.py::TypeCheckSuite::check-dataclasses.test
+# Run self type checks
+uv run typecheck
 
-# Set up a development environment with all the project libraries and run a command
-tox -e dev -- mypy --verbose test_case.py
-tox -e dev --override testenv:dev.allowlist_externals+=env -- env  # inspect the environment
+# Build docs
+uv run docs
+
+# Inspect the environment
+uv run env
 ```
 
-If you don't already have `tox` installed, you can use a virtual environment as
-described above to install `tox` via `pip` (e.g., ``python -m pip install tox``).
+The same commands are also available through the dispatcher, for example
+`uv run dev pytest -n0 -k test_name`.
 
 ## LLM-assisted contributions
 
