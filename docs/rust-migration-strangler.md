@@ -227,7 +227,7 @@ uv run test
 More exhaustive local run:
 
 ```bash
-uv run test self self-packaging lint pytest-fast pytest-cmdline pytest-slow mypyc-fast pytest-extra mypyc-extra
+uv run all
 ```
 
 Direct check commands:
