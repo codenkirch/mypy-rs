@@ -293,3 +293,59 @@ Definition of done:
 - The fallback path remains available until CI coverage proves stability.
 
 After that, start the module discovery/import graph prepass.
+
+## In-Tree Rust Parser Replacement Status
+
+The repository now has the start of an owned Rust replacement for the external
+`ast-serialize` wheel:
+
+- `Cargo.toml`
+- `crates/ast_serialize/Cargo.toml`
+- `crates/ast_serialize/src/lib.rs`
+
+The crate builds a Python extension module named `ast_serialize` and preserves
+the existing Python API shape:
+
+```python
+parse(...) -> tuple[bytes, list[ParseError], TypeIgnores, bytes, ASTData]
+```
+
+Current correctness status:
+
+- Uses `rustpython-parser` for the Rust-side Python parse.
+- Serializes the existing binary AST format for the narrow
+  `print('hello')` expression-statement case.
+- Matches the current mypy cache/node tag constants for this branch.
+- Raises a normal `UnicodeDecodeError` for invalid UTF-8 byte input.
+- Passes the Rust unit test for the trivial binary AST contract.
+- When built as a local extension and placed ahead of the installed wheel on
+  `PYTHONPATH`, passes `TestNativeParserBinaryFormat`.
+
+Verification run locally:
+
+```bash
+cargo test -p mypy-ast-serialize
+cargo rustc -p mypy-ast-serialize --features extension-module --lib \
+  --crate-type cdylib -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+PYTHONPATH=/private/tmp uv run pytest 'mypy/test/test_nativeparse.py::TestNativeParserBinaryFormat' -q
+uv run pytest mypy/test/test_nativeparse.py
+```
+
+The full native parser suite still passes with the external wheel installed:
+`254 passed`.
+
+This implementation is not ready to become the default parser. It only proves
+that the repo can own the parser extension and match the existing wire format
+for a seed case. The next correctness step is to expand the Rust serializer in
+the same order as the native parser data tests:
+
+- imports and import metadata
+- names, literals, member access, calls, and index expressions
+- assignments and annotated assignments
+- function and class definitions
+- control-flow statements
+- type comments, type ignores, and mypy comments
+- syntax error and version-gated syntax diagnostics
+
+Only after the in-tree extension can pass `mypy/test/test_nativeparse.py`
+without the external wheel should `mypy.nativeparse` be switched to prefer it.

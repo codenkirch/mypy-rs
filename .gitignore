@@ -60,3 +60,6 @@ test_capi
 test_capi
 /mypyc/lib-rt/build/
 /mypyc/lib-rt/*.so
+
+# Rust build output
+/target/
