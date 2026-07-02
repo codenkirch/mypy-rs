@@ -34,68 +34,68 @@ jobs:
         - name: Test suite with py310-ubuntu, mypyc-compiled
           python: '3.10'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
           test_mypyc: true
         - name: Test suite with py311-ubuntu
           python: '3.11'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
         - name: Test suite with py312-ubuntu
           python: '3.12'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
         - name: Test suite with py313-ubuntu, mypyc-compiled
           python: '3.13'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
           test_mypyc: true
         - name: Test suite with py314-ubuntu, mypyc-compiled
           python: '3.14'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
           test_mypyc: true
         - name: Test suite with py315-ubuntu, mypyc-compiled
           python: '3.15'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
           test_mypyc: true
         - name: Test suite with py314t-ubuntu, mypyc-compiled
           python: '3.14t'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
           test_mypyc: true
         - name: Test suite with py314-windows-64
           python: '3.14'
           os: windows-latest
-          toxenv: py
-          tox_extra_args: "-n 4"
+          check: pytest
+          check_args: "-n 4"
 
         # - name: Test suite with py315-dev-ubuntu
         #   python: '3.15-dev'
         #   os: ubuntu-24.04-arm
-        #   toxenv: py
-        #   tox_extra_args: "-n 4"
+        #   check: pytest
+        #   check_args: "-n 4"
         #   # allow_failure: true
         #   test_mypyc: true
 
         - name: mypyc runtime tests with py313-macos
           python: '3.13'
           os: macos-latest
-          toxenv: py
-          tox_extra_args: "-n 3 mypyc/test/test_run.py mypyc/test/test_external.py"
+          check: pytest
+          check_args: "-n 3 mypyc/test/test_run.py mypyc/test/test_external.py"
 
         - name: mypyc runtime tests with py310-ubuntu
           python: '3.10'
           os: ubuntu-latest
-          toxenv: py
-          tox_extra_args: "-n 3 mypyc/test/test_run.py mypyc/test/test_external.py"
+          check: pytest
+          check_args: "-n 3 mypyc/test/test_run.py mypyc/test/test_external.py"
 
         # This is broken. See
         # - https://github.com/python/mypy/issues/17819
@@ -103,52 +103,49 @@ jobs:
         # - name: mypyc runtime tests with py310-debug-build-ubuntu
         #   python: '3.10'
         #   os: ubuntu-latest
-        #   toxenv: py
-        #   tox_extra_args: "-n 4 mypyc/test/test_run.py mypyc/test/test_external.py"
+        #   check: pytest
+        #   check_args: "-n 4 mypyc/test/test_run.py mypyc/test/test_external.py"
         #   debug_build: true
 
         - name: Parallel tests with py314-ubuntu, interpreted
           python: '3.14'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
+          check: pytest
+          check_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
         - name: Parallel tests with py314-ubuntu, mypyc-compiled
           python: '3.14'
           os: ubuntu-24.04-arm
-          toxenv: py
-          tox_extra_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
+          check: pytest
+          check_args: "-n 4 --mypy-num-workers=4 mypy/test/testcheck.py"
           test_mypyc: true
         - name: Parallel tests with py314-windows-64, interpreted
           python: '3.14'
           os: windows-latest
-          toxenv: py
-          tox_extra_args: "-n 2 --mypy-num-workers=2 mypy/test/testcheck.py -k 'incremental or modules or classes'"
+          check: pytest
+          check_args: "-n 2 --mypy-num-workers=2 mypy/test/testcheck.py -k 'incremental or modules or classes'"
 
         - name: Type check our own code (py310-ubuntu)
           python: '3.10'
           os: ubuntu-latest
-          toxenv: type
+          check: typecheck
+          check_args: ""
         - name: Type check our own code (py310-windows-64)
           python: '3.10'
           os: windows-latest
-          toxenv: type
+          check: typecheck
+          check_args: ""
 
-          # We also run these checks with pre-commit in CI,
-          # but it's useful to run them with tox too,
-          # to ensure the tox env works as expected
         - name: Formatting and code style with Black + ruff
           python: '3.10'
           os: ubuntu-latest
-          toxenv: lint
+          check: lint
+          check_args: ""
 
     name: ${{ matrix.name }}
     timeout-minutes: 60
     env:
-      TOX_SKIP_MISSING_INTERPRETERS: False
-      VIRTUALENV_SYSTEM_SITE_PACKAGES: ${{ matrix.test_mypyc && 1 || 0 }}
       # Rich (pip) -- Disable color for windows + pytest
-      FORCE_COLOR: ${{ !(startsWith(matrix.os, 'windows-') && startsWith(matrix.toxenv, 'py')) && 1 || 0 }}
-      # Tox
+      FORCE_COLOR: ${{ !(startsWith(matrix.os, 'windows-') && startsWith(matrix.check, 'pytest')) && 1 || 0 }}
       PY_COLORS: 1
       # Python -- Disable argparse help colors (3.14+)
       PYTHON_COLORS: 0
@@ -204,7 +201,7 @@ jobs:
         python-version: ${{ matrix.python }}
         allow-prereleases: true
 
-    - name: Install tox
+    - name: Install uv
       run: |
         echo PATH; echo $PATH
         echo which python; which python
@@ -213,21 +210,28 @@ jobs:
         echo debug build; python -c 'import sysconfig; print(bool(sysconfig.get_config_var("Py_DEBUG")))'
         echo os.cpu_count; python -c 'import os; print(os.cpu_count())'
         echo os.sched_getaffinity; python -c 'import os; print(len(getattr(os, "sched_getaffinity", lambda *args: [])(0)))'
-        pip install tox==4.53.1
+        pip install uv==0.11.26
+
+    - name: Setup uv environment
+      if: ${{ !matrix.test_mypyc }}
+      run: |
+        uv sync --python python
 
     - name: Compiled with mypyc
       if: ${{ matrix.test_mypyc }}
       # Use local version of librt during self-compilation in tests.
       run: |
-        pip install -r test-requirements.txt
-        pip install -U mypyc/lib-rt
-        CC=clang MYPYC_OPT_LEVEL=0 MYPY_USE_MYPYC=1 pip install -e .
-
-    - name: Setup tox environment
-      run: |
-        tox run -e ${{ matrix.toxenv }} --notest
+        uv sync --no-install-project --python python
+        uv pip install -U mypyc/lib-rt
+        CC=clang MYPYC_OPT_LEVEL=0 MYPY_USE_MYPYC=1 uv pip install -e .
     - name: Test
-      run: tox run -e ${{ matrix.toxenv }} --skip-pkg-install -- ${{ matrix.tox_extra_args }}
+      if: ${{ !matrix.test_mypyc }}
+      run: uv run ${{ matrix.check }} ${{ matrix.check_args }}
+      continue-on-error: ${{ matrix.allow_failure == 'true' }}
+
+    - name: Test compiled with mypyc
+      if: ${{ matrix.test_mypyc }}
+      run: uv run --no-sync ${{ matrix.check }} ${{ matrix.check_args }}
       continue-on-error: ${{ matrix.allow_failure == 'true' }}
 
     - name: Mark as success (check failures manually)
@@ -239,10 +243,8 @@ jobs:
     name: Test mypyc suite with 32-bit Python
     timeout-minutes: 60
     env:
-      TOX_SKIP_MISSING_INTERPRETERS: False
       # Rich (pip)
       FORCE_COLOR: 1
-      # Tox
       PY_COLORS: 1
       # Mypy (see https://github.com/python/mypy/issues/7771)
       TERM: xterm-color
@@ -277,9 +279,9 @@ jobs:
         with:
           default: 3.11.1
           command: python -c "import platform; print(f'{platform.architecture()=} {platform.machine()=}');"
-      - name: Install tox
-        run: pip install tox==4.53.1
-      - name: Setup tox environment
-        run: tox run -e py --notest
+      - name: Install uv
+        run: pip install uv==0.11.26
+      - name: Setup uv environment
+        run: uv sync --python python
       - name: Test
-        run: tox run -e py --skip-pkg-install -- -n 4 mypyc/test/
+        run: uv run pytest -n 4 mypyc/test/

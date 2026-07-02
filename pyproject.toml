@@ -71,6 +71,35 @@ install-types = ["pip"]
 faster-cache = ["orjson"]
 native-parser = []
 
+[dependency-groups]
+test = [
+  "attrs>=18.0",
+  "filelock>=3.3.0",
+  "lxml>=5.3.0; python_version<'3.15'",
+  # This exercises the faster-cache path in CI.
+  "orjson; python_version=='3.12'",
+  "pre-commit>=3.5.0",
+  "psutil>=4.0",
+  "pytest>=8.1.0",
+  "pytest-cov>=2.10.0",
+  "pytest-xdist>=1.34.0",
+  "setuptools>=77.0.3",
+  # Needed even on py311+ so the self check passes with --python-version 3.10.
+  "tomli>=1.1.0",
+  "types-psutil",
+  "types-setuptools",
+]
+docs = [
+  "furo>=2022.3.4",
+  "myst-parser>=4.0.0",
+  "sphinx>=8.1.0",
+  "sphinx-inline-tabs>=2023.04.21",
+]
+dev = [
+  {include-group = "test"},
+  {include-group = "docs"},
+]
+
 [project.urls]
 Homepage = "https://www.mypy-lang.org/"
 Documentation = "https://mypy.readthedocs.io/en/stable/index.html"
@@ -84,9 +113,16 @@ stubgen = "mypy.stubgen:main"
 stubtest = "mypy.stubtest:main"
 dmypy = "mypy.dmypy.client:console_entry"
 mypyc = "mypyc.__main__:main"
+dev = "script:main"
+test = "script:test"
+lint = "script:lint"
+format = "script:format"
+typecheck = "script:typecheck"
+docs = "script:docs"
+env = "script:env"
 
 [tool.setuptools.packages.find]
-include = ["mypy*", "mypyc*", "*__mypyc*"]
+include = ["mypy*", "mypyc*", "script*", "*__mypyc*"]
 exclude = ["mypyc.test-data*"]
 namespaces = false
 

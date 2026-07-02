@@ -12,16 +12,16 @@ Building the documentation
 --------------------------
 
 Install Sphinx and other dependencies (i.e. theme) needed for the documentation.
-From the `docs` directory, use `pip`:
+From the repository root, use `uv`:
 
 ```
-pip install -r requirements-docs.txt
+uv sync
 ```
 
 Build the documentation like this:
 
 ```
-make html
+uv run docs
 ```
 
 The built documentation will be placed in the `docs/build` directory. Open
