@@ -28,6 +28,7 @@ Common commands:
 
 ```bash
 uv sync
+uv run all
 uv run test
 uv run pytest -n0 -k test_name
 uv run lint
@@ -84,10 +85,7 @@ first, then the broader suite when practical:
 
 ```bash
 uv lock --check
-uv run typecheck
-uv run docs
-uv run lint
-uv run test
+uv run all
 ```
 
 For Rust migration work, add targeted parity tests and include native-parser,

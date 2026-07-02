@@ -14,6 +14,17 @@ from collections.abc import Sequence
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+ALL_TEST_GROUPS = (
+    "self",
+    "self-packaging",
+    "lint",
+    "pytest-fast",
+    "pytest-cmdline",
+    "pytest-slow",
+    "mypyc-fast",
+    "pytest-extra",
+    "mypyc-extra",
+)
 
 
 def run_step(name: str, command: Sequence[str], *, env: dict[str, str] | None = None) -> int:
@@ -132,6 +143,18 @@ def docs(args: Sequence[str] | None = None) -> None:
         print(f"documentation available under file://{out_dir / 'index.html'}")
 
 
+def all_checks(args: Sequence[str] | None = None) -> None:
+    """Run the broad local verification suite."""
+    if args is None:
+        args = sys.argv[1:]
+
+    require_success("lock", ["uv", "lock", "--check"])
+    typecheck([])
+    docs([])
+    lint([])
+    test(args or ALL_TEST_GROUPS)
+
+
 def env(args: Sequence[str] | None = None) -> None:
     """Inspect the uv-managed environment or run an arbitrary command."""
     if args is None:
@@ -177,4 +200,15 @@ def main() -> None:
     runner(args)
 
 
-__all__ = ["docs", "env", "format", "lint", "main", "pytest", "run_step", "test", "typecheck"]
+__all__ = [
+    "all_checks",
+    "docs",
+    "env",
+    "format",
+    "lint",
+    "main",
+    "pytest",
+    "run_step",
+    "test",
+    "typecheck",
+]
