@@ -353,16 +353,23 @@ Current correctness status:
 - Serializes `import`, `from ... import ...`, and `from ... import *`
   statements.
 - Serializes call positional, keyword, `*args`, and `**kwargs` argument
-  metadata for supported argument expressions.
+  metadata for supported argument expressions, using mypy's canonical
+  positional-then-keyword call argument order.
 - Serializes import side-channel metadata in the format expected by
   `mypy.nativeparse.deserialize_imports`, including top-level flags,
   function-local import flags, mypy-only flags for `TYPE_CHECKING`/`MYPY`
   blocks, and basic reachability for `PY2`/`PY3`, boolean operators, and
   `sys.version_info`/`sys.platform` comparisons.
+- Preserves native import dependency-discovery behavior for unreachable branch
+  imports without reintroducing missing-import diagnostics for dead code after
+  top-level always-failing asserts.
 - Serializes type-ignore side-channel metadata for `# type: ignore` comments,
   including bracketed error-code lists.
 - Preserves inline `# mypy: ...` comments and native raw-load behavior for
   whole-module ignores and top-level always-failing asserts.
+- Preserves expression-statement source locations, type-comment diagnostics for
+  invalid function signatures, invalid call annotations, duplicate signatures,
+  and type-ignore parsing edge cases covered by the fastparse tests.
 - Preserves Ruff parser recovery errors and recovered ASTs for the syntax
   error cases covered by `mypy/test/test_nativeparse.py`.
 - Uses the same short and long integer byte encoding as `librt` for all bare
@@ -429,14 +436,9 @@ Current local-extension baseline for the full native parser suite:
 `254 passed`.
 
 Current local-extension baseline for full native-parser `testcheck.py`:
-`53 failed, 8091 passed, 69 skipped, 7 xfailed`. This is no longer just
-serializer fixture parity; remaining failures are concentrated in semantic
-integration details such as selected type-comment diagnostics and locations,
-tuple/variadic tuple edge cases, module `__getattr__` package behavior, and
-incremental/redefinition behavior.
+`8144 passed, 69 skipped, 7 xfailed`.
 
 This implementation is not ready to become the default parser solely from this
-file-level parity result. The next correctness step is broader integration
-validation around daemon, cache, incremental-mode, import discovery, and
-realistic mypy self-check paths before `mypy.nativeparse` is switched to prefer
-the in-tree extension.
+file-level parity result. The next correctness step is broader validation
+around daemon, cache, incremental-mode, and realistic mypy self-check paths
+before `mypy.nativeparse` is switched to prefer the in-tree extension.

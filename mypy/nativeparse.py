@@ -331,7 +331,7 @@ def read_statement(state: State, data: ReadBuffer) -> Statement:
         return a
     elif tag == nodes.EXPR_STMT:
         es = ExpressionStmt(read_expression(state, data))
-        set_line_column_range(es, es.expr)
+        read_loc(data, es)
         expect_end_tag(data)
         return es
     elif tag == nodes.IF_STMT:
@@ -2009,7 +2009,9 @@ def fix_function_overloads(state: State, stmts: list[Statement]) -> list[Stateme
     return ret
 
 
-def deserialize_imports(import_bytes: bytes) -> list[ImportBase]:
+def deserialize_imports(
+    import_bytes: bytes, *, dependency_discovery: bool = False
+) -> list[ImportBase]:
     """Deserialize import metadata from bytes into mypy AST nodes."""
     if not import_bytes:
         return []
@@ -2036,7 +2038,7 @@ def deserialize_imports(import_bytes: bytes) -> list[ImportBase]:
 
             # Note: relative imports are handled via ImportFrom, so relative should be 0 here
             stmt = Import([(name, asname)])
-            _read_and_set_import_metadata(data, stmt)
+            _read_and_set_import_metadata(data, stmt, dependency_discovery=dependency_discovery)
             imports.append(stmt)
 
         elif tag == IMPORTFROM_METADATA:
@@ -2057,7 +2059,7 @@ def deserialize_imports(import_bytes: bytes) -> list[ImportBase]:
                 names.append((name, asname))
 
             stmt = ImportFrom(module, relative, names)
-            _read_and_set_import_metadata(data, stmt)
+            _read_and_set_import_metadata(data, stmt, dependency_discovery=dependency_discovery)
             imports.append(stmt)
 
         elif tag == IMPORTALL_METADATA:
@@ -2065,7 +2067,7 @@ def deserialize_imports(import_bytes: bytes) -> list[ImportBase]:
             relative = read_int(data)
 
             stmt = ImportAll(module, relative)
-            _read_and_set_import_metadata(data, stmt)
+            _read_and_set_import_metadata(data, stmt, dependency_discovery=dependency_discovery)
             imports.append(stmt)
 
         else:
@@ -2074,7 +2076,12 @@ def deserialize_imports(import_bytes: bytes) -> list[ImportBase]:
     return imports
 
 
-def _read_and_set_import_metadata(data: ReadBuffer, stmt: Import | ImportFrom | ImportAll) -> None:
+def _read_and_set_import_metadata(
+    data: ReadBuffer,
+    stmt: Import | ImportFrom | ImportAll,
+    *,
+    dependency_discovery: bool = False,
+) -> None:
     read_loc(data, stmt)
 
     # Metadata flags as a single integer bitfield
@@ -2084,6 +2091,12 @@ def _read_and_set_import_metadata(data: ReadBuffer, stmt: Import | ImportFrom | 
     # Bit 0: is_top_level
     # Bit 1: is_unreachable
     # Bit 2: is_mypy_only
+    # Bit 3: omit from dependency discovery
     stmt.is_top_level = (flags & 0x01) != 0
-    stmt.is_unreachable = (flags & 0x02) != 0
+    is_unreachable = (flags & 0x02) != 0
+    omit_from_dependencies = (flags & 0x08) != 0
+    stmt.is_unreachable = is_unreachable
+    stmt.is_unreachable_dependency = (
+        dependency_discovery and is_unreachable and not omit_from_dependencies
+    )
     stmt.is_mypy_only = (flags & 0x04) != 0

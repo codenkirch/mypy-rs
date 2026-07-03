@@ -1209,39 +1209,48 @@ class BuildManager:
         """
         res: list[tuple[int, str, int]] = []
         for imp in file.imports:
-            if not imp.is_unreachable:
-                if isinstance(imp, Import):
-                    pri = import_priority(imp, PRI_MED)
-                    ancestor_pri = import_priority(imp, PRI_LOW)
-                    for id, _ in imp.ids:
-                        res.append((pri, id, imp.line))
-                        ancestor_parts = id.split(".")[:-1]
-                        ancestors = []
-                        for part in ancestor_parts:
-                            ancestors.append(part)
-                            res.append((ancestor_pri, ".".join(ancestors), imp.line))
-                elif isinstance(imp, ImportFrom):
-                    cur_id = self.correct_rel_imp(file, imp)
-                    all_are_submodules = True
-                    # Also add any imported names that are submodules.
-                    pri = import_priority(imp, PRI_MED)
-                    for name, __ in imp.names:
-                        sub_id = cur_id + "." + name
-                        if self.is_module(sub_id):
-                            res.append((pri, sub_id, imp.line))
-                        else:
-                            all_are_submodules = False
-                    # Add cur_id as a dependency, even if all the
-                    # imports are submodules. Processing import from will try
-                    # to look through cur_id, so we should depend on it.
-                    # As a workaround for some bugs in cycle handling (#4498),
-                    # if all the imports are submodules, do the import at a lower
-                    # priority.
-                    pri = import_priority(imp, PRI_HIGH if not all_are_submodules else PRI_LOW)
-                    res.append((pri, cur_id, imp.line))
-                elif isinstance(imp, ImportAll):
-                    pri = import_priority(imp, PRI_HIGH)
-                    res.append((pri, self.correct_rel_imp(file, imp), imp.line))
+            if imp.is_unreachable and not imp.is_unreachable_dependency:
+                continue
+            include_only_if_resolvable = imp.is_unreachable_dependency
+            if isinstance(imp, Import):
+                pri = import_priority(imp, PRI_MED)
+                ancestor_pri = import_priority(imp, PRI_LOW)
+                for id, _ in imp.ids:
+                    if include_only_if_resolvable and not self.is_module(id):
+                        continue
+                    res.append((pri, id, imp.line))
+                    ancestor_parts = id.split(".")[:-1]
+                    ancestors = []
+                    for part in ancestor_parts:
+                        ancestors.append(part)
+                        res.append((ancestor_pri, ".".join(ancestors), imp.line))
+            elif isinstance(imp, ImportFrom):
+                cur_id = self.correct_rel_imp(file, imp)
+                if include_only_if_resolvable and not self.is_module(cur_id):
+                    continue
+                all_are_submodules = True
+                # Also add any imported names that are submodules.
+                pri = import_priority(imp, PRI_MED)
+                for name, __ in imp.names:
+                    sub_id = cur_id + "." + name
+                    if self.is_module(sub_id):
+                        res.append((pri, sub_id, imp.line))
+                    else:
+                        all_are_submodules = False
+                # Add cur_id as a dependency, even if all the
+                # imports are submodules. Processing import from will try
+                # to look through cur_id, so we should depend on it.
+                # As a workaround for some bugs in cycle handling (#4498),
+                # if all the imports are submodules, do the import at a lower
+                # priority.
+                pri = import_priority(imp, PRI_HIGH if not all_are_submodules else PRI_LOW)
+                res.append((pri, cur_id, imp.line))
+            elif isinstance(imp, ImportAll):
+                cur_id = self.correct_rel_imp(file, imp)
+                if include_only_if_resolvable and not self.is_module(cur_id):
+                    continue
+                pri = import_priority(imp, PRI_HIGH)
+                res.append((pri, cur_id, imp.line))
 
         # Sort such that module (e.g. foo.bar.baz) comes before its ancestors (e.g. foo
         # and foo.bar) so that, if FindModuleCache finds the target module in a

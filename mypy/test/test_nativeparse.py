@@ -274,7 +274,9 @@ class TestNativeParserBinaryFormat(unittest.TestCase):
                 # arg_names: [None]
                 + [LIST_GEN, 22, LITERAL_NONE]
                 + locs(1, 0, 1, 14)
-                + [END_TAG, END_TAG]
+                + [END_TAG]
+                + locs(1, 0, 1, 14)
+                + [END_TAG]
             ),
         )
 

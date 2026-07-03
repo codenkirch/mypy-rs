@@ -621,9 +621,16 @@ class MypyFile(SymbolNode):
 class ImportBase(Statement):
     """Base class for all import statements."""
 
-    __slots__ = ("is_unreachable", "is_top_level", "is_mypy_only", "assignments")
+    __slots__ = (
+        "is_unreachable",
+        "is_unreachable_dependency",
+        "is_top_level",
+        "is_mypy_only",
+        "assignments",
+    )
 
     is_unreachable: bool  # Set by semanal.SemanticAnalyzerPass1 if inside `if False` etc.
+    is_unreachable_dependency: bool  # Native parser: include only if already resolvable.
     is_top_level: bool  # Ditto if outside any class or def
     is_mypy_only: bool  # Ditto if inside `if TYPE_CHECKING` or `if MYPY`
 
@@ -639,6 +646,7 @@ class ImportBase(Statement):
         super().__init__()
         self.assignments = []
         self.is_unreachable = False
+        self.is_unreachable_dependency = False
         self.is_top_level = False
         self.is_mypy_only = False
 

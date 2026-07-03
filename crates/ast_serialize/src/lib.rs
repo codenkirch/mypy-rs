@@ -109,7 +109,9 @@ const ARG_STAR2: i64 = 4;
 const ARG_NAMED_OPT: i64 = 5;
 
 const IMPORT_FLAG_TOP_LEVEL: i64 = 0x01;
+const IMPORT_FLAG_UNREACHABLE: i64 = 0x02;
 const IMPORT_FLAG_MYPY_ONLY: i64 = 0x04;
+const IMPORT_FLAG_OMIT_FROM_DEPENDENCIES: i64 = 0x08;
 
 const TYPE_VAR_KIND: i64 = 0;
 const PARAM_SPEC_KIND: i64 = 1;
@@ -238,6 +240,9 @@ struct Serializer<'a> {
     always_false: HashSet<String>,
     skip_function_bodies: bool,
     class_depth: usize,
+    parse_errors: Vec<NativeParseError>,
+    forced_type_loc: Option<SourceLocation>,
+    callable_arg_list_depth: usize,
 }
 
 impl<'a> Serializer<'a> {
@@ -262,6 +267,9 @@ impl<'a> Serializer<'a> {
             always_false,
             skip_function_bodies,
             class_depth: 0,
+            parse_errors: Vec::new(),
+            forced_type_loc: None,
+            callable_arg_list_depth: 0,
         }
     }
 
@@ -300,12 +308,22 @@ struct ImportMetadata {
     flags: i64,
 }
 
+#[derive(Clone, Debug)]
+struct NativeParseError {
+    line: i64,
+    column: i64,
+    message: String,
+    blocker: bool,
+    code: &'static str,
+}
+
 #[derive(Default)]
 struct ImportCollector {
     imports: Vec<ImportMetadata>,
     function_depth: usize,
     unreachable_depth: usize,
     mypy_only_depth: usize,
+    omit_from_dependencies_depth: usize,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -326,9 +344,7 @@ enum ConditionValue {
 
 impl ImportCollector {
     fn push(&mut self, import: ImportMetadata) {
-        if self.unreachable_depth == 0 {
-            self.imports.push(import);
-        }
+        self.imports.push(import);
     }
 
     fn flags(&self) -> i64 {
@@ -339,6 +355,12 @@ impl ImportCollector {
         };
         if self.mypy_only_depth > 0 {
             flags |= IMPORT_FLAG_MYPY_ONLY;
+        }
+        if self.unreachable_depth > 0 {
+            flags |= IMPORT_FLAG_UNREACHABLE;
+        }
+        if self.omit_from_dependencies_depth > 0 {
+            flags |= IMPORT_FLAG_OMIT_FROM_DEPENDENCIES;
         }
         flags
     }
@@ -365,6 +387,14 @@ impl ImportCollector {
 
     fn leave_mypy_only(&mut self) {
         self.mypy_only_depth -= 1;
+    }
+
+    fn enter_omit_from_dependencies(&mut self) {
+        self.omit_from_dependencies_depth += 1;
+    }
+
+    fn leave_omit_from_dependencies(&mut self) {
+        self.omit_from_dependencies_depth -= 1;
     }
 }
 
@@ -393,12 +423,13 @@ fn parse(
     let _ = cache_version;
     let source = read_source(py, source, fnam)?;
     let parsed = parse_unchecked_source(&source, PySourceType::Python);
-    let errors = parse_errors_to_py(py, &source, parsed.errors())?;
+    let mut errors = parse_errors_to_py(py, &source, parsed.errors())?;
     let (type_ignores, type_comments) = collect_comment_directives(&source, parsed.tokens());
     let module = parsed.into_syntax();
+    let is_partial_package = is_partial_stub_package(fnam, &module.body);
     let python_version = python_version.unwrap_or((3, 10));
     let python_version = (i64::from(python_version.0), i64::from(python_version.1));
-    let (ast_bytes, imports) = serialize_suite(
+    let (ast_bytes, imports, native_errors) = serialize_suite(
         &module.body,
         &source,
         python_version,
@@ -408,9 +439,10 @@ fn parse(
         skip_function_bodies,
         type_comments,
     )?;
+    errors.extend(native_parse_errors_to_py(py, native_errors)?);
     let import_bytes = serialize_import_metadata(&imports);
     let data = pyo3::types::PyDict::new(py);
-    data.set_item("is_partial_package", false)?;
+    data.set_item("is_partial_package", is_partial_package)?;
     data.set_item("uses_template_strings", false)?;
     data.set_item("mypy_ignores", type_ignores.clone())?;
     data.set_item("source_hash", source_hash(&source))?;
@@ -459,14 +491,49 @@ fn parse_errors_to_py(
         let offset = error.location.start().to_usize();
         let line_index = line_starts.partition_point(|start| *start <= offset) - 1;
         let line_start = line_starts[line_index];
+        let line_end = line_starts
+            .get(line_index + 1)
+            .copied()
+            .unwrap_or(source.len());
+        let source_line = &source[line_start..line_end];
         let column = source[line_start..offset].chars().count() + 1;
+        let message = translate_parse_error_message(&error.error.to_string(), source_line);
 
         let dict = pyo3::types::PyDict::new(py);
         dict.set_item("line", line_index + 1)?;
         dict.set_item("column", column)?;
-        dict.set_item("message", error.error.to_string())?;
+        dict.set_item("message", message)?;
         dict.set_item("blocker", true)?;
         dict.set_item("code", "syntax")?;
+        result.push(dict.into_py(py));
+    }
+    Ok(result)
+}
+
+fn translate_parse_error_message(message: &str, source_line: &str) -> String {
+    if source_line.contains("TypedDict") {
+        if let Some(keyword) = message
+            .strip_prefix("Duplicate keyword argument \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            return format!("Repeated keyword argument \"{keyword}\" for \"TypedDict\"");
+        }
+    }
+    message.to_owned()
+}
+
+fn native_parse_errors_to_py(
+    py: Python<'_>,
+    errors: Vec<NativeParseError>,
+) -> PyResult<Vec<PyObject>> {
+    let mut result = Vec::with_capacity(errors.len());
+    for error in errors {
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("line", error.line)?;
+        dict.set_item("column", error.column)?;
+        dict.set_item("message", error.message)?;
+        dict.set_item("blocker", error.blocker)?;
+        dict.set_item("code", error.code)?;
         result.push(dict.into_py(py));
     }
     Ok(result)
@@ -481,7 +548,7 @@ fn serialize_suite(
     always_false: Vec<String>,
     skip_function_bodies: bool,
     type_comments: HashMap<i64, String>,
-) -> PyResult<(Vec<u8>, Vec<ImportMetadata>)> {
+) -> PyResult<(Vec<u8>, Vec<ImportMetadata>, Vec<NativeParseError>)> {
     let mut serializer = Serializer::new(
         source,
         python_version,
@@ -496,7 +563,9 @@ fn serialize_suite(
     for statement in suite {
         if rest_unreachable {
             serializer.imports.enter_unreachable();
+            serializer.imports.enter_omit_from_dependencies();
             let result = serialize_stmt(&mut serializer, statement);
+            serializer.imports.leave_omit_from_dependencies();
             serializer.imports.leave_unreachable();
             result?;
         } else {
@@ -505,7 +574,8 @@ fn serialize_suite(
         }
     }
     let imports = serializer.imports.imports.clone();
-    Ok((serializer.into_bytes(), imports))
+    let errors = serializer.parse_errors.clone();
+    Ok((serializer.into_bytes(), imports, errors))
 }
 
 fn serialize_import_metadata(imports: &[ImportMetadata]) -> Vec<u8> {
@@ -541,11 +611,23 @@ fn serialize_import_metadata(imports: &[ImportMetadata]) -> Vec<u8> {
     writer.into_bytes()
 }
 
+fn is_partial_stub_package(fnam: &str, suite: &ast::Suite) -> bool {
+    if !(fnam.ends_with("/__init__.pyi") || fnam.ends_with("\\__init__.pyi")) {
+        return false;
+    }
+    suite.iter().any(|statement| match statement {
+        ast::Stmt::FunctionDef(function) => function.name.as_str() == "__getattr__",
+        _ => false,
+    })
+}
+
 fn serialize_stmt(serializer: &mut Serializer<'_>, statement: &ast::Stmt) -> PyResult<()> {
     match statement {
         ast::Stmt::Expr(expr) => {
+            let loc = serializer.loc(statement);
             serializer.writer.tag(EXPR_STMT);
             serialize_expr(serializer, &expr.value)?;
+            serializer.writer.loc(&loc);
             serializer.writer.tag(END_TAG);
             Ok(())
         }
@@ -562,7 +644,7 @@ fn serialize_stmt(serializer: &mut Serializer<'_>, statement: &ast::Stmt) -> PyR
                     .map_err(to_parse_error)?
                     .into_expr();
                 serializer.writer.bool(true);
-                serialize_type(serializer, &parsed_type)?;
+                serialize_type_with_forced_loc(serializer, &parsed_type, &loc)?;
             } else {
                 serializer.writer.bool(false);
             }
@@ -800,34 +882,33 @@ fn serialize_expr(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> Py
             serializer.writer.tag(CALL_EXPR);
             serialize_expr(serializer, &call.func)?;
 
-            let args: Vec<ArgOrKeyword<'_>> = call.arguments.iter_source_order().collect();
+            let arg_count = call.arguments.args.len() + call.arguments.keywords.len();
             serializer.writer.tag(LIST_GEN);
-            serializer.writer.bare_int(args.len() as i64);
-            for arg in &args {
-                serialize_call_arg_value(serializer, arg)?;
+            serializer.writer.bare_int(arg_count as i64);
+            for arg in &call.arguments.args {
+                serialize_call_arg_value(serializer, &ArgOrKeyword::Arg(arg))?;
+            }
+            for keyword in &call.arguments.keywords {
+                serialize_call_arg_value(serializer, &ArgOrKeyword::Keyword(keyword))?;
             }
 
-            let mut arg_kinds = Vec::with_capacity(args.len());
-            let mut arg_names = Vec::with_capacity(args.len());
-            for arg in args {
-                match arg {
-                    ArgOrKeyword::Arg(expr) => {
-                        arg_kinds.push(if matches!(expr, ast::Expr::Starred(_)) {
-                            ARG_STAR
-                        } else {
-                            ARG_POS
-                        });
-                        arg_names.push(None);
-                    }
-                    ArgOrKeyword::Keyword(keyword) => {
-                        if let Some(name) = &keyword.arg {
-                            arg_kinds.push(ARG_NAMED);
-                            arg_names.push(Some(name.as_str().to_owned()));
-                        } else {
-                            arg_kinds.push(ARG_STAR2);
-                            arg_names.push(None);
-                        }
-                    }
+            let mut arg_kinds = Vec::with_capacity(arg_count);
+            let mut arg_names = Vec::with_capacity(arg_count);
+            for arg in &call.arguments.args {
+                arg_kinds.push(if matches!(arg, ast::Expr::Starred(_)) {
+                    ARG_STAR
+                } else {
+                    ARG_POS
+                });
+                arg_names.push(None);
+            }
+            for keyword in &call.arguments.keywords {
+                if let Some(name) = &keyword.arg {
+                    arg_kinds.push(ARG_NAMED);
+                    arg_names.push(Some(name.as_str().to_owned()));
+                } else {
+                    arg_kinds.push(ARG_STAR2);
+                    arg_names.push(None);
                 }
             }
             serializer.writer.int_list(&arg_kinds);
@@ -1675,7 +1756,7 @@ fn serialize_function_def(
     };
     serializer.writer.tag(FUNC_DEF_STMT);
     serializer.writer.string(function.name.as_str());
-    let type_comment = function_type_comment(serializer, function, full_loc.line);
+    let type_comment = function_type_comment(serializer, function, &loc);
     let comment_arg_types = type_comment
         .as_ref()
         .and_then(|comment| comment.arg_types.as_deref());
@@ -1709,7 +1790,7 @@ fn serialize_function_def(
                 "mypy in-tree Rust parser does not parse this function return type comment yet: {err}"
             ))
         })?;
-        serialize_type_with_loc(serializer, &parsed_type.into_expr(), &loc)?;
+        serialize_type_with_forced_loc(serializer, &parsed_type.into_expr(), &loc)?;
     }
     serializer.writer.loc(&loc);
     serializer.writer.tag(END_TAG);
@@ -1730,7 +1811,7 @@ fn serialize_decorated_function_def(
         serialize_expr(serializer, &decorator.expression)?;
     }
     serializer.writer.int(loc.line);
-    serializer.writer.int(loc.column);
+    serializer.writer.int(loc.column + 1);
     serialize_function_def(serializer, function)?;
     serializer.writer.tag(END_TAG);
     Ok(())
@@ -1761,10 +1842,11 @@ struct ParsedFunctionTypeComment {
 }
 
 fn function_type_comment(
-    serializer: &Serializer<'_>,
+    serializer: &mut Serializer<'_>,
     function: &ast::StmtFunctionDef,
-    def_line: i64,
+    function_loc: &SourceLocation,
 ) -> Option<ParsedFunctionTypeComment> {
+    let def_line = function_loc.line;
     let first_body_line = function
         .body
         .first()
@@ -1775,16 +1857,116 @@ fn function_type_comment(
             continue;
         };
         let Some(mut parsed) = parse_function_type_comment(comment) else {
+            if comment.contains("->") {
+                serializer
+                    .parse_errors
+                    .push(type_comment_syntax_error(function_loc, comment));
+            }
             continue;
         };
+        if function_type_comment_has_syntax_error(&parsed) {
+            serializer
+                .parse_errors
+                .push(type_comment_syntax_error(function_loc, comment));
+            return None;
+        }
         if let Some(arg_types) = &mut parsed.arg_types {
             if serializer.class_depth > 0 && arg_types.len() + 1 == function.parameters.len() {
                 arg_types.insert(0, None);
             }
+            if function.returns.is_some() || has_parameter_annotation(function) {
+                serializer
+                    .parse_errors
+                    .push(duplicate_type_signature_error(function_loc));
+            }
+            if let Some(parameter_loc) = first_parameter_type_comment_loc(serializer, function) {
+                serializer
+                    .parse_errors
+                    .push(duplicate_type_signature_error(&parameter_loc));
+            }
+            if arg_types.len() > function.parameters.len() {
+                serializer.parse_errors.push(NativeParseError {
+                    line: function_loc.line,
+                    column: function_loc.column,
+                    message: "Type signature has too many parameters".to_owned(),
+                    blocker: false,
+                    code: "syntax",
+                });
+                return None;
+            }
+            if arg_types.len() < function.parameters.len() {
+                serializer.parse_errors.push(NativeParseError {
+                    line: function_loc.line,
+                    column: function_loc.column,
+                    message: "Type signature has too few parameters".to_owned(),
+                    blocker: false,
+                    code: "syntax",
+                });
+                return None;
+            }
+        } else if function.returns.is_some() {
+            serializer
+                .parse_errors
+                .push(duplicate_type_signature_error(function_loc));
         }
         return Some(parsed);
     }
     None
+}
+
+fn function_type_comment_has_syntax_error(comment: &ParsedFunctionTypeComment) -> bool {
+    comment
+        .arg_types
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|arg| arg.as_deref())
+        .any(|arg| parse_expression(arg).is_err())
+        || parse_expression(&comment.return_type).is_err()
+}
+
+fn type_comment_syntax_error(loc: &SourceLocation, comment: &str) -> NativeParseError {
+    NativeParseError {
+        line: loc.line,
+        column: loc.column,
+        message: format!(
+            "Syntax error in type comment \"{}\"",
+            comment.split('#').next().unwrap_or(comment).trim()
+        ),
+        blocker: false,
+        code: "syntax",
+    }
+}
+
+fn duplicate_type_signature_error(loc: &SourceLocation) -> NativeParseError {
+    NativeParseError {
+        line: loc.line,
+        column: loc.column,
+        message: "Function has duplicate type signatures".to_owned(),
+        blocker: false,
+        code: "syntax",
+    }
+}
+
+fn has_parameter_annotation(function: &ast::StmtFunctionDef) -> bool {
+    function
+        .parameters
+        .iter()
+        .any(|parameter| parameter.annotation().is_some())
+}
+
+fn first_parameter_type_comment_loc(
+    serializer: &Serializer<'_>,
+    function: &ast::StmtFunctionDef,
+) -> Option<SourceLocation> {
+    function.parameters.iter().find_map(|parameter| {
+        let loc = serializer.loc(&parameter);
+        serializer
+            .type_comments
+            .get(&loc.end_line)
+            .is_some_and(|comment| parse_function_type_comment(comment).is_none())
+            .then_some(loc)
+    })
 }
 
 fn parse_function_type_comment(comment: &str) -> Option<ParsedFunctionTypeComment> {
@@ -2051,12 +2233,18 @@ fn serialize_parameter(
     let loc = serializer.loc(&parameter);
     let name = parameter.name().as_str();
     let pos_only = pos_only || argument_elide_name(name);
-    let inline_type_comment = if comment_annotation.is_none() && parameter.annotation().is_none() {
+    let inline_comment = serializer
+        .type_comments
+        .get(&loc.end_line)
+        .filter(|comment| parse_function_type_comment(comment).is_none())
+        .cloned();
+    if parameter.annotation().is_some() && inline_comment.is_some() {
         serializer
-            .type_comments
-            .get(&loc.end_line)
-            .filter(|comment| parse_function_type_comment(comment).is_none())
-            .cloned()
+            .parse_errors
+            .push(duplicate_type_signature_error(&loc));
+    }
+    let inline_type_comment = if comment_annotation.is_none() && parameter.annotation().is_none() {
+        inline_comment
     } else {
         None
     };
@@ -2072,7 +2260,7 @@ fn serialize_parameter(
                 "mypy in-tree Rust parser does not parse this parameter type comment yet: {err}"
             ))
         })?;
-        serialize_type_with_loc(serializer, &parsed_type.into_expr(), &loc)?;
+        serialize_type_with_forced_loc(serializer, &parsed_type.into_expr(), &loc)?;
     } else if let Some(annotation) = parameter.annotation() {
         serialize_type(serializer, annotation)?;
     }
@@ -2384,8 +2572,22 @@ fn import_alias_names(aliases: &[ast::Alias]) -> Vec<(String, Option<String>)> {
 }
 
 fn serialize_type(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> PyResult<()> {
-    let loc = serializer.loc(expression);
+    let loc = serializer
+        .forced_type_loc
+        .clone()
+        .unwrap_or_else(|| serializer.loc(expression));
     serialize_type_with_loc(serializer, expression, &loc)
+}
+
+fn serialize_type_with_forced_loc(
+    serializer: &mut Serializer<'_>,
+    expression: &ast::Expr,
+    loc: &SourceLocation,
+) -> PyResult<()> {
+    let previous = serializer.forced_type_loc.replace(loc.clone());
+    let result = serialize_type_with_loc(serializer, expression, loc);
+    serializer.forced_type_loc = previous;
+    result
 }
 
 fn serialize_type_with_loc(
@@ -2406,34 +2608,36 @@ fn serialize_type_with_loc(
                 return serialize_invalid_raw_expression_type(serializer, loc, None);
             };
             let args = type_arg_expressions(&subscript.slice);
-            serializer.writer.tag(UNBOUND_TYPE);
-            serializer.writer.string(&name);
-            serializer.writer.tag(LIST_GEN);
-            serializer.writer.bare_int(args.len() as i64);
-            for arg in args {
-                serialize_type(serializer, arg)?;
-            }
-            serializer.writer.bool(false);
-            serializer.writer.none();
-            serializer.writer.none();
-            serializer.writer.loc(loc);
-            serializer.writer.tag(END_TAG);
-            Ok(())
+            serialize_unbound_type_with_originals(
+                serializer,
+                &name,
+                args.as_slice(),
+                matches!(&*subscript.slice, ast::Expr::Tuple(tuple) if tuple.elts.is_empty()),
+                None,
+                None,
+                loc,
+            )
         }
         ast::Expr::Call(call) => {
-            if is_arg_constructor_call(&call.func) {
+            if serializer.callable_arg_list_depth > 0 {
                 serialize_call_type(serializer, call, loc)
             } else {
-                serialize_invalid_raw_expression_type(serializer, loc, None)
+                serialize_invalid_raw_expression_type(
+                    serializer,
+                    loc,
+                    invalid_call_type_note(call).as_deref(),
+                )
             }
         }
         ast::Expr::List(list) => {
             serializer.writer.tag(LIST_TYPE);
             serializer.writer.tag(LIST_GEN);
             serializer.writer.bare_int(list.elts.len() as i64);
+            serializer.callable_arg_list_depth += 1;
             for item in &list.elts {
                 serialize_type(serializer, item)?;
             }
+            serializer.callable_arg_list_depth -= 1;
             serializer.writer.loc(loc);
             serializer.writer.tag(END_TAG);
             Ok(())
@@ -2612,13 +2816,16 @@ fn serialize_type_string(
     match parse_expression(&format!("({text})")) {
         Ok(parsed) => {
             let expression = parsed.into_expr();
-            if serialize_type_with_original_string(
+            let previous = serializer.forced_type_loc.replace(loc.clone());
+            let serialized = serialize_type_with_original_string(
                 serializer,
                 &expression,
                 text,
                 fallback_name,
                 loc,
-            )? {
+            );
+            serializer.forced_type_loc = previous;
+            if serialized? {
                 Ok(())
             } else {
                 serialize_raw_expression_type(
@@ -2789,27 +2996,6 @@ fn serialize_call_type(
     Ok(())
 }
 
-fn is_arg_constructor_call(func: &ast::Expr) -> bool {
-    let Some(name) = dotted_name(func) else {
-        return false;
-    };
-    matches!(
-        name.as_str(),
-        "Arg"
-            | "DefaultArg"
-            | "NamedArg"
-            | "DefaultNamedArg"
-            | "VarArg"
-            | "KwArg"
-            | "mypy_extensions.Arg"
-            | "mypy_extensions.DefaultArg"
-            | "mypy_extensions.NamedArg"
-            | "mypy_extensions.DefaultNamedArg"
-            | "mypy_extensions.VarArg"
-            | "mypy_extensions.KwArg"
-    )
-}
-
 enum RawTypeValue {
     Bool(bool),
     Int(i64),
@@ -2854,6 +3040,17 @@ fn serialize_invalid_raw_expression_type(
     serializer.writer.loc(loc);
     serializer.writer.tag(END_TAG);
     Ok(())
+}
+
+fn invalid_call_type_note(call: &ast::ExprCall) -> Option<String> {
+    let constructor = dotted_name(&call.func)?;
+    if !call.arguments.keywords.is_empty() {
+        Some("Cannot use a function call in a type annotation".to_owned())
+    } else {
+        Some(format!(
+            "Suggestion: use {constructor}[...] instead of {constructor}(...)"
+        ))
+    }
 }
 
 fn type_arg_expressions(expression: &ast::Expr) -> Vec<&ast::Expr> {
@@ -3221,45 +3418,63 @@ fn collect_comment_directives(
         let line_index =
             line_starts.partition_point(|start| *start <= range.start().to_usize()) - 1;
         let line = (line_index + 1) as i64;
-        if let Some(codes) = parse_type_ignore_comment(comment) {
-            ignores.push((line, codes));
-        }
-        if let Some(type_comment) = parse_assignment_type_comment(comment) {
+        if let Some((type_comment, type_ignore)) = parse_assignment_type_comment(comment) {
             type_comments.insert(line, type_comment);
+            if let Some(codes) = type_ignore {
+                ignores.push((line, codes));
+            }
+        } else if let Some(codes) = parse_type_ignore_comment(comment) {
+            ignores.push((line, codes));
         }
     }
     (ignores, type_comments)
 }
 
 fn parse_type_ignore_comment(comment: &str) -> Option<Vec<String>> {
-    for segment in comment.split('#').skip(1) {
-        let after_hash = segment.trim_start();
-        if let Some(after_type) = after_hash.strip_prefix("type:") {
-            if let Some(tag) = after_type.trim_start().strip_prefix("ignore") {
-                return parse_type_ignore_tag(tag);
-            }
-        }
-    }
-    None
+    let text = comment.trim_start();
+    let after_hash = text.strip_prefix('#')?.trim_start();
+    let after_type = after_hash.strip_prefix("type:")?;
+    let tag = strip_type_ignore_keyword(after_type.trim_start())?;
+    parse_type_ignore_tag(tag)
 }
 
-fn parse_assignment_type_comment(comment: &str) -> Option<String> {
+fn parse_assignment_type_comment(comment: &str) -> Option<(String, Option<Vec<String>>)> {
     let text = comment.trim_start();
     let after_hash = text.strip_prefix('#')?.trim_start();
     let type_comment = after_hash.strip_prefix("type:")?.trim_start();
-    if type_comment.starts_with("ignore") {
+    if strip_type_ignore_keyword(type_comment).is_some() {
         return None;
     }
-    let type_comment =
-        strip_trailing_comment(strip_trailing_type_ignore_comment(type_comment)).trim();
-    (!type_comment.is_empty()).then(|| type_comment.to_owned())
+    let (type_comment, type_ignore) = split_type_comment_ignore(type_comment);
+    let type_comment = strip_trailing_comment(type_comment).trim();
+    (!type_comment.is_empty()).then(|| (type_comment.to_owned(), type_ignore))
 }
 
-fn strip_trailing_type_ignore_comment(type_comment: &str) -> &str {
-    type_comment
-        .find("# type: ignore")
-        .or_else(|| type_comment.find("#type:ignore"))
-        .map_or(type_comment, |index| &type_comment[..index])
+fn split_type_comment_ignore(type_comment: &str) -> (&str, Option<Vec<String>>) {
+    let Some(hash_index) = type_comment.find('#') else {
+        return (type_comment, None);
+    };
+    let after_hash = type_comment[hash_index + 1..].trim_start();
+    let Some(after_type) = after_hash.strip_prefix("type:") else {
+        return (type_comment, None);
+    };
+    let Some(tag) = strip_type_ignore_keyword(after_type.trim_start()) else {
+        return (type_comment, None);
+    };
+    (&type_comment[..hash_index], parse_type_ignore_tag(tag))
+}
+
+fn strip_type_ignore_keyword(comment: &str) -> Option<&str> {
+    let rest = comment.strip_prefix("ignore")?;
+    if rest.is_empty()
+        || rest.starts_with('[')
+        || rest.starts_with('#')
+        || rest.starts_with(char::is_whitespace)
+    {
+        Some(rest)
+    } else {
+        None
+    }
 }
 
 fn strip_trailing_comment(type_comment: &str) -> &str {
@@ -3323,7 +3538,7 @@ mod tests {
     #[test]
     fn serializes_trivial_call_like_existing_binary_contract() {
         let suite = parse_module("print('hello')").unwrap().into_suite();
-        let (bytes, imports) = serialize_suite(
+        let (bytes, imports, errors) = serialize_suite(
             &suite,
             "print('hello')",
             (3, 10),
@@ -3335,6 +3550,7 @@ mod tests {
         )
         .unwrap();
         assert!(imports.is_empty());
+        assert!(errors.is_empty());
         assert_eq!(
             bytes,
             [
@@ -3384,6 +3600,11 @@ mod tests {
                 20,
                 48,
                 END_TAG,
+                LOCATION,
+                22,
+                20,
+                20,
+                48,
                 END_TAG,
             ]
         );
