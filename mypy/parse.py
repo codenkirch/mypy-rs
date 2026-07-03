@@ -13,13 +13,22 @@ from mypy.nodes import (
     Block,
     ClassDef,
     FileRawData,
+    IfStmt,
     ImportBase,
     MypyFile,
     ParseError,
     Statement,
 )
 from mypy.options import Options
-from mypy.reachability import assert_will_always_fail
+from mypy.reachability import (
+    ALWAYS_FALSE,
+    ALWAYS_TRUE,
+    MYPY_FALSE,
+    MYPY_TRUE,
+    assert_will_always_fail,
+    infer_condition_value,
+)
+from mypy.traverser import TraverserVisitor
 
 
 def parse(
@@ -106,12 +115,13 @@ def load_from_raw(
             block.end_line = defs[-1].end_line
             block.end_column = defs[-1].end_column
             defs = [block]
-    imports = deserialize_imports(raw_data.imports)
+    imports = deserialize_imports(raw_data.imports, dependency_discovery=True)
     skipped_lines: set[int] = set()
     if ignore_whole_module:
         imports = []
     elif not imports_only:
         defs, imports, skipped_lines = truncate_after_failing_toplevel_assert(defs, imports, options)
+        skipped_lines.update(collect_skipped_lines(defs, options))
 
     tree = MypyFile(defs, imports)
     tree.path = fnam
@@ -167,6 +177,51 @@ def truncate_after_failing_toplevel_assert(
             ]
             return defs[: index + 1], imports, skipped_lines
     return defs, imports, set()
+
+
+def collect_skipped_lines(defs: list[Statement], options: Options) -> set[int]:
+    visitor = SkippedLinesVisitor(options)
+    for stmt in defs:
+        stmt.accept(visitor)
+    return visitor.skipped_lines
+
+
+class SkippedLinesVisitor(TraverserVisitor):
+    def __init__(self, options: Options) -> None:
+        self.options = options
+        self.skipped_lines: set[int] = set()
+
+    def visit_if_stmt(self, stmt: IfStmt) -> None:
+        remaining_reachable = True
+        for index, expr in enumerate(stmt.expr):
+            if not remaining_reachable:
+                self.add_block_lines(stmt.body[index])
+                continue
+            result = infer_condition_value(expr, self.options)
+            if result in (ALWAYS_FALSE, MYPY_FALSE):
+                self.add_block_lines(stmt.body[index])
+            elif result in (ALWAYS_TRUE, MYPY_TRUE):
+                remaining_reachable = False
+                for body in stmt.body[index + 1 :]:
+                    self.add_block_lines(body)
+                if stmt.else_body is not None:
+                    self.add_block_lines(stmt.else_body)
+        for expr in stmt.expr:
+            expr.accept(self)
+        for block in stmt.body:
+            block.accept(self)
+        if stmt.else_body is not None:
+            stmt.else_body.accept(self)
+
+    def visit_block(self, block: Block) -> None:
+        if block.is_unreachable:
+            self.add_block_lines(block)
+            return
+        super().visit_block(block)
+
+    def add_block_lines(self, block: Block) -> None:
+        if block.end_line is not None:
+            self.skipped_lines.update(range(block.line, block.end_line + 1))
 
 
 def report_parse_error(error: ParseError, errors: Errors) -> None:
