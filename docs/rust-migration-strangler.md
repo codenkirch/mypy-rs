@@ -312,14 +312,67 @@ parse(...) -> tuple[bytes, list[ParseError], TypeIgnores, bytes, ASTData]
 
 Current correctness status:
 
-- Uses `rustpython-parser` for the Rust-side Python parse.
-- Serializes the existing binary AST format for the narrow
-  `print('hello')` expression-statement case.
+- Uses Ruff's Rust parser crates for the Rust-side Python parse.
+- Owns the mypy-specific translation layer in this repo:
+  Ruff AST -> mypy native binary AST bytes.
+- Serializes the existing binary AST format for a small first slice:
+  expression statements, calls, names, strings,
+  member access, binary operators, small integer literals, tuples, lists, sets,
+  dictionaries, index and slice expressions, boolean operations, comparisons,
+  unary operations, `None`/boolean/ellipsis literals, float/complex/bytes/big
+  integer literals, bytes literals with escaped display payloads, and plain
+  assignments.
+- Serializes simple statement tags for augmented assignment, return, pass,
+  raise, assert, delete, break, continue, global, and nonlocal.
+- Serializes annotated assignments for the supported type-expression subset,
+  including no-RHS assignments through `TempNode`, assignment type comments,
+  and nested list/tuple assignment targets.
+- Serializes function definitions, including function blocks,
+  positional-only parameters, positional parameters, keyword-only parameters,
+  `*args`, `**kwargs`, defaults, async functions, parameter annotations,
+  return annotations, and decorated functions.
+- Serializes a growing type-expression subset for annotations: unbound names,
+  dotted names, subscripted types, PEP 604 unions, list type arguments,
+  ellipsis type arguments, unpacked type arguments, `Arg(...)` callable
+  argument constructor calls, invalid-expression fallbacks, literal
+  string/bytes/int/bool values, string forward references, and PEP 695 type
+  parameters/type aliases.
+- Serializes `if`/`elif`/`else`, `while`/`else`, `for`/`else`, `with`, and
+  `try`/`except`/`finally` statements.
+- Serializes comprehensions and generators, lambdas, conditional expressions,
+  named expressions, yield expressions, and skip-function-body handling for
+  `# mypy: ignore-errors=True`.
+- Serializes f-strings through the native parser f-string wire format,
+  including conversion flags, format specifiers, nested format-spec
+  expressions, and debug f-strings.
+- Serializes match statements and the pattern forms covered by the native
+  parser suite: class, value, singleton, or, sequence/star, mapping, capture,
+  wildcard, and guarded cases.
+- Serializes class definitions with bodies, base expressions, decorators,
+  metaclass and other class keyword arguments.
+- Serializes `import`, `from ... import ...`, and `from ... import *`
+  statements.
+- Serializes call positional, keyword, `*args`, and `**kwargs` argument
+  metadata for supported argument expressions.
+- Serializes import side-channel metadata in the format expected by
+  `mypy.nativeparse.deserialize_imports`, including top-level flags,
+  function-local import flags, mypy-only flags for `TYPE_CHECKING`/`MYPY`
+  blocks, and basic reachability for `PY2`/`PY3`, boolean operators, and
+  `sys.version_info` comparisons.
+- Serializes type-ignore side-channel metadata for `# type: ignore` comments,
+  including bracketed error-code lists.
+- Preserves Ruff parser recovery errors and recovered ASTs for the syntax
+  error cases covered by `mypy/test/test_nativeparse.py`.
+- Uses the same short and long integer byte encoding as `librt` for all bare
+  integer fields currently emitted by the Rust serializer.
 - Matches the current mypy cache/node tag constants for this branch.
 - Raises a normal `UnicodeDecodeError` for invalid UTF-8 byte input.
 - Passes the Rust unit test for the trivial binary AST contract.
 - When built as a local extension and placed ahead of the installed wheel on
   `PYTHONPATH`, passes `TestNativeParserBinaryFormat`.
+- The first native parser data cases now pass with the local extension, and
+  the full native parser suite currently has a concrete local-extension
+  baseline.
 
 Verification run locally:
 
@@ -327,25 +380,61 @@ Verification run locally:
 cargo test -p mypy-ast-serialize
 cargo rustc -p mypy-ast-serialize --features extension-module --lib \
   --crate-type cdylib -- -C link-arg=-undefined -C link-arg=dynamic_lookup
-PYTHONPATH=/private/tmp uv run pytest 'mypy/test/test_nativeparse.py::TestNativeParserBinaryFormat' -q
-uv run pytest mypy/test/test_nativeparse.py
+cp target/debug/libast_serialize.dylib \
+  /private/tmp/mypy-rs-local-ast/ast_serialize.cpython-313-darwin.so
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest \
+  'mypy/test/test_nativeparse.py::TestNativeParserBinaryFormat' -q
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest \
+  'mypy/test/test_nativeparse.py::NativeParserSuite::native-parser.test::testHello' \
+  'mypy/test/test_nativeparse.py::NativeParserSuite::native-parser.test::testMemberExpr' \
+  'mypy/test/test_nativeparse.py::NativeParserSuite::native-parser.test::testTupleExpr' \
+  'mypy/test/test_nativeparse.py::NativeParserSuite::native-parser.test::testOpExpr' \
+  'mypy/test/test_nativeparse.py::NativeParserSuite::native-parser.test::testAssignmentStmt' \
+  -q
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'SimpleFunction or FunctionWithArgs or FunctionWithVarArgs or FunctionWithKwargs or FunctionWithKwOnly or FunctionWithAllArgKinds or AsyncFunction or FunctionWithDefaultArg or FunctionWithMultipleDefaults or FunctionMixedDefaultsAndRegular or FunctionWithKwOnlyDefault'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'IfStmt or WhileStmt'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'IntExpr'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'SimpleClass or ClassWithMethod or ClassWithSingleBase or ClassWithMultipleBases or Metaclass or ClassWithKeywordArgs or ClassDecorator'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'NativeParserImportsSuite'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q \
+  -k 'NativeParserImportsSuite or TestNativeParserBinaryFormat or BytesLiteral or AnnotatedAssignment or LiteralStringType or LiteralStringWithEscapes or ForwardReference or FunctionSignature or UnionTypes or FunctionWithEllipsisCallableType or FunctionWithCallableType or FunctionWithEmptyCallableType or FunctionWithComplexCallableType or DecoratedFuncDef or FunctionOverload or RaiseStatements or AssertStatements or GlobalAndNonlocal or DelStmt or StarExpression or AwaitExpression or ForStatements or WithStatements'
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m pytest mypy/test/test_nativeparse.py -q
 ```
 
-The full native parser suite still passes with the external wheel installed:
+Current local-extension baseline for the import side-channel suite:
+`78 passed`.
+
+Focused native parser slices added in the latest expansion all pass:
+`TypeIgnores`, `NestedListAssignment`, `TypeComment`, `ArgConstructor`,
+`CallableWithArg`, `InvalidType`, `FString`, `Match`, `PEP695`, and
+`SyntaxError`.
+
+Current local-extension baseline for the full native parser suite:
 `254 passed`.
 
-This implementation is not ready to become the default parser. It only proves
-that the repo can own the parser extension and match the existing wire format
-for a seed case. The next correctness step is to expand the Rust serializer in
-the same order as the native parser data tests:
+Current local-extension baseline for full native-parser `testcheck.py`:
+`82 failed, 8062 passed, 69 skipped, 7 xfailed`. This is no longer just
+serializer fixture parity; remaining failures are concentrated in semantic
+integration details such as whole-module ignores, inline config comments,
+unreachable/import handling, selected type-comment diagnostics and locations,
+variadic tuple edge cases, and incremental/redefinition behavior.
 
-- imports and import metadata
-- names, literals, member access, calls, and index expressions
-- assignments and annotated assignments
-- function and class definitions
-- control-flow statements
-- type comments, type ignores, and mypy comments
-- syntax error and version-gated syntax diagnostics
-
-Only after the in-tree extension can pass `mypy/test/test_nativeparse.py`
-without the external wheel should `mypy.nativeparse` be switched to prefer it.
+This implementation is not ready to become the default parser solely from this
+file-level parity result. The next correctness step is broader integration
+validation around daemon, cache, incremental-mode, import discovery, and
+realistic mypy self-check paths before `mypy.nativeparse` is switched to prefer
+the in-tree extension.
