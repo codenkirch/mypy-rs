@@ -6,7 +6,7 @@ use ruff_python_parser::parse_module;
 use ruff_python_parser::{parse_expression, parse_unchecked_source};
 use ruff_text_size::Ranged;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 
 const LITERAL_NONE: u8 = 2;
@@ -233,6 +233,9 @@ struct Serializer<'a> {
     line_starts: Vec<usize>,
     source: &'a str,
     python_version: (i64, i64),
+    platform: String,
+    always_true: HashSet<String>,
+    always_false: HashSet<String>,
     skip_function_bodies: bool,
     class_depth: usize,
 }
@@ -241,6 +244,9 @@ impl<'a> Serializer<'a> {
     fn new(
         source: &'a str,
         python_version: (i64, i64),
+        platform: String,
+        always_true: HashSet<String>,
+        always_false: HashSet<String>,
         skip_function_bodies: bool,
         type_comments: HashMap<i64, String>,
     ) -> Self {
@@ -251,6 +257,9 @@ impl<'a> Serializer<'a> {
             line_starts: line_starts(source),
             source,
             python_version,
+            platform,
+            always_true,
+            always_false,
             skip_function_bodies,
             class_depth: 0,
         }
@@ -381,7 +390,7 @@ fn parse(
     always_false: Option<Vec<String>>,
     cache_version: i64,
 ) -> PyResult<PyObject> {
-    let _ = (platform, always_true, always_false, cache_version);
+    let _ = cache_version;
     let source = read_source(py, source, fnam)?;
     let parsed = parse_unchecked_source(&source, PySourceType::Python);
     let errors = parse_errors_to_py(py, &source, parsed.errors())?;
@@ -393,6 +402,9 @@ fn parse(
         &module.body,
         &source,
         python_version,
+        platform.unwrap_or_default(),
+        always_true.unwrap_or_default(),
+        always_false.unwrap_or_default(),
         skip_function_bodies,
         type_comments,
     )?;
@@ -402,7 +414,7 @@ fn parse(
     data.set_item("uses_template_strings", false)?;
     data.set_item("mypy_ignores", type_ignores.clone())?;
     data.set_item("source_hash", source_hash(&source))?;
-    data.set_item("mypy_comments", Vec::<(i64, String)>::new())?;
+    data.set_item("mypy_comments", collect_mypy_comments(&source))?;
     Ok((
         pyo3::types::PyBytes::new(py, &ast_bytes),
         errors,
@@ -464,14 +476,33 @@ fn serialize_suite(
     suite: &ast::Suite,
     source: &str,
     python_version: (i64, i64),
+    platform: String,
+    always_true: Vec<String>,
+    always_false: Vec<String>,
     skip_function_bodies: bool,
     type_comments: HashMap<i64, String>,
 ) -> PyResult<(Vec<u8>, Vec<ImportMetadata>)> {
-    let mut serializer =
-        Serializer::new(source, python_version, skip_function_bodies, type_comments);
+    let mut serializer = Serializer::new(
+        source,
+        python_version,
+        platform,
+        always_true.into_iter().collect(),
+        always_false.into_iter().collect(),
+        skip_function_bodies,
+        type_comments,
+    );
     serializer.writer.int(suite.len() as i64);
+    let mut rest_unreachable = false;
     for statement in suite {
-        serialize_stmt(&mut serializer, statement)?;
+        if rest_unreachable {
+            serializer.imports.enter_unreachable();
+            let result = serialize_stmt(&mut serializer, statement);
+            serializer.imports.leave_unreachable();
+            result?;
+        } else {
+            serialize_stmt(&mut serializer, statement)?;
+            rest_unreachable = top_level_assert_always_fails(&serializer, statement);
+        }
     }
     let imports = serializer.imports.imports.clone();
     Ok((serializer.into_bytes(), imports))
@@ -1366,6 +1397,17 @@ fn serialize_if_stmt(serializer: &mut Serializer<'_>, if_stmt: &ast::StmtIf) -> 
     serializer.writer.loc(&loc);
     serializer.writer.tag(END_TAG);
     Ok(())
+}
+
+fn top_level_assert_always_fails(serializer: &Serializer<'_>, statement: &ast::Stmt) -> bool {
+    matches!(
+        statement,
+        ast::Stmt::Assert(assert_stmt)
+            if matches!(
+                evaluate_condition(serializer, &assert_stmt.test),
+                ConditionValue::AlwaysFalse | ConditionValue::MypyFalse
+            )
+    )
 }
 
 fn branch_modes_for_condition(
@@ -2913,8 +2955,10 @@ fn comparison_index(operator: ast::CmpOp) -> i64 {
 
 fn evaluate_condition(serializer: &Serializer<'_>, expression: &ast::Expr) -> ConditionValue {
     match expression {
-        ast::Expr::Name(name) => evaluate_special_name(name.id.as_str()),
-        ast::Expr::Attribute(attribute) => evaluate_special_name(attribute.attr.as_str()),
+        ast::Expr::Name(name) => evaluate_special_name(serializer, name.id.as_str()),
+        ast::Expr::Attribute(attribute) => {
+            evaluate_special_name(serializer, attribute.attr.as_str())
+        }
         ast::Expr::BooleanLiteral(boolean) => {
             if boolean.value {
                 ConditionValue::AlwaysTrue
@@ -2926,18 +2970,20 @@ fn evaluate_condition(serializer: &Serializer<'_>, expression: &ast::Expr) -> Co
             negate_condition(evaluate_condition(serializer, &unary.operand))
         }
         ast::Expr::BoolOp(bool_op) => evaluate_bool_op(serializer, bool_op),
-        ast::Expr::Compare(compare) => evaluate_version_compare(serializer, compare)
+        ast::Expr::Compare(compare) => evaluate_compare(serializer, compare)
             .map(bool_condition)
             .unwrap_or(ConditionValue::Unknown),
         _ => ConditionValue::Unknown,
     }
 }
 
-fn evaluate_special_name(name: &str) -> ConditionValue {
+fn evaluate_special_name(serializer: &Serializer<'_>, name: &str) -> ConditionValue {
     match name {
         "PY3" => ConditionValue::AlwaysTrue,
         "PY2" => ConditionValue::AlwaysFalse,
         "MYPY" | "TYPE_CHECKING" => ConditionValue::MypyTrue,
+        _ if serializer.always_true.contains(name) => ConditionValue::AlwaysTrue,
+        _ if serializer.always_false.contains(name) => ConditionValue::AlwaysFalse,
         _ => ConditionValue::Unknown,
     }
 }
@@ -3003,6 +3049,11 @@ fn bool_condition(value: bool) -> ConditionValue {
     }
 }
 
+fn evaluate_compare(serializer: &Serializer<'_>, compare: &ast::ExprCompare) -> Option<bool> {
+    evaluate_version_compare(serializer, compare)
+        .or_else(|| evaluate_platform_compare(serializer, compare))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 enum VersionValue {
     Int(i64),
@@ -3059,6 +3110,27 @@ fn version_value(serializer: &Serializer<'_>, expression: &ast::Expr) -> Option<
         {
             version_subscript(serializer, &subscript.slice)
         }
+        _ => None,
+    }
+}
+
+fn evaluate_platform_compare(
+    serializer: &Serializer<'_>,
+    compare: &ast::ExprCompare,
+) -> Option<bool> {
+    if compare.ops.len() != 1 || compare.comparators.len() != 1 {
+        return None;
+    }
+    if dotted_name(&compare.left).as_deref() != Some("sys.platform") {
+        return None;
+    }
+    let ast::Expr::StringLiteral(right) = &compare.comparators[0] else {
+        return None;
+    };
+    let right = right.value.to_str();
+    match compare.ops[0] {
+        ast::CmpOp::Eq => Some(serializer.platform == right),
+        ast::CmpOp::NotEq => Some(serializer.platform != right),
         _ => None,
     }
 }
@@ -3220,6 +3292,18 @@ fn parse_type_ignore_tag(tag: &str) -> Option<Vec<String>> {
     )
 }
 
+fn collect_mypy_comments(source: &str) -> Vec<(i64, String)> {
+    const PREFIX: &str = "# mypy: ";
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.strip_prefix(PREFIX)
+                .map(|comment| ((index + 1) as i64, comment.to_owned()))
+        })
+        .collect()
+}
+
 fn source_hash(source: &str) -> String {
     let mut hash = Sha256::new();
     hash.update(source.as_bytes());
@@ -3239,8 +3323,17 @@ mod tests {
     #[test]
     fn serializes_trivial_call_like_existing_binary_contract() {
         let suite = parse_module("print('hello')").unwrap().into_suite();
-        let (bytes, imports) =
-            serialize_suite(&suite, "print('hello')", (3, 10), false, HashMap::new()).unwrap();
+        let (bytes, imports) = serialize_suite(
+            &suite,
+            "print('hello')",
+            (3, 10),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            false,
+            HashMap::new(),
+        )
+        .unwrap();
         assert!(imports.is_empty());
         assert_eq!(
             bytes,

@@ -7,8 +7,19 @@ from librt.internal import ReadBuffer
 from mypy import errorcodes as codes
 from mypy.cache import read_int
 from mypy.errors import Errors
-from mypy.nodes import FileRawData, MypyFile, ParseError
+from mypy import message_registry
+from mypy.nodes import (
+    AssertStmt,
+    Block,
+    ClassDef,
+    FileRawData,
+    ImportBase,
+    MypyFile,
+    ParseError,
+    Statement,
+)
 from mypy.options import Options
+from mypy.reachability import assert_will_always_fail
 
 
 def parse(
@@ -78,11 +89,34 @@ def load_from_raw(
         data = ReadBuffer(raw_data.defs)
         n = read_int(data)
         defs = read_statements(state, data, n)
+    ignored_lines = dict(raw_data.ignored_lines)
+    module_ignore_error: tuple[int, list[str]] | None = None
+    ignore_whole_module = False
+    if not imports_only and defs and ignored_lines:
+        first_ignore_line = min(ignored_lines)
+        if first_ignore_line < first_statement_line(defs[0]):
+            ignore_whole_module = True
+            ignored_codes = ignored_lines[first_ignore_line]
+            if ignored_codes:
+                module_ignore_error = (first_ignore_line, ignored_codes)
+            ignored_lines = {}
+            block = Block(defs, is_unreachable=True)
+            block.line = defs[0].line
+            block.column = defs[0].column
+            block.end_line = defs[-1].end_line
+            block.end_column = defs[-1].end_column
+            defs = [block]
     imports = deserialize_imports(raw_data.imports)
+    skipped_lines: set[int] = set()
+    if ignore_whole_module:
+        imports = []
+    elif not imports_only:
+        defs, imports, skipped_lines = truncate_after_failing_toplevel_assert(defs, imports, options)
 
     tree = MypyFile(defs, imports)
     tree.path = fnam
-    tree.ignored_lines = raw_data.ignored_lines
+    tree.ignored_lines = ignored_lines
+    tree.skipped_lines = skipped_lines
     tree.is_partial_stub_package = raw_data.is_partial_stub_package
     tree.uses_template_strings = raw_data.uses_template_strings
     tree.is_stub = fnam.endswith(".pyi")
@@ -92,6 +126,12 @@ def load_from_raw(
     # Report parse errors, this replicates the logic in parse().
     all_errors = raw_data.raw_errors + state.errors
     errors.set_file(fnam, module, options=options)
+    if module_ignore_error is not None:
+        line, ignored_codes = module_ignore_error
+        message = message_registry.TYPE_IGNORE_WITH_ERRCODE_ON_MODULE.format(
+            ", ".join(ignored_codes)
+        )
+        errors.report(line, 0, message.value, blocker=False, code=message.code)
     for error in all_errors:
         # Note we never raise in this function, so it should not be called in coordinator.
         report_parse_error(error, errors)
@@ -100,6 +140,33 @@ def load_from_raw(
         # the parallel workers.
         tree.raw_data = raw_data
     return tree
+
+
+def first_statement_line(stmt: Statement) -> int:
+    if isinstance(stmt, ClassDef) and stmt.decorators:
+        return min(decorator.line for decorator in stmt.decorators)
+    return stmt.line
+
+
+def truncate_after_failing_toplevel_assert(
+    defs: list[Statement], imports: list[ImportBase], options: Options
+) -> tuple[list[Statement], list[ImportBase], set[int]]:
+    for index, stmt in enumerate(defs):
+        if isinstance(stmt, AssertStmt) and assert_will_always_fail(stmt, options):
+            if index == len(defs) - 1:
+                return defs, imports, set()
+            next_def = defs[index + 1]
+            last_def = defs[-1]
+            skipped_lines: set[int] = set()
+            if last_def.end_line is not None:
+                skipped_lines = set(range(next_def.line, last_def.end_line + 1))
+            imports = [
+                import_node
+                for import_node in imports
+                if (import_node.line, import_node.column) <= (stmt.line, stmt.column)
+            ]
+            return defs[: index + 1], imports, skipped_lines
+    return defs, imports, set()
 
 
 def report_parse_error(error: ParseError, errors: Errors) -> None:
