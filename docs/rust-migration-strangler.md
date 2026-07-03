@@ -358,9 +358,11 @@ Current correctness status:
   `mypy.nativeparse.deserialize_imports`, including top-level flags,
   function-local import flags, mypy-only flags for `TYPE_CHECKING`/`MYPY`
   blocks, and basic reachability for `PY2`/`PY3`, boolean operators, and
-  `sys.version_info` comparisons.
+  `sys.version_info`/`sys.platform` comparisons.
 - Serializes type-ignore side-channel metadata for `# type: ignore` comments,
   including bracketed error-code lists.
+- Preserves inline `# mypy: ...` comments and native raw-load behavior for
+  whole-module ignores and top-level always-failing asserts.
 - Preserves Ruff parser recovery errors and recovered ASTs for the syntax
   error cases covered by `mypy/test/test_nativeparse.py`.
 - Uses the same short and long integer byte encoding as `librt` for all bare
@@ -427,11 +429,11 @@ Current local-extension baseline for the full native parser suite:
 `254 passed`.
 
 Current local-extension baseline for full native-parser `testcheck.py`:
-`82 failed, 8062 passed, 69 skipped, 7 xfailed`. This is no longer just
+`53 failed, 8091 passed, 69 skipped, 7 xfailed`. This is no longer just
 serializer fixture parity; remaining failures are concentrated in semantic
-integration details such as whole-module ignores, inline config comments,
-unreachable/import handling, selected type-comment diagnostics and locations,
-variadic tuple edge cases, and incremental/redefinition behavior.
+integration details such as selected type-comment diagnostics and locations,
+tuple/variadic tuple edge cases, module `__getattr__` package behavior, and
+incremental/redefinition behavior.
 
 This implementation is not ready to become the default parser solely from this
 file-level parity result. The next correctness step is broader integration
