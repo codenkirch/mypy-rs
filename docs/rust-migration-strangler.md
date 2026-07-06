@@ -621,22 +621,40 @@ Python mypy). Calls `FindModuleCache.find_module` directly on 95 unique
 top-level imports extracted from the real source corpus. Best of 5
 iterations:
 
-| Resolver | real (s) | per-module (µs) |
-|----------|----------|------------------|
-| Python   | 0.0017   | 18.3             |
-| Native   | 0.0024   | 25.6             |
+| Resolver        | real (s) | per-module (µs) |
+|-----------------|----------|------------------|
+| Python          | 0.0016   | 16.5             |
+| Native (per-call) | 0.0023 | 23.8             |
+| Native (batched)  | 0.0003 | 2.7              |
 
-Native is **~1.4x slower** per-module in isolation. The remaining gap is
-pure PyO3 entry/exit overhead per call plus the `options.clone_for_module`
-call on the Python side. The previous callback strategy (Rust calling back
-into Python's `FileSystemCache` for every `isfile`/`isdir`/`listdir`) was
-~8x slower (175µs/module); the direct `std::fs` read with persistent
-caches closed that gap.
+The per-call native path is **~1.4x slower** than Python in isolation. The
+entire gap is PyO3 entry/exit overhead paid once per module id, plus the
+`options.clone_for_module` call on the Python side — the Rust kernel itself
+is faster than mypyc-compiled Python, but the boundary tax per call dwarfs
+the work done inside it.
 
-End-to-end, the overhead is invisible because resolution is a tiny fraction
-of total mypy time. Self-check timing (`mypy/modulefinder.py
+Hoisting the whole import set into one `NativeResolver.resolve_many` call
+(one boundary crossing for N ids, mirroring the existing
+`compute_dep_records` shape) closes the gap decisively: **batched native is
+~6x faster than Python** (2.7 µs vs 16.5 µs per module) and ~8.6x faster
+than the per-call native path. This proves the resolver seam has perf legs
+once the per-file import set is resolved in one Rust call rather than one
+call per id.
+
+The previous callback strategy (Rust calling back into Python's
+`FileSystemCache` for every `isfile`/`isdir`/`listdir`) was ~8x slower
+(175µs/module); the direct `std::fs` read with persistent caches closed
+that gap.
+
+End-to-end, the per-call overhead is invisible because resolution is a tiny
+fraction of total mypy time. Self-check timing (`mypy/modulefinder.py
 mypy/native_resolve.py mypy/nativeparse.py`, `--no-incremental`): byte-for-byte
-identical output between the Python resolver and `--native-resolver`.
+identical output between the Python resolver and `--native-resolver`. The
+batched `resolve_many` path is not yet wired into `FindModuleCache`; it is
+exposed on the adapter (`mypy.native_resolve.resolve_modules`) and proven
+on the microbench above. Production wiring (a batched `find_modules` on
+`FindModuleCache` consuming the per-file import set in one Rust call) is the
+next milestone for this seam.
 
 ### Verification
 

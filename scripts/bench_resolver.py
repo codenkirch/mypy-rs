@@ -4,6 +4,15 @@ Calls FindModuleCache.find_module() directly on every import that appears in
 the real source corpus (mypy + mypyc + bundled typeshed), bypassing type
 checking entirely. This isolates module-resolution throughput, the part the
 Rust migration actually touches.
+
+Three columns:
+  * python       — per-call find_module on the Python resolver.
+  * native       — per-call find_module routing through the Rust resolver
+                   (one PyO3 boundary crossing per module id).
+  * native batch — one resolve_many call resolving all ids in a single PyO3
+                   boundary crossing, proving whether hoisting the per-file
+                   import set into one Rust call closes the per-module
+                   boundary-overhead gap.
 """
 from __future__ import annotations
 
@@ -16,6 +25,7 @@ from pathlib import Path
 from mypy.modulefinder import FindModuleCache, compute_search_paths
 from mypy.fscache import FileSystemCache
 from mypy.options import Options
+from mypy.native_resolve import make_resolver, resolve_modules
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -65,41 +75,72 @@ def run_once(imports: list[str], native: bool) -> float:
     return time.perf_counter() - t0
 
 
+def run_once_batched(imports: list[str], resolver) -> float:
+    """One resolve_many call for the whole import set.
+
+    The resolver is built once and reused across iterations (mirroring how
+    FindModuleCache holds a long-lived NativeResolver). The bench corpus has
+    no per-module `# mypy: follow-untyped-imports` overrides, so a uniform
+    False is correct.
+    """
+    ids_with_follow = [(mod, False) for mod in imports]
+    t0 = time.perf_counter()
+    resolve_modules(resolver, ids_with_follow)
+    return time.perf_counter() - t0
+
+
 def main() -> None:
     imports = sorted(collect_imports())
     print(f"Corpus: {len(imports)} unique top-level imports")
     print()
 
-    # Warm both resolvers once.
+    # Build one long-lived native resolver for the batched column, mirroring how
+    # FindModuleCache._ensure_native_resolver constructs it once and reuses it.
+    batch_cache = make_cache(native=True)
+    batch_cache._ensure_native_resolver()
+    batch_resolver = batch_cache._native_resolver
+
+    # Warm all three paths once.
     run_once(imports[:20], native=False)
     run_once(imports[:20], native=True)
+    run_once_batched(imports[:20], batch_resolver)
 
     py_times: list[float] = []
     nat_times: list[float] = []
+    bat_times: list[float] = []
     iterations = 5
     for i in range(iterations):
         pt = run_once(imports, native=False)
         nt = run_once(imports, native=True)
+        bt = run_once_batched(imports, batch_resolver)
         py_times.append(pt)
         nat_times.append(nt)
-        print(f"  iter {i+1}: python={pt:.4f}s  native={nt:.4f}s")
+        bat_times.append(bt)
+        print(f"  iter {i+1}: python={pt:.4f}s  native={nt:.4f}s  batched={bt:.4f}s")
 
     best_py = min(py_times)
     best_nat = min(nat_times)
+    best_bat = min(bat_times)
     print()
-    print(f"Python resolver best-of-{iterations}: {best_py:.4f}s")
-    print(f"Native resolver best-of-{iterations}: {best_nat:.4f}s")
-    delta = best_nat - best_py
-    pct = (delta / best_py) * 100
-    if delta < 0:
-        print(f"Native is {-pct:.1f}% faster ({-delta:.4f}s saved)")
-    elif delta > 0:
-        print(f"Native is {pct:.1f}% slower ({delta:.4f}s added)")
-    else:
-        print("Native and Python are identical")
-    print(f"Per-module (python): {best_py / len(imports) * 1e6:.1f} µs")
-    print(f"Per-module (native): {best_nat / len(imports) * 1e6:.1f} µs")
+    print(f"Python resolver       best-of-{iterations}: {best_py:.4f}s")
+    print(f"Native resolver       best-of-{iterations}: {best_nat:.4f}s")
+    print(f"Native (batched)      best-of-{iterations}: {best_bat:.4f}s")
+    print()
+    print(f"Per-module (python):       {best_py / len(imports) * 1e6:.1f} µs")
+    print(f"Per-module (native):        {best_nat / len(imports) * 1e6:.1f} µs")
+    print(f"Per-module (native batch):  {best_bat / len(imports) * 1e6:.1f} µs")
+    print()
+    for label, best in (("native", best_nat), ("native batch", best_bat)):
+        delta = best - best_py
+        pct = (delta / best_py) * 100
+        if delta < 0:
+            print(f"{label:12} is {-pct:.1f}% faster than python ({-delta:.4f}s saved)")
+        elif delta > 0:
+            print(f"{label:12} is {pct:.1f}% slower than python ({delta:.4f}s added)")
+        else:
+            print(f"{label:12} identical to python")
 
 
 if __name__ == "__main__":
     main()
+
