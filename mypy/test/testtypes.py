@@ -17,6 +17,7 @@ from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
 from mypy.nodes import (
     ARG_NAMED,
+    ARG_NAMED_OPT,
     ARG_OPT,
     ARG_POS,
     ARG_STAR,
@@ -1500,6 +1501,223 @@ class RemoveLastKnownValueSuite(Suite):
         t2 = remove_instance_last_known_values(t)
         assert type(t2) is UnionType
         assert t2.items == expected
+
+
+# Stage 3a parity suite: round-trips `mypy.types.Type` through the binary
+# wire format and asserts that the Rust reader produces the same `str(t)` as
+# the Python `TypeStrVisitor`. Gated by `TEST_NATIVE_TYPE_KERNEL=1` plus the
+# presence of the `type_kernel` extension; skipped otherwise. This exercises
+# the reader end-to-end (varint, tagged helpers, per-variant dispatch, and
+# the `Display` impl) but does not wire the reader into any production path.
+try:
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL_WIRE = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL_WIRE = False
+
+_NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_WIRE
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeWireSuite(Suite):
+    """Parity tests for the Rust `Type` wire reader (Stage 3a).
+
+    Each test serializes a `Type` via `Type.write(WriteBuffer)` and asserts
+    that `type_kernel.read_type_to_str(bytes) == str(t)`. The seed corpus
+    mirrors the golden cases in `TypesSuite` (lines 72-200) plus the
+    `TypeFixture` instances that exercise each wire-format branch.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def assert_wire_par(self, t: Type) -> None:
+        expected = str(t)
+        actual = _type_kernel.read_type_to_str(self._bytes_of(t))
+        assert_equal(actual, expected, f"wire str({t!r}) = {{}} ({{}} expected)")
+
+    def test_any(self) -> None:
+        self.assert_wire_par(AnyType(TypeOfAny.special_form))
+
+    def test_none(self) -> None:
+        self.assert_wire_par(NoneType())
+
+    def test_uninhabited(self) -> None:
+        self.assert_wire_par(UninhabitedType())
+
+    def test_unbound_simple(self) -> None:
+        self.assert_wire_par(UnboundType("Foo"))
+
+    def test_unbound_generic(self) -> None:
+        self.assert_wire_par(
+            UnboundType("Foo", [UnboundType("T"), AnyType(TypeOfAny.special_form)])
+        )
+
+    def test_instance_singletons(self) -> None:
+        # INSTANCE_STR / INSTANCE_FUNCTION / INSTANCE_INT / INSTANCE_BOOL /
+        # INSTANCE_OBJECT fast paths, plus INSTANCE_SIMPLE for non-builtin.
+        self.assert_wire_par(self.fx.str_type)
+        self.assert_wire_par(self.fx.function)
+        self.assert_wire_par(self.fx.bool_type)
+        self.assert_wire_par(self.fx.o)
+        self.assert_wire_par(self.fx.a)
+        self.assert_wire_par(self.fx.b)
+
+    def test_instance_generic(self) -> None:
+        self.assert_wire_par(self.fx.ga)
+        self.assert_wire_par(self.fx.gb)
+        self.assert_wire_par(self.fx.gt)
+        self.assert_wire_par(self.fx.lsta)
+        self.assert_wire_par(self.fx.lstb)
+
+    def test_instance_tuple(self) -> None:
+        # builtins.tuple renders as `tuple[T, ...]`.
+        self.assert_wire_par(self.fx.std_tuple)
+
+    def test_literal_int(self) -> None:
+        self.assert_wire_par(self.fx.lit1)
+        self.assert_wire_par(self.fx.lit2)
+        self.assert_wire_par(self.fx.lit4)
+
+    def test_literal_str(self) -> None:
+        self.assert_wire_par(self.fx.lit_str1)
+        self.assert_wire_par(self.fx.lit_str2)
+        self.assert_wire_par(self.fx.lit_str3)
+
+    def test_literal_bool(self) -> None:
+        self.assert_wire_par(self.fx.lit_false)
+        self.assert_wire_par(self.fx.lit_true)
+
+    def test_type_type(self) -> None:
+        self.assert_wire_par(self.fx.type_a)
+        self.assert_wire_par(self.fx.type_b)
+        self.assert_wire_par(self.fx.type_any)
+
+    def test_callable_pos(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_no_ret(self) -> None:
+        c = CallableType([], [], [], NoneType(), self.fx.function)
+        self.assert_wire_par(c)
+
+    def test_callable_opt(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_OPT],
+            [None, None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_star(self) -> None:
+        c = CallableType(
+            [self.fx.a],
+            [ARG_STAR],
+            [None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_named(self) -> None:
+        c = CallableType(
+            [self.fx.a],
+            [ARG_NAMED],
+            ["x"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_named_opt(self) -> None:
+        c = CallableType(
+            [self.fx.a],
+            [ARG_NAMED_OPT],
+            ["x"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_star2(self) -> None:
+        c = CallableType(
+            [self.fx.a],
+            [ARG_STAR2],
+            ["kwargs"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_callable_generic(self) -> None:
+        # Mirrors `test_generic_function_type`: variables block renders as
+        # `def [X] (...)` (after `def`, before params).
+        c = CallableType(
+            [UnboundType("X"), UnboundType("Y")],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            UnboundType("Y"),
+            self.fx.function,
+            name=None,
+            variables=[
+                TypeVarType(
+                    "X",
+                    "X",
+                    TypeVarId(-1),
+                    [],
+                    self.fx.o,
+                    AnyType(TypeOfAny.from_omitted_generics),
+                )
+            ],
+        )
+        self.assert_wire_par(c)
+
+    def test_tuple_type_str(self) -> None:
+        t1 = TupleType([], self.fx.std_tuple)
+        self.assert_wire_par(t1)
+        t2 = TupleType([UnboundType("X")], self.fx.std_tuple)
+        self.assert_wire_par(t2)
+        t3 = TupleType([UnboundType("X"), AnyType(TypeOfAny.special_form)], self.fx.std_tuple)
+        self.assert_wire_par(t3)
+
+    def test_typevar(self) -> None:
+        self.assert_wire_par(self.fx.t)
+        self.assert_wire_par(self.fx.s)
+        self.assert_wire_par(self.fx.u)
+
+    def test_union(self) -> None:
+        self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
+        self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.nonet]))
+        self.assert_wire_par(
+            UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet])
+        )
+
+    def test_overloaded(self) -> None:
+        ov = Overloaded(
+            [
+                self.fx.callable(self.fx.a, AnyType(TypeOfAny.special_form)),
+                self.fx.callable(self.fx.b, AnyType(TypeOfAny.special_form)),
+            ]
+        )
+        self.assert_wire_par(ov)
 
 
 class ShallowOverloadMatchingSuite(Suite):

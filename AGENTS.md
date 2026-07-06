@@ -61,7 +61,9 @@ Follow a strangler-fig approach:
   type kernel is the active migration target, starting with `erase_type`
   behind the `native_type_kernel` gate (Stage 1, opt-in). Stage 2 ports
   `remove_instance_last_known_values` (`LastKnownValueEraser`) on the same
-  PyO3 seam, also opt-in.
+  PyO3 seam, also opt-in. Stage 3a adds a Rust `Type` enum + binary
+  wire-format reader (`wire::read_type`), parity-tested but not yet wired
+  into production — foundation for Stage 3c (`is_subtype`).
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
 
@@ -237,12 +239,16 @@ functions that walk live Python `Type` objects:
 - `erase_type` (Stage 1) — mirrors `mypy.erasetype.EraseTypeVisitor`.
 - `remove_instance_last_known_values` (Stage 2) — mirrors
   `mypy.erasetype.LastKnownValueEraser` (a `TypeTranslator`).
+- `read_type_to_str` (Stage 3a) — parity-only: reads a serialized
+  `mypy.types.Type` from its binary wire format and returns
+  `str(t)`. Not wired into any production path; used by
+  `NativeTypeWireSuite` to prove the Rust `Type` enum + reader
+  reconstructs the same type. Foundation for Stage 3c (`is_subtype`).
 
-Both return `None` for any type class Rust does not handle, and the
-Python caller falls back to the pure-Python visitor. This is the
-strangler-fig per-call gate. See "Milestone 3 (Phase 4)" and "Milestone 4
-(Phase 4)" in `docs/rust-migration-strangler.md` for the staging
-roadmap.
+Stages 1/2 return `None` for any type class Rust does not handle, and
+the Python caller falls back to the pure-Python visitor. This is the
+strangler-fig per-call gate. See "Milestone 3/4/5 (Phase 4)" in
+`docs/rust-migration-strangler.md` for the staging roadmap.
 
 **Rebuild the extension after any change to
 `crates/type_kernel/src/lib.rs`.** The same stale-binary hazard as the
