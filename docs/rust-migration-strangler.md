@@ -605,9 +605,14 @@ All suites run with both `TEST_NATIVE_PARSER=1` and
 | `testfinegrainedcache.py` | 549 passed, 229 skipped |
 
 mypy self-check diagnostic parity (`mypy_self_check.ini -p mypy -p mypyc`,
-340 source files): byte-for-byte identical output between the default
+341 source files): byte-for-byte identical output between the default
 Python resolver, `--native-resolver`, and `--native-parser --native-resolver`.
-All three report the same 2 pre-existing errors in `mypy/parse.py`.
+All three report 0 errors. The two pre-existing type errors in
+`mypy/parse.py` (a `list[Block]` vs `list[Statement]` mismatch in the
+`ignore_whole_module` branch) are fixed by annotating the initial `defs`
+binding; the three errors that PR #4 introduced (the untyped
+`module_resolver` import) are fixed by an in-tree stub at `stubs/module_resolver.pyi`
+found via `mypy_path` in `mypy_self_check.ini`.
 
 ### Performance
 

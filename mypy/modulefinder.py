@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 from enum import Enum, unique
-from typing import Final, TypeAlias as _TypeAlias
+from typing import TYPE_CHECKING, Final, TypeAlias as _TypeAlias
 
 from pathspec import GitIgnoreSpec
 from pathspec.patterns.gitignore import GitIgnorePatternError
@@ -30,6 +30,9 @@ from mypy.stubinfo import (
     stub_distribution_name,
 )
 from mypy.util import os_path_join
+
+if TYPE_CHECKING:
+    import module_resolver
 
 
 # Paths to be searched in find_module().
@@ -228,7 +231,7 @@ class FindModuleCache:
         # across find_module calls, mirroring fscache's cache lifetime.
         # Lazily constructed on first native resolve so the extension import
         # stays out of the non-native hot path.
-        self._native_resolver: object | None = None
+        self._native_resolver: module_resolver.NativeResolver | None = None
 
     def clear(self) -> None:
         self.results.clear()
