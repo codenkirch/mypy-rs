@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+use fs_probe::FsProbe;
 use pyo3::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -210,18 +211,7 @@ fn split_dot(id: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// FsProbe trait
-// ---------------------------------------------------------------------------
-
-trait FsProbe {
-    fn isfile(&self, path: &str) -> bool;
-    fn isdir(&self, path: &str) -> bool;
-    fn listdir(&self, path: &str) -> Vec<String>;
-    fn isfile_case(&self, path: &str, prefix: &str) -> bool;
-    fn exists_case(&self, path: &str, prefix: &str) -> bool;
-    fn read(&self, path: &str) -> Vec<u8>;
-}
-
+// In-memory FsProbe for unit tests
 // ---------------------------------------------------------------------------
 // In-memory FsProbe for unit tests
 // ---------------------------------------------------------------------------
@@ -535,7 +525,7 @@ impl NativeResolver {
     /// per-id work, which is the whole point of batching.
     fn resolve_many(
         &self,
-        py: Python<'_>,
+        _py: Python<'_>,
         ids_with_follow: Vec<(String, bool)>,
     ) -> PyResult<Vec<(u8, Option<String>, bool)>> {
         let res = resolve_many_with(
