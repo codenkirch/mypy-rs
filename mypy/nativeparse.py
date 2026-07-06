@@ -229,6 +229,24 @@ def native_parse(
         node.path = filename
         return node, [], []
 
+    # When source is None, the Rust extension would read the file directly via
+    # fs::read_to_string (UTF-8), which ignores PEP 263 encoding declarations
+    # (e.g. `# coding: ascii`). Read and decode here so decode errors surface
+    # the same way build.py's get_source() handles them — as a CompileError
+    # with "Cannot decode file: ..." (caught by the caller's wrap_context).
+    if source is None:
+        from mypy.errors import CompileError
+        from mypy.util import DecodeError, decode_python_encoding
+
+        try:
+            with open(filename, "rb") as f:
+                source = decode_python_encoding(f.read())
+        except (UnicodeDecodeError, DecodeError) as decodeerr:
+            raise CompileError(
+                [f"{filename}: error: Cannot decode file: {str(decodeerr)}"],
+                module_with_blocker=filename,
+            ) from decodeerr
+
     (
         b,
         errors,
@@ -295,7 +313,7 @@ def parse_to_binary_ast(
         platform=options.platform,
         always_true=options.always_true,
         always_false=options.always_false,
-        cache_version=3,
+        cache_version=4,
     )
     return (
         ast_bytes,
@@ -409,7 +427,12 @@ def read_statement(state: State, data: ReadBuffer) -> Statement:
         body = read_block(state, data)
         else_body = read_optional_block(state, data)
         is_async = read_bool(data)
-        stmt = ForStmt(index, expr, body, else_body)
+        has_index_type = read_bool(data)
+        if has_index_type:
+            index_type = read_type(state, data)
+        else:
+            index_type = None
+        stmt = ForStmt(index, expr, body, else_body, index_type=index_type)
         stmt.is_async = is_async
         read_loc(data, stmt)
         expect_end_tag(data)
@@ -510,7 +533,12 @@ def read_statement(state: State, data: ReadBuffer) -> Statement:
                 target_list.append(None)
         body = read_block(state, data)
         is_async = read_bool(data)
-        stmt = WithStmt(expr_list, target_list, body)
+        has_target_type = read_bool(data)
+        if has_target_type:
+            target_type = read_type(state, data)
+        else:
+            target_type = None
+        stmt = WithStmt(expr_list, target_list, body, target_type=target_type)
         stmt.is_async = is_async
         read_loc(data, stmt)
         expect_end_tag(data)
