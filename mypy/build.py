@@ -3387,9 +3387,29 @@ class State:
         if not self.tree.defs and self.tree.raw_data is not None:
             self.tree.defs = list(self.tree.imports)
             copied_imports = True
-        dep_entries = manager.all_imported_modules_in_file(
-            self.tree
-        ) + self.manager.plugin.get_additional_deps(self.tree)
+        if manager.find_module_cache._native_gate_active():
+            # Native dependency-record extraction: Rust walks the import list
+            # and resolves module ids via the same NativeResolver that
+            # _resolve uses, returning (priority, module_id, line) records.
+            # Plugin deps and the correct_rel_imp error reporting stay in
+            # Python (concatenated / reported after the Rust call).
+            import mypy.native_resolve as _native
+
+            manager.find_module_cache._ensure_native_resolver()
+            resolver = manager.find_module_cache._native_resolver
+            assert resolver is not None
+            known = set(manager.modules) | set(manager.source_set.source_modules)
+            dep_entries = _native.compute_dep_records(
+                resolver,
+                file=self.tree,
+                known_modules=known,
+                errors=manager.errors,
+                options=manager.options,
+            ) + manager.plugin.get_additional_deps(self.tree)
+        else:
+            dep_entries = manager.all_imported_modules_in_file(
+                self.tree
+            ) + manager.plugin.get_additional_deps(self.tree)
         if copied_imports:
             self.tree.defs = []
         for pri, id, line in dep_entries:

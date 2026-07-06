@@ -377,22 +377,12 @@ class FindModuleCache:
         modes: cold runs go to Rust, daemon/Bazel runs fall back to Python
         ``_find_module`` until the VFS is ported or the daemon is retired.
         """
-        if (
-            self.options is not None
-            and self.options.native_resolver
-            and not self.options.fine_grained_incremental
-            and not self.options.bazel
-        ):
-            from mypy.native_resolve import make_resolver, resolve_module as _native_resolve
+        if self._native_gate_active():
+            self._ensure_native_resolver()
+            from mypy.native_resolve import resolve_module as _native_resolve
 
-            if self._native_resolver is None:
-                self._native_resolver = make_resolver(
-                    options=self.options,
-                    search_paths=self.search_paths,
-                    stdlib_versions=self.stdlib_py_versions,
-                    stub_flat=self._stub_flat,
-                    stub_namespace=self._stub_namespace,
-                )
+            assert self._native_resolver is not None
+            assert self.options is not None
             return _native_resolve(
                 self._native_resolver,
                 id,
@@ -400,6 +390,38 @@ class FindModuleCache:
                 options=self.options,
             )
         return self._find_module(id, use_typeshed)
+
+    def _native_gate_active(self) -> bool:
+        """Whether the native resolver is enabled for this run.
+
+        Shared by ``_resolve`` (module resolution) and ``compute_dependencies``
+        (dependency-record extraction) so both dispatch gates stay in sync.
+        """
+        return (
+            self.options is not None
+            and self.options.native_resolver
+            and not self.options.fine_grained_incremental
+            and not self.options.bazel
+        )
+
+    def _ensure_native_resolver(self) -> None:
+        """Lazily construct the long-lived ``NativeResolver`` if not yet built.
+
+        Called from both ``_resolve`` and the dependency-record dispatch in
+        ``State.compute_dependencies`` so the ``make_resolver`` call isn't
+        duplicated.
+        """
+        if self._native_resolver is None:
+            from mypy.native_resolve import make_resolver
+
+            assert self.options is not None  # gate-checked by _native_gate_active
+            self._native_resolver = make_resolver(
+                options=self.options,
+                search_paths=self.search_paths,
+                stdlib_versions=self.stdlib_py_versions,
+                stub_flat=self._stub_flat,
+                stub_namespace=self._stub_namespace,
+            )
 
     def _typeshed_has_version(self, module: str) -> bool:
         if not self.options:

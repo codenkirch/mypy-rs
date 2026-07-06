@@ -23,7 +23,7 @@
 //!   * `HashMapFs` — an in-memory store used by the Rust unit tests.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use pyo3::prelude::*;
@@ -43,6 +43,87 @@ const REASON_APPROVED_STUBS_NOT_INSTALLED: u8 = 3;
 const FOUND: u8 = 255;
 
 const PYTHON_EXTENSIONS: &[&str] = &[".pyi", ".py"];
+
+// ---------------------------------------------------------------------------
+// Dependency-record extraction (mirrors mypy.build.all_imported_modules_in_file)
+// ---------------------------------------------------------------------------
+
+// Import-priority constants. Mirrors mypy.build.PRI_*.
+const PRI_HIGH: i32 = 5; // top-level "from X import blah"
+const PRI_MED: i32 = 10; // top-level "import X"
+const PRI_LOW: i32 = 20; // either form inside a function
+const PRI_MYPY: i32 = 25; // inside "if MYPY" or "if TYPE_CHECKING"
+
+// ImportRecord kinds matching the Python ImportBase subclasses.
+const IMP_IMPORT: u8 = 0;
+const IMP_IMPORTFROM: u8 = 1;
+const IMP_IMPORTALL: u8 = 2;
+
+/// A single import statement, in the plain-record shape Python passes across
+/// the PyO3 boundary. Mirrors the `Import`/`ImportFrom`/`ImportAll` nodes'
+/// dependency-relevant fields (see `mypy/nodes.py:621-708`).
+///
+/// PyO3's `FromPyObject` for a tuple struct extracts positionally from a
+/// Python sequence (tuple), which matches how `_import_to_record` builds the
+/// record on the Python side.
+#[derive(FromPyObject)]
+struct ImportRecord(
+    u8,                            // kind: IMP_IMPORT | IMP_IMPORTFROM | IMP_IMPORTALL
+    String,                        // module
+    i32,                           // relative
+    Vec<(String, Option<String>)>, // ids / names
+    i32,                           // line
+    bool,                          // is_top_level
+    bool,                          // is_unreachable
+    bool,                          // is_unreachable_dependency
+    bool,                          // is_mypy_only
+);
+
+/// `import_priority` from `mypy/build.py:623-632`.
+fn import_priority(is_top_level: bool, is_mypy_only: bool, toplevel_priority: i32) -> i32 {
+    if !is_top_level {
+        PRI_LOW
+    } else if is_mypy_only {
+        std::cmp::max(PRI_MYPY, toplevel_priority)
+    } else {
+        toplevel_priority
+    }
+}
+
+/// `correct_rel_imp` from `mypy/build.py:1182-1200`. Returns `None` when the
+/// relative import resolves to an empty id (a blocking error Python reports).
+fn correct_rel_imp(file_id: &str, file_path: &str, module: &str, relative: i32) -> Option<String> {
+    if relative == 0 {
+        return Some(module.to_string());
+    }
+    let mut rel = relative;
+    if Path::new(file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("__init__."))
+        .unwrap_or(false)
+    {
+        rel -= 1;
+    }
+    let mut new_id = file_id.to_string();
+    if rel != 0 {
+        let parts: Vec<&str> = new_id.split('.').collect();
+        let take = parts.len().saturating_sub(rel as usize);
+        new_id = parts[..take].join(".");
+    }
+    if !module.is_empty() {
+        if new_id.is_empty() {
+            new_id = module.to_string();
+        } else {
+            new_id = format!("{}.{}", new_id, module);
+        }
+    }
+    if new_id.is_empty() {
+        None
+    } else {
+        Some(new_id)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Path helpers
@@ -160,7 +241,8 @@ impl HashMapFs {
         }
     }
     fn file(mut self, path: &str, content: &str) -> Self {
-        self.files.insert(path.to_string(), content.as_bytes().to_vec());
+        self.files
+            .insert(path.to_string(), content.as_bytes().to_vec());
         // Auto-register parent dirs.
         let mut acc = String::new();
         for component in path.split('/').skip(1) {
@@ -272,11 +354,15 @@ struct NativeResolver {
     package_path: Vec<String>,
     typeshed_path: Vec<String>,
     /// (module_name, min_version, max_version) for stdlib version gating.
-    /// (Currently unused at the Rust layer; `use_typeshed` is computed
-    /// Python-side and passed in as a bool. Kept for future Rust-side
-    /// version gating.)
-    #[allow(dead_code)]
-    stdlib_versions: Vec<(String, (u8, u8), Option<(u8, u8)>)>,
+    /// Used by `use_typeshed_for` in the dependency-record walk so Rust's
+    /// `is_module` mirrors Python's `find_module`/`_typeshed_has_version`:
+    /// a stdlib module outside the target version range is NOT looked up in
+    /// typeshed, so it resolves as NOT_FOUND (matching Python).
+    stdlib_versions: HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
+    /// Clamped Python target version (`max(python_version, (3, 10))`),
+    /// mirroring `typeshed_py_version`. Used for stdlib version gating in
+    /// `use_typeshed_for`.
+    python_version: (u8, u8),
     /// Top-level module names with a flat stub-distribution lookup.
     stub_flat: BTreeSet<String>,
     /// Namespace-lookup stub distributions: module_name -> dist_name.
@@ -304,6 +390,7 @@ impl NativeResolver {
         mypy_path,
         package_path,
         typeshed_path,
+        python_version,
         stdlib_versions,
         stub_flat,
         stub_namespace,
@@ -315,10 +402,13 @@ impl NativeResolver {
         mypy_path: Vec<String>,
         package_path: Vec<String>,
         typeshed_path: Vec<String>,
+        python_version: (u8, u8),
         stdlib_versions: Vec<(String, (u8, u8), Option<(u8, u8)>)>,
         stub_flat: Vec<String>,
         stub_namespace: Vec<(String, String)>,
     ) -> Self {
+        // Clamp to (3, 10) minimum, mirroring typeshed_py_version.
+        let python_version = std::cmp::max(python_version, (3, 10));
         NativeResolver {
             listdir_cache: RefCell::new(HashMap::new()),
             isfile_case_cache: RefCell::new(HashMap::new()),
@@ -330,7 +420,11 @@ impl NativeResolver {
             mypy_path,
             package_path,
             typeshed_path,
-            stdlib_versions,
+            stdlib_versions: stdlib_versions
+                .into_iter()
+                .map(|(name, lo, hi)| (name, (lo, hi)))
+                .collect(),
+            python_version,
             stub_flat: stub_flat.into_iter().collect(),
             stub_namespace: stub_namespace.into_iter().collect(),
             initial_components: RefCell::new(HashMap::new()),
@@ -379,6 +473,337 @@ impl NativeResolver {
         };
         Ok((kind, path_obj, can_cache).into_py(py))
     }
+
+    /// Compute dependency records for a module's imports.
+    ///
+    /// Mirrors `BuildManager.all_imported_modules_in_file`
+    /// (`mypy/build.py:1202-1262`): walks the import list, computes
+    /// priorities (`import_priority`), corrects relative imports
+    /// (`correct_rel_imp`), expands ancestor packages for `Import`,
+    /// discriminates submodule-vs-name for `ImportFrom`, and checks module
+    /// existence via `is_module` (the `known_modules` set first, then this
+    /// resolver's `resolve()`).
+    ///
+    /// Returns `(records, error)` where `records` is a list of
+    /// `(priority, module_id, line)` tuples and `error` is an optional
+    /// `(line, message)` for the blocking "No parent module" relative-import
+    /// error that Python reports via `Errors`.
+    ///
+    /// Only the per-call varying args cross the boundary here: the import
+    /// list (already deserialized by Python) and the known-modules set
+    /// (rebuilt per call from `manager.modules` + `source_set.source_modules`).
+    fn compute_dep_records(
+        &self,
+        py: Python<'_>,
+        file_id: &str,
+        file_path: &str,
+        imports: Vec<ImportRecord>,
+        known_modules: HashSet<String>,
+    ) -> PyResult<(PyObject, PyObject)> {
+        let (res, error) = dep_records_with(
+            self,
+            file_id,
+            file_path,
+            &imports,
+            &known_modules,
+            &self.initial_components,
+            &self.ns_ancestors,
+            &self.python_path,
+            &self.mypy_path,
+            &self.package_path,
+            &self.typeshed_path,
+            &self.stdlib_versions,
+            self.python_version,
+            &self.stub_flat,
+            &self.stub_namespace,
+            self.namespace_packages,
+            self.use_builtins_fixtures,
+        )?;
+        Ok((res.into_py(py), error.into_py(py)))
+    }
+}
+
+/// Core dependency-record walk, generic over the `FsProbe` implementation so
+/// it can be unit-tested with `HashMapFs`. The resolver config (search paths,
+/// stub tables, flags) is passed in so `is_module` lookups use the same config
+/// as a real `find_module` call. `initial_components` and `ns_ancestors` are
+/// `RefCell`s so the caller controls cross-call cache lifetime.
+fn dep_records_with<F: FsProbe>(
+    fs: &F,
+    file_id: &str,
+    file_path: &str,
+    imports: &[ImportRecord],
+    known_modules: &HashSet<String>,
+    initial_components: &RefCell<HashMap<Vec<String>, HashMap<String, Vec<String>>>>,
+    ns_ancestors: &RefCell<HashMap<String, String>>,
+    python_path: &[String],
+    mypy_path: &[String],
+    package_path: &[String],
+    typeshed_path: &[String],
+    stdlib_versions: &HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
+    python_version: (u8, u8),
+    stub_flat: &BTreeSet<String>,
+    stub_namespace: &BTreeMap<String, String>,
+    namespace_packages: bool,
+    use_builtins_fixtures: bool,
+) -> PyResult<(Vec<(i32, String, i32)>, Option<(i32, String)>)> {
+    let mut res: Vec<(i32, String, i32)> = Vec::new();
+    let mut error: Option<(i32, String)> = None;
+
+    for imp in imports {
+        // Destructure the tuple struct into named fields for readability.
+        let (
+            kind,
+            module,
+            relative,
+            ids,
+            line,
+            is_top_level,
+            is_unreachable,
+            is_unreachable_dependency,
+            is_mypy_only,
+        ) = (
+            imp.0, &imp.1, imp.2, &imp.3, imp.4, imp.5, imp.6, imp.7, imp.8,
+        );
+
+        if is_unreachable && !is_unreachable_dependency {
+            continue;
+        }
+        let include_only_if_resolvable = is_unreachable_dependency;
+
+        match kind {
+            IMP_IMPORT => {
+                let pri = import_priority(is_top_level, is_mypy_only, PRI_MED);
+                let ancestor_pri = import_priority(is_top_level, is_mypy_only, PRI_LOW);
+                for (id, _asname) in ids {
+                    if include_only_if_resolvable
+                        && !is_module_inline(
+                            fs,
+                            id,
+                            known_modules,
+                            initial_components,
+                            ns_ancestors,
+                            python_path,
+                            mypy_path,
+                            package_path,
+                            typeshed_path,
+                            stdlib_versions,
+                            python_version,
+                            stub_flat,
+                            stub_namespace,
+                            namespace_packages,
+                            use_builtins_fixtures,
+                        )?
+                    {
+                        continue;
+                    }
+                    res.push((pri, id.clone(), line));
+                    // Expand ancestor packages (mirrors build.py:1222-1226):
+                    // `id.split(".")[:-1]` — all components except the last.
+                    let parts: Vec<&str> = id.split('.').collect();
+                    let mut ancestors: Vec<String> = Vec::new();
+                    for part in &parts[..parts.len().saturating_sub(1)] {
+                        ancestors.push(part.to_string());
+                        res.push((ancestor_pri, ancestors.join("."), line));
+                    }
+                }
+            }
+            IMP_IMPORTFROM => {
+                let cur_id = match correct_rel_imp(file_id, file_path, module, relative) {
+                    Some(id) => id,
+                    None => {
+                        error = Some((
+                            line,
+                            "No parent module -- cannot perform relative import".to_string(),
+                        ));
+                        return Ok((res, error));
+                    }
+                };
+                if include_only_if_resolvable
+                    && !is_module_inline(
+                        fs,
+                        &cur_id,
+                        known_modules,
+                        initial_components,
+                        ns_ancestors,
+                        python_path,
+                        mypy_path,
+                        package_path,
+                        typeshed_path,
+                        stdlib_versions,
+                        python_version,
+                        stub_flat,
+                        stub_namespace,
+                        namespace_packages,
+                        use_builtins_fixtures,
+                    )?
+                {
+                    continue;
+                }
+                let mut all_are_submodules = true;
+                let pri_sub = import_priority(is_top_level, is_mypy_only, PRI_MED);
+                for (name, _asname) in ids {
+                    let sub_id = format!("{}.{}", cur_id, name);
+                    if is_module_inline(
+                        fs,
+                        &sub_id,
+                        known_modules,
+                        initial_components,
+                        ns_ancestors,
+                        python_path,
+                        mypy_path,
+                        package_path,
+                        typeshed_path,
+                        stdlib_versions,
+                        python_version,
+                        stub_flat,
+                        stub_namespace,
+                        namespace_packages,
+                        use_builtins_fixtures,
+                    )? {
+                        res.push((pri_sub, sub_id, line));
+                    } else {
+                        all_are_submodules = false;
+                    }
+                }
+                // Workaround for cycle-handling bugs (#4498): if all imported
+                // names are submodules, import the parent at a lower priority
+                // (mirrors build.py:1246).
+                let pri = import_priority(
+                    is_top_level,
+                    is_mypy_only,
+                    if all_are_submodules {
+                        PRI_LOW
+                    } else {
+                        PRI_HIGH
+                    },
+                );
+                res.push((pri, cur_id, line));
+            }
+            IMP_IMPORTALL => {
+                let cur_id = match correct_rel_imp(file_id, file_path, module, relative) {
+                    Some(id) => id,
+                    None => {
+                        error = Some((
+                            line,
+                            "No parent module -- cannot perform relative import".to_string(),
+                        ));
+                        return Ok((res, error));
+                    }
+                };
+                if include_only_if_resolvable
+                    && !is_module_inline(
+                        fs,
+                        &cur_id,
+                        known_modules,
+                        initial_components,
+                        ns_ancestors,
+                        python_path,
+                        mypy_path,
+                        package_path,
+                        typeshed_path,
+                        stdlib_versions,
+                        python_version,
+                        stub_flat,
+                        stub_namespace,
+                        namespace_packages,
+                        use_builtins_fixtures,
+                    )?
+                {
+                    continue;
+                }
+                let pri = import_priority(is_top_level, is_mypy_only, PRI_HIGH);
+                res.push((pri, cur_id, line));
+            }
+            _ => {}
+        }
+    }
+
+    // Sort by descending dot count so modules come before their ancestors
+    // (mirrors build.py:1261). This primes FindModuleCache.ns_ancestors.
+    res.sort_by(|a, b| b.1.matches('.').count().cmp(&a.1.matches('.').count()));
+
+    Ok((res, error))
+}
+
+/// `is_module` from `mypy/build.py:1264-1278`, generic over `FsProbe`. Checks
+/// the known-modules set first (the fast path), then resolves on disk via the
+/// shared `Resolver` caches.
+///
+/// `use_typeshed` is computed here (not Python-side) because `is_module` is
+/// called from inside the Rust dependency walk — computing it Python-side would
+/// require a per-id callback across the PyO3 boundary, defeating the purpose of
+/// running the walk in Rust. The computation mirrors
+/// `FindModuleCache.find_module` + `_typeshed_has_version` exactly.
+#[allow(clippy::too_many_arguments)]
+fn is_module_inline<F: FsProbe>(
+    fs: &F,
+    id: &str,
+    known_modules: &HashSet<String>,
+    initial_components: &RefCell<HashMap<Vec<String>, HashMap<String, Vec<String>>>>,
+    ns_ancestors: &RefCell<HashMap<String, String>>,
+    python_path: &[String],
+    mypy_path: &[String],
+    package_path: &[String],
+    typeshed_path: &[String],
+    stdlib_versions: &HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
+    python_version: (u8, u8),
+    stub_flat: &BTreeSet<String>,
+    stub_namespace: &BTreeMap<String, String>,
+    namespace_packages: bool,
+    use_builtins_fixtures: bool,
+) -> PyResult<bool> {
+    if known_modules.contains(id) {
+        return Ok(true);
+    }
+    let use_typeshed = use_typeshed_for(id, python_version, stdlib_versions);
+    let inputs = ResolveInputs {
+        id,
+        use_typeshed,
+        namespace_packages,
+        use_builtins_fixtures,
+        follow_untyped_imports: false,
+        python_path,
+        mypy_path,
+        package_path,
+        typeshed_path,
+        stdlib_versions,
+        stub_flat,
+        stub_namespace,
+        fs,
+    };
+    let mut ic = initial_components.borrow_mut();
+    let mut ns = ns_ancestors.borrow_mut();
+    let mut resolver = Resolver::new(&inputs, &mut ic, &mut ns);
+    let (kind, _path, _can_cache) = resolver.find_module(id, use_typeshed);
+    Ok(kind == FOUND)
+}
+
+/// Mirror `FindModuleCache.find_module`'s `use_typeshed` computation
+/// (`mypy/modulefinder.py:343-349`) + `_typeshed_has_version`
+/// (`mypy/modulefinder.py:426-431`).
+///
+/// A stdlib module outside the target Python version range is NOT looked up in
+/// typeshed. This is what makes `import tomllib` (added in 3.11) resolve as
+/// NOT_FOUND when targeting 3.10, so the dependency walk skips it via
+/// `include_only_if_resolvable`.
+fn use_typeshed_for(
+    id: &str,
+    python_version: (u8, u8),
+    stdlib_versions: &HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
+) -> bool {
+    let top_level = id.split('.').next().unwrap_or(id);
+    let key = if stdlib_versions.contains_key(id) {
+        id
+    } else if stdlib_versions.contains_key(top_level) {
+        top_level
+    } else {
+        // Not a known stdlib module → search typeshed.
+        return true;
+    };
+    let (min_version, max_version) = &stdlib_versions[key];
+    // python_version is already clamped to (3, 10) at construction time.
+    python_version >= *min_version && max_version.map_or(true, |max| python_version <= max)
 }
 
 impl FsProbe for NativeResolver {
@@ -427,7 +852,9 @@ impl NativeResolver {
         let result = std::fs::metadata(path)
             .ok()
             .map(|m| (m.is_file(), m.is_dir()));
-        self.stat_cache.borrow_mut().insert(path.to_string(), result);
+        self.stat_cache
+            .borrow_mut()
+            .insert(path.to_string(), result);
         result
     }
 
@@ -512,7 +939,10 @@ fn split_head_tail(path: &str) -> (String, String) {
             let tail = String::from_utf8_lossy(&bytes[idx + 1..end]).to_string();
             (head, tail)
         }
-        None => (String::new(), String::from_utf8_lossy(&bytes[..end]).to_string()),
+        None => (
+            String::new(),
+            String::from_utf8_lossy(&bytes[..end]).to_string(),
+        ),
     }
 }
 
@@ -541,12 +971,13 @@ struct ResolveInputs<'a, F: FsProbe> {
     mypy_path: &'a [String],
     package_path: &'a [String],
     typeshed_path: &'a [String],
-    /// (module_name, min_version, max_version) for stdlib version gating.
-    /// (Currently unused at the Rust layer; `use_typeshed` is computed
-    /// Python-side and passed in as a bool. Kept for future Rust-side
-    /// version gating.)
+    /// (module_name, (min_version, max_version)) for stdlib version gating.
+    /// Unused by `Resolver::find_module` itself (which receives `use_typeshed`
+    /// pre-computed), but referenced by `is_module_inline` via
+    /// `use_typeshed_for`. Kept in the struct so `resolve()` and the
+    /// dependency walk share one input bundle.
     #[allow(dead_code)]
-    stdlib_versions: &'a [(String, (u8, u8), Option<(u8, u8)>)],
+    stdlib_versions: &'a HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
     /// Top-level module names with a flat stub-distribution lookup
     /// (mirrors mypy.stubinfo.non_bundled_packages_flat keys + legacy bundled).
     stub_flat: &'a BTreeSet<String>,
@@ -613,11 +1044,7 @@ impl<'a, F: FsProbe> Resolver<'a, F> {
     }
 
     // Mirrors FindModuleCache.get_toplevel_possibilities.
-    fn get_toplevel_possibilities(
-        &mut self,
-        lib_path: &[String],
-        id: &str,
-    ) -> Vec<String> {
+    fn get_toplevel_possibilities(&mut self, lib_path: &[String], id: &str) -> Vec<String> {
         let key: Vec<String> = lib_path.to_vec();
         if !self.initial_components.contains_key(&key) {
             let mut components: HashMap<String, Vec<String>> = HashMap::new();
@@ -644,11 +1071,7 @@ impl<'a, F: FsProbe> Resolver<'a, F> {
     }
 
     // Mirrors FindModuleCache._find_module_non_stub_helper.
-    fn find_module_non_stub_helper(
-        &self,
-        id: &str,
-        pkg_dir: &str,
-    ) -> Result<(String, bool), u8> {
+    fn find_module_non_stub_helper(&self, id: &str, pkg_dir: &str) -> Result<(String, bool), u8> {
         let mut plausible_match = false;
         let mut dir_path = pkg_dir.to_string();
         let components = split_dot(id);
@@ -1023,6 +1446,7 @@ mod tests {
         let myp: Vec<String> = mypy_path.iter().map(|s| s.to_string()).collect();
         let flat_set: BTreeSet<String> = approved.iter().map(|s| s.to_string()).collect();
         let ns_map: BTreeMap<String, String> = BTreeMap::new();
+        let stdlib_map: HashMap<String, ((u8, u8), Option<(u8, u8)>)> = HashMap::new();
         let inputs = ResolveInputs {
             id,
             use_typeshed: false,
@@ -1033,7 +1457,7 @@ mod tests {
             mypy_path: &myp,
             package_path: &pkg,
             typeshed_path: &[],
-            stdlib_versions: &[],
+            stdlib_versions: &stdlib_map,
             stub_flat: &flat_set,
             stub_namespace: &ns_map,
             fs,
@@ -1058,9 +1482,7 @@ mod tests {
 
     #[test]
     fn prefers_pyi_over_py() {
-        let f = fs()
-            .file("/lib/pkg1/c.pyi", "")
-            .file("/lib/pkg1/c.py", "");
+        let f = fs().file("/lib/pkg1/c.pyi", "").file("/lib/pkg1/c.py", "");
         let (kind, path, _) = resolve(&f, "c", &["/lib/pkg1"], false, false, &[]);
         assert_eq!(kind, FOUND);
         assert_eq!(path.as_deref(), Some("/lib/pkg1/c.pyi"));
@@ -1157,7 +1579,14 @@ mod tests {
     #[test]
     fn approved_stubs_returns_reason() {
         let f = fs();
-        let (kind, _, _) = resolve(&f, "someapproved", &["/lib"], false, false, &["someapproved"]);
+        let (kind, _, _) = resolve(
+            &f,
+            "someapproved",
+            &["/lib"],
+            false,
+            false,
+            &["someapproved"],
+        );
         assert_eq!(kind, REASON_APPROVED_STUBS_NOT_INSTALLED);
     }
 
@@ -1183,5 +1612,459 @@ mod tests {
         assert_eq!(basename("/a/b/c.py"), "c.py");
         assert_eq!(basename("/a/b/__init__.pyi"), "__init__.pyi");
         assert_eq!(basename("/"), "");
+    }
+
+    // --- Dependency-record extraction tests ---
+    // These exercise `dep_records_with` (the core of
+    // `NativeResolver::compute_dep_records`) using `HashMapFs` as the
+    // filesystem. They mirror the cases in `mypy/build.py:all_imported_modules_in_file`.
+
+    use std::cell::RefCell as TestRefCell;
+
+    /// Build the import-record inputs and call `dep_records_with` against a
+    /// `HashMapFs` with the given search paths. The search path is passed as
+    /// `mypy_path` (matching `resolve_with`) since test modules are plain
+    /// source files, not typed third-party packages.
+    fn dep_records(
+        fs: &HashMapFs,
+        file_id: &str,
+        file_path: &str,
+        imports: &[ImportRecord],
+        known: &[&str],
+        search_path: &[&str],
+    ) -> (Vec<(i32, String, i32)>, Option<(i32, String)>) {
+        let myp: Vec<String> = search_path.iter().map(|s| s.to_string()).collect();
+        let flat = BTreeSet::<String>::new();
+        let ns_map = BTreeMap::<String, String>::new();
+        let stdlib_map = HashMap::<String, ((u8, u8), Option<(u8, u8)>)>::new();
+        let known_set: HashSet<String> = known.iter().map(|s| s.to_string()).collect();
+        let ic = TestRefCell::new(HashMap::new());
+        let ns = TestRefCell::new(HashMap::new());
+        dep_records_with(
+            fs,
+            file_id,
+            file_path,
+            imports,
+            &known_set,
+            &ic,
+            &ns,
+            &[],
+            &myp,
+            &[],
+            &[],
+            &stdlib_map,
+            (3, 10),
+            &flat,
+            &ns_map,
+            false,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn imp(id: &str, line: i32) -> ImportRecord {
+        ImportRecord(
+            IMP_IMPORT,
+            id.to_string(),
+            0,
+            vec![(id.to_string(), None)],
+            line,
+            true,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn imp_from(module: &str, names: &[&str], line: i32) -> ImportRecord {
+        ImportRecord(
+            IMP_IMPORTFROM,
+            module.to_string(),
+            0,
+            names.iter().map(|n| (n.to_string(), None)).collect(),
+            line,
+            true,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn imp_all(module: &str, line: i32) -> ImportRecord {
+        ImportRecord(
+            IMP_IMPORTALL,
+            module.to_string(),
+            0,
+            vec![],
+            line,
+            true,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[test]
+    fn import_emits_module_and_ancestors() {
+        let f = fs().file("/lib/pkg/a/b/c.py", "");
+        let (recs, err) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp("a.b.c", 1)],
+            &[],
+            &["/lib/pkg"],
+        );
+        assert!(err.is_none());
+        // Module itself at PRI_MED, ancestors at PRI_LOW. Sorted by
+        // descending dot count: a.b.c (2 dots) before a.b (1) before a (0).
+        assert_eq!(
+            recs,
+            vec![
+                (PRI_MED, "a.b.c".to_string(), 1),
+                (PRI_LOW, "a.b".to_string(), 1),
+                (PRI_LOW, "a".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_from_with_names_uses_pri_high() {
+        // `from m import x` where x is NOT a submodule → PRI_HIGH for m.
+        let f = fs().file("/lib/pkg/m.py", "");
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp_from("m", &["x"], 1)],
+            &[],
+            &["/lib/pkg"],
+        );
+        assert_eq!(recs, vec![(PRI_HIGH, "m".to_string(), 1)]);
+    }
+
+    #[test]
+    fn import_from_all_submodules_uses_pri_low() {
+        // `from m import sub` where sub IS a submodule → PRI_LOW for m
+        // (the #4498 cycle workaround).
+        let f = fs()
+            .file("/lib/pkg/m/__init__.py", "")
+            .file("/lib/pkg/m/sub.py", "");
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp_from("m", &["sub"], 1)],
+            &[],
+            &["/lib/pkg"],
+        );
+        // sub at PRI_MED, m at PRI_LOW. sub has 1 dot, m has 0 → sub first.
+        assert_eq!(
+            recs,
+            vec![
+                (PRI_MED, "m.sub".to_string(), 1),
+                (PRI_LOW, "m".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_from_mixed_submodule_and_name_uses_pri_high() {
+        // `from m import sub, x` where sub IS a submodule but x is NOT →
+        // not all_are_submodules → PRI_HIGH for m.
+        let f = fs()
+            .file("/lib/pkg/m/__init__.py", "")
+            .file("/lib/pkg/m/sub.py", "");
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp_from("m", &["sub", "x"], 1)],
+            &[],
+            &["/lib/pkg"],
+        );
+        // m.sub at PRI_MED, m at PRI_HIGH.
+        assert_eq!(
+            recs,
+            vec![
+                (PRI_MED, "m.sub".to_string(), 1),
+                (PRI_HIGH, "m".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn import_all_uses_pri_high() {
+        let f = fs().file("/lib/pkg/m.py", "");
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp_all("m", 1)],
+            &[],
+            &["/lib/pkg"],
+        );
+        assert_eq!(recs, vec![(PRI_HIGH, "m".to_string(), 1)]);
+    }
+
+    #[test]
+    fn relative_import_corrected() {
+        // `from . import x` inside pkg.mod → cur_id = "pkg".
+        // x IS a submodule (pkg.x = /lib/pkg/pkg/x.py exists), so it gets
+        // PRI_MED and the parent pkg gets PRI_LOW (all_are_submodules).
+        let f = fs()
+            .file("/lib/pkg/pkg/__init__.py", "")
+            .file("/lib/pkg/pkg/x.py", "");
+        let mut r = imp_from("", &["x"], 1);
+        r.2 = 1;
+        let (recs, _) = dep_records(
+            &f,
+            "pkg.mod",
+            "/lib/pkg/pkg/mod.py",
+            &[r],
+            &[],
+            &["/lib/pkg"],
+        );
+        assert_eq!(
+            recs,
+            vec![
+                (PRI_MED, "pkg.x".to_string(), 1),
+                (PRI_LOW, "pkg".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_import_in_init_file_adjusts() {
+        // `from . import x` inside pkg/__init__.py → relative 1 becomes 0,
+        // so cur_id = "pkg" + "" = "pkg", then sub_id = "pkg.x".
+        let f = fs()
+            .file("/lib/pkg/pkg/__init__.py", "")
+            .file("/lib/pkg/pkg/x.py", "");
+        let mut r = imp_from("", &["x"], 1);
+        r.2 = 1;
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/pkg/__init__.py",
+            &[r],
+            &[],
+            &["/lib/pkg"],
+        );
+        // x is a submodule of pkg → PRI_MED for pkg.x, PRI_LOW for pkg.
+        assert_eq!(
+            recs,
+            vec![
+                (PRI_MED, "pkg.x".to_string(), 1),
+                (PRI_LOW, "pkg".to_string(), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_import_no_parent_emits_error() {
+        // `from .. import x` at top level → empty new_id → blocking error.
+        let f = fs();
+        let mut r = imp_from("", &["x"], 3);
+        r.2 = 1;
+        let (_, err) = dep_records(&f, "", "/lib/mod.py", &[r], &[], &["/lib"]);
+        assert!(err.is_some());
+        let (line, msg) = err.unwrap();
+        assert_eq!(line, 3);
+        assert!(msg.contains("No parent module"));
+    }
+
+    #[test]
+    fn unreachable_import_skipped() {
+        // is_unreachable and not is_unreachable_dependency → skipped.
+        let f = fs().file("/lib/pkg/m.py", "");
+        let mut r = imp("m", 1);
+        r.6 = true;
+        r.7 = false;
+        let (recs, _) = dep_records(&f, "pkg", "/lib/pkg/__init__.py", &[r], &[], &["/lib/pkg"]);
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn unreachable_dependency_included_if_resolvable() {
+        // is_unreachable_dependency → included only if is_module returns true.
+        let f = fs().file("/lib/pkg/m.py", "");
+        let mut r = imp("m", 1);
+        r.6 = true;
+        r.7 = true;
+        let (recs, _) = dep_records(&f, "pkg", "/lib/pkg/__init__.py", &[r], &[], &["/lib/pkg"]);
+        // m.py exists → included. Ancestors: none (m has no dots).
+        assert_eq!(recs, vec![(PRI_MED, "m".to_string(), 1)]);
+    }
+
+    #[test]
+    fn unreachable_dependency_excluded_if_not_resolvable() {
+        // is_unreachable_dependency but module doesn't exist → excluded.
+        let f = fs();
+        let mut r = imp("nonexistent", 1);
+        r.6 = true;
+        r.7 = true;
+        let (recs, _) = dep_records(&f, "pkg", "/lib/pkg/__init__.py", &[r], &[], &["/lib/pkg"]);
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn known_modules_short_circuits_is_module() {
+        // If a module id is in `known_modules`, it's considered a module even
+        // if it doesn't exist on disk. This mirrors `BuildManager.is_module`'s
+        // `self.modules` / `source_set.source_modules` fast paths.
+        let f = fs(); // no files on disk
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &[imp_from("known_mod", &["x"], 1)],
+            &["known_mod"],
+            &["/lib/pkg"],
+        );
+        // known_mod is in known_modules → is_module returns true → x is NOT a
+        // submodule (no "known_mod.x" on disk or in known set) → PRI_HIGH.
+        assert_eq!(recs, vec![(PRI_HIGH, "known_mod".to_string(), 1)]);
+    }
+
+    #[test]
+    fn import_priority_inside_function_is_pri_low() {
+        let f = fs().file("/lib/pkg/m.py", "");
+        let mut r = imp("m", 1);
+        r.5 = false;
+        let (recs, _) = dep_records(&f, "pkg", "/lib/pkg/__init__.py", &[r], &[], &["/lib/pkg"]);
+        assert_eq!(recs, vec![(PRI_LOW, "m".to_string(), 1)]);
+    }
+
+    #[test]
+    fn import_priority_mypy_only_is_pri_mypy() {
+        let f = fs().file("/lib/pkg/m.py", "");
+        let mut r = imp("m", 1);
+        r.8 = true;
+        let (recs, _) = dep_records(&f, "pkg", "/lib/pkg/__init__.py", &[r], &[], &["/lib/pkg"]);
+        assert_eq!(recs, vec![(PRI_MYPY, "m".to_string(), 1)]);
+    }
+
+    #[test]
+    fn records_sorted_by_descending_dot_count() {
+        // Ensure the sort puts deeper modules before their ancestors so
+        // FindModuleCache.ns_ancestors gets primed correctly.
+        let f = fs()
+            .file("/lib/pkg/a/__init__.py", "")
+            .file("/lib/pkg/a/b.py", "")
+            .file("/lib/pkg/c.py", "");
+        let imports = vec![imp("c", 1), imp("a.b", 2)];
+        let (recs, _) = dep_records(
+            &f,
+            "pkg",
+            "/lib/pkg/__init__.py",
+            &imports,
+            &[],
+            &["/lib/pkg"],
+        );
+        // a.b (1 dot) before c (0 dots), then a (0 dots) from ancestor expansion.
+        let ids: Vec<&str> = recs.iter().map(|(_, id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a.b", "c", "a"]);
+    }
+
+    // --- stdlib version-gating regression tests ---
+    // `is_module_inline` must replicate `FindModuleCache.find_module`'s
+    // `use_typeshed` computation (`_typeshed_has_version`): a stdlib module
+    // outside the target Python version range must NOT be looked up in
+    // typeshed. This is what makes `import tomllib` (added in 3.11) resolve
+    // as NOT_FOUND when targeting 3.10, so the dependency walk skips it via
+    // `include_only_if_resolvable` instead of including it as a phantom dep.
+
+    fn dep_records_versioned(
+        fs: &HashMapFs,
+        file_id: &str,
+        file_path: &str,
+        imports: &[ImportRecord],
+        known: &[&str],
+        mypy_path: &[&str],
+        typeshed_path: &[&str],
+        python_version: (u8, u8),
+        stdlib_versions: &[(&str, (u8, u8), Option<(u8, u8)>)],
+    ) -> Vec<(i32, String, i32)> {
+        let myp: Vec<String> = mypy_path.iter().map(|s| s.to_string()).collect();
+        let tsp: Vec<String> = typeshed_path.iter().map(|s| s.to_string()).collect();
+        let flat = BTreeSet::<String>::new();
+        let ns_map = BTreeMap::<String, String>::new();
+        let stdlib_map: HashMap<String, ((u8, u8), Option<(u8, u8)>)> = stdlib_versions
+            .iter()
+            .map(|(n, lo, hi)| (n.to_string(), (*lo, *hi)))
+            .collect();
+        let known_set: HashSet<String> = known.iter().map(|s| s.to_string()).collect();
+        let ic = TestRefCell::new(HashMap::new());
+        let ns = TestRefCell::new(HashMap::new());
+        dep_records_with(
+            fs,
+            file_id,
+            file_path,
+            imports,
+            &known_set,
+            &ic,
+            &ns,
+            &[],
+            &myp,
+            &[],
+            &tsp,
+            &stdlib_map,
+            python_version,
+            &flat,
+            &ns_map,
+            false,
+            false,
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn unreachable_dependency_skipped_when_typeshed_version_too_low() {
+        // `tomllib` is registered in typeshed with min version (3, 11). When
+        // targeting 3.10, `is_module` must NOT look it up in typeshed, so it
+        // resolves as NOT_FOUND and the import (an unreachable dependency) is
+        // skipped — mirroring Python's `find_module` + `_typeshed_has_version`.
+        let f = fs().file("/typeshed/stdlib/tomllib/__init__.pyi", "");
+        let mut r = imp("tomllib", 1);
+        r.6 = true; // is_unreachable
+        r.7 = true; // is_unreachable_dependency
+        let recs = dep_records_versioned(
+            &f,
+            "config_parser",
+            "/src/config_parser.py",
+            &[r],
+            &[],
+            &[],
+            &["/typeshed/stdlib"],
+            (3, 10),
+            &[("tomllib", (3, 11), None)],
+        );
+        // Skipped: tomllib is outside the target version range → NOT_FOUND →
+        // include_only_if_resolvable drops it.
+        assert!(recs.is_empty(), "expected no records, got {:?}", recs);
+    }
+
+    #[test]
+    fn unreachable_dependency_included_when_typeshed_version_in_range() {
+        // Same setup as above but targeting 3.11: tomllib is now in range,
+        // typeshed resolves it, and the import is included.
+        let f = fs().file("/typeshed/stdlib/tomllib/__init__.pyi", "");
+        let mut r = imp("tomllib", 1);
+        r.6 = true; // is_unreachable
+        r.7 = true; // is_unreachable_dependency
+        let recs = dep_records_versioned(
+            &f,
+            "config_parser",
+            "/src/config_parser.py",
+            &[r],
+            &[],
+            &[],
+            &["/typeshed/stdlib"],
+            (3, 11),
+            &[("tomllib", (3, 11), None)],
+        );
+        assert_eq!(recs, vec![(PRI_MED, "tomllib".to_string(), 1)]);
     }
 }
