@@ -500,10 +500,13 @@ PYTHONPATH=/private/tmp/mypy-rs-local-ast \
   uv run --group test python scripts/bench_parser.py
 ```
 
-Local file-level, daemon, cache, incremental, self-check, and performance parity
-are all green. With CI not available on this fork (see "CI Coverage" above),
-the local baselines recorded here are the production-readiness gate for
-`mypy.nativeparse` switching to prefer the in-tree extension.
+Local file-level, daemon, cache, incremental, self-check, and performance
+parity are all green. (The daemon/cache/incremental suites initially had
+33 native-parser regressions when `native_parser` was defaulted on; these
+were fixed — see `AGENTS.md` "Native-parser parity".) With CI not
+available on this fork (see "CI Coverage" above), the local baselines
+recorded here are the production-readiness gate for `mypy.nativeparse`
+switching to prefer the in-tree extension.
 
 ## Milestone 2 (First Slice): Rust Module-Resolution Core
 
@@ -692,9 +695,12 @@ PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
   uv run --group test python scripts/bench_resolver.py
 ```
 
-Local modulefinder, testcheck, daemon, cache, incremental, and self-check
-parity are all green. The native parser is now the default
-(`native_parser = True`); the native resolver remains opt-in
+Local modulefinder, testcheck, fine-grained, daemon, cache, incremental,
+and self-check parity are all green. (The fine-grained / daemon / cache
+suites initially had 33 native-parser regressions — type-comment handling,
+error-message parity, and PEP 263 encoding — which were fixed; see
+`AGENTS.md` "Native-parser parity".) The native parser is now the
+default (`native_parser = True`); the native resolver remains opt-in
 (`native_resolver = False`) until the daemon VFS path is resolved or
 dmypy is retired. The direct `std::fs` read strategy with
 persistent caches brings the isolated microbench within 1.4x of pure
@@ -873,19 +879,27 @@ FsProbe`) to `&FsCache`.
 | `test_find_sources.py` (incl. `FakeFSCache` subclass) | 8 passed |
 | `testmodulefinder.py` + `testgraph.py` (`TEST_NATIVE_RESOLVER=1`) | 27 passed |
 | `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1`) | 8144 passed, 69 skipped, 7 xfailed |
-| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1300 passed, 33 pre-existing failures (identical to `main` baseline) |
+| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1333 passed, 256 skipped |
 | Rust unit tests (`fs_cache`) | 11 passed |
 | Rust unit tests (`module_resolver`) | 35 passed |
 | Self-check (`mypy_self_check.ini -p mypy -p mypyc`, 341 files) | 0 errors |
 
-The 33 fine-grained/daemon failures are pre-existing on `main` (native
-parser error-message differences in blocking-error tests) and are
-unaffected by this slice.
+The fine-grained / daemon / cache suites initially had 33 native-parser
+regressions (type-comment handling, error-message parity, PEP 263
+encoding) introduced when `native_parser` was defaulted on (commit
+`5041901ca`, Phase 1). These were fixed in a subsequent parity fix
+commit — see `AGENTS.md` ("Native-parser parity") for details.
 
 ### Verification
 
+> **Note**: Phase 2 merged `crates/fs_cache/` into `crates/module_resolver/`,
+> so the `mypy-fs-cache` package no longer exists. The commands below are
+> kept for historical reference; use the Phase 2 Verification commands
+> (which build only `mypy-module-resolver` and `mypy-ast-serialize`) for
+> current work.
+
 ```bash
-cargo test -p mypy-fs-cache -p mypy-module-resolver -p mypy-fs-probe
+cargo test -p mypy-fs-cache -p mypy-module-resolver -p mypy-fs-probe   # historical
 cargo rustc -p mypy-fs-cache --features extension-module --lib \
   --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
 cargo rustc -p mypy-module-resolver --features extension-module --lib \
@@ -991,30 +1005,46 @@ the `FileSystemCache` delegate surface.
 | `testfscache.py` + `test_find_sources.py` | 13 passed |
 | `testmodulefinder.py` + `testgraph.py` (`TEST_NATIVE_RESOLVER=1`) | 27 passed |
 | `testcheck.py` (`TEST_NATIVE_RESOLVER=1`) | 8198 passed, 15 skipped, 7 xfailed |
-| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1300 passed, 33 pre-existing failures (identical to `main` baseline) |
+| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1333 passed, 256 skipped |
 | Rust unit tests (`module_resolver`, incl. `fs_cache` submodule) | 46 passed |
 | Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
 
-The 33 fine-grained/daemon failures are pre-existing on `main` (native
-parser error-message differences in blocking-error tests) and are
-unaffected by this slice — the failure set is byte-identical to the
-Phase 1 baseline.
+The fine-grained / daemon / cache suites initially had 33 native-parser
+regressions from Phase 1 (commit `5041901ca`, defaulting `native_parser`
+on). These were fixed in a subsequent parity fix commit — see
+`AGENTS.md` ("Native-parser parity") for details. Phase 2 itself adds
+zero new failures: diffing `TEST_NATIVE_PARSER=1` with and without
+`TEST_NATIVE_RESOLVER=1` yields an identical result set.
 
 ### Verification
 
 ```bash
 cargo test --release -p mypy-module-resolver -p mypy-fs-probe
-cd crates/module_resolver && uvx maturin develop --release && cd ../..
 
-TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
+# Build the extensions to a scratch dir (NOT maturin develop — see
+# AGENTS.md "Native parser build order" for why).
+cargo rustc -p mypy-ast-serialize --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cargo rustc -p mypy-module-resolver --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libast_serialize.dylib \
+  /private/tmp/mypy-rs-local-ast/ast_serialize.cpython-313-darwin.so
+cp target/release/libmodule_resolver.dylib \
+  /private/tmp/mypy-rs-local-resolver/module_resolver.cpython-313-darwin.so
+
+export PYEXT=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver
+
+PYTHONPATH=$PYEXT TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
   mypy/test/testmodulefinder.py mypy/test/testgraph.py
-TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 mypy/test/testcheck.py
-uv run python -m pytest -n0 \
+PYTHONPATH=$PYEXT TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run python -m pytest -n0 mypy/test/testcheck.py
+PYTHONPATH=$PYEXT uv run python -m pytest -n0 \
   mypy/test/testfscache.py mypy/test/test_find_sources.py
-uv run python -m pytest -n0 \
+PYTHONPATH=$PYEXT TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run python -m pytest -n0 \
   mypy/test/testfinegrained.py mypy/test/testdaemon.py \
   mypy/test/testfinegrainedcache.py
-uv run python -m mypy --config-file mypy_self_check.ini -p mypy
+PYTHONPATH=$PYEXT uv run python -m mypy --config-file mypy_self_check.ini -p mypy
 ```
 
 ### Next milestone (Phase 3)
