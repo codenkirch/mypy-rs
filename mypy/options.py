@@ -387,7 +387,7 @@ class Options:
         # If True, partial types can't span a module top level and a function
         self.local_partial_types = True
         # If True, use the native parser (experimental)
-        self.native_parser = False
+        self.native_parser = True
         # If True, use the native module resolver (experimental)
         self.native_resolver = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
