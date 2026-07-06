@@ -98,16 +98,23 @@ daemon, cache, and incremental-mode checks when affected.
 
 The native resolver and dependency-records extraction are gated behind
 `Options.native_resolver` (forced on under parallel mode via `main.py`).
-Build the extension before running parity:
+Build the extension before running parity — use the `cargo rustc` + scratch-dir
+approach documented under "Native parser build order" below, not
+`maturin develop`:
 
 ```bash
-# Build the module_resolver extension into the venv (editable).
-cd crates/module_resolver && uvx maturin develop && cd ../..
+cargo rustc -p mypy-module-resolver --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libmodule_resolver.dylib \
+  /private/tmp/mypy-rs-local-resolver/module_resolver.cpython-313-darwin.so
 
 # Parity suites — both run against the in-tree Rust extension.
-TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
   mypy/test/testmodulefinder.py mypy/test/testgraph.py
-TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 mypy/test/testcheck.py
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run python -m pytest -n0 mypy/test/testcheck.py
 ```
 
 `TEST_NATIVE_RESOLVER=1` flips `Options.native_resolver` in the test harness
@@ -123,21 +130,72 @@ parallel mode) is backed by the `ast_serialize` Rust extension. The
 serialized AST format is fixed by `crates/ast_serialize/src/lib.rs` and read
 by `mypy/nativeparse.py`; the two must stay in lockstep.
 
-**Rebuild the extension after any change to `crates/ast_serialize/src/lib.rs`
-before running mypy or its test suites.** A stale binary in the venv produces
-silent deserialization mismatches — e.g. an `AssertionError: 255` (END_TAG
-read where a LOCATION tag was expected) that crashes parallel workers during
+**Rebuild the extensions after any change to `crates/ast_serialize/src/lib.rs`
+or `crates/module_resolver/src/`.** A stale binary produces silent
+deserialization mismatches — e.g. an `AssertionError: 255` (END_TAG read
+where a LOCATION tag was expected) that crashes parallel workers during
 self-check. The on-disk source can look correct while the installed binary
-is stale, so always rebuild:
+is stale, so always rebuild.
+
+Do **not** use `maturin develop` for these crates: `crates/ast_serialize`
+has no `pyproject.toml`, so maturin picks up the repo-root `pyproject.toml`
+(mypy's) and installs a bogus `mypy-0.1.0` package that shadows the real
+mypy. Build the `.so`s to a scratch dir via `cargo rustc` and put them on
+`PYTHONPATH` instead — this is the verified approach the migration doc uses:
 
 ```bash
-cd crates/ast_serialize && uvx maturin develop && cd ../..
-cd crates/module_resolver && uvx maturin develop && cd ../..   # if touched
+cargo rustc -p mypy-ast-serialize --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cargo rustc -p mypy-module-resolver --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libast_serialize.dylib \
+  /private/tmp/mypy-rs-local-ast/ast_serialize.cpython-313-darwin.so
+cp target/release/libmodule_resolver.dylib \
+  /private/tmp/mypy-rs-local-resolver/module_resolver.cpython-313-darwin.so
 ```
+
+Run parity with those dirs prepended to `PYTHONPATH`:
+
+```bash
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run --group test python -m pytest mypy/test/testcheck.py -q
+```
+
+A second hazard: `pyproject.toml` declares the PyPI `ast-serialize>=0.6.0`
+stub package (type stubs only — no `parse` implementation). When the Rust
+`.so` is not on `PYTHONPATH`, `import ast_serialize` resolves to this stub
+and crashes with `AttributeError: module 'ast_serialize' has no attribute
+'parse'`. The daemon test harness historically overwrote `PYTHONPATH`
+(see `testdaemon.py:run_cmd`), which dropped the Rust dirs and triggered
+this; that harness now prepends instead of overwriting.
 
 `mypy_self_check.ini` runs with `num_workers = 4`, which forces both
 `native_parser` and `native_resolver` on, so the self-check exercises both
 extensions end-to-end and is the cheapest correctness gate after a rebuild.
+
+### Native-parser parity
+
+`Options.native_parser` defaults to `True` (Phase 1). The native parser
+(ruff-based) matches the Python parser (CPython-based) on all parity suites:
+testcheck (8144 passed), fine-grained / daemon / cache (1333 passed), and
+self-check (0 errors). Three parity fixes were applied:
+
+1. **Type-comment handling on `for` and `with` statements**: the Rust
+   serializer now extracts `# type:` comments on `for`-loop and `with`
+   statements and writes them into the binary AST (cache_version bumped
+   to 4). The Python deserializer reads them back as `index_type` /
+   `target_type`.
+2. **Syntax-error message + location parity**: when ruff reports a syntax
+   error, the Rust extension re-parses with CPython's `ast.parse` to get
+   CPython's exact `SyntaxError.msg`, `lineno`, and `offset`. This
+   guarantees byte-identical error output. Syntax errors are rare in
+   production, so the double-parse cost is negligible.
+3. **PEP 263 encoding handling**: when the native parser reads a file
+   directly (source is `None`), it now decodes via Python's
+   `decode_python_encoding` so `# coding:` declarations are respected
+   and decode errors surface as `CompileError("Cannot decode file: ...")`
+   — matching the Python path in `build.py:get_source()`.
 
 ## Pull Requests
 
