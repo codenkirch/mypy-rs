@@ -93,7 +93,7 @@ def load_from_raw(
 
     state = State(options, is_stub=fnam.endswith(".pyi"))
     if imports_only:
-        defs = []
+        defs: list[Statement] = []
     else:
         data = ReadBuffer(raw_data.defs)
         n = read_int(data)
