@@ -1241,7 +1241,17 @@ default.
 - **Stage 3**: Rust-owned `Type` enum + bytes seam. Port
   `is_subtype`/`is_proper_subtype` (the perf win — 26 unit tests +
   thousands of data-driven cases). `TypeInfo` snapshot protocol
-  formalized.
+  formalized. Decomposed into:
+  - **Stage 3a**: Rust `Type` enum + binary wire-format reader
+    (`wire::read_type`), parity-tested via `str(python_type) ==
+    rust_read(bytes).to_string()`. No production wiring — foundation
+    only.
+  - **Stage 3b**: `TypeInfo` snapshot protocol. Resolves `type_ref` →
+    `name`/`fullname`, `type_vars`, `mro`, `is_enum`, etc. Unblocks
+    `Instance` prefix stripping and enum-literal/bytes-literal
+    `value_repr` parity.
+  - **Stage 3c**: `is_subtype`/`is_proper_subtype` on the Rust enum,
+    wired through the seam (the perf win).
 - **Stage 4**: `check_call` / `ExpressionChecker.visit_call_expr_inner`
   — the big one, highest value, needs the plugin-hook snapshot
   protocol.
@@ -1321,4 +1331,97 @@ path accepts both before recursing or checking emptiness.
 The default-off path is unchanged. Stage 2 does not flip the default —
 `Options.native_type_kernel` remains `False` until the full staging
 roadmap proves out.
+
+
+## Milestone 5 (Phase 4): Type Kernel — Stage 3a (`wire::read_type`)
+
+Stage 3a lays the foundation for the perf-winning Stage 3c
+(`is_subtype`) by introducing a Rust-owned `Type` enum and a binary
+wire-format reader for `mypy.types.Type`. It is parity-tested but **not
+wired into any production path** — no `Options.native_type_kernel` flip,
+no `mypy/subtypes.py` changes. The reader is exposed only as
+`type_kernel.read_type_to_str(bytes) -> str` for parity verification.
+
+### Why a reader first
+
+Stage 3c needs a Rust `Type` enum that mirrors `mypy.types`'s 19
+serialized subclasses. Building the enum + reader in isolation (before
+tackling `is_subtype` or the `TypeInfo` snapshot protocol) lets us prove
+the wire-format contract end-to-end with the smallest possible surface
+area. The `Display` impl doubles as the parity oracle: it mirrors
+`TypeStrVisitor` (non-verbose mode), so `str(python_type) ==
+rust_read(bytes).to_string()` is a direct check that the reader
+reconstructed the same type.
+
+### Scope
+
+- `crates/type_kernel/src/wire.rs` (~1700 lines, new):
+  - `ReadBuffer` + bare primitives: `read_tag`, `read_bool`,
+    `read_short_int` (the varint from `librt_internal.c`), `read_long_int`,
+    `read_int_bare`, `read_str_bare`, `read_bytes_bare`, `read_float_bare`.
+  - Tagged helpers mirroring `mypy/cache.py`: `read_int`, `read_str`,
+    `read_str_opt`, `read_int_list`, `read_str_list`, `read_str_opt_list`,
+    `read_flags` (bit-packed, max 26), `read_literal`.
+  - `Type` enum (19 variants) + `ExtraAttrs` + `Parameters` +
+    `LiteralValue`.
+  - `read_type(buf, tag)` dispatching on all 19 wire tags in Python's
+    popularity order, including the Instance compact fast-path
+    (`INSTANCE_STR`/`FUNCTION`/`INT`/`BOOL`/`OBJECT` singletons,
+    `INSTANCE_SIMPLE` bare-str, `INSTANCE_GENERIC` tagged-str + args +
+    `last_known_value` + `extra_attrs` + `END_TAG`).
+  - Per-variant readers for every serialized subclass.
+  - `impl Display for Type` mirroring `TypeStrVisitor` non-verbose mode,
+    including the `def [vars] (params) -> ret` shape, `tuple[T, ...]`,
+    `Literal[...]`, `Overload(...)`, `TypedDict(...)`, union ` | `
+    syntax, and `type[T]` / `TypeForm[T]`.
+  - `#[pyfunction] read_type_to_str(bytes: &[u8]) -> PyResult<String>`
+    — parity-only entry point; errors raise as `ValueError`.
+
+### Wire-format invariants preserved
+
+- **Varint**: 1-byte (`-10..117`, low bit 0), 2-byte (`-100..16283`,
+  low 2 bits `01`), 4-byte (`-10000..536860911`, low 3 bits `011`),
+  long-int (`LONG_INT_TRAILER=15` sentinel + short-int
+  `(size<<1|sign)` + LE magnitude). The subtle CPyTagged `<<1` form
+  difference between C's `_read_short_int` (returns `value << 1`) and
+  the Rust reader (returns raw value) is handled in `read_long_int`:
+  `sign = size_and_sign & 1; size = (size_and_sign >> 1) as usize`.
+- **Instance fast paths**: 5 singletons (no `END_TAG`),
+  `INSTANCE_SIMPLE` (bare str, no `END_TAG`), `INSTANCE_GENERIC`
+  (tagged str + args + `last_known_value` + `extra_attrs` + `END_TAG`).
+- **Literal tags**: `LITERAL_FALSE`/`TRUE`/`NONE`/`INT`/`STR`/`FLOAT`/
+  `COMPLEX` + the `read_literal` dispatch.
+- **`type_ref` flyweight**: `Instance.type_ref` and
+  `TypeAliasType.type_ref` carry unresolved fullname strings;
+  `TypeFixer` resolves them post-deserialization. Stage 3a renders
+  `type_ref` verbatim (no `builtins.` prefix strip) because the wire
+  format carries `type.fullname`, not `type.name`. Stage 3b will
+  resolve refs against a `TypeInfo` snapshot for production-correct
+  stripping.
+
+### Known deferred renderings (Stage 3b)
+
+- `TypeAliasType` renders `"<alias (unfixed)>"` (honest deferred state)
+  because the wire format carries `type_ref` but no resolved `TypeAlias`
+  node.
+- `Instance` `builtins.` prefix is not stripped (see above).
+- The `has_type_var_tuple_type && len(type_vars) == 1` `[()]` branch
+  needs a `TypeInfo` field not in the wire format.
+- Enum-literal and bytes-literal `value_repr` need `TypeInfo` resolution
+  (`is_enum_literal`, `fallback_name == "builtins.bytes"`).
+- `ParamSpec`/`TypeVarTuple` default rendering under
+  `reveal_verbose_types` is not mirrored (test corpus uses non-verbose).
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `cargo test -p mypy-type-kernel wire::` (13 Rust unit tests) | 13 passed |
+| `testtypes.py::NativeTypeWireSuite` (`TEST_NATIVE_TYPE_KERNEL=1`) | 24 passed |
+| `testtypes.py` full (`TEST_NATIVE_TYPE_KERNEL=1`) | 143 passed, 2 skipped |
+| `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 TEST_NATIVE_TYPE_KERNEL=1`) | 8198 passed, 15 skipped, 7 xfailed |
+
+The default-off path is unchanged. Stage 3a introduces no production
+wiring — `read_type_to_str` is parity-only and gated behind the
+`type_kernel` extension import (skipped when the `.so` is absent).
 
