@@ -1081,10 +1081,60 @@ two-way parity differential the strangler-fig contract requires.
 
 ### Next milestone (Phase 4)
 
-Module discovery / import graph prepass: a Rust prepass that walks the
-search paths once and produces the full module-id → path map (and the
-suppressed / unreachable dependency sets) in a single traversal, so the
-per-module `find_module` calls in `build.py` can be replaced by a lookup.
-This is the next candidate in the strangler-fig order: cache indexing and
-validation, then selected pure type-operation kernels.
+**Status: not pursued.** The prepass rationale — "improve cold start and
+graph-load performance" — does not survive measurement. With the native
+resolver + shared `FsCache` default-on (Phase 3), `--dump-build-stats`
+on the self-check corpus (197 modules, parallel) shows:
+
+| stat | value |
+|------|-------|
+| `find_module_calls` | 1004 |
+| `find_module_time` | 0.010s |
+| `total_process_stale_time` | 4.109s |
+| `type_check_time_implementation` | 2.938s (71%) |
+| `semanal_time` | 0.650s (16%) |
+
+`find_module` is **0.24% of build time**. A prepass would optimize away
+~10ms by replacing per-module lookups with a single traversal, while
+duplicating logic `module_resolver` already implements per-call. This
+violates the strangler-fig principle of solving real problems behind
+narrow interfaces — it would be a shallow pass-through with no measurable
+gain.
+
+The real bottleneck is the **type checker and semantic analyzer**
+(87% of build time combined), which is the "pure type-operations kernel"
+the migration doc lists as item #4 but flags as high-risk because
+`mypy.types`/`mypy.nodes` are widely-shared mutable object graphs and
+plugin-visible. That warning stands; the kernel is high-value but needs
+careful scoping.
+
+**Revised next candidate: cache indexing and validation (item #3).**
+`mypy/cache.py` indexing/validation is string/path heavy, has a clear
+schema, and sits below the mutable object graph — a safer Rust target
+than the type kernel, and not a micro-optimization like the prepass.
+
+## Performance baseline
+
+Recorded 2026-07-06 on the self-check corpus (`mypy_self_check.ini -p mypy`,
+197 modules, 4 parallel workers), native parser + native resolver
+default-on, extensions built `--release`:
+
+| stat | value |
+|------|-------|
+| `find_module_calls` | 1004 |
+| `find_module_time` | 0.010s |
+| `fm_cache_size` | 394 |
+| `parse_time` | 0.149s |
+| `semanal_time` | 0.650s |
+| `type_check_time_implementation` | 2.938s |
+| `type_check_time_interface` | 0.225s |
+| `scc_wait_time` | 1.080s |
+| `total_process_stale_time` | 4.109s |
+| `deserialize_time` | 0.032s |
+| `flush_and_cache_time` | 0.054s |
+
+This is the regression baseline for the default-on resolver + parser.
+Re-run with `--dump-build-stats` after changes to the parser or resolver
+seams and compare; a >10% regression in any row warrants investigation
+before merging.
 
