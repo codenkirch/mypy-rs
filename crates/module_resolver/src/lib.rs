@@ -521,9 +521,95 @@ impl NativeResolver {
         )?;
         Ok((res.into_py(py), error.into_py(py)))
     }
+
+    /// Resolve a batch of module ids in one PyO3 call.
+    ///
+    /// Mirrors `resolve` per id but amortizes the boundary cost: one crossing
+    /// resolves N ids, returning one `Vec<(kind, path, can_cache)>`. `kind ==
+    /// 255` (FOUND) means `path` is `Some`; otherwise it's `None` and `kind`
+    /// is a `ModuleNotFoundReason` value.
+    ///
+    /// `use_typeshed` is computed inside Rust via `use_typeshed_for` (matching
+    /// the dep-records walk, not the per-call `resolve` path), so each id is a
+    /// bare `(module_id, follow_untyped_imports)` pair — no Python-side
+    /// per-id work, which is the whole point of batching.
+    fn resolve_many(
+        &self,
+        py: Python<'_>,
+        ids_with_follow: Vec<(String, bool)>,
+    ) -> PyResult<Vec<(u8, Option<String>, bool)>> {
+        let res = resolve_many_with(
+            self,
+            &ids_with_follow,
+            &self.initial_components,
+            &self.ns_ancestors,
+            &self.python_path,
+            &self.mypy_path,
+            &self.package_path,
+            &self.typeshed_path,
+            &self.stdlib_versions,
+            self.python_version,
+            &self.stub_flat,
+            &self.stub_namespace,
+            self.namespace_packages,
+            self.use_builtins_fixtures,
+        )?;
+        Ok(res)
+    }
 }
 
-/// Core dependency-record walk, generic over the `FsProbe` implementation so
+/// Batched resolution core, generic over the `FsProbe` implementation so it can
+/// be unit-tested with `HashMapFs` (mirroring `dep_records_with`). The resolver
+/// config is passed in so each id resolves against the same config as a real
+/// `find_module` call. `initial_components` and `ns_ancestors` are `RefCell`s
+/// so the caller controls cross-call cache lifetime — a single
+/// `resolve_many_with` call shares one cache borrow across all ids, exactly as
+/// `dep_records_with` does across one file's import list.
+#[allow(clippy::too_many_arguments)]
+fn resolve_many_with<F: FsProbe>(
+    fs: &F,
+    ids_with_follow: &[(String, bool)],
+    initial_components: &RefCell<HashMap<Vec<String>, HashMap<String, Vec<String>>>>,
+    ns_ancestors: &RefCell<HashMap<String, String>>,
+    python_path: &[String],
+    mypy_path: &[String],
+    package_path: &[String],
+    typeshed_path: &[String],
+    stdlib_versions: &HashMap<String, ((u8, u8), Option<(u8, u8)>)>,
+    python_version: (u8, u8),
+    stub_flat: &BTreeSet<String>,
+    stub_namespace: &BTreeMap<String, String>,
+    namespace_packages: bool,
+    use_builtins_fixtures: bool,
+) -> PyResult<Vec<(u8, Option<String>, bool)>> {
+    let mut out: Vec<(u8, Option<String>, bool)> = Vec::with_capacity(ids_with_follow.len());
+    let mut initial_components = initial_components.borrow_mut();
+    let mut ns_ancestors = ns_ancestors.borrow_mut();
+
+    for (id, follow_untyped_imports) in ids_with_follow {
+        let use_typeshed = use_typeshed_for(id, python_version, stdlib_versions);
+        let inputs = ResolveInputs {
+            id,
+            use_typeshed,
+            namespace_packages,
+            use_builtins_fixtures,
+            follow_untyped_imports: *follow_untyped_imports,
+            python_path,
+            mypy_path,
+            package_path,
+            typeshed_path,
+            stdlib_versions,
+            stub_flat,
+            stub_namespace,
+            fs,
+        };
+        let mut resolver = Resolver::new(&inputs, &mut initial_components, &mut ns_ancestors);
+        let (kind, path, can_cache) = resolver.find_module(id, use_typeshed);
+        out.push((kind, path, can_cache));
+    }
+
+    Ok(out)
+}
 /// it can be unit-tested with `HashMapFs`. The resolver config (search paths,
 /// stub tables, flags) is passed in so `is_module` lookups use the same config
 /// as a real `find_module` call. `initial_components` and `ns_ancestors` are
@@ -2066,5 +2152,137 @@ mod tests {
             &[("tomllib", (3, 11), None)],
         );
         assert_eq!(recs, vec![(PRI_MED, "tomllib".to_string(), 1)]);
+    }
+
+    // --- Batched resolution tests ---
+    // Exercise `resolve_many_with` (the core of `NativeResolver::resolve_many`)
+    // using `HashMapFs`, mirroring how `dep_records_with` is tested above.
+
+    /// Resolve a batch of ids against a `HashMapFs` with the given search paths.
+    /// Mirrors the `resolve` test helper: `search` is passed as `mypy_path`
+    /// (matching how `resolve_with(fs, id, &[], search, ...)` wires it), so
+    /// plain modules resolve as FOUND rather than FOUND_WITHOUT_TYPE_HINTS.
+    fn resolve_many(
+        fs: &HashMapFs,
+        ids_with_follow: &[(&str, bool)],
+        search: &[&str],
+        ns: bool,
+    ) -> Vec<(u8, Option<String>, bool)> {
+        let myp: Vec<String> = search.iter().map(|s| s.to_string()).collect();
+        let flat = BTreeSet::<String>::new();
+        let ns_map = BTreeMap::<String, String>::new();
+        let stdlib_map = HashMap::<String, ((u8, u8), Option<(u8, u8)>)>::new();
+        let input: Vec<(String, bool)> = ids_with_follow
+            .iter()
+            .map(|(id, fu)| (id.to_string(), *fu))
+            .collect();
+        let ic = TestRefCell::new(HashMap::new());
+        let ns_anc = TestRefCell::new(HashMap::new());
+        resolve_many_with(
+            fs,
+            &input,
+            &ic,
+            &ns_anc,
+            &[],
+            &myp,
+            &[],
+            &[],
+            &stdlib_map,
+            (3, 10),
+            &flat,
+            &ns_map,
+            ns,
+            false,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn resolve_many_finds_mixed_batch() {
+        // One found module, one not-found, one found under a different name:
+        // the batched call must return one result per id in input order,
+        // matching what `resolve` would return for each id individually.
+        let f = fs()
+            .file("/lib/pkg1/a.py", "")
+            .file("/lib/pkg1/c.py", "");
+        let res = resolve_many(
+            &f,
+            &[("a", false), ("missing", false), ("c", false)],
+            &["/lib/pkg1"],
+            false,
+        );
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].0, FOUND);
+        assert_eq!(res[0].1.as_deref(), Some("/lib/pkg1/a.py"));
+        assert_eq!(res[1].0, REASON_NOT_FOUND);
+        assert_eq!(res[1].1, None);
+        assert_eq!(res[2].0, FOUND);
+        assert_eq!(res[2].1.as_deref(), Some("/lib/pkg1/c.py"));
+    }
+
+    #[test]
+    fn resolve_many_shares_caches_across_ids() {
+        // Resolving `pkg.a` then `pkg.b` against the same package exercises the
+        // shared `initial_components` cache (the toplevel-components lookup
+        // for `/lib/pkg` is computed once for `pkg.a` and reused for `pkg.b`).
+        // The test passes as long as both ids resolve correctly; the cache
+        // sharing is the mechanism under test.
+        let f = fs()
+            .file("/lib/pkg/py.typed", "")
+            .file("/lib/pkg/__init__.py", "")
+            .file("/lib/pkg/a.py", "")
+            .file("/lib/pkg/b.py", "");
+        let res = resolve_many(
+            &f,
+            &[("pkg.a", false), ("pkg.b", false)],
+            &["/lib"],
+            false,
+        );
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].0, FOUND);
+        assert_eq!(res[0].1.as_deref(), Some("/lib/pkg/a.py"));
+        assert_eq!(res[1].0, FOUND);
+        assert_eq!(res[1].1.as_deref(), Some("/lib/pkg/b.py"));
+    }
+
+    #[test]
+    fn resolve_many_respects_follow_untyped_per_id() {
+        // Per-id `follow_untyped_imports` must take effect: the same untyped
+        // package (no `py.typed` marker) on `package_path` resolves as
+        // FOUND_WITHOUT_TYPE_HINTS without follow, and as FOUND with it, in
+        // the same batched call. Inlined (not via the `resolve_many` helper)
+        // because the helper passes `search` as `mypy_path`, which doesn't
+        // trigger the non-stub-helper branch.
+        let f = fs().file("/lib/pkg1/untyped/__init__.py", "");
+        let pkg: Vec<String> = vec!["/lib/pkg1".to_string()];
+        let flat = BTreeSet::<String>::new();
+        let ns_map = BTreeMap::<String, String>::new();
+        let stdlib_map = HashMap::<String, ((u8, u8), Option<(u8, u8)>)>::new();
+        let input: Vec<(String, bool)> =
+            vec![("untyped".to_string(), false), ("untyped".to_string(), true)];
+        let ic = TestRefCell::new(HashMap::new());
+        let ns_anc = TestRefCell::new(HashMap::new());
+        let res = resolve_many_with(
+            &f,
+            &input,
+            &ic,
+            &ns_anc,
+            &[],
+            &[],
+            &pkg,
+            &[],
+            &stdlib_map,
+            (3, 10),
+            &flat,
+            &ns_map,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].0, REASON_FOUND_WITHOUT_TYPE_HINTS);
+        assert_eq!(res[0].1, None);
+        assert_eq!(res[1].0, FOUND);
+        assert_eq!(res[1].1.as_deref(), Some("/lib/pkg1/untyped/__init__.py"));
     }
 }

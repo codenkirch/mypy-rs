@@ -92,6 +92,35 @@ def resolve_module(
     return ModuleNotFoundReason(kind), can_cache
 
 
+def resolve_modules(
+    resolver: module_resolver.NativeResolver,
+    ids_with_follow: list[tuple[str, bool]],
+) -> list[tuple[str | ModuleNotFoundReason, bool]]:
+    """Resolve a batch of module ids in one PyO3 call.
+
+    Mirrors ``resolve_module`` per id but amortizes the boundary cost: one
+    crossing resolves N ids. ``use_typeshed`` is computed inside Rust (matching
+    the dep-records walk, not the per-call ``resolve_module`` path), so each id
+    is a bare ``(module_id, follow_untyped_imports)`` pair — no Python-side
+    per-id work.
+
+    Returns one ``(result, can_cache)`` per input id, in order, with the same
+    contract as ``resolve_module``. Not wired into ``FindModuleCache`` yet;
+    exposed for the batched-resolution microbench so it can prove (or disprove)
+    that hoisting the per-file import set into one Rust call closes the
+    per-module boundary-overhead gap.
+    """
+    results = resolver.resolve_many(ids_with_follow)
+    out: list[tuple[str | ModuleNotFoundReason, bool]] = []
+    for kind, path, can_cache in results:
+        if kind == _FOUND:
+            assert path is not None
+            out.append((path, can_cache))
+        else:
+            out.append((ModuleNotFoundReason(kind), can_cache))
+    return out
+
+
 # Rust ImportRecord kinds. Must match crates/module_resolver/src/lib.rs.
 _IMP_IMPORT = 0
 _IMP_IMPORTFROM = 1
