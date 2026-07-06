@@ -486,21 +486,47 @@ fn parse_errors_to_py(
     errors: &[ruff_python_parser::ParseError],
 ) -> PyResult<Vec<PyObject>> {
     let line_starts = line_starts(source);
+
+    // Ruff produces more specific syntax-error messages than CPython (e.g.
+    // "Simple statements must be separated by newlines or semicolons" vs
+    // CPython's "invalid syntax"). The strangler-fig contract requires the
+    // native parser to produce byte-identical output to the Python path,
+    // which uses CPython's SyntaxError.msg and offset. So when ruff reports
+    // syntax errors, re-parse with CPython's ast.parse to get its exact
+    // message and location. Syntax errors are rare in production (users fix
+    // them), so the double-parse cost is negligible.
+    let cpython_error = cpython_syntax_error(py, source).ok();
+
     let mut result = Vec::with_capacity(errors.len());
     for error in errors {
-        let offset = error.location.start().to_usize();
-        let line_index = line_starts.partition_point(|start| *start <= offset) - 1;
-        let line_start = line_starts[line_index];
-        let line_end = line_starts
-            .get(line_index + 1)
+        let ruff_offset = error.location.start().to_usize();
+        let ruff_line_index = line_starts.partition_point(|start| *start <= ruff_offset) - 1;
+        let ruff_line_start = line_starts[ruff_line_index];
+        let ruff_line_end = line_starts
+            .get(ruff_line_index + 1)
             .copied()
             .unwrap_or(source.len());
-        let source_line = &source[line_start..line_end];
-        let column = source[line_start..offset].chars().count() + 1;
-        let message = translate_parse_error_message(&error.error.to_string(), source_line);
+        let source_line = &source[ruff_line_start..ruff_line_end];
+
+        let (line, column, message) = match &cpython_error {
+            Some(cpe) => {
+                let line = cpe.lineno.unwrap_or(ruff_line_index as i64 + 1);
+                let column = cpe.offset.unwrap_or(
+                    (source[ruff_line_start..ruff_offset].chars().count() + 1) as i64,
+                );
+                (line, column, cpe.message.clone())
+            }
+            None => {
+                // Fallback: translate via the TypedDict special-case, else
+                // use ruff's message and location.
+                let column = source[ruff_line_start..ruff_offset].chars().count() + 1;
+                let msg = translate_parse_error_message(&error.error.to_string(), source_line);
+                (ruff_line_index as i64 + 1, column as i64, msg)
+            }
+        };
 
         let dict = pyo3::types::PyDict::new(py);
-        dict.set_item("line", line_index + 1)?;
+        dict.set_item("line", line)?;
         dict.set_item("column", column)?;
         dict.set_item("message", message)?;
         dict.set_item("blocker", true)?;
@@ -508,6 +534,40 @@ fn parse_errors_to_py(
         result.push(dict.into_py(py));
     }
     Ok(result)
+}
+
+/// The information CPython's `ast.parse` reports in its SyntaxError.
+struct CpythonSyntaxError {
+    message: String,
+    lineno: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// Re-parse `source` with CPython's `ast.parse` to obtain the exact
+/// `SyntaxError` CPython would raise. Returns `None` if CPython does not
+/// report a syntax error (shouldn't happen if ruff found one, but we guard
+/// against it so the caller can fall back to ruff's message/location).
+fn cpython_syntax_error(py: Python<'_>, source: &str) -> PyResult<CpythonSyntaxError> {
+    let ast_module = py.import("ast")?;
+    let result: PyResult<PyObject> = ast_module
+        .call_method1("parse", (source, "<native-parser>", "exec"))
+        .map(|obj| obj.into_py(py));
+    match result {
+        Ok(_) => {
+            // CPython parsed successfully but ruff didn't — fall back.
+            Err(pyo3::exceptions::PyValueError::new_err(
+                "CPython accepted source that ruff rejected",
+            ))
+        }
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PySyntaxError>(py) => {
+            let value = err.value(py);
+            let message: String = value.getattr("msg")?.extract()?;
+            let lineno: Option<i64> = value.getattr("lineno").ok().and_then(|a| a.extract().ok());
+            let offset: Option<i64> = value.getattr("offset").ok().and_then(|a| a.extract().ok());
+            Ok(CpythonSyntaxError { message, lineno, offset })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn translate_parse_error_message(message: &str, source_line: &str) -> String {
@@ -1526,6 +1586,17 @@ fn serialize_for_stmt(serializer: &mut Serializer<'_>, for_stmt: &ast::StmtFor) 
     serialize_block(serializer, &for_stmt.body, &loc)?;
     serialize_optional_block(serializer, &for_stmt.orelse)?;
     serializer.writer.bool(for_stmt.is_async);
+    // Type comment on the for-loop variable (e.g. `for x in l:  # type: object`).
+    // Keyed by the line of the comment, which is the for-statement's line.
+    if let Some(type_comment) = serializer.type_comments.get(&loc.line).cloned() {
+        let parsed_type = parse_expression(&type_comment)
+            .map_err(to_parse_error)?
+            .into_expr();
+        serializer.writer.bool(true);
+        serialize_type_with_forced_loc(serializer, &parsed_type, &loc)?;
+    } else {
+        serializer.writer.bool(false);
+    }
     serializer.writer.loc(&loc);
     serializer.writer.tag(END_TAG);
     Ok(())
@@ -1544,6 +1615,16 @@ fn serialize_with_stmt(serializer: &mut Serializer<'_>, with_stmt: &ast::StmtWit
     }
     serialize_block(serializer, &with_stmt.body, &loc)?;
     serializer.writer.bool(with_stmt.is_async);
+    // Type comment on the with-statement target (e.g. `with open(f) as d:  # type: io.TextIO`).
+    if let Some(type_comment) = serializer.type_comments.get(&loc.line).cloned() {
+        let parsed_type = parse_expression(&type_comment)
+            .map_err(to_parse_error)?
+            .into_expr();
+        serializer.writer.bool(true);
+        serialize_type_with_forced_loc(serializer, &parsed_type, &loc)?;
+    } else {
+        serializer.writer.bool(false);
+    }
     serializer.writer.loc(&loc);
     serializer.writer.tag(END_TAG);
     Ok(())
