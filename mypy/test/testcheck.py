@@ -138,11 +138,13 @@ class TypeCheckSuite(DataSuite):
         options.use_builtins_fixtures = True
         options.show_traceback = True
         options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+        options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
         options.reveal_verbose_types = not testcase.name.endswith("_no_verbose_reveal")
 
         if options.num_workers:
             options.fixed_format_cache = True
             options.native_parser = True
+            options.native_resolver = True
             if testcase.output_files:
                 raise pytest.skip("Reports are not supported in parallel mode")
             # Note: do not use this unless really needed!
@@ -154,6 +156,8 @@ class TypeCheckSuite(DataSuite):
 
         if options.native_parser and testcase.name.endswith("_no_native_parse"):
             raise pytest.skip("Test not supported by native parser yet")
+        if options.native_resolver and testcase.name.endswith("_no_native_resolver"):
+            raise pytest.skip("Test not supported by native resolver yet")
 
         # Enable some options automatically based on test file name.
         if "columns" in testcase.file:

@@ -504,3 +504,176 @@ Local file-level, daemon, cache, incremental, self-check, and performance parity
 are all green. With CI not available on this fork (see "CI Coverage" above),
 the local baselines recorded here are the production-readiness gate for
 `mypy.nativeparse` switching to prefer the in-tree extension.
+
+## Milestone 2 (First Slice): Rust Module-Resolution Core
+
+The repository now has an in-tree Rust module resolver alongside the parser
+extension:
+
+- `crates/module_resolver/Cargo.toml`
+- `crates/module_resolver/src/lib.rs`
+- `mypy/native_resolve.py` (Python adapter)
+
+The crate builds a Python extension module named `module_resolver` and
+preserves the existing `FindModuleCache.find_module` contract:
+
+```python
+resolve_module(id, ...) -> tuple[str | ModuleNotFoundReason, bool]
+```
+
+### Scope
+
+**Ports to Rust** (the pure, fscache-only resolution core):
+- `FindModuleCache._find_module` — the heart of the resolver.
+- Helpers: `_find_module_non_stub_helper`, `_update_ns_ancestors`,
+  `find_lib_path_dirs`, `get_toplevel_possibilities`, `verify_module`,
+  `highest_init_level`.
+- `stub_distribution_name` — replicated from the stubinfo tables passed in
+  as plain data (flat set + namespace map).
+
+**Stays in Python** (policy/diagnostics/side-effects):
+- `FindModuleCache.find_module` — result caching, `use_typeshed` decision,
+  WRONG_WORKING_DIRECTORY decoration, dispatch to Rust.
+- `find_module_via_source_set` — the `fast_module_lookup` optimization.
+- `find_modules_recursive` — touches `exclude` regex, gitignore, `sys.exit`.
+- The entire `find_module_simple` / `find_module_with_reason` /
+  `find_module_and_diagnose` layer in `build.py` — follow_imports policy,
+  diagnostics, `ModuleNotFound`/`CompileError` raising.
+
+### Filesystem strategy
+
+Rust reads the real filesystem via `std::fs` directly, with no per-call
+Python callbacks. The `NativeResolver` `#[pyclass]` is owned by
+`FindModuleCache` for its lifetime and holds:
+
+- FS caches (`listdir`, `isfile_case`, `exists_case`, `stat`) mirroring
+  `FileSystemCache`'s cache fields, persisting across all `find_module`
+  calls served by Rust.
+- Resolution caches (`initial_components`, `ns_ancestors`) mirroring
+  `FindModuleCache`'s cross-call memoization.
+- Stable resolver config (search paths, stubinfo tables, resolver flags),
+  set once at construction so only per-call varying args (`id`,
+  `use_typeshed`, `follow_untyped_imports`) cross the PyO3 boundary on each
+  resolve.
+
+The dispatch gate in `FindModuleCache._resolve` routes only cold,
+real-filesystem runs to Rust. Daemon (`fine_grained_incremental`) and Bazel
+runs fall back to Python `_find_module` so the daemon VFS and Bazel
+fake-init synthesis remain Python-owned until they are ported or retired:
+
+```python
+if (self.options.native_resolver
+        and not self.options.fine_grained_incremental
+        and not self.options.bazel):
+    # Rust owns the FS for cold runs.
+```
+
+This is the direction the strangler-fig migration is heading: pure Rust,
+no Python runtime. The callback strategy (Rust calling back into Python's
+`FileSystemCache` for every `isfile`/`isdir`/`listdir`) was architecturally
+backwards for that goal — it made Rust depend on Python's VFS forever. The
+`StdFs` direct-read strategy makes Rust own the FS for cold runs, and the
+gate is the honest way to say "Rust owns the FS for cold runs; daemon mode
+uses Python until the VFS is ported or the daemon is retired."
+
+Case-sensitive matching on macOS/Windows is replicated in Rust via
+`read_dir` listing checks, mirroring `FileSystemCache.isfile_case` and
+`exists_case`.
+
+### Wiring
+
+- `Options.native_resolver` (default `False`) gates the dispatch in
+  `FindModuleCache._resolve`.
+- `--native-resolver` CLI flag (invertible).
+- `TEST_NATIVE_RESOLVER=1` env var flips it in the testcheck harness.
+- Force-on under parallel mode (`main.py`), same as `native_parser`.
+- `native_resolver` is in `OPTIONS_AFFECTING_CACHE`.
+
+### Parity baselines
+
+All suites run with both `TEST_NATIVE_PARSER=1` and
+`TEST_NATIVE_RESOLVER=1` against the in-tree Rust extensions on
+`PYTHONPATH`:
+
+| Suite | Result |
+|-------|--------|
+| `testmodulefinder.py` (Python path) | 16 passed |
+| `testmodulefinder.py` (`TEST_NATIVE_RESOLVER=1`) | 16 passed |
+| `testcheck.py` | 8144 passed, 69 skipped, 7 xfailed |
+| `testfinegrained.py` | 747 passed, 27 skipped |
+| `testdaemon.py` | 37 passed |
+| `testfinegrainedcache.py` | 549 passed, 229 skipped |
+
+mypy self-check diagnostic parity (`mypy_self_check.ini -p mypy -p mypyc`,
+340 source files): byte-for-byte identical output between the default
+Python resolver, `--native-resolver`, and `--native-parser --native-resolver`.
+All three report the same 2 pre-existing errors in `mypy/parse.py`.
+
+### Performance
+
+Resolver-focused microbenchmark (release build of the Rust extension, pure
+Python mypy). Calls `FindModuleCache.find_module` directly on 95 unique
+top-level imports extracted from the real source corpus. Best of 5
+iterations:
+
+| Resolver | real (s) | per-module (µs) |
+|----------|----------|------------------|
+| Python   | 0.0017   | 18.3             |
+| Native   | 0.0024   | 25.6             |
+
+Native is **~1.4x slower** per-module in isolation. The remaining gap is
+pure PyO3 entry/exit overhead per call plus the `options.clone_for_module`
+call on the Python side. The previous callback strategy (Rust calling back
+into Python's `FileSystemCache` for every `isfile`/`isdir`/`listdir`) was
+~8x slower (175µs/module); the direct `std::fs` read with persistent
+caches closed that gap.
+
+End-to-end, the overhead is invisible because resolution is a tiny fraction
+of total mypy time. Self-check timing (`mypy/modulefinder.py
+mypy/native_resolve.py mypy/nativeparse.py`, `--no-incremental`): byte-for-byte
+identical output between the Python resolver and `--native-resolver`.
+
+### Verification
+
+```bash
+cargo test -p mypy-module-resolver
+cargo rustc -p mypy-module-resolver --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libmodule_resolver.dylib \
+  /private/tmp/mypy-rs-local-resolver/module_resolver.cpython-313-darwin.so
+
+# Parity (both extensions on PYTHONPATH):
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run --group test python -m pytest mypy/test/testmodulefinder.py -q
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run --group test python -m pytest mypy/test/testcheck.py -q
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run --group test python -m pytest \
+  mypy/test/testfinegrained.py mypy/test/testdaemon.py \
+  mypy/test/testfinegrainedcache.py -q
+
+# Self-check diagnostic parity:
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  uv run --group test python -m mypy --config-file mypy_self_check.ini \
+  --no-incremental --cache-dir /tmp/perf-py -p mypy -p mypyc
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  uv run --group test python -m mypy --native-resolver \
+  --config-file mypy_self_check.ini --no-incremental \
+  --cache-dir /tmp/perf-native -p mypy -p mypyc
+
+# Resolver-only microbenchmark against the real corpus:
+PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
+  uv run --group test python scripts/bench_resolver.py
+```
+
+Local modulefinder, testcheck, daemon, cache, incremental, and self-check
+parity are all green. The fallback Python path remains the default
+(`native_resolver = False`). The direct `std::fs` read strategy with
+persistent caches brings the isolated microbench within 1.4x of pure
+Python (and faster than mypyc-compiled Python would be once the boundary
+overhead is eliminated by hoisting more work into Rust). End-to-end
+performance is unaffected.
+
