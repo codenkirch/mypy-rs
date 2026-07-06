@@ -115,6 +115,29 @@ so the existing fixtures become a parity differential. The daemon
 (`fine_grained_incremental`) and Bazel paths stay on the Python resolver by
 the dispatch gate, so they need no special env var.
 
+### Native parser build order
+
+The native parser (`Options.native_parser`, defaulted on and force-on under
+parallel mode) is backed by the `ast_serialize` Rust extension. The
+serialized AST format is fixed by `crates/ast_serialize/src/lib.rs` and read
+by `mypy/nativeparse.py`; the two must stay in lockstep.
+
+**Rebuild the extension after any change to `crates/ast_serialize/src/lib.rs`
+before running mypy or its test suites.** A stale binary in the venv produces
+silent deserialization mismatches — e.g. an `AssertionError: 255` (END_TAG
+read where a LOCATION tag was expected) that crashes parallel workers during
+self-check. The on-disk source can look correct while the installed binary
+is stale, so always rebuild:
+
+```bash
+cd crates/ast_serialize && uvx maturin develop && cd ../..
+cd crates/module_resolver && uvx maturin develop && cd ../..   # if touched
+```
+
+`mypy_self_check.ini` runs with `num_workers = 4`, which forces both
+`native_parser` and `native_resolver` on, so the self-check exercises both
+extensions end-to-end and is the cheapest correctness gate after a rebuild.
+
 ## Pull Requests
 
 The default branch on this fork is `main` (not `master`). Always target
