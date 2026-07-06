@@ -86,7 +86,7 @@ Plan:
 
 - Expand parser parity tests.
 - Run broad checker tests with `TEST_NATIVE_PARSER=1`.
-- Make native parser default in a limited mode first.
+- Make native parser default in a limited mode first. ✓ `Options.native_parser` now defaults to `True`; the Python parser remains available via `--no-native-parser`. The test harness still forces the Python path unless `TEST_NATIVE_PARSER=1` so both paths stay covered.
 - Remove or demote the Python parser only after behavior is stable.
 
 Why this is first:
@@ -675,8 +675,10 @@ PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
 ```
 
 Local modulefinder, testcheck, daemon, cache, incremental, and self-check
-parity are all green. The fallback Python path remains the default
-(`native_resolver = False`). The direct `std::fs` read strategy with
+parity are all green. The native parser is now the default
+(`native_parser = True`); the native resolver remains opt-in
+(`native_resolver = False`) until the daemon VFS path is resolved or
+dmypy is retired. The direct `std::fs` read strategy with
 persistent caches brings the isolated microbench within 1.4x of pure
 Python (and faster than mypyc-compiled Python would be once the boundary
 overhead is eliminated by hoisting more work into Rust). End-to-end
