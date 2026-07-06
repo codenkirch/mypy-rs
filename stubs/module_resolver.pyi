@@ -24,6 +24,7 @@ class NativeResolver:
         mypy_path: list[str],
         package_path: list[str],
         typeshed_path: list[str],
+        python_version: tuple[int, int],
         stdlib_versions: list[_StdlibVersionEntry],
         stub_flat: list[str],
         stub_namespace: list[tuple[str, str]],
@@ -31,3 +32,10 @@ class NativeResolver:
     def resolve(
         self, id: str, use_typeshed: bool, follow_untyped_imports: bool
     ) -> tuple[int, Optional[str], bool]: ...
+    def compute_dep_records(
+        self,
+        file_id: str,
+        file_path: str,
+        imports: list[tuple[int, str, int, list[tuple[str, Optional[str]]], int, bool, bool, bool, bool]],
+        known_modules: set[str],
+    ) -> tuple[list[tuple[int, str, int]], Optional[tuple[int, str]]]: ...

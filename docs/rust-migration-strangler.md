@@ -684,3 +684,102 @@ Python (and faster than mypyc-compiled Python would be once the boundary
 overhead is eliminated by hoisting more work into Rust). End-to-end
 performance is unaffected.
 
+## Milestone 2 (Second Slice): Rust Dependency-Record Extraction
+
+The second slice of Milestone 2 ports
+`BuildManager.all_imported_modules_in_file` (`mypy/build.py:1202-1262`) to
+Rust, behind the same `native_resolver` dispatch gate as the resolution
+core. This walks a module's import list and emits
+`(priority, module_id, line)` tuples — the records `compute_dependencies`
+consumes to build the module dependency graph.
+
+### Scope
+
+**Ports to Rust** (the pure dependency-walk core):
+- `import_priority` — `is_top_level`/`is_mypy_only` → priority constant.
+- `correct_rel_imp` — relative-import resolution (pure string manipulation).
+- The import walk itself: `Import` (with ancestor expansion),
+  `ImportFrom` (with submodule-vs-name discrimination and the #4498
+  cycle-workaround priority), `ImportAll`.
+- `is_module` — the build-graph fast path (`known_modules` set) then
+  filesystem resolution via the same `NativeResolver` that `_resolve`
+  uses, with `use_typeshed` computed in Rust (see below).
+- `use_typeshed_for` — mirrors `FindModuleCache.find_module`'s
+  `use_typeshed` decision + `_typeshed_has_version`, so a stdlib module
+  outside the target Python version range is NOT looked up in typeshed.
+
+**Stays in Python** (side-effects, plugin integration):
+- `plugin.get_additional_deps` — concatenated after the Rust call.
+- `Errors.report(..., blocker=True)` for the "No parent module"
+  relative-import error — Rust returns an `Option<(line, message)>` and
+  Python reports it via `errors.set_file` + `errors.report`.
+- The dispatch gate in `State.compute_dependencies` (`build.py`).
+
+### Wiring
+
+The dispatch is in `State.compute_dependencies` (`mypy/build.py`):
+
+```python
+if manager.find_module_cache._native_gate_active():
+    # Rust walks the import list and resolves module ids via the same
+    # NativeResolver that _resolve uses, returning (priority, module_id,
+    # line) records. Plugin deps and the correct_rel_imp error reporting
+    # stay in Python (concatenated / reported after the Rust call).
+    dep_entries = _native.compute_dep_records(
+        resolver, file=self.tree, known_modules=known,
+        errors=manager.errors, options=manager.options,
+    ) + manager.plugin.get_additional_deps(self.tree)
+else:
+    dep_entries = manager.all_imported_modules_in_file(
+        self.tree) + manager.plugin.get_additional_deps(self.tree)
+```
+
+`_import_to_record` (`mypy/native_resolve.py`) flattens each
+`ImportBase` AST node into the plain tuple shape Rust expects (PyO3's
+`FromPyObject` for a tuple struct reads positionally). The import records
+are already deserialized by `load_from_raw` with
+`dependency_discovery=True`, so `is_unreachable` /
+`is_unreachable_dependency` flags cross the boundary as plain bools.
+
+### The `use_typeshed` computation
+
+The first slice computed `use_typeshed` Python-side and passed it to Rust
+as a bool on each `resolve` call. The dependency walk calls `is_module` on
+many ids in a tight loop, so computing `use_typeshed` Python-side per id
+would defeat the purpose of running the walk in Rust. Instead, the
+`NativeResolver` now carries the stdlib version table
+(`stdlib_versions: HashMap<String, ((u8, u8), Option<(u8, u8)>)>`) and
+the clamped target Python version (`python_version: (u8, u8)`, clamped to
+`(3, 10)` minimum mirroring `typeshed_py_version`). `use_typeshed_for`
+in Rust replicates `FindModuleCache.find_module`'s decision exactly:
+
+```rust
+fn use_typeshed_for(id, python_version, stdlib_versions) -> bool {
+    // Mirrors find_module's id-then-top_level lookup.
+    let (min, max) = stdlib_versions[key];
+    python_version >= min && max.map_or(true, |m| python_version <= m)
+}
+```
+
+This is what makes `import tomllib` (added in Python 3.11) resolve as
+`NOT_FOUND` when targeting 3.10, so the dependency walk skips it via
+`include_only_if_resolvable` — matching the Python path's behavior
+exactly. Without this, the self-check would report a phantom
+`import-not-found` error for `tomllib` whenever `compute_dep_records`
+ran (which it does under `num_workers > 0`, since that forces
+`native_resolver = True`).
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `testmodulefinder.py` (`TEST_NATIVE_RESOLVER=1`) | 16 passed |
+| `testgraph.py` (`TEST_NATIVE_RESOLVER=1`) | 11 passed |
+| `testcheck.py` (`TEST_NATIVE_RESOLVER=1`) | 8198 passed, 15 skipped, 7 xfailed |
+| Rust unit tests | 32 passed (15 resolution + 15 dep-walk + 2 version-gating regression) |
+
+The 2 version-gating regression tests pin the `tomllib` fix: a stdlib
+module outside the target version range is skipped (empty records), while
+the same module in range is included.
+
+

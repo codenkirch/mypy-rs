@@ -26,7 +26,9 @@ import module_resolver
 from mypy.modulefinder import ModuleNotFoundReason
 
 if TYPE_CHECKING:
+    from mypy.errors import Errors
     from mypy.modulefinder import SearchPaths, StdlibVersions
+    from mypy.nodes import ImportBase, MypyFile
     from mypy.options import Options
 
 # Rust result-kind sentinels. Must match crates/module_resolver/src/lib.rs.
@@ -58,6 +60,7 @@ def make_resolver(
         list(search_paths.mypy_path),
         list(search_paths.package_path),
         list(search_paths.typeshed_path),
+        options.python_version,
         stdlib_list,
         sorted(stub_flat),
         sorted(stub_namespace.items()),
@@ -87,3 +90,97 @@ def resolve_module(
         assert path is not None
         return path, can_cache
     return ModuleNotFoundReason(kind), can_cache
+
+
+# Rust ImportRecord kinds. Must match crates/module_resolver/src/lib.rs.
+_IMP_IMPORT = 0
+_IMP_IMPORTFROM = 1
+_IMP_IMPORTALL = 2
+
+
+def _import_to_record(
+    imp: ImportBase,
+) -> tuple[int, str, int, list[tuple[str, str | None]], int, bool, bool, bool, bool]:
+    """Flatten an ``ImportBase`` node into the plain-record shape Rust expects.
+
+    The field order must match the ``ImportRecord`` struct's declaration
+    order in ``crates/module_resolver/src/lib.rs`` (the struct derives
+    ``FromPyObject``, so PyO3 reads fields positionally from the tuple).
+    """
+    from mypy import nodes
+
+    if isinstance(imp, nodes.Import):
+        return (
+            _IMP_IMPORT,
+            imp.ids[0][0] if imp.ids else "",
+            0,  # relative — Import is always absolute
+            imp.ids,
+            imp.line,
+            imp.is_top_level,
+            imp.is_unreachable,
+            imp.is_unreachable_dependency,
+            imp.is_mypy_only,
+        )
+    if isinstance(imp, nodes.ImportFrom):
+        return (
+            _IMP_IMPORTFROM,
+            imp.id,
+            imp.relative,
+            imp.names,
+            imp.line,
+            imp.is_top_level,
+            imp.is_unreachable,
+            imp.is_unreachable_dependency,
+            imp.is_mypy_only,
+        )
+    if isinstance(imp, nodes.ImportAll):
+        return (
+            _IMP_IMPORTALL,
+            imp.id,
+            imp.relative,
+            [],  # ImportAll has no names list
+            imp.line,
+            imp.is_top_level,
+            imp.is_unreachable,
+            imp.is_unreachable_dependency,
+            imp.is_mypy_only,
+        )
+    raise TypeError(f"Unexpected import type: {type(imp).__name__}")
+
+
+def compute_dep_records(
+    resolver: module_resolver.NativeResolver,
+    *,
+    file: MypyFile,
+    known_modules: set[str],
+    errors: Errors,
+    options: Options,
+) -> list[tuple[int, str, int]]:
+    """Compute ``(priority, module_id, line)`` records for ``file``'s imports.
+
+    Mirrors ``BuildManager.all_imported_modules_in_file``: walks the import
+    list, computes priorities, corrects relative imports, expands ancestor
+    packages, and discriminates submodule-vs-name. The walk runs entirely in
+    Rust (via the long-lived ``NativeResolver``); only the import records
+    (already deserialized AST nodes) and the known-modules set cross the
+    boundary.
+
+    The known-modules set is rebuilt per call from
+    ``manager.modules`` + ``source_set.source_modules`` so Rust's
+    ``is_module`` check mirrors the build-graph fast path before falling back
+    to filesystem resolution.
+    """
+    import_records = [_import_to_record(imp) for imp in file.imports]
+    records, error = resolver.compute_dep_records(
+        file.fullname,
+        file.path,
+        import_records,
+        known_modules,
+    )
+    if error is not None:
+        # Report the blocking relative-import error, mirroring
+        # ``BuildManager.correct_rel_imp``'s ``self.error(...)`` call.
+        line, message = error
+        errors.set_file(file.path, file.fullname, options=options)
+        errors.report(line, 0, message, blocker=True)
+    return records
