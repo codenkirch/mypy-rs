@@ -52,7 +52,10 @@ Follow a strangler-fig approach:
 - Do not start by porting `mypy.nodes` or `mypy.types`; they are widely shared
   mutable object graphs and plugin-visible.
 - Treat the native parser path as the first production migration seam.
-- Next candidates are module discovery/import graph prepass, cache indexing and
+- The native module resolver (`FindModuleCache._find_module`) and the
+  dependency-records extraction (`BuildManager.all_imported_modules_in_file`)
+  are the second and third seams; both are ported behind the
+  `native_resolver` dispatch gate. Next candidates are cache indexing and
   validation, and only later selected pure type-operation kernels.
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
@@ -90,3 +93,30 @@ uv run all
 
 For Rust migration work, add targeted parity tests and include native-parser,
 daemon, cache, and incremental-mode checks when affected.
+
+### Native resolver / dependency-records parity
+
+The native resolver and dependency-records extraction are gated behind
+`Options.native_resolver` (forced on under parallel mode via `main.py`).
+Build the extension before running parity:
+
+```bash
+# Build the module_resolver extension into the venv (editable).
+cd crates/module_resolver && uvx maturin develop && cd ../..
+
+# Parity suites — both run against the in-tree Rust extension.
+TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
+  mypy/test/testmodulefinder.py mypy/test/testgraph.py
+TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 mypy/test/testcheck.py
+```
+
+`TEST_NATIVE_RESOLVER=1` flips `Options.native_resolver` in the test harness
+so the existing fixtures become a parity differential. The daemon
+(`fine_grained_incremental`) and Bazel paths stay on the Python resolver by
+the dispatch gate, so they need no special env var.
+
+## Pull Requests
+
+The default branch on this fork is `main` (not `master`). Always target
+`main` as the PR base. Branch from `main` before committing — do not commit
+directly to `main`.
