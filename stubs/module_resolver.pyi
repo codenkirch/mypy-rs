@@ -32,6 +32,9 @@ class NativeResolver:
     def resolve(
         self, id: str, use_typeshed: bool, follow_untyped_imports: bool
     ) -> tuple[int, Optional[str], bool]: ...
+    def resolve_many(
+        self, ids_with_follow: list[tuple[str, bool]]
+    ) -> list[tuple[int, Optional[str], bool]]: ...
     def compute_dep_records(
         self,
         file_id: str,
