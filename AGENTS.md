@@ -112,8 +112,9 @@ TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 mypy/test/testcheck.py
 
 `TEST_NATIVE_RESOLVER=1` flips `Options.native_resolver` in the test harness
 so the existing fixtures become a parity differential. The daemon
-(`fine_grained_incremental`) and Bazel paths stay on the Python resolver by
-the dispatch gate, so they need no special env var.
+(`fine_grained_incremental`) path now also uses the native resolver (it
+reads through the shared `FsCache`); only Bazel stays on the Python
+resolver by the dispatch gate, so the Bazel path needs no special env var.
 
 ### Native parser build order
 

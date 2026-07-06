@@ -805,11 +805,11 @@ the same module in range is included.
 
 The third slice ports `mypy.fscache.FileSystemCache` to Rust behind a
 `FsCache` `#[pyclass]`. The Python class becomes a thin delegate that
-forwards every method to the Rust implementation. This is the foundation
-for dropping the daemon exclusion gate (`_native_gate_active` excludes
-`fine_grained_incremental`): once `NativeResolver` reads through the same
-shared `FsCache` (Phase 2), the dual-cache hazard disappears and the
-daemon can use native resolution.
+forwards every method to the Rust implementation. This was the foundation
+for dropping the daemon exclusion gate (`_native_gate_active` excluded
+`fine_grained_incremental`): Phase 2 (below) repointed `NativeResolver`
+at the shared `FsCache`, eliminating the dual-cache hazard so the daemon
+now uses native resolution.
 
 ### Why this slice
 
@@ -821,13 +821,14 @@ consistency: repeated reads of the same path return the same result even
 if the real filesystem changes underneath. `flush()` starts a new
 transaction. Both are naturally Rust-implementable.
 
-The dual-cache hazard is the concrete blocker: `NativeResolver` owns four
-caches (`listdir_cache`, `isfile_case_cache`, `exists_case_cache`,
-`stat_cache` at `crates/module_resolver/src/lib.rs:342-348`) that mirror
-`FileSystemCache`'s caches one-for-one. Both can disagree within a
-transaction. The `_native_gate_active` exclusion of
-`fine_grained_incremental` (`mypy/modulefinder.py:403`) is the only thing
-preventing that hazard in daemon mode today.
+The dual-cache hazard was the concrete blocker for daemon parity:
+`NativeResolver` owned four caches (`listdir_cache`, `isfile_case_cache`,
+`exists_case_cache`, `stat_cache`) that mirrored `FileSystemCache`'s caches
+one-for-one, and both could disagree within a transaction. The
+`_native_gate_active` exclusion of `fine_grained_incremental`
+(`mypy/modulefinder.py:403`) was the only thing preventing that hazard in
+daemon mode. Phase 2 (below) resolved this by repointing `NativeResolver`
+at the shared `FsCache`.
 
 ### Scope
 
@@ -861,8 +862,8 @@ preventing that hazard in daemon mode today.
 tiny no-pyo3 crate so `fs_cache` and `module_resolver` can both depend
 on it without one pyo3 cdylib needing to link the other. The trait is the
 single seam through which `NativeResolver` reads the filesystem; Phase 2
-will swap production's `fs` parameter from `&NativeResolver` (which
-`impl FsProbe`) to `&FsCache`.
+swapped production's `fs` parameter from `&NativeResolver` (which `impl
+FsProbe`) to `&FsCache`.
 
 ### Parity baselines
 
@@ -911,12 +912,117 @@ PYTHONPATH=... \
   --no-incremental --cache-dir /tmp/perf-fscache -p mypy -p mypyc
 ```
 
-### Next milestone (Phase 2)
 
-Rework `NativeResolver` to read through the shared `FsCache` (retire its
-private `StdFs`/`HashMapFs` caches or repoint them at the shared cache);
-drop the `fine_grained_incremental` exclusion in `_native_gate_active`.
-Daemon mode then uses the native resolution path with snapshot
-consistency, eliminating the dual-cache hazard and landing the 6x
-batched-resolution win in daemon mode.
+## Milestone 2 (Phase 2): `NativeResolver` Reads Through the Shared `FsCache`
+
+Phase 2 retires the dual-cache hazard by repointing `NativeResolver` at
+the shared `FsCache`. The resolver no longer owns private FS caches; it
+borrows the `FsCache` pyclass owned by the Python `FileSystemCache`
+delegate, so there is exactly one FS cache per transaction. With the
+hazard gone, the `_native_gate_active` exclusion of
+`fine_grained_incremental` is dropped and daemon mode uses the native
+resolution path, landing the 6x batched-resolution win in daemon mode.
+
+### Why this slice
+
+The strangler-fig contract requires that adding Rust behind a narrow
+interface never changes Python-facing behavior. Phase 1 left the daemon
+exclusion in place because `NativeResolver`'s private caches could
+disagree with `FileSystemCache`'s caches within a transaction — a
+correctness hazard, not a performance one. Phase 2 removes the hazard at
+its root (one cache, not two) rather than patching around it (exclusion
+gate), which is the only sound way to extend native resolution to daemon
+mode.
+
+### Scope
+
+**Rust** (`crates/module_resolver/`):
+- `FsCache` pyclass moved into `module_resolver` (merged from the deleted
+  `crates/fs_cache` crate). Two pyo3 cdylibs cannot depend on each other
+  (feature unification propagates `extension-module`, breaking the link
+  step), so both pyclasses live in one cdylib.
+- `NativeResolver` holds `Py<FsCache>` instead of four private cache
+  fields. `resolve` / `resolve_many` / `compute_dep_records` borrow it
+  per call (`self.fs_cache.borrow(py)` → `&*fs`) and pass `&FsCache` as
+  the `fs: F: FsProbe` parameter.
+- Removed: `impl FsProbe for NativeResolver`, `stat_cached`,
+  `listdir_cached`, `listdir_uncached`, `case_check`,
+  `case_check_uncached`, `split_head_tail` (all now dead — the shared
+  `FsCache` owns these).
+- New `NativeResolver::flush()` pymethod clears the resolver's derived
+  resolution caches (`initial_components`, `ns_ancestors`) that must not
+  outlive an FS transaction.
+
+**`crates/fs_probe/`**: added a blanket `impl<T: FsProbe + ?Sized>
+FsProbe for &T` so `&FsCache` (obtained via `&*PyRef<FsCache>`) satisfies
+the `F: FsProbe` bound without `NativeResolver` needing its own impl.
+
+**Python**:
+- `mypy/modulefinder.py`: `_native_gate_active` no longer excludes
+  `fine_grained_incremental` (only `bazel` remains, for the fake-init
+  synthesis path). `FindModuleCache.clear()` now calls
+  `self._native_resolver.flush()` so the derived caches don't outlive an
+  FS transaction. `_ensure_native_resolver` passes `fscache=self.fscache`
+  to `make_resolver`.
+- `mypy/native_resolve.py`: `make_resolver` takes a `fscache:
+  FileSystemCache` param and passes `fscache._rust` (the `FsCache`
+  pyclass) as `NativeResolver`'s first constructor arg.
+- `mypy/dmypy_server.py`: when `_HAS_RUST_CACHE and not options.bazel`,
+  sets `options.native_resolver = True` before the initial options
+  snapshot (in `__init__`) and re-applies it after `process_options` in
+  `check()` (before `compare_stable`), so the daemon uses native
+  resolution without triggering a "configuration changed" restart.
+- `mypy/fscache.py`: imports `FsCache` from `module_resolver` (not the
+  deleted `fs_cache` extension).
+- `mypy/options.py`: removed `native_resolver` from
+  `OPTIONS_AFFECTING_CACHE`. It is a pure performance optimization
+  (verified by testcheck parity) that does not change cache semantics;
+  leaving it in caused fine-grained cache invalidation because the
+  initial `build.build()` run (cmd1) used the default `native_resolver=
+  False` while the subsequent `Server.check()` increments used `True`.
+
+**Stays in Python**: `FakeFSCache` test subclass, `copy_os_error` helper,
+the `FileSystemCache` delegate surface.
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `testfscache.py` + `test_find_sources.py` | 13 passed |
+| `testmodulefinder.py` + `testgraph.py` (`TEST_NATIVE_RESOLVER=1`) | 27 passed |
+| `testcheck.py` (`TEST_NATIVE_RESOLVER=1`) | 8198 passed, 15 skipped, 7 xfailed |
+| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1300 passed, 33 pre-existing failures (identical to `main` baseline) |
+| Rust unit tests (`module_resolver`, incl. `fs_cache` submodule) | 46 passed |
+| Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
+
+The 33 fine-grained/daemon failures are pre-existing on `main` (native
+parser error-message differences in blocking-error tests) and are
+unaffected by this slice — the failure set is byte-identical to the
+Phase 1 baseline.
+
+### Verification
+
+```bash
+cargo test --release -p mypy-module-resolver -p mypy-fs-probe
+cd crates/module_resolver && uvx maturin develop --release && cd ../..
+
+TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 \
+  mypy/test/testmodulefinder.py mypy/test/testgraph.py
+TEST_NATIVE_RESOLVER=1 uv run python -m pytest -n0 mypy/test/testcheck.py
+uv run python -m pytest -n0 \
+  mypy/test/testfscache.py mypy/test/test_find_sources.py
+uv run python -m pytest -n0 \
+  mypy/test/testfinegrained.py mypy/test/testdaemon.py \
+  mypy/test/testfinegrainedcache.py
+uv run python -m mypy --config-file mypy_self_check.ini -p mypy
+```
+
+### Next milestone (Phase 3)
+
+Module discovery / import graph prepass: a Rust prepass that walks the
+search paths once and produces the full module-id → path map (and the
+suppressed / unreachable dependency sets) in a single traversal, so the
+per-module `find_module` calls in `build.py` can be replaced by a lookup.
+This is the next candidate in the strangler-fig order: cache indexing and
+validation, then selected pure type-operation kernels.
 

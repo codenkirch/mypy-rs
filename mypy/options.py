@@ -71,7 +71,6 @@ OPTIONS_AFFECTING_CACHE: Final = (
         "platform",
         "bazel",
         "native_parser",
-        "native_resolver",
         "old_type_inference",
         "plugins",
         "disable_bytearray_promotion",

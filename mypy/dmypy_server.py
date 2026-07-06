@@ -26,7 +26,7 @@ import mypy.errors
 import mypy.main
 from mypy.dmypy_util import WriteToConn, receive, send
 from mypy.find_sources import InvalidSourceList, create_source_list
-from mypy.fscache import FileSystemCache
+from mypy.fscache import FileSystemCache, _HAS_RUST_CACHE
 from mypy.fswatcher import FileData, FileSystemWatcher
 from mypy.inspections import InspectionEngine
 from mypy.ipc import IPCServer
@@ -176,6 +176,11 @@ class Server:
     def __init__(self, options: Options, status_file: str, timeout: int | None = None) -> None:
         """Initialize the server with the desired mypy flags."""
         self.options = options
+        # Strangler-fig enable: the daemon uses native resolution when the
+        # Rust extension is importable. Set BEFORE the snapshot so
+        # compare_stable doesn't see a config change on the first check.
+        if _HAS_RUST_CACHE and not options.bazel:
+            options.native_resolver = True
         # Snapshot the options info before we muck with it, to detect changes
         self.options_snapshot = options.snapshot()
         self.timeout = timeout
@@ -340,6 +345,10 @@ class Server:
                         program="mypy-daemon",
                         header=argparse.SUPPRESS,
                     )
+            # Re-apply the native-resolver enable on the freshly parsed
+            # options, mirroring __init__. Must happen before compare_stable.
+            if _HAS_RUST_CACHE and not options.bazel:
+                options.native_resolver = True
             # Signal that we need to restart if the options have changed
             if not options.compare_stable(self.options_snapshot):
                 return {"restart": "configuration changed"}
