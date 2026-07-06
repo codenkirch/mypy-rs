@@ -259,23 +259,14 @@ uv run pytest mypy/test/testfinegrained.py mypy/test/testdaemon.py
 For checker/type-system behavior changes, use `mypy_primer` as a differential
 test over real projects.
 
-## CI Coverage Observed
+## CI Coverage
 
-The GitHub Actions test matrix runs:
-
-- multiple Python versions
-- Windows, Linux, and macOS jobs
-- interpreted and mypyc-compiled mypy jobs
-- parallel checking jobs with `--mypy-num-workers`
-- mypyc runtime tests
-- type-checking jobs
-- lint jobs
-- a separate `mypy_primer` workflow over real projects
-
-This is strong coverage for ordinary mypy development. For a Rust migration, it
-needs to be supplemented with adapter parity tests, native-parser mode tests,
-cache-format compatibility tests, daemon identity tests, and performance
-regression tracking.
+This fork does not run GitHub Actions (no CI credits). The workflow files that
+upstream mypy ships under `.github/workflows/` have been removed. Parity is
+validated locally instead, via the native-parser test suites, the daemon and
+incremental suites, the mypy self-check, and (when needed) a local
+`mypy_primer` differential run. Add CI back only when there is a hosted runner
+to run it on.
 
 ## Suggested First Milestone
 
@@ -290,7 +281,8 @@ Definition of done:
 - Incremental and daemon tests pass in native parser mode where applicable.
 - Parser output parity is tracked in test data.
 - Performance is measured against the current parser path.
-- The fallback path remains available until CI coverage proves stability.
+- The fallback path remains available until the local parity baselines above
+  prove stable.
 
 After that, start the module discovery/import graph prepass.
 
@@ -438,7 +430,77 @@ Current local-extension baseline for the full native parser suite:
 Current local-extension baseline for full native-parser `testcheck.py`:
 `8144 passed, 69 skipped, 7 xfailed`.
 
-This implementation is not ready to become the default parser solely from this
-file-level parity result. The next correctness step is broader validation
-around daemon, cache, incremental-mode, and realistic mypy self-check paths
-before `mypy.nativeparse` is switched to prefer the in-tree extension.
+Current local-extension baseline for native-parser daemon and incremental
+suites (run with `TEST_NATIVE_PARSER=1`):
+
+- `mypy/test/testfinegrained.py`: `747 passed, 27 skipped`
+- `mypy/test/testdaemon.py`: `37 passed`
+- `mypy/test/testfinegrainedcache.py`: `549 passed, 229 skipped`
+
+Verification run locally:
+
+```bash
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  TEST_NATIVE_PARSER=1 uv run --group test python -m pytest \
+  mypy/test/testfinegrained.py mypy/test/testdaemon.py \
+  mypy/test/testfinegrainedcache.py -q
+```
+
+Current local-extension baseline for the mypy self-check (run with
+`--config-file mypy_self_check.ini -p mypy -p mypyc`, 340 source files):
+
+- Diagnostic parity: byte-for-byte identical output between the default
+  Python parser and `--native-parser`. Both report the same 2 pre-existing
+  errors in `mypy/parse.py` (unrelated to native parsing).
+- Performance (cold, `--no-incremental`, 3 iterations each, best-of):
+
+  | Parser  | real (s) |
+  |---------|----------|
+  | Python  | 7.40     |
+  | Native  | 7.31     |
+
+  No measurable regression. The self-check is type-checker-dominated, so
+  parser time is a small fraction of the total and a parser-only speedup is
+  not expected to move this number significantly. Parser-focused microbench
+  marks (below) are the right place to measure native-parser throughput.
+
+Parser-focused microbenchmark (release build of the Rust extension, mypyc
+build of mypy). Calls `mypy.parse.parse(..., eager=True)` directly on the real
+source corpus — 1856 files, 12,159 KiB (`mypy` + `mypyc` `.py` plus the bundled
+typeshed `.pyi`). Bypasses type checking entirely so only parse + AST
+materialization throughput is measured. Best of 3 iterations:
+
+| Parser  | real (s) | throughput (KiB/s) |
+|---------|----------|--------------------|
+| Python  | 2.472    | 4918               |
+| Native  | 1.761    | 6905               |
+
+Native is **28.8% faster** on this corpus. (A debug build of the Rust
+extension was 53% *slower* than the mypyc Python parser — only the release
+build is a fair comparison, since the Python parser path runs through
+mypyc-optimized code.)
+
+Verification run locally:
+
+```bash
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m mypy --config-file mypy_self_check.ini \
+  --no-incremental --cache-dir /tmp/perf-py -p mypy -p mypyc
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python -m mypy --native-parser \
+  --config-file mypy_self_check.ini --no-incremental \
+  --cache-dir /tmp/perf-native -p mypy -p mypyc
+
+# Parser-only microbenchmark against the real source corpus:
+cargo rustc -p mypy-ast-serialize --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libast_serialize.dylib \
+  /private/tmp/mypy-rs-local-ast/ast_serialize.cpython-313-darwin.so
+PYTHONPATH=/private/tmp/mypy-rs-local-ast \
+  uv run --group test python scripts/bench_parser.py
+```
+
+Local file-level, daemon, cache, incremental, self-check, and performance parity
+are all green. With CI not available on this fork (see "CI Coverage" above),
+the local baselines recorded here are the production-readiness gate for
+`mypy.nativeparse` switching to prefer the in-tree extension.
