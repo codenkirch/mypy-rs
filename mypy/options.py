@@ -393,6 +393,11 @@ class Options:
         # and parallel mode force this on regardless; Bazel stays on the
         # Python resolver (see `FindModuleCache._native_gate_active`).
         self.native_resolver = True
+        # If True, route `erase_type` through the `type_kernel` Rust extension
+        # when importable, with per-call fallback to the pure-Python
+        # `EraseTypeVisitor` for any type class Rust does not handle. Stage 1
+        # of the type-kernel migration; default off until parity is proven.
+        self.native_type_kernel = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

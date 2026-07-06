@@ -55,9 +55,11 @@ Follow a strangler-fig approach:
 - The native module resolver (`FindModuleCache._find_module`) and the
   dependency-records extraction (`BuildManager.all_imported_modules_in_file`)
   are the second and third seams; both are ported behind the
-  `native_resolver` dispatch gate and now default-on. The next candidate
-  is cache indexing/validation; the import-graph prepass is *not* pursued
-  (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`).
+  `native_resolver` dispatch gate and now default-on. The import-graph
+  prepass and cache indexing/validation were both measured and dropped
+  (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`); the
+  type kernel is the active migration target, starting with `erase_type`
+  behind the `native_type_kernel` gate (Stage 1, opt-in).
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
 
@@ -223,6 +225,43 @@ self-check (0 errors). Three parity fixes were applied:
    `decode_python_encoding` so `# coding:` declarations are respected
    and decode errors surface as `CompileError("Cannot decode file: ...")`
    — matching the Python path in `build.py:get_source()`.
+
+### Type kernel build order
+
+The type kernel (`Options.native_type_kernel`, default off — Stage 1 is
+opt-in) is backed by the `type_kernel` Rust extension. It implements
+`erase_type` as a PyO3 function that walks live Python `Type` objects,
+mirroring `mypy.erasetype.EraseTypeVisitor`, with per-call fallback to
+the pure-Python visitor for any type class Rust does not handle. This is
+the first slice of the type-kernel migration; see "Milestone 3 (Phase
+4)" in `docs/rust-migration-strangler.md` for the staging roadmap.
+
+**Rebuild the extension after any change to
+`crates/type_kernel/src/lib.rs`.** The same stale-binary hazard as the
+native parser applies: the on-disk source can look correct while the
+installed `.so` is stale. Build via `cargo rustc` to a scratch dir (not
+`maturin develop`, for the same reason as the other crates):
+
+```bash
+cargo rustc -p mypy-type-kernel --features extension-module --lib \
+  --crate-type cdylib --release -- -C link-arg=-undefined -C link-arg=dynamic_lookup
+cp target/release/libtype_kernel.dylib \
+  /private/tmp/mypy-rs-local-typekernel/type_kernel.cpython-313-darwin.so
+```
+
+Run parity with all three extension dirs prepended to `PYTHONPATH`:
+
+```bash
+PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-ast \
+  TEST_NATIVE_TYPE_KERNEL=1 TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
+  uv run python -m pytest mypy/test/testtypes.py mypy/test/testcheck.py -q
+```
+
+The type-kernel gate is opt-in: without `TEST_NATIVE_TYPE_KERNEL=1`,
+`erase_type` uses the pure-Python visitor unchanged. The build manager
+propagates `Options.native_type_kernel` to a module-level flag in
+`mypy/erasetype.py` at the start of each build (`_set_native_erase_active`),
+so the hot path avoids an options lookup per call.
 
 ## Pull Requests
 

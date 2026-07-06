@@ -37,6 +37,30 @@ from mypy.types import (
 )
 from mypy.typevartuples import erased_vars
 
+# Stage 1 type-kernel seam: when the `type_kernel` Rust extension is importable
+# and `Options.native_type_kernel` is set, `erase_type` is routed through Rust.
+# The Rust path returns `None` for any type it does not handle, in which case
+# we fall back to the pure-Python `EraseTypeVisitor`. This is the strangler-fig
+# per-call gate — no behavior change unless the option is explicitly enabled.
+try:
+    from type_kernel import erase_type as _rust_erase_type
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_erase_type = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag read by the gate below. Set by the build manager from
+# `Options.native_type_kernel` at the start of each build, so the hot path
+# avoids an attribute lookup on the options object per call.
+_native_erase_active: bool = False
+
+
+def _set_native_erase_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_erase_active
+    _native_erase_active = active
+
 
 def erase_type(typ: Type) -> ProperType:
     """Erase any type variables from a type.
@@ -50,6 +74,11 @@ def erase_type(typ: Type) -> ProperType:
       Callable[[A1, A2, ...], R] -> Callable[..., Any]
       Type[X] -> Type[Any]
     """
+    if _HAS_TYPE_KERNEL and _native_erase_active:
+        result = _rust_erase_type(typ)
+        if result is not None:
+            return result
+        # Rust returned None (unsupported case) — fall through to Python.
     typ = get_proper_type(typ)
     return typ.accept(EraseTypeVisitor())
 
