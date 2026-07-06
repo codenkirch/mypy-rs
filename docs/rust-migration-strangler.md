@@ -1232,11 +1232,12 @@ default.
 
 ### Staging roadmap
 
-- **Stage 1 (this milestone)**: `erase_type` via PyO3, gated,
+- **Stage 1 (milestone 3)**: `erase_type` via PyO3, gated,
   parity-tested. Proves the seam.
-- **Stage 2**: More pure visitors (`LastKnownValueEraser`,
-  `TypeStrVisitor`) on the same seam. Cheap wins, broadens Rust coverage
-  of the visitor dispatch.
+- **Stage 2 (milestone 4)**: `remove_instance_last_known_values`
+  (`LastKnownValueEraser`) on the same seam. Broadens Rust coverage of
+  the visitor dispatch and the `TypeTranslator` defaults; exercised by
+  the checker, expression checker, and binder on hot paths.
 - **Stage 3**: Rust-owned `Type` enum + bytes seam. Port
   `is_subtype`/`is_proper_subtype` (the perf win — 26 unit tests +
   thousands of data-driven cases). `TypeInfo` snapshot protocol
@@ -1245,4 +1246,79 @@ default.
   — the big one, highest value, needs the plugin-hook snapshot
   protocol.
 - **Stage 5**: Semantic analyzer kernel (`semanal_time`, 16% of build).
+
+
+## Milestone 4 (Phase 4): Type Kernel — Stage 2 (`remove_instance_last_known_values`)
+
+Stage 2 ports the second pure visitor onto the PyO3 seam established in
+Stage 1: `mypy.erasetype.remove_instance_last_known_values`, backed by
+`LastKnownValueEraser` (a `TypeTranslator`).
+
+### Why this visitor
+
+- **Pure translator**: `Type → Type`, no plugin hooks, no `TypeInfo`
+  mutation. Unlike `erase_type` it reads no `defn.type_vars` — it only
+  walks the type's own children and strips `Instance.last_known_value`.
+- **Hot path**: 11 call sites across `mypy/checker.py`,
+  `mypy/checkexpr.py`, and `mypy/binder.py`, including assignment
+  narrowing and union simplification. Broadens the Rust dispatch
+  coverage beyond the `EraseTypeVisitor` shape.
+- **Reuses the seam**: same `TypeRefs` class cache, same
+  `Options.native_type_kernel` gate, same `TEST_NATIVE_TYPE_KERNEL` env
+  var. No new Python-side surface — one more `#[pyfunction]` on the
+  existing module.
+- **`TypeTranslator` defaults are mechanical**: leaf types are identity,
+  composite types recurse on children via `copy_modified` / direct
+  construction. The only non-trivial override is `visit_union_type`,
+  which deduplicates `Instance` items with the same fullname via
+  `make_simplified_union`.
+
+### Implementation
+
+`crates/type_kernel` exposes a second PyO3 function:
+
+```rust
+#[pyfunction]
+fn remove_instance_last_known_values(typ: &PyAny) -> PyResult<PyObject>
+```
+
+`lkv_translate_one` dispatches by `isinstance` against the same resolved
+class objects used by `erase_type`. It mirrors the three
+`LastKnownValueEraser` overrides:
+
+- `visit_instance`: if `last_known_value` is set or `args` is non-empty,
+  call `copy_modified(args=[translated], last_known_value=None)`.
+  Otherwise return as-is.
+- `visit_type_alias_type`: return as-is (aliases can't contain literal
+  values).
+- `visit_union_type`: translate all items, then group `Instance` items
+  with no args by `type.fullname` and merge groups of size >1 via
+  `mypy.typeops.make_simplified_union`, matching the Python dedup
+  exactly.
+
+All other types use the `TypeTranslator` defaults implemented directly
+in Rust (`visit_callable_type`, `visit_tuple_type`, `visit_overloaded`,
+`visit_type_type`, `visit_literal_type`, `visit_unpack_type`). For any
+case Rust does not handle — `TypedDictType`, `Parameters`, non-list/tuple
+`args` shapes — it returns `None` and the Python caller falls back to
+the pure-Python `LastKnownValueEraser`. Same strangler-fig per-call gate
+as Stage 1.
+
+One subtlety caught during parity: `Instance.args` is typed as
+`tuple[Type, ...]` but arrives as a `list` in some code paths. The Rust
+path accepts both before recursing or checking emptiness.
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `testtypes.py` full (`TEST_NATIVE_TYPE_KERNEL=1`) | 119 passed, 2 skipped |
+| `testtypes.py::RemoveLastKnownValueSuite` (`TEST_NATIVE_TYPE_KERNEL=1`) | 6 passed |
+| `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 TEST_NATIVE_TYPE_KERNEL=1`) | 8144 passed, 69 skipped, 7 xfailed |
+| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1333 passed, 256 skipped |
+| Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
+
+The default-off path is unchanged. Stage 2 does not flip the default —
+`Options.native_type_kernel` remains `False` until the full staging
+roadmap proves out.
 

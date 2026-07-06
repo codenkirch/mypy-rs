@@ -59,7 +59,9 @@ Follow a strangler-fig approach:
   prepass and cache indexing/validation were both measured and dropped
   (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`); the
   type kernel is the active migration target, starting with `erase_type`
-  behind the `native_type_kernel` gate (Stage 1, opt-in).
+  behind the `native_type_kernel` gate (Stage 1, opt-in). Stage 2 ports
+  `remove_instance_last_known_values` (`LastKnownValueEraser`) on the same
+  PyO3 seam, also opt-in.
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
 
@@ -228,13 +230,19 @@ self-check (0 errors). Three parity fixes were applied:
 
 ### Type kernel build order
 
-The type kernel (`Options.native_type_kernel`, default off — Stage 1 is
-opt-in) is backed by the `type_kernel` Rust extension. It implements
-`erase_type` as a PyO3 function that walks live Python `Type` objects,
-mirroring `mypy.erasetype.EraseTypeVisitor`, with per-call fallback to
-the pure-Python visitor for any type class Rust does not handle. This is
-the first slice of the type-kernel migration; see "Milestone 3 (Phase
-4)" in `docs/rust-migration-strangler.md` for the staging roadmap.
+The type kernel (`Options.native_type_kernel`, default off — opt-in) is
+backed by the `type_kernel` Rust extension. It implements two PyO3
+functions that walk live Python `Type` objects:
+
+- `erase_type` (Stage 1) — mirrors `mypy.erasetype.EraseTypeVisitor`.
+- `remove_instance_last_known_values` (Stage 2) — mirrors
+  `mypy.erasetype.LastKnownValueEraser` (a `TypeTranslator`).
+
+Both return `None` for any type class Rust does not handle, and the
+Python caller falls back to the pure-Python visitor. This is the
+strangler-fig per-call gate. See "Milestone 3 (Phase 4)" and "Milestone 4
+(Phase 4)" in `docs/rust-migration-strangler.md` for the staging
+roadmap.
 
 **Rebuild the extension after any change to
 `crates/type_kernel/src/lib.rs`.** The same stale-binary hazard as the
@@ -258,8 +266,9 @@ PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-reso
 ```
 
 The type-kernel gate is opt-in: without `TEST_NATIVE_TYPE_KERNEL=1`,
-`erase_type` uses the pure-Python visitor unchanged. The build manager
-propagates `Options.native_type_kernel` to a module-level flag in
+both `erase_type` and `remove_instance_last_known_values` use the
+pure-Python visitors unchanged. The build manager propagates
+`Options.native_type_kernel` to a module-level flag in
 `mypy/erasetype.py` at the start of each build (`_set_native_erase_active`),
 so the hot path avoids an options lookup per call.
 
