@@ -55,10 +55,26 @@ Follow a strangler-fig approach:
 - The native module resolver (`FindModuleCache._find_module`) and the
   dependency-records extraction (`BuildManager.all_imported_modules_in_file`)
   are the second and third seams; both are ported behind the
-  `native_resolver` dispatch gate. Next candidates are cache indexing and
-  validation, and only later selected pure type-operation kernels.
+  `native_resolver` dispatch gate and now default-on. The next candidate
+  is cache indexing/validation; the import-graph prepass is *not* pursued
+  (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`).
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
+
+## Search Tools
+
+Use `rg` (ripgrep) and `fd` instead of `grep` and `find` for any
+codebase search. They are faster, respect `.gitignore` by default, and
+produce cleaner output. Reach for them when locating symbols, files,
+or patterns rather than the POSIX equivalents. Examples:
+
+```bash
+rg "native_resolver" mypy/
+fd -e py -p "testfinegrained"
+```
+
+Only fall back to `grep`/`find` when a pipeline or environment strictly
+requires POSIX semantics.
 
 ## Design Principles
 
