@@ -139,6 +139,7 @@ class TypeCheckSuite(DataSuite):
         options.show_traceback = True
         options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
         options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+        options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
         options.reveal_verbose_types = not testcase.name.endswith("_no_verbose_reveal")
 
         if options.num_workers:
@@ -158,6 +159,8 @@ class TypeCheckSuite(DataSuite):
             raise pytest.skip("Test not supported by native parser yet")
         if options.native_resolver and testcase.name.endswith("_no_native_resolver"):
             raise pytest.skip("Test not supported by native resolver yet")
+        if options.native_type_kernel and testcase.name.endswith("_no_native_type_kernel"):
+            raise pytest.skip("Test not supported by native type kernel yet")
 
         # Enable some options automatically based on test file name.
         if "columns" in testcase.file:

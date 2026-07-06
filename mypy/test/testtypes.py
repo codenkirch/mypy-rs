@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import re
 from unittest import TestCase, skipUnless
 
-from mypy.erasetype import erase_type, remove_instance_last_known_values
+from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
+
+# Mirror testcheck.py: flip the type-kernel gate from the env var so the
+# unit tests exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set.
+# Unset exercises the default (Python) path; =1 exercises the Rust path.
+_set_native_erase_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type

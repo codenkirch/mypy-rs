@@ -1108,10 +1108,13 @@ the migration doc lists as item #4 but flags as high-risk because
 plugin-visible. That warning stands; the kernel is high-value but needs
 careful scoping.
 
-**Revised next candidate: cache indexing and validation (item #3).**
-`mypy/cache.py` indexing/validation is string/path heavy, has a clear
-schema, and sits below the mutable object graph — a safer Rust target
-than the type kernel, and not a micro-optimization like the prepass.
+**Revised next candidate: the type kernel (item #4).** The cache
+indexing/validation slice (item #3) was also measured and dropped —
+`load_meta_time` is 8ms and `validate_meta_time` is 5ms on a ~4s warm
+build (0.17% combined), and validation is dominated by `stat()` syscalls
+Rust cannot speed up. See "Stage 1" below for the type-kernel staging
+plan, which targets the real bottleneck (type checker + semantic analyzer,
+87% of build time combined).
 
 ## Performance baseline
 
@@ -1137,4 +1140,109 @@ This is the regression baseline for the default-on resolver + parser.
 Re-run with `--dump-build-stats` after changes to the parser or resolver
 seams and compare; a >10% regression in any row warrants investigation
 before merging.
+
+## Milestone 3 (Phase 4): Type Kernel — Stage 1 (`erase_type`)
+
+The type kernel is the highest-risk slice in the migration: `mypy.types`
+is a widely-shared mutable object graph, plugin-visible, with 30+ `Type`
+subclasses, a `TypeVisitor` dispatch, two serialization formats (dict +
+binary), and mutation seams (`type_ref` fixup, `instance_cache`
+flyweights, lazy bool caches). AGENTS.md says "do not start by porting
+`mypy.nodes` or `mypy.types`" — Stage 1 consciously relaxes that for
+the kernel, but keeps every stage behind a parity gate with Python
+fallback, so no behavior changes ship unproven.
+
+### The seam challenge
+
+Every kernel operation needs to resolve `TypeInfo` objects (MRO, variances,
+protocol members) referenced by name via `type_ref` — these are *not* in
+the binary wire format. Two possible seams:
+
+- **(A) PyO3 on live Python `Type` objects** — Rust walks Python objects
+  via the C API. Simple, no new wire format, but per-call FFI overhead
+  makes it slower than Python for cheap operations, and it touches the
+  mutable graph directly.
+- **(B) Rust-owned `Type` representation built from the binary wire
+  format** — Rust holds its own `Type` enum, built from `Type.write(bytes)`
+  and a `TypeInfo` snapshot side-table. Faster at steady state, but
+  requires a full Rust `Type` hierarchy + snapshot protocol before any
+  operation can run.
+
+**Stage 1 uses (A)** because it proves the seam end-to-end with the
+smallest surface area and lets Rust fall back to Python per-call for any
+case it doesn't handle yet (true strangler-fig). Stage 3+ (`is_subtype`,
+the perf win) will move to (B) once the operation shape is validated.
+
+### Why `erase_type` is the right first operation
+
+- **Pure visitor**: `Type → Type`, no plugin hooks, no mutation of input,
+  no `TypeInfo` mutation. The only `TypeInfo` dependency is
+  `t.type.defn.type_vars` (count + kinds, for `Instance` erasure) — a
+  narrow, stable record read directly from the live object.
+- **Well-tested**: 8 dedicated tests in `mypy/test/testtypes.py`
+  (`test_trivial_erase`, `test_erase_with_type_variable`,
+  `test_erase_with_generic_type`, `_recursive`, `_tuple_type`,
+  `_function_type`, `_type_object`, `_type_type`). Parity contract is
+  `str(erase_type(orig)) == str(result)` — string equality of
+  pretty-printed types, robust and already used by the tests.
+- **Called constantly** from the checker and subtypes, so the seam is
+  exercised under real load.
+- **Cheap enough to not regress visibly** if the PyO3 path is slower
+  per-call, but real enough to prove the full dispatch gate.
+
+### Implementation
+
+New crate `crates/type_kernel` exposes one PyO3 function:
+
+```rust
+#[pyfunction]
+fn erase_type(typ: &PyAny) -> PyResult<PyObject>
+```
+
+It walks `typ` as a Python `Type` object via `isinstance` checks against
+resolved class objects (so plugin subclasses are handled correctly),
+mirroring `EraseTypeVisitor`. For `Instance`, it reads
+`t.type.defn.type_vars` directly from the live `TypeInfo` (same as the
+Python visitor — no snapshot cache needed in Stage 1). For
+`CallableType`, `UnionType`, `TypeType`, `Overloaded`, `TupleType`,
+`TypedDictType`, it recurses or constructs new Python objects via the
+same Python constructors. For any class it doesn't recognize, it
+returns `None` — the Python caller falls back to the pure-Python
+visitor. This is the strangler-fig per-call gate.
+
+The Python side gates `erase_type()` in `mypy/erasetype.py` on a
+module-level flag set by the build manager from
+`Options.native_type_kernel` (default `False` — Stage 1 is opt-in).
+Test harnesses flip it from `TEST_NATIVE_TYPE_KERNEL`, mirroring the
+`TEST_NATIVE_PARSER`/`TEST_NATIVE_RESOLVER` pattern.
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `testtypes.py -k test_erase` (`TEST_NATIVE_TYPE_KERNEL=1`) | 7 passed |
+| `testtypes.py` full (`TEST_NATIVE_TYPE_KERNEL=1`) | 119 passed, 2 skipped |
+| `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 TEST_NATIVE_TYPE_KERNEL=1`) | 8144 passed, 69 skipped, 7 xfailed |
+| Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
+
+The default-off path is unchanged: `testtypes.py -k test_erase` without
+the env var passes identically. The gate is opt-in until parity is
+proven across the full suite, at which point a future stage can flip the
+default.
+
+### Staging roadmap
+
+- **Stage 1 (this milestone)**: `erase_type` via PyO3, gated,
+  parity-tested. Proves the seam.
+- **Stage 2**: More pure visitors (`LastKnownValueEraser`,
+  `TypeStrVisitor`) on the same seam. Cheap wins, broadens Rust coverage
+  of the visitor dispatch.
+- **Stage 3**: Rust-owned `Type` enum + bytes seam. Port
+  `is_subtype`/`is_proper_subtype` (the perf win — 26 unit tests +
+  thousands of data-driven cases). `TypeInfo` snapshot protocol
+  formalized.
+- **Stage 4**: `check_call` / `ExpressionChecker.visit_call_expr_inner`
+  — the big one, highest value, needs the plugin-hook snapshot
+  protocol.
+- **Stage 5**: Semantic analyzer kernel (`semanal_time`, 16% of build).
 

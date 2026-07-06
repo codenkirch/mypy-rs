@@ -886,6 +886,11 @@ class BuildManager:
         self.stats_enabled = self.options.dump_build_stats
         self.logging_enabled = self.options.verbosity >= 1
         self.tracing_enabled = self.options.verbosity >= 2
+        # Propagate the type-kernel gate to the erasetype module flag, which
+        # the hot-path `erase_type()` reads without an options lookup per call.
+        from mypy.erasetype import _set_native_erase_active
+
+        _set_native_erase_active(self.options.native_type_kernel)
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()
