@@ -225,18 +225,24 @@ class FindModuleCache:
         self._stub_namespace: dict[str, str] = {}
         for _ns_top, _ns_map in non_bundled_packages_namespace.items():
             self._stub_namespace.update(_ns_map)
-        # Long-lived Rust resolver: holds the FS caches (listdir, isfile_case,
-        # exists_case, stat) AND the stable resolver config (search paths,
-        # stubinfo tables). Owned by this FindModuleCache so caches persist
-        # across find_module calls, mirroring fscache's cache lifetime.
-        # Lazily constructed on first native resolve so the extension import
-        # stays out of the non-native hot path.
+        # Long-lived Rust resolver: holds the stable resolver config (search
+        # paths, stubinfo tables) and the cross-call resolution caches. Reads
+        # through the shared FsCache owned by self.fscache, so there is exactly
+        # one FS cache per transaction. Lazily constructed on first native
+        # resolve so the extension import stays out of the non-native hot path.
         self._native_resolver: module_resolver.NativeResolver | None = None
 
     def clear(self) -> None:
         self.results.clear()
         self.initial_components.clear()
         self.ns_ancestors.clear()
+        # The native resolver holds derived resolution caches
+        # (initial_components, ns_ancestors) that must not outlive an FS
+        # transaction: fscache.flush() clears the shared FS caches, so the
+        # resolver's derived caches would otherwise read stale toplevel
+        # listings on the next fine-grained increment.
+        if self._native_resolver is not None:
+            self._native_resolver.flush()
 
     def find_module_via_source_set(self, id: str) -> ModuleSearchResult | None:
         """Fast path to find modules by looking through the input sources
@@ -396,13 +402,15 @@ class FindModuleCache:
 
         Shared by ``_resolve`` (module resolution) and ``compute_dependencies``
         (dependency-record extraction) so both dispatch gates stay in sync.
+
+        The resolver reads through the shared ``FsCache`` (owned by
+        ``self.fscache``), so there is exactly one FS cache per transaction.
+        Daemon (``fine_grained_incremental``) mode is no longer excluded:
+        ``FindModuleCache.clear()`` flushes the resolver's derived caches on
+        each fine-grained increment, and ``FileSystemCache.flush()`` flushes
+        the shared FS caches, so both stay consistent within a transaction.
         """
-        return (
-            self.options is not None
-            and self.options.native_resolver
-            and not self.options.fine_grained_incremental
-            and not self.options.bazel
-        )
+        return self.options is not None and self.options.native_resolver and not self.options.bazel
 
     def _ensure_native_resolver(self) -> None:
         """Lazily construct the long-lived ``NativeResolver`` if not yet built.
@@ -421,6 +429,7 @@ class FindModuleCache:
                 stdlib_versions=self.stdlib_py_versions,
                 stub_flat=self._stub_flat,
                 stub_namespace=self._stub_namespace,
+                fscache=self.fscache,
             )
 
     def _typeshed_has_version(self, module: str) -> bool:

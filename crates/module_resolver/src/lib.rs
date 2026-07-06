@@ -22,12 +22,16 @@
 //!     and `exists_case`.
 //!   * `HashMapFs` — an in-memory store used by the Rust unit tests.
 
+mod fs_cache;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use fs_probe::FsProbe;
 use pyo3::prelude::*;
+
+pub use fs_cache::FsCache;
 
 // ---------------------------------------------------------------------------
 // Result encoding
@@ -304,38 +308,32 @@ impl FsProbe for HashMapFs {
 }
 
 // ---------------------------------------------------------------------------
-// std::fs-backed FsProbe for production
+// NativeResolver — production resolver backed by a shared FsCache
 // ---------------------------------------------------------------------------
 
-/// Native module resolver: owns the FS caches, stubinfo tables, search
-/// paths, and resolver config for the lifetime of a `FindModuleCache`.
+/// Native module resolver: owns the stubinfo tables, search paths, resolver
+/// config, and the cross-call resolution caches for the lifetime of a
+/// `FindModuleCache`.
 ///
-/// Exposed to Python as `NativeResolver`. Constructed once when the
-/// dispatch gate in `FindModuleCache._resolve` first routes to Rust, then
-/// reused for every subsequent `find_module` call on that cache. This keeps
-/// the FS caches (listdir, isfile_case, exists_case, stat) AND the stubinfo
-/// tables (stub_flat BTreeSet, stub_namespace BTreeMap) alive across calls,
-/// mirroring `FileSystemCache`'s cache lifetime and avoiding per-call
-/// reconstruction of the lookup tables.
+/// Exposed to Python as `NativeResolver`. Constructed once when the dispatch
+/// gate in `FindModuleCache._resolve` first routes to Rust, then reused for
+/// every subsequent `find_module` call on that cache.
 ///
-/// The dispatch gate routes only cold, real-filesystem runs here: daemon
-/// (`fine_grained_incremental`) and Bazel runs stay on the Python
-/// `_find_module` path. So the resolver never needs to impersonate the
-/// daemon's VFS or synthesize Bazel fake `__init__` files — those concerns
-/// remain Python-owned until the daemon is retired or the Bazel VFS is
-/// ported.
+/// Filesystem access is **not** owned here: the resolver reads through a
+/// shared `FsCache` (`Py<FsCache>`) that is owned by the same
+/// `FileSystemCache` Python delegate the rest of mypy uses. This eliminates
+/// the dual-cache hazard that previously forced `_native_gate_active` to
+/// exclude daemon (`fine_grained_incremental`) and Bazel modes: there is now
+/// exactly one FS cache per transaction, so the resolver and every other
+/// fscache caller see the same snapshot. `fscache.flush()` clears the FS
+/// caches; `NativeResolver::flush()` clears the resolution caches
+/// (`initial_components`, `ns_ancestors`) that are derived from `listdir`
+/// and must not outlive a transaction.
 #[pyclass(name = "NativeResolver")]
 struct NativeResolver {
-    // --- Filesystem caches (mirror FileSystemCache's cache fields) ---
-    /// listdir cache: path -> entry names (or None if the dir read errored,
-    /// mirroring fscache.listdir raising OSError).
-    listdir_cache: RefCell<HashMap<String, Option<Vec<String>>>>,
-    /// isfile_case cache: path -> bool.
-    isfile_case_cache: RefCell<HashMap<String, bool>>,
-    /// exists_case cache: path -> bool.
-    exists_case_cache: RefCell<HashMap<String, bool>>,
-    /// stat cache: path -> (is_file, is_dir). None means "does not exist".
-    stat_cache: RefCell<HashMap<String, Option<(bool, bool)>>>,
+    /// Shared transactional FS cache. Borrowed per call via `as_ref(py)` so
+    /// the resolver reads through the same snapshot as the rest of mypy.
+    fs_cache: Py<FsCache>,
     // --- Resolver config (stable for the lifetime of the FindModuleCache) ---
     namespace_packages: bool,
     use_builtins_fixtures: bool,
@@ -372,8 +370,14 @@ impl NativeResolver {
     /// Construct a `NativeResolver` with all stable config. Called once by
     /// `FindModuleCache._resolve` on first native dispatch; the returned
     /// object is reused for all subsequent `find_module` calls on that cache.
+    ///
+    /// `fs_cache` is the shared `FsCache` pyclass owned by the Python
+    /// `FileSystemCache` delegate (`fscache._rust`). The resolver borrows it
+    /// per call so it reads through the same transactional snapshot as the
+    /// rest of mypy — eliminating the dual-cache hazard.
     #[new]
     #[pyo3(signature = (
+        fs_cache,
         namespace_packages,
         use_builtins_fixtures,
         python_path,
@@ -386,6 +390,7 @@ impl NativeResolver {
         stub_namespace,
     ))]
     fn new(
+        fs_cache: Py<FsCache>,
         namespace_packages: bool,
         use_builtins_fixtures: bool,
         python_path: Vec<String>,
@@ -400,10 +405,7 @@ impl NativeResolver {
         // Clamp to (3, 10) minimum, mirroring typeshed_py_version.
         let python_version = std::cmp::max(python_version, (3, 10));
         NativeResolver {
-            listdir_cache: RefCell::new(HashMap::new()),
-            isfile_case_cache: RefCell::new(HashMap::new()),
-            exists_case_cache: RefCell::new(HashMap::new()),
-            stat_cache: RefCell::new(HashMap::new()),
+            fs_cache,
             namespace_packages,
             use_builtins_fixtures,
             python_path,
@@ -422,6 +424,20 @@ impl NativeResolver {
         }
     }
 
+    /// Clear the cross-call resolution caches (`initial_components`,
+    /// `ns_ancestors`). These are derived from `listdir` and must not outlive
+    /// an FS transaction; `FindModuleCache.clear()` calls this on every
+    /// fine-grained increment so the resolver doesn't read stale toplevel
+    /// listings after `fscache.flush()`.
+    ///
+    /// The shared `FsCache`'s own caches are flushed separately by
+    /// `FileSystemCache.flush()`; this method only touches the
+    /// resolver-private caches.
+    fn flush(&self) {
+        self.initial_components.borrow_mut().clear();
+        self.ns_ancestors.borrow_mut().clear();
+    }
+
     /// Resolve a module id to a path or a `ModuleNotFoundReason`.
     ///
     /// Returns `(kind, path, can_cache)`: `kind == 255` means found (path is
@@ -438,6 +454,7 @@ impl NativeResolver {
         use_typeshed: bool,
         follow_untyped_imports: bool,
     ) -> PyResult<PyObject> {
+        let fs = self.fs_cache.borrow(py);
         let inputs = ResolveInputs {
             id,
             use_typeshed,
@@ -451,7 +468,7 @@ impl NativeResolver {
             stdlib_versions: &self.stdlib_versions,
             stub_flat: &self.stub_flat,
             stub_namespace: &self.stub_namespace,
-            fs: self,
+            fs: &*fs,
         };
         let mut initial_components = self.initial_components.borrow_mut();
         let mut ns_ancestors = self.ns_ancestors.borrow_mut();
@@ -490,8 +507,9 @@ impl NativeResolver {
         imports: Vec<ImportRecord>,
         known_modules: HashSet<String>,
     ) -> PyResult<(PyObject, PyObject)> {
+        let fs = self.fs_cache.borrow(py);
         let (res, error) = dep_records_with(
-            self,
+            &*fs,
             file_id,
             file_path,
             &imports,
@@ -525,11 +543,12 @@ impl NativeResolver {
     /// per-id work, which is the whole point of batching.
     fn resolve_many(
         &self,
-        _py: Python<'_>,
+        py: Python<'_>,
         ids_with_follow: Vec<(String, bool)>,
     ) -> PyResult<Vec<(u8, Option<String>, bool)>> {
+        let fs = self.fs_cache.borrow(py);
         let res = resolve_many_with(
-            self,
+            &*fs,
             &ids_with_follow,
             &self.initial_components,
             &self.ns_ancestors,
@@ -591,7 +610,7 @@ fn resolve_many_with<F: FsProbe>(
             stdlib_versions,
             stub_flat,
             stub_namespace,
-            fs,
+            fs: &*fs,
         };
         let mut resolver = Resolver::new(&inputs, &mut initial_components, &mut ns_ancestors);
         let (kind, path, can_cache) = resolver.find_module(id, use_typeshed);
@@ -880,146 +899,6 @@ fn use_typeshed_for(
     let (min_version, max_version) = &stdlib_versions[key];
     // python_version is already clamped to (3, 10) at construction time.
     python_version >= *min_version && max_version.map_or(true, |max| python_version <= max)
-}
-
-impl FsProbe for NativeResolver {
-    fn isfile(&self, path: &str) -> bool {
-        self.stat_cached(path).map(|(f, _)| f).unwrap_or(false)
-    }
-    fn isdir(&self, path: &str) -> bool {
-        self.stat_cached(path).map(|(_, d)| d).unwrap_or(false)
-    }
-    fn listdir(&self, path: &str) -> Vec<String> {
-        self.listdir_cached(path).unwrap_or_default()
-    }
-    fn isfile_case(&self, path: &str, prefix: &str) -> bool {
-        // Mirror fscache.isfile_case: fast-fail on non-files, then verify
-        // the tail's case via case_check (which also recurses upward).
-        if !self.isfile(path) {
-            return false;
-        }
-        if let Some(cached) = self.isfile_case_cache.borrow().get(path) {
-            return *cached;
-        }
-        let result = self.case_check(path, prefix);
-        self.isfile_case_cache
-            .borrow_mut()
-            .insert(path.to_string(), result);
-        result
-    }
-    fn exists_case(&self, path: &str, prefix: &str) -> bool {
-        // Mirror fscache.exists_case: no precheck for file/dir-ness; the
-        // case_check walk implies existence (a missing tail won't appear
-        // in its parent's listing).
-        self.case_check(path, prefix)
-    }
-    fn read(&self, path: &str) -> Vec<u8> {
-        std::fs::read(path).unwrap_or_default()
-    }
-}
-
-impl NativeResolver {
-    /// Stat a path, returning (is_file, is_dir). Cached so repeated probes
-    /// of the same path within a resolution call tree are free.
-    fn stat_cached(&self, path: &str) -> Option<(bool, bool)> {
-        if let Some(st) = self.stat_cache.borrow().get(path) {
-            return *st;
-        }
-        let result = std::fs::metadata(path)
-            .ok()
-            .map(|m| (m.is_file(), m.is_dir()));
-        self.stat_cache
-            .borrow_mut()
-            .insert(path.to_string(), result);
-        result
-    }
-
-    /// Read a directory's immediate entry names. Cached: each unique path
-    /// is listed at most once for the resolver's lifetime. Returns None on
-    /// any I/O error (mirroring fscache.listdir raising OSError).
-    fn listdir_cached(&self, path: &str) -> Option<Vec<String>> {
-        if let Some(cached) = self.listdir_cache.borrow().get(path) {
-            return cached.clone();
-        }
-        let result = self.listdir_uncached(path);
-        self.listdir_cache
-            .borrow_mut()
-            .insert(path.to_string(), result.clone());
-        result
-    }
-
-    fn listdir_uncached(&self, path: &str) -> Option<Vec<String>> {
-        let rd = std::fs::read_dir(Path::new(path)).ok()?;
-        let mut out = Vec::new();
-        for entry in rd.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                out.push(name.to_string());
-            }
-        }
-        Some(out)
-    }
-
-    /// Case-sensitive existence check mirroring `FileSystemCache.exists_case`:
-    /// walk path components from the tail up to `prefix`, requiring each
-    /// component to appear (exact case) in its parent's listing. Components
-    /// at or above `prefix` are trusted and not checked.
-    fn case_check(&self, path: &str, prefix: &str) -> bool {
-        if let Some(cached) = self.exists_case_cache.borrow().get(path) {
-            return *cached;
-        }
-        let result = self.case_check_uncached(path, prefix);
-        self.exists_case_cache
-            .borrow_mut()
-            .insert(path.to_string(), result);
-        result
-    }
-
-    fn case_check_uncached(&self, path: &str, prefix: &str) -> bool {
-        let (head, tail) = split_head_tail(path);
-        // Stop once we climb above prefix, or at a component with no tail
-        // (e.g. the root). fscache returns True here: prefix and above are
-        // trusted.
-        if !head.starts_with(prefix) || tail.is_empty() {
-            return true;
-        }
-        let names = match self.listdir_cached(&head) {
-            Some(n) => n,
-            None => return false,
-        };
-        if !names.contains(&tail) {
-            return false;
-        }
-        self.case_check(&head, prefix)
-    }
-}
-
-/// Mirror `os.path.split` on POSIX: strip trailing slashes, then split at
-/// the last `/`. Used by `case_check` to walk components the same way
-/// `FileSystemCache.exists_case` does.
-fn split_head_tail(path: &str) -> (String, String) {
-    let bytes = path.as_bytes();
-    let mut end = bytes.len();
-    while end > 1 && bytes[end - 1] == b'/' {
-        end -= 1;
-    }
-    if end == 0 {
-        return (String::new(), String::new());
-    }
-    match bytes[..end].iter().rposition(|&b| b == b'/') {
-        Some(idx) => {
-            let head = if idx == 0 {
-                "/".to_string()
-            } else {
-                String::from_utf8_lossy(&bytes[..idx]).to_string()
-            };
-            let tail = String::from_utf8_lossy(&bytes[idx + 1..end]).to_string();
-            (head, tail)
-        }
-        None => (
-            String::new(),
-            String::from_utf8_lossy(&bytes[..end]).to_string(),
-        ),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1486,6 +1365,7 @@ impl<'a, F: FsProbe> Resolver<'a, F> {
 
 #[pymodule]
 fn module_resolver(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
+    module.add_class::<FsCache>()?;
     module.add_class::<NativeResolver>()?;
     Ok(())
 }
@@ -1536,7 +1416,7 @@ mod tests {
             stdlib_versions: &stdlib_map,
             stub_flat: &flat_set,
             stub_namespace: &ns_map,
-            fs,
+            fs: &*fs,
         };
         let mut ic: HashMap<Vec<String>, HashMap<String, Vec<String>>> = HashMap::new();
         let mut ns: HashMap<String, String> = HashMap::new();
@@ -1717,7 +1597,7 @@ mod tests {
         let ic = TestRefCell::new(HashMap::new());
         let ns = TestRefCell::new(HashMap::new());
         dep_records_with(
-            fs,
+            &*fs,
             file_id,
             file_path,
             imports,
@@ -2074,7 +1954,7 @@ mod tests {
         let ic = TestRefCell::new(HashMap::new());
         let ns = TestRefCell::new(HashMap::new());
         dep_records_with(
-            fs,
+            &*fs,
             file_id,
             file_path,
             imports,
@@ -2169,7 +2049,7 @@ mod tests {
         let ic = TestRefCell::new(HashMap::new());
         let ns_anc = TestRefCell::new(HashMap::new());
         resolve_many_with(
-            fs,
+            &*fs,
             &input,
             &ic,
             &ns_anc,
