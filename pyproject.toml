@@ -70,6 +70,7 @@ reports = ["lxml"]
 install-types = ["pip"]
 faster-cache = ["orjson"]
 native-parser = []
+native-resolver = []
 
 [dependency-groups]
 test = [

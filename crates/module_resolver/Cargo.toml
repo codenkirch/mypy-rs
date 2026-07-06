@@ -1,0 +1,15 @@
+[package]
+name = "mypy-module-resolver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "module_resolver"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+pyo3 = { version = "0.20.2", features = ["abi3-py37"] }

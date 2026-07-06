@@ -9,6 +9,10 @@ from mypy.test.helpers import Suite, assert_equal
 
 data_path = os.path.relpath(os.path.join(package_path, "modulefinder"))
 
+# When set, dispatch FindModuleCache.find_module through the in-tree Rust
+# extension so the existing fixtures become a parity differential.
+_NATIVE_RESOLVER = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+
 
 class ModuleFinderSuite(Suite):
     def setUp(self) -> None:
@@ -28,10 +32,12 @@ class ModuleFinderSuite(Suite):
         )
         options = Options()
         options.namespace_packages = True
+        options.native_resolver = _NATIVE_RESOLVER
         self.fmc_ns = FindModuleCache(self.search_paths, fscache=None, options=options)
 
         options = Options()
         options.namespace_packages = False
+        options.native_resolver = _NATIVE_RESOLVER
         self.fmc_nons = FindModuleCache(self.search_paths, fscache=None, options=options)
 
     def test__no_namespace_packages__nsx(self) -> None:
@@ -158,10 +164,12 @@ class ModuleFinderSitePackagesSuite(Suite):
         )
         options = Options()
         options.namespace_packages = True
+        options.native_resolver = _NATIVE_RESOLVER
         self.fmc_ns = FindModuleCache(self.search_paths, fscache=None, options=options)
 
         options = Options()
         options.namespace_packages = False
+        options.native_resolver = _NATIVE_RESOLVER
         self.fmc_nons = FindModuleCache(self.search_paths, fscache=None, options=options)
 
     def path(self, *parts: str) -> str:

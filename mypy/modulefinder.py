@@ -23,7 +23,12 @@ from mypy.errors import CompileError
 from mypy.fscache import FileSystemCache
 from mypy.nodes import MypyFile
 from mypy.options import Options
-from mypy.stubinfo import stub_distribution_name
+from mypy.stubinfo import (
+    _legacy_bundled_packages,
+    non_bundled_packages_flat,
+    non_bundled_packages_namespace,
+    stub_distribution_name,
+)
 from mypy.util import os_path_join
 
 
@@ -204,6 +209,26 @@ class FindModuleCache:
         self.stdlib_py_versions = stdlib_py_versions or load_stdlib_py_versions(
             custom_typeshed_dir
         )
+        # Pre-computed stubinfo tables for the native resolver. Rust replicates
+        # stub_distribution_name() using these two collections:
+        #   * _stub_flat: top-level names with a flat (legacy-bundled or
+        #     non_bundled_packages_flat) dist lookup.
+        #   * _stub_namespace: flattened namespace-lookup table
+        #     (module_name -> dist_name), walked longest-first.
+        self._stub_flat: set[str] = {
+            *non_bundled_packages_flat,
+            *_legacy_bundled_packages,
+        }
+        self._stub_namespace: dict[str, str] = {}
+        for _ns_top, _ns_map in non_bundled_packages_namespace.items():
+            self._stub_namespace.update(_ns_map)
+        # Long-lived Rust resolver: holds the FS caches (listdir, isfile_case,
+        # exists_case, stat) AND the stable resolver config (search paths,
+        # stubinfo tables). Owned by this FindModuleCache so caches persist
+        # across find_module calls, mirroring fscache's cache lifetime.
+        # Lazily constructed on first native resolve so the extension import
+        # stays out of the non-native hot path.
+        self._native_resolver: object | None = None
 
     def clear(self) -> None:
         self.results.clear()
@@ -319,7 +344,7 @@ class FindModuleCache:
                 use_typeshed = self._typeshed_has_version(id)
             elif top_level in self.stdlib_py_versions:
                 use_typeshed = self._typeshed_has_version(top_level)
-            result, should_cache = self._find_module(id, use_typeshed)
+            result, should_cache = self._resolve(id, use_typeshed)
             if should_cache:
                 if (
                     not (
@@ -335,6 +360,43 @@ class FindModuleCache:
             else:
                 return result
         return self.results[id]
+
+    def _resolve(self, id: str, use_typeshed: bool) -> tuple[ModuleSearchResult, bool]:
+        """Dispatch to the native resolver when enabled, else the Python core.
+
+        Both paths return the same ``(ModuleSearchResult, can_cache)`` record;
+        the native path produces plain bytes/bools that this method's caller
+        (``find_module``) treats identically to the Python result.
+
+        The native resolver reads the real filesystem via ``std::fs`` and owns
+        no Python callbacks, so it cannot serve the daemon's virtual filesystem
+        or Bazel's synthesized fake ``__init__`` files. Gate it off for those
+        modes: cold runs go to Rust, daemon/Bazel runs fall back to Python
+        ``_find_module`` until the VFS is ported or the daemon is retired.
+        """
+        if (
+            self.options is not None
+            and self.options.native_resolver
+            and not self.options.fine_grained_incremental
+            and not self.options.bazel
+        ):
+            from mypy.native_resolve import make_resolver, resolve_module as _native_resolve
+
+            if self._native_resolver is None:
+                self._native_resolver = make_resolver(
+                    options=self.options,
+                    search_paths=self.search_paths,
+                    stdlib_versions=self.stdlib_py_versions,
+                    stub_flat=self._stub_flat,
+                    stub_namespace=self._stub_namespace,
+                )
+            return _native_resolve(
+                self._native_resolver,
+                id,
+                use_typeshed=use_typeshed,
+                options=self.options,
+            )
+        return self._find_module(id, use_typeshed)
 
     def _typeshed_has_version(self, module: str) -> bool:
         if not self.options:

@@ -71,6 +71,7 @@ OPTIONS_AFFECTING_CACHE: Final = (
         "platform",
         "bazel",
         "native_parser",
+        "native_resolver",
         "old_type_inference",
         "plugins",
         "disable_bytearray_promotion",
@@ -387,6 +388,8 @@ class Options:
         self.local_partial_types = True
         # If True, use the native parser (experimental)
         self.native_parser = False
+        # If True, use the native module resolver (experimental)
+        self.native_resolver = False
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

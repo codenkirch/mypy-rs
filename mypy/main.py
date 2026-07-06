@@ -100,6 +100,9 @@ def main(
     if options.num_workers:
         # Supporting both parsers would be really tricky, so just support the new one.
         options.native_parser = True
+        # The native resolver shares the same parallel-mode assumption as the
+        # native parser: only the new path is supported under workers.
+        options.native_resolver = True
         if options.num_workers < 0:
             fail("error: Number of workers cannot be negative", stderr, options)
         if options.cache_dir == os.devnull:
@@ -1301,6 +1304,12 @@ def define_options(
         "--native-parser",
         default=False,
         help="Enable faster parser that parses directly to mypy AST",
+    )
+    # --native-resolver enables the native module resolver (experimental)
+    add_invertible_flag(
+        "--native-resolver",
+        default=False,
+        help="Enable Rust-backed module resolution",
     )
     # --logical-deps adds some more dependencies that are not semantically needed, but
     # may be helpful to determine relative importance of classes and functions for overall

@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["crates/ast_serialize"]
+members = ["crates/ast_serialize", "crates/module_resolver"]
 
