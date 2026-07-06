@@ -128,6 +128,14 @@ Why this is a good strangler target:
 - It can improve cold start and graph-load performance without changing plugin
   behavior.
 
+**Status:** the Rust resolver (`crates/module_resolver`), dependency-records
+extraction, and shared `FsCache` backing all landed in Milestone 2 and are
+now default-on across every path except Bazel (`Options.native_resolver`
+defaults to `True` as of Phase 3; the daemon and parallel mode force it on
+regardless). The per-module `find_module` lookup is still Python-orchestrated
+— the import-graph prepass that replaces it with a single traversal remains
+future work (see "Next milestone" below).
+
 ### 3. Move Cache Indexing and Validation Below Python Object Materialization
 
 Recommendation: worth exploring.
@@ -1047,7 +1055,31 @@ PYTHONPATH=$PYEXT TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 \
 PYTHONPATH=$PYEXT uv run python -m mypy --config-file mypy_self_check.ini -p mypy
 ```
 
-### Next milestone (Phase 3)
+## Milestone 2 (Phase 3): Default-on Native Resolver
+
+`Options.native_resolver` now defaults to `True`. The daemon
+(`dmypy_server.py`) and parallel mode (`main.py`) already forced it on
+when `_HAS_RUST_CACHE`; this closes the gap for normal cold-run `mypy`
+invocations, which previously fell back to `FindModuleCache._find_module`.
+Bazel remains on the Python resolver by the `_native_gate_active` dispatch
+gate.
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `testmodulefinder.py` + `testgraph.py` + `testfscache.py` + `test_find_sources.py` | 40 passed |
+| `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1`) | 8144 passed, 69 skipped, 7 xfailed |
+| `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1333 passed, 256 skipped |
+| Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
+
+The default flip does not change test behavior: `testcheck.py` and
+`testmodulefinder.py` override `options.native_resolver` from
+`TEST_NATIVE_RESOLVER` *after* option parsing, so unset exercises the
+default-on path and `=0` forces the Python fallback — preserving the
+two-way parity differential the strangler-fig contract requires.
+
+### Next milestone (Phase 4)
 
 Module discovery / import graph prepass: a Rust prepass that walks the
 search paths once and produces the full module-id → path map (and the

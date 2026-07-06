@@ -387,8 +387,12 @@ class Options:
         self.local_partial_types = True
         # If True, use the native parser (experimental)
         self.native_parser = True
-        # If True, use the native module resolver (experimental)
-        self.native_resolver = False
+        # If True, use the native module resolver. Backed by the
+        # `module_resolver` Rust extension when importable; the Python
+        # `FindModuleCache._find_module` path is the fallback. The daemon
+        # and parallel mode force this on regardless; Bazel stays on the
+        # Python resolver (see `FindModuleCache._native_gate_active`).
+        self.native_resolver = True
         # Some behaviors are changed when using Bazel (https://bazel.build).
         self.bazel = False
         # If True, export inferred types for all expressions as BuildResult.types

@@ -97,7 +97,13 @@ daemon, cache, and incremental-mode checks when affected.
 ### Native resolver / dependency-records parity
 
 The native resolver and dependency-records extraction are gated behind
-`Options.native_resolver` (forced on under parallel mode via `main.py`).
+`Options.native_resolver`, which now defaults to `True` (Phase 3). The
+daemon (`dmypy_server`) and parallel mode (`main.py`) force it on
+regardless of the default; the only path that previously fell back to
+the Python `FindModuleCache._find_module` was a normal cold-run `mypy`
+invocation, which now also uses the native resolver. Bazel remains on
+the Python resolver by the dispatch gate in `_native_gate_active`.
+
 Build the extension before running parity — use the `cargo rustc` + scratch-dir
 approach documented under "Native parser build order" below, not
 `maturin develop`:
@@ -117,11 +123,16 @@ PYTHONPATH=/private/tmp/mypy-rs-local-ast:/private/tmp/mypy-rs-local-resolver \
   uv run python -m pytest -n0 mypy/test/testcheck.py
 ```
 
-`TEST_NATIVE_RESOLVER=1` flips `Options.native_resolver` in the test harness
-so the existing fixtures become a parity differential. The daemon
-(`fine_grained_incremental`) path now also uses the native resolver (it
-reads through the shared `FsCache`); only Bazel stays on the Python
-resolver by the dispatch gate, so the Bazel path needs no special env var.
+`TEST_NATIVE_RESOLVER=1` is now redundant for production parity (the
+default is on), but still serves as a parity differential in the test
+harness: `testcheck.py` and `testmodulefinder.py` set
+`options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))`
+*after* option parsing, overriding the default. Unset, they exercise the
+default-on path; `=0` forces the Python fallback. `=1` is kept so the
+differential stays explicit. The daemon (`fine_grained_incremental`)
+path uses the native resolver (it reads through the shared `FsCache`);
+only Bazel stays on the Python resolver by the dispatch gate, so the
+Bazel path needs no special env var.
 
 ### Native parser build order
 
