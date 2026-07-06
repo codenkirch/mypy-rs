@@ -14,3 +14,8 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 pyo3 = { version = "0.20.2", features = ["abi3-py37"] }
 mypy-fs-probe = { path = "../fs_probe" }
+sha1 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
+pyo3 = { version = "0.20.2", features = ["auto-initialize"] }

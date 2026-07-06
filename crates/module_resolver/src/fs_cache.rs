@@ -150,7 +150,7 @@ impl StatResult {
 /// All caches are per-transaction; `flush()` clears them. `package_root`
 /// survives across flushes (matches the Python contract).
 #[pyclass(name = "FsCache")]
-struct FsCache {
+pub struct FsCache {
     /// Long-lived across transactions; only mutated by `set_package_root`.
     /// Each entry is a normalized relative path with a trailing separator.
     package_root: RefCell<Vec<String>>,

@@ -395,16 +395,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mypy-fs-cache"
-version = "0.1.0"
-dependencies = [
- "mypy-fs-probe",
- "pyo3",
- "sha1",
- "tempfile",
-]
-
-[[package]]
 name = "mypy-fs-probe"
 version = "0.1.0"
 
@@ -414,6 +404,8 @@ version = "0.1.0"
 dependencies = [
  "mypy-fs-probe",
  "pyo3",
+ "sha1",
+ "tempfile",
 ]
 
 [[package]]

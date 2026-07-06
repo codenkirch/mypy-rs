@@ -38,12 +38,13 @@ from mypy_extensions import mypyc_attr
 from mypy.util import hash_digest
 
 # The transactional memoizing cache is implemented in Rust
-# (``crates/fs_cache``); this class is a thin Python delegate that forwards
-# every method to the ``fs_cache.FsCache`` pyclass. The delegate exists so
-# ``FileSystemCache`` keeps its Python type identity (callers subclass it,
-# annotate against it, and ``fswatcher``/``build`` import it by name) while
-# the implementation — including the per-transaction snapshot semantics and
-# the Bazel fake ``__init__.py`` synthesis — lives in Rust.
+# (``crates/module_resolver/src/fs_cache.rs``); this class is a thin Python
+# delegate that forwards every method to the ``module_resolver.FsCache``
+# pyclass. The delegate exists so ``FileSystemCache`` keeps its Python type
+# identity (callers subclass it, annotate against it, and
+# ``fswatcher``/``build`` import it by name) while the implementation —
+# including the per-transaction snapshot semantics and the Bazel fake
+# ``__init__.py`` synthesis — lives in Rust.
 #
 # When the compiled extension is not on PYTHONPATH (e.g. a daemon subprocess
 # that overrides PYTHONPATH to the repo root), we fall back to the pure
@@ -51,11 +52,11 @@ from mypy.util import hash_digest
 # Python keeps working without the extension; the extension is an
 # optimization when present.
 try:
-    import fs_cache as _fs_cache
+    from module_resolver import FsCache as _FsCache
 
     _HAS_RUST_CACHE = True
 except ImportError:
-    _fs_cache = None  # type: ignore[assignment]
+    _FsCache = None  # type: ignore[assignment,misc]
     _HAS_RUST_CACHE = False
 
 # os.stat_result indices (matches the CPython struct stat sequence order
@@ -77,7 +78,7 @@ class FileSystemCache:
         # It is set by set_package_root() below.
         self.package_root: list[str] = []
         if _HAS_RUST_CACHE:
-            self._rust = _fs_cache.FsCache()
+            self._rust = _FsCache()
         self.flush()
 
     def set_package_root(self, package_root: list[str]) -> None:

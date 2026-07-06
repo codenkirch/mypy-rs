@@ -9,12 +9,13 @@ Policy (options interpretation, diagnostics, result caching, the
 WRONG_WORKING_DIRECTORY decoration, follow_imports policy) stays in Python;
 this module only resolves a module id to a path or ``ModuleNotFoundReason``.
 
-Filesystem access is owned by Rust: the resolver reads the real filesystem
-via ``std::fs`` directly, with no per-call PyO3 callbacks. The dispatch gate
-in ``FindModuleCache._resolve`` routes only cold, real-filesystem runs here;
-daemon (``fine_grained_incremental``) and Bazel runs stay on the Python
-``_find_module`` path so the daemon VFS and Bazel fake-init synthesis remain
-Python-owned until they are ported or retired.
+Filesystem access is owned by the shared ``FsCache``: the resolver reads
+through the same transactional snapshot as the rest of mypy (no private FS
+caches, no per-call PyO3 callbacks). The dispatch gate in
+``FindModuleCache._resolve`` routes cold, real-filesystem runs here; daemon
+(``fine_grained_incremental``) runs also route here now that the dual-cache
+hazard is gone. Only Bazel runs stay on the Python ``_find_module`` path so
+Bazel fake-init synthesis remains Python-owned until it is ported.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from typing import TYPE_CHECKING
 
 import module_resolver
 
+from mypy.fscache import FileSystemCache
 from mypy.modulefinder import ModuleNotFoundReason
 
 if TYPE_CHECKING:
@@ -42,6 +44,7 @@ def make_resolver(
     stdlib_versions: StdlibVersions,
     stub_flat: set[str],
     stub_namespace: dict[str, str],
+    fscache: FileSystemCache,
 ) -> module_resolver.NativeResolver:
     """Construct a long-lived ``NativeResolver`` owned by ``FindModuleCache``.
 
@@ -49,11 +52,19 @@ def make_resolver(
     flags) is set once here and reused across every ``find_module`` call on
     the owning cache. Only per-call varying args (``id``, ``use_typeshed``,
     ``follow_untyped_imports``) cross the PyO3 boundary on each resolve.
+
+    ``fscache`` is the shared ``FileSystemCache``. Its Rust delegate
+    (``fscache._rust``) is passed as the resolver's first constructor arg so
+    the resolver reads through the same transactional snapshot as the rest
+    of mypy — eliminating the dual-cache hazard that previously forced the
+    daemon (``fine_grained_incremental``) exclusion.
     """
+    assert fscache._rust is not None  # gate-checked by _native_gate_active
     stdlib_list = [
         (name, lo, hi) for name, (lo, hi) in stdlib_versions.items()
     ]
     return module_resolver.NativeResolver(
+        fscache._rust,
         options.namespace_packages,
         options.use_builtins_fixtures,
         list(search_paths.python_path),

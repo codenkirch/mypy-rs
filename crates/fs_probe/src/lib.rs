@@ -15,3 +15,26 @@ pub trait FsProbe {
     fn exists_case(&self, path: &str, prefix: &str) -> bool;
     fn read(&self, path: &str) -> Vec<u8>;
 }
+
+/// Blanket impl so callers that hold `&FsCache` (or `&HashMapFs`) can pass
+/// `&fs` where `F: FsProbe` is expected, without each call site deref'ing.
+impl<T: FsProbe + ?Sized> FsProbe for &T {
+    fn isfile(&self, path: &str) -> bool {
+        (**self).isfile(path)
+    }
+    fn isdir(&self, path: &str) -> bool {
+        (**self).isdir(path)
+    }
+    fn listdir(&self, path: &str) -> Vec<String> {
+        (**self).listdir(path)
+    }
+    fn isfile_case(&self, path: &str, prefix: &str) -> bool {
+        (**self).isfile_case(path, prefix)
+    }
+    fn exists_case(&self, path: &str, prefix: &str) -> bool {
+        (**self).exists_case(path, prefix)
+    }
+    fn read(&self, path: &str) -> Vec<u8> {
+        (**self).read(path)
+    }
+}
