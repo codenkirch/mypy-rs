@@ -1510,9 +1510,8 @@ class RemoveLastKnownValueSuite(Suite):
 # the reader end-to-end (varint, tagged helpers, per-variant dispatch, and
 # the `Display` impl) but does not wire the reader into any production path.
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
-
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL_WIRE = True
 except ImportError:
@@ -1983,3 +1982,104 @@ class TestExpandTypeLimitGetProperType(TestCase):
         get_proper_type_count = len(re.findall(r"get_proper_type\(", code))
         get_proper_type_count -= len(re.findall(r"get_proper_type\(\)", code))
         assert get_proper_type_count == self.ALLOWED_GET_PROPER_TYPES
+
+
+def _is_type_info(value: object) -> bool:
+    """True if `value` is a `mypy.nodes.TypeInfo` instance."""
+    from mypy.nodes import TypeInfo
+
+    return isinstance(value, TypeInfo)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinMeetSuite(Suite):
+    """Parity suite for the Rust `trivial_join`/`trivial_meet` (Stage 3c M8d).
+
+    Exercises the Rust path with the resolver built from the TypeFixture.
+    Rust handles nominal-instance subtype/join/meet and returns `None`
+    (Python fallthrough) for non-Instance right in object_or_any_from_type
+    and when is_subtype defers. Because Python runs when Rust returns None,
+    every assertion matches the pure-Python result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_trivial_join_subtype_returns_supertype(self) -> None:
+        # B <: A -> trivial_join(B, A) = A (the supertype).
+        from mypy.join import trivial_join
+
+        assert trivial_join(self.fx.b, self.fx.a) == self.fx.a
+        assert trivial_join(self.fx.a, self.fx.b) == self.fx.a
+
+    def test_trivial_join_same_type(self) -> None:
+        # A <: A -> trivial_join(A, A) = A.
+        from mypy.join import trivial_join
+
+        assert trivial_join(self.fx.a, self.fx.a) == self.fx.a
+        assert trivial_join(self.fx.o, self.fx.o) == self.fx.o
+
+    def test_trivial_join_unrelated_returns_object(self) -> None:
+        # B and C unrelated -> object_or_any_from_type(right) = object.
+        from mypy.join import trivial_join
+
+        result = trivial_join(self.fx.b, self.fx.c)
+        assert result == self.fx.o
+
+    def test_trivial_meet_subtype_returns_subtype(self) -> None:
+        # B <: A -> trivial_meet(B, A) = B (the subtype).
+        from mypy.meet import trivial_meet
+
+        assert trivial_meet(self.fx.b, self.fx.a) == self.fx.b
+        assert trivial_meet(self.fx.a, self.fx.b) == self.fx.b
+
+    def test_trivial_meet_same_type(self) -> None:
+        # A <: A -> trivial_meet(A, A) = A.
+        from mypy.meet import trivial_meet
+
+        assert trivial_meet(self.fx.a, self.fx.a) == self.fx.a
+        assert trivial_meet(self.fx.o, self.fx.o) == self.fx.o
+
+    def test_trivial_meet_unrelated_returns_bottom(self) -> None:
+        # B and C unrelated, strict_optional -> UninhabitedType.
+        from mypy.meet import trivial_meet
+
+        with state.strict_optional_set(True):
+            result = trivial_meet(self.fx.b, self.fx.c)
+            assert isinstance(result, UninhabitedType)
+
+    def test_trivial_meet_unrelated_non_strict_returns_none_type(self) -> None:
+        # B and C unrelated, non-strict-optional -> NoneType.
+        from mypy.meet import trivial_meet
+
+        with state.strict_optional_set(False):
+            result = trivial_meet(self.fx.b, self.fx.c)
+            assert isinstance(result, NoneType)

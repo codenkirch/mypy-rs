@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import overload
+from typing import Any, overload
 
 import mypy.typeops
 from mypy.expandtype import expand_type
@@ -53,6 +53,51 @@ from mypy.types import (
     get_proper_types,
     split_with_prefix_and_suffix,
 )
+
+# Stage 3c (M8d) type-kernel seam: when type_kernel is importable
+# and a resolver is installed, trivial_join routes through Rust.
+# Rust returns None for unhandled (non-Instance right).
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag + resolver, set by the build manager from
+# `Options.native_type_kernel` at the start of each build. Reuses the
+# subtype resolver (trivial_join only needs is_subtype, which shares
+# the same NativeTypeResolver). When `_native_join_active` is True but
+# `_native_join_resolver` is None, the shim falls through to Python.
+_native_join_active: bool = False
+_native_join_resolver: Any = None
+
+
+def _set_native_join_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust join path."""
+    global _native_join_active
+    _native_join_active = active
+
+
+def _set_native_join_resolver(resolver: Any) -> None:
+    """Install the `NativeTypeResolver` pyclass for the Rust join path.
+
+    Called by the build manager (or the parity test suite) after building
+    the resolver from the live TypeInfo graph. Pass `None` to clear.
+    Shares the same resolver as the subtype path.
+    """
+    global _native_join_resolver
+    _native_join_resolver = resolver
+
+
+def _serialize_type(t: Type) -> bytes:
+    """Serialize a `Type` to its wire-format bytes for the Rust reader."""
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
 
 
 class InstanceJoiner:
@@ -197,6 +242,37 @@ class InstanceJoiner:
 
 def trivial_join(s: Type, t: Type) -> Type:
     """Return one of types (expanded) if it is a supertype of other, otherwise top type."""
+    # Stage 3c (M8d): try the Rust trivial_join path. Rust returns a
+    # discriminator (0=SameS, 1=SameT, 2=Object, 3=Bottom) or None
+    # (unsupported, e.g. non-Instance right in object_or_any_from_type).
+    # Mirrors the erasetype.py:80-86 strangler-fig contract.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_join_active
+        and _native_join_resolver is not None
+    ):
+        result = _type_kernel.rust_trivial_join(
+            _serialize_type(s),
+            _serialize_type(t),
+            False,  # ignore_type_params
+            False,  # ignore_declared_variance
+            False,  # always_covariant
+            False,  # ignore_promotions
+            state.strict_optional,
+            _native_join_resolver,
+        )
+        if result is not None:
+            if result == 0:
+                return s
+            elif result == 1:
+                return t
+            elif result == 2:
+                return object_or_any_from_type(get_proper_type(t))
+            elif result == 3:
+                # trivial_join never returns Bottom (it's the meet path).
+                # Defensive: fall through if it ever does.
+                pass
+        # Rust returned None (unsupported case) — fall through to Python.
     if is_subtype(s, t):
         return t
     elif is_subtype(t, s):
