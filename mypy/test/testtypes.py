@@ -2003,25 +2003,28 @@ class NativeJoinMeetSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.fx = TypeFixture(INVARIANT)
         type_infos = self._collect_type_infos()
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
         _set_native_subtype_active(True)
         _set_native_subtype_resolver(self.resolver)
         _set_native_join_active(True)
         _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
         _set_native_join_active(False)
         _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
 
     def _collect_type_infos(self) -> list:
         infos = []
@@ -2098,25 +2101,28 @@ class NativeJoinTypesSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.fx = TypeFixture(INVARIANT)
         type_infos = self._collect_type_infos()
         self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
         _set_native_subtype_active(True)
         _set_native_subtype_resolver(self.resolver)
         _set_native_join_active(True)
         _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
         _set_native_join_active(False)
         _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
 
     def _collect_type_infos(self) -> list:
         infos = []
@@ -2196,4 +2202,91 @@ class NativeJoinTypesSuite(Suite):
         from mypy.join import join_types
 
         assert join_types(self.fx.a, self.fx.a) == self.fx.a
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinInstanceSuite(Suite):
+    """Parity suite for the Rust `visit_instance` nominal join (Stage 3c M8f).
+
+    Exercises the args-less Instance-Instance nominal join: same-type,
+    direct-subtype, and common-ancestor via the MRO bases walk. The
+    fixture provides A, B(A), C(A), D (unrelated). join(B, C) finds A as
+    the common ancestor via the bases walk, which trivial_join (direct
+    subtype only) would miss (it returns object).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_join_same_type_returns_self(self) -> None:
+        # join.py:114: t.type == s.type, no args -> Instance(A, []) = A.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.a) == self.fx.a
+        assert join_types(self.fx.d, self.fx.d) == self.fx.d
+
+    def test_join_direct_subtype_returns_supertype(self) -> None:
+        # B <: A -> join(A, B) = A. The Rust path returns
+        # Ancestor("A") which the shim maps to Instance(A, []).
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.b) == self.fx.a
+        assert join_types(self.fx.b, self.fx.a) == self.fx.a
+
+    def test_join_common_ancestor_returns_ancestor(self) -> None:
+        # B <: A, C <: A, B not <: C, C not <: B -> join(B, C) = A.
+        # trivial_join would return object (neither is a subtype of
+        # the other); the visit_instance bases walk finds A.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.b, self.fx.c) == self.fx.a
+        assert join_types(self.fx.c, self.fx.b) == self.fx.a
+
+    def test_join_unrelated_defers_to_python_returns_object(self) -> None:
+        # A and D unrelated (D not <: A, A not <: D, no common base
+        # in the fixture). Rust defers; Python returns object.
+        from mypy.join import join_types
+
+        result = join_types(self.fx.a, self.fx.d)
+        assert result == self.fx.o
+
+    def test_join_with_args_defers_to_python(self) -> None:
+        # Instance with type args -> Rust defers (needs type-arg join).
+        # ga is G[A]; join(G[A], G[A]) defers to Python which returns
+        # G[A].
+        from mypy.join import join_types
+
+        result = join_types(self.fx.ga, self.fx.ga)
+        assert result == self.fx.ga
 

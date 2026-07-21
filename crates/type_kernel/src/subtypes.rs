@@ -180,7 +180,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
 /// `None` when any step hits an unsupported Type variant in
 /// `expand_type_by_instance`, or when no derivation path is found (the
 /// snapshot may be stale mid-build; Python handles the Any fallback).
-fn map_instance_to_supertype(
+pub(crate) fn map_instance_to_supertype(
     left_ref: &str,
     left_args: &[Type],
     right_ref: &str,

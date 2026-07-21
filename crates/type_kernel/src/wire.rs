@@ -1622,6 +1622,28 @@ pub(crate) fn read_type_to_str(bytes: &[u8]) -> PyResult<String> {
     Ok(typ.to_string())
 }
 
+/// Minimal short-int encoder for test helpers in other modules.
+/// Mirrors `_write_short_int` 1-byte form (values -10..=117).
+#[cfg(test)]
+pub(crate) fn encode_short_int_for_test(value: i64) -> Vec<u8> {
+    assert!(
+        value >= MIN_ONE_BYTE_INT && value <= 117,
+        "test helper only supports 1-byte short-int range"
+    );
+    vec![((value - MIN_ONE_BYTE_INT) << 1) as u8]
+}
+
+/// Minimal args-less Instance wire blob for tests: INSTANCE (80) +
+/// INSTANCE_SIMPLE (81) + short-int length + UTF-8 fullname.
+#[cfg(test)]
+pub(crate) fn encode_instance_simple_for_test(fullname: &str) -> Vec<u8> {
+    let bytes = fullname.as_bytes();
+    let mut blob = vec![INSTANCE, INSTANCE_SIMPLE];
+    blob.extend(encode_short_int_for_test(bytes.len() as i64));
+    blob.extend_from_slice(bytes);
+    blob
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
