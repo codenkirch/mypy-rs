@@ -3719,4 +3719,63 @@ class NativeMeetSuite(Suite):
         tup2 = TupleType([self.fx.a], self.fx.std_tuple)
         assert meet_types(tup1, tup2) == tup1
 
+    # ---- visit_type_var (M8q) ----
+
+    def test_meet_type_var_same_id_same_upper_bound_returns_s(self) -> None:
+        # visit_type_var case 1 (meet.py:880-881): s.id == t.id,
+        # s.upper_bound == t.upper_bound -> return self.s.
+        assert meet_types(self.fx.t, self.fx.t) == self.fx.t
+
+    def test_meet_type_var_different_id_returns_bottom(self) -> None:
+        # visit_type_var else (meet.py:883-884): s.id != t.id ->
+        # default(self.s) -> Bottom.
+        assert meet_types(self.fx.t, self.fx.s) == UninhabitedType()
+
+    def test_meet_type_var_s_not_type_var_returns_bottom(self) -> None:
+        # visit_type_var else: s is Instance (not TypeVarType) ->
+        # default -> Bottom.
+        assert meet_types(self.fx.a, self.fx.t) == UninhabitedType()
+
+    # ---- visit_literal_type (M8q) ----
+
+    def test_meet_literal_equal_literal_returns_t(self) -> None:
+        # visit_literal_type case 1 (meet.py:1237-1238): s is LiteralType,
+        # s == t -> return t.
+        assert meet_types(self.fx.lit1, self.fx.lit1) == self.fx.lit1
+
+    def test_meet_literal_unequal_literal_returns_bottom(self) -> None:
+        # visit_literal_type else: s is LiteralType, s != t -> default
+        # -> Bottom.
+        assert meet_types(self.fx.lit1, self.fx.lit2) == UninhabitedType()
+
+    def test_meet_literal_s_is_instance_fallback_subtype_returns_t(self) -> None:
+        # visit_literal_type case 2 (meet.py:1239-1240): s is Instance,
+        # is_subtype(t.fallback, s) -> return t. lit1 has fallback a;
+        # meet(a, lit1) = lit1 (a is supertype of lit1's fallback).
+        assert meet_types(self.fx.a, self.fx.lit1) == self.fx.lit1
+
+    def test_meet_literal_s_is_instance_fallback_not_subtype_returns_bottom(self) -> None:
+        # visit_literal_type else: s is Instance, is_subtype(t.fallback,
+        # s) = False -> default -> Bottom. lit3 has fallback d (unrelated
+        # to a); meet(a, lit3) = Bottom.
+        assert meet_types(self.fx.a, self.fx.lit3) == UninhabitedType()
+
+    # ---- visit_type_type (M8q) ----
+
+    def test_meet_type_type_s_is_builtins_type_returns_t(self) -> None:
+        # visit_type_type case 2 (meet.py:1256-1257): s is
+        # Instance(builtins.type) -> return t.
+        assert meet_types(self.fx.type_type, self.fx.type_a) == self.fx.type_a
+
+    def test_meet_type_type_both_type_type_defers_to_python(self) -> None:
+        # visit_type_type case 1 (meet.py:1249-1255): both TypeType ->
+        # recursive meet + make_normalized -> defers. Result identical.
+        assert meet_types(self.fx.type_a, self.fx.type_a) == self.fx.type_a
+
+    def test_meet_type_type_s_is_unrelated_instance_returns_bottom(self) -> None:
+        # visit_type_type else (meet.py:1260-1261): s is Instance (not
+        # builtins.type) -> default -> Bottom.
+        assert meet_types(self.fx.a, self.fx.type_a) == UninhabitedType()
+
+
 
