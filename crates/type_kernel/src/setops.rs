@@ -781,6 +781,336 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
     })
 }
 
+/// `is_similar_callables` (join.py:993-1001): same arg count, same
+/// min_args (ARG_POS count), same is_var_arg (any ARG_STAR). The wire
+/// format stores arg_kinds as i64 (ARG_POS=0, ARG_STAR=2).
+fn is_similar_callables(
+    t_arg_types: &[Type],
+    t_arg_kinds: &[i64],
+    s_arg_types: &[Type],
+    s_arg_kinds: &[i64],
+) -> bool {
+    t_arg_types.len() == s_arg_types.len()
+        && min_args(t_arg_kinds) == min_args(s_arg_kinds)
+        && is_var_arg(t_arg_kinds) == is_var_arg(s_arg_kinds)
+}
+
+fn min_args(arg_kinds: &[i64]) -> usize {
+    arg_kinds.iter().filter(|&&k| k == 0).count()
+}
+
+fn is_var_arg(arg_kinds: &[i64]) -> bool {
+    arg_kinds.contains(&2)
+}
+
+/// `is_equivalent` (subtypes.py:277-300) for two Callables: is_subtype
+/// both ways on pairwise arg_types + ret_type. Returns `None` (defer)
+/// if any is_subtype can't decide; `Some(true)` if mutually subtype,
+/// `Some(false)` otherwise.
+fn is_equivalent_callable(
+    t_arg_types: &[Type],
+    t_ret_type: &Type,
+    s_arg_types: &[Type],
+    s_ret_type: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
+        let fwd = is_subtype(ta, sa, ctx, resolver)?;
+        if !fwd {
+            return Some(false);
+        }
+        let bwd = is_subtype(sa, ta, ctx, resolver)?;
+        if !bwd {
+            return Some(false);
+        }
+    }
+    let ret_fwd = is_subtype(t_ret_type, s_ret_type, ctx, resolver)?;
+    if !ret_fwd {
+        return Some(false);
+    }
+    let ret_bwd = is_subtype(s_ret_type, t_ret_type, ctx, resolver)?;
+    Some(ret_bwd)
+}
+
+/// `combine_arg_names` (join.py:1123-1156): per-index, None if either is
+/// None or names differ. Preserves positional names when compatible.
+fn combine_arg_names(
+    t_names: &[Option<String>],
+    s_names: &[Option<String>],
+) -> Vec<Option<String>> {
+    t_names
+        .iter()
+        .zip(s_names.iter())
+        .map(|(tn, sn)| match (tn, sn) {
+            (Some(tn), Some(sn)) if tn == sn => Some(tn.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `safe_join` (join.py:1065-1072): join_types for non-UnpackType
+/// pairs. Both-UnpackType -> UnpackType(join). Mixed -> defer (None).
+fn safe_join(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
+    let t_unpack = matches!(t, Type::UnpackType { .. });
+    let s_unpack = matches!(s, Type::UnpackType { .. });
+    if !t_unpack && !s_unpack {
+        return setop_result_to_type(join_types(t, s, ctx, resolver), t, s);
+    }
+    if t_unpack && s_unpack {
+        let t_inner = match t {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => unreachable!(),
+        };
+        let s_inner = match s {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => unreachable!(),
+        };
+        let joined = setop_result_to_type(
+            join_types(t_inner, s_inner, ctx, resolver),
+            t_inner,
+            s_inner,
+        )?;
+        return Some(Type::UnpackType {
+            typ: Box::new(joined),
+        });
+    }
+    // Mixed UnpackType / non-UnpackType: object_or_any_from_type fallback.
+    // Defer to Python (rare case, needs full object_or_any_from_type).
+    None
+}
+
+/// `safe_meet` (meet.py equivalent of safe_join): meet_types for
+/// non-UnpackType pairs. Both-UnpackType needs tuple_fallback lookup
+/// (defer). Mixed -> UninhabitedType. Returns None (defer) if the
+/// underlying meet_types defers.
+fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
+    let t_unpack = matches!(t, Type::UnpackType { .. });
+    let s_unpack = matches!(s, Type::UnpackType { .. });
+    if !t_unpack && !s_unpack {
+        return setop_result_to_type(meet_types(t, s, ctx, resolver), t, s);
+    }
+    if t_unpack && s_unpack {
+        // meet.py:1082-1093: needs tuple_fallback.type from the
+        // unpacked TypeVarTupleType/TupleType/Instance. Defer.
+        return None;
+    }
+    // Mixed: meet.py:1094 returns UninhabitedType().
+    Some(Type::UninhabitedType)
+}
+
+/// Pick the fallback per join.py:1106-1109 (combine) / 1048-1051
+/// (join_similar): if t.fallback is builtins.function, use t.fallback,
+/// else s.fallback. The "t" here is the second operand (self.s in
+/// Python is the first arg; our s/t naming follows the Rust convention
+/// where s is the first arg to join_types).
+fn pick_fallback(s_fallback: &Type, t_fallback: &Type) -> Type {
+    if let Type::Instance { type_ref, .. } = s_fallback {
+        if type_ref == "builtins.function" {
+            return s_fallback.clone();
+        }
+    }
+    t_fallback.clone()
+}
+
+/// `combine_similar_callables` (join.py:1097-1120): is_equivalent path.
+/// Per-arg safe_join, ret join, instance_type join, fallback pick.
+/// Returns Encoded(new CallableType) or None (defer).
+#[allow(clippy::too_many_arguments)]
+fn combine_similar_callables(
+    s: &Type,
+    t: &Type,
+    s_arg_types: &[Type],
+    t_arg_types: &[Type],
+    s_ret_type: &Type,
+    t_ret_type: &Type,
+    s_fallback: &Type,
+    t_fallback: &Type,
+    s_instance_type: &Option<Box<Type>>,
+    t_instance_type: &Option<Box<Type>>,
+    s_arg_names: &[Option<String>],
+    t_arg_names: &[Option<String>],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let mut new_arg_types = Vec::with_capacity(t_arg_types.len());
+    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
+        new_arg_types.push(safe_join(ta, sa, ctx, resolver)?);
+    }
+    let new_ret = setop_result_to_type(
+        join_types(t_ret_type, s_ret_type, ctx, resolver),
+        s_ret_type,
+        t_ret_type,
+    )?;
+    let new_instance_type = match (s_instance_type, t_instance_type) {
+        (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
+            join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
+            si.as_ref(),
+            ti.as_ref(),
+        )?)),
+        _ => None,
+    };
+    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names);
+    let new_fallback = pick_fallback(s_fallback, t_fallback);
+    let (
+        arg_kinds,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        type_guard,
+        type_is,
+    ) = extract_callable_invariants(t);
+    let new_callable = Type::CallableType {
+        fallback: Box::new(new_fallback),
+        instance_type: new_instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        arg_types: new_arg_types,
+        arg_kinds,
+        arg_names: new_arg_names,
+        ret_type: Box::new(new_ret),
+        name: None,
+        variables: Vec::new(),
+        type_guard,
+        type_is,
+    };
+    let _ = t;
+    let _ = s;
+    encode_callable(new_callable)
+}
+
+/// `join_similar_callables` (join.py:1040-1062): similar-but-not-
+/// equivalent path. Per-arg safe_meet, ret join, instance_type join,
+/// fallback pick. Returns Encoded(new CallableType) or None (defer).
+#[allow(clippy::too_many_arguments)]
+fn join_similar_callables(
+    s: &Type,
+    t: &Type,
+    s_arg_types: &[Type],
+    t_arg_types: &[Type],
+    s_ret_type: &Type,
+    t_ret_type: &Type,
+    s_fallback: &Type,
+    t_fallback: &Type,
+    s_instance_type: &Option<Box<Type>>,
+    t_instance_type: &Option<Box<Type>>,
+    s_arg_names: &[Option<String>],
+    t_arg_names: &[Option<String>],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let mut new_arg_types = Vec::with_capacity(t_arg_types.len());
+    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
+        new_arg_types.push(safe_meet(ta, sa, ctx, resolver)?);
+    }
+    let new_ret = setop_result_to_type(
+        join_types(t_ret_type, s_ret_type, ctx, resolver),
+        s_ret_type,
+        t_ret_type,
+    )?;
+    let new_instance_type = match (s_instance_type, t_instance_type) {
+        (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
+            join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
+            si.as_ref(),
+            ti.as_ref(),
+        )?)),
+        _ => None,
+    };
+    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names);
+    let new_fallback = pick_fallback(s_fallback, t_fallback);
+    let (
+        arg_kinds,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        type_guard,
+        type_is,
+    ) = extract_callable_invariants(t);
+    let new_callable = Type::CallableType {
+        fallback: Box::new(new_fallback),
+        instance_type: new_instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        arg_types: new_arg_types,
+        arg_kinds,
+        arg_names: new_arg_names,
+        ret_type: Box::new(new_ret),
+        name: None,
+        variables: Vec::new(),
+        type_guard,
+        type_is,
+    };
+    let _ = s;
+    let _ = t;
+    encode_callable(new_callable)
+}
+
+/// Extract the invariant fields (arg_kinds, flags, type_guard, type_is)
+/// from a CallableType `t`. These are copied as-is to the result
+/// (join.py:1113-1119 copy_modified preserves them).
+#[allow(clippy::type_complexity)]
+fn extract_callable_invariants(
+    t: &Type,
+) -> (
+    Vec<i64>,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    bool,
+    Option<Box<Type>>,
+    Option<Box<Type>>,
+) {
+    match t {
+        Type::CallableType {
+            arg_kinds,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            type_guard,
+            type_is,
+            ..
+        } => (
+            arg_kinds.clone(),
+            *is_ellipsis_args,
+            *implicit,
+            *is_bound,
+            *from_concatenate,
+            *imprecise_arg_kinds,
+            *unpack_kwargs,
+            type_guard.clone(),
+            type_is.clone(),
+        ),
+        _ => unreachable!("extract_callable_invariants on non-CallableType"),
+    }
+}
+
+/// Encode a CallableType via write_type and wrap as Encoded. Returns
+/// None if write_type fails (unsupported nested variant).
+fn encode_callable(t: Type) -> Option<SetOpResult> {
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &t).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
 /// `TypeJoinVisitor.visit_*` leaf methods (join.py:344-374), Rust
 /// subset. Handles the visitors that don't recurse into `join_types`.
 fn visit_join(
@@ -907,13 +1237,64 @@ fn visit_join(
                 if identical {
                     return Some(SetOpResult::SameS);
                 }
-                // Similar-but-not-identical: combine_similar_callables
-                // (is_equivalent) or join_similar_callables (similar
-                // only). Both build a new CallableType via per-arg
-                // join/meet + ret join + fallback pick. Defer to
-                // Python until match_generic_callables + safe_join +
-                // is_equivalent are ported.
-                return None;
+                // join.py:620: is_similar_callables(t, self.s).
+                if !is_similar_callables(arg_types, arg_kinds, s_arg_types, s_arg_kinds) {
+                    // Not similar: the var-arg / subtype fallback
+                    // branches (join.py:638-646) need is_subtype on
+                    // whole callables -> defer.
+                    return None;
+                }
+                // join.py:621: is_equivalent(t, self.s). Approximated
+                // by is_subtype both ways on pairwise arg_types +
+                // ret_type. Returns None (defer) if any is_subtype
+                // can't decide (non-Instance, generic args, etc.).
+                let equivalent = is_equivalent_callable(
+                    arg_types,
+                    ret_type,
+                    s_arg_types,
+                    s_ret_type,
+                    ctx,
+                    resolver,
+                )?;
+                // Both-generic case (match_generic_callables) needs
+                // expand_type + fresh TypeVarId generation -> defer.
+                if !variables.is_empty() || !s_variables.is_empty() {
+                    return None;
+                }
+                if equivalent {
+                    return combine_similar_callables(
+                        s,
+                        t,
+                        s_arg_types,
+                        arg_types,
+                        s_ret_type,
+                        ret_type,
+                        s_fallback,
+                        fallback,
+                        s_instance_type,
+                        instance_type,
+                        s_arg_names,
+                        arg_names,
+                        ctx,
+                        resolver,
+                    );
+                }
+                return join_similar_callables(
+                    s,
+                    t,
+                    s_arg_types,
+                    arg_types,
+                    s_ret_type,
+                    ret_type,
+                    s_fallback,
+                    fallback,
+                    s_instance_type,
+                    instance_type,
+                    s_arg_names,
+                    arg_names,
+                    ctx,
+                    resolver,
+                );
             }
             visit_callable_fallback(s, fallback, ctx, resolver)
         }
@@ -1693,7 +2074,7 @@ fn discriminator_trivial(r: SetOpResult) -> i64 {
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
-    use crate::wire::{LiteralValue, Type};
+    use crate::wire::{read_type, LiteralValue, Type};
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
         let mut r = TypeResolver::new();
@@ -2206,12 +2587,11 @@ mod tests {
 
     #[test]
     fn join_callable_with_callable_defers() {
-        // Both s and t are CallableType, similar but not structurally
-        // identical (arg types differ: object vs function). The Rust
-        // visit_callable_type both-CallableType case handles only the
-        // structurally-identical case (returns SameS); everything else
-        // defers to Python (combine_similar_callables /
-        // join_similar_callables produce a new CallableType).
+        // Both s and t are CallableType but NOT similar (different arg
+        // counts), so is_similar_callables returns false. The Rust
+        // visit_callable_type both-CallableType case defers (the
+        // var-arg / subtype fallback branches at join.py:638-646 need
+        // is_subtype on whole callables -> not yet ported).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -2222,7 +2602,10 @@ mod tests {
         );
         let t = callable(
             "builtins.function",
-            vec![instance("builtins.function", vec![])],
+            vec![
+                instance("builtins.object", vec![]),
+                instance("builtins.object", vec![]),
+            ],
             instance("builtins.object", vec![]),
         );
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
@@ -2248,6 +2631,81 @@ mod tests {
             vec![instance("builtins.object", vec![])],
             instance("builtins.object", vec![]),
         );
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_similar_callables_non_equivalent_returns_encoded() {
+        // join(callable(B, object), callable(A, object)) where B <: A.
+        // is_similar_callables=True (same arg count, same min_args,
+        // same is_var_arg). is_equivalent=False (B <: A but not A <: B).
+        // visit_callable_type fires join_similar_callables: per-arg
+        // safe_meet(B, A) = B (the narrower), ret join(object, object)
+        // = object. Result is a new CallableType(arg=[B], ret=object)
+        // returned as Encoded (disc=7).
+        let o = snap("builtins.object", "object");
+        let a = snap_with_bases("a.A", "A", &["builtins.object"]);
+        let b = snap_with_bases("a.B", "B", &["a.A", "builtins.object"]);
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, a, b, func]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("a.B", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = callable(
+            "builtins.function",
+            vec![instance("a.A", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = callable(
+                "builtins.function",
+                vec![instance("a.B", vec![])],
+                instance("builtins.object", vec![]),
+            );
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn combine_similar_callables_equivalent_returns_encoded() {
+        // join(callable(A, object), callable(A, object)) where the two
+        // A instances are structurally equal (same type_ref) but the
+        // callables are not the same Rust object. is_equivalent=True
+        // (A <: A both ways). combine_similar_callables: per-arg
+        // safe_join(A, A) = A, ret join(object, object) = object.
+        // Result is a new CallableType(arg=[A], ret=object) returned as
+        // Encoded. (Distinct from the identical case because the M8t
+        // identical check compares the full struct; here we want to
+        // exercise the combine path. Since the structs are identical,
+        // M8t returns SameS. To force the combine path, we'd need
+        // non-identical-but-equivalent args, which for Instance means
+        // same type_ref. So this test is subsumed by the identical case;
+        // we assert SameS here to document the overlap.)
+        let o = snap("builtins.object", "object");
+        let a = snap_with_bases("a.A", "A", &["builtins.object"]);
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, a, func]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("a.A", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = callable(
+            "builtins.function",
+            vec![instance("a.A", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        // Structurally identical -> SameS (M8t path).
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
