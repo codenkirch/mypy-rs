@@ -51,6 +51,7 @@ from mypy.types import (
     TypeType,
     TypeVarId,
     TypeVarType,
+    TypeVarTupleType,
     UnboundType,
     UninhabitedType,
     UnionType,
@@ -3718,6 +3719,204 @@ class NativeMeetSuite(Suite):
         tup1 = TupleType([self.fx.a], self.fx.std_tuple)
         tup2 = TupleType([self.fx.a], self.fx.std_tuple)
         assert meet_types(tup1, tup2) == tup1
+
+
+class NativeMeetUnboundSuite(Suite):
+    """Parity suite for the Rust `visit_unbound_type` meet (Stage 3c M8r).
+
+    Exercises the three branches of `TypeMeetVisitor.visit_unbound_type`
+    (meet.py:864-873): NoneType s (strict/non-strict), UninhabitedType s,
+    and the else branch (AnyType). The Rust arm fires for UnboundType t;
+    cases that would reach the visitor with AnyType s instead short-circuit
+    at meet.py:145 (AnyType-s -> return t), verified separately.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_meet_unbound_s_none_strict_returns_bottom(self) -> None:
+        # visit_unbound_type (meet.py:865-867): s=NoneType, strict ->
+        # UninhabitedType.
+        with state.strict_optional_set(True):
+            assert meet_types(NoneType(), UnboundType("X")) == UninhabitedType()
+
+    def test_meet_unbound_s_none_non_strict_returns_s(self) -> None:
+        # visit_unbound_type (meet.py:865,868-869): s=NoneType, non-strict
+        # -> self.s (NoneType).
+        with state.strict_optional_set(False):
+            assert meet_types(NoneType(), UnboundType("X")) == NoneType()
+
+    def test_meet_unbound_s_uninhabited_returns_s(self) -> None:
+        # visit_unbound_type (meet.py:870-871): s=UninhabitedType ->
+        # self.s (UninhabitedType).
+        with state.strict_optional_set(True):
+            assert meet_types(UninhabitedType(), UnboundType("X")) == UninhabitedType()
+
+    def test_meet_unbound_s_instance_returns_any(self) -> None:
+        # visit_unbound_type else (meet.py:872-873): AnyType.
+        with state.strict_optional_set(True):
+            result = meet_types(self.fx.a, UnboundType("X"))
+            assert isinstance(result, AnyType)
+
+    def test_meet_unbound_s_any_short_circuits_to_t(self) -> None:
+        # AnyType-s short-circuit (meet.py:145) fires before the visitor:
+        # meet_types(AnyType, UnboundType) returns t (the UnboundType).
+        # The Rust path mirrors this in meet_types (SameT).
+        with state.strict_optional_set(True):
+            result = meet_types(self.fx.anyt, UnboundType("X"))
+            assert isinstance(result, UnboundType)
+
+
+class NativeMeetTypeVarTupleSuite(Suite):
+    """Parity suite for the Rust `visit_type_var_tuple` meet (Stage 3c M8r).
+
+    Exercises `TypeMeetVisitor.visit_type_var_tuple` (meet.py:930-934):
+    same id -> pick by min_len; different id / s not TypeVarTupleType ->
+    default(self.s) -> Bottom (strict).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _tvt(self, raw_id: int, min_len: int) -> TypeVarTupleType:
+        return TypeVarTupleType(
+            "Ts",
+            "Ts",
+            TypeVarId(raw_id),
+            self.fx.o,
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+            min_len=min_len,
+        )
+
+    def test_meet_tvt_same_id_s_larger_min_returns_s(self) -> None:
+        # visit_type_var_tuple (meet.py:931-932): same id, s.min_len >
+        # t.min_len -> self.s.
+        s = self._tvt(1, 2)
+        t = self._tvt(1, 1)
+        with state.strict_optional_set(True):
+            assert meet_types(s, t) == s
+
+    def test_meet_tvt_same_id_t_larger_min_returns_t(self) -> None:
+        # visit_type_var_tuple: same id, s.min_len <= t.min_len -> t.
+        s = self._tvt(1, 1)
+        t = self._tvt(1, 2)
+        with state.strict_optional_set(True):
+            assert meet_types(s, t) == t
+
+    def test_meet_tvt_same_id_equal_min_returns_t(self) -> None:
+        # visit_type_var_tuple: same id, equal min_len -> t (the `else`
+        # branch of `self.s if self.s.min_len > t.min_len else t`).
+        s = self._tvt(1, 3)
+        t = self._tvt(1, 3)
+        with state.strict_optional_set(True):
+            assert meet_types(s, t) == t
+
+    def test_meet_tvt_different_id_returns_bottom(self) -> None:
+        # visit_type_var_tuple else (meet.py:933-934): different id ->
+        # default(self.s) -> Bottom (strict).
+        s = self._tvt(1, 2)
+        t = self._tvt(2, 2)
+        with state.strict_optional_set(True):
+            assert meet_types(s, t) == UninhabitedType()
+
+    def test_meet_tvt_s_not_tvt_returns_bottom(self) -> None:
+        # visit_type_var_tuple else: s is Instance -> default(Instance)
+        # -> Bottom (strict).
+        t = self._tvt(1, 2)
+        with state.strict_optional_set(True):
+            assert meet_types(self.fx.a, t) == UninhabitedType()
+
 
     # ---- visit_type_var (M8q) ----
 
