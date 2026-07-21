@@ -47,7 +47,6 @@ const LITERAL_TRUE: u8 = 1;
 const LITERAL_NONE: u8 = 2;
 const LITERAL_INT: u8 = 3;
 const LITERAL_STR: u8 = 4;
-#[allow(dead_code)]
 const LITERAL_BYTES: u8 = 5;
 const LITERAL_FLOAT: u8 = 6;
 
@@ -275,9 +274,8 @@ fn read_str_bare(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
 }
 
 /// Read bare bytes (short-int length prefix + raw body). Mirrors
-/// `read_bytes_internal`. Kept for wire-format completeness; not yet
-/// exercised by Stage 3a's reader (no serialized Type uses bare bytes).
-#[allow(dead_code)]
+/// `read_bytes_internal`. Used by `read_literal` for the
+/// `LITERAL_BYTES` tag (cache.py:347-364).
 fn read_bytes_bare(buf: &mut ReadBuffer<'_>) -> Result<Vec<u8>, WireError> {
     let first = buf.read_u8()?;
     if first == LONG_INT_TRAILER {
@@ -405,6 +403,7 @@ fn read_flags(buf: &mut ReadBuffer<'_>, num_flags: usize) -> Result<Vec<bool>, W
 pub(crate) enum LiteralValue {
     Int(i64),
     Str(String),
+    Bytes(Vec<u8>),
     Bool(bool),
     Float(f64),
 }
@@ -413,6 +412,7 @@ fn read_literal(buf: &mut ReadBuffer<'_>, tag: u8) -> Result<LiteralValue, WireE
     match tag {
         LITERAL_INT => Ok(LiteralValue::Int(read_int_bare(buf)?)),
         LITERAL_STR => Ok(LiteralValue::Str(read_str_bare(buf)?)),
+        LITERAL_BYTES => Ok(LiteralValue::Bytes(read_bytes_bare(buf)?)),
         LITERAL_FALSE => Ok(LiteralValue::Bool(false)),
         LITERAL_TRUE => Ok(LiteralValue::Bool(true)),
         LITERAL_FLOAT => Ok(LiteralValue::Float(read_float_bare(buf)?)),
@@ -1096,6 +1096,9 @@ impl fmt::Display for LiteralValue {
             // contains a single quote (then double-quoted). Rust's `{:?}`
             // always double-quotes, so we replicate Python's preference here.
             LiteralValue::Str(s) => python_str_repr(f, s),
+            // Mirror Python `repr(bytes)` — always single-quoted with a
+            // `b` prefix; non-printable bytes use `\xNN` escapes.
+            LiteralValue::Bytes(b) => python_bytes_repr(f, b),
             // Python capitalizes bool literals: `True` / `False`.
             LiteralValue::Bool(b) => {
                 if *b {
@@ -1151,6 +1154,26 @@ fn python_str_body(f: &mut fmt::Formatter<'_>, s: &str, quote: char) -> fmt::Res
         }
     }
     Ok(())
+}
+
+/// Replicate CPython's `repr(bytes)`: always single-quoted with a `b`
+/// prefix. Printable ASCII (0x20-0x7e) passes through except `\\`, `'`.
+/// Non-printable bytes use `\xNN`. Control bytes `\n \r \t` use named
+/// escapes, matching CPython's bytes repr.
+fn python_bytes_repr(f: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
+    f.write_str("b'")?;
+    for &b in bytes {
+        match b {
+            b'\\' => f.write_str("\\\\")?,
+            b'\'' => f.write_str("\\'")?,
+            b'\n' => f.write_str("\\n")?,
+            b'\r' => f.write_str("\\r")?,
+            b'\t' => f.write_str("\\t")?,
+            0x20..=0x7e => write!(f, "{}", b as char)?,
+            _ => write!(f, "\\x{:02x}", b)?,
+        }
+    }
+    f.write_str("'")
 }
 
 impl fmt::Display for Type {
@@ -1257,7 +1280,6 @@ impl fmt::Display for Type {
                 type_guard,
                 type_is,
                 unpack_kwargs,
-                is_ellipsis_args: _,
                 ..
             } => {
                 // visit_callable_type. Python builds `def {vars_block} ({params}) -> {ret}`:

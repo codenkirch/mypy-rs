@@ -1425,3 +1425,91 @@ The default-off path is unchanged. Stage 3a introduces no production
 wiring — `read_type_to_str` is parity-only and gated behind the
 `type_kernel` extension import (skipped when the `.so` is absent).
 
+## Milestone 6 (Phase 4): Type Kernel, Stage 3b (`typeinfo::build_resolver`)
+
+Stage 3b closes the Stage 3a deferred renderings by resolving the
+unresolved `type_ref` (the `type.fullname` string carried by
+`Type::Instance` / `Type::TypeAliasType` in the wire format) against a
+frozen snapshot of the live Python `mypy.nodes.TypeInfo` graph.
+
+### Why a snapshot
+
+Stage 3a's `Display` impl renders `type_ref` verbatim because the wire
+format carries only `type.fullname`, not `type.name`. This matches the
+`TypeFixture` corpus (where `TypeInfo.name == fullname`) but diverges in
+production, where `TypeInfo.fullname == "builtins.int"` and
+`TypeInfo.name == "int"`. The same gap blocks the enum-literal
+`value_repr` (`f"{fallback_name}.{value}"`, needs `is_enum`), the
+bytes-literal `value_repr` (needs `fallback_name == "builtins.bytes"`),
+and the `[()]` variadic-tuple branch (needs `has_type_var_tuple_type`
+and `len(type_vars)`). All four deferred renderings need a small set of
+`TypeInfo` fields resolved by `fullname`.
+
+Stage 3b introduces `TypeInfoSnapshot`, a frozen view of the fields
+`mypy.subtypes` and `mypy.types.TypeStrVisitor` consult, keyed by
+`fullname`. The snapshot is built once per type-checking pass by walking
+the live Python TypeInfo graph via PyO3; lookups are `O(1)`.
+
+### Scope
+
+New module `crates/type_kernel/src/typeinfo.rs` exposing two
+`#[pyfunction]`s registered in `#[pymodule] type_kernel`:
+
+- `build_resolver(type_infos: Iterable[TypeInfo]) -> dict[str, dict]`:
+  walks each `TypeInfo`, reads the Stage 3b/3c field set (see below),
+  and returns a snapshot dict keyed by `fullname`. Each value is a
+  JSON-serializable dict of strings, bools, `list[str]`, and a
+  `list[bytes]` of serialized `_promote` Types (Stage 3c decodes via
+  `wire::read_type`). Per-item read failures degrade gracefully (item
+  skipped, resolver still builds), mirroring the strangler-fig pattern
+  from `erase::erase_type`.
+- `read_type_to_str_with_resolver(bytes: bytes, resolver: dict) -> str`:
+  reads a serialized `Type` via `wire::read_type`, then renders it via
+  `render_type(t, resolver)`. For `Instance` and `LiteralType` the
+  resolver is consulted (prefix-strip on `builtins.*`, enum-literal
+  `value_repr`, bytes-literal `value_repr`, `[()]` branch). All other
+  variants delegate to the Stage 3a `Display` impl, so `render_type(t,
+  None) == t.to_string()` holds exactly (regression guard).
+
+`wire.rs` gained the `LITERAL_BYTES` tag (tag 5, already declared but
+previously unhandled) in `read_literal`, plus the `LiteralValue::Bytes`
+variant and a `python_bytes_repr` helper mirroring CPython's `repr(bytes)`.
+Stage 3a could not read bytes literals; Stage 3b can.
+
+### Snapshot field set
+
+Union of Stage 3b rendering consumers and Stage 3c `is_subtype`
+consumers, so the struct is not reshaped when Stage 3c lands:
+
+- Rendering: `fullname`, `name`, `is_enum`, `has_type_var_tuple_type`,
+  `type_vars` (length only).
+- `is_subtype`: `is_protocol`, `fallback_to_any`, `meta_fallback_to_any`,
+  `is_named_tuple`, `is_abstract`, `mro`, `protocol_members`,
+  `has_base` (precomputed from mro), `promote_bytes`, `alt_promote_fullname`,
+  `metaclass_fullname`.
+
+Mutable scratch fields (`assuming`, `assuming_proper`, `inferring`,
+`metadata`) are NOT snapshotted; they remain Python-side as a
+recursion-guard sidecar.
+
+### No production wiring
+
+Stage 3b is parity-only, same as Stage 3a. `Options.native_type_kernel`
+still defaults to `False`, `BuildManager` is unchanged, and
+`mypy/subtypes.py` is unchanged. The foundation lands first; Stage 3c
+will consume the same resolver in `is_subtype`.
+
+### Parity baselines
+
+| Suite | Result |
+|-------|--------|
+| `cargo test -p mypy-type-kernel typeinfo::` (new) | 13 passed |
+| `cargo test -p mypy-type-kernel wire::` (Stage 3a regression) | 13 passed |
+| `testtypes.py::NativeTypeWireResolverSuite` (new, `TEST_NATIVE_TYPE_KERNEL=1`) | 17 passed |
+| `testtypes.py::NativeTypeWireSuite` (Stage 3a regression) | 17 passed |
+| `testtypes.py` full (`TEST_NATIVE_TYPE_KERNEL=1`) | 153 passed, 2 skipped |
+
+The default-off path is unchanged. Stage 3b introduces no production
+wiring: both `#[pyfunction]`s are parity-only and gated behind the
+`type_kernel` extension import (skipped when the `.so` is absent).
+
