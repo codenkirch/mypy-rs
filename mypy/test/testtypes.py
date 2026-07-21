@@ -2611,9 +2611,11 @@ class NativeJoinCallableSuite(Suite):
     `SameS` (result==s) passes through (disc 0). Results are identical
     to pure-Python `JoinSuite.test_function_types`.
 
-    The similar-callables case (both sides CallableType) defers to
-    Python because `combine_similar_callables` produces a new
-    CallableType (needs a Type encoder).
+    The similar-callables case (both sides CallableType, non-generic)
+    is handled by the Rust `join_similar_callables` /
+    `combine_similar_callables` path (per-arg safe_meet/safe_join, ret
+    join, fallback pick, wire-encoded result decoded and type_ref-fixed
+    on the Python side).
     """
 
     def setUp(self) -> None:
@@ -2735,10 +2737,10 @@ class NativeJoinCallableSuite(Suite):
 
     def test_callable_with_callable_defers_to_python(self) -> None:
         # Both sides CallableType, similar but not equivalent (arg types
-        # differ: (A, B) vs (A, A)). The Rust path handles only the
-        # structurally-identical case; this falls through to Python,
-        # which computes join_similar_callables. The result is identical
-        # regardless of which path computed it.
+        # differ: (A, B) vs (A, A)). The Rust path now handles the
+        # non-generic similar-but-not-equivalent case via
+        # join_similar_callables (per-arg safe_meet, ret join, fallback
+        # pick); the result matches the Python combine path.
         from mypy.join import join_types
 
         c1 = self.callable(self.fx.a, self.fx.b)

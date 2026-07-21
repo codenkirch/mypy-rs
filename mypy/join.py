@@ -145,6 +145,22 @@ class _TypeRefFixer(TypeTranslator):
             return t
         return super().visit_instance(t)
 
+    def visit_callable_type(self, t: CallableType, /) -> Type:
+        # The default TypeTranslator.visit_callable_type recurses into
+        # arg_types, ret_type, instance_type, and variables, but NOT
+        # into `t.fallback` (an Instance). The wire-encoded fallback
+        # carries an unresolved `type_ref` that must be fixed here, or
+        # downstream `==` on the decoded CallableType fails.
+        if self.missing:
+            return t
+        fallback = t.fallback.accept(self)
+        if self.missing:
+            return t
+        result = super().visit_callable_type(t)
+        if isinstance(result, CallableType):
+            result = result.copy_modified(fallback=fallback)
+        return result
+
     def visit_type_type(self, t: TypeType, /) -> Type:
         if self.missing:
             return t
