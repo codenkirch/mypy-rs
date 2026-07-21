@@ -2373,3 +2373,111 @@ class NativeJoinInstanceWithArgsSuite(Suite):
 
         assert join_types(self.fx.ga, self.fx.ga) == self.fx.ga
 
+
+class NativeJoinCovariantArgsSuite(Suite):
+    """Parity suite for the Rust `visit_instance` covariant-arg join
+    (Stage 3c M8h).
+
+    Exercises the Instance-Instance same-type join where T is covariant:
+    equal args fire the Rust path (recursive join_types returns SameS/
+    SameT, is_subtype(arg, upper_bound=object)=True); unequal args defer
+    to Python (the recursive join returns Ancestor, which the Rust
+    covariant branch can't express as an arg disc). AnyType args
+    short-circuit on either side (disc 4). Results are identical to the
+    pure-Python `JoinSuite.test_generics_covariant` cases.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(COVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_equal_args_returns_same_instance(self) -> None:
+        # join(G[A], G[A]) where T is covariant. join_types(A, A)=A
+        # (SameS) -> arg disc 1 (t.args[0]=A). is_subtype(A, object)=
+        # True -> G[A]. Fires the Rust covariant branch.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.ga, self.fx.ga) == self.fx.ga
+
+    def test_any_arg_returns_any_instance(self) -> None:
+        # join(G[Any], G[A]) where T is covariant. AnyType arg
+        # short-circuits (join.py:131-135) -> G[Any]. Fires the Rust
+        # AnyType-discard path (disc 4), shared with the invariant
+        # branch.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.gdyn, self.fx.ga) == self.fx.gdyn
+        assert join_types(self.fx.ga, self.fx.gdyn) == self.fx.gdyn
+
+    def test_multiple_equal_args_returns_same_instance(self) -> None:
+        # join(H[A,B], H[A,B]) where S,T are covariant. Both args
+        # equal -> recursive join returns SameS for each -> H[A,B].
+        # Fires the Rust covariant branch per-arg.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.hab, self.fx.hab) == self.fx.hab
+
+    def test_subtype_args_defer_to_python(self) -> None:
+        # join(G[A], G[B]) where T is covariant, B <: A. The
+        # recursive join_types(A, B) returns Ancestor(A) (the common
+        # supertype), which the Rust covariant branch can't express as
+        # an arg disc, so it defers. Python computes G[A]. The result
+        # is identical to pure-Python JoinSuite.test_generics_covariant.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.ga, self.fx.gb) == self.fx.ga
+        assert join_types(self.fx.gb, self.fx.ga) == self.fx.ga
+
+    def test_unrelated_args_defer_to_python(self) -> None:
+        # join(G[A], G[D]) where T is covariant, A,D unrelated. The
+        # recursive join_types(A, D) returns Ancestor(object), which
+        # the Rust covariant branch can't express -> defers. Python
+        # computes G[object].
+        from mypy.join import join_types
+
+        assert join_types(self.fx.ga, self.fx.gd) == self.fx.go
+

@@ -384,23 +384,29 @@ fn visit_instance_join(
 /// (join.py:114-180), Rust subset.
 ///
 /// Combines type arguments positionally via `zip(t.args, s.args,
-/// type_vars)`. M8g handles:
+/// type_vars)`. Handles:
 /// * AnyType arg (either side) -> `AnyType(from_another_any)`
 ///   (arg disc 4).
 /// * Invariant TypeVarType + `is_equivalent(ta, sa)` False ->
 ///   `object_from_instance(t)` (return `Object`).
 /// * Invariant TypeVarType + `is_equivalent` True + recursive
 ///   `join_types(ta, sa)` returns SameS/SameT -> arg disc 0/1.
+/// * Covariant TypeVarType: recursive `join_types(ta, sa)` returns
+///   SameS/SameT (equal args) -> arg disc 1/0, gated by
+///   `is_subtype(new_type, upper_bound)` (false -> `Object`).
 ///
 /// Defers (returns `None`) for:
-/// * Covariant TypeVarType (needs `upper_bound` check,
-///   subtypes.py:612 — not in the snapshot; M8h).
-/// * `type_var.values` non-empty (needs values check).
+/// * Covariant/contravariant TypeVarType where the recursive join
+///   returns `Ancestor`/`Object`/`Any`/`Bottom` (can't express as an
+///   arg disc without a Type encoder). In practice this fires when
+///   the two args differ: Instance-Instance recursion yields
+///   `Ancestor(common-supertype)` rather than `SameS`/`SameT`.
+/// * Empty `upper_bound` blob (can't safely skip the bound check).
+/// * `type_var.values` non-empty (snapshot has no `values` field;
+///   deferred conservatively via the recursive-join-non-trivial path).
 /// * ParamSpec (kind=1) / TypeVarTupleType (kind=2).
 /// * `has_type_var_tuple_type` (variadic instance).
-/// * Arg-count mismatch (Python uses `zip`; Rust defers).
-/// * Invariant equivalent but recursive join returns Ancestor/Object
-///   (can't express without a Type encoder).
+/// * Arg-count mismatch (Python uses `zip`; Rust requires equal).
 ///
 /// `s_args` / `t_args` are the Instance args (s=left, t=right). The
 /// returned `SameTypeWithArgs.arg_discs[i]` is 0 (s.args[i]), 1
@@ -458,9 +464,36 @@ fn visit_instance_with_args(
 
         match *variance {
             v if v == COVARIANT || v == VARIANCE_NOT_READY => {
-                // Covariant: join_types(ta, sa) + upper_bound check.
-                // No upper_bound in snapshot -> defer (M8h).
-                return None;
+                // join.py:136-148: covariant. new_type = join_types(ta,
+                // sa). If type_var.values non-empty, defer (needs
+                // values check, join.py:140-143; snapshot has no
+                // values). Then is_subtype(new_type, upper_bound):
+                // false -> object_from_instance(t) (Object).
+                // upper_bound blob is at type_var_upper_bounds[i].
+                // Empty blob -> defer (can't safely skip the check).
+                let ub_blob = snap.type_var_upper_bounds.get(i)?;
+                if ub_blob.is_empty() {
+                    return None;
+                }
+                let upper_bound = decode_type(ub_blob)?;
+                // Recursive join. SameS -> result = ta = t.args[i]
+                // (disc 1); SameT -> result = sa = s.args[i] (disc 0).
+                // Ancestor/Object/Any/Bottom -> defer (can't express as
+                // an arg disc without a Type encoder). In practice
+                // Instance-Instance recursion only yields SameS/SameT
+                // (when args are equal) or Ancestor (when they differ),
+                // so the covariant branch fires on equal-arg cases and
+                // defers otherwise.
+                let new_type_disc = match join_types(ta, sa, ctx, resolver) {
+                    Some(SetOpResult::SameS) => 1i8,
+                    Some(SetOpResult::SameT) => 0,
+                    Some(_) | None => return None,
+                };
+                let new_type = if new_type_disc == 1 { ta } else { sa };
+                if !is_subtype(new_type, &upper_bound, ctx, resolver)? {
+                    return Some(SetOpResult::Object);
+                }
+                arg_discs.push(new_type_disc);
             }
             v if v == INVARIANT || v == CONTRAVARIANT => {
                 // join.py:149-160: invariant/contravariant.
@@ -472,16 +505,13 @@ fn visit_instance_with_args(
                 if !equiv {
                     return Some(SetOpResult::Object);
                 }
-                // Equivalent: new_type = join_types(ta, sa). If the
-                // recursive join returns SameS/SameT, pick that arg.
-                // If Ancestor/Object, defer (can't express without a
-                // Type encoder).
+                // Equivalent: new_type = join_types(ta, sa). SameS ->
+                // result = ta = t.args[i] (disc 1); SameT -> result =
+                // sa = s.args[i] (disc 0). Ancestor/Object/Any/Bottom
+                // -> defer (can't express without a Type encoder).
                 match join_types(ta, sa, ctx, resolver)? {
-                    SetOpResult::SameS => arg_discs.push(0),
-                    SetOpResult::SameT => arg_discs.push(1),
-                    // Ancestor/Object/Any/Bottom/SameTypeWithArgs:
-                    // recursive join produced a third type or
-                    // bottom/any — defer to Python.
+                    SetOpResult::SameS => arg_discs.push(1),
+                    SetOpResult::SameT => arg_discs.push(0),
                     _ => return None,
                 }
             }
@@ -753,6 +783,13 @@ mod tests {
         };
         s.mro.push(fullname.to_string());
         s.has_base.insert(fullname.to_string());
+        // Every class implicitly has builtins.object in its MRO
+        // (mirrors the Python TypeFixture where oi=object is in every
+        // class's mro). Needed for is_subtype(X, builtins.object)=True.
+        if fullname != "builtins.object" {
+            s.mro.push("builtins.object".to_string());
+            s.has_base.insert("builtins.object".to_string());
+        }
         s
     }
 
@@ -1180,10 +1217,14 @@ mod tests {
         s
     }
 
-    /// TypeInfo with one covariant TypeVar `T` (variance=1, kind=0).
+    /// TypeInfo with one covariant TypeVar `T` (variance=1, kind=0)
+    /// and `upper_bound = builtins.object`.
     fn snap_with_covariant_tvar(fullname: &str) -> TypeInfoSnapshot {
         let mut s = snap(fullname, fullname.rsplit('.').next().unwrap_or(fullname));
         s.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        s.type_var_upper_bounds = vec![crate::wire::encode_instance_simple_for_test(
+            "builtins.object",
+        )];
         s
     }
 
@@ -1231,7 +1272,8 @@ mod tests {
     fn join_instance_invariant_equiv_true_returns_same_args() {
         // join(G[A], G[A]) where T is invariant, A <: A.
         // is_equivalent(A, A) = true. join_types(A, A) = A (SameS).
-        // Result: SameTypeWithArgs { type_ref: g.G, [Left] }.
+        // SameS means result = ta = t.args[0] -> disc 1. Both args are
+        // A so the reconstructed Instance is G[A] either way.
         let g = snap_with_invariant_tvar("g.G");
         let a = snap("a.A", "A");
         let r = make_resolver(vec![g, a]);
@@ -1244,17 +1286,100 @@ mod tests {
                 arg_discs,
             }) => {
                 assert_eq!(type_ref, "g.G");
-                assert_eq!(arg_discs, vec![0]);
+                assert_eq!(arg_discs, vec![1]);
             }
             other => panic!("expected SameTypeWithArgs, got {other:?}"),
         }
     }
 
     #[test]
-    fn join_instance_covariant_arg_defers() {
-        // Covariant TypeVar needs upper_bound check (subtypes.py:612).
-        // Rust snapshot has no upper_bound -> defer (M8h).
+    fn join_instance_covariant_same_arg_returns_same() {
+        // Covariant T, upper_bound=object. join(G[A], G[A]):
+        // join_types(A, A) = A (SameS). is_subtype(A, object)=True.
+        // arg disc 1 (t.args[0]=A, since SameS -> ta).
         let g = snap_with_covariant_tvar("g.G");
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, a, o]);
+        let s = instance("g.G", vec![instance("a.A", vec![])]);
+        let t = instance("g.G", vec![instance("a.A", vec![])]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        match result {
+            Some(SetOpResult::SameTypeWithArgs {
+                type_ref,
+                arg_discs,
+            }) => {
+                assert_eq!(type_ref, "g.G");
+                assert_eq!(arg_discs, vec![1]);
+            }
+            other => panic!("expected SameTypeWithArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_instance_covariant_subtype_defers() {
+        // Covariant T, upper_bound=object. join(G[B], G[A]) where
+        // B <: A. The recursive join_types(A, B) returns Ancestor(A)
+        // (the common supertype), not SameS/SameT. The covariant
+        // branch can't express an Ancestor result as an arg disc, so
+        // it defers to Python. This is a known limitation: the
+        // covariant branch only fires when ta and sa are structurally
+        // equal (trivial join -> SameS/SameT).
+        let g = snap_with_covariant_tvar("g.G");
+        let a = snap("a.A", "A");
+        let b = snap_with_bases("a.B", "B", &["a.A"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, a, b, o]);
+        let s = instance("g.G", vec![instance("a.B", vec![])]);
+        let t = instance("g.G", vec![instance("a.A", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_covariant_unrelated_defers() {
+        // Covariant T, upper_bound=object. join(G[A], G[D]) where
+        // A, D unrelated. The recursive join_types(A, D) returns
+        // Ancestor(builtins.object), which the covariant branch
+        // can't express as an arg disc. Defers to Python.
+        let g = snap_with_covariant_tvar("g.G");
+        let a = snap("a.A", "A");
+        let d = snap("a.D", "D");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, a, d, o]);
+        let s = instance("g.G", vec![instance("a.A", vec![])]);
+        let t = instance("g.G", vec![instance("a.D", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_covariant_upper_bound_fail_returns_object() {
+        // Covariant T, upper_bound=A (narrow). join(G[B], G[B]) where
+        // B is NOT <: A (an invalid arg, constructed for the test).
+        // join_types(B, B) = SameS -> new_type = ta = B.
+        // is_subtype(B, A) = False (B not in A's has_base) ->
+        // object_from_instance(t) = Object (whole result bails).
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        g.type_var_upper_bounds = vec![crate::wire::encode_instance_simple_for_test("a.A")];
+        let a = snap("a.A", "A");
+        let b = snap("a.B", "B");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, a, b, o]);
+        let s = instance("g.G", vec![instance("a.B", vec![])]);
+        let t = instance("g.G", vec![instance("a.B", vec![])]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Object)
+        );
+    }
+
+    #[test]
+    fn join_instance_covariant_no_upper_bound_defers() {
+        // Covariant T with empty upper_bound blob (missing from
+        // snapshot). Defer — can't safely skip the bound check.
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        g.type_var_upper_bounds = vec![Vec::new()]; // empty blob
         let a = snap("a.A", "A");
         let r = make_resolver(vec![g, a]);
         let s = instance("g.G", vec![instance("a.A", vec![])]);

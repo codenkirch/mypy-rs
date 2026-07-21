@@ -365,6 +365,8 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # SameTypeWithArgs: reconstruct Instance(typeinfo,
                 # [joined_args]) from per-arg discriminators. arg_discs
                 # [i] is 0 (s.args[i]), 1 (t.args[i]), or 4 (AnyType).
+                # Covariant args yield 0/1 (SameS/SameT on equal args);
+                # invariant equivalent args yield 0/1; AnyType yields 4.
                 if (
                     _native_join_typeinfo_map is None
                     or fullname not in _native_join_typeinfo_map
