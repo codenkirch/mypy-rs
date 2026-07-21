@@ -72,6 +72,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
+    module.add_function(wrap_pyfunction!(setops::rust_meet_types, module)?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }

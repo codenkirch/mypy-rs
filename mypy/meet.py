@@ -150,6 +150,44 @@ def meet_types(s: Type, t: Type) -> ProperType:
     # Meets/joins require callable type normalization.
     s, t = join.normalize_callables(s, t)
 
+    # Stage 3c (M8p): try the Rust meet_types pre-dispatch + leaf
+    # visitors. Rust handles the AnyType/NoneType/UninhabitedType/
+    # DeletedType leaf visitors and the args-less Instance-Instance
+    # nominal meet (same-type, subtype, supertype, unrelated). Returns
+    # (disc, fullname, arg_discs) where disc is 0=SameS, 1=SameT,
+    # 3=Bottom, 4=Any, or None (defer to Python). Mirrors the
+    # erasetype.py:80-86 strangler-fig contract. Placed after the
+    # is_proper_subtype pre-check, the AnyType-s / UnionType-s
+    # pre-dispatch, and normalize_callables, so Rust only handles the
+    # visitor leaf cases (the pre-dispatch is already done in Python;
+    # Rust repeats it for the cases where is_proper_subtype returned
+    # None on non-Instance inputs).
+    if (
+        join._HAS_TYPE_KERNEL
+        and join._native_join_active
+        and join._native_join_resolver is not None
+    ):
+        result = join._type_kernel.rust_meet_types(
+            join._serialize_type(s),
+            join._serialize_type(t),
+            state.strict_optional,
+            join._native_join_resolver,
+        )
+        if result is not None:
+            disc, _fullname, _arg_discs = result
+            if disc == 0:
+                return s
+            elif disc == 1:
+                return t
+            elif disc == 3:
+                return UninhabitedType() if state.strict_optional else NoneType()
+            elif disc == 4:
+                return AnyType(TypeOfAny.special_form)
+            # disc == 2 (Object), 5 (Ancestor), 6 (SameTypeWithArgs)
+            # are join-only results; meet_types never emits them. Fall
+            # through to Python if Rust ever does.
+        # Rust returned None (unsupported case) — fall through to Python.
+
     return t.accept(TypeMeetVisitor(s))
 
 
