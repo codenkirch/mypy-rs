@@ -2083,3 +2083,117 @@ class NativeJoinMeetSuite(Suite):
         with state.strict_optional_set(False):
             result = trivial_meet(self.fx.b, self.fx.c)
             assert isinstance(result, NoneType)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinTypesSuite(Suite):
+    """Parity suite for the Rust `join_types` pre-dispatch (Stage 3c M8e).
+
+    Exercises the Rust path with the resolver built from the TypeFixture.
+    Rust handles the UnionType swap + AnyType/NoneType/UninhabitedType/
+    DeletedType short-circuits and the leaf TypeJoinVisitor cases that
+    don't recurse. Returns `None` (Python fallthrough) for Instance/
+    Union/CallableType right and normalize_callables. Because Python runs
+    when Rust returns None, every assertion matches the pure-Python result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_join_any_left_returns_any(self) -> None:
+        # join.py:314: isinstance(s, AnyType) -> return s.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.anyt, self.fx.a) == self.fx.anyt
+
+    def test_join_none_none_strict_returns_none(self) -> None:
+        # visit_none_type, strict_optional, s=None -> SameT (None).
+        from mypy.join import join_types
+
+        with state.strict_optional_set(True):
+            assert join_types(self.fx.nonet, self.fx.nonet) == self.fx.nonet
+
+    def test_join_none_none_non_strict_returns_none(self) -> None:
+        # Non-strict-optional: visit_none_type returns s.
+        from mypy.join import join_types
+
+        with state.strict_optional_set(False):
+            assert join_types(self.fx.nonet, self.fx.nonet) == self.fx.nonet
+
+    def test_join_uninhabited_none_strict_returns_none(self) -> None:
+        # s=Uninhabited, t=None: Uninhabited swap fires -> s=None,
+        # t=Uninhabited. visit_uninhabited returns s (NoneType).
+        from mypy.join import join_types
+
+        with state.strict_optional_set(True):
+            result = join_types(UninhabitedType(), self.fx.nonet)
+            assert result == self.fx.nonet
+
+    def test_join_uninhabited_uninhabited_returns_uninhabited(self) -> None:
+        # s=Uninhabited, t=Uninhabited: no swap, visit_uninhabited
+        # returns s (UninhabitedType).
+        from mypy.join import join_types
+
+        bottom = UninhabitedType()
+        with state.strict_optional_set(True):
+            assert join_types(bottom, UninhabitedType()) == bottom
+
+    def test_join_instance_none_strict_defers_to_python(self) -> None:
+        # s=Instance, t=None, strict_optional: visit_none_type else
+        # branch -> make_simplified_union (Python). Result is a union.
+        from mypy.join import join_types
+
+        with state.strict_optional_set(True):
+            result = join_types(self.fx.a, self.fx.nonet)
+            # Python falls through and builds a union of A and None.
+            assert isinstance(result, UnionType)
+
+    def test_join_instance_none_non_strict_returns_instance(self) -> None:
+        # Non-strict-optional: visit_none_type returns s (Instance).
+        from mypy.join import join_types
+
+        with state.strict_optional_set(False):
+            assert join_types(self.fx.a, self.fx.nonet) == self.fx.a
+
+    def test_join_instance_uninhabited_returns_instance(self) -> None:
+        # s=Instance, t=Uninhabited: visit_uninhabited returns s.
+        from mypy.join import join_types
+
+        with state.strict_optional_set(True):
+            assert join_types(self.fx.a, UninhabitedType()) == self.fx.a
+
+    def test_join_instance_instance_defers_to_python(self) -> None:
+        # visit_instance needs InstanceJoiner + protocol checks ->
+        # defer (None). Python computes the nominal join (A <: A -> A).
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.a) == self.fx.a
+
