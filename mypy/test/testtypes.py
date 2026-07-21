@@ -3415,3 +3415,126 @@ class NativeJoinTypedDictSuite(Suite):
         td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.o)
         assert join_types(self.fx.t, td) == self.fx.o
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinTupleSuite(Suite):
+    """Parity suite for the Rust `visit_tuple_type` join
+    (Stage 3c M8o).
+
+    Exercises the TupleType-vs-non-TupleType fallback case (join.py:
+    774-775) when `partial_fallback` is NOT `builtins.tuple` (so
+    `tuple_fallback(t) == t.partial_fallback`). Case 1 (s is
+    TupleType, builds a new TupleType) and the `builtins.tuple`
+    fallback case (constructs `Instance(builtins.tuple, [union])`)
+    defer to Python.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_tuple_with_equal_namedtuple_fallback_returns_instance(self) -> None:
+        # join(A, Tuple(items, fallback=A)) = A. visit_tuple_type case 2
+        # (join.py:774-775): s is Instance(A), t is TupleType with
+        # partial_fallback=A (not builtins.tuple). tuple_fallback(t) ==
+        # t.partial_fallback = A. Recursive: join_types(A, A) = A (SameS).
+        # Fires the Rust SameS path (shim returns s=A).
+        from mypy.join import join_types
+        from mypy.types import TupleType
+
+        tup = TupleType([self.fx.a], self.fx.a)
+        assert join_types(self.fx.a, tup) == self.fx.a
+
+    def test_tuple_with_supertype_namedtuple_fallback_returns_object(self) -> None:
+        # join(object, Tuple(items, fallback=A)) = object. visit_tuple_type
+        # case 2: s=object, t.fallback=A. Recursive: join_types(object, A).
+        # A <: object -> join is object. Rust returns
+        # Ancestor("builtins.object"), shim reconstructs Instance(object).
+        from mypy.join import join_types
+        from mypy.types import TupleType
+
+        tup = TupleType([self.fx.a], self.fx.a)
+        assert join_types(self.fx.o, tup) == self.fx.o
+
+    def test_tuple_with_subtype_namedtuple_fallback_returns_object(self) -> None:
+        # join(A, Tuple(items, fallback=object)) = object. visit_tuple_type
+        # case 2: s=A, t.fallback=object. Recursive: join_types(A, object).
+        # A <: object -> join is object. Rust returns
+        # Ancestor("builtins.object"), passes through.
+        from mypy.join import join_types
+        from mypy.types import TupleType
+
+        tup = TupleType([self.fx.a], self.fx.o)
+        assert join_types(self.fx.a, tup) == self.fx.o
+
+    def test_tuple_with_builtins_tuple_fallback_defers_to_python(self) -> None:
+        # join(tuple, Tuple(items, fallback=builtins.tuple)) = tuple.
+        # visit_tuple_type case 2: s=Instance(builtins.tuple),
+        # t.partial_fallback=builtins.tuple. tuple_fallback(t)
+        # constructs Instance(builtins.tuple, [union(items)]) (not
+        # partial_fallback). Rust defers; Python handles it. Result
+        # identical regardless of which path computed it.
+        from mypy.join import join_types
+        from mypy.types import TupleType
+
+        tup = TupleType([self.fx.a], self.fx.std_tuple)
+        # join(tuple[Any], Tuple[A, fallback=tuple]) — Python computes
+        # this via tuple_fallback. The Rust path defers.
+        assert join_types(self.fx.std_tuple, tup) == self.fx.std_tuple
+
+    def test_tuple_with_tuple_defers_to_python(self) -> None:
+        # join(Tuple1, Tuple2) = new TupleType. visit_tuple_type case 1
+        # (join.py:753-773): s is TupleType -> builds a new TupleType
+        # via join_tuples + InstanceJoiner. Defers to Python. Result
+        # identical regardless of which path computed it.
+        from mypy.join import join_types
+        from mypy.types import TupleType
+
+        tup1 = TupleType([self.fx.a], self.fx.a)
+        tup2 = TupleType([self.fx.a], self.fx.a)
+        assert join_types(tup1, tup2) == tup1
+

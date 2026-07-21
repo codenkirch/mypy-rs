@@ -178,6 +178,14 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 ///   (recursive, result=fallback != t) defers. Case 1 (s is
 ///   TypedDictType, builds a new TypedDictType) and case 3 (s not
 ///   Instance/TypedDictType, walks fallback chain) defer.
+/// - TupleType right, s is not TupleType AND `partial_fallback` is
+///   NOT `builtins.tuple`: recursive `join_types(s,
+///   partial_fallback)`. `tuple_fallback(t) == t.partial_fallback`
+///   only when the fallback is non-builtin (typeops.py:108-109);
+///   when it IS `builtins.tuple`, `tuple_fallback` constructs a new
+///   Instance with a union of items -> defer. SameS -> SameS;
+///   Ancestor/Object pass through. Case 1 (s is TupleType, builds a
+///   new TupleType via `join_tuples`) defers.
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
@@ -188,7 +196,7 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - Overloaded left AND callable-like right (both-FunctionLike needs
 ///   `is_similar_callables` + `combine_similar_callables`).
 /// - Parameters (needs live callable normalization).
-/// - Instance/TupleType/etc right (full visitor).
+/// - Instance/etc right (full visitor).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
 /// BEFORE calling this, matching `join.py:303-304`.
@@ -482,6 +490,50 @@ fn visit_join(
                     SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
                     SetOpResult::Object => Some(SetOpResult::Object),
                     _ => None,
+                }
+            } else {
+                None
+            }
+        }
+
+        // visit_tuple_type (join.py:741-775), case 2 non-TupleType-s
+        // only. Case 1 (s is TupleType) builds a new TupleType via
+        // join_tuples + InstanceJoiner -> defer (no encoder). Case 2
+        // (else) calls join_types(self.s, tuple_fallback(t)).
+        //
+        // `tuple_fallback(t)` (typeops.py:105-129) equals
+        // `t.partial_fallback` only when the fallback is NOT
+        // `builtins.tuple` (typeops.py:108-109). When it IS
+        // `builtins.tuple`, it constructs `Instance(builtins.tuple,
+        // [make_simplified_union(items)])` — a new Instance the Rust
+        // path can't replicate without a Type encoder -> defer.
+        //
+        // When the fallback is a non-builtin (e.g. a namedtuple class),
+        // `tuple_fallback(t) == t.partial_fallback`, and the recursive
+        // call join_types(s, partial_fallback) lands on the
+        // Instance-Instance nominal path. SameS -> outer SameS
+        // (result = s); Ancestor/Object pass through; SameT (result =
+        // fallback != t) defers.
+        //
+        // The partial_fallback is always an Instance (wire reader
+        // asserts the INSTANCE tag at wire.rs:968; types.py:2909
+        // serializes `self.partial_fallback.write(data)`).
+        Type::TupleType {
+            partial_fallback, ..
+        } => {
+            if let Type::Instance {
+                type_ref: fb_ref, ..
+            } = partial_fallback.as_ref()
+            {
+                if fb_ref != "builtins.tuple" {
+                    match join_types(s, partial_fallback, ctx, resolver)? {
+                        SetOpResult::SameS => Some(SetOpResult::SameS),
+                        SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+                        SetOpResult::Object => Some(SetOpResult::Object),
+                        _ => None,
+                    }
+                } else {
+                    None
                 }
             } else {
                 None
@@ -1622,6 +1674,23 @@ mod tests {
         }
     }
 
+    /// Minimal `TupleType` for join tests. `fallback_ref` is the
+    /// `partial_fallback` Instance (always an Instance per wire
+    /// format). The portable join case (visit_tuple_type case 2,
+    /// join.py:774-775) calls `tuple_fallback(t)` which equals
+    /// `t.partial_fallback` only when the fallback is NOT
+    /// `builtins.tuple` (typeops.py:108-109). When it IS
+    /// `builtins.tuple`, `tuple_fallback` constructs a new Instance
+    /// with a union of items — Rust can't replicate without a Type
+    /// encoder, so that case must defer.
+    fn tuple_type(fallback_ref: &str, items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(instance(fallback_ref, vec![])),
+            items,
+            implicit: false,
+        }
+    }
+
     #[test]
     fn join_type_type_with_builtins_type_instance_returns_s() {
         // visit_type_type case 2 (join.py:861-862): s is Instance with
@@ -2388,6 +2457,82 @@ mod tests {
         let r = make_resolver(vec![o]);
         let s = type_var(1, "~", instance("builtins.object", vec![]));
         let t = typed_dict("builtins.dict");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_tuple_with_instance_equal_namedtuple_fallback_returns_s() {
+        // visit_tuple_type case 2 (join.py:774-775): s is not a
+        // TupleType -> join_types(self.s, tuple_fallback(t)). When
+        // partial_fallback is NOT builtins.tuple (e.g. a namedtuple
+        // class "nt.NT"), tuple_fallback(t) == t.partial_fallback
+        // (typeops.py:108-109). Recursive: join_types(NT, NT) = NT
+        // (SameS). Fires the Rust SameS path (shim returns s=NT).
+        let o = snap("builtins.object", "object");
+        let nt = snap_with_bases("nt.NT", "NT", &["builtins.object"]);
+        let r = make_resolver(vec![o, nt]);
+        let s = instance("nt.NT", vec![]);
+        let t = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_tuple_with_instance_supertype_namedtuple_fallback_returns_ancestor() {
+        // visit_tuple_type case 2: s=object, t=Tuple(fallback=NT).
+        // Recursive: join_types(object, NT). NT <: object, so the
+        // join is object. Rust returns Ancestor("builtins.object"),
+        // which the shim reconstructs as Instance(object).
+        let o = snap("builtins.object", "object");
+        let nt = snap_with_bases("nt.NT", "NT", &["builtins.object"]);
+        let r = make_resolver(vec![o, nt]);
+        let s = instance("builtins.object", vec![]);
+        let t = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_tuple_with_instance_subtype_namedtuple_fallback_returns_ancestor() {
+        // visit_tuple_type case 2: s=NT, t=Tuple(fallback=object).
+        // Recursive: join_types(NT, object). NT <: object, so the
+        // join is object. Rust returns Ancestor("builtins.object").
+        let o = snap("builtins.object", "object");
+        let nt = snap_with_bases("nt.NT", "NT", &["builtins.object"]);
+        let r = make_resolver(vec![o, nt]);
+        let s = instance("nt.NT", vec![]);
+        let t = tuple_type("builtins.object", vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_tuple_with_builtins_tuple_fallback_defers() {
+        // visit_tuple_type case 2: s is Instance, t=Tuple with
+        // partial_fallback=builtins.tuple. tuple_fallback(t) constructs
+        // Instance(builtins.tuple, [make_simplified_union(items)])
+        // (typeops.py:110-129) — NOT the same as partial_fallback.
+        // Rust can't replicate without a Type encoder -> defer.
+        let o = snap("builtins.object", "object");
+        let tuple = snap_with_bases("builtins.tuple", "tuple", &["builtins.object"]);
+        let r = make_resolver(vec![o, tuple]);
+        let s = instance("builtins.tuple", vec![]);
+        let t = tuple_type("builtins.tuple", vec![instance("builtins.int", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_tuple_with_tuple_defers() {
+        // visit_tuple_type case 1 (join.py:753-773): s is TupleType ->
+        // builds a new TupleType via join_tuples + InstanceJoiner.
+        // Produces a new type -> defer (no Type encoder).
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
+        let t = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 }
