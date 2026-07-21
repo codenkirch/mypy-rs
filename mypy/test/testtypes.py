@@ -2734,15 +2734,36 @@ class NativeJoinCallableSuite(Suite):
         assert join_types(self.fx.a, c) == self.fx.o
 
     def test_callable_with_callable_defers_to_python(self) -> None:
-        # Both sides CallableType. The Rust pre-dispatch defers (both
-        # callable-like) because combine_similar_callables needs a Type
-        # encoder. Python computes the combined callable. The result is
-        # identical regardless of which path computed it.
+        # Both sides CallableType, similar but not equivalent (arg types
+        # differ: (A, B) vs (A, A)). The Rust path handles only the
+        # structurally-identical case; this falls through to Python,
+        # which computes join_similar_callables. The result is identical
+        # regardless of which path computed it.
         from mypy.join import join_types
 
         c1 = self.callable(self.fx.a, self.fx.b)
         c2 = self.callable(self.fx.a, self.fx.a)
         assert join_types(c1, c2) == c2
+
+    def test_identical_callable_returns_same(self) -> None:
+        # join(c, c) where c is a non-generic CallableType. Both sides
+        # are structurally identical, so the Rust visit_callable_type
+        # both-CallableType case fires and returns SameS (shim returns
+        # s = c). The result is identical to the Python combine path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(c, c) == c
+
+    def test_identical_callable_with_object_arg_returns_same(self) -> None:
+        # join(c, c) where c takes a builtins.object arg. Same as above
+        # but the arg type is builtins.object (INSTANCE_OBJECT singleton
+        # on the wire). Exercises the encoder's Instance builtin path
+        # inside a CallableType.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.o, self.fx.o)
+        assert join_types(c, c) == c
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

@@ -1798,6 +1798,61 @@ fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireErro
     Ok(())
 }
 
+/// `write_int_list`: `LIST_INT` + bare size + N bare ints. Inverse of
+/// `read_int_list` (wire.rs:343-359). Used for `CallableType.arg_kinds`.
+fn write_int_list(buf: &mut WriteBuffer, items: &[i64]) -> Result<(), WireError> {
+    write_tag(buf, LIST_INT);
+    write_int_bare(buf, items.len() as i64)?;
+    for &item in items {
+        write_int_bare(buf, item)?;
+    }
+    Ok(())
+}
+
+/// `write_str_opt_list`: `LIST_GEN` + bare size + N `write_str_opt`s.
+/// Inverse of `read_str_opt_list` (wire.rs:382-398). Used for
+/// `CallableType.arg_names` (None means positional/unnamed).
+fn write_str_opt_list(buf: &mut WriteBuffer, items: &[Option<String>]) -> Result<(), WireError> {
+    write_tag(buf, LIST_GEN);
+    write_int_bare(buf, items.len() as i64)?;
+    for item in items {
+        write_str_opt(buf, item.as_deref())?;
+    }
+    Ok(())
+}
+
+/// `write_flags`: bit-pack up to 26 bools into one tagged int. Inverse
+/// of `read_flags` (wire.rs:402-409). Mirrors `cache.write_flags`.
+fn write_flags(buf: &mut WriteBuffer, flags: &[bool]) -> Result<(), WireError> {
+    if flags.len() > 26 {
+        return Err(WireError::invalid(format!(
+            "write_flags: {} flags exceed the 26-flag limit",
+            flags.len()
+        )));
+    }
+    let mut packed: i64 = 0;
+    for (i, &f) in flags.iter().enumerate() {
+        if f {
+            packed |= 1 << i;
+        }
+    }
+    write_int(buf, packed)
+}
+
+/// `write_type_var_likes`: `LIST_GEN` + bare size + N TypeVarLike
+/// entries (TypeVarType / ParamSpecType / TypeVarTupleType). Inverse
+/// of `read_type_var_likes` (wire.rs:642-668). Used for
+/// `CallableType.variables`. Each entry is dispatched via `write_type`,
+/// which handles all three TypeVar-like variants.
+fn write_type_var_likes(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireError> {
+    write_tag(buf, LIST_GEN);
+    write_int_bare(buf, items.len() as i64)?;
+    for item in items {
+        write_type(buf, item)?;
+    }
+    Ok(())
+}
+
 /// `write_type`: the `Type.write(WriteBuffer)` inverse of `read_type`.
 ///
 /// Implements only the variants the set-ops visitors can produce:
@@ -1873,8 +1928,52 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            write_tag(buf, CALLABLE_TYPE);
+            // fallback is always an Instance (Python asserts the tag).
+            write_type(buf, fallback)?;
+            write_type_opt(buf, instance_type.as_deref())?;
+            write_flags(
+                buf,
+                &[
+                    *is_ellipsis_args,
+                    *implicit,
+                    *is_bound,
+                    *from_concatenate,
+                    *imprecise_arg_kinds,
+                    *unpack_kwargs,
+                ],
+            )?;
+            write_type_list(buf, arg_types)?;
+            write_int_list(buf, arg_kinds)?;
+            write_str_opt_list(buf, arg_names)?;
+            write_type(buf, ret_type)?;
+            write_str_opt(buf, name.as_deref())?;
+            write_type_var_likes(buf, variables)?;
+            write_type_opt(buf, type_guard.as_deref())?;
+            write_type_opt(buf, type_is.as_deref())?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType)",
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType)",
             t.variant_name()
         ))),
     }
@@ -2277,9 +2376,10 @@ mod tests {
     }
 
     #[test]
-    fn write_type_rejects_unsupported_variant() {
-        // CallableType is not in the implemented set; must error rather
-        // than emit bytes Type.read() would reject.
+    fn write_then_read_callable_type_minimal_round_trips() {
+        // Minimal CallableType: empty args, NoneType ret, builtins.function
+        // fallback, no variables/guard/type_is. Mirrors the shape produced
+        // by combine_similar_callables when both operands are nullary.
         let t = Type::CallableType {
             fallback: Box::new(Type::Instance {
                 type_ref: "builtins.function".to_string(),
@@ -2294,15 +2394,70 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
-            name: None,
-            arg_names: Vec::new(),
-            arg_kinds: Vec::new(),
             arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
             ret_type: Box::new(Type::NoneType),
+            name: None,
             variables: Vec::new(),
             type_guard: None,
             type_is: None,
         };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_callable_type_with_args_round_trips() {
+        // CallableType with two positional int/str args, str ret, named.
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: true,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![
+                Type::Instance {
+                    type_ref: "builtins.int".to_string(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+                Type::Instance {
+                    type_ref: "builtins.str".to_string(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+            ],
+            arg_kinds: vec![0, 0], // ARG_POS = 0
+            arg_names: vec![None, None],
+            ret_type: Box::new(Type::Instance {
+                type_ref: "builtins.str".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            name: Some("f".to_string()),
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_type_rejects_unsupported_variant() {
+        // Overloaded is not in the implemented set; must error rather
+        // than emit bytes Type.read() would reject.
+        let t = Type::Overloaded { items: Vec::new() };
         let mut buf = WriteBuffer::new();
         assert!(matches!(
             write_type(&mut buf, &t),
