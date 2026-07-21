@@ -393,11 +393,88 @@ class NativeSubtypeSuite(Suite):
 
     def test_generic_substitution_falls_through(self) -> None:
         # GS[A, B] <: G[B] needs map_instance_to_supertype (generic
-        # substitution). Rust returns None, Python falls through and
-        # computes the correct result. This proves the strangler-fig
-        # contract: Rust's `None` doesn't change the answer.
+        # substitution via expand_type_by_instance). The fixture's
+        # TypeVars carry namespace="" (not the class fullname), so the
+        # Rust substitution check (tvar.namespace == left.type_ref)
+        # does not match and Rust returns None. Python falls through
+        # and computes the correct result. This proves the
+        # strangler-fig contract: Rust's `None` doesn't change the
+        # answer. Real code (class typevars with namespace=class
+        # fullname) exercises the Rust substitution path.
         assert is_subtype(self.fx.gsab, self.fx.gb)
         assert not is_subtype(self.fx.gsab, self.fx.ga)
+
+    def test_generic_substitution_with_namespaced_tvar(self) -> None:
+        # Real code path: class typevars carry namespace=class.fullname.
+        # Build GS[T, S] <: G[S] with namespace set on both the class's
+        # defn.type_vars and the base Instance's TypeVar args. The Rust
+        # path substitutes tvar.raw_id=2 (S) -> left.args[1] (B),
+        # producing G[B], so GS[A, B] <: G[B] holds and GS[A, B] <:
+        # G[A] does not.
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+        from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
+
+        def make_class(name, *, bases, typevars):
+            defn = ClassDef(name, Block([]), None, [])
+            defn.fullname = name
+            defn.type_vars = [
+                TypeVarType(
+                    n,
+                    n,
+                    TypeVarId(i, namespace=name),
+                    [],
+                    self.fx.o,
+                    AnyType(TypeOfAny.from_omitted_generics),
+                    variance=INVARIANT,
+                )
+                for i, n in enumerate(typevars, 1)
+            ]
+            info = TypeInfo(SymbolTable(), defn, name)
+            info.bases = bases
+            # mro must include base type infos so has_base() works
+            # (nodes.py:4140 walks mro by fullname). Real TypeInfo
+            # mro is built by calculate_mro(), but for this test we
+            # assemble it manually.
+            mro = [info]
+            for base in bases:
+                if isinstance(base, Instance):
+                    mro.extend(base.type.mro)
+            if self.fx.oi not in mro:
+                mro.append(self.fx.oi)
+            info.mro = mro
+            return info
+
+        # G[T] with T`1 namespace="ns.G"
+        gi = make_class("ns.G", bases=[], typevars=["T"])
+        # GS[T, S] <: G[S], base arg references GS's S (raw_id=2)
+        s_tvar = TypeVarType(
+            "S",
+            "S",
+            TypeVarId(2, namespace="ns.GS"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+            variance=INVARIANT,
+        )
+        gsi = make_class(
+            "ns.GS",
+            bases=[Instance(gi, [s_tvar])],
+            typevars=["T", "S"],
+        )
+        gsab = Instance(gsi, [self.fx.a, self.fx.b])
+        gb = Instance(gi, [self.fx.b])
+        ga = Instance(gi, [self.fx.a])
+        # Rebuild resolver so Rust sees the new TypeInfos' bases blobs.
+        # Must include the fixture's TypeInfos (A, B, object) so the
+        # recursive check_type_parameter calls (is_subtype(B, B)) can
+        # resolve the Instance type_refs.
+        from mypy.subtypes import _set_native_subtype_resolver
+
+        all_infos = [gi, gsi] + self._collect_type_infos()
+        resolver = _type_kernel.build_native_resolver(all_infos, [])
+        _set_native_subtype_resolver(resolver)
+        assert is_subtype(gsab, gb)
+        assert not is_subtype(gsab, ga)
 
 
 def _is_type_info(value: object) -> bool:

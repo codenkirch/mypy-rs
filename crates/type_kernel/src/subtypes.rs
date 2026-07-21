@@ -92,21 +92,155 @@ pub(crate) fn is_subtype(
 }
 
 /// The `visit_instance` `isinstance(right, Instance)` branch
-/// (subtypes.py:531-626), minus the protocol/variadic/find_member/
-/// tuple-type/type_type/literal/callable paths (all return `None`).
+/// `expand_type_by_instance` (expandtype.py:85-115), Rust subset.
 ///
-/// Handles:
-/// - `fallback_to_any` short-circuit (subtypes.py:493-498).
-/// - the promote loop (subtypes.py:536-542).
-/// - `alt_promote` equality (subtypes.py:546-547).
-/// - nominal `has_base` check + `check_type_parameter` over
-///   `type_vars_with_variance` (subtypes.py:554-626) for the
-///   non-generic-substitution cases.
+/// Substitutes TypeVarType nodes in `typ` whose `namespace` matches
+/// `left_ref` and whose `raw_id` is a 1-based position into `left_args`.
+/// Mirrors the Python env build:
+///   `variables[binder.id] = arg` for each (defn.type_vars[i], args[i]).
 ///
-/// Returns `None` (fall through) when the path needs
-/// `map_instance_to_supertype` with arg substitution (right has type
-/// vars and left.type != right.type), since that requires
-/// `expand_type_by_instance` (deferred to M8c).
+/// Class type vars have `raw_id = i+1` and `namespace = class.fullname`,
+/// so we match `(namespace == left_ref, raw_id == i+1)` and substitute
+/// `left_args[i]`. Returns `None` for Type variants the subset walker
+/// does not handle (CallableType, ParamSpec, UnpackType, etc. inside
+/// the tree); the caller falls through to Python for those.
+fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> {
+    match typ {
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        } => {
+            if args.is_empty() {
+                return Some(typ.clone());
+            }
+            let mut new_args = Vec::with_capacity(args.len());
+            for arg in args {
+                new_args.push(expand_type_by_instance(arg, left_ref, left_args)?);
+            }
+            // builtins.tuple normalization (expandtype.py:228-237) is
+            // deferred; the common nominal case doesn't need it.
+            Some(Type::Instance {
+                type_ref: type_ref.clone(),
+                args: new_args,
+                last_known_value: last_known_value.clone(),
+                extra_attrs: extra_attrs.clone(),
+            })
+        }
+        Type::TypeVarType {
+            raw_id, namespace, ..
+        } => {
+            // Match class type vars: namespace == left_ref, raw_id is
+            // 1-based position into defn.type_vars (== left_args).
+            if namespace == left_ref && *raw_id >= 1 {
+                let idx = (*raw_id - 1) as usize;
+                if idx < left_args.len() {
+                    // Python clears last_known_value on Instance
+                    // replacements (expandtype.py:246-249); we clone as-is
+                    // since lkv handling is the LiteralType path (M8c+).
+                    return Some(left_args[idx].clone());
+                }
+            }
+            // Unmatched TypeVar: namespace mismatch or raw_id out of
+            // range. Python leaves it as-is and visit_typevar (not
+            // ported) handles it. Return None to fall through.
+            None
+        }
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+        } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                new_items.push(expand_type_by_instance(item, left_ref, left_args)?);
+            }
+            Some(Type::UnionType {
+                items: new_items,
+                uses_pep604_syntax: *uses_pep604_syntax,
+            })
+        }
+        Type::NoneType | Type::UninhabitedType => Some(typ.clone()),
+        Type::AnyType { .. } | Type::DeletedType { .. } | Type::LiteralType { .. } => {
+            Some(typ.clone())
+        }
+        // Unsupported variants in the tree: fall through to Python.
+        _ => None,
+    }
+}
+
+/// `map_instance_to_supertype` (maptype.py:8-23), Rust subset.
+///
+/// Walks `class_derivation_paths` (maptype.py:46-67) over the snapshot's
+/// `bases` blobs, mapping `left` up to `right_ref`'s frame step by step
+/// via `expand_type_by_instance`. Returns the mapped args (to compare
+/// against `right_args` in `check_type_parameter`).
+///
+/// Handles direct bases (path length 1) and multi-level paths. Returns
+/// `None` when any step hits an unsupported Type variant in
+/// `expand_type_by_instance`, or when no derivation path is found (the
+/// snapshot may be stale mid-build; Python handles the Any fallback).
+fn map_instance_to_supertype(
+    left_ref: &str,
+    left_args: &[Type],
+    right_ref: &str,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let _left_snap = resolver.get(left_ref)?;
+    // Fast path: left.type == right.type (maptype.py:15-17).
+    if left_ref == right_ref {
+        return Some(left_args.to_vec());
+    }
+    // Walk class_derivation_paths via the snapshot's bases blobs.
+    // Each base is a serialized Instance; decode and recurse.
+    map_derivation_path(left_ref, left_args, right_ref, resolver)
+}
+
+/// Recursive step of `map_instance_to_supertypes` (maptype.py:26-43).
+/// Finds a base whose type_ref == right_ref (direct) or recurses through
+/// a base whose own bases lead to right_ref (multi-level path).
+fn map_derivation_path(
+    left_ref: &str,
+    left_args: &[Type],
+    right_ref: &str,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let left_snap = resolver.get(left_ref)?;
+    for base_blob in &left_snap.bases {
+        let base = decode_type(base_blob)?;
+        if let Type::Instance {
+            type_ref: base_ref,
+            args: _base_args,
+            ..
+        } = &base
+        {
+            if base_ref == right_ref {
+                // Direct base: expand base's args by left's frame.
+                let expanded = expand_type_by_instance(&base, left_ref, left_args)?;
+                if let Type::Instance { args, .. } = expanded {
+                    return Some(args);
+                }
+                return None;
+            }
+            // Multi-level: recurse through this base. First map left to
+            // this base's frame, then continue from there.
+            let mapped = expand_type_by_instance(&base, left_ref, left_args)?;
+            if let Type::Instance {
+                type_ref: mid_ref,
+                args: mid_args,
+                ..
+            } = mapped
+            {
+                if let Some(result) = map_derivation_path(&mid_ref, &mid_args, right_ref, resolver)
+                {
+                    return Some(result);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn visit_instance_nominal(
     left_ref: &str,
     left_args: &[Type],
@@ -183,8 +317,8 @@ fn visit_instance_nominal(
     let right_snap = right_snap?;
 
     // Map left to right's type. Fast path: left.type == right.type (no
-    // substitution needed). Slow path (map_instance_to_supertype with
-    // arg substitution) returns None for the generic case.
+    // substitution needed). Slow path calls map_instance_to_supertype
+    // to walk the bases blobs and substitute TypeVars.
     let mapped_args: Vec<Type> = if left_ref == right_ref {
         left_args.to_vec()
     } else if right_snap.type_vars_with_variance.is_empty() {
@@ -192,10 +326,12 @@ fn visit_instance_nominal(
         // Instance(right, []) (no args to substitute).
         Vec::new()
     } else {
-        // Generic substitution path. Needs expand_type_by_instance,
-        // which is a TypeVar-substitution walk over the base Instance
-        // blob. Deferred to M8c.
-        return None;
+        // Generic substitution path: map_instance_to_supertype walks
+        // class_derivation_paths over the snapshot's bases blobs,
+        // substituting TypeVars via expand_type_by_instance. Returns
+        // None when an unsupported Type variant is in the tree (e.g.
+        // UnpackType, ParamSpec), in which case Python falls through.
+        map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
     };
 
     if ctx.ignore_type_params {
@@ -437,9 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn generic_substitution_returns_none() {
-        // right has type_vars_with_variance and left.type != right.type:
-        // needs expand_type_by_instance, returns None.
+    fn generic_substitution_without_bases_returns_none() {
+        // right has type_vars_with_variance and left.type != right.type,
+        // but left has no bases blobs (snapshot not populated). The
+        // map_instance_to_supertype walker returns None, falling through.
         let mut base = snap("a.Gen", "Gen");
         base.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
         let mut derived = snap("a.Sub", "Sub");
@@ -448,8 +585,95 @@ mod tests {
         let r = make_resolver(vec![base, derived]);
         let left = instance("a.Sub", vec![]);
         let right = instance("a.Gen", vec![any_type()]);
-        // Generic substitution path -> None.
+        // No bases blobs -> map_instance_to_supertype returns None.
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn expand_type_by_instance_substitutes_typevar() {
+        // Instance[TypeVarType(T`1, ns="a.Sub")] with left = a.Sub[A]
+        // -> Instance[A]. The TypeVar's (namespace, raw_id) matches
+        // (left_ref, 1), so it's replaced by left_args[0].
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+        };
+        let base = instance("a.Gen", vec![tvar]);
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&base, "a.Sub", &[left_arg.clone()]);
+        assert_eq!(expanded, Some(instance("a.Gen", vec![left_arg])));
+    }
+
+    #[test]
+    fn expand_type_by_instance_no_match_returns_none() {
+        // TypeVar with a different namespace is not substituted. Python
+        // leaves it as-is, but visit_typevar (the unmatched-tvar path)
+        // is not ported, so Rust returns None to fall through.
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Other.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Other".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+        };
+        let base = instance("a.Gen", vec![tvar]);
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&base, "a.Sub", &[left_arg]);
+        assert_eq!(expanded, None);
+    }
+
+    #[test]
+    fn expand_type_by_instance_recurses_into_instance_args() {
+        // Instance[a.Gen[Instance[a.Gen[T]]]] with left = a.Sub[A]:
+        // both outer and inner TypeVars get substituted.
+        let tvar = || Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+        };
+        let inner = instance("a.Gen", vec![tvar()]);
+        let outer = instance("a.Gen", vec![inner]);
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&outer, "a.Sub", &[left_arg.clone()]);
+        let expected = instance("a.Gen", vec![instance("a.Gen", vec![left_arg])]);
+        assert_eq!(expanded, Some(expected));
+    }
+
+    #[test]
+    fn expand_type_by_instance_passthrough_for_leaf_types() {
+        // NoneType, AnyType, LiteralType pass through unchanged.
+        assert_eq!(
+            expand_type_by_instance(&Type::NoneType, "a.Sub", &[]),
+            Some(Type::NoneType)
+        );
+        let any = any_type();
+        assert_eq!(expand_type_by_instance(&any, "a.Sub", &[]), Some(any));
+    }
+
+    #[test]
+    fn expand_type_by_instance_returns_none_for_unsupported() {
+        // TupleType inside the tree is not handled by the subset walker.
+        let t = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+            items: vec![any_type()],
+            implicit: false,
+        };
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[any_type()]);
+        assert_eq!(expanded, None);
     }
 
     #[test]
