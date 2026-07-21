@@ -2743,3 +2743,174 @@ class NativeJoinCallableSuite(Suite):
         c2 = self.callable(self.fx.a, self.fx.a)
         assert join_types(c1, c2) == c2
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinOverloadedSuite(Suite):
+    """Parity suite for the Rust `visit_overloaded` fallback join
+    (Stage 3c M8k).
+
+    Exercises the Overloaded-vs-non-callable join (join.py:581-632).
+    The Rust port handles only the fallback case where `s` is not a
+    FunctionLike and not a protocol-Instance. The recursive
+    `join_types(t.fallback, s)` fires the Instance-Instance nominal path;
+    `t.fallback` is `items[0].fallback` (types.py:2744), extracted from
+    the wire-format `items` field. `Ancestor(common-supertype)` passes
+    through (shim maps disc 5 to `Instance(typeinfo, [])`), `Object`
+    passes through (disc 2), and `SameS` (result==s) passes through
+    (disc 0). Results are identical to pure-Python `JoinSuite.test_overloaded`
+    fallback cases.
+
+    The both-FunctionLike case (s is CallableType/Overloaded) defers to
+    Python because the similar-callables walk needs
+    `combine_similar_callables` (produces a new CallableType / Overloaded,
+    needs a Type encoder). The protocol-Instance case also defers (needs
+    `unpack_callback_proxy`).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def callable(self, *a: Type) -> CallableType:
+        n = len(a) - 1
+        return CallableType(list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.function)
+
+    def overloaded(self, *items: CallableType) -> Overloaded:
+        return Overloaded(list(items))
+
+    def test_overloaded_with_function_returns_function(self) -> None:
+        # join(overloaded, function): the recursive join_types(
+        # fallback=function, s=function) hits the Instance-Instance
+        # same-type path -> SameS -> outer SameS (shim returns
+        # s=function). Fires the Rust SameS path.
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(ov, self.fx.function) == self.fx.function
+
+    def test_overloaded_with_object_returns_object(self) -> None:
+        # join(overloaded, object): recursive join_types(function,
+        # object) -> is_subtype(function, object)=True ->
+        # via_supertype(function, object) -> function.bases=[object] ->
+        # join_instances_nominal(object, object) -> Left ->
+        # Ancestor("builtins.object"). Fires the Rust Ancestor path.
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(ov, self.fx.o) == self.fx.o
+
+    def test_overloaded_with_unrelated_instance_returns_object(self) -> None:
+        # join(overloaded, A): recursive join_types(function, A).
+        # Neither is a subtype of the other. via_supertype(A, function)
+        # walks A.bases=[object] -> join_instances_nominal(object,
+        # function) -> is_subtype(function, object)=True ->
+        # via_supertype(function, object) -> Ancestor("builtins.object").
+        # Fires the Rust Ancestor path.
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(ov, self.fx.a) == self.fx.o
+
+    def test_function_with_overloaded_returns_function(self) -> None:
+        # join(function, overloaded): s=function, t=overloaded. The Rust
+        # pre-dispatch reaches visit_join(t=Overloaded, s=function) ->
+        # visit_overloaded fallback -> recursive join_types(fallback=
+        # function, s=function) -> SameS. Fires the Rust SameS path
+        # (shim returns s=function).
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(self.fx.function, ov) == self.fx.function
+
+    def test_object_with_overloaded_returns_object(self) -> None:
+        # join(object, overloaded): s=object, t=overloaded. The recursive
+        # join_types(function, object) -> Ancestor("builtins.object").
+        # The outer overloaded fallback passes Ancestor through; the
+        # shim returns Instance(object_typeinfo, []) = object = s.
+        # Fires the Rust Ancestor path.
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(self.fx.o, ov) == self.fx.o
+
+    def test_instance_with_overloaded_returns_object(self) -> None:
+        # join(A, overloaded): s=A, t=overloaded. The recursive
+        # join_types(function, A) -> Ancestor("builtins.object"). Same
+        # shape as test_overloaded_with_unrelated_instance_returns_object
+        # but with s/t swapped. Fires the Rust Ancestor path.
+        from mypy.join import join_types
+
+        ov = self.overloaded(self.callable(self.fx.a, self.fx.b))
+        assert join_types(self.fx.a, ov) == self.fx.o
+
+    def test_overloaded_with_callable_defers_to_python(self) -> None:
+        # s=CallableType, t=Overloaded. Both callable-like -> the Rust
+        # pre-dispatch defers (both sides callable-like). Python computes
+        # the both-FunctionLike case (is_similar_callables walk). The
+        # result is identical regardless of which path computed it.
+        from mypy.join import join_types
+
+        ov = self.overloaded(
+            self.callable(self.fx.a, self.fx.b),
+            self.callable(self.fx.b, self.fx.a),
+        )
+        c1 = self.callable(self.fx.a, self.fx.b)
+        assert join_types(ov, c1) == c1
+
+    def test_overloaded_with_overloaded_defers_to_python(self) -> None:
+        # Both sides Overloaded. The Rust pre-dispatch defers (both
+        # callable-like) because the both-FunctionLike case needs
+        # is_similar_callables + combine_similar_callables. Python
+        # computes the result. The result is identical regardless of
+        # which path computed it.
+        from mypy.join import join_types
+
+        c1 = self.callable(self.fx.a, self.fx.a)
+        c2 = self.callable(self.fx.b, self.fx.b)
+        ov = self.overloaded(c1, c2)
+        assert join_types(ov, ov) == ov
+
