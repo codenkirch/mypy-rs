@@ -155,13 +155,18 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - UnionType right: s <: any item -> SameT (return t); every item
 ///   <: s -> SameS (union collapses); else defer (needs a Type encoder
 ///   to build the new union).
+/// - CallableType right, s non-callable: fallback join
+///   (join_types(t.fallback, s)); Ancestor/Object pass through,
+///   SameT (result=s) -> SameS, SameS (result=fallback=s) -> SameS.
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
 /// - `can_be_true`/`can_be_false` mismatch (needs the properties).
 /// - UnionType left AND UnionType right (needs merge/flatten).
-/// - Instance/CallableType/TypeVarType/etc right (full visitor).
-/// - `normalize_callables` (needs live callable normalization).
+/// - CallableType left AND CallableType right (similar-callables needs
+///   `combine_similar_callables` which produces a new CallableType).
+/// - Overloaded/Parameters (needs live callable normalization).
+/// - Instance/TypeVarType/TypedDict/etc right (full visitor).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
 /// BEFORE calling this, matching `join.py:303-304`.
@@ -213,15 +218,22 @@ pub(crate) fn join_types(
     };
     let swapped = swapped ^ swap3;
 
-    // normalize_callables (join.py:327): deferred. If either side is a
-    // callable-like variant, defer to Python.
-    if matches!(
+    // normalize_callables (join.py:327) is a no-op for the Rust path:
+    // the Python shim serializes the post-normalization form. The
+    // similar-callables case (both sides callable-like) needs
+    // combine_similar_callables which produces a new CallableType —
+    // no Type encoder -> defer. The fallback case (t=CallableType,
+    // s non-callable) recurses into join_types(t.fallback, s), which
+    // the Rust Instance-Instance path handles.
+    let s_is_callable = matches!(
         s,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
-    ) || matches!(
+    );
+    let t_is_callable = matches!(
         t,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
-    ) {
+    );
+    if s_is_callable && t_is_callable {
         return None;
     }
 
@@ -316,7 +328,68 @@ fn visit_join(
         // new union needs a Type encoder (not available reader-only).
         Type::UnionType { items, .. } => visit_union_join(s, items, ctx, resolver),
 
-        // Full visitors (CallableType, TypeVar, etc.) — deferred.
+        // visit_callable_type (join.py:541-577), fallback case only.
+        // The similar-callables case (s is CallableType) needs
+        // combine_similar_callables (produces a new CallableType — no
+        // Type encoder). The protocol-Instance case needs
+        // unpack_callback_proxy. The fallback case (s is non-callable,
+        // non-protocol) recurses into join_types(t.fallback, s).
+        Type::CallableType { fallback, .. } => visit_callable_fallback(s, fallback, ctx, resolver),
+
+        // Full visitors (Overloaded, TypeVar, TypedDict, etc.) —
+        // deferred.
+        _ => None,
+    }
+}
+
+/// `TypeJoinVisitor.visit_callable_type` fallback case (join.py:577):
+/// `return join_types(t.fallback, self.s)`. Fires when `s` is not a
+/// CallableType, not an Overloaded, and not a protocol-Instance. The
+/// fallback is always an Instance (builtins.function / builtins.type /
+/// a user metaclass), so this recurses into the Instance-vs-`s` join.
+///
+/// Protocol check: if `s` is an Instance whose TypeInfo has
+/// `is_protocol=True`, defer (needs `unpack_callback_proxy` to extract
+/// the `__call__` member). Otherwise recurse.
+///
+/// The recursive call is `join_types(fallback, s)` (fallback=left,
+/// s=right). SameS in the recursive frame means the result is
+/// `fallback`; SameT means the result is `s`. The outer shim maps
+/// SameS -> s, SameT -> t. Since the result of the fallback join is
+/// neither s nor t in general, only the cases where the result IS s
+/// can be expressed as SameS. Ancestor/Object pass through.
+///
+/// Defers when:
+/// * `s` is a protocol Instance (needs callback proxy unpacking).
+/// * The recursive `join_types(fallback, s)` returns `None`.
+/// * The recursive result is `fallback` but `fallback != s` (can't
+///   express as SameS; would need SameT-but-for-t-which-is-callable).
+fn visit_callable_fallback(
+    s: &Type,
+    fallback: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    // s is a protocol Instance -> defer (needs unpack_callback_proxy).
+    if let Type::Instance { type_ref, .. } = s {
+        if let Some(snap) = resolver.get(type_ref) {
+            if snap.is_protocol {
+                return None;
+            }
+        }
+    }
+    match join_types(fallback, s, ctx, resolver)? {
+        // Recursive SameT: result = s (recursive right) -> outer SameS
+        // (the shim returns s).
+        SetOpResult::SameT => Some(SetOpResult::SameS),
+        // Recursive SameS: result = fallback (recursive left). Only
+        // expressible if fallback == s (then result is s -> SameS).
+        SetOpResult::SameS if fallback == s => Some(SetOpResult::SameS),
+        // Ancestor / Object pass through (swap-invariant).
+        SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+        SetOpResult::Object => Some(SetOpResult::Object),
+        // SameS (fallback != s), Any, Bottom, SameTypeWithArgs: can't
+        // express without a Type encoder. Defer.
         _ => None,
     }
 }
@@ -829,6 +902,32 @@ mod tests {
         }
     }
 
+    /// Minimal `CallableType` for join tests. `fallback` is the
+    /// `builtins.function` (or `builtins.type`) Instance. arg_kinds
+    /// defaults to ARG_POS (0) per arg.
+    fn callable(fallback_ref: &str, arg_types: Vec<Type>, ret_type: Type) -> Type {
+        let arg_kinds = vec![0i64; arg_types.len()];
+        let arg_names = vec![None; arg_types.len()];
+        Type::CallableType {
+            fallback: Box::new(instance(fallback_ref, vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(ret_type),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
     fn ctx(strict_optional: bool) -> SubtypeContext {
         SubtypeContext::new(false, false, false, false, false, strict_optional)
     }
@@ -1205,6 +1304,105 @@ mod tests {
             items: vec![instance("a.B", vec![])],
             uses_pep604_syntax: false,
         };
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_callable_with_unrelated_instance_returns_object() {
+        // visit_callable_type fallback (join.py:579): s is a non-
+        // callable, non-protocol Instance. Result is
+        // join_types(t.fallback, s). t.fallback=builtins.function (with
+        // bases=[object], mirroring the Python fixture), s=a.A (with
+        // bases=[object]). Neither is_subtype(function, a) nor
+        // is_subtype(a, function) holds, so join_instances_nominal(
+        // function, a) -> via_supertype(a, function). a's bases=[object];
+        // join_instances_nominal(object, function) -> is_subtype(
+        // function, object)=True -> via_supertype(function, object).
+        // function's bases=[object]; join_instances_nominal(object,
+        // object) -> Left -> mapped to Ancestor("builtins.object").
+        // The outer callable fallback passes Ancestor through; the
+        // shim maps disc 5 to Instance(object_typeinfo, []) = object.
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let a = snap_with_bases("a.A", "A", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, a, o]);
+        let s = instance("a.A", vec![]);
+        let t = callable(
+            "builtins.function",
+            vec![instance("a.A", vec![])],
+            instance("a.A", vec![]),
+        );
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_callable_with_object_returns_object() {
+        // visit_callable_type fallback: s=builtins.object, t=callable
+        // with fallback=builtins.function (bases=[object], mirroring
+        // the Python fixture). join_types(function, object):
+        // is_subtype(object, function)=False, is_subtype(function,
+        // object)=True -> join_instances_nominal(function, object) ->
+        // via_supertype(function, object). function's bases=[object];
+        // join_instances_nominal(object, object) -> Left (same type)
+        // -> mapped to Ancestor("builtins.object"). The outer
+        // callable fallback passes Ancestor through. The shim maps
+        // disc 5 to Instance(object_typeinfo, []) = object.
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, o]);
+        let s = instance("builtins.object", vec![]);
+        let t = callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.object", vec![]),
+        );
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_callable_with_same_fallback_instance_returns_s() {
+        // visit_callable_type fallback: s=builtins.function (the
+        // callable's own fallback), t=callable with fallback=
+        // builtins.function. join_types(function, function) ->
+        // visit_instance_join: same type, no args -> SameS. The
+        // outer callable join returns SameS (s=builtins.function).
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, o]);
+        let s = instance("builtins.function", vec![]);
+        let t = callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.object", vec![]),
+        );
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_callable_with_callable_defers() {
+        // Both s and t are CallableType. visit_callable_type case 1
+        // (isinstance(s, CallableType)) needs is_similar_callables +
+        // combine_similar_callables, which produce a new CallableType.
+        // No Type encoder -> defer.
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 

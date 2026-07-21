@@ -2292,6 +2292,7 @@ class NativeJoinInstanceSuite(Suite):
         assert result == self.fx.ga
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstanceWithArgsSuite(Suite):
     """Parity suite for the Rust `visit_instance` same-type-with-args join
     (Stage 3c M8g).
@@ -2374,6 +2375,7 @@ class NativeJoinInstanceWithArgsSuite(Suite):
         assert join_types(self.fx.ga, self.fx.ga) == self.fx.ga
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinCovariantArgsSuite(Suite):
     """Parity suite for the Rust `visit_instance` covariant-arg join
     (Stage 3c M8h).
@@ -2482,6 +2484,7 @@ class NativeJoinCovariantArgsSuite(Suite):
         assert join_types(self.fx.ga, self.fx.gd) == self.fx.go
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinUnionSuite(Suite):
     """Parity suite for the Rust `visit_union_type` join
     (Stage 3c M8i).
@@ -2591,4 +2594,152 @@ class NativeJoinUnionSuite(Suite):
         s = UnionType([self.fx.a])
         t = UnionType([self.fx.b])
         assert join_types(s, t) == self.fx.a
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinCallableSuite(Suite):
+    """Parity suite for the Rust `visit_callable_type` fallback join
+    (Stage 3c M8j).
+
+    Exercises the CallableType-vs-non-callable join (join.py:541-577).
+    The Rust port handles only the fallback case (`visit_callable_fallback`)
+    where `s` is a non-callable, non-protocol type. The recursive
+    `join_types(t.fallback, s)` fires the Instance-Instance nominal path;
+    `Ancestor(common-supertype)` passes through (shim maps disc 5 to
+    `Instance(typeinfo, [])`), `Object` passes through (disc 2), and
+    `SameS` (result==s) passes through (disc 0). Results are identical
+    to pure-Python `JoinSuite.test_function_types`.
+
+    The similar-callables case (both sides CallableType) defers to
+    Python because `combine_similar_callables` produces a new
+    CallableType (needs a Type encoder).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def callable(self, *a: Type) -> CallableType:
+        n = len(a) - 1
+        return CallableType(list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.function)
+
+    def test_callable_with_function_returns_function(self) -> None:
+        # join(callable, function): the recursive join_types(fallback=
+        # function, s=function) hits the Instance-Instance same-type path
+        # -> SameS -> outer SameS (shim returns s=function). Fires the
+        # Rust SameS path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(c, self.fx.function) == self.fx.function
+
+    def test_callable_with_object_returns_object(self) -> None:
+        # join(callable, object): recursive join_types(function, object)
+        # -> is_subtype(function, object)=True -> via_supertype(function,
+        # object) -> function.bases=[object] -> join_instances_nominal(
+        # object, object) -> Left -> Ancestor("builtins.object"). Fires
+        # the Rust Ancestor path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(c, self.fx.o) == self.fx.o
+
+    def test_callable_with_unrelated_instance_returns_object(self) -> None:
+        # join(callable, A): recursive join_types(function, A). Neither
+        # is a subtype of the other. via_supertype(A, function) walks
+        # A.bases=[object] -> join_instances_nominal(object, function)
+        # -> is_subtype(function, object)=True -> via_supertype(function,
+        # object) -> Ancestor("builtins.object"). Fires the Rust
+        # Ancestor path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(c, self.fx.a) == self.fx.o
+
+    def test_function_with_callable_returns_function(self) -> None:
+        # join(function, callable): s=function, t=callable. The Rust
+        # pre-dispatch reaches visit_join(t=CallableType, s=function) ->
+        # visit_callable_fallback(s=function, fallback=function) ->
+        # recursive join_types(function, function) -> SameS. Fires the
+        # Rust SameS path (shim returns s=function).
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(self.fx.function, c) == self.fx.function
+
+    def test_object_with_callable_returns_object(self) -> None:
+        # join(object, callable): s=object, t=callable. The recursive
+        # join_types(function, object) -> Ancestor("builtins.object").
+        # The outer callable fallback passes Ancestor through; the shim
+        # returns Instance(object_typeinfo, []) = object = s. Fires the
+        # Rust Ancestor path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(self.fx.o, c) == self.fx.o
+
+    def test_instance_with_callable_returns_object(self) -> None:
+        # join(A, callable): s=A, t=callable. The recursive
+        # join_types(function, A) -> Ancestor("builtins.object"). Same
+        # shape as test_callable_with_unrelated_instance_returns_object
+        # but with s/t swapped. Fires the Rust Ancestor path.
+        from mypy.join import join_types
+
+        c = self.callable(self.fx.a, self.fx.b)
+        assert join_types(self.fx.a, c) == self.fx.o
+
+    def test_callable_with_callable_defers_to_python(self) -> None:
+        # Both sides CallableType. The Rust pre-dispatch defers (both
+        # callable-like) because combine_similar_callables needs a Type
+        # encoder. Python computes the combined callable. The result is
+        # identical regardless of which path computed it.
+        from mypy.join import join_types
+
+        c1 = self.callable(self.fx.a, self.fx.b)
+        c2 = self.callable(self.fx.a, self.fx.a)
+        assert join_types(c1, c2) == c2
 
