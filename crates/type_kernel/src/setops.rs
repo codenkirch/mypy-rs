@@ -160,6 +160,13 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 ///   SameT (result=s) -> SameS, SameS (result=fallback=s) -> SameS.
 /// - Overloaded right, s non-callable: same fallback join, with the
 ///   fallback extracted from `items[0].fallback` (types.py:2744).
+/// - TypeType right, s is Instance(builtins.type): SameS (return s).
+///   The TypeType-vs-TypeType case (produces a new TypeType via
+///   `TypeType.make_normalized`) defers (needs a Type encoder).
+/// - LiteralType right, s is LiteralType with equal value: SameT
+///   (return t). s is Instance with `last_known_value == t`: SameT.
+///   Unequal literals / non-matching lkv defer (the fallback join
+///   produces a type that is neither s nor t).
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
@@ -359,6 +366,49 @@ fn visit_join(
                 _ => return None,
             };
             visit_callable_fallback(s, fallback, ctx, resolver)
+        }
+
+        // visit_type_type (join.py:854-864), case 2 only. Case 1 (s is
+        // TypeType) produces a new TypeType via
+        // TypeType.make_normalized — no Type encoder -> defer. Case 3
+        // (else -> default) walks s's fallback chain, complex -> defer.
+        // Case 2 (s is Instance with fullname=="builtins.type")
+        // returns self.s -> SameS.
+        Type::TypeType { .. } => {
+            if let Type::Instance { type_ref, .. } = s {
+                if type_ref == "builtins.type" {
+                    return Some(SetOpResult::SameS);
+                }
+            }
+            None
+        }
+
+        // visit_literal_type (join.py:837-847), cases 1+4 only. Case 1
+        // (s is LiteralType, t==s) returns t -> SameT. Case 4 (s is
+        // Instance, s.last_known_value==t) returns t -> SameT. Case 2
+        // (enum simplified union) and case 3 (fallback join) produce
+        // types other than s/t -> defer. Case 5 (join_types(s,
+        // t.fallback)) recurses into Instance-vs-Instance but the
+        // result is neither s nor t in general -> defer.
+        Type::LiteralType { value: t_val, .. } => {
+            if let Type::LiteralType { value: s_val, .. } = s {
+                if s_val == t_val {
+                    return Some(SetOpResult::SameT);
+                }
+                return None;
+            }
+            if let Type::Instance {
+                last_known_value: Some(lkv),
+                ..
+            } = s
+            {
+                if let Type::LiteralType { value: lkv_val, .. } = lkv.as_ref() {
+                    if lkv_val == t_val {
+                        return Some(SetOpResult::SameT);
+                    }
+                }
+            }
+            None
         }
 
         // Full visitors (TypeVar, TypedDict, etc.) — deferred.
@@ -907,7 +957,7 @@ fn discriminator_trivial(r: SetOpResult) -> i64 {
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
-    use crate::wire::Type;
+    use crate::wire::{LiteralValue, Type};
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
         let mut r = TypeResolver::new();
@@ -1436,6 +1486,146 @@ mod tests {
     fn overloaded(items: Vec<Type>) -> Type {
         assert!(!items.is_empty(), "Overloaded requires >=1 item");
         Type::Overloaded { items }
+    }
+
+    /// Minimal `LiteralType` for join tests. `fallback` is the
+    /// Instance whose value space the literal belongs to (e.g.
+    /// builtins.int, builtins.str, or a user enum).
+    fn literal(value: LiteralValue, fallback_ref: &str) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(instance(fallback_ref, vec![])),
+            value,
+        }
+    }
+
+    /// Minimal `TypeType` for join tests. `item` is the Instance
+    /// the type-of-type refers to (e.g. type[A]).
+    fn type_type(item_ref: &str) -> Type {
+        Type::TypeType {
+            item: Box::new(instance(item_ref, vec![])),
+            is_type_form: false,
+        }
+    }
+
+    #[test]
+    fn join_type_type_with_builtins_type_instance_returns_s() {
+        // visit_type_type case 2 (join.py:861-862): s is Instance with
+        // fullname=="builtins.type" -> return self.s. Fires the Rust
+        // SameS path (shim returns s=builtins.type).
+        let o = snap("builtins.object", "object");
+        let tt = snap("builtins.type", "type");
+        let r = make_resolver(vec![o, tt]);
+        let s = instance("builtins.type", vec![]);
+        let t = type_type("builtins.object");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_builtins_type_instance_with_type_type_returns_s() {
+        // Same as above but with s/t swapped to verify the flip_if
+        // mapping. s=builtins.type, t=type[object]. The Rust path
+        // returns SameS (shim returns s=builtins.type).
+        let o = snap("builtins.object", "object");
+        let tt = snap("builtins.type", "type");
+        let r = make_resolver(vec![o, tt]);
+        let s = instance("builtins.type", vec![]);
+        let t = type_type("builtins.object");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_type_type_with_type_type_defers() {
+        // visit_type_type case 1 (join.py:855-860): s is TypeType ->
+        // TypeType.make_normalized(join_types(t.item, s.item), ...).
+        // Produces a new TypeType — no Type encoder -> defer.
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = type_type("builtins.object");
+        let t = type_type("builtins.object");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_type_type_with_other_instance_defers() {
+        // visit_type_type case 3 (join.py:863-864 -> default): s is
+        // Instance that is NOT builtins.type. default(s) walks the
+        // fallback chain. Defer (default is complex).
+        let o = snap("builtins.object", "object");
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![o, a]);
+        let s = instance("a.A", vec![]);
+        let t = type_type("builtins.object");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_literal_with_equal_literal_returns_t() {
+        // visit_literal_type case 1 (join.py:838-840): s is
+        // LiteralType, t == s -> return t. Fires the Rust SameT path
+        // (shim returns t).
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = literal(LiteralValue::Int(1), "builtins.int");
+        let t = literal(LiteralValue::Int(1), "builtins.int");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_literal_with_unequal_literal_defers() {
+        // visit_literal_type case 1 (join.py:841-843): s is
+        // LiteralType, t != s, not enum -> join_types(s.fallback,
+        // t.fallback). The result is the joined fallback, which is
+        // neither s nor t in general. Defer (can't express as
+        // SameS/SameT unless the fallback equals s or t, which the
+        // Instance-Instance path handles separately when both sides
+        // are Instances — but here both sides are LiteralType).
+        let o = snap("builtins.object", "object");
+        let i = snap("builtins.int", "int");
+        let r = make_resolver(vec![o, i]);
+        let s = literal(LiteralValue::Int(1), "builtins.int");
+        let t = literal(LiteralValue::Int(2), "builtins.int");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_with_matching_last_known_value_returns_t() {
+        // visit_literal_type case 4 (join.py:844-845): s is Instance,
+        // s.last_known_value == t -> return t. Fires the Rust SameT
+        // path (shim returns t, the literal).
+        let o = snap("builtins.object", "object");
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![o, a]);
+        let lit = literal(LiteralValue::Int(1), "a.A");
+        let s = Type::Instance {
+            type_ref: "a.A".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(lit.clone())),
+            extra_attrs: None,
+        };
+        let t = lit;
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_instance_with_mismatched_last_known_value_defers() {
+        // visit_literal_type case 5 (join.py:847): s is Instance,
+        // s.last_known_value != t -> join_types(self.s, t.fallback).
+        // The recursive call is Instance-vs-Instance (both fallback=A),
+        // which yields SameS. But the result (A) is neither s nor t.
+        // Defer (can't express as SameS/SameT relative to the outer
+        // s=Instance(A, lkv=Lit[1]), t=Lit[2] frame).
+        let o = snap("builtins.object", "object");
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![o, a]);
+        let lkv = literal(LiteralValue::Int(1), "a.A");
+        let s = Type::Instance {
+            type_ref: "a.A".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(lkv)),
+            extra_attrs: None,
+        };
+        let t = literal(LiteralValue::Int(2), "a.A");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 
     #[test]
