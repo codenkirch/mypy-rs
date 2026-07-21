@@ -172,6 +172,12 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 ///   in the wire format) AND equal upper_bound: SameS (return s).
 ///   Different upper_bounds / different ids / s not TypeVarType defer
 ///   (the copy_modified or bound-join produces a new type).
+/// - TypedDictType right, s is Instance: recursive
+///   `join_types(s, t.fallback)` (s=left, fallback=right). SameS
+///   (recursive) -> SameS; Ancestor/Object pass through. SameT
+///   (recursive, result=fallback != t) defers. Case 1 (s is
+///   TypedDictType, builds a new TypedDictType) and case 3 (s not
+///   Instance/TypedDictType, walks fallback chain) defer.
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
@@ -182,7 +188,7 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - Overloaded left AND callable-like right (both-FunctionLike needs
 ///   `is_similar_callables` + `combine_similar_callables`).
 /// - Parameters (needs live callable normalization).
-/// - Instance/TypedDict/etc right (full visitor).
+/// - Instance/TupleType/etc right (full visitor).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
 /// BEFORE calling this, matching `join.py:303-304`.
@@ -450,6 +456,36 @@ fn visit_join(
                 }
             }
             None
+        }
+
+        // visit_typeddict (join.py:811-835), case 2 Instance-s only.
+        // Case 1 (s is TypedDictType) builds a NEW TypedDictType via
+        // resolve_typeddict_item over zipall -> defer (no encoder).
+        // Case 2 (s is Instance) recurses into
+        // join_types(self.s, t.fallback). The recursive call is
+        // join_types(s, fallback) (s=left, fallback=right). SameS in
+        // the recursive frame means result=s -> outer SameS. SameT
+        // means result=fallback, which is neither s nor t (t is the
+        // TypedDict) -> defer. Ancestor/Object pass through.
+        // Case 3 (else) walks s's fallback chain -> defer.
+        //
+        // The fallback is always an Instance (the wire reader asserts
+        // the INSTANCE tag at wire.rs:987; types.py:3122 serializes
+        // `self.fallback.write(data)` where fallback is an Instance).
+        // No protocol deferral needed (unlike visit_callable_fallback):
+        // the recursion is a plain Instance-Instance join, no callback
+        // proxy unpacking involved.
+        Type::TypedDictType { fallback, .. } => {
+            if let Type::Instance { .. } = s {
+                match join_types(s, fallback, ctx, resolver)? {
+                    SetOpResult::SameS => Some(SetOpResult::SameS),
+                    SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+                    SetOpResult::Object => Some(SetOpResult::Object),
+                    _ => None,
+                }
+            } else {
+                None
+            }
         }
 
         // Full visitors (TypeVar, TypedDict, etc.) — deferred.
@@ -1570,6 +1606,22 @@ mod tests {
         }
     }
 
+    /// Minimal `TypedDictType` for join tests. `fallback_ref` is the
+    /// Instance TypedDict falls back to (typically builtins.dict or a
+    /// user TypedDict class). The portable join case (visit_typeddict
+    /// case 2, join.py:832-833) only reads `t.fallback`; items /
+    /// required_keys / readonly_keys / is_closed don't affect the
+    /// deferral decision, so they default to empty.
+    fn typed_dict(fallback_ref: &str) -> Type {
+        Type::TypedDictType {
+            fallback: Box::new(instance(fallback_ref, vec![])),
+            items: Vec::new(),
+            required_keys: std::collections::HashSet::new(),
+            readonly_keys: std::collections::HashSet::new(),
+            is_closed: true,
+        }
+    }
+
     #[test]
     fn join_type_type_with_builtins_type_instance_returns_s() {
         // visit_type_type case 2 (join.py:861-862): s is Instance with
@@ -2255,5 +2307,87 @@ mod tests {
         let s = type_var(1, "~", instance("builtins.object", vec![]));
         let t = type_var(1, "other", instance("builtins.object", vec![]));
         assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+    }
+
+    #[test]
+    fn join_typeddict_with_instance_equal_fallback_returns_s() {
+        // visit_typeddict case 2 (join.py:832-833): s is Instance,
+        // t is TypedDictType -> join_types(self.s, t.fallback).
+        // Recursive call: join_types(s=builtins.dict, t.fallback=
+        // builtins.dict). Same Instance, no args -> SameS (recursive
+        // left = s). Maps to outer SameS (shim returns s).
+        let o = snap("builtins.object", "object");
+        let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
+        let r = make_resolver(vec![o, dict]);
+        let s = instance("builtins.dict", vec![]);
+        let t = typed_dict("builtins.dict");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_typeddict_with_instance_supertype_fallback_returns_ancestor() {
+        // visit_typeddict case 2: s is Instance(builtins.object),
+        // t is TypedDictType with fallback=builtins.dict.
+        // Recursive: join_types(object, builtins.dict). dict <: object,
+        // so the join is object (the supertype). The Rust Instance
+        // path returns Ancestor("builtins.object") (the common base),
+        // which the Python shim reconstructs as Instance(object) =
+        // object. Passes through.
+        let o = snap("builtins.object", "object");
+        let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
+        let r = make_resolver(vec![o, dict]);
+        let s = instance("builtins.object", vec![]);
+        let t = typed_dict("builtins.dict");
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_typeddict_with_instance_subtype_fallback_returns_ancestor() {
+        // visit_typeddict case 2: s is Instance(builtins.dict), t is
+        // TypedDictType with fallback=builtins.object. Recursive:
+        // join_types(builtins.dict, builtins.object). dict <: object,
+        // so the join is object (the supertype). The Rust path returns
+        // Ancestor("builtins.object"), which passes through (the shim
+        // reconstructs Instance(object) = object). NOT a defer — the
+        // Ancestor is the correct result, not SameT.
+        let o = snap("builtins.object", "object");
+        let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
+        let r = make_resolver(vec![o, dict]);
+        let s = instance("builtins.dict", vec![]);
+        let t = typed_dict("builtins.object");
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_typeddict_with_typeddict_defers() {
+        // visit_typeddict case 1 (join.py:812-831): s is TypedDictType
+        // -> builds a NEW TypedDictType via resolve_typeddict_item over
+        // zipall. Produces a new type (neither s nor t) -> defer (no
+        // Type encoder).
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = typed_dict("builtins.dict");
+        let t = typed_dict("builtins.dict");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_typeddict_with_non_instance_s_defers() {
+        // visit_typeddict case 3 (join.py:834-835): s is not an
+        // Instance (and not a TypedDictType) -> default(self.s).
+        // Walks s's fallback chain -> defer. Use TypeVarType (passes
+        // pre-dispatch: not Any/None/Uninhabited/Union/Callable, reaches
+        // visit_typeddict case 3).
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = type_var(1, "~", instance("builtins.object", vec![]));
+        let t = typed_dict("builtins.dict");
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 }
