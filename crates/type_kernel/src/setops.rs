@@ -158,6 +158,8 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - CallableType right, s non-callable: fallback join
 ///   (join_types(t.fallback, s)); Ancestor/Object pass through,
 ///   SameT (result=s) -> SameS, SameS (result=fallback=s) -> SameS.
+/// - Overloaded right, s non-callable: same fallback join, with the
+///   fallback extracted from `items[0].fallback` (types.py:2744).
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
@@ -165,7 +167,9 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - UnionType left AND UnionType right (needs merge/flatten).
 /// - CallableType left AND CallableType right (similar-callables needs
 ///   `combine_similar_callables` which produces a new CallableType).
-/// - Overloaded/Parameters (needs live callable normalization).
+/// - Overloaded left AND callable-like right (both-FunctionLike needs
+///   `is_similar_callables` + `combine_similar_callables`).
+/// - Parameters (needs live callable normalization).
 /// - Instance/TypeVarType/TypedDict/etc right (full visitor).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
@@ -220,11 +224,12 @@ pub(crate) fn join_types(
 
     // normalize_callables (join.py:327) is a no-op for the Rust path:
     // the Python shim serializes the post-normalization form. The
-    // similar-callables case (both sides callable-like) needs
-    // combine_similar_callables which produces a new CallableType —
-    // no Type encoder -> defer. The fallback case (t=CallableType,
-    // s non-callable) recurses into join_types(t.fallback, s), which
-    // the Rust Instance-Instance path handles.
+    // both-FunctionLike case (both sides callable-like) needs
+    // is_similar_callables + combine_similar_callables which produce
+    // a new CallableType / Overloaded — no Type encoder -> defer. The
+    // fallback case (t=CallableType/Overloaded, s non-callable)
+    // recurses into join_types(t.fallback, s), which the Rust
+    // Instance-Instance path handles.
     let s_is_callable = matches!(
         s,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
@@ -336,8 +341,27 @@ fn visit_join(
         // non-protocol) recurses into join_types(t.fallback, s).
         Type::CallableType { fallback, .. } => visit_callable_fallback(s, fallback, ctx, resolver),
 
-        // Full visitors (Overloaded, TypeVar, TypedDict, etc.) —
-        // deferred.
+        // visit_overloaded (join.py:581-632), fallback case only. The
+        // both-FunctionLike case (s is CallableType/Overloaded) is
+        // already deferred by the pre-dispatch both-callable-like guard.
+        // The protocol-Instance case needs unpack_callback_proxy. The
+        // fallback case (join.py:632: join_types(t.fallback, s))
+        // recurses into the Instance-vs-s join. `t.fallback` is
+        // `items[0].fallback` (types.py:2744); the wire format stores
+        // only `items`, so extract it here.
+        Type::Overloaded { items, .. } => {
+            let first = items.first()?;
+            let fallback = match first {
+                Type::CallableType { fallback, .. } => fallback.as_ref(),
+                // Non-Callable item violates the Overloaded invariant
+                // (types.py:2739: "_items: list[CallableType]"). Defer
+                // rather than panic: the wire format can't enforce this.
+                _ => return None,
+            };
+            visit_callable_fallback(s, fallback, ctx, resolver)
+        }
+
+        // Full visitors (TypeVar, TypedDict, etc.) — deferred.
         _ => None,
     }
 }
@@ -1404,6 +1428,147 @@ mod tests {
             instance("builtins.object", vec![]),
         );
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    /// Minimal `Overloaded` for join tests. The fallback is
+    /// `items[0].fallback` (mirrors `Overloaded.__init__` in
+    /// types.py:2744). Each item is a `CallableType`.
+    fn overloaded(items: Vec<Type>) -> Type {
+        assert!(!items.is_empty(), "Overloaded requires >=1 item");
+        Type::Overloaded { items }
+    }
+
+    #[test]
+    fn join_overloaded_with_object_returns_object() {
+        // visit_overloaded fallback (join.py:632): s=object, t=Overloaded.
+        // Recursive join_types(t.fallback=function, s=object) ->
+        // is_subtype(function, object)=True -> via_supertype(function,
+        // object) -> function.bases=[object] ->
+        // join_instances_nominal(object, object) -> Left ->
+        // Ancestor("builtins.object"). The outer overloaded fallback
+        // passes Ancestor through; the shim maps disc 5 to
+        // Instance(object_typeinfo, []) = object.
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, o]);
+        let s = instance("builtins.object", vec![]);
+        let t = overloaded(vec![callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        )]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_overloaded_with_function_returns_function() {
+        // visit_overloaded fallback: s=builtins.function, t=Overloaded
+        // with fallback=builtins.function. Recursive join_types(function,
+        // function) -> visit_instance_join: same type, no args -> SameS.
+        // The outer overloaded join returns SameS (s=builtins.function).
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, o]);
+        let s = instance("builtins.function", vec![]);
+        let t = overloaded(vec![callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.object", vec![]),
+        )]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_overloaded_with_unrelated_instance_returns_object() {
+        // visit_overloaded fallback: s=a.A, t=Overloaded with fallback=
+        // builtins.function. Neither is_subtype(function, a) nor
+        // is_subtype(a, function) holds, so via_supertype(a, function)
+        // walks a.bases=[object] -> join_instances_nominal(object,
+        // function) -> is_subtype(function, object)=True ->
+        // via_supertype(function, object) -> function.bases=[object] ->
+        // join_instances_nominal(object, object) -> Left ->
+        // Ancestor("builtins.object").
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let a = snap_with_bases("a.A", "A", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, a, o]);
+        let s = instance("a.A", vec![]);
+        let t = overloaded(vec![callable(
+            "builtins.function",
+            vec![instance("a.A", vec![])],
+            instance("a.A", vec![]),
+        )]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
+    }
+
+    #[test]
+    fn join_overloaded_with_overloaded_defers() {
+        // Both s and t are callable-like (Overloaded). The pre-dispatch
+        // defers because visit_overloaded's both-FunctionLike case
+        // (join.py:612-627) needs is_similar_callables +
+        // combine_similar_callables, which produce new CallableType /
+        // Overloaded. No Type encoder -> defer.
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let c = || {
+            callable(
+                "builtins.function",
+                vec![instance("builtins.object", vec![])],
+                instance("builtins.object", vec![]),
+            )
+        };
+        let s = overloaded(vec![c()]);
+        let t = overloaded(vec![c()]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_overloaded_with_callable_defers() {
+        // s=CallableType, t=Overloaded. Both callable-like -> the
+        // pre-dispatch defers (both sides callable-like).
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = overloaded(vec![callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        )]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_object_with_overloaded_returns_object() {
+        // s=object, t=Overloaded. Same as
+        // join_overloaded_with_object_returns_object but with s/t roles
+        // verified from the other direction (s=object, t=overloaded).
+        // The recursive join_types(fallback=function, s=object) ->
+        // Ancestor("builtins.object"). Fires the Rust Ancestor path.
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![func, o]);
+        let s = instance("builtins.object", vec![]);
+        let t = overloaded(vec![callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.object", vec![]),
+        )]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("builtins.object".to_string()))
+        );
     }
 
     #[test]
