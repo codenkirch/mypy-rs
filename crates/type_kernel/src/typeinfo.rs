@@ -87,6 +87,11 @@ pub(crate) struct TypeInfoSnapshot {
     /// 1=ParamSpecType, 2=TypeVarTupleType. Stage 3c dispatches
     /// `check_type_parameter` on (variance, kind).
     pub type_vars_with_variance: Vec<(String, i64, i64)>,
+    /// Serialized `TypeVarType.upper_bound` for each TypeVar (parallel
+    /// to `type_vars_with_variance`). Stage 3c checks
+    /// `is_subtype(new_type, upper_bound)` in the covariant branch
+    /// (subtypes.py:612-619). Empty blob for ParamSpec/TypeVarTuple.
+    pub type_var_upper_bounds: Vec<Vec<u8>>,
 }
 
 #[allow(dead_code)]
@@ -271,8 +276,11 @@ fn read_promote_bytes(py: Python<'_>, obj: &PyAny) -> Vec<Vec<u8>> {
 /// (nodes.py:3146). kind: 0=TypeVarType, 1=ParamSpecType, 2=TypeVarTupleType.
 /// ParamSpec and TypeVarTuple default to variance=0 (INVARIANT) since
 /// `check_type_parameter` (subtypes.py:617-621) treats them as invariant
-/// unless overridden.
-fn read_type_vars_with_variance(obj: &PyAny) -> Vec<(String, i64, i64)> {
+/// unless overridden. Also returns the serialized `upper_bound` blob for
+/// each TypeVar (empty for ParamSpec/TypeVarTuple); Stage 3c checks
+/// `is_subtype(new_type, upper_bound)` in the covariant branch
+/// (subtypes.py:612-619).
+fn read_type_vars_with_variance(py: Python<'_>, obj: &PyAny) -> Vec<(String, i64, i64, Vec<u8>)> {
     let defn = match obj.getattr("defn") {
         Ok(d) => d,
         Err(_) => return Vec::new(),
@@ -305,7 +313,18 @@ fn read_type_vars_with_variance(obj: &PyAny) -> Vec<(String, i64, i64)> {
             "TypeVarTupleType" => (0, 2),
             _ => (0, 0),
         };
-        out.push((name, variance, kind));
+        // upper_bound blob: TypeVarType has `.upper_bound`; ParamSpec
+        // / TypeVarTuple have it too but the join visitor doesn't read
+        // it for those kinds. Empty blob signals "no bound check".
+        let upper_bound = if kind == 0 {
+            item.getattr("upper_bound")
+                .ok()
+                .and_then(|ub| serialize_type_to_bytes(py, ub))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        out.push((name, variance, kind, upper_bound));
     }
     out
 }
@@ -450,11 +469,13 @@ pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyO
             None => snap_dict.set_item("type_var_tuple_suffix", py.None())?,
         }
 
-        // type_vars_with_variance: Vec<(name, variance, kind)>.
-        let tvw = read_type_vars_with_variance(item);
+        // type_vars_with_variance: Vec<(name, variance, kind, upper_bound)>.
+        // The dict path stores the 3-tuple (no upper_bound); the
+        // #[pyclass] path keeps the full 4-tuple.
+        let tvw = read_type_vars_with_variance(py, item);
         let py_tvw = PyList::new(
             py,
-            tvw.iter().map(|(n, v, k)| {
+            tvw.iter().map(|(n, v, k, _)| {
                 let tup = (n.as_str(), *v, *k).to_object(py);
                 tup
             }),
@@ -807,7 +828,15 @@ pub(crate) fn build_native_resolver(
         let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
         let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
         let type_var_tuple_suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
-        let type_vars_with_variance = read_type_vars_with_variance(item);
+        let type_vars_with_variance_full = read_type_vars_with_variance(py, item);
+        let type_vars_with_variance: Vec<(String, i64, i64)> = type_vars_with_variance_full
+            .iter()
+            .map(|(n, v, k, _)| (n.clone(), *v, *k))
+            .collect();
+        let type_var_upper_bounds: Vec<Vec<u8>> = type_vars_with_variance_full
+            .into_iter()
+            .map(|(_, _, _, ub)| ub)
+            .collect();
 
         let snap = TypeInfoSnapshot {
             fullname,
@@ -831,6 +860,7 @@ pub(crate) fn build_native_resolver(
             type_var_tuple_prefix,
             type_var_tuple_suffix,
             type_vars_with_variance,
+            type_var_upper_bounds,
         };
         resolver.insert(snap.fullname.clone(), snap);
     }
