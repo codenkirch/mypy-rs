@@ -167,6 +167,11 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 ///   (return t). s is Instance with `last_known_value == t`: SameT.
 ///   Unequal literals / non-matching lkv defer (the fallback join
 ///   produces a type that is neither s nor t).
+/// - TypeVarType right, s is TypeVarType with same id (raw_id +
+///   namespace, matching wire-roundtrip semantics — meta_level is not
+///   in the wire format) AND equal upper_bound: SameS (return s).
+///   Different upper_bounds / different ids / s not TypeVarType defer
+///   (the copy_modified or bound-join produces a new type).
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
@@ -177,7 +182,7 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - Overloaded left AND callable-like right (both-FunctionLike needs
 ///   `is_similar_callables` + `combine_similar_callables`).
 /// - Parameters (needs live callable normalization).
-/// - Instance/TypeVarType/TypedDict/etc right (full visitor).
+/// - Instance/TypedDict/etc right (full visitor).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
 /// BEFORE calling this, matching `join.py:303-304`.
@@ -406,6 +411,42 @@ fn visit_join(
                     if lkv_val == t_val {
                         return Some(SetOpResult::SameT);
                     }
+                }
+            }
+            None
+        }
+
+        // visit_type_var (join.py:463-474), case 1 same-id-same-bound
+        // only. Case 1 (s is TypeVarType, s.id==t.id,
+        // s.upper_bound==t.upper_bound) returns self.s -> SameS. The
+        // copy_modified branch (case 1, upper_bounds differ) and
+        // case 2 (s.id != t.id -> join upper_bounds) both produce a
+        // new TypeVarType or the bound's join result — neither s nor
+        // t in general -> defer. Case 3 (s not TypeVarType ->
+        // default(s)) walks fallback chains -> defer.
+        //
+        // `TypeVarId.__eq__` (types.py:567-577) checks raw_id,
+        // meta_level, AND namespace. The wire format serializes only
+        // raw_id + namespace (types.py:739-740); `read` reconstructs
+        // TypeVarId with meta_level=0 (types.py:752). Meta variables
+        // (meta_level > 0) are constraint-solver internals that do
+        // not cross this FFI seam, so raw_id + namespace equality here
+        // matches wire-roundtrip semantics exactly.
+        Type::TypeVarType {
+            raw_id: t_raw,
+            namespace: t_ns,
+            upper_bound: t_ub,
+            ..
+        } => {
+            if let Type::TypeVarType {
+                raw_id: s_raw,
+                namespace: s_ns,
+                upper_bound: s_ub,
+                ..
+            } = s
+            {
+                if s_raw == t_raw && s_ns == t_ns && s_ub == t_ub {
+                    return Some(SetOpResult::SameS);
                 }
             }
             None
@@ -1507,6 +1548,28 @@ mod tests {
         }
     }
 
+    /// Minimal `TypeVarType` for join tests. `raw_id` + `namespace`
+    /// form the identity (mirrors `TypeVarId.__eq__` in
+    /// types.py:567-577; `meta_level` is not in the wire format —
+    /// see `visit_type_var` docstring). `upper_bound` is the bound
+    /// compared by join.py:466.
+    fn type_var(raw_id: i64, namespace: &str, upper_bound: Type) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            values: Vec::new(),
+            upper_bound: Box::new(upper_bound),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: INVARIANT,
+        }
+    }
+
     #[test]
     fn join_type_type_with_builtins_type_instance_returns_s() {
         // visit_type_type case 2 (join.py:861-862): s is Instance with
@@ -2136,5 +2199,61 @@ mod tests {
         let s = instance("g.G", vec![instance("builtins.int", vec![])]);
         let t = instance("g.G", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_type_var_same_id_same_upper_bound_returns_s() {
+        // visit_type_var case 1 (join.py:465-467): s is TypeVarType,
+        // s.id == t.id, s.upper_bound == t.upper_bound -> return
+        // self.s. Fires the Rust SameS path (shim returns s).
+        let bound = instance("builtins.object", vec![]);
+        let s = type_var(1, "~", bound.clone());
+        let t = type_var(1, "~", bound);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &make_resolver(vec![])),
+            Some(SetOpResult::SameS)
+        );
+    }
+
+    #[test]
+    fn join_type_var_same_id_different_upper_bound_defers() {
+        // visit_type_var case 1 (join.py:468-470): s.id == t.id but
+        // upper_bounds differ -> copy_modified(upper_bound=join_types(...)).
+        // Produces a NEW TypeVarType (neither s nor t) -> defer (no Type
+        // encoder).
+        let s = type_var(1, "~", instance("builtins.int", vec![]));
+        let t = type_var(1, "~", instance("builtins.str", vec![]));
+        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+    }
+
+    #[test]
+    fn join_type_var_different_id_defers() {
+        // visit_type_var case 2 (join.py:472): s is TypeVarType but
+        // s.id != t.id -> join_types(s.upper_bound, t.upper_bound).
+        // The bound join is generally neither s nor t -> defer.
+        let s = type_var(1, "~", instance("builtins.int", vec![]));
+        let t = type_var(2, "~", instance("builtins.int", vec![]));
+        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+    }
+
+    #[test]
+    fn join_type_var_with_non_type_var_s_defers() {
+        // visit_type_var case 3 (join.py:474): s is NOT a TypeVarType ->
+        // return self.default(self.s). The default walks s's fallback
+        // chain (join.py:869-888) and produces object/Any/instance —
+        // generally neither s nor t -> defer.
+        let t = type_var(1, "~", instance("builtins.object", vec![]));
+        let s = instance("builtins.int", vec![]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+    }
+
+    #[test]
+    fn join_type_var_same_id_different_namespace_defers() {
+        // TypeVarId equality checks namespace (types.py:576): same
+        // raw_id, different namespace -> s.id != t.id -> case 2 ->
+        // defer.
+        let s = type_var(1, "~", instance("builtins.object", vec![]));
+        let t = type_var(1, "other", instance("builtins.object", vec![]));
+        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
     }
 }
