@@ -3538,3 +3538,185 @@ class NativeJoinTupleSuite(Suite):
         tup2 = TupleType([self.fx.a], self.fx.a)
         assert join_types(tup1, tup2) == tup1
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMeetSuite(Suite):
+    """Parity suite for the Rust `meet_types` (Stage 3c M8p).
+
+    Exercises the leaf visitors (meet.py:822+) and the args-less
+    Instance-Instance nominal meet (meet.py:913-979). Cases that
+    produce a new type (union, callable, typeddict, tuple, type_type,
+    type_var with bound-meet) or need live TypeInfo (alt_promote,
+    protocol) defer to Python; the result is identical regardless of
+    which path computed it.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def callable(self, *a: Type) -> CallableType:
+        n = len(a) - 1
+        return CallableType(list(a[:-1]), [ARG_POS] * n, [None] * n, a[-1], self.fx.function)
+
+    def test_meet_any_s_returns_t(self) -> None:
+        # meet.py:145-146: isinstance(s, AnyType) -> return t.
+        assert meet_types(self.fx.anyt, self.fx.a) == self.fx.a
+
+    def test_meet_any_t_returns_s(self) -> None:
+        # visit_any (meet.py:837): return self.s.
+        assert meet_types(self.fx.a, self.fx.anyt) == self.fx.a
+
+    def test_meet_none_t_strict_s_is_none_returns_none(self) -> None:
+        # visit_none_type strict, s=NoneType -> t (NoneType).
+        with state.strict_optional_set(True):
+            assert meet_types(NoneType(), NoneType()) == NoneType()
+
+    def test_meet_none_t_strict_s_is_object_returns_none(self) -> None:
+        # visit_none_type strict, s=Instance(object) -> t (NoneType).
+        with state.strict_optional_set(True):
+            assert meet_types(self.fx.o, NoneType()) == NoneType()
+
+    def test_meet_none_t_strict_s_is_instance_returns_bottom(self) -> None:
+        # visit_none_type strict, s=non-object Instance -> Bottom.
+        with state.strict_optional_set(True):
+            assert meet_types(self.fx.a, NoneType()) == UninhabitedType()
+
+    def test_meet_none_t_non_strict_returns_none(self) -> None:
+        # visit_none_type non-strict -> t (NoneType).
+        with state.strict_optional_set(False):
+            assert meet_types(self.fx.a, NoneType()) == NoneType()
+
+    def test_meet_uninhabited_t_returns_t(self) -> None:
+        # visit_uninhabited_type (meet.py:861): return t.
+        assert meet_types(self.fx.a, UninhabitedType()) == UninhabitedType()
+
+    def test_meet_deleted_t_s_is_instance_returns_t(self) -> None:
+        # visit_deleted_type: s not None/Uninhabited -> t (DeletedType).
+        # DeletedType uses identity equality, so compare by type.
+        from mypy.types import DeletedType
+
+        result = meet_types(self.fx.a, DeletedType())
+        assert isinstance(result, DeletedType)
+
+    def test_meet_deleted_t_s_is_uninhabited_returns_s(self) -> None:
+        # visit_deleted_type: s is Uninhabited -> self.s (Uninhabited).
+        from mypy.types import DeletedType
+
+        assert meet_types(UninhabitedType(), DeletedType()) == UninhabitedType()
+
+    def test_meet_proper_subtype_returns_subtype(self) -> None:
+        # meet.py:137-141 pre-check: is_proper_subtype(t, s) -> t.
+        # B <: A, meet(A, B) = B (the subtype is the lower bound).
+        assert meet_types(self.fx.a, self.fx.b) == self.fx.b
+
+    def test_meet_proper_subtype_returns_subtype_swapped(self) -> None:
+        # meet.py:137-141: is_proper_subtype(t, s) -> t.
+        # B <: A, meet(B, A) = B (same subtype, swapped args).
+        assert meet_types(self.fx.b, self.fx.a) == self.fx.b
+
+    def test_meet_instance_same_type_no_args_returns_s(self) -> None:
+        # visit_instance same type_ref, args-less -> SameS.
+        assert meet_types(self.fx.a, self.fx.a) == self.fx.a
+
+    def test_meet_instance_different_unrelated_returns_bottom(self) -> None:
+        # visit_instance different types, neither <: other -> Bottom.
+        assert meet_types(self.fx.a, self.fx.d) == UninhabitedType()
+
+    def test_meet_instance_different_unrelated_non_strict_returns_none(self) -> None:
+        # Non-strict: Bottom maps to NoneType via the shim.
+        with state.strict_optional_set(False):
+            assert meet_types(self.fx.a, self.fx.d) == NoneType()
+
+    def test_meet_instance_subtype_returns_subtype(self) -> None:
+        # visit_instance different types, B <: A.
+        # meet(A, B) = B (the subtype is the lower bound).
+        assert meet_types(self.fx.a, self.fx.b) == self.fx.b
+
+    def test_meet_instance_subtype_returns_subtype_swapped(self) -> None:
+        # visit_instance different types, B <: A.
+        # meet(B, A) = B (same subtype, swapped args).
+        assert meet_types(self.fx.b, self.fx.a) == self.fx.b
+
+    def test_meet_instance_with_args_same_type_defers_to_python(self) -> None:
+        # visit_instance same type_ref with args -> combine args
+        # (produces new Instance) -> defers. Result identical to Python.
+        assert meet_types(self.fx.ga, self.fx.ga) == self.fx.ga
+
+    def test_meet_instance_with_args_different_subtype_defers_to_python(self) -> None:
+        # visit_instance different types with args -> needs
+        # map_instance_to_supertype + arg combination -> defers.
+        assert meet_types(self.fx.gsab, self.fx.gb) == self.fx.gsab
+
+    def test_meet_union_s_non_union_t_defers_to_python(self) -> None:
+        # visit_union_type builds a new union -> defers. Python computes
+        # make_simplified_union([meet(a, a), meet(b, a)]) = A | B.
+        from mypy.types import UnionType
+
+        u = UnionType.make_union([self.fx.a, self.fx.b])
+        assert meet_types(u, self.fx.a) == u
+
+    def test_meet_both_callable_defers_to_python(self) -> None:
+        # both callable-like -> meet_similar_callables (produces new
+        # CallableType) -> defers. Result identical.
+        c = self.callable(self.fx.a, self.fx.b)
+        assert meet_types(c, c) == c
+
+    def test_meet_typeddict_defers_to_python(self) -> None:
+        # visit_typeddict_type builds a new TypedDictType -> defers.
+        # Result identical to Python (which also builds the new type).
+        td = TypedDictType({"x": self.fx.a}, {"x"}, set(), self.fx.o)
+        assert meet_types(td, td) == td
+
+    def test_meet_tuple_defers_to_python(self) -> None:
+        # visit_tuple_type builds a new TupleType -> defers. Result
+        # identical to Python.
+        tup1 = TupleType([self.fx.a], self.fx.std_tuple)
+        tup2 = TupleType([self.fx.a], self.fx.std_tuple)
+        assert meet_types(tup1, tup2) == tup1
+
+

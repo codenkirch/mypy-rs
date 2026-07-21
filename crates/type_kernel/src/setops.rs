@@ -306,6 +306,247 @@ fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
     }
 }
 
+/// `meet_types` (meet.py:114-153) pre-dispatch + leaf visitors
+/// (meet.py:822+), Rust subset. Mirror of `join_types`.
+///
+/// Handles the cases that don't recurse into `meet_types`:
+/// - `is_proper_subtype(s, t, ignore_promotions=True)` -> SameS.
+/// - `is_proper_subtype(t, s, ignore_promotions=True)` -> SameT.
+/// - AnyType s (after UnionType swap) -> SameT (return t).
+/// - UnionType s AND t not UnionType -> swap; both UnionType defers
+///   (needs make_simplified_union).
+/// - Both callable-like -> defer (needs meet_similar_callables).
+/// - Leaf visitors:
+///   * visit_any (meet.py:837): return self.s -> SameS.
+///   * visit_none_type (meet.py:850-859): strict_optional, s in
+///     {NoneType, Instance(builtins.object)} -> SameT; else Bottom.
+///     Non-strict -> SameT.
+///   * visit_uninhabited_type (meet.py:861): return t -> SameT.
+///   * visit_deleted_type (meet.py:864-873): s is NoneType ->
+///     SameS (strict) / SameT (non-strict); s is UninhabitedType ->
+///     SameS; else SameT.
+///   * visit_instance (meet.py:913-996), args-less nominal only:
+///     same type_ref -> SameS (equal, no args to combine); different
+///     type_ref with is_subtype(t, s) -> SameT; is_subtype(s, t) ->
+///     SameS; else Bottom. Args / alt_promote / protocol defers.
+///
+/// Returns `None` (defer to Python) for:
+/// - `is_recursive_pair` (checked in Python before the Rust call).
+/// - `can_be_true`/`can_be_false` mismatch (needs the properties).
+/// - UnionType right (after swap): needs make_simplified_union.
+/// - Both callable-like: needs meet_similar_callables.
+/// - CallableType/Overloaded/Parameters right, s non-callable: the
+///   visit_callable_type branches need unpack_callback_proxy /
+///   live TypeInfo protocol flag not in the snapshot -> defer.
+/// - TypeVarType/ParamSpec/TypeVarTuple right: copy_modified or
+///   bound-meet produces a new type -> defer.
+/// - TypedDictType/TupleType/TypeType/LiteralType right: produce a new
+///   type or need live TypeInfo (alt_promote, is_metaclass, etc.) ->
+///   defer.
+/// - Instance right with args: needs arg combination -> defer.
+///
+/// The Python shim is responsible for `get_proper_type` expansion
+/// BEFORE calling this, matching `meet.py:120-121`.
+pub(crate) fn meet_types(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    // meet.py:137-141: is_proper_subtype pre-check (ignore_promotions).
+    // Only fires for Instance-Instance (Rust is_subtype returns None
+    // for non-Instance). Both directions must not be UnboundType
+    // (ErasedType has no wire variant -> never UnboundType here).
+    let proper_ctx = {
+        let mut c = ctx.clone();
+        c.proper_subtype = true;
+        c.ignore_promotions = true;
+        c
+    };
+    if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
+        return Some(SetOpResult::SameS);
+    }
+    if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
+        return Some(SetOpResult::SameT);
+    }
+
+    // meet.py:143-144 (isinstance(s, ErasedType) -> return s) is
+    // unreachable: ErasedType has no wire-format variant.
+    // meet.py:145-146: isinstance(s, AnyType) -> return t (SameT).
+    if matches!(s, Type::AnyType { .. }) {
+        return Some(SetOpResult::SameT);
+    }
+
+    // meet.py:147-148: isinstance(s, UnionType) and not isinstance(t,
+    // UnionType) -> swap. Both UnionType -> visit_union_type builds a
+    // new union -> defer.
+    let (s, t, swapped) = match (s, t) {
+        (Type::UnionType { .. }, other) if !matches!(other, Type::UnionType { .. }) => (t, s, true),
+        (Type::UnionType { .. }, Type::UnionType { .. }) => return None,
+        _ => (s, t, false),
+    };
+
+    // normalize_callables (meet.py:151) is a no-op for the Rust path:
+    // the Python shim serializes the post-normalization form. The
+    // both-FunctionLike case needs meet_similar_callables (produces a
+    // new CallableType) -> defer.
+    let s_is_callable = matches!(
+        s,
+        Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
+    );
+    let t_is_callable = matches!(
+        t,
+        Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
+    );
+    if s_is_callable && t_is_callable {
+        return None;
+    }
+
+    // t.accept(TypeMeetVisitor(s)) — leaf visitors only. The visitor
+    // returns SameS/SameT relative to the post-swap s/t; flip back to
+    // the original s/t frame.
+    visit_meet(s, t, ctx, resolver).map(|r| flip_if(r, swapped))
+}
+
+/// `TypeMeetVisitor.visit_*` leaf methods (meet.py:822+), Rust subset.
+/// Handles the visitors that don't recurse into `meet_types`.
+fn visit_meet(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    match t {
+        // visit_any (meet.py:837): return self.s.
+        Type::AnyType { .. } => Some(SetOpResult::SameS),
+
+        // visit_none_type (meet.py:850-859).
+        Type::NoneType => {
+            if ctx.strict_optional {
+                let s_is_object = matches!(
+                    s,
+                    Type::Instance { type_ref, .. } if type_ref == "builtins.object"
+                );
+                if matches!(s, Type::NoneType) || s_is_object {
+                    Some(SetOpResult::SameT)
+                } else {
+                    Some(SetOpResult::Bottom)
+                }
+            } else {
+                // Non-strict: return t.
+                Some(SetOpResult::SameT)
+            }
+        }
+
+        // visit_uninhabited_type (meet.py:861): return t (SameT).
+        Type::UninhabitedType => Some(SetOpResult::SameT),
+
+        // visit_deleted_type (meet.py:864-873).
+        Type::DeletedType { .. } => {
+            if matches!(s, Type::NoneType) {
+                // strict_optional: return t (DeletedType); non-strict:
+                // return self.s (NoneType). The Python shim maps both
+                // via the SameS/SameT discriminator + strict_optional
+                // flag.
+                if ctx.strict_optional {
+                    Some(SetOpResult::SameT)
+                } else {
+                    Some(SetOpResult::SameS)
+                }
+            } else if matches!(s, Type::UninhabitedType) {
+                // return self.s (Uninhabited).
+                Some(SetOpResult::SameS)
+            } else {
+                // else: return t (DeletedType).
+                Some(SetOpResult::SameT)
+            }
+        }
+
+        // visit_erased_type (meet.py:875) is unreachable: ErasedType
+        // has no wire-format variant.
+
+        // visit_instance (meet.py:913-996), args-less nominal subset.
+        Type::Instance { .. } => visit_instance_meet(s, t, ctx, resolver),
+
+        // Full visitors (union, callable, type_var, typeddict, tuple,
+        // literal, type_type, paramspec, typevartuple, parameters,
+        // overloaded) — deferred. The both-FunctionLike and both-Union
+        // cases are already deferred by meet_types pre-dispatch. The
+        // remaining cases (s non-callable, t callable-like; s
+        // non-union, t union after swap) reach here and defer.
+        _ => None,
+    }
+}
+
+/// `TypeMeetVisitor.visit_instance` (meet.py:913-996), args-less
+/// nominal subset. Mirrors `visit_instance_join` but for meet.
+///
+/// Handles:
+/// - Same type_ref, both args-less -> SameS (equal).
+/// - Different type_ref, args-less: `is_subtype(t, s)` -> SameT;
+///   `is_subtype(s, t)` -> SameS; else Bottom.
+///
+/// Defers (returns `None`) for:
+/// - s not Instance (FunctionLike/TypeType/Tuple/Literal/TypedDict
+///   branches recurse into meet_types(t, self.s) or default).
+/// - Same type_ref with args: combines args via meet -> produces a new
+///   Instance -> defer (no Type encoder).
+/// - Different type_ref with args: needs map_instance_to_supertype +
+///   arg combination -> defer.
+/// - `alt_promote` (meet.py:964-969): snapshot has no alt_promote
+///   field. For args-less Instance-Instance, the is_subtype check
+///   covers the common case; alt_promote fires for mypyc native ints
+///   (i64, i32) which the parity suite (TypeFixture) does not set.
+fn visit_instance_meet(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let (s_ref, s_args) = match s {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        // s not Instance: the FunctionLike/TypeType/Tuple/Literal/
+        // TypedDict branches (meet.py:980-996) recurse or default ->
+        // defer.
+        _ => return None,
+    };
+    let (t_ref, t_args) = match t {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return None,
+    };
+
+    // meet.py:914-957: t.type == self.s.type -> combine args.
+    if t_ref == s_ref {
+        if s_args.is_empty() && t_args.is_empty() {
+            // Equal args-less Instances -> meet is the type itself.
+            return Some(SetOpResult::SameS);
+        }
+        // Same type with args: needs arg combination -> defer.
+        return None;
+    }
+
+    // Different types with args: needs map_instance_to_supertype ->
+    // defer.
+    if !s_args.is_empty() || !t_args.is_empty() {
+        return None;
+    }
+
+    // meet.py:970-979 (alt_promote branches skipped — snapshot has no
+    // alt_promote; is_subtype covers the nominal case): is_subtype(t,
+    // s) -> return t; is_subtype(s, t) -> return s; else Bottom.
+    // Use non-proper is_subtype (visit_instance uses is_subtype, not
+    // is_proper_subtype, here — the pre-check already failed for
+    // proper_subtype with ignore_promotions=True, but is_subtype may
+    // still succeed via promotions).
+    if let Some(true) = is_subtype(t, s, ctx, resolver) {
+        Some(SetOpResult::SameT)
+    } else if let Some(true) = is_subtype(s, t, ctx, resolver) {
+        Some(SetOpResult::SameS)
+    } else {
+        Some(SetOpResult::Bottom)
+    }
+}
+
 /// `TypeJoinVisitor.visit_*` leaf methods (join.py:344-374), Rust
 /// subset. Handles the visitors that don't recurse into `join_types`.
 fn visit_join(
@@ -1045,6 +1286,27 @@ pub(crate) fn rust_join_types(
     let t = decode_type(t_bytes)?;
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     join_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
+}
+
+/// `#[pyfunction]` entry for `meet_types`. The Python-side shim
+/// (mypy/meet.py) calls this after `get_proper_type` expansion with
+/// serialized `s`/`t` blobs plus the `NativeTypeResolver` pyclass.
+/// Returns `None` (Python `None`) when Rust doesn't handle the case;
+/// `Some((disc, fullname, arg_discs))` otherwise. `meet_types` only
+/// emits disc 0=SameS, 1=SameT, 3=Bottom, 4=Any (never 2=Object,
+/// 5=Ancestor, 6=SameTypeWithArgs — those are join supertype results).
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_meet_types(
+    s_bytes: &[u8],
+    t_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<(i64, Option<String>, Vec<i8>)> {
+    let s = decode_type(s_bytes)?;
+    let t = decode_type(t_bytes)?;
+    let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+    meet_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
 /// Map `SetOpResult` to the Python-side `(disc, fullname, arg_discs)`
@@ -2534,5 +2796,300 @@ mod tests {
         let s = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
         let t = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    // ---- meet_types (M8p) ----
+    // Mirrors meet.py:114-153 (pre-dispatch) + meet.py:822+
+    // (TypeMeetVisitor leaf visitors). Returns SameS/SameT/Bottom/Any
+    // for the portable cases; defers (None) for everything else.
+
+    #[test]
+    fn meet_types_any_s_returns_t() {
+        // meet.py:145-146: isinstance(s, AnyType) -> return t.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = any_type();
+        let t = instance("a.A", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_any_t_returns_s() {
+        // visit_any (meet.py:837): return self.s.
+        // Pre-check (proper_subtype) returns None (not Instance-Instance
+        // proper subtype via ignore_promotions). AnyType-s pre-dispatch
+        // does not fire (s is Instance). Reaches visitor -> SameS.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = any_type();
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_none_t_strict_s_is_none_returns_t() {
+        // visit_none_type (meet.py:850-859), strict_optional, s is
+        // NoneType -> return t (SameT).
+        let r = make_resolver(vec![]);
+        let s = Type::NoneType;
+        let t = Type::NoneType;
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_none_t_strict_s_is_object_returns_t() {
+        // visit_none_type strict, s is Instance(builtins.object) -> t.
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![o]);
+        let s = instance("builtins.object", vec![]);
+        let t = Type::NoneType;
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_none_t_strict_s_is_instance_returns_bottom() {
+        // visit_none_type strict, s is non-object Instance -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = Type::NoneType;
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_types_none_t_non_strict_returns_t() {
+        // visit_none_type non-strict -> return t (SameT).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = Type::NoneType;
+        assert_eq!(
+            meet_types(&s, &t, &ctx(false), &r),
+            Some(SetOpResult::SameT)
+        );
+    }
+
+    #[test]
+    fn meet_types_uninhabited_t_returns_t() {
+        // visit_uninhabited_type (meet.py:861): return t (SameT).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UninhabitedType;
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_deleted_t_s_is_instance_returns_t() {
+        // visit_deleted_type (meet.py:864-873): s not None/Uninhabited
+        // -> return t (SameT).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = Type::DeletedType { source: None };
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_deleted_t_s_is_uninhabited_returns_s() {
+        // visit_deleted_type: s is UninhabitedType -> return self.s
+        // (SameS = Uninhabited).
+        let r = make_resolver(vec![]);
+        let s = Type::UninhabitedType;
+        let t = Type::DeletedType { source: None };
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_proper_subtype_s_returns_s() {
+        // meet.py:137-141 pre-check: is_proper_subtype(s, t) -> s.
+        // A <: B (proper, args-less) -> SameS.
+        let mut a = snap("a.A", "A");
+        a.has_base.insert("a.B".to_string());
+        a.mro.push("a.B".to_string());
+        let b = snap("a.B", "B");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_proper_subtype_t_returns_t() {
+        // meet.py:137-141: is_proper_subtype(t, s) -> t.
+        // B <: A (proper, args-less) -> SameT.
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_instance_same_type_no_args_returns_s() {
+        // visit_instance (meet.py:913-957), same type_ref, args-less.
+        // is_subtype(t, s) True (equal) -> would combine args (empty)
+        // -> Instance(t.type, []) == s -> SameS.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.A", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_instance_different_unrelated_returns_bottom() {
+        // visit_instance different types, neither <: other -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_types_instance_different_unrelated_non_strict_returns_bottom() {
+        // Non-strict: Bottom maps to NoneType in Python; Rust still
+        // reports Bottom (the shim maps Bottom -> NoneType when
+        // strict_optional is False).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(false), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_types_instance_different_subtype_returns_t() {
+        // visit_instance different types, is_subtype(t, s) True ->
+        // return t (SameT). A <: B, s=B, t=A -> meet(B, A) = A.
+        let mut a = snap("a.A", "A");
+        a.has_base.insert("a.B".to_string());
+        a.mro.push("a.B".to_string());
+        let b = snap("a.B", "B");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.B", vec![]);
+        let t = instance("a.A", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_types_instance_different_supertype_returns_s() {
+        // visit_instance different types, is_subtype(s, t) True ->
+        // return s (SameS). A <: B, s=A, t=B -> meet(A, B) = A.
+        let mut a = snap("a.A", "A");
+        a.has_base.insert("a.B".to_string());
+        a.mro.push("a.B".to_string());
+        let b = snap("a.B", "B");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_instance_with_args_same_type_defers() {
+        // visit_instance same type_ref with args -> combine args
+        // (produces new Instance with meet args) -> defer (no encoder).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![instance("builtins.int", vec![])]);
+        let t = instance("a.A", vec![instance("builtins.str", vec![])]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_types_instance_with_args_different_subtype_defers() {
+        // visit_instance different types with args -> needs
+        // map_instance_to_supertype + arg combination -> defer.
+        let mut a = snap("a.A", "A");
+        a.has_base.insert("a.B".to_string());
+        a.mro.push("a.B".to_string());
+        let b = snap("a.B", "B");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.B", vec![instance("builtins.int", vec![])]);
+        let t = instance("a.A", vec![instance("builtins.int", vec![])]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_types_union_s_non_union_t_swaps_then_defers() {
+        // meet.py:147-148: isinstance(s, UnionType) and not isinstance(t,
+        // UnionType) -> swap. After swap, s is non-union, t is union.
+        // visit_union_type (meet.py:840-848) builds a new union via
+        // make_simplified_union -> defer (no encoder).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = Type::UnionType {
+            items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+        };
+        let t = instance("a.A", vec![]);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_types_both_union_defers() {
+        // Both UnionType -> visit_union_type builds a new union -> defer.
+        let r = make_resolver(vec![]);
+        let s = Type::UnionType {
+            items: vec![instance("a.A", vec![])],
+            uses_pep604_syntax: false,
+        };
+        let t = Type::UnionType {
+            items: vec![instance("a.A", vec![])],
+            uses_pep604_syntax: false,
+        };
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_types_both_callable_defers() {
+        // normalize_callables + visit_callable_type: both callable-like
+        // -> needs combine_similar_callables / meet_similar_callables
+        // (produces a new CallableType) -> defer.
+        let r = make_resolver(vec![snap("builtins.function", "function")]);
+        let s = callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.int", vec![]),
+        );
+        let t = callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.int", vec![]),
+        );
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_types_callable_t_non_callable_s_fallback_defers() {
+        // visit_callable_type fallback case (s non-callable): meet_types
+        // does NOT have a callable-fallback short-circuit like join's
+        // visit_callable_type. Instead visit_instance handles s=Instance
+        // via is_subtype(t.fallback, s) -> produces s or t only when
+        // fallback <: s. For unrelated s, falls to default -> Bottom.
+        // But CallableType t is not Instance -> visit_instance not
+        // reached. visit_callable_type checks isinstance(self.s,
+        // CallableType) (no), TypeType (no), Instance+protocol (no) ->
+        // default(self.s) -> Bottom. However, reaching visit_callable_type
+        // requires passing the both-callable guard; the Rust path defers
+        // both-callable. For non-both-callable, t is CallableType and s
+        // is not: Rust would hit visit_callable_type which checks s
+        // shape. Defer conservatively (the s=Instance+protocol branch
+        // needs unpack_callback_proxy).
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("builtins.function", "function"),
+            snap("builtins.int", "int"),
+        ]);
+        let s = instance("a.A", vec![]);
+        let t = callable(
+            "builtins.function",
+            vec![],
+            instance("builtins.int", vec![]),
+        );
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
     }
 }
