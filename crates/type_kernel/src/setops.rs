@@ -51,7 +51,11 @@ use crate::subtypes::{is_subtype, SubtypeContext};
 ///   non-Instance right defers with `None`).
 /// * `Bottom` -> `UninhabitedType` (strict_optional) or `NoneType`.
 /// * `Any` -> `AnyType(TypeOfAny.special_form)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// * `Ancestor(fullname)` -> `Instance(typeinfo_map[fullname], [])`
+///   (the common supertype found by the Instance-Instance nominal join;
+///   the Python shim holds a fullname -> TypeInfo map alongside the
+///   resolver).
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum SetOpResult {
     SameS,
@@ -59,6 +63,7 @@ pub(crate) enum SetOpResult {
     Object,
     Bottom,
     Any,
+    Ancestor(String),
 }
 
 /// `trivial_join` (join.py:198-205), Rust subset.
@@ -209,12 +214,15 @@ pub(crate) fn join_types(
 }
 
 /// Swap SameS/SameT when the join_types pre-dispatch swapped s and t.
-/// `Object`, `Bottom`, and `Any` are swap-invariant.
+/// `Object`, `Bottom`, `Any`, and `Ancestor` are swap-invariant.
 fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
-    match (r, swapped) {
-        (SetOpResult::SameS, true) => SetOpResult::SameT,
-        (SetOpResult::SameT, true) => SetOpResult::SameS,
-        _ => r,
+    if !swapped {
+        return r;
+    }
+    match r {
+        SetOpResult::SameS => SetOpResult::SameT,
+        SetOpResult::SameT => SetOpResult::SameS,
+        other => other,
     }
 }
 
@@ -224,7 +232,7 @@ fn visit_join(
     s: &Type,
     t: &Type,
     ctx: &SubtypeContext,
-    _resolver: &TypeResolver,
+    resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
     match t {
         // visit_any (join.py:353-354): return t.
@@ -255,10 +263,190 @@ fn visit_join(
         // visit_erased_type (join.py:373-374) is unhandled: ErasedType
         // has no wire-format variant, so it cannot arrive over FFI.
 
-        // Full visitors (Instance, UnionType, CallableType, TypeVar,
-        // etc.) — deferred to M8f+.
+        // visit_instance (join.py:421-454), Instance-vs-Instance nominal
+        // subset. Only handles args-less instances (no type params) and
+        // defers when args are present or the s side is not an Instance
+        // (FunctionLike/TypeType/TypedDict/Tuple/Literal cases recurse
+        // into join_types and need the InstanceJoiner recursion guard).
+        Type::Instance { .. } => visit_instance_join(s, t, ctx, resolver),
+
+        // Full visitors (UnionType, CallableType, TypeVar, etc.) —
+        // deferred to M8g+.
         _ => None,
     }
+}
+
+/// `TypeJoinVisitor.visit_instance` (join.py:421-454), the
+/// `isinstance(self.s, Instance)` branch, Rust subset.
+///
+/// Ports the `InstanceJoiner.join_instances` (join.py:107-202) nominal
+/// path for args-less instances only:
+/// - Same type (t.type == s.type, no args) -> SameS (return s).
+/// - t <: s (ignore_type_params) -> join_instances_via_supertype(t, s):
+///   walk t's bases, find the common ancestor via recursion.
+/// - else -> join_instances_via_supertype(s, t): walk s's bases.
+///
+/// The common-ancestor walk (`join_instances_via_supertype`,
+/// join.py:204-240) for args-less instances reduces to: collect base
+/// type_refs from both t and s, map each base, recurse
+/// `join_instances(base, other)`, pick the one with the longest MRO
+/// (`is_better`, join.py:804+). Returns `Ancestor(fullname)` when a
+/// common ancestor is found, `Object` when the walk bottoms out at
+/// `builtins.object`, or `None` (defer) when args are present or a
+/// promote/blob decode fails.
+fn visit_instance_join(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let s_ref = match s {
+        Type::Instance { type_ref, args, .. } if args.is_empty() => type_ref.as_str(),
+        // s is not an args-less Instance: the FunctionLike/TypeType/
+        // TypedDict/Tuple/Literal/TypeVarTuple branches (join.py:437-454)
+        // all recurse into join_types — defer to Python.
+        _ => return None,
+    };
+    let t_ref = match t {
+        Type::Instance { type_ref, args, .. } if args.is_empty() => type_ref.as_str(),
+        // t has args: the same-type case needs to join args via
+        // join_types (covariant) or is_equivalent (invariant) — defer.
+        _ => return None,
+    };
+
+    // join.py:114: t.type == s.type -> return Instance(t.type, []).
+    if t_ref == s_ref {
+        return Some(SetOpResult::SameS);
+    }
+
+    // join.py:191-199: dispatch to join_instances_via_supertype.
+    // The recursive nominal join returns the fullname of the result
+    // Instance; convert to SameS/SameT/Ancestor relative to the
+    // original s/t frame.
+    let result_ref = if is_subtype(t, s, ctx, resolver)? {
+        join_instances_nominal(t_ref, s_ref, ctx, resolver)?
+    } else {
+        join_instances_nominal(s_ref, t_ref, ctx, resolver)?
+    };
+    Some(match result_ref {
+        // Left/Right never escape via_supertype (Left -> Ancestor(base)
+        // inside via_supertype). The top-level call only produces
+        // Ancestor/Object after the t==s early return.
+        JoinResult::Left => SetOpResult::SameS,
+        JoinResult::Ancestor(fullname) => SetOpResult::Ancestor(fullname),
+        JoinResult::Object => SetOpResult::Object,
+    })
+}
+
+/// Outcome of the nominal Instance-Instance join, relative to the
+/// (left, right) args of the recursive call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum JoinResult {
+    /// The result is `left` (the first arg). Only produced by the
+    /// `t == s` base case; `join_instances_via_supertype` converts
+    /// it to `Ancestor(base)` before propagating.
+    Left,
+    /// The result is a common ancestor neither arg.
+    Ancestor(String),
+    /// The result is `builtins.object`.
+    Object,
+}
+
+/// `InstanceJoiner.join_instances` (join.py:107-202) for args-less
+/// instances. Same-type -> Left; t<:s -> via_supertype(t, s); else ->
+/// via_supertype(s, t). The recursion mirrors Python's
+/// `seen_instances` guard implicitly: args-less instances have no
+/// type-arg recursion, so the only cycle is structural (A's base is A),
+/// which the `left_ref == right_ref` fast path short-circuits.
+fn join_instances_nominal(
+    t_ref: &str,
+    s_ref: &str,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<JoinResult> {
+    if t_ref == s_ref {
+        return Some(JoinResult::Left);
+    }
+    let t = Type::Instance {
+        type_ref: t_ref.to_string(),
+        args: vec![],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let s = Type::Instance {
+        type_ref: s_ref.to_string(),
+        args: vec![],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    if is_subtype(&t, &s, ctx, resolver)? {
+        join_instances_via_supertype(t_ref, s_ref, ctx, resolver)
+    } else {
+        join_instances_via_supertype(s_ref, t_ref, ctx, resolver)
+    }
+}
+
+/// `InstanceJoiner.join_instances_via_supertype` (join.py:204-240),
+/// args-less subset. Finds the common ancestor of `left_ref` and
+/// `right_ref` by walking `left`'s bases and recursing
+/// `join_instances(base, right)`. Returns the best (longest MRO)
+/// candidate as a `JoinResult` relative to (left, right): if the
+/// recursion returns Left, the base is the result (Ancestor(base));
+/// if Right, right_ref is the result (Right).
+fn join_instances_via_supertype(
+    left_ref: &str,
+    right_ref: &str,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<JoinResult> {
+    let left_snap = resolver.get(left_ref)?;
+    // join.py:221-226: collect base type_refs from left's bases.
+    let mut base_refs: Vec<String> = Vec::new();
+    for base_blob in &left_snap.bases {
+        let base = decode_type(base_blob)?;
+        if let Type::Instance { type_ref, .. } = &base {
+            base_refs.push(type_ref.clone());
+        } else {
+            // Non-Instance base (e.g. ParamSpec): defer.
+            return None;
+        }
+    }
+    // join.py:228-234: for each base, recurse and pick the best.
+    let mut best: Option<(JoinResult, usize)> = None;
+    for base_ref in &base_refs {
+        let candidate = join_instances_nominal(base_ref, right_ref, ctx, resolver)?;
+        // Convert the recursive result (relative to base, right) to
+        // relative to (left, right): Left means base won -> Ancestor(base);
+        // Ancestor/Object pass through unchanged.
+        let mapped = match candidate {
+            JoinResult::Left => JoinResult::Ancestor(base_ref.clone()),
+            other => other,
+        };
+        let mro = mro_len(base_ref, resolver);
+        match &best {
+            None => best = Some((mapped, mro)),
+            Some((_, best_mro)) if mro > *best_mro => best = Some((mapped, mro)),
+            _ => {}
+        }
+    }
+    match best {
+        Some((result, _)) => Some(result),
+        // No bases: if left is builtins.object, return Object. Else
+        // defer (Python asserts best is not None when bases non-empty).
+        None => {
+            if left_ref == "builtins.object" {
+                Some(JoinResult::Object)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// MRO length for `is_better` (join.py:804+). Returns 0 if the
+/// TypeInfo is missing (treated as shortest; loses the is_better tie).
+fn mro_len(type_ref: &str, resolver: &TypeResolver) -> usize {
+    resolver.get(type_ref).map_or(0, |s| s.mro.len())
 }
 
 /// `#[pyfunction]` entry for `trivial_join`. The Python-side shim
@@ -288,7 +476,7 @@ pub(crate) fn rust_trivial_join(
         false,
         strict_optional,
     );
-    trivial_join(&s, &t, &ctx, resolver.resolver()).map(discriminator)
+    trivial_join(&s, &t, &ctx, resolver.resolver()).map(discriminator_trivial)
 }
 
 /// `#[pyfunction]` entry for `trivial_meet`. Mirrors
@@ -315,15 +503,15 @@ pub(crate) fn rust_trivial_meet(
         false,
         strict_optional,
     );
-    trivial_meet(&s, &t, &ctx, resolver.resolver()).map(discriminator)
+    trivial_meet(&s, &t, &ctx, resolver.resolver()).map(discriminator_trivial)
 }
 
 /// `#[pyfunction]` entry for `join_types`. The Python-side shim
 /// (mypy/join.py) calls this after `get_proper_type` expansion with
 /// serialized `s`/`t` blobs plus the `NativeTypeResolver` pyclass.
 /// Returns `None` (Python `None`) when Rust doesn't handle the case;
-/// `Some(i64)` discriminator otherwise (0=SameS, 1=SameT, 2=Object,
-/// 3=Bottom, 4=Any).
+/// `Some((disc, fullname))` otherwise. `disc` is 0=SameS, 1=SameT,
+/// 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_join_types(
@@ -331,24 +519,39 @@ pub(crate) fn rust_join_types(
     t_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
-) -> Option<i64> {
+) -> Option<(i64, Option<String>)> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
-    // join_types leaf visitors only read `strict_optional`; the other
-    // SubtypeContext flags affect the is_subtype recursion used by
-    // trivial_join/trivial_meet, not the leaf visitors ported here.
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     join_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
-/// Map `SetOpResult` to the Python-side discriminator integer.
-fn discriminator(r: SetOpResult) -> i64 {
+/// Map `SetOpResult` to the Python-side discriminator integer plus
+/// an optional ancestor fullname (discriminator 5). The Python shim
+/// unpacks `(disc, fullname)` and constructs the Instance from the
+/// fullname -> TypeInfo map when `disc == 5`.
+fn discriminator(r: SetOpResult) -> (i64, Option<String>) {
+    match r {
+        SetOpResult::SameS => (0, None),
+        SetOpResult::SameT => (1, None),
+        SetOpResult::Object => (2, None),
+        SetOpResult::Bottom => (3, None),
+        SetOpResult::Any => (4, None),
+        SetOpResult::Ancestor(fullname) => (5, Some(fullname)),
+    }
+}
+
+/// `trivial_join`/`trivial_meet` only produce SameS/SameT/Object/Bottom
+/// (never Any or Ancestor), so they return a plain `i64` discriminator.
+fn discriminator_trivial(r: SetOpResult) -> i64 {
     match r {
         SetOpResult::SameS => 0,
         SetOpResult::SameT => 1,
         SetOpResult::Object => 2,
         SetOpResult::Bottom => 3,
-        SetOpResult::Any => 4,
+        SetOpResult::Any | SetOpResult::Ancestor(_) => {
+            unreachable!("trivial_join/trivial_meet never produce Any/Ancestor")
+        }
     }
 }
 
@@ -527,11 +730,15 @@ mod tests {
 
     #[test]
     fn discriminator_maps_variants() {
-        assert_eq!(discriminator(SetOpResult::SameS), 0);
-        assert_eq!(discriminator(SetOpResult::SameT), 1);
-        assert_eq!(discriminator(SetOpResult::Object), 2);
-        assert_eq!(discriminator(SetOpResult::Bottom), 3);
-        assert_eq!(discriminator(SetOpResult::Any), 4);
+        assert_eq!(discriminator(SetOpResult::SameS), (0, None));
+        assert_eq!(discriminator(SetOpResult::SameT), (1, None));
+        assert_eq!(discriminator(SetOpResult::Object), (2, None));
+        assert_eq!(discriminator(SetOpResult::Bottom), (3, None));
+        assert_eq!(discriminator(SetOpResult::Any), (4, None));
+        assert_eq!(
+            discriminator(SetOpResult::Ancestor("a.C".to_string())),
+            (5, Some("a.C".to_string()))
+        );
     }
 
     fn any_type() -> Type {
@@ -681,5 +888,109 @@ mod tests {
         // callable t.
         let t = Type::NoneType;
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    // ---- visit_instance nominal join (M8f) ----
+
+    fn snap_with_bases(fullname: &str, name: &str, base_refs: &[&str]) -> TypeInfoSnapshot {
+        let mut s = snap(fullname, name);
+        let mut bases = Vec::new();
+        for base_ref in base_refs {
+            bases.push(crate::wire::encode_instance_simple_for_test(base_ref));
+            s.has_base.insert((*base_ref).to_string());
+            s.mro.push((*base_ref).to_string());
+        }
+        s.bases = bases;
+        s
+    }
+
+    #[test]
+    fn visit_instance_same_type_returns_s() {
+        // join.py:114: t.type == s.type, no args -> SameS.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.A", vec![]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn visit_instance_direct_subtype_returns_supertype() {
+        // B <: A -> join(A, B): s=A, t=B. is_subtype(B, A)=true ->
+        // join_instances_nominal(B, A) -> via_supertype(B, A).
+        // B's bases=[A]. join_instances_nominal(A, A) -> Left.
+        // Mapped: Left -> Ancestor("a.A") (the base is the common
+        // ancestor, which equals original s=A).
+        let a = snap("a.A", "A");
+        let b = snap_with_bases("a.B", "B", &["a.A"]);
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.A", vec![]);
+        let t = instance("a.B", vec![]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("a.A".to_string()))
+        );
+    }
+
+    #[test]
+    fn visit_instance_common_ancestor_returns_ancestor() {
+        // D <: C, E <: C, D not <: E, E not <: D.
+        // join(D, E): t=D, s=E. is_subtype(D, E)=false ->
+        // via_supertype(E, D). E's bases=[C].
+        // join_instances_nominal(C, D): C != D, is_subtype(C, D)=false
+        // -> via_supertype(D, C). D's bases=[C].
+        // join_instances_nominal(C, C) -> SameS (Ancestor(C)).
+        // The best candidate is C -> Ancestor("a.C").
+        let c = snap("a.C", "C");
+        let d = snap_with_bases("a.D", "D", &["a.C"]);
+        let e = snap_with_bases("a.E", "E", &["a.C"]);
+        let r = make_resolver(vec![c, d, e]);
+        let s = instance("a.D", vec![]);
+        let t = instance("a.E", vec![]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Ancestor("a.C".to_string()))
+        );
+    }
+
+    #[test]
+    fn visit_instance_unrelated_returns_object() {
+        // D and E unrelated (no common base in resolver) ->
+        // via_supertype bottoms out at builtins.object -> Object.
+        let d = snap("a.D", "D");
+        let e = snap("a.E", "E");
+        let r = make_resolver(vec![d, e]);
+        let s = instance("a.D", vec![]);
+        let t = instance("a.E", vec![]);
+        // No bases on either -> join_instances_via_supertype returns
+        // None (defer) since bases is empty and neither is object.
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn visit_instance_args_defers() {
+        // Instance with args -> defer (needs type-arg join).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![any_type()]);
+        let t = instance("a.A", vec![]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn visit_instance_s_not_instance_defers() {
+        // s is AnyType, t is Instance -> the visit_instance Instance
+        // branch requires s to be Instance; AnyType s falls to the
+        // else branch (join.py:453 default). But AnyType s is caught
+        // by the AnyType short-circuit BEFORE visit_join. So this test
+        // uses UnboundType s (not AnyType, not Instance).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = Type::UnboundType {
+            name: "X".to_string(),
+            args: vec![],
+            original_str_expr: None,
+            original_str_fallback: None,
+        };
+        let t = instance("a.A", vec![]);
+        // visit_instance with s=UnboundType -> not Instance -> defer.
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 }

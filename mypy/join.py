@@ -74,12 +74,23 @@ except ImportError:
 # `_native_join_resolver` is None, the shim falls through to Python.
 _native_join_active: bool = False
 _native_join_resolver: Any = None
+# fullname -> TypeInfo map, set alongside the resolver. Used to
+# construct `Instance(typeinfo, [])` when the Rust visit_instance
+# nominal join returns discriminator 5 (Ancestor). Built from the
+# same TypeInfo list passed to `build_native_resolver`.
+_native_join_typeinfo_map: dict[str, Any] | None = None
 
 
 def _set_native_join_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust join path."""
     global _native_join_active
     _native_join_active = active
+
+
+def _set_native_join_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
+    """Install the fullname -> TypeInfo map for the Ancestor result."""
+    global _native_join_typeinfo_map
+    _native_join_typeinfo_map = typeinfo_map
 
 
 def _set_native_join_resolver(resolver: Any) -> None:
@@ -308,14 +319,16 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
         s = mypy.typeops.true_or_false(s)
         t = mypy.typeops.true_or_false(t)
 
-    # Stage 3c (M8e): try the Rust join_types pre-dispatch + leaf
-    # visitors. Rust handles the UnionType swap, AnyType/NoneType/
-    # UninhabitedType/DeletedType short-circuits, and the leaf
-    # TypeJoinVisitor cases that don't recurse (Any/None/Uninhabited/
-    # Deleted right). Returns a discriminator (0=SameS, 1=SameT,
-    # 2=Object, 3=Bottom, 4=Any) or None (defer to Python, e.g. for
-    # Instance/Union/CallableType right or normalize_callables).
-    # Mirrors the erasetype.py:80-86 strangler-fig contract.
+    # Stage 3c (M8e/M8f): try the Rust join_types pre-dispatch + leaf
+    # visitors + Instance-Instance nominal join. Rust handles the
+    # UnionType swap, AnyType/NoneType/UninhabitedType/DeletedType
+    # short-circuits, the leaf TypeJoinVisitor cases that don't
+    # recurse, and the args-less Instance-Instance nominal join
+    # (same-type, direct-subtype, common-ancestor via bases walk).
+    # Returns (disc, fullname) where disc is 0=SameS, 1=SameT,
+    # 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set), or None
+    # (defer to Python). Mirrors the erasetype.py:80-86 strangler-fig
+    # contract.
     if (
         _HAS_TYPE_KERNEL
         and _native_join_active
@@ -328,16 +341,24 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
             _native_join_resolver,
         )
         if result is not None:
-            if result == 0:
+            disc, fullname = result
+            if disc == 0:
                 return s
-            elif result == 1:
+            elif disc == 1:
                 return t
-            elif result == 2:
+            elif disc == 2:
                 return object_or_any_from_type(get_proper_type(t))
-            elif result == 3:
+            elif disc == 3:
                 return UninhabitedType() if state.strict_optional else NoneType()
-            elif result == 4:
+            elif disc == 4:
                 return AnyType(TypeOfAny.special_form)
+            elif disc == 5:
+                # Ancestor: construct Instance(typeinfo, []) from the
+                # fullname -> TypeInfo map. If the map is missing or the
+                # fullname is not in it, defer to Python.
+                if _native_join_typeinfo_map is not None and fullname in _native_join_typeinfo_map:
+                    return Instance(_native_join_typeinfo_map[fullname], [])
+                # Fall through to Python.
         # Rust returned None (unsupported case) — fall through to Python.
 
     if isinstance(s, UnionType) and not isinstance(t, UnionType):
