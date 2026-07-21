@@ -77,6 +77,52 @@ from mypy.types_utils import flatten_types
 from mypy.typestate import SubtypeKind, type_state
 from mypy.typevars import fill_typevars, fill_typevars_with_any
 
+# Stage 3c (M8b) type-kernel seam: when type_kernel is importable,
+# native_type_kernel is set, and a resolver is installed, the nominal
+# is_subtype path routes through Rust. Rust returns None for unhandled.
+try:
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag + resolver, set by the build manager from
+# `Options.native_type_kernel` at the start of each build. The hot path
+# reads these without an options lookup per call. When `_native_subtype_active`
+# is True but `_native_subtype_resolver` is None, the shim falls through to
+# Python (the resolver isn't wired yet, e.g. in tests that only set the flag).
+_native_subtype_active: bool = False
+_native_subtype_resolver: Any = None
+
+
+def _set_native_subtype_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust subtype path."""
+    global _native_subtype_active
+    _native_subtype_active = active
+
+
+def _set_native_subtype_resolver(resolver: Any) -> None:
+    """Install the `NativeTypeResolver` pyclass for the Rust subtype path.
+
+    Called by the build manager (or the parity test suite) after building
+    the resolver from the live TypeInfo graph. Pass `None` to clear.
+    """
+    global _native_subtype_resolver
+    _native_subtype_resolver = resolver
+
+
+def _serialize_type(t: Type) -> bytes:
+    """Serialize a `Type` to its wire-format bytes for the Rust reader."""
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
 # Flags for detected protocol members
 IS_SETTABLE: Final = 1
 IS_CLASSVAR: Final = 2
@@ -372,6 +418,35 @@ def _is_subtype(
                 return True
         elif all(is_subtype(orig_left, v, subtype_context=subtype_context) for v in right.values):
             return True
+
+    # Stage 3c (M8b): try the Rust nominal-instance path. By this point
+    # `left`/`right` are proper types and the AnyType/UnionType/
+    # TypeVarType-with-values right short-circuits have fired, matching
+    # the Rust `is_subtype` contract. Rust returns `None` for any case
+    # it does not handle (generics needing `expand_type_by_instance`,
+    # protocols, tuples, callables, etc.); we then fall through to
+    # `SubtypeVisitor`. Mirrors `erasetype.py:80-86`.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+        and not subtype_context.erase_instances
+        and not subtype_context.keep_erased_types
+    ):
+        result = _type_kernel.rust_is_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            subtype_context.ignore_type_params,
+            subtype_context.ignore_declared_variance,
+            subtype_context.always_covariant,
+            subtype_context.ignore_promotions,
+            proper_subtype,
+            state.strict_optional,
+            _native_subtype_resolver,
+        )
+        if result is not None:
+            return result
+        # Rust returned None (unsupported case) — fall through to Python.
 
     return left.accept(SubtypeVisitor(orig_right, subtype_context, proper_subtype))
 

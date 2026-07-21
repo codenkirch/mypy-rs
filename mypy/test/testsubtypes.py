@@ -1,10 +1,26 @@
 from __future__ import annotations
 
+import os
+from unittest import skipUnless
+
 from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT
 from mypy.subtypes import is_subtype
 from mypy.test.helpers import Suite
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.types import Instance, TupleType, Type, UninhabitedType, UnpackType
+
+# Stage 3c (M8b) parity suite: reruns the nominal-instance subtype cases
+# with the Rust is_subtype path active. Rust handles nominal cases and
+# falls through to Python on the rest, so results must match. Gated.
+try:
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL
 
 
 class SubtypingSuite(Suite):
@@ -304,3 +320,88 @@ class SubtypingSuite(Suite):
     def assert_unrelated(self, s: Type, t: Type) -> None:
         self.assert_not_subtype(s, t)
         self.assert_not_subtype(t, s)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSubtypeSuite(Suite):
+    """Parity suite for the Rust nominal-instance `is_subtype` (Stage 3c M8b).
+
+    Reruns the nominal-instance cases from `SubtypingSuite` with the Rust
+    path active. The Rust path handles non-generic nominal subtyping and
+    same-type arg checks; it returns `None` (fall through to Python) for
+    generics needing `map_instance_to_supertype` substitution, protocols,
+    tuples, callables, etc. Because the Python fallback runs when Rust
+    returns `None`, every assertion must match the pure-Python result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        # Build the resolver from the fixture's TypeInfos so the Rust
+        # path can look up `has_base`, `mro`, `type_vars_with_variance`.
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list:
+        # The fixture stores TypeInfo objects on its `*i` attributes.
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_trivial_cases(self) -> None:
+        for simple in self.fx.a, self.fx.o, self.fx.b:
+            assert is_subtype(simple, simple), f"{simple} not subtype of {simple}"
+
+    def test_instance_subtyping(self) -> None:
+        # B <: A (nominal, non-generic): Rust handles this.
+        assert is_subtype(self.fx.b, self.fx.a)
+        assert is_subtype(self.fx.a, self.fx.o)
+        assert is_subtype(self.fx.b, self.fx.o)
+        # A not <: D, B not <: C: Rust returns False (not protocol).
+        assert not is_subtype(self.fx.a, self.fx.d)
+        assert not is_subtype(self.fx.b, self.fx.c)
+
+    def test_same_type_no_args_is_subtype(self) -> None:
+        # A <: A, object <: object: Rust handles same-type, no args.
+        assert is_subtype(self.fx.a, self.fx.a)
+        assert is_subtype(self.fx.o, self.fx.o)
+
+    def test_generic_same_type_same_args(self) -> None:
+        # G[A] <: G[A] (same type, same args): Rust handles the
+        # same-type fast path (no map_instance_to_supertype needed).
+        assert is_subtype(self.fx.ga, self.fx.ga)
+        assert is_subtype(self.fx.hab, self.fx.hab)
+
+    def test_generic_different_args_invariant_not_subtype(self) -> None:
+        # G[A] not <: G[B] (invariant): Rust handles same-type arg check.
+        assert not is_subtype(self.fx.ga, self.fx.gb)
+        assert not is_subtype(self.fx.gb, self.fx.ga)
+
+    def test_generic_substitution_falls_through(self) -> None:
+        # GS[A, B] <: G[B] needs map_instance_to_supertype (generic
+        # substitution). Rust returns None, Python falls through and
+        # computes the correct result. This proves the strangler-fig
+        # contract: Rust's `None` doesn't change the answer.
+        assert is_subtype(self.fx.gsab, self.fx.gb)
+        assert not is_subtype(self.fx.gsab, self.fx.ga)
+
+
+def _is_type_info(value: object) -> bool:
+    """True if `value` is a `mypy.nodes.TypeInfo` instance."""
+    from mypy.nodes import TypeInfo
+
+    return isinstance(value, TypeInfo)

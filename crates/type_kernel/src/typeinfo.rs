@@ -736,6 +736,12 @@ impl NativeTypeResolver {
         }
     }
 
+    /// Borrow the inner `TypeResolver` so Stage 3c `is_subtype` can look
+    /// up `TypeInfoSnapshot`s without FFI. Used by `subtypes::rust_is_subtype`.
+    pub(crate) fn resolver(&self) -> &TypeResolver {
+        &self.resolver
+    }
+
     /// Borrow the snapshots for the dict-view builder. Returns an iterator
     /// of `(fullname, &TypeInfoSnapshot)`.
     fn resolver_snapshots_for_render(

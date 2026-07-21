@@ -891,6 +891,12 @@ class BuildManager:
         from mypy.erasetype import _set_native_erase_active
 
         _set_native_erase_active(self.options.native_type_kernel)
+        # Stage 3c (M8b): also gate the nominal-instance `is_subtype` path.
+        # The resolver is installed separately (by the parity suite for M8b;
+        # production wiring lands when `native_type_kernel` defaults on).
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(self.options.native_type_kernel)
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()
