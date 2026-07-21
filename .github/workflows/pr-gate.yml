@@ -1,0 +1,81 @@
+name: pr-gate
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: cargo build --workspace
+        run: cargo build --workspace --locked
+
+      - name: cargo fmt --check (type_kernel)
+        run: cargo fmt -p mypy-type-kernel -- --check
+
+      - name: cargo clippy (type_kernel lib)
+        run: cargo clippy -p mypy-type-kernel --lib -- -D warnings
+
+      - name: cargo test (pure-Rust type_kernel suites)
+        run: cargo test -p mypy-type-kernel
+
+      - name: Build type_kernel extension
+        run: |
+          SCRATCH=/tmp/type-kernel-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-type-kernel --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          # cargo emits libtype_kernel.so (Linux) / .dylib (macOS); Python's
+          # import machinery wants the EXT_SUFFIX name, so rename on copy.
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Python parity (NativeTypeWire + Resolver suites)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+        run: uv run python -m pytest mypy/test/testtypes.py -q
+
+      - name: Python subtypes baseline (pre-Stage-3c)
+        run: uv run python -m pytest mypy/test/testsubtypes.py -q

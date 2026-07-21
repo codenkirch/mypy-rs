@@ -144,9 +144,7 @@ fn read_bool_attr(obj: &PyAny, attr: &str) -> Option<bool> {
 
 /// Read a `str` attribute, or `None` on failure.
 fn read_str_attr(obj: &PyAny, attr: &str) -> Option<String> {
-    obj.getattr(attr)
-        .and_then(|v| v.extract::<String>())
-        .ok()
+    obj.getattr(attr).and_then(|v| v.extract::<String>()).ok()
 }
 
 /// Read an `Option[Instance]` attribute as the Instance's `type.fullname`
@@ -158,7 +156,10 @@ fn read_opt_instance_fullname(obj: &PyAny, attr: &str) -> Option<String> {
     }
     // `Instance.type` is the TypeInfo; read its `fullname`.
     let type_info = value.getattr("type").ok()?;
-    type_info.getattr("fullname").and_then(|f| f.extract::<String>()).ok()
+    type_info
+        .getattr("fullname")
+        .and_then(|f| f.extract::<String>())
+        .ok()
 }
 
 /// Read a `list[TypeInfo]` attribute as a Vec of fullname strings.
@@ -248,10 +249,7 @@ fn read_promote_bytes(py: Python<'_>, obj: &PyAny) -> Vec<Vec<u8>> {
 /// builds for the items that succeeded), mirroring the strangler-fig
 /// degrade-gracefully pattern from `erase::erase_type`.
 #[pyfunction]
-pub(crate) fn build_resolver(
-    py: Python<'_>,
-    type_infos: &PyAny,
-) -> PyResult<PyObject> {
+pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyObject> {
     let result = PyDict::new(py);
     let iter = type_infos.iter()?;
     for item in iter {
@@ -263,16 +261,15 @@ pub(crate) fn build_resolver(
         let name = read_str_attr(item, "name").unwrap_or_else(|| {
             // `name` is `defn.name`; if missing, fall back to the last
             // component of `fullname`.
-            fullname
-                .rsplit('.')
-                .next()
-                .unwrap_or(&fullname)
-                .to_owned()
+            fullname.rsplit('.').next().unwrap_or(&fullname).to_owned()
         });
         let snap_dict = PyDict::new(py);
         snap_dict.set_item("fullname", &fullname)?;
         snap_dict.set_item("name", &name)?;
-        snap_dict.set_item("is_protocol", read_bool_attr(item, "is_protocol").unwrap_or(false))?;
+        snap_dict.set_item(
+            "is_protocol",
+            read_bool_attr(item, "is_protocol").unwrap_or(false),
+        )?;
         snap_dict.set_item("is_enum", read_bool_attr(item, "is_enum").unwrap_or(false))?;
         snap_dict.set_item(
             "fallback_to_any",
@@ -333,9 +330,7 @@ pub(crate) fn build_resolver(
         let promote = read_promote_bytes(py, item);
         let py_promote = PyList::new(
             py,
-            promote
-                .iter()
-                .map(|b| PyBytes::new(py, b).to_object(py)),
+            promote.iter().map(|b| PyBytes::new(py, b).to_object(py)),
         );
         snap_dict.set_item("promote_bytes", py_promote)?;
 
@@ -356,22 +351,11 @@ pub(crate) fn build_resolver(
 /// `name` / `has_type_var_tuple_type` / `type_vars` fields we need for
 /// rendering. Returns `None` if the fullname is not in the resolver or
 /// the fields cannot be read.
-fn lookup_render_fields(
-    resolver: &PyDict,
-    fullname: &str,
-) -> Option<RenderFields> {
+fn lookup_render_fields(resolver: &PyDict, fullname: &str) -> Option<RenderFields> {
     let snap = resolver.get_item(fullname).ok()??;
     let snap_dict = snap.downcast::<PyDict>().ok()?;
-    let name: String = snap_dict
-        .get_item("name")
-        .ok()??
-        .extract()
-        .ok()?;
-    let is_enum: bool = snap_dict
-        .get_item("is_enum")
-        .ok()??
-        .extract()
-        .ok()?;
+    let name: String = snap_dict.get_item("name").ok()??.extract().ok()?;
+    let is_enum: bool = snap_dict.get_item("is_enum").ok()??.extract().ok()?;
     let has_tvt: bool = snap_dict
         .get_item("has_type_var_tuple_type")
         .ok()??
@@ -409,11 +393,7 @@ struct RenderFields {
 /// consult the resolver to (a) strip the `builtins.` prefix on Instance,
 /// (b) apply the `[()]` variadic-tuple branch, (c) render enum-literal and
 /// bytes-literal `value_repr`. All other variants delegate to `Display`.
-pub(crate) fn render_type(
-    py: Python<'_>,
-    t: &Type,
-    resolver: Option<&PyDict>,
-) -> String {
+pub(crate) fn render_type(py: Python<'_>, t: &Type, resolver: Option<&PyDict>) -> String {
     let Some(resolver) = resolver else {
         return t.to_string();
     };
@@ -424,9 +404,7 @@ pub(crate) fn render_type(
             last_known_value,
             ..
         } => render_instance(py, type_ref, args, last_known_value.as_deref(), resolver),
-        Type::LiteralType { fallback, value } => {
-            render_literal(fallback, value, resolver)
-        }
+        Type::LiteralType { fallback, value } => render_literal(fallback, value, resolver),
         _ => t.to_string(),
     }
 }
@@ -509,11 +487,7 @@ fn render_instance(
 /// - enum literal: `f"{fallback_name}.{self.value}"`.
 /// - `fallback_name == "builtins.bytes"`: `"b" + repr(self.value)`.
 /// - else: `repr(self.value)` (the existing `LiteralValue::Display`).
-fn render_literal(
-    fallback: &Type,
-    value: &LiteralValue,
-    resolver: &PyDict,
-) -> String {
+fn render_literal(fallback: &Type, value: &LiteralValue, resolver: &PyDict) -> String {
     // Extract the fallback's type_ref (the Instance fullname).
     let fallback_ref = match fallback {
         Type::Instance { type_ref, .. } => Some(type_ref.as_str()),
@@ -784,8 +758,7 @@ mod tests {
         };
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let resolver_obj =
-                make_resolver_dict(py, &[snap_enum("my.Color", "Color")]);
+            let resolver_obj = make_resolver_dict(py, &[snap_enum("my.Color", "Color")]);
             let resolver = resolver_obj.downcast::<PyDict>(py).unwrap();
             let rendered = render_type(py, &t, Some(resolver));
             assert_eq!(rendered, "Literal[my.Color.RED]");
@@ -806,8 +779,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             // Resolver has builtins.bytes but is_enum=False.
-            let resolver_obj =
-                make_resolver_dict(py, &[snap("builtins.bytes", "bytes")]);
+            let resolver_obj = make_resolver_dict(py, &[snap("builtins.bytes", "bytes")]);
             let resolver = resolver_obj.downcast::<PyDict>(py).unwrap();
             let rendered = render_type(py, &t, Some(resolver));
             // bytes path: "b" + repr(value). repr("x") == "'x'", so "b'x'".
@@ -828,8 +800,7 @@ mod tests {
         };
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let resolver_obj =
-                make_resolver_dict(py, &[snap("builtins.int", "int")]);
+            let resolver_obj = make_resolver_dict(py, &[snap("builtins.int", "int")]);
             let resolver = resolver_obj.downcast::<PyDict>(py).unwrap();
             let rendered = render_type(py, &t, Some(resolver));
             assert_eq!(rendered, "Literal[1]");
@@ -870,8 +841,7 @@ mod tests {
         };
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let resolver_obj =
-                make_resolver_dict(py, &[snap("builtins.tuple", "tuple")]);
+            let resolver_obj = make_resolver_dict(py, &[snap("builtins.tuple", "tuple")]);
             let resolver = resolver_obj.downcast::<PyDict>(py).unwrap();
             let rendered = render_type(py, &t, Some(resolver));
             assert_eq!(rendered, "tuple[Any, ...]");
