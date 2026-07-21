@@ -468,12 +468,107 @@ fn visit_meet(
         // visit_instance (meet.py:913-996), args-less nominal subset.
         Type::Instance { .. } => visit_instance_meet(s, t, ctx, resolver),
 
-        // Full visitors (union, callable, type_var, typeddict, tuple,
-        // literal, type_type, paramspec, typevartuple, parameters,
-        // overloaded) — deferred. The both-FunctionLike and both-Union
-        // cases are already deferred by meet_types pre-dispatch. The
-        // remaining cases (s non-callable, t callable-like; s
-        // non-union, t union after swap) reach here and defer.
+        // visit_type_var (meet.py:878-884), case 1 same-id-same-bound
+        // only. Case 1 (s is TypeVarType, s.id==t.id,
+        // s.upper_bound==t.upper_bound) returns self.s -> SameS. The
+        // copy_modified branch (upper_bounds differ) produces a new
+        // TypeVarType -> defer. The else (s not TypeVarType or
+        // different id) -> default(self.s) -> Bottom.
+        //
+        // TypeVarId.__eq__ (types.py:567-577) checks raw_id,
+        // meta_level, namespace. Wire format omits meta_level
+        // (types.py:739-740, 752); meta variables don't cross FFI.
+        // raw_id + namespace equality matches wire-roundtrip semantics.
+        Type::TypeVarType {
+            raw_id: t_raw,
+            namespace: t_ns,
+            upper_bound: t_ub,
+            ..
+        } => {
+            if let Type::TypeVarType {
+                raw_id: s_raw,
+                namespace: s_ns,
+                upper_bound: s_ub,
+                ..
+            } = s
+            {
+                if s_raw == t_raw && s_ns == t_ns {
+                    if s_ub == t_ub {
+                        return Some(SetOpResult::SameS);
+                    }
+                    // Different upper_bound: copy_modified ->
+                    // defer (no encoder).
+                    return None;
+                }
+            }
+            // s not TypeVarType or different id -> default -> Bottom.
+            Some(SetOpResult::Bottom)
+        }
+
+        // visit_literal_type (meet.py:1236-1242). Case 1 (s is
+        // LiteralType, s==t) -> return t (SameT). Case 2 (s is
+        // Instance, is_subtype(t.fallback, s)) -> return t (SameT).
+        // Else -> default(self.s) -> Bottom.
+        //
+        // LiteralType.__eq__ (types.py:3361-3363) compares value AND
+        // fallback. The Type enum derives PartialEq, so s == t is
+        // structural equality over the LiteralType variant (fallback +
+        // value). This matches Python's s == t exactly.
+        Type::LiteralType { .. } => {
+            if let Type::LiteralType { .. } = s {
+                if s == t {
+                    return Some(SetOpResult::SameT);
+                }
+                // s is LiteralType but s != t -> default -> Bottom.
+                return Some(SetOpResult::Bottom);
+            }
+            if let Type::Instance { .. } = s {
+                // Case 2: is_subtype(t.fallback, s). t.fallback is
+                // the LiteralType's fallback Instance. Extract it and
+                // check. is_subtype returns None for unsupported
+                // (non-Instance) -> defer conservatively.
+                if let Type::LiteralType { fallback, .. } = t {
+                    if let Some(true) = is_subtype(fallback, s, ctx, resolver) {
+                        return Some(SetOpResult::SameT);
+                    }
+                    // is_subtype False or None. False -> Bottom
+                    // (default). None -> defer (can't decide).
+                    if let Some(false) = is_subtype(fallback, s, ctx, resolver) {
+                        return Some(SetOpResult::Bottom);
+                    }
+                    return None;
+                }
+            }
+            // s is not LiteralType or Instance -> default -> Bottom.
+            Some(SetOpResult::Bottom)
+        }
+
+        // visit_type_type (meet.py:1248-1261), case 2 only. Case 1
+        // (both TypeType) recurses + make_normalized -> defer. Case 3
+        // (CallableType) recurses -> defer. Case 2 (s is
+        // Instance(builtins.type)) -> return t (SameT). Else ->
+        // default -> Bottom.
+        Type::TypeType { .. } => {
+            if let Type::Instance { type_ref, .. } = s {
+                if type_ref == "builtins.type" {
+                    return Some(SetOpResult::SameT);
+                }
+            }
+            if matches!(s, Type::TypeType { .. } | Type::CallableType { .. }) {
+                // Case 1 (both TypeType) + case 3 (CallableType):
+                // recursive meet -> defer.
+                return None;
+            }
+            // Else -> default -> Bottom.
+            Some(SetOpResult::Bottom)
+        }
+
+        // Full visitors (union, callable, typeddict, tuple,
+        // paramspec, typevartuple, parameters, overloaded) — deferred.
+        // The both-FunctionLike and both-Union cases are already
+        // deferred by meet_types pre-dispatch. The remaining cases (s
+        // non-callable, t callable-like; s non-union, t union after
+        // swap) reach here and defer.
         _ => None,
     }
 }
@@ -3091,5 +3186,185 @@ mod tests {
             instance("builtins.int", vec![]),
         );
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    // ---- meet visit_type_var (M8q) ----
+    // Mirrors meet.py:878-884. Case 1 (same id + same upper_bound) ->
+    // SameS. copy_modified (different bound) -> defer. default (s not
+    // TypeVarType or different id) -> Bottom.
+
+    #[test]
+    fn meet_type_var_same_id_same_upper_bound_returns_s() {
+        // visit_type_var case 1 (meet.py:880-881): s.id == t.id,
+        // s.upper_bound == t.upper_bound -> return self.s (SameS).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let ub = instance("a.A", vec![]);
+        let s = type_var(1, "ns", ub.clone());
+        let t = type_var(1, "ns", ub);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_type_var_same_id_different_upper_bound_defers() {
+        // visit_type_var case 1, upper_bounds differ (meet.py:882):
+        // copy_modified(upper_bound=meet(...)) -> produces a new
+        // TypeVarType -> defer (no encoder).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = type_var(1, "ns", instance("a.A", vec![]));
+        let t = type_var(1, "ns", instance("a.B", vec![]));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_type_var_different_id_returns_bottom() {
+        // visit_type_var else (meet.py:883-884): s.id != t.id ->
+        // default(self.s) -> Bottom (strict).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let ub = instance("a.A", vec![]);
+        let s = type_var(1, "ns", ub.clone());
+        let t = type_var(2, "ns", ub);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_type_var_different_namespace_returns_bottom() {
+        // visit_type_var else: same raw_id, different namespace ->
+        // s.id != t.id (TypeVarId.__eq__ checks namespace) -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let ub = instance("a.A", vec![]);
+        let s = type_var(1, "ns1", ub.clone());
+        let t = type_var(1, "ns2", ub);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_type_var_s_not_type_var_returns_bottom() {
+        // visit_type_var else (meet.py:883-884): s is not TypeVarType
+        // -> default(self.s) -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = type_var(1, "ns", instance("a.A", vec![]));
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    // ---- meet visit_literal_type (M8q) ----
+    // Mirrors meet.py:1236-1242. Case 1 (s is LiteralType, s==t) ->
+    // SameT. Case 2 (s is Instance, is_subtype(t.fallback, s)) ->
+    // SameT. Else -> Bottom (default).
+
+    #[test]
+    fn meet_literal_equal_literal_returns_t() {
+        // visit_literal_type case 1 (meet.py:1237-1238): s is
+        // LiteralType, s == t -> return t (SameT).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = literal(LiteralValue::Int(1), "a.A");
+        let t = literal(LiteralValue::Int(1), "a.A");
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_literal_unequal_literal_returns_bottom() {
+        // visit_literal_type else (meet.py:1241-1242): s is LiteralType,
+        // s != t (different value) -> default -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = literal(LiteralValue::Int(1), "a.A");
+        let t = literal(LiteralValue::Int(2), "a.A");
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_literal_s_is_instance_fallback_subtype_returns_t() {
+        // visit_literal_type case 2 (meet.py:1239-1240): s is Instance,
+        // is_subtype(t.fallback, s) -> return t (SameT).
+        // t.fallback = a.B, s = a.A, B <: A -> is_subtype(B, A) = True.
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![a, b]);
+        let s = instance("a.A", vec![]);
+        let t = literal(LiteralValue::Int(1), "a.B");
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_literal_s_is_instance_fallback_not_subtype_returns_bottom() {
+        // visit_literal_type else (meet.py:1241-1242): s is Instance,
+        // is_subtype(t.fallback, s) = False -> default -> Bottom.
+        // t.fallback = a.B, s = a.A, B not <: A (unrelated).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = instance("a.A", vec![]);
+        let t = literal(LiteralValue::Int(1), "a.B");
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    // ---- meet visit_type_type (M8q) ----
+    // Mirrors meet.py:1248-1261. Case 2 (s is Instance(builtins.type))
+    // -> SameT. Case 1 (both TypeType) -> defer (recursive meet +
+    // make_normalized). Case 3 (CallableType) -> defer (recursive).
+    // Else -> Bottom (default).
+
+    #[test]
+    fn meet_type_type_s_is_builtins_type_returns_t() {
+        // visit_type_type case 2 (meet.py:1256-1257): s is
+        // Instance(builtins.type) -> return t (SameT).
+        let r = make_resolver(vec![snap("builtins.type", "type"), snap("a.A", "A")]);
+        let s = instance("builtins.type", vec![]);
+        let t = type_type("a.A");
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_type_type_both_type_type_defers() {
+        // visit_type_type case 1 (meet.py:1249-1255): s is TypeType ->
+        // meet(t.item, s.item) + make_normalized -> produces a new
+        // TypeType -> defer (no encoder).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = type_type("a.A");
+        let t = type_type("a.A");
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn meet_type_type_s_is_unrelated_instance_returns_bottom() {
+        // visit_type_type else (meet.py:1260-1261): s is Instance (not
+        // builtins.type) -> default(self.s) -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = type_type("a.A");
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_type_type_s_is_uninhabited_returns_bottom() {
+        // visit_type_type else: s is UninhabitedType -> default ->
+        // Bottom (strict). Note: UninhabitedType as s would normally
+        // be caught by visit_uninhabited_type if t were Uninhabited,
+        // but here t is TypeType so visit_type_type fires.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = Type::UninhabitedType;
+        let t = type_type("a.A");
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
     }
 }
