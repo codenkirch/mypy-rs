@@ -411,7 +411,7 @@ fn read_flags(buf: &mut ReadBuffer<'_>, num_flags: usize) -> Result<Vec<bool>, W
 /// A literal value as stored by `write_literal` (cache.py:347-364): the tag
 /// byte is already consumed by the caller (it was the discriminator), and
 /// this reads the body.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum LiteralValue {
     Int(i64),
@@ -438,7 +438,7 @@ fn read_literal(buf: &mut ReadBuffer<'_>, tag: u8) -> Result<LiteralValue, WireE
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.ExtraAttrs` — module-attribute summary attached to `Instance`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ExtraAttrs {
     pub attrs: HashMap<String, Type>,
@@ -448,7 +448,7 @@ pub(crate) struct ExtraAttrs {
 
 /// `mypy.types.Parameters` — a standalone parameter list (used by
 /// `ParamSpecType.prefix` and as the `PARAMETERS` tag).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct Parameters {
     pub arg_types: Vec<Type>,
@@ -466,7 +466,7 @@ pub(crate) struct Parameters {
 /// kept: they will be consumed by Stage 3b (`TypeInfo` snapshot) and 3c
 /// (`is_subtype`), and storing them now keeps the reader byte-exact against
 /// the Python wire format.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 // Variant names mirror mypy's `Type` subclasses (Instance, AnyType, NoneType,
 // ...) for direct cross-referencing with `mypy/types.py`. Clippy's
 // `enum_variant_names` lint would force renames that diverge from that
