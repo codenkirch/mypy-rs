@@ -465,6 +465,27 @@ fn visit_meet(
         // visit_erased_type (meet.py:875) is unreachable: ErasedType
         // has no wire-format variant.
 
+        // visit_unbound_type (meet.py:864-873). Three branches on s:
+        //   * NoneType + strict_optional -> UninhabitedType (Bottom).
+        //     Non-strict -> self.s (SameS).
+        //   * UninhabitedType -> self.s (SameS).
+        //   * else -> AnyType (Any). AnyType-s never reaches here (the
+        //     meet_types AnyType-s short-circuit at meet.py:145 returns
+        //     t before the visitor fires).
+        Type::UnboundType { .. } => {
+            if matches!(s, Type::NoneType) {
+                if ctx.strict_optional {
+                    Some(SetOpResult::Bottom)
+                } else {
+                    Some(SetOpResult::SameS)
+                }
+            } else if matches!(s, Type::UninhabitedType) {
+                Some(SetOpResult::SameS)
+            } else {
+                Some(SetOpResult::Any)
+            }
+        }
+
         // visit_instance (meet.py:913-996), args-less nominal subset.
         Type::Instance { .. } => visit_instance_meet(s, t, ctx, resolver),
 
@@ -502,6 +523,38 @@ fn visit_meet(
                 }
             }
             // s not TypeVarType or different id -> default -> Bottom.
+            Some(SetOpResult::Bottom)
+        }
+
+        // visit_type_var_tuple (meet.py:930-934). Same id (raw_id +
+        // namespace) -> `self.s if self.s.min_len > t.min_len else t`.
+        // Different id / s not TypeVarTupleType -> default(self.s) ->
+        // Bottom (strict) / NoneType (non-strict).
+        //
+        // TypeVarId.__eq__ (types.py:567-577) checks raw_id,
+        // meta_level, namespace; wire format omits meta_level (meta
+        // variables don't cross FFI), so raw_id + namespace equality
+        // matches wire-roundtrip semantics.
+        Type::TypeVarTupleType {
+            raw_id: t_raw,
+            namespace: t_ns,
+            min_len: t_min,
+            ..
+        } => {
+            if let Type::TypeVarTupleType {
+                raw_id: s_raw,
+                namespace: s_ns,
+                min_len: s_min,
+                ..
+            } = s
+            {
+                if s_raw == t_raw && s_ns == t_ns {
+                    if s_min > t_min {
+                        return Some(SetOpResult::SameS);
+                    }
+                    return Some(SetOpResult::SameT);
+                }
+            }
             Some(SetOpResult::Bottom)
         }
 
@@ -2048,6 +2101,38 @@ mod tests {
         }
     }
 
+    /// Minimal `UnboundType` for meet tests. `visit_unbound_type`
+    /// (meet.py:864-873) reads only `s`'s variant, so the name/args
+    /// fields are don't-cares for the meet decision.
+    fn unbound_type() -> Type {
+        Type::UnboundType {
+            name: "?".to_string(),
+            args: Vec::new(),
+            original_str_expr: None,
+            original_str_fallback: None,
+        }
+    }
+
+    /// Minimal `TypeVarTupleType` for meet tests. `visit_type_var_tuple`
+    /// (meet.py:930-934) compares `s.id == t.id` (raw_id + namespace,
+    /// mirroring `TypeVarId.__eq__`) then picks by `min_len`.
+    fn type_var_tuple(raw_id: i64, namespace: &str, min_len: i64) -> Type {
+        Type::TypeVarTupleType {
+            tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
+            name: "Ts".to_string(),
+            fullname: "Ts".to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            upper_bound: Box::new(instance("builtins.tuple", vec![])),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            min_len,
+        }
+    }
+
     #[test]
     fn join_type_type_with_builtins_type_instance_returns_s() {
         // visit_type_type case 2 (join.py:861-862): s is Instance with
@@ -3362,6 +3447,154 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = Type::UninhabitedType;
         let t = type_type("a.A");
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    // ---- meet visit_unbound_type (M8r) ----
+    // Mirrors meet.py:864-873. Three branches on s:
+    //   * NoneType, strict_optional -> UninhabitedType (Bottom).
+    //   * NoneType, non-strict -> self.s (SameS).
+    //   * UninhabitedType -> self.s (SameS).
+    //   * else -> AnyType (Any).
+
+    #[test]
+    fn meet_unbound_s_is_none_strict_returns_bottom() {
+        // visit_unbound_type (meet.py:865-867): s is NoneType,
+        // strict_optional -> UninhabitedType. The shim maps disc=3 to
+        // UninhabitedType(strict) / NoneType(non-strict).
+        let r = make_resolver(vec![]);
+        let s = Type::NoneType;
+        let t = unbound_type();
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_unbound_s_is_none_non_strict_returns_s() {
+        // visit_unbound_type (meet.py:865,868-869): s is NoneType,
+        // non-strict -> return self.s (SameS).
+        let r = make_resolver(vec![]);
+        let s = Type::NoneType;
+        let t = unbound_type();
+        assert_eq!(
+            meet_types(&s, &t, &ctx(false), &r),
+            Some(SetOpResult::SameS)
+        );
+    }
+
+    #[test]
+    fn meet_unbound_s_is_uninhabited_returns_s() {
+        // visit_unbound_type (meet.py:870-871): s is UninhabitedType ->
+        // return self.s (SameS).
+        let r = make_resolver(vec![]);
+        let s = Type::UninhabitedType;
+        let t = unbound_type();
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_unbound_s_is_instance_returns_any() {
+        // visit_unbound_type (meet.py:872-873): else -> AnyType. The
+        // shim maps disc=4 to AnyType(TypeOfAny.special_form).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = unbound_type();
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::Any));
+    }
+
+    #[test]
+    fn meet_unbound_s_is_any_returns_any() {
+        // visit_unbound_type else branch fires for AnyType s too (AnyType
+        // is not NoneType/Uninhabited). Result is AnyType. The meet_types
+        // AnyType-s short-circuit (meet.py:145) returns t before the
+        // visitor when s is AnyType, so this case is actually unreachable
+        // in Python. Rust mirrors: meet_types returns SameT (t) for
+        // AnyType-s. Assert the short-circuit wins.
+        let r = make_resolver(vec![]);
+        let s = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let t = unbound_type();
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    // ---- meet visit_type_var_tuple (M8r) ----
+    // Mirrors meet.py:930-934. Same id (raw_id + namespace) -> pick by
+    // min_len: s if s.min_len > t.min_len else t. Different id ->
+    // default(self.s) -> Bottom (strict) / NoneType (non-strict).
+
+    #[test]
+    fn meet_type_var_tuple_same_id_s_larger_min_len_returns_s() {
+        // visit_type_var_tuple (meet.py:931-932): s.id == t.id, s.min_len
+        // (2) > t.min_len (1) -> return self.s (SameS).
+        let r = make_resolver(vec![]);
+        let s = type_var_tuple(1, "ns", 2);
+        let t = type_var_tuple(1, "ns", 1);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_type_var_tuple_same_id_t_larger_min_len_returns_t() {
+        // visit_type_var_tuple (meet.py:931-932): s.id == t.id, s.min_len
+        // (1) <= t.min_len (2) -> return t (SameT).
+        let r = make_resolver(vec![]);
+        let s = type_var_tuple(1, "ns", 1);
+        let t = type_var_tuple(1, "ns", 2);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_type_var_tuple_same_id_equal_min_len_returns_t() {
+        // visit_type_var_tuple (meet.py:932): s.min_len == t.min_len ->
+        // `self.s if self.s.min_len > t.min_len else t` -> t (SameT).
+        let r = make_resolver(vec![]);
+        let s = type_var_tuple(1, "ns", 3);
+        let t = type_var_tuple(1, "ns", 3);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn meet_type_var_tuple_different_id_returns_bottom() {
+        // visit_type_var_tuple else (meet.py:933-934): s.id != t.id ->
+        // default(self.s) -> Bottom (strict).
+        let r = make_resolver(vec![]);
+        let s = type_var_tuple(1, "ns", 2);
+        let t = type_var_tuple(2, "ns", 2);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_type_var_tuple_different_namespace_returns_bottom() {
+        // visit_type_var_tuple else: same raw_id, different namespace ->
+        // TypeVarId.__eq__ False (types.py:567-577) -> default -> Bottom.
+        let r = make_resolver(vec![]);
+        let s = type_var_tuple(1, "ns1", 2);
+        let t = type_var_tuple(1, "ns2", 2);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_type_var_tuple_s_not_tvt_returns_bottom() {
+        // visit_type_var_tuple else (meet.py:933): s not TypeVarTupleType
+        // -> default(self.s). s is Instance -> default(Instance) ->
+        // Bottom (strict). Instance.default falls to object_from_instance
+        // in join but meet.default(strict) returns UninhabitedType.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = type_var_tuple(1, "ns", 2);
         assert_eq!(
             meet_types(&s, &t, &ctx(true), &r),
             Some(SetOpResult::Bottom)
