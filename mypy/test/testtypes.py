@@ -2481,3 +2481,114 @@ class NativeJoinCovariantArgsSuite(Suite):
 
         assert join_types(self.fx.ga, self.fx.gd) == self.fx.go
 
+
+class NativeJoinUnionSuite(Suite):
+    """Parity suite for the Rust `visit_union_type` join
+    (Stage 3c M8i).
+
+    Exercises the Instance-vs-UnionType join (join.py:432-436):
+    s <: any union item fires the Rust path (returns t, SameT);
+    every union item <: s fires the Rust path (returns s, SameS);
+    unrelated args defer to Python (needs make_simplified_union to
+    build a new union). Results are identical to pure-Python JoinSuite.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_subtype_of_union_returns_union(self) -> None:
+        # join(A, Union[A, B]) where A is in the union. A <: A (an
+        # item) -> is_subtype(A, Union[A, B])=True -> returns the
+        # union. Fires the Rust SameT path.
+        from mypy.join import join_types
+
+        u = UnionType([self.fx.a, self.fx.b])
+        assert join_types(self.fx.a, u) == u
+        assert join_types(self.fx.b, u) == u
+
+    def test_union_subtype_of_s_returns_s(self) -> None:
+        # join(A, Union[B, C]) where B <: A, C <: A. Every item of the
+        # union is a subtype of A -> the simplified union collapses to
+        # A. Fires the Rust SameS path.
+        from mypy.join import join_types
+
+        u = UnionType([self.fx.b, self.fx.c])
+        assert join_types(self.fx.a, u) == self.fx.a
+
+    def test_union_unrelated_defers_to_python(self) -> None:
+        # join(A, Union[D]) where D is unrelated to A. Neither A <: D
+        # nor D <: A. The Rust path defers; Python computes
+        # Union[A, D] via make_simplified_union. The result is the
+        # same regardless of which path computed it.
+        from mypy.join import join_types
+
+        u = UnionType([self.fx.d])
+        assert join_types(self.fx.a, u) == UnionType([self.fx.a, self.fx.d])
+
+    def test_union_with_object_item_returns_union(self) -> None:
+        # join(A, Union[object]). A <: object (an item) -> is_subtype(A,
+        # Union[object])=True -> returns the union (SameT). Note: the
+        # union is NOT collapsed to object here (join_types does not
+        # apply get_proper_type to its result); callers that need the
+        # collapsed form apply it themselves. Fires the Rust SameT path.
+        from mypy.join import join_types
+
+        u = UnionType([self.fx.o])
+        assert join_types(self.fx.a, u) == u
+
+    def test_union_both_sides_defers_to_python(self) -> None:
+        # join(Union[A], Union[B]). Both sides are unions; the Rust
+        # pre-dispatch defers (needs merge/flatten). Python collapses
+        # single-item unions via get_proper_type, so this reduces to
+        # join(A, B) = A (B extends A). Result is identical.
+        from mypy.join import join_types
+
+        s = UnionType([self.fx.a])
+        t = UnionType([self.fx.b])
+        assert join_types(s, t) == self.fx.a
+
