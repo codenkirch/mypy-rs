@@ -16,6 +16,11 @@
 //!   * **Stage 3a** (`wire::read_type_to_str`): a Rust-owned `Type` enum +
 //!     binary wire-format reader, parity-tested but not yet wired to any
 //!     visitor. Foundation for Stage 3c (`is_subtype`).
+//!   * **Stage 3b** (`typeinfo::build_resolver` +
+//!     `typeinfo::read_type_to_str_with_resolver`): freezes the live Python
+//!     `TypeInfo` graph into a snapshot keyed by `fullname`, closing the
+//!     Stage 3a deferred renderings (prefix-strip, enum/bytes literal,
+//!     `[()]` variadic-tuple). Foundation for Stage 3c (`is_subtype`).
 //!
 //! Shared infrastructure (`TypeRefs` class cache, `fallback_sentinel`/
 //! `is_fallback`, `make_any`) lives in `refs` and is reused by both stages.
@@ -25,12 +30,13 @@
 mod erase;
 mod lkv;
 mod refs;
+mod typeinfo;
 mod wire;
 
 use pyo3::prelude::*;
 
-/// PyO3 module entry point: registers the visitor functions (Stages 1/2) and
-/// the parity-only wire reader (Stage 3a).
+/// PyO3 module entry point: registers the visitor functions (Stages 1/2)
+/// and the parity-only wire readers (Stages 3a/3b).
 #[pymodule]
 fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(erase::erase_type, module)?)?;
@@ -39,5 +45,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        typeinfo::build_resolver,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeinfo::read_type_to_str_with_resolver,
+        module
+    )?)?;
     Ok(())
 }

@@ -1720,6 +1720,123 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(ov)
 
 
+# Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
+# wire format and asserts that the Rust reader, with a TypeInfo resolver
+# built from the live Python TypeInfo graph, produces the same `str(t)` as
+# the Python `TypeStrVisitor`. Gated by `TEST_NATIVE_TYPE_KERNEL=1` plus
+# the presence of the `type_kernel` extension; skipped otherwise. This
+# closes the Stage 3a deferred renderings (prefix-strip on builtins.*,
+# enum-literal `value_repr`, bytes-literal `value_repr`, the `[()]`
+# variadic-tuple branch) and proves the resolver protocol end-to-end.
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeWireResolverSuite(Suite):
+    """Parity tests for the Rust `Type` reader with TypeInfo resolver.
+
+    Each test builds a resolver from the live Python TypeInfo graph via
+    `type_kernel.build_resolver(type_infos)`, serializes a `Type` via
+    `Type.write(WriteBuffer)`, and asserts:
+        type_kernel.read_type_to_str_with_resolver(bytes, resolver) == str(t)
+    The seed corpus targets the Stage 3b deferred renderings: builtins
+    prefix stripping, enum-literal `value_repr`, bytes-literal
+    `value_repr`, and the `[()]` variadic-tuple branch.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        # The fixture's TypeInfo graph: all TypeInfos reachable from the
+        # fixture instances. build_resolver walks them into snapshot dicts.
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.gsi,
+            self.fx.gs2i,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _type_kernel.build_resolver(type_infos)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def assert_wire_par(self, t: Type) -> None:
+        expected = str(t)
+        actual = _type_kernel.read_type_to_str_with_resolver(
+            self._bytes_of(t), self.resolver
+        )
+        assert_equal(
+            actual, expected, f"wire-resolver str({t!r}) = {{}} ({{}} expected)"
+        )
+
+    def test_instance_no_args(self) -> None:
+        self.assert_wire_par(self.fx.a)
+        self.assert_wire_par(self.fx.b)
+        self.assert_wire_par(self.fx.o)
+
+    def test_instance_generic(self) -> None:
+        self.assert_wire_par(self.fx.ga)
+        self.assert_wire_par(self.fx.gb)
+        self.assert_wire_par(self.fx.gt)
+
+    def test_instance_tuple(self) -> None:
+        # builtins.tuple renders as `tuple[T, ...]`.
+        self.assert_wire_par(self.fx.std_tuple)
+
+    def test_literal_int(self) -> None:
+        self.assert_wire_par(self.fx.lit1)
+        self.assert_wire_par(self.fx.lit2)
+        self.assert_wire_par(self.fx.lit4)
+
+    def test_literal_str(self) -> None:
+        self.assert_wire_par(self.fx.lit_str1)
+        self.assert_wire_par(self.fx.lit_str2)
+
+    def test_literal_bool(self) -> None:
+        self.assert_wire_par(self.fx.lit_false)
+        self.assert_wire_par(self.fx.lit_true)
+
+    def test_last_known_value(self) -> None:
+        self.assert_wire_par(self.fx.lit1_inst)
+        self.assert_wire_par(self.fx.lit_str1_inst)
+
+    def test_type_type(self) -> None:
+        self.assert_wire_par(self.fx.type_a)
+        self.assert_wire_par(self.fx.type_b)
+
+    def test_callable_pos(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+        self.assert_wire_par(c)
+
+    def test_union(self) -> None:
+        self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
+        self.assert_wire_par(
+            UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet])
+        )
+
+
 class ShallowOverloadMatchingSuite(Suite):
     def setUp(self) -> None:
         self.fx = TypeFixture()

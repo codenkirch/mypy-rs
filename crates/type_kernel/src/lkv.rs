@@ -220,7 +220,7 @@ fn lkv_visit_union(
                 let idx = fullnames.len() - 1;
                 groups_by_name
                     .entry(fullname)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(idx);
                 continue;
             }
