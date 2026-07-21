@@ -1622,6 +1622,291 @@ pub(crate) fn read_type_to_str(bytes: &[u8]) -> PyResult<String> {
     Ok(typ.to_string())
 }
 
+/// Parity entry point for Stage 3c M8s: read one serialized `Type` from
+/// `bytes`, then re-encode it via `write_type` and return the resulting
+/// bytes. Lets the Python suite assert
+/// `Type.read(ReadBuffer(rust_bytes)) == Type.read(ReadBuffer(python_bytes))`,
+/// proving the Rust encoder produces bytes Python's `Type.read()` decodes
+/// identically. Unsupported variants raise `ValueError`.
+#[pyfunction]
+pub(crate) fn round_trip_type_bytes(bytes: &[u8]) -> PyResult<Vec<u8>> {
+    let mut rbuf = ReadBuffer::new(bytes);
+    let typ = read_type(&mut rbuf, None)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &typ)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(wbuf.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+// WriteBuffer + write_type (Stage 3c M8s)
+// ---------------------------------------------------------------------------
+//
+// The reader above is the source of truth for the byte layout: every
+// `write_*` here is the exact inverse of the corresponding `read_*`, so
+// `read_type(&write_type(t)) == t` over the supported variants. Mirrors
+// `Type.write(WriteBuffer)` in mypy/types.py and the bare primitives in
+// librt_internal.c. Only the variants the set-ops visitors can produce
+// (leaf types + args-less Instance + TypeType) are implemented; other
+// variants return `Err(WireError::Invalid(...))` so callers fail loudly
+// rather than emitting malformed bytes.
+
+/// Append-only byte buffer mirroring librt's `WriteBuffer` C type.
+pub(crate) struct WriteBuffer {
+    out: Vec<u8>,
+}
+
+impl WriteBuffer {
+    pub(crate) fn new() -> Self {
+        WriteBuffer { out: Vec::new() }
+    }
+
+    /// The encoded bytes (consumes the buffer).
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.out
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.out.push(byte);
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.out.extend_from_slice(bytes);
+    }
+}
+
+/// `write_tag`: a single byte.
+fn write_tag(buf: &mut WriteBuffer, tag: u8) {
+    buf.push(tag);
+}
+
+/// `write_bool`: 0 or 1.
+fn write_bool(buf: &mut WriteBuffer, value: bool) {
+    buf.push(if value { 1 } else { 0 });
+}
+
+/// `write_int_bare`: the tagged-int encoding inverse of `read_int_bare`.
+///
+/// Layout mirrors librt_internal.c `write_int_internal` / `_read_short_int`
+/// (wire.rs:185-212). Three width tiers, chosen by value range:
+/// - 1-byte:  value in [-10, 117], payload = (value + 10) << 1 (low bit 0)
+/// - 2-byte: value in [-100, 16283], payload = (value + 100) << 2 | 0b01
+///   (byte0 low 2 bits = 0b01, byte1 = high 8 bits)
+/// - 4-byte: value in [-10000, 536870911], payload = (value + 10000) << 3
+///   | 0b011 (byte0 low 3 bits = 0b011, byte1 = bits 3..8, bytes 2-3 =
+///   bits 8..21 little-endian)
+///
+/// Larger values use the `LONG_INT_TRAILER` form. mypy's wire format only
+/// serializes i64 ints that fit the short-int range (TypeVarId.raw_id is
+/// tiny; Enum int values are small); we return `Err` for values outside
+/// i32 short-int range rather than silently truncate.
+fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
+    if value >= MIN_ONE_BYTE_INT {
+        let payload = (value - MIN_ONE_BYTE_INT) << 1;
+        debug_assert!(payload <= 0x7F);
+        buf.push(payload as u8);
+        return Ok(());
+    }
+    if value >= MIN_TWO_BYTES_INT {
+        let payload = (value - MIN_TWO_BYTES_INT) << 2 | (TWO_BYTES_INT_BIT as i64);
+        debug_assert!(payload <= 0x3FFF);
+        buf.push((payload & 0xFF) as u8);
+        buf.push(((payload >> 8) & 0xFF) as u8);
+        return Ok(());
+    }
+    if value >= MIN_FOUR_BYTES_INT {
+        let payload = (value - MIN_FOUR_BYTES_INT) << 3
+            | (TWO_BYTES_INT_BIT as i64)
+            | (FOUR_BYTES_INT_BIT as i64);
+        debug_assert!(payload <= 0x1FFFFFFF);
+        buf.push((payload & 0xFF) as u8);
+        buf.push(((payload >> 8) & 0xFF) as u8);
+        buf.push(((payload >> 16) & 0xFF) as u8);
+        buf.push(((payload >> 24) & 0xFF) as u8);
+        return Ok(());
+    }
+    // Long-int form (LONG_INT_TRAILER). Only reached for values < -10000,
+    // which the type-kernel set-ops never produce (no raw_id is that
+    // negative). Implemented for completeness; uses little-endian magnitude.
+    buf.push(LONG_INT_TRAILER);
+    let magnitude = (-(value)) as u128;
+    let mut bytes = Vec::new();
+    let mut m = magnitude;
+    while m != 0 {
+        bytes.push((m & 0xFF) as u8);
+        m >>= 8;
+    }
+    let size_and_sign = ((bytes.len() as i64) << 1) | 1;
+    write_int_bare(buf, size_and_sign)?;
+    buf.extend(&bytes);
+    Ok(())
+}
+
+/// `write_str_bare`: short-int length prefix + UTF-8 body. Inverse of
+/// `read_str_bare` (wire.rs:261-274).
+fn write_str_bare(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
+    write_int_bare(buf, s.len() as i64)?;
+    buf.extend(s.as_bytes());
+    Ok(())
+}
+
+/// `write_str`: tagged `LITERAL_STR` + bare str. Inverse of `read_str`.
+fn write_str(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
+    write_tag(buf, LITERAL_STR);
+    write_str_bare(buf, s)
+}
+
+/// `write_str_opt`: `LITERAL_NONE` for None, else `write_str`. Inverse of
+/// `read_str_opt` (wire.rs:328-340).
+fn write_str_opt(buf: &mut WriteBuffer, value: Option<&str>) -> Result<(), WireError> {
+    match value {
+        Some(s) => write_str(buf, s),
+        None => {
+            write_tag(buf, LITERAL_NONE);
+            Ok(())
+        }
+    }
+}
+
+/// `write_int`: tagged `LITERAL_INT` + bare int. Inverse of `read_int`.
+fn write_int(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
+    write_tag(buf, LITERAL_INT);
+    write_int_bare(buf, value)
+}
+
+/// `write_type_opt`: `LITERAL_NONE` for None, else `write_type`. Inverse
+/// of `read_type_opt` (wire.rs:591-600).
+fn write_type_opt(buf: &mut WriteBuffer, value: Option<&Type>) -> Result<(), WireError> {
+    match value {
+        Some(t) => write_type(buf, t),
+        None => {
+            write_tag(buf, LITERAL_NONE);
+            Ok(())
+        }
+    }
+}
+
+/// `write_type_list`: `LIST_GEN` + bare size + N types. Inverse of
+/// `read_type_list` (wire.rs:4543-4553).
+fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireError> {
+    write_tag(buf, LIST_GEN);
+    write_int_bare(buf, items.len() as i64)?;
+    for item in items {
+        write_type(buf, item)?;
+    }
+    Ok(())
+}
+
+/// `write_type`: the `Type.write(WriteBuffer)` inverse of `read_type`.
+///
+/// Implements only the variants the set-ops visitors can produce:
+/// `AnyType`, `NoneType`, `UninhabitedType`, `Instance` (args-less or
+/// generic), `TypeType`. Other variants return `Err` so callers fail
+/// loudly rather than emit malformed bytes that `Type.read()` would
+/// reject.
+pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireError> {
+    match t {
+        Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } => {
+            write_tag(buf, ANY_TYPE);
+            write_type_opt(buf, source_any.as_deref())?;
+            write_int(buf, *type_of_any)?;
+            write_str_opt(buf, missing_import_name.as_deref())?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::NoneType => {
+            write_tag(buf, NONE_TYPE);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::UninhabitedType => {
+            write_tag(buf, UNINHABITED_TYPE);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        } => {
+            write_tag(buf, INSTANCE);
+            if args.is_empty() && last_known_value.is_none() && extra_attrs.is_none() {
+                match type_ref.as_str() {
+                    "builtins.str" => write_tag(buf, INSTANCE_STR),
+                    "builtins.function" => write_tag(buf, INSTANCE_FUNCTION),
+                    "builtins.int" => write_tag(buf, INSTANCE_INT),
+                    "builtins.bool" => write_tag(buf, INSTANCE_BOOL),
+                    "builtins.object" => write_tag(buf, INSTANCE_OBJECT),
+                    _ => {
+                        write_tag(buf, INSTANCE_SIMPLE);
+                        write_str_bare(buf, type_ref)?;
+                    }
+                }
+                Ok(())
+            } else {
+                write_tag(buf, INSTANCE_GENERIC);
+                write_str(buf, type_ref)?;
+                write_type_list(buf, args)?;
+                write_type_opt(buf, last_known_value.as_deref())?;
+                match extra_attrs {
+                    None => write_tag(buf, LITERAL_NONE),
+                    Some(_) => {
+                        return Err(WireError::invalid(
+                            "extra_attrs encoder not implemented (no set-ops visitor produces it)",
+                        ));
+                    }
+                }
+                write_tag(buf, END_TAG);
+                Ok(())
+            }
+        }
+        Type::TypeType { item, is_type_form } => {
+            write_tag(buf, TYPE_TYPE);
+            write_type(buf, item)?;
+            write_bool(buf, *is_type_form);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        _ => Err(WireError::invalid(format!(
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType)",
+            t.variant_name()
+        ))),
+    }
+}
+
+impl Type {
+    /// Stable variant name for error messages (mirrors the Python class name).
+    fn variant_name(&self) -> &'static str {
+        match self {
+            Type::Instance { .. } => "Instance",
+            Type::TypeAliasType { .. } => "TypeAliasType",
+            Type::TypeVarType { .. } => "TypeVarType",
+            Type::ParamSpecType { .. } => "ParamSpecType",
+            Type::TypeVarTupleType { .. } => "TypeVarTupleType",
+            Type::UnboundType { .. } => "UnboundType",
+            Type::UnpackType { .. } => "UnpackType",
+            Type::AnyType { .. } => "AnyType",
+            Type::UninhabitedType => "UninhabitedType",
+            Type::NoneType => "NoneType",
+            Type::DeletedType { .. } => "DeletedType",
+            Type::CallableType { .. } => "CallableType",
+            Type::Overloaded { .. } => "Overloaded",
+            Type::TupleType { .. } => "TupleType",
+            Type::TypedDictType { .. } => "TypedDictType",
+            Type::LiteralType { .. } => "LiteralType",
+            Type::UnionType { .. } => "UnionType",
+            Type::TypeType { .. } => "TypeType",
+            Type::Parameters(_) => "Parameters",
+        }
+    }
+}
+
 /// Minimal short-int encoder for test helpers in other modules.
 /// Mirrors `_write_short_int` 1-byte form (values -10..=117).
 #[cfg(test)]
@@ -1903,6 +2188,124 @@ mod tests {
         let mut buf = ReadBuffer::new(&[200]);
         assert!(matches!(
             read_type(&mut buf, None),
+            Err(WireError::Invalid(_))
+        ));
+    }
+
+    // ----- write_type round-trip (M8s) -----
+    // Every test writes a Type then reads it back; the result must equal
+    // the input. This is the exact contract Python's Type.read() will
+    // rely on when decoding bytes Rust produces over FFI.
+
+    fn round_trip(t: &Type) -> Type {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, t).expect("write_type failed");
+        let bytes = buf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&bytes);
+        read_type(&mut rbuf, None).expect("read_type failed")
+    }
+
+    #[test]
+    fn write_then_read_any_type_round_trips() {
+        let t = Type::AnyType {
+            type_of_any: 3,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_none_type_round_trips() {
+        assert_eq!(round_trip(&Type::NoneType), Type::NoneType);
+    }
+
+    #[test]
+    fn write_then_read_uninhabited_type_round_trips() {
+        assert_eq!(round_trip(&Type::UninhabitedType), Type::UninhabitedType);
+    }
+
+    #[test]
+    fn write_then_read_instance_simple_round_trips() {
+        let t = Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_instance_simple_non_builtin_round_trips() {
+        let t = Type::Instance {
+            type_ref: "a.A".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_instance_generic_round_trips() {
+        let t = Type::Instance {
+            type_ref: "a.A".to_string(),
+            args: vec![Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_then_read_type_type_round_trips() {
+        let t = Type::TypeType {
+            item: Box::new(Type::Instance {
+                type_ref: "a.A".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            is_type_form: false,
+        };
+        assert_eq!(round_trip(&t), t);
+    }
+
+    #[test]
+    fn write_type_rejects_unsupported_variant() {
+        // CallableType is not in the implemented set; must error rather
+        // than emit bytes Type.read() would reject.
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            name: None,
+            arg_names: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_types: Vec::new(),
+            ret_type: Box::new(Type::NoneType),
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        };
+        let mut buf = WriteBuffer::new();
+        assert!(matches!(
+            write_type(&mut buf, &t),
             Err(WireError::Invalid(_))
         ));
     }

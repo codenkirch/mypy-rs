@@ -2993,20 +2993,22 @@ class NativeJoinTypeTypeSuite(Suite):
 
         assert join_types(self.fx.type_type, self.fx.type_a) == self.fx.type_type
 
-    def test_type_type_with_type_type_defers_to_python(self) -> None:
+    def test_type_type_with_type_type_returns_encoded(self) -> None:
         # join(type[A], type[A]) = type[A]. Both sides TypeType. Case 1
-        # (join.py:855-860) produces a new TypeType via
-        # TypeType.make_normalized — defers to Python (needs a Type
-        # encoder). The result is identical regardless of which path
-        # computed it.
+        # (join.py:855-860) fires the Rust encoder: it builds a new
+        # TypeType wrapping join_types(t.item, s.item) and serializes it
+        # via write_type; the shim decodes via read_type then resolves
+        # wire-only type_refs to live TypeInfo via the fullname map.
         from mypy.join import join_types
 
         assert join_types(self.fx.type_a, self.fx.type_a) == self.fx.type_a
 
-    def test_type_type_with_different_type_type_defers_to_python(self) -> None:
+    def test_type_type_with_different_type_type_returns_encoded(self) -> None:
         # join(type[A], type[B]) = type[A] (B <: A). Both sides TypeType.
-        # Case 1 produces a new TypeType — defers to Python. The result
-        # is identical regardless of which path computed it.
+        # Case 1 fires the Rust encoder; the recursive join_types(A, B)
+        # returns Ancestor(a.A), setop_result_to_type reuses the fixed
+        # s.item operand, and the shim resolves the decoded Instance's
+        # type_ref via the fullname map.
         from mypy.join import join_types
 
         assert join_types(self.fx.type_a, self.fx.type_b) == self.fx.type_a

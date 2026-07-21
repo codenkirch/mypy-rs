@@ -37,7 +37,7 @@
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{self, ReadBuffer, Type};
+use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 use crate::subtypes::{
     is_subtype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT, VARIANCE_NOT_READY,
@@ -79,6 +79,11 @@ pub(crate) enum SetOpResult {
         type_ref: String,
         arg_discs: Vec<i8>,
     },
+    /// A newly-constructed type encoded in the wire format. The Python
+    /// shim decodes via `read_type(ReadBuffer(bytes))`. Used by visitors
+    /// that produce a type other than s/t (e.g. `visit_type_type` case 1
+    /// builds a new `TypeType`). `disc=7` on the wire.
+    Encoded(Vec<u8>),
 }
 
 /// `trivial_join` (join.py:198-205), Rust subset.
@@ -695,6 +700,82 @@ fn visit_instance_meet(
     }
 }
 
+/// Map a `SetOpResult` to the `Type` it denotes, given the `s`/`t`
+/// operands. Used by visitors that need to feed the recursive result
+/// into a new type (e.g. `visit_type_type` case 1 wraps the joined
+/// item in a new `TypeType`).
+///
+/// Returns `None` for results that can't be materialized without a
+/// Type encoder or that the caller should defer on:
+/// - `None` (the recursive call deferred)
+/// - `SameTypeWithArgs` (needs per-arg reconstruction)
+/// - `Ancestor` whose fullname is not in the resolver (would need
+///   `object_or_any_from_type` fallback)
+///
+/// `Object` maps to `Instance(builtins.object, [])` (the common case
+/// of `object_or_any_from_type` for Instance right; `visit_type_type`
+/// recurses on `t.item`/`s.item` which are always Instance, so the
+/// Object result is always `builtins.object`).
+fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Type> {
+    match r? {
+        SetOpResult::SameS => Some(s.clone()),
+        SetOpResult::SameT => Some(t.clone()),
+        SetOpResult::Any => Some(Type::AnyType {
+            type_of_any: 3, // TypeOfAny.special_form
+            source_any: None,
+            missing_import_name: None,
+        }),
+        SetOpResult::Bottom => Some(Type::UninhabitedType),
+        SetOpResult::Object => {
+            // Prefer the fixed s/t operand if it is already
+            // builtins.object (avoids decoding an unfixed Instance).
+            for candidate in [s, t] {
+                if let Type::Instance { type_ref, .. } = candidate {
+                    if type_ref == "builtins.object" {
+                        return Some(candidate.clone());
+                    }
+                }
+            }
+            Some(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        SetOpResult::Ancestor(fullname) => {
+            // Prefer the fixed s/t operand when its type_ref matches
+            // the ancestor fullname — the decoded bytes would otherwise
+            // produce an unfixed Instance (type_ref only, no live
+            // TypeInfo), which breaks == against fixed operands.
+            for candidate in [s, t] {
+                if let Type::Instance { type_ref, .. } = candidate {
+                    if type_ref == &fullname {
+                        return Some(candidate.clone());
+                    }
+                }
+            }
+            Some(Type::Instance {
+                type_ref: fullname,
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        // SameTypeWithArgs needs per-arg reconstruction (which arg to
+        // pick from s vs t); the visitor callers above
+        // visit_type_type only recurse on args-less Instance items,
+        // so this arm is unreachable in practice. Defer conservatively.
+        SetOpResult::SameTypeWithArgs { .. } | SetOpResult::Encoded(_) => None,
+    }
+    .filter(|typ| {
+        // Only return types the encoder can write. Other variants
+        // (CallableType, UnionType, etc.) would error in write_type;
+        // defer so Python handles them.
+        wire::write_type(&mut WriteBuffer::new(), typ).is_ok()
+    })
+}
+
 /// `TypeJoinVisitor.visit_*` leaf methods (join.py:344-374), Rust
 /// subset. Handles the visitors that don't recurse into `join_types`.
 fn visit_join(
@@ -776,17 +857,41 @@ fn visit_join(
             visit_callable_fallback(s, fallback, ctx, resolver)
         }
 
-        // visit_type_type (join.py:854-864), case 2 only. Case 1 (s is
-        // TypeType) produces a new TypeType via
-        // TypeType.make_normalized — no Type encoder -> defer. Case 3
-        // (else -> default) walks s's fallback chain, complex -> defer.
-        // Case 2 (s is Instance with fullname=="builtins.type")
-        // returns self.s -> SameS.
-        Type::TypeType { .. } => {
+        // visit_type_type (join.py:854-864). Case 2 (s is Instance with
+        // fullname=="builtins.type") returns self.s -> SameS. Case 1
+        // (s is TypeType) builds a new TypeType wrapping
+        // join_types(t.item, s.item); the joined item is materialized
+        // via setop_result_to_type and encoded via write_type. Case 3
+        // (else -> default) walks s's fallback chain -> defer.
+        Type::TypeType {
+            item: t_item,
+            is_type_form: t_itf,
+        } => {
             if let Type::Instance { type_ref, .. } = s {
                 if type_ref == "builtins.type" {
                     return Some(SetOpResult::SameS);
                 }
+            }
+            if let Type::TypeType {
+                item: s_item,
+                is_type_form: s_itf,
+            } = s
+            {
+                // join.py:857-861: TypeType.make_normalized(
+                //   join_types(t.item, self.s.item),
+                //   is_type_form=s.is_type_form or t.is_type_form)
+                let joined = setop_result_to_type(
+                    join_types(t_item, s_item, ctx, resolver),
+                    s_item,
+                    t_item,
+                )?;
+                let new_type = Type::TypeType {
+                    item: Box::new(joined),
+                    is_type_form: *s_itf || *t_itf,
+                };
+                let mut wbuf = WriteBuffer::new();
+                wire::write_type(&mut wbuf, &new_type).ok()?;
+                return Some(SetOpResult::Encoded(wbuf.into_bytes()));
             }
             None
         }
@@ -1420,8 +1525,10 @@ pub(crate) fn rust_trivial_meet(
 /// (mypy/join.py) calls this after `get_proper_type` expansion with
 /// serialized `s`/`t` blobs plus the `NativeTypeResolver` pyclass.
 /// Returns `None` (Python `None`) when Rust doesn't handle the case;
-/// `Some((disc, fullname))` otherwise. `disc` is 0=SameS, 1=SameT,
-/// 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set).
+/// `Some((disc, fullname, arg_discs, encoded))` otherwise. `disc` is
+/// 0=SameS, 1=SameT, 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname
+/// set), 6=SameTypeWithArgs, 7=Encoded (the `encoded` bytes hold a
+/// wire-format type blob the shim decodes via `read_type`).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_join_types(
@@ -1429,7 +1536,7 @@ pub(crate) fn rust_join_types(
     t_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
-) -> Option<(i64, Option<String>, Vec<i8>)> {
+) -> Option<DiscriminatorOut> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
@@ -1440,9 +1547,10 @@ pub(crate) fn rust_join_types(
 /// (mypy/meet.py) calls this after `get_proper_type` expansion with
 /// serialized `s`/`t` blobs plus the `NativeTypeResolver` pyclass.
 /// Returns `None` (Python `None`) when Rust doesn't handle the case;
-/// `Some((disc, fullname, arg_discs))` otherwise. `meet_types` only
-/// emits disc 0=SameS, 1=SameT, 3=Bottom, 4=Any (never 2=Object,
-/// 5=Ancestor, 6=SameTypeWithArgs — those are join supertype results).
+/// `Some((disc, fullname, arg_discs, encoded))` otherwise.
+/// `meet_types` only emits disc 0=SameS, 1=SameT, 3=Bottom, 4=Any
+/// (never 2=Object, 5=Ancestor, 6=SameTypeWithArgs — those are join
+/// supertype results).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_meet_types(
@@ -1450,30 +1558,35 @@ pub(crate) fn rust_meet_types(
     t_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
-) -> Option<(i64, Option<String>, Vec<i8>)> {
+) -> Option<DiscriminatorOut> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     meet_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
-/// Map `SetOpResult` to the Python-side `(disc, fullname, arg_discs)`
-/// triple. `disc` is 0=SameS, 1=SameT, 2=Object, 3=Bottom, 4=Any,
-/// 5=Ancestor (fullname set, arg_discs empty), 6=SameTypeWithArgs
-/// (fullname set, arg_discs populated: 0=s.args[i], 1=t.args[i],
-/// 4=Any).
-fn discriminator(r: SetOpResult) -> (i64, Option<String>, Vec<i8>) {
+/// Map `SetOpResult` to the Python-side
+/// `(disc, fullname, arg_discs, encoded)` 4-tuple. `disc` is 0=SameS,
+/// 1=SameT, 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set,
+/// arg_discs empty), 6=SameTypeWithArgs (fullname set, arg_discs
+/// populated: 0=s.args[i], 1=t.args[i], 4=Any), 7=Encoded (the
+/// `encoded` bytes hold a wire-format type blob the shim decodes via
+/// `read_type(ReadBuffer(encoded))`).
+type DiscriminatorOut = (i64, Option<String>, Vec<i8>, Vec<u8>);
+
+fn discriminator(r: SetOpResult) -> DiscriminatorOut {
     match r {
-        SetOpResult::SameS => (0, None, Vec::new()),
-        SetOpResult::SameT => (1, None, Vec::new()),
-        SetOpResult::Object => (2, None, Vec::new()),
-        SetOpResult::Bottom => (3, None, Vec::new()),
-        SetOpResult::Any => (4, None, Vec::new()),
-        SetOpResult::Ancestor(fullname) => (5, Some(fullname), Vec::new()),
+        SetOpResult::SameS => (0, None, Vec::new(), Vec::new()),
+        SetOpResult::SameT => (1, None, Vec::new(), Vec::new()),
+        SetOpResult::Object => (2, None, Vec::new(), Vec::new()),
+        SetOpResult::Bottom => (3, None, Vec::new(), Vec::new()),
+        SetOpResult::Any => (4, None, Vec::new(), Vec::new()),
+        SetOpResult::Ancestor(fullname) => (5, Some(fullname), Vec::new(), Vec::new()),
         SetOpResult::SameTypeWithArgs {
             type_ref,
             arg_discs,
-        } => (6, Some(type_ref), arg_discs),
+        } => (6, Some(type_ref), arg_discs, Vec::new()),
+        SetOpResult::Encoded(bytes) => (7, None, Vec::new(), bytes),
     }
 }
 
@@ -1486,8 +1599,11 @@ fn discriminator_trivial(r: SetOpResult) -> i64 {
         SetOpResult::SameT => 1,
         SetOpResult::Object => 2,
         SetOpResult::Bottom => 3,
-        SetOpResult::Any | SetOpResult::Ancestor(_) | SetOpResult::SameTypeWithArgs { .. } => {
-            unreachable!("trivial_join/trivial_meet never produce Any/Ancestor/WithArgs")
+        SetOpResult::Any
+        | SetOpResult::Ancestor(_)
+        | SetOpResult::SameTypeWithArgs { .. }
+        | SetOpResult::Encoded(_) => {
+            unreachable!("trivial_join/trivial_meet never produce Any/Ancestor/WithArgs/Encoded")
         }
     }
 }
@@ -1700,21 +1816,31 @@ mod tests {
 
     #[test]
     fn discriminator_maps_variants() {
-        assert_eq!(discriminator(SetOpResult::SameS), (0, None, vec![]));
-        assert_eq!(discriminator(SetOpResult::SameT), (1, None, vec![]));
-        assert_eq!(discriminator(SetOpResult::Object), (2, None, vec![]));
-        assert_eq!(discriminator(SetOpResult::Bottom), (3, None, vec![]));
-        assert_eq!(discriminator(SetOpResult::Any), (4, None, vec![]));
+        assert_eq!(discriminator(SetOpResult::SameS), (0, None, vec![], vec![]));
+        assert_eq!(discriminator(SetOpResult::SameT), (1, None, vec![], vec![]));
+        assert_eq!(
+            discriminator(SetOpResult::Object),
+            (2, None, vec![], vec![])
+        );
+        assert_eq!(
+            discriminator(SetOpResult::Bottom),
+            (3, None, vec![], vec![])
+        );
+        assert_eq!(discriminator(SetOpResult::Any), (4, None, vec![], vec![]));
         assert_eq!(
             discriminator(SetOpResult::Ancestor("a.C".to_string())),
-            (5, Some("a.C".to_string()), vec![])
+            (5, Some("a.C".to_string()), vec![], vec![])
         );
         assert_eq!(
             discriminator(SetOpResult::SameTypeWithArgs {
                 type_ref: "g.G".to_string(),
                 arg_discs: vec![0, 1, 4],
             }),
-            (6, Some("g.G".to_string()), vec![0, 1, 4])
+            (6, Some("g.G".to_string()), vec![0, 1, 4], vec![])
+        );
+        assert_eq!(
+            discriminator(SetOpResult::Encoded(vec![80, 81])),
+            (7, None, vec![], vec![80, 81])
         );
     }
 
@@ -2160,15 +2286,31 @@ mod tests {
     }
 
     #[test]
-    fn join_type_type_with_type_type_defers() {
-        // visit_type_type case 1 (join.py:855-860): s is TypeType ->
-        // TypeType.make_normalized(join_types(t.item, s.item), ...).
-        // Produces a new TypeType — no Type encoder -> defer.
+    fn join_type_type_with_type_type_same_item_returns_encoded() {
+        // visit_type_type case 1 (join.py:855-860): both TypeType ->
+        // TypeType(make_normalized(join_types(t.item, s.item)),
+        // is_type_form=s.is_type_form or t.is_type_form). With same
+        // item (builtins.object), join_types returns SameS, so the
+        // joined item is s.item=Instance(builtins.object). The result
+        // is TypeType{item: builtins.object, is_type_form: false},
+        // encoded via write_type -> Encoded(bytes).
         let o = snap("builtins.object", "object");
         let r = make_resolver(vec![o]);
         let s = type_type("builtins.object");
         let t = type_type("builtins.object");
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        let bytes = match result {
+            Some(SetOpResult::Encoded(bytes)) => bytes,
+            other => panic!("expected Encoded, got {other:?}"),
+        };
+        // Decode and verify: TypeType(Instance(builtins.object)).
+        let mut rbuf = ReadBuffer::new(&bytes);
+        let decoded = crate::wire::read_type(&mut rbuf, None).expect("decode failed");
+        let expected = Type::TypeType {
+            item: Box::new(instance("builtins.object", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(decoded, expected);
     }
 
     #[test]
