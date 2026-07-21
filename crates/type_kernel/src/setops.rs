@@ -152,11 +152,14 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// - NoneType right (non-strict) -> SameS.
 /// - UninhabitedType right -> SameS.
 /// - DeletedType right -> SameS.
+/// - UnionType right: s <: any item -> SameT (return t); every item
+///   <: s -> SameS (union collapses); else defer (needs a Type encoder
+///   to build the new union).
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (needs the live alias graph).
 /// - `can_be_true`/`can_be_false` mismatch (needs the properties).
-/// - UnionType right (needs `make_simplified_union`).
+/// - UnionType left AND UnionType right (needs merge/flatten).
 /// - Instance/CallableType/TypeVarType/etc right (full visitor).
 /// - `normalize_callables` (needs live callable normalization).
 ///
@@ -169,11 +172,11 @@ pub(crate) fn join_types(
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
     // join.py:311-312: if s is UnionType and t is not, swap so s is
-    // the non-union. We only handle the post-swap shape; if t is
-    // UnionType, defer (needs make_simplified_union).
+    // the non-union. If both are unions, visit_union_type would need
+    // make_simplified_union to merge them — defer.
     let (s, t, swapped) = match (s, t) {
         (Type::UnionType { .. }, other) if !matches!(other, Type::UnionType { .. }) => (t, s, true),
-        (_, Type::UnionType { .. }) => return None,
+        (Type::UnionType { .. }, Type::UnionType { .. }) => return None,
         _ => (s, t, false),
     };
 
@@ -304,10 +307,65 @@ fn visit_join(
         // into join_types and need the InstanceJoiner recursion guard).
         Type::Instance { .. } => visit_instance_join(s, t, ctx, resolver),
 
-        // Full visitors (UnionType, CallableType, TypeVar, etc.) —
-        // deferred to M8g+.
+        // visit_union_type (join.py:432-436):
+        //   if is_proper_subtype(s, t): return t (SameT)
+        //   else: return make_simplified_union([s, t])
+        // is_subtype(s, Union[..]) is True iff s <: any item. We also
+        // check is_subtype(t, s): if every item <: s, the simplified
+        // union collapses to s (SameS). Otherwise defer — building a
+        // new union needs a Type encoder (not available reader-only).
+        Type::UnionType { items, .. } => visit_union_join(s, items, ctx, resolver),
+
+        // Full visitors (CallableType, TypeVar, etc.) — deferred.
         _ => None,
     }
+}
+
+/// `TypeJoinVisitor.visit_union_type` (join.py:432-436), Rust subset.
+///
+/// `is_subtype(s, Union[A, B])` is True iff `s <: A` or `s <: B`
+/// (subtypes.py: UnionType right is an OR over items). If True, the
+/// join is `t` (the union): `SameT`.
+///
+/// If `s` is not a subtype of `t`, Python calls `make_simplified_union
+/// ([s, t])`. We can't build a new union without a Type encoder, but we
+/// can detect one case: if `t <: s` (every union item is a subtype of
+/// `s`), the simplified union collapses to `s` alone: `SameS`.
+///
+/// Defers (returns `None`) when:
+/// * Any `is_subtype` call returns `None` (can't conclude).
+/// * Neither `s <: t` nor `t <: s` (needs a new union).
+fn visit_union_join(
+    s: &Type,
+    items: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    // s <: t iff s <: any item of t.
+    let mut found_subtype = false;
+    for item in items {
+        match is_subtype(s, item, ctx, resolver) {
+            Some(true) => {
+                found_subtype = true;
+                break;
+            }
+            Some(false) => {}
+            None => return None,
+        }
+    }
+    if found_subtype {
+        return Some(SetOpResult::SameT);
+    }
+    // t <: s iff every item of t is <: s. If any item is not a
+    // subtype, the simplified union won't collapse to s -> defer.
+    for item in items {
+        match is_subtype(item, s, ctx, resolver) {
+            Some(true) => {}
+            Some(false) => return None,
+            None => return None,
+        }
+    }
+    Some(SetOpResult::SameS)
 }
 
 /// `TypeJoinVisitor.visit_instance` (join.py:421-454), the
@@ -1047,12 +1105,104 @@ mod tests {
     }
 
     #[test]
-    fn join_types_union_right_defers() {
-        // visit_union_type needs make_simplified_union -> defer.
-        let r = make_resolver(vec![snap("a.A", "A")]);
+    fn join_types_union_subtype_returns_union() {
+        // visit_union_type (join.py:432-434): if is_proper_subtype(s, t)
+        // return t. s=A, t=Union[A, B] where A <: Union[A, B] (every
+        // member of the union is a supertype of A via A itself). The
+        // is_subtype(s, t) check walks the union items and returns True
+        // if s is a subtype of any item -> SameT (return t=the union).
+        let a = snap("a.A", "A");
+        let b = snap("a.B", "B");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, b, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+        };
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_types_union_supertype_returns_s() {
+        // visit_union_type: s is not <: t (s=A, t=Union[B, C] where A
+        // is unrelated). make_simplified_union([s, t]) would flatten
+        // to Union[A, B, C]. We can't express a new union without a
+        // Type encoder, BUT if t <: s (every union item is a subtype of
+        // s), the simplified union is just s. Detect via is_subtype(t,
+        // s): Union[B, C] <: A when B <: A and C <: A -> SameS.
+        let a = snap("a.A", "A");
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let mut c = snap("a.C", "C");
+        c.has_base.insert("a.A".to_string());
+        c.mro.push("a.A".to_string());
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, b, c, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![instance("a.B", vec![]), instance("a.C", vec![])],
+            uses_pep604_syntax: false,
+        };
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn join_types_union_equal_single_item_returns_s() {
+        // visit_union_type: s=A, t=Union[A] (single-item union, after
+        // get_proper_type it's just A). is_subtype(A, Union[A])=True
+        // (A is a subtype of A which is an item) -> SameT. But t is
+        // Union[A] not A, so the result is the union. In practice the
+        // Python shim calls get_proper_type before the Rust entry, so
+        // single-item unions are flattened. This test guards the
+        // is_subtype(s, t) path with a single-item union.
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, o]);
         let s = instance("a.A", vec![]);
         let t = Type::UnionType {
             items: vec![instance("a.A", vec![])],
+            uses_pep604_syntax: false,
+        };
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_types_union_unrelated_defers() {
+        // visit_union_type: s=A, t=Union[B, C] where A is not <: t
+        // and t is not <: s (B, C unrelated to A). make_simplified_union
+        // would produce Union[A, B, C]. We can't express a new union
+        // without a Type encoder -> defer to Python.
+        let a = snap("a.A", "A");
+        let b = snap("a.B", "B");
+        let c = snap("a.C", "C");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, b, c, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![instance("a.B", vec![]), instance("a.C", vec![])],
+            uses_pep604_syntax: false,
+        };
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_types_union_s_is_union_defers() {
+        // Both s and t are UnionType. The pre-dispatch swap only fires
+        // when exactly one side is a union (join.py:311-312). When both
+        // are unions, visit_union_type calls make_simplified_union
+        // which needs to merge/flatten -> defer (no Type encoder).
+        let a = snap("a.A", "A");
+        let b = snap("a.B", "B");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, b, o]);
+        let s = Type::UnionType {
+            items: vec![instance("a.A", vec![])],
+            uses_pep604_syntax: false,
+        };
+        let t = Type::UnionType {
+            items: vec![instance("a.B", vec![])],
             uses_pep604_syntax: false,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
