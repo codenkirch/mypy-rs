@@ -897,6 +897,12 @@ class BuildManager:
         from mypy.subtypes import _set_native_subtype_active
 
         _set_native_subtype_active(self.options.native_type_kernel)
+        # Stage 3c (M8d): gate the trivial_join/trivial_meet fallbacks.
+        # Reuses the same resolver as the subtype path (trivial_* only
+        # need is_subtype, which shares NativeTypeResolver).
+        from mypy.join import _set_native_join_active
+
+        _set_native_join_active(self.options.native_type_kernel)
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()

@@ -56,11 +56,50 @@ from mypy.types import (
     split_with_prefix_and_suffix,
 )
 
+# Stage 3c (M8d) type-kernel seam: trivial_meet reuses the join
+# path's resolver + WriteBuffer (only needs is_subtype). The active
+# flag + resolver are owned by `mypy.join`, read at call time.
+
 # TODO Describe this module.
 
 
 def trivial_meet(s: Type, t: Type) -> ProperType:
     """Return one of types (expanded) if it is a subtype of other, otherwise bottom type."""
+    # Stage 3c (M8d): try the Rust trivial_meet path. Rust returns a
+    # discriminator (0=SameS, 1=SameT, 2=Object, 3=Bottom) or None
+    # (unsupported, e.g. non-Instance left that makes is_subtype defer).
+    # Reuses the join path's resolver + active flag. Mirrors the
+    # erasetype.py:80-86 strangler-fig contract.
+    if (
+        join._HAS_TYPE_KERNEL
+        and join._native_join_active
+        and join._native_join_resolver is not None
+    ):
+        result = join._type_kernel.rust_trivial_meet(
+            join._serialize_type(s),
+            join._serialize_type(t),
+            False,  # ignore_type_params
+            False,  # ignore_declared_variance
+            False,  # always_covariant
+            False,  # ignore_promotions
+            state.strict_optional,
+            join._native_join_resolver,
+        )
+        if result is not None:
+            if result == 0:
+                return get_proper_type(s)
+            elif result == 1:
+                return get_proper_type(t)
+            elif result == 2:
+                # trivial_meet never returns Object (it's the join path).
+                # Defensive: fall through if it ever does.
+                pass
+            elif result == 3:
+                if state.strict_optional:
+                    return UninhabitedType()
+                else:
+                    return NoneType()
+        # Rust returned None (unsupported case) — fall through to Python.
     if is_subtype(s, t):
         return get_proper_type(s)
     elif is_subtype(t, s):

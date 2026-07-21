@@ -43,7 +43,7 @@ pub(crate) struct SubtypeContext {
 }
 
 impl SubtypeContext {
-    fn new(
+    pub(crate) fn new(
         ignore_type_params: bool,
         ignore_declared_variance: bool,
         always_covariant: bool,
