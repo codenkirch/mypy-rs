@@ -1744,7 +1744,9 @@ class NativeTypeWireResolverSuite(Suite):
     def setUp(self) -> None:
         self.fx = TypeFixture()
         # The fixture's TypeInfo graph: all TypeInfos reachable from the
-        # fixture instances. build_resolver walks them into snapshot dicts.
+        # fixture instances. build_native_resolver walks them into the
+        # NativeTypeResolver pyclass (Rust-owned HashMaps, zero FFI per
+        # lookup). No aliases in this fixture; pass [].
         type_infos = [
             self.fx.oi,
             self.fx.ai,
@@ -1769,7 +1771,7 @@ class NativeTypeWireResolverSuite(Suite):
             self.fx.str_type_info,
             self.fx.functioni,
         ]
-        self.resolver = _type_kernel.build_resolver(type_infos)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
 
     def _bytes_of(self, t: Type) -> bytes:
         buf = _WriteBuffer()
@@ -1778,7 +1780,7 @@ class NativeTypeWireResolverSuite(Suite):
 
     def assert_wire_par(self, t: Type) -> None:
         expected = str(t)
-        actual = _type_kernel.read_type_to_str_with_resolver(
+        actual = _type_kernel.read_type_to_str_with_native_resolver(
             self._bytes_of(t), self.resolver
         )
         assert_equal(
