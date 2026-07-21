@@ -57,6 +57,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
+    module.add_function(wrap_pyfunction!(wire::round_trip_type_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(typeinfo::build_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(
         typeinfo::read_type_to_str_with_resolver,

@@ -18,6 +18,7 @@ from mypy.subtypes import (
     is_protocol_implementation,
     is_subtype,
 )
+from mypy.type_visitor import TypeTranslator
 from mypy.types import (
     AnyType,
     CallableType,
@@ -51,6 +52,7 @@ from mypy.types import (
     find_unpack_in_list,
     get_proper_type,
     get_proper_types,
+    read_type,
     split_with_prefix_and_suffix,
 )
 
@@ -59,11 +61,13 @@ from mypy.types import (
 # Rust returns None for unhandled (non-Instance right).
 try:
     import type_kernel as _type_kernel
+    from librt.internal import ReadBuffer as _ReadBuffer
     from librt.internal import WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
     _WriteBuffer = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -91,6 +95,66 @@ def _set_native_join_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
     """Install the fullname -> TypeInfo map for the Ancestor result."""
     global _native_join_typeinfo_map
     _native_join_typeinfo_map = typeinfo_map
+
+
+def _fixup_decoded_type(typ: Type) -> Type | None:
+    """Resolve `type_ref` strings in a wire-decoded Type to live TypeInfo.
+
+    `read_type` produces Instances whose `type` is `NOT_READY` (a
+    FakeInfo) and whose `type_ref` holds the fullname. This mirrors
+    `fixup.TypeFixer.visit_instance` but consults the fullname ->
+    TypeInfo map held by this module (the same one used for `disc == 5`
+    Ancestor reconstruction), avoiding the need for a full
+    `modules: dict[str, MypyFile]` graph.
+
+    Returns None if any Instance's `type_ref` is absent from the map,
+    so the caller can defer to Python. Mutates Instances in place when
+    possible (each Instance is freshly built by `read_type`, so there
+    is no aliasing risk).
+    """
+    if _native_join_typeinfo_map is None:
+        return None
+    fixer = _TypeRefFixer(_native_join_typeinfo_map)
+    result = typ.accept(fixer)
+    return None if fixer.missing else result
+
+
+class _TypeRefFixer(TypeTranslator):
+    """Resolve wire-decoded `Instance.type_ref` to live TypeInfo in place.
+
+    Overrides only `visit_instance` (and `visit_type_type` to descend
+    into the item); other variants carry no `Instance` references. Sets
+    `self.missing` when a `type_ref` is absent from the map so the
+    caller can defer to Python.
+    """
+
+    def __init__(self, typeinfo_map: dict[str, Any]) -> None:
+        super().__init__()
+        self.typeinfo_map = typeinfo_map
+        self.missing = False
+
+    def visit_instance(self, t: Instance, /) -> Type:
+        if t.type_ref is not None:
+            info = self.typeinfo_map.get(t.type_ref)
+            if info is None:
+                self.missing = True
+                return t
+            t.type = info
+            t.type_ref = None
+        if self.missing:
+            return t
+        return super().visit_instance(t)
+
+    def visit_type_type(self, t: TypeType, /) -> Type:
+        if self.missing:
+            return t
+        return super().visit_type_type(t)
+
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        # TypeAliasType carries its own `type_ref` -> `alias` fixup,
+        # but the Rust encoder does not emit TypeAliasType today.
+        # Leave it untouched to avoid masking a missing alias.
+        return t
 
 
 def _set_native_join_resolver(resolver: Any) -> None:
@@ -343,7 +407,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
             _native_join_resolver,
         )
         if result is not None:
-            disc, fullname, arg_discs = result
+            disc, fullname, arg_discs, encoded = result
             if disc == 0:
                 return s
             elif disc == 1:
@@ -354,6 +418,17 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 return UninhabitedType() if state.strict_optional else NoneType()
             elif disc == 4:
                 return AnyType(TypeOfAny.special_form)
+            elif disc == 7:
+                # Encoded: Rust built a new type and serialized it in
+                # the wire format. Decode via read_type(ReadBuffer),
+                # then resolve wire-only `type_ref` strings to live
+                # TypeInfo via the fullname -> TypeInfo map. If any
+                # type_ref is missing, defer to Python.
+                decoded = read_type(_ReadBuffer(bytes(encoded)))
+                fixed = _fixup_decoded_type(decoded)
+                if fixed is not None:
+                    return fixed
+                # Fall through to Python.
             elif disc == 5:
                 # Ancestor: construct Instance(typeinfo, []) from the
                 # fullname -> TypeInfo map. If the map is missing or the

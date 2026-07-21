@@ -53,6 +53,7 @@ from mypy.types import (
     get_proper_types,
     has_type_vars,
     is_named_instance,
+    read_type,
     split_with_prefix_and_suffix,
 )
 
@@ -174,7 +175,7 @@ def meet_types(s: Type, t: Type) -> ProperType:
             join._native_join_resolver,
         )
         if result is not None:
-            disc, _fullname, _arg_discs = result
+            disc, _fullname, _arg_discs, encoded = result
             if disc == 0:
                 return s
             elif disc == 1:
@@ -183,6 +184,17 @@ def meet_types(s: Type, t: Type) -> ProperType:
                 return UninhabitedType() if state.strict_optional else NoneType()
             elif disc == 4:
                 return AnyType(TypeOfAny.special_form)
+            elif disc == 7:
+                # Encoded: Rust built a new type and serialized it in
+                # the wire format. Decode via read_type(ReadBuffer),
+                # then resolve wire-only `type_ref` strings to live
+                # TypeInfo via join._fixup_decoded_type. If any type_ref
+                # is missing, defer to Python.
+                decoded = read_type(join._ReadBuffer(bytes(encoded)))
+                fixed = join._fixup_decoded_type(decoded)
+                if fixed is not None:
+                    return fixed
+                # Fall through to Python.
             # disc == 2 (Object), 5 (Ancestor), 6 (SameTypeWithArgs)
             # are join-only results; meet_types never emits them. Fall
             # through to Python if Rust ever does.
