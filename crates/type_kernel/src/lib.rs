@@ -21,12 +21,21 @@
 //!     `TypeInfo` graph into a snapshot keyed by `fullname`, closing the
 //!     Stage 3a deferred renderings (prefix-strip, enum/bytes literal,
 //!     `[()]` variadic-tuple). Foundation for Stage 3c (`is_subtype`).
+//!   * **Stage 3c / M8a** (`typeinfo::build_native_resolver` +
+//!     `typeinfo::read_type_to_str_with_native_resolver` +
+//!     `aliases::build_alias_resolver`): enriches the snapshot with
+//!     `bases`, `tuple_type`, `type_var_tuple_prefix/suffix`,
+//!     `type_vars_with_variance`, and adds a `TypeAliasResolver` for
+//!     `TypeAliasType` expansion. The `NativeTypeResolver` `#[pyclass]`
+//!     holds both resolvers in Rust for zero-FFI-per-lookup access by
+//!     Stage 3c `is_subtype`.
 //!
 //! Shared infrastructure (`TypeRefs` class cache, `fallback_sentinel`/
 //! `is_fallback`, `make_any`) lives in `refs` and is reused by both stages.
 //! See `docs/rust-migration-strangler.md` ("Milestone 3/4/5 (Phase 4)") for the
 //! full staging roadmap.
 
+mod aliases;
 mod erase;
 mod lkv;
 mod refs;
@@ -36,7 +45,8 @@ mod wire;
 use pyo3::prelude::*;
 
 /// PyO3 module entry point: registers the visitor functions (Stages 1/2)
-/// and the parity-only wire readers (Stages 3a/3b).
+/// and the parity-only wire readers (Stages 3a/3b) + the Stage 3c M8a
+/// native resolver.
 #[pymodule]
 fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(erase::erase_type, module)?)?;
@@ -50,5 +60,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeinfo::read_type_to_str_with_resolver,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(aliases::build_alias_resolver, module)?)?;
+    module.add_function(wrap_pyfunction!(typeinfo::build_native_resolver, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        typeinfo::read_type_to_str_with_native_resolver,
+        module
+    )?)?;
+    module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }

@@ -68,6 +68,25 @@ pub(crate) struct TypeInfoSnapshot {
     /// `TypeInfo.metaclass_type` fullname, if any (nodes.py:3701).
     /// subtypes.py:1195,1433.
     pub metaclass_fullname: Option<String>,
+    /// `TypeInfo.bases` serialized as wire-format `Instance` blobs
+    /// (nodes.py:3880). Each element is a `Type::Instance` blob; Stage 3c
+    /// decodes via `wire::read_type` for `map_instance_to_supertype`.
+    /// Mirrors the promote_bytes pattern.
+    pub bases: Vec<Vec<u8>>,
+    /// `TypeInfo.tuple_type` serialized as a wire-format `TupleType` blob,
+    /// or `None` (nodes.py:3905). maptype.py:78 special-cases
+    /// `builtins.tuple` bases when set.
+    pub tuple_type: Option<Vec<u8>>,
+    /// `TypeInfo.type_var_tuple_prefix` (nodes.py:3895). subtypes.py:572.
+    pub type_var_tuple_prefix: Option<usize>,
+    /// `TypeInfo.type_var_tuple_suffix` (nodes.py:3896). subtypes.py:575.
+    pub type_var_tuple_suffix: Option<usize>,
+    /// `(name, variance, kind)` for each `defn.type_vars` entry.
+    /// variance: 0=INVARIANT, 1=COVARIANT, 2=CONTRAVARIANT,
+    /// 3=VARIANCE_NOT_READY (nodes.py:3146). kind: 0=TypeVarType,
+    /// 1=ParamSpecType, 2=TypeVarTupleType. Stage 3c dispatches
+    /// `check_type_parameter` on (variance, kind).
+    pub type_vars_with_variance: Vec<(String, i64, i64)>,
 }
 
 #[allow(dead_code)]
@@ -116,6 +135,12 @@ impl TypeResolver {
 
     pub fn is_empty(&self) -> bool {
         self.snapshots.is_empty()
+    }
+
+    /// Iterate over all `(fullname, snapshot)` pairs. Used by
+    /// `NativeTypeResolver::render_dict` to build the lazy dict view.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &TypeInfoSnapshot)> {
+        self.snapshots.iter()
     }
 }
 
@@ -188,51 +213,110 @@ fn read_str_list_attr(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
-/// Serialize each `TypeInfo._promote` Type to bytes via mypy's WriteBuffer.
-/// Returns a Vec of byte blobs; Stage 3c decodes via `wire::read_type`.
-fn read_promote_bytes(py: Python<'_>, obj: &PyAny) -> Vec<Vec<u8>> {
-    let promote = match obj.getattr("_promote") {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-    let list = match promote.downcast::<PyList>() {
-        Ok(l) => l,
-        Err(_) => return Vec::new(),
-    };
-    let write_buffer_cls = match py.import("librt.internal") {
-        Ok(mod_) => match mod_.getattr("WriteBuffer") {
-            Ok(cls) => cls,
+/// Serialize a single `mypy.types.Type` (or any object with `.write(buf)`)
+/// to its wire-format bytes via mypy's `librt.internal.WriteBuffer`.
+/// Returns `None` on any failure. Used for `_promote`, `bases`,
+/// `tuple_type` — any field Stage 3c decodes via `wire::read_type`.
+pub(crate) fn serialize_type_to_bytes(py: Python<'_>, obj: &PyAny) -> Option<Vec<u8>> {
+    let write_buffer_cls = py
+        .import("librt.internal")
+        .ok()?
+        .getattr("WriteBuffer")
+        .ok()?;
+    let buf = write_buffer_cls.call0().ok()?;
+    let write = obj.getattr("write").ok()?;
+    write.call1((buf,)).ok()?;
+    let bytes = buf.getattr("getvalue").ok()?.call0().ok()?;
+    bytes.extract::<Vec<u8>>().ok()
+}
+
+/// Serialize each element of a `list[Type]` attribute to wire-format bytes.
+/// Returns an empty Vec if the attribute is missing or not a list; skips
+/// individual items that fail to serialize.
+fn read_type_list_bytes(py: Python<'_>, obj: &PyAny, attr: &str) -> Vec<Vec<u8>> {
+    let list = match obj.getattr(attr) {
+        Ok(l) => match l.downcast::<PyList>() {
+            Ok(list) => list,
             Err(_) => return Vec::new(),
         },
         Err(_) => return Vec::new(),
     };
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(list.len());
     for item in list.iter() {
-        // Each item is a mypy.types.Type; call `item.write(buf)` then
-        // `buf.getvalue()`. Skip on any failure.
-        let buf = match write_buffer_cls.call0() {
-            Ok(b) => b,
-            Err(_) => continue,
-        };
-        let write = match item.getattr("write") {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
-        if write.call1((buf,)).is_err() {
-            continue;
-        }
-        let bytes = match buf.getattr("getvalue") {
-            Ok(g) => match g.call0() {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-            Err(_) => continue,
-        };
-        if let Ok(b) = bytes.extract::<Vec<u8>>() {
+        if let Some(b) = serialize_type_to_bytes(py, item) {
             out.push(b);
         }
     }
     out
+}
+
+/// Serialize an `Optional[Type]` attribute (e.g. `tuple_type`) to
+/// `Option<Vec<u8>>`. Returns `None` if the attribute is `None` or missing.
+fn read_opt_type_bytes(py: Python<'_>, obj: &PyAny, attr: &str) -> Option<Vec<u8>> {
+    let value = obj.getattr(attr).ok()?;
+    if value.is_none() {
+        return None;
+    }
+    serialize_type_to_bytes(py, value)
+}
+
+/// Serialize each `TypeInfo._promote` Type to bytes via mypy's WriteBuffer.
+/// Returns a Vec of byte blobs; Stage 3c decodes via `wire::read_type`.
+fn read_promote_bytes(py: Python<'_>, obj: &PyAny) -> Vec<Vec<u8>> {
+    read_type_list_bytes(py, obj, "_promote")
+}
+
+/// Read `TypeInfo.defn.type_vars` as `(name, variance, kind)` triples.
+/// variance: 0=INVARIANT, 1=COVARIANT, 2=CONTRAVARIANT, 3=VARIANCE_NOT_READY
+/// (nodes.py:3146). kind: 0=TypeVarType, 1=ParamSpecType, 2=TypeVarTupleType.
+/// ParamSpec and TypeVarTuple default to variance=0 (INVARIANT) since
+/// `check_type_parameter` (subtypes.py:617-621) treats them as invariant
+/// unless overridden.
+fn read_type_vars_with_variance(obj: &PyAny) -> Vec<(String, i64, i64)> {
+    let defn = match obj.getattr("defn") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let tvars = match defn.getattr("type_vars") {
+        Ok(t) => match t.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(tvars.len());
+    for item in tvars.iter() {
+        let name = match item.getattr("name").and_then(|n| n.extract::<String>()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        // Class-name dispatch: TypeVarType has `.variance`; others default 0.
+        let class_name: String = item.get_type().name().unwrap_or("").to_string();
+        let (variance, kind) = match class_name.as_str() {
+            "TypeVarType" => {
+                let v: i64 = item
+                    .getattr("variance")
+                    .ok()
+                    .and_then(|x| x.extract().ok())
+                    .unwrap_or(0);
+                (v, 0)
+            }
+            "ParamSpecType" => (0, 1),
+            "TypeVarTupleType" => (0, 2),
+            _ => (0, 0),
+        };
+        out.push((name, variance, kind));
+    }
+    out
+}
+
+/// Read `TypeInfo.type_var_tuple_prefix` / `_suffix` as `Option<usize>`.
+fn read_opt_usize_attr(obj: &PyAny, attr: &str) -> Option<usize> {
+    let v = obj.getattr(attr).ok()?;
+    if v.is_none() {
+        return None;
+    }
+    v.extract::<usize>().ok()
 }
 
 /// Build a resolver (Python `dict[str, dict]`) from an iterable of live
@@ -341,6 +425,41 @@ pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyO
         // metaclass_type: Option[Instance] -> Option[fullname].
         let meta = read_opt_instance_fullname(item, "metaclass_type");
         snap_dict.set_item("metaclass_fullname", meta.as_ref())?;
+
+        // bases: serialize each `TypeInfo.bases` Instance to wire bytes.
+        let bases = read_type_list_bytes(py, item, "bases");
+        let py_bases = PyList::new(py, bases.iter().map(|b| PyBytes::new(py, b).to_object(py)));
+        snap_dict.set_item("bases", py_bases)?;
+
+        // tuple_type: Optional[TupleType] -> Option[wire bytes].
+        let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
+        match &tuple_type {
+            Some(b) => snap_dict.set_item("tuple_type", PyBytes::new(py, b))?,
+            None => snap_dict.set_item("tuple_type", py.None())?,
+        }
+
+        // type_var_tuple_prefix / _suffix: Option[usize].
+        let prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
+        match prefix {
+            Some(p) => snap_dict.set_item("type_var_tuple_prefix", p)?,
+            None => snap_dict.set_item("type_var_tuple_prefix", py.None())?,
+        }
+        let suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
+        match suffix {
+            Some(s) => snap_dict.set_item("type_var_tuple_suffix", s)?,
+            None => snap_dict.set_item("type_var_tuple_suffix", py.None())?,
+        }
+
+        // type_vars_with_variance: Vec<(name, variance, kind)>.
+        let tvw = read_type_vars_with_variance(item);
+        let py_tvw = PyList::new(
+            py,
+            tvw.iter().map(|(n, v, k)| {
+                let tup = (n.as_str(), *v, *k).to_object(py);
+                tup
+            }),
+        );
+        snap_dict.set_item("type_vars_with_variance", py_tvw)?;
 
         result.set_item(fullname, snap_dict)?;
     }
@@ -544,6 +663,252 @@ pub(crate) fn read_type_to_str_with_resolver(
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     let resolver_dict = resolver.downcast::<PyDict>()?;
     Ok(render_type(py, &typ, Some(resolver_dict)))
+}
+
+/// `#[pyclass]` wrapper holding the `TypeResolver` and `TypeAliasResolver`
+/// in Rust, so Stage 3c `is_subtype` can consult them with zero FFI per
+/// lookup. The Stage 3b `render_type` path still needs a `&PyDict`, so the
+/// pyclass lazily builds and caches a dict view on first render.
+///
+/// Built once per type-checking pass by `build_native_resolver` from the
+/// live Python TypeInfo graph + alias symbol table. Held by the build
+/// manager (`mypy.build`) and threaded into `mypy.subtypes` in M8b.
+#[pyclass]
+#[allow(dead_code)]
+pub(crate) struct NativeTypeResolver {
+    resolver: TypeResolver,
+    alias_resolver: crate::aliases::TypeAliasResolver,
+    /// Lazily-built dict view for the Stage 3b `render_type` path.
+    /// `None` until first `render_dict()` call. Kept on the Python heap
+    /// because `render_type` takes `&PyDict`.
+    cached_dict: Option<PyObject>,
+}
+
+#[pymethods]
+#[allow(dead_code)]
+impl NativeTypeResolver {
+    /// Number of TypeInfo snapshots held.
+    #[getter]
+    fn len(&self) -> usize {
+        self.resolver.len()
+    }
+
+    /// Number of TypeAlias snapshots held.
+    #[getter]
+    fn alias_len(&self) -> usize {
+        self.alias_resolver.len()
+    }
+
+    /// Return (and lazily build) the dict view of the TypeInfo resolver,
+    /// for the Stage 3b `render_type` path. Subsequent calls return the
+    /// cached dict without rebuilding.
+    fn render_dict(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        if let Some(d) = &self.cached_dict {
+            return Ok(d.clone_ref(py));
+        }
+        let dict = PyDict::new(py);
+        // The dict view mirrors build_resolver's output shape so the
+        // existing render_type lookup_render_fields works unchanged.
+        for (fullname, snap) in self.resolver_snapshots_for_render() {
+            let inner = PyDict::new(py);
+            inner.set_item("fullname", &snap.fullname)?;
+            inner.set_item("name", &snap.name)?;
+            inner.set_item("is_protocol", snap.is_protocol)?;
+            inner.set_item("is_enum", snap.is_enum)?;
+            inner.set_item("fallback_to_any", snap.fallback_to_any)?;
+            inner.set_item("has_type_var_tuple_type", snap.has_type_var_tuple_type)?;
+            let tv: Vec<String> = snap.type_vars.clone();
+            inner.set_item("type_vars", PyList::new(py, &tv))?;
+            dict.set_item(fullname, inner)?;
+        }
+        let obj: PyObject = dict.into();
+        self.cached_dict = Some(obj.clone_ref(py));
+        Ok(obj)
+    }
+}
+
+impl NativeTypeResolver {
+    fn new(resolver: TypeResolver, alias_resolver: crate::aliases::TypeAliasResolver) -> Self {
+        Self {
+            resolver,
+            alias_resolver,
+            cached_dict: None,
+        }
+    }
+
+    /// Borrow the snapshots for the dict-view builder. Returns an iterator
+    /// of `(fullname, &TypeInfoSnapshot)`.
+    fn resolver_snapshots_for_render(
+        &mut self,
+    ) -> impl Iterator<Item = (&String, &TypeInfoSnapshot)> {
+        self.resolver_snapshots_iter()
+    }
+
+    fn resolver_snapshots_iter(&self) -> impl Iterator<Item = (&String, &TypeInfoSnapshot)> {
+        self.resolver.iter()
+    }
+}
+
+/// Build a `NativeTypeResolver` pyclass from an iterable of live
+/// `mypy.nodes.TypeInfo` objects and an iterable of `mypy.nodes.TypeAlias`
+/// objects. Holds both resolvers in Rust; the dict view is built lazily
+/// on first `render_dict()` call.
+///
+/// Mirrors `build_resolver` (dict-returning, Stage 3b) but returns the
+/// Rust-owned pyclass for zero-FFI-per-lookup access by Stage 3c
+/// `is_subtype`. The dict-returning `build_resolver` remains for one
+/// release as a deprecated alias so Stage 3b parity tests don't break.
+#[pyfunction]
+pub(crate) fn build_native_resolver(
+    py: Python<'_>,
+    type_infos: &PyAny,
+    aliases: &PyAny,
+) -> PyResult<Py<NativeTypeResolver>> {
+    let mut resolver = TypeResolver::new();
+    for item in type_infos.iter()? {
+        let item = item?;
+        let fullname = match read_str_attr(item, "fullname") {
+            Some(f) => f,
+            None => continue,
+        };
+        let name = read_str_attr(item, "name")
+            .unwrap_or_else(|| fullname.rsplit('.').next().unwrap_or(&fullname).to_owned());
+        let is_protocol = read_bool_attr(item, "is_protocol").unwrap_or(false);
+        let is_enum = read_bool_attr(item, "is_enum").unwrap_or(false);
+        let fallback_to_any = read_bool_attr(item, "fallback_to_any").unwrap_or(false);
+        let meta_fallback_to_any = read_bool_attr(item, "meta_fallback_to_any").unwrap_or(false);
+        let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
+        let has_type_var_tuple_type =
+            read_bool_attr(item, "has_type_var_tuple_type").unwrap_or(false);
+        let is_abstract = read_bool_attr(item, "is_abstract").unwrap_or(false);
+        let type_vars = read_str_list_attr(item, "type_vars").unwrap_or_default();
+        let mro = read_mro_fullnames(item, "mro").unwrap_or_default();
+        let has_base: HashSet<String> = mro.iter().cloned().collect();
+        let protocol_members = item
+            .getattr("protocol_members")
+            .ok()
+            .and_then(|pm| pm.downcast::<PyList>().ok())
+            .map(|list| {
+                list.iter()
+                    .filter_map(|x| x.extract::<String>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let promote_bytes = read_promote_bytes(py, item);
+        let alt_promote_fullname = read_opt_instance_fullname(item, "alt_promote");
+        let metaclass_fullname = read_opt_instance_fullname(item, "metaclass_type");
+        let bases = read_type_list_bytes(py, item, "bases");
+        let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
+        let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
+        let type_var_tuple_suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
+        let type_vars_with_variance = read_type_vars_with_variance(item);
+
+        let snap = TypeInfoSnapshot {
+            fullname,
+            name,
+            is_protocol,
+            is_enum,
+            fallback_to_any,
+            meta_fallback_to_any,
+            is_named_tuple,
+            has_type_var_tuple_type,
+            is_abstract,
+            type_vars,
+            mro,
+            protocol_members,
+            has_base,
+            promote_bytes,
+            alt_promote_fullname,
+            metaclass_fullname,
+            bases,
+            tuple_type,
+            type_var_tuple_prefix,
+            type_var_tuple_suffix,
+            type_vars_with_variance,
+        };
+        resolver.insert(snap.fullname.clone(), snap);
+    }
+
+    let mut alias_resolver = crate::aliases::TypeAliasResolver::new();
+    for item in aliases.iter()? {
+        let item = item?;
+        let fullname: String = match item.getattr("fullname").and_then(|f| f.extract()) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let target = match serialize_type_to_bytes(py, item) {
+            Some(b) => b,
+            None => continue,
+        };
+        let alias_tvars = read_alias_tvar_names_pub(item);
+        let tvar_tuple_index = read_tvar_tuple_index_pub(item);
+        let no_args: bool = item
+            .getattr("no_args")
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or(false);
+        let snap = crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.clone(),
+            target,
+            alias_tvars,
+            tvar_tuple_index,
+            no_args,
+        };
+        alias_resolver.insert(fullname, snap);
+    }
+
+    let native = NativeTypeResolver::new(resolver, alias_resolver);
+    Py::new(py, native)
+}
+
+/// Read `TypeAlias.alias_tvars` as a Vec of names. Mirrors the private
+/// helper in `aliases.rs` but `pub(crate)` so `build_native_resolver`
+/// can reuse it without exposing the alias-iter logic.
+fn read_alias_tvar_names_pub(obj: &PyAny) -> Vec<String> {
+    let tvars = match obj.getattr("alias_tvars") {
+        Ok(t) => match t.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(tvars.len());
+    for item in tvars.iter() {
+        if let Ok(n) = item.getattr("name").and_then(|n| n.extract::<String>()) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+/// Read `TypeAlias.tvar_tuple_index` as `Option<usize>`.
+fn read_tvar_tuple_index_pub(obj: &PyAny) -> Option<usize> {
+    let v = obj.getattr("tvar_tuple_index").ok()?;
+    if v.is_none() {
+        return None;
+    }
+    v.extract::<usize>().ok()
+}
+
+/// Read a serialized Type from bytes, resolving `type_ref` via the
+/// `NativeTypeResolver` pyclass (built by `build_native_resolver`),
+/// and return `str(t)`. This is the M8a zero-FFI-per-lookup path: the
+/// resolver is Rust-owned, only the final str crosses the boundary.
+///
+/// Parity contract:
+///   `str(python_type) == read_type_to_str_with_native_resolver(bytes, resolver)`
+#[pyfunction]
+pub(crate) fn read_type_to_str_with_native_resolver(
+    py: Python<'_>,
+    bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> PyResult<String> {
+    let mut buf = ReadBuffer::new(bytes);
+    let typ = wire::read_type(&mut buf, None)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    let dict_obj = resolver.render_dict(py)?;
+    let dict = dict_obj.downcast::<PyDict>(py)?;
+    Ok(render_type(py, &typ, Some(dict)))
 }
 
 #[cfg(test)]
@@ -846,5 +1211,56 @@ mod tests {
             let rendered = render_type(py, &t, Some(resolver));
             assert_eq!(rendered, "tuple[Any, ...]");
         });
+    }
+
+    // --- Stage 3c M8a: enriched snapshot field tests ---
+
+    #[test]
+    fn snapshot_default_has_empty_enriched_fields() {
+        let s = TypeInfoSnapshot::default();
+        assert!(s.bases.is_empty());
+        assert!(s.tuple_type.is_none());
+        assert!(s.type_var_tuple_prefix.is_none());
+        assert!(s.type_var_tuple_suffix.is_none());
+        assert!(s.type_vars_with_variance.is_empty());
+    }
+
+    #[test]
+    fn snapshot_carries_bases_and_tuple_type_blobs() {
+        let mut s = snap("builtins.int", "int");
+        s.bases = vec![vec![1, 2, 3], vec![4, 5]];
+        s.tuple_type = Some(vec![0xAB]);
+        assert_eq!(s.bases.len(), 2);
+        assert_eq!(s.bases[0], vec![1, 2, 3]);
+        assert_eq!(s.tuple_type.as_deref(), Some(&[0xAB][..]));
+    }
+
+    #[test]
+    fn snapshot_carries_type_var_tuple_prefix_and_suffix() {
+        let mut s = snap("foo.VarTuple", "VarTuple");
+        s.type_var_tuple_prefix = Some(2);
+        s.type_var_tuple_suffix = Some(1);
+        assert_eq!(s.type_var_tuple_prefix, Some(2));
+        assert_eq!(s.type_var_tuple_suffix, Some(1));
+    }
+
+    #[test]
+    fn snapshot_carries_type_vars_with_variance() {
+        let mut s = snap("foo.Generic", "Generic");
+        // (name, variance, kind): COVARIANT=1 TypeVar, INVARIANT=0 ParamSpec.
+        s.type_vars_with_variance = vec![("T".to_string(), 1, 0), ("P".to_string(), 0, 1)];
+        assert_eq!(s.type_vars_with_variance.len(), 2);
+        assert_eq!(s.type_vars_with_variance[0], ("T".to_string(), 1, 0));
+        assert_eq!(s.type_vars_with_variance[1], ("P".to_string(), 0, 1));
+    }
+
+    #[test]
+    fn resolver_iter_yields_all_inserted_snapshots() {
+        let mut r = TypeResolver::new();
+        r.insert("a".to_string(), snap("a", "a"));
+        r.insert("b".to_string(), snap("b", "b"));
+        let mut keys: Vec<&String> = r.iter().map(|(k, _)| k).collect();
+        keys.sort();
+        assert_eq!(keys, vec![&"a".to_string(), &"b".to_string()]);
     }
 }
