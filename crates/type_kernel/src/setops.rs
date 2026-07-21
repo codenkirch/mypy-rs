@@ -39,7 +39,9 @@ use pyo3::prelude::*;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{self, ReadBuffer, Type};
 
-use crate::subtypes::{is_subtype, SubtypeContext};
+use crate::subtypes::{
+    is_subtype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT, VARIANCE_NOT_READY,
+};
 
 /// Discriminator for `trivial_join` / `trivial_meet` / `join_types`
 /// results.
@@ -55,6 +57,12 @@ use crate::subtypes::{is_subtype, SubtypeContext};
 ///   (the common supertype found by the Instance-Instance nominal join;
 ///   the Python shim holds a fullname -> TypeInfo map alongside the
 ///   resolver).
+/// * `SameTypeWithArgs { type_ref, arg_discs }` ->
+///   `Instance(typeinfo_map[type_ref], [reconstructed args])` where
+///   each `arg_discs[i]` is 0 (use `s.args[i]`), 1 (use `t.args[i]`),
+///   or 4 (use `AnyType(from_another_any)`). Produced by the
+///   same-type-with-args join (join.py:114-180) when every arg reduces
+///   to one of the original args or Any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum SetOpResult {
@@ -64,6 +72,13 @@ pub(crate) enum SetOpResult {
     Bottom,
     Any,
     Ancestor(String),
+    /// Same-type Instance-Instance join with per-arg discriminators.
+    /// `arg_discs[i]`: 0=left arg (s.args[i]), 1=right arg
+    /// (t.args[i]), 4=AnyType(from_another_any).
+    SameTypeWithArgs {
+        type_ref: String,
+        arg_discs: Vec<i8>,
+    },
 }
 
 /// `trivial_join` (join.py:198-205), Rust subset.
@@ -215,6 +230,8 @@ pub(crate) fn join_types(
 
 /// Swap SameS/SameT when the join_types pre-dispatch swapped s and t.
 /// `Object`, `Bottom`, `Any`, and `Ancestor` are swap-invariant.
+/// `SameTypeWithArgs` exchanges per-arg Left(0)/Right(1) discriminators
+/// (Any=4 is invariant); `type_ref` is unchanged (same-type case).
 fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
     if !swapped {
         return r;
@@ -222,6 +239,23 @@ fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
     match r {
         SetOpResult::SameS => SetOpResult::SameT,
         SetOpResult::SameT => SetOpResult::SameS,
+        SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        } => {
+            let flipped = arg_discs
+                .into_iter()
+                .map(|d| match d {
+                    0 => 1,
+                    1 => 0,
+                    other => other,
+                })
+                .collect();
+            SetOpResult::SameTypeWithArgs {
+                type_ref,
+                arg_discs: flipped,
+            }
+        }
         other => other,
     }
 }
@@ -279,44 +313,52 @@ fn visit_join(
 /// `TypeJoinVisitor.visit_instance` (join.py:421-454), the
 /// `isinstance(self.s, Instance)` branch, Rust subset.
 ///
-/// Ports the `InstanceJoiner.join_instances` (join.py:107-202) nominal
-/// path for args-less instances only:
-/// - Same type (t.type == s.type, no args) -> SameS (return s).
-/// - t <: s (ignore_type_params) -> join_instances_via_supertype(t, s):
-///   walk t's bases, find the common ancestor via recursion.
-/// - else -> join_instances_via_supertype(s, t): walk s's bases.
+/// Ports the `InstanceJoiner.join_instances` (join.py:107-202):
+/// - Same type, both args-less -> SameS.
+/// - Same type, args present -> `visit_instance_with_args` (M8g):
+///   AnyType args + invariant `is_equivalent` only; covariant /
+///   variadic / ParamSpec / TypeVarTupleType defer.
+/// - Different type, both args-less -> `join_instances_via_supertype`
+///   (the nominal common-ancestor walk).
+/// - Different type with args -> defer (the via_supertype path with
+///   args needs `expand_type_by_instance` on each base, deferred).
 ///
-/// The common-ancestor walk (`join_instances_via_supertype`,
-/// join.py:204-240) for args-less instances reduces to: collect base
-/// type_refs from both t and s, map each base, recurse
-/// `join_instances(base, other)`, pick the one with the longest MRO
-/// (`is_better`, join.py:804+). Returns `Ancestor(fullname)` when a
-/// common ancestor is found, `Object` when the walk bottoms out at
-/// `builtins.object`, or `None` (defer) when args are present or a
-/// promote/blob decode fails.
+/// Returns `None` (defer to Python) when args are present but the
+/// specific arg-shape is not handled, or when a promote/blob decode
+/// fails.
 fn visit_instance_join(
     s: &Type,
     t: &Type,
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
-    let s_ref = match s {
-        Type::Instance { type_ref, args, .. } if args.is_empty() => type_ref.as_str(),
-        // s is not an args-less Instance: the FunctionLike/TypeType/
-        // TypedDict/Tuple/Literal/TypeVarTuple branches (join.py:437-454)
-        // all recurse into join_types — defer to Python.
+    let (s_ref, s_args) = match s {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        // s is not an Instance: the FunctionLike/TypeType/TypedDict/
+        // Tuple/Literal/TypeVarTuple branches (join.py:437-454) all
+        // recurse into join_types — defer to Python.
         _ => return None,
     };
-    let t_ref = match t {
-        Type::Instance { type_ref, args, .. } if args.is_empty() => type_ref.as_str(),
-        // t has args: the same-type case needs to join args via
-        // join_types (covariant) or is_equivalent (invariant) — defer.
+    let (t_ref, t_args) = match t {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,
     };
 
-    // join.py:114: t.type == s.type -> return Instance(t.type, []).
+    // join.py:114: t.type == s.type -> combine type args.
     if t_ref == s_ref {
-        return Some(SetOpResult::SameS);
+        if s_args.is_empty() && t_args.is_empty() {
+            return Some(SetOpResult::SameS);
+        }
+        // Same type with args: M8g handles AnyType + invariant
+        // is_equivalent; covariant / variadic / ParamSpec defer.
+        return visit_instance_with_args(s_ref, s_args, t_args, ctx, resolver);
+    }
+
+    // Different types with args: the via_supertype path needs
+    // expand_type_by_instance on each base (join.py:204-240 with
+    // args). Deferred — fall through to Python.
+    if !s_args.is_empty() || !t_args.is_empty() {
+        return None;
     }
 
     // join.py:191-199: dispatch to join_instances_via_supertype.
@@ -335,6 +377,121 @@ fn visit_instance_join(
         JoinResult::Left => SetOpResult::SameS,
         JoinResult::Ancestor(fullname) => SetOpResult::Ancestor(fullname),
         JoinResult::Object => SetOpResult::Object,
+    })
+}
+
+/// `InstanceJoiner.join_instances` same-type-with-args branch
+/// (join.py:114-180), Rust subset.
+///
+/// Combines type arguments positionally via `zip(t.args, s.args,
+/// type_vars)`. M8g handles:
+/// * AnyType arg (either side) -> `AnyType(from_another_any)`
+///   (arg disc 4).
+/// * Invariant TypeVarType + `is_equivalent(ta, sa)` False ->
+///   `object_from_instance(t)` (return `Object`).
+/// * Invariant TypeVarType + `is_equivalent` True + recursive
+///   `join_types(ta, sa)` returns SameS/SameT -> arg disc 0/1.
+///
+/// Defers (returns `None`) for:
+/// * Covariant TypeVarType (needs `upper_bound` check,
+///   subtypes.py:612 — not in the snapshot; M8h).
+/// * `type_var.values` non-empty (needs values check).
+/// * ParamSpec (kind=1) / TypeVarTupleType (kind=2).
+/// * `has_type_var_tuple_type` (variadic instance).
+/// * Arg-count mismatch (Python uses `zip`; Rust defers).
+/// * Invariant equivalent but recursive join returns Ancestor/Object
+///   (can't express without a Type encoder).
+///
+/// `s_args` / `t_args` are the Instance args (s=left, t=right). The
+/// returned `SameTypeWithArgs.arg_discs[i]` is 0 (s.args[i]), 1
+/// (t.args[i]), or 4 (Any).
+fn visit_instance_with_args(
+    type_ref: &str,
+    s_args: &[Type],
+    t_args: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let snap = resolver.get(type_ref)?;
+    // Variadic instance: needs split_with_prefix_and_suffix — defer.
+    if snap.has_type_var_tuple_type {
+        return None;
+    }
+    let tvars = &snap.type_vars_with_variance;
+    // Python uses zip (tolerates length mismatch during daemon
+    // reprocessing). Rust requires equal lengths + matching tvars.
+    if s_args.len() != t_args.len() || s_args.len() != tvars.len() {
+        return None;
+    }
+
+    let mut arg_discs: Vec<i8> = Vec::with_capacity(tvars.len());
+    for (i, (_, variance, kind)) in tvars.iter().enumerate() {
+        let ta = &t_args[i]; // Python's t.args[i] (right arg).
+        let sa = &s_args[i]; // Python's s.args[i] (left arg).
+
+        // join.py:131-135: AnyType arg -> AnyType(from_another_any).
+        if matches!(ta, Type::AnyType { .. }) || matches!(sa, Type::AnyType { .. }) {
+            arg_discs.push(4);
+            continue;
+        }
+
+        // kind: 0=TypeVarType, 1=ParamSpec, 2=TypeVarTupleType.
+        match *kind {
+            0 => {} // TypeVarType, handled below.
+            1 | 2 => {
+                // ParamSpec / TypeVarTupleType: defer (needs
+                // is_equivalent for ParamSpec, tuple unpacking for
+                // TypeVarTupleType).
+                return None;
+            }
+            _ => return None,
+        }
+
+        // TypeVarType. values non-empty -> defer (needs values check,
+        // join.py:140-143).
+        // We can't read `values` from the snapshot (only name +
+        // variance + kind); defer if the tvar might have values.
+        // The snapshot doesn't carry `values`, so we conservatively
+        // defer only when the recursive join is non-trivial. For the
+        // invariant equivalent-same-type case, values are typically
+        // empty, so we proceed and let the recursive join decide.
+
+        match *variance {
+            v if v == COVARIANT || v == VARIANCE_NOT_READY => {
+                // Covariant: join_types(ta, sa) + upper_bound check.
+                // No upper_bound in snapshot -> defer (M8h).
+                return None;
+            }
+            v if v == INVARIANT || v == CONTRAVARIANT => {
+                // join.py:149-160: invariant/contravariant.
+                // is_equivalent(ta, sa) = is_subtype(ta, sa) &&
+                // is_subtype(sa, ta). If not equivalent ->
+                // object_from_instance(t) (Object).
+                let equiv =
+                    is_subtype(ta, sa, ctx, resolver)? && is_subtype(sa, ta, ctx, resolver)?;
+                if !equiv {
+                    return Some(SetOpResult::Object);
+                }
+                // Equivalent: new_type = join_types(ta, sa). If the
+                // recursive join returns SameS/SameT, pick that arg.
+                // If Ancestor/Object, defer (can't express without a
+                // Type encoder).
+                match join_types(ta, sa, ctx, resolver)? {
+                    SetOpResult::SameS => arg_discs.push(0),
+                    SetOpResult::SameT => arg_discs.push(1),
+                    // Ancestor/Object/Any/Bottom/SameTypeWithArgs:
+                    // recursive join produced a third type or
+                    // bottom/any — defer to Python.
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    Some(SetOpResult::SameTypeWithArgs {
+        type_ref: type_ref.to_string(),
+        arg_discs,
     })
 }
 
@@ -519,38 +676,44 @@ pub(crate) fn rust_join_types(
     t_bytes: &[u8],
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
-) -> Option<(i64, Option<String>)> {
+) -> Option<(i64, Option<String>, Vec<i8>)> {
     let s = decode_type(s_bytes)?;
     let t = decode_type(t_bytes)?;
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
     join_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
-/// Map `SetOpResult` to the Python-side discriminator integer plus
-/// an optional ancestor fullname (discriminator 5). The Python shim
-/// unpacks `(disc, fullname)` and constructs the Instance from the
-/// fullname -> TypeInfo map when `disc == 5`.
-fn discriminator(r: SetOpResult) -> (i64, Option<String>) {
+/// Map `SetOpResult` to the Python-side `(disc, fullname, arg_discs)`
+/// triple. `disc` is 0=SameS, 1=SameT, 2=Object, 3=Bottom, 4=Any,
+/// 5=Ancestor (fullname set, arg_discs empty), 6=SameTypeWithArgs
+/// (fullname set, arg_discs populated: 0=s.args[i], 1=t.args[i],
+/// 4=Any).
+fn discriminator(r: SetOpResult) -> (i64, Option<String>, Vec<i8>) {
     match r {
-        SetOpResult::SameS => (0, None),
-        SetOpResult::SameT => (1, None),
-        SetOpResult::Object => (2, None),
-        SetOpResult::Bottom => (3, None),
-        SetOpResult::Any => (4, None),
-        SetOpResult::Ancestor(fullname) => (5, Some(fullname)),
+        SetOpResult::SameS => (0, None, Vec::new()),
+        SetOpResult::SameT => (1, None, Vec::new()),
+        SetOpResult::Object => (2, None, Vec::new()),
+        SetOpResult::Bottom => (3, None, Vec::new()),
+        SetOpResult::Any => (4, None, Vec::new()),
+        SetOpResult::Ancestor(fullname) => (5, Some(fullname), Vec::new()),
+        SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        } => (6, Some(type_ref), arg_discs),
     }
 }
 
 /// `trivial_join`/`trivial_meet` only produce SameS/SameT/Object/Bottom
-/// (never Any or Ancestor), so they return a plain `i64` discriminator.
+/// (never Any, Ancestor, or SameTypeWithArgs), so they return a plain
+/// `i64` discriminator.
 fn discriminator_trivial(r: SetOpResult) -> i64 {
     match r {
         SetOpResult::SameS => 0,
         SetOpResult::SameT => 1,
         SetOpResult::Object => 2,
         SetOpResult::Bottom => 3,
-        SetOpResult::Any | SetOpResult::Ancestor(_) => {
-            unreachable!("trivial_join/trivial_meet never produce Any/Ancestor")
+        SetOpResult::Any | SetOpResult::Ancestor(_) | SetOpResult::SameTypeWithArgs { .. } => {
+            unreachable!("trivial_join/trivial_meet never produce Any/Ancestor/WithArgs")
         }
     }
 }
@@ -730,14 +893,21 @@ mod tests {
 
     #[test]
     fn discriminator_maps_variants() {
-        assert_eq!(discriminator(SetOpResult::SameS), (0, None));
-        assert_eq!(discriminator(SetOpResult::SameT), (1, None));
-        assert_eq!(discriminator(SetOpResult::Object), (2, None));
-        assert_eq!(discriminator(SetOpResult::Bottom), (3, None));
-        assert_eq!(discriminator(SetOpResult::Any), (4, None));
+        assert_eq!(discriminator(SetOpResult::SameS), (0, None, vec![]));
+        assert_eq!(discriminator(SetOpResult::SameT), (1, None, vec![]));
+        assert_eq!(discriminator(SetOpResult::Object), (2, None, vec![]));
+        assert_eq!(discriminator(SetOpResult::Bottom), (3, None, vec![]));
+        assert_eq!(discriminator(SetOpResult::Any), (4, None, vec![]));
         assert_eq!(
             discriminator(SetOpResult::Ancestor("a.C".to_string())),
-            (5, Some("a.C".to_string()))
+            (5, Some("a.C".to_string()), vec![])
+        );
+        assert_eq!(
+            discriminator(SetOpResult::SameTypeWithArgs {
+                type_ref: "g.G".to_string(),
+                arg_discs: vec![0, 1, 4],
+            }),
+            (6, Some("g.G".to_string()), vec![0, 1, 4])
         );
     }
 
@@ -991,6 +1161,152 @@ mod tests {
         };
         let t = instance("a.A", vec![]);
         // visit_instance with s=UnboundType -> not Instance -> defer.
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    // ---- visit_instance with args (M8g) ----
+    //
+    // join.py:114-180: t.type == s.type, combine type args via
+    // join_types (covariant) or is_equivalent (invariant). M8g
+    // handles: AnyType arg, invariant is_equivalent (False -> Object,
+    // True -> SameS/SameT). Covariant recursion needs upper_bound
+    // (deferred to M8h). Variadic / ParamSpec / TypeVarTupleType
+    // defer.
+
+    /// TypeInfo with one invariant TypeVar `T` (variance=0, kind=0).
+    fn snap_with_invariant_tvar(fullname: &str) -> TypeInfoSnapshot {
+        let mut s = snap(fullname, fullname.rsplit('.').next().unwrap_or(fullname));
+        s.type_vars_with_variance = vec![("T".to_string(), INVARIANT, 0)];
+        s
+    }
+
+    /// TypeInfo with one covariant TypeVar `T` (variance=1, kind=0).
+    fn snap_with_covariant_tvar(fullname: &str) -> TypeInfoSnapshot {
+        let mut s = snap(fullname, fullname.rsplit('.').next().unwrap_or(fullname));
+        s.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        s
+    }
+
+    #[test]
+    fn join_instance_any_arg_returns_any_arg() {
+        // join(G[Any, int], G[int, Any]) where T1, T2 are invariant.
+        // AnyType arg short-circuits (join.py:131-135) before the
+        // variance dispatch. Both args have an Any on one side ->
+        // both reduce to Any -> SameTypeWithArgs { [Any, Any] }.
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![
+            ("T1".to_string(), INVARIANT, 0),
+            ("T2".to_string(), INVARIANT, 0),
+        ];
+        let r = make_resolver(vec![g]);
+        let s = instance("g.G", vec![any_type(), instance("builtins.int", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.int", vec![]), any_type()]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        match result {
+            Some(SetOpResult::SameTypeWithArgs { arg_discs, .. }) => {
+                assert_eq!(arg_discs, vec![4, 4]);
+            }
+            other => panic!("expected SameTypeWithArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_instance_invariant_equiv_false_returns_object() {
+        // join(G[int], G[str]) where T is invariant.
+        // is_equivalent(int, str) = false -> object_from_instance(t).
+        // Result: Object.
+        let g = snap_with_invariant_tvar("g.G");
+        let int_snap = snap("builtins.int", "int");
+        let str_snap = snap("builtins.str", "str");
+        let r = make_resolver(vec![g, int_snap, str_snap]);
+        let s = instance("g.G", vec![instance("builtins.int", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.str", vec![])]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Object)
+        );
+    }
+
+    #[test]
+    fn join_instance_invariant_equiv_true_returns_same_args() {
+        // join(G[A], G[A]) where T is invariant, A <: A.
+        // is_equivalent(A, A) = true. join_types(A, A) = A (SameS).
+        // Result: SameTypeWithArgs { type_ref: g.G, [Left] }.
+        let g = snap_with_invariant_tvar("g.G");
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![g, a]);
+        let s = instance("g.G", vec![instance("a.A", vec![])]);
+        let t = instance("g.G", vec![instance("a.A", vec![])]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        match result {
+            Some(SetOpResult::SameTypeWithArgs {
+                type_ref,
+                arg_discs,
+            }) => {
+                assert_eq!(type_ref, "g.G");
+                assert_eq!(arg_discs, vec![0]);
+            }
+            other => panic!("expected SameTypeWithArgs, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn join_instance_covariant_arg_defers() {
+        // Covariant TypeVar needs upper_bound check (subtypes.py:612).
+        // Rust snapshot has no upper_bound -> defer (M8h).
+        let g = snap_with_covariant_tvar("g.G");
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![g, a]);
+        let s = instance("g.G", vec![instance("a.A", vec![])]);
+        let t = instance("g.G", vec![instance("a.A", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_arg_count_mismatch_defers() {
+        // len(s.args) != len(t.args) -> Python uses zip (mismatch OK
+        // during daemon reprocessing). Rust defers (no zip semantics).
+        let g = snap_with_invariant_tvar("g.G");
+        let r = make_resolver(vec![g]);
+        let s = instance("g.G", vec![any_type(), any_type()]);
+        let t = instance("g.G", vec![any_type()]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_variadic_defers() {
+        // has_type_var_tuple_type -> variadic instance. Defer.
+        let mut g = snap_with_invariant_tvar("g.G");
+        g.has_type_var_tuple_type = true;
+        let r = make_resolver(vec![g]);
+        let s = instance("g.G", vec![any_type()]);
+        let t = instance("g.G", vec![any_type()]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_paramspec_arg_defers() {
+        // kind=1 (ParamSpec) with non-Any arg -> defer (AnyType
+        // short-circuits first, so use Instance args to reach the
+        // kind dispatch).
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("P".to_string(), INVARIANT, 1)];
+        let int_snap = snap("builtins.int", "int");
+        let r = make_resolver(vec![g, int_snap]);
+        let s = instance("g.G", vec![instance("builtins.int", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.int", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_typevartuple_arg_defers() {
+        // kind=2 (TypeVarTupleType) with non-Any arg -> defer.
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("Ts".to_string(), INVARIANT, 2)];
+        let int_snap = snap("builtins.int", "int");
+        let r = make_resolver(vec![g, int_snap]);
+        let s = instance("g.G", vec![instance("builtins.int", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.int", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 }

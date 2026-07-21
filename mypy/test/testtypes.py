@@ -2281,12 +2281,95 @@ class NativeJoinInstanceSuite(Suite):
         result = join_types(self.fx.a, self.fx.d)
         assert result == self.fx.o
 
-    def test_join_with_args_defers_to_python(self) -> None:
-        # Instance with type args -> Rust defers (needs type-arg join).
-        # ga is G[A]; join(G[A], G[A]) defers to Python which returns
-        # G[A].
+    def test_join_with_args_returns_same_instance(self) -> None:
+        # Instance with type args (M8g): join(G[A], G[A]) where T is
+        # invariant. is_equivalent(A, A)=True, join_types(A, A)=A ->
+        # Rust returns SameTypeWithArgs (disc 6) with arg_discs=[0]
+        # (use s.args[0]=A). Shim reconstructs G[A].
         from mypy.join import join_types
 
         result = join_types(self.fx.ga, self.fx.ga)
         assert result == self.fx.ga
+
+
+class NativeJoinInstanceWithArgsSuite(Suite):
+    """Parity suite for the Rust `visit_instance` same-type-with-args join
+    (Stage 3c M8g).
+
+    Exercises the Instance-Instance same-type join where T is invariant:
+    AnyType args (short-circuit), invariant `is_equivalent` False
+    (object bail), and invariant `is_equivalent` True (same arg). The
+    fixture's `G[T]` is constructed with `INVARIANT` variance.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_any_arg_returns_any_instance(self) -> None:
+        # join(G[Any], G[A]) where T is invariant. AnyType arg
+        # short-circuits (join.py:131-135) -> G[Any].
+        from mypy.join import join_types
+
+        assert join_types(self.fx.gdyn, self.fx.ga) == self.fx.gdyn
+        assert join_types(self.fx.ga, self.fx.gdyn) == self.fx.gdyn
+
+    def test_invariant_not_equivalent_returns_object(self) -> None:
+        # join(G[A], G[B]) where T is invariant. A not <: B ->
+        # is_equivalent(A, B)=False -> object_from_instance(t)=object.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.ga, self.fx.gb) == self.fx.o
+        assert join_types(self.fx.gb, self.fx.ga) == self.fx.o
+
+    def test_invariant_equivalent_returns_same_instance(self) -> None:
+        # join(G[A], G[A]) where T is invariant. is_equivalent(A, A)=
+        # True, join_types(A, A)=A -> G[A].
+        from mypy.join import join_types
+
+        assert join_types(self.fx.ga, self.fx.ga) == self.fx.ga
 

@@ -319,14 +319,16 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
         s = mypy.typeops.true_or_false(s)
         t = mypy.typeops.true_or_false(t)
 
-    # Stage 3c (M8e/M8f): try the Rust join_types pre-dispatch + leaf
-    # visitors + Instance-Instance nominal join. Rust handles the
+    # Stage 3c (M8e/M8f/M8g): try the Rust join_types pre-dispatch +
+    # leaf visitors + Instance-Instance nominal join. Rust handles the
     # UnionType swap, AnyType/NoneType/UninhabitedType/DeletedType
     # short-circuits, the leaf TypeJoinVisitor cases that don't
-    # recurse, and the args-less Instance-Instance nominal join
-    # (same-type, direct-subtype, common-ancestor via bases walk).
-    # Returns (disc, fullname) where disc is 0=SameS, 1=SameT,
-    # 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set), or None
+    # recurse, the args-less Instance-Instance nominal join
+    # (same-type, direct-subtype, common-ancestor via bases walk), and
+    # the same-type-with-args join (AnyType args + invariant
+    # is_equivalent). Returns (disc, fullname, arg_discs) where disc is
+    # 0=SameS, 1=SameT, 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname
+    # set), 6=SameTypeWithArgs (fullname + arg_discs set), or None
     # (defer to Python). Mirrors the erasetype.py:80-86 strangler-fig
     # contract.
     if (
@@ -341,7 +343,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
             _native_join_resolver,
         )
         if result is not None:
-            disc, fullname = result
+            disc, fullname, arg_discs = result
             if disc == 0:
                 return s
             elif disc == 1:
@@ -359,6 +361,36 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 if _native_join_typeinfo_map is not None and fullname in _native_join_typeinfo_map:
                     return Instance(_native_join_typeinfo_map[fullname], [])
                 # Fall through to Python.
+            elif disc == 6:
+                # SameTypeWithArgs: reconstruct Instance(typeinfo,
+                # [joined_args]) from per-arg discriminators. arg_discs
+                # [i] is 0 (s.args[i]), 1 (t.args[i]), or 4 (AnyType).
+                if (
+                    _native_join_typeinfo_map is None
+                    or fullname not in _native_join_typeinfo_map
+                ):
+                    # Fall through to Python.
+                    pass
+                else:
+                    type_info = _native_join_typeinfo_map[fullname]
+                    s_args = s.args if isinstance(s, Instance) else []
+                    t_args = t.args if isinstance(t, Instance) else []
+                    new_args: list[Type] = []
+                    for i, ad in enumerate(arg_discs):
+                        if ad == 0:
+                            new_args.append(s_args[i])
+                        elif ad == 1:
+                            new_args.append(t_args[i])
+                        elif ad == 4:
+                            # AnyType(from_another_any, source): mirror
+                            # join.py:131-135, pick the AnyType side.
+                            src = s_args[i] if isinstance(
+                                get_proper_type(s_args[i]), AnyType
+                            ) else t_args[i]
+                            new_args.append(
+                                AnyType(TypeOfAny.from_another_any, get_proper_type(src))
+                            )
+                    return Instance(type_info, new_args)
         # Rust returned None (unsupported case) — fall through to Python.
 
     if isinstance(s, UnionType) and not isinstance(t, UnionType):
