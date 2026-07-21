@@ -255,9 +255,11 @@ pub(crate) fn join_types(
 
     // normalize_callables (join.py:327) is a no-op for the Rust path:
     // the Python shim serializes the post-normalization form. The
-    // both-FunctionLike case (both sides callable-like) needs
-    // is_similar_callables + combine_similar_callables which produce
-    // a new CallableType / Overloaded — no Type encoder -> defer. The
+    // both-FunctionLike case where either side is Overloaded or
+    // Parameters needs combine logic that produces a new
+    // CallableType/Overloaded -> defer. The
+    // CallableType-vs-CallableType case is handled in visit_join
+    // (identical shape returns SameS; everything else defers). The
     // fallback case (t=CallableType/Overloaded, s non-callable)
     // recurses into join_types(t.fallback, s), which the Rust
     // Instance-Instance path handles.
@@ -269,7 +271,10 @@ pub(crate) fn join_types(
         t,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
     );
-    if s_is_callable && t_is_callable {
+    let either_overloaded_or_params =
+        matches!(s, Type::Overloaded { .. } | Type::Parameters { .. })
+            || matches!(t, Type::Overloaded { .. } | Type::Parameters { .. });
+    if s_is_callable && t_is_callable && either_overloaded_or_params {
         return None;
     }
 
@@ -829,13 +834,89 @@ fn visit_join(
         // new union needs a Type encoder (not available reader-only).
         Type::UnionType { items, .. } => visit_union_join(s, items, ctx, resolver),
 
-        // visit_callable_type (join.py:541-577), fallback case only.
-        // The similar-callables case (s is CallableType) needs
-        // combine_similar_callables (produces a new CallableType — no
-        // Type encoder). The protocol-Instance case needs
-        // unpack_callback_proxy. The fallback case (s is non-callable,
-        // non-protocol) recurses into join_types(t.fallback, s).
-        Type::CallableType { fallback, .. } => visit_callable_fallback(s, fallback, ctx, resolver),
+        // visit_callable_type (join.py:541-577). The both-CallableType
+        // case (isinstance(s, CallableType)) needs is_similar_callables
+        // + is_equivalent + combine_similar_callables, which build a
+        // new CallableType. The wire encoder now supports CallableType,
+        // so the structurally-identical case (join(c, c) = c) returns
+        // SameS without building anything. The similar-but-not-identical
+        // case (combine/join_similar_callables) and the protocol-Instance
+        // case (unpack_callback_proxy) still defer to Python. The
+        // fallback case (s non-callable, non-protocol) recurses into
+        // join_types(t.fallback, s).
+        Type::CallableType {
+            fallback,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            variables,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            name,
+            type_guard,
+            type_is,
+        } => {
+            if let Type::CallableType {
+                fallback: s_fallback,
+                arg_types: s_arg_types,
+                arg_kinds: s_arg_kinds,
+                arg_names: s_arg_names,
+                ret_type: s_ret_type,
+                variables: s_variables,
+                instance_type: s_instance_type,
+                is_ellipsis_args: s_is_ellipsis_args,
+                implicit: s_implicit,
+                is_bound: s_is_bound,
+                from_concatenate: s_from_concatenate,
+                imprecise_arg_kinds: s_imprecise_arg_kinds,
+                unpack_kwargs: s_unpack_kwargs,
+                name: s_name,
+                type_guard: s_type_guard,
+                type_is: s_type_is,
+            } = s
+            {
+                // join.py:620-622: is_similar_callables(t, self.s) &&
+                // is_equivalent(t, self.s) -> combine_similar_callables.
+                // For the structurally-identical case (t == s on all
+                // wire-relevant fields), combine_similar_callables(t, t)
+                // returns t (every arg_join is join(x, x) = x, ret_join
+                // is join(x, x) = x, fallback is t.fallback). So SameS
+                // is correct without building a new CallableType.
+                let identical = arg_kinds == s_arg_kinds
+                    && arg_names == s_arg_names
+                    && arg_types == s_arg_types
+                    && ret_type == s_ret_type
+                    && variables == s_variables
+                    && instance_type == s_instance_type
+                    && is_ellipsis_args == s_is_ellipsis_args
+                    && implicit == s_implicit
+                    && is_bound == s_is_bound
+                    && from_concatenate == s_from_concatenate
+                    && imprecise_arg_kinds == s_imprecise_arg_kinds
+                    && unpack_kwargs == s_unpack_kwargs
+                    && name == s_name
+                    && type_guard == s_type_guard
+                    && type_is == s_type_is
+                    && fallback == s_fallback;
+                if identical {
+                    return Some(SetOpResult::SameS);
+                }
+                // Similar-but-not-identical: combine_similar_callables
+                // (is_equivalent) or join_similar_callables (similar
+                // only). Both build a new CallableType via per-arg
+                // join/meet + ret join + fallback pick. Defer to
+                // Python until match_generic_callables + safe_join +
+                // is_equivalent are ported.
+                return None;
+            }
+            visit_callable_fallback(s, fallback, ctx, resolver)
+        }
 
         // visit_overloaded (join.py:581-632), fallback case only. The
         // both-FunctionLike case (s is CallableType/Overloaded) is
@@ -2125,10 +2206,35 @@ mod tests {
 
     #[test]
     fn join_callable_with_callable_defers() {
-        // Both s and t are CallableType. visit_callable_type case 1
-        // (isinstance(s, CallableType)) needs is_similar_callables +
-        // combine_similar_callables, which produce a new CallableType.
-        // No Type encoder -> defer.
+        // Both s and t are CallableType, similar but not structurally
+        // identical (arg types differ: object vs function). The Rust
+        // visit_callable_type both-CallableType case handles only the
+        // structurally-identical case (returns SameS); everything else
+        // defers to Python (combine_similar_callables /
+        // join_similar_callables produce a new CallableType).
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let s = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let t = callable(
+            "builtins.function",
+            vec![instance("builtins.function", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_callable_with_identical_callable_returns_same_s() {
+        // join(c, c) where c is a non-generic CallableType. Both sides
+        // are structurally identical, so visit_callable_type's
+        // both-CallableType case returns SameS (the joined callable is
+        // the same as s). Exercises the wire-format CallableType
+        // encoder end-to-end (Encoded -> read_type -> fixup).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -2142,7 +2248,7 @@ mod tests {
             vec![instance("builtins.object", vec![])],
             instance("builtins.object", vec![]),
         );
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     /// Minimal `Overloaded` for join tests. The fallback is
