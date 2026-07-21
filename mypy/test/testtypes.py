@@ -3131,3 +3131,155 @@ class NativeJoinLiteralSuite(Suite):
         # the LiteralType-vs-Instance mismatched-lkv case correctly.
         assert result in (self.fx.a, inst_with_lkv)
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinTypeVarSuite(Suite):
+    """Parity suite for the Rust `visit_type_var` join
+    (Stage 3c M8m).
+
+    Exercises the TypeVarType-vs-TypeVarType same-id-same-bound case
+    (join.py:465-467). The Rust port handles only case 1 where s.id
+    == t.id AND s.upper_bound == t.upper_bound (returns s, SameS).
+    The copy_modified branch (same id, different upper_bound) and
+    case 2 (different id -> join upper_bounds) produce a new type
+    and defer to Python. Case 3 (s not TypeVarType -> default) walks
+    s's fallback chain and defers.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_type_var_same_id_same_upper_bound_returns_self(self) -> None:
+        # join(T`1, T`1) = T`1. visit_type_var case 1 (join.py:465-467):
+        # s is TypeVarType, s.id == t.id, s.upper_bound == t.upper_bound
+        # -> return self.s. Fires the Rust SameS path (shim returns s).
+        from mypy.join import join_types
+
+        assert join_types(self.fx.t, self.fx.t) == self.fx.t
+
+    def test_type_var_different_id_defers_to_python(self) -> None:
+        # join(T`1, S`2) = object (both upper_bounds are object, so the
+        # bound join is object). visit_type_var case 2 (join.py:472):
+        # s.id != t.id -> join_types(s.upper_bound, t.upper_bound).
+        # The bound join is object (neither s nor t) -> defers. The
+        # result is identical regardless of which path computed it.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.t, self.fx.s) == self.fx.o
+
+    def test_type_var_same_id_different_upper_bound_defers_to_python(
+        self,
+    ) -> None:
+        # join(T`1 with bound=A, T`1 with bound=B) = T`1 with bound=join(A,B).
+        # visit_type_var case 1 copy_modified branch (join.py:468-470):
+        # s.id == t.id but upper_bounds differ -> copy_modified(
+        # upper_bound=join_types(...)). Produces a new TypeVarType -> defers.
+        from mypy.join import join_types
+        from mypy.types import TypeVarType
+
+        t_with_a_bound = TypeVarType(
+            self.fx.t.name,
+            self.fx.t.fullname,
+            self.fx.t.id,
+            self.fx.t.values,
+            self.fx.a,
+            self.fx.t.default,
+            self.fx.t.variance,
+        )
+        t_with_b_bound = TypeVarType(
+            self.fx.t.name,
+            self.fx.t.fullname,
+            self.fx.t.id,
+            self.fx.t.values,
+            self.fx.b,
+            self.fx.t.default,
+            self.fx.t.variance,
+        )
+        # The bound join is join(A, B) = A (B <: A); the result is a
+        # TypeVarType with upper_bound=A. Defers to Python.
+        result = join_types(t_with_a_bound, t_with_b_bound)
+        assert result == t_with_a_bound
+
+    def test_type_var_with_non_type_var_defers_to_python(self) -> None:
+        # join(int, T`1) = object. visit_type_var case 3 (join.py:474):
+        # s is not a TypeVarType -> default(s). The default walks s's
+        # fallback chain (join.py:869-888); for Instance(int) it returns
+        # object_from_instance(int) = object. Defers to Python.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.t) == self.fx.o
+
+    def test_type_var_same_id_different_namespace_defers_to_python(
+        self,
+    ) -> None:
+        # TypeVarId.__eq__ (types.py:567-577) checks namespace. Same
+        # raw_id, different namespace -> s.id != t.id -> case 2 -> defers.
+        from mypy.join import join_types
+        from mypy.types import TypeVarId, TypeVarType
+
+        t_ns1 = TypeVarType(
+            self.fx.t.name,
+            self.fx.t.fullname,
+            TypeVarId(1, namespace="ns1"),
+            self.fx.t.values,
+            self.fx.o,
+            self.fx.t.default,
+            self.fx.t.variance,
+        )
+        t_ns2 = TypeVarType(
+            self.fx.t.name,
+            self.fx.t.fullname,
+            TypeVarId(1, namespace="ns2"),
+            self.fx.t.values,
+            self.fx.o,
+            self.fx.t.default,
+            self.fx.t.variance,
+        )
+        # Both bounds are object, so join(o, o) = o -> defers to Python.
+        assert join_types(t_ns1, t_ns2) == self.fx.o
+
