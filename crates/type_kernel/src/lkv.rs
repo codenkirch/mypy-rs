@@ -24,11 +24,7 @@ use crate::refs::{fallback_sentinel, is_fallback, is_instance, TypeRefs};
 ///
 /// Returns `None` (the fallback sentinel) for cases Rust does not handle —
 /// the Python caller falls back to the pure-Python visitor.
-fn lkv_translate_one(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_translate_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     // --- Leaf types: TypeTranslator defaults are identity ---
     // AnyType, NoneType, UninhabitedType, ErasedType, DeletedType,
     // TypeVarType, ParamSpecType, TypeVarTupleType, PartialType, UnboundType
@@ -110,11 +106,7 @@ fn lkv_translate_one(
 }
 
 /// LastKnownValueEraser.visit_instance: strip last_known_value, recurse args.
-fn lkv_visit_instance(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_instance(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let has_lkv = !obj.getattr("last_known_value")?.is_none();
     let args = obj.getattr("args")?;
 
@@ -155,11 +147,7 @@ fn lkv_visit_instance(
 
 /// LastKnownValueEraser.visit_union_type: translate items, then dedup
 /// Instance items with the same fullname via make_simplified_union.
-fn lkv_visit_union(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_union(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let items = obj.getattr("items")?.downcast::<PyList>()?;
 
     // Translate all items (TypeTranslator.visit_union_type default).
@@ -208,20 +196,11 @@ fn lkv_visit_union(
                 false
             };
             if no_args {
-                let fullname_obj = p
-                    .as_ref(py)
-                    .getattr("type")?
-                    .getattr("fullname")?;
-                let fullname: String = fullname_obj
-                    .downcast::<PyString>()?
-                    .to_str()?
-                    .to_string();
+                let fullname_obj = p.as_ref(py).getattr("type")?.getattr("fullname")?;
+                let fullname: String = fullname_obj.downcast::<PyString>()?.to_str()?.to_string();
                 fullnames.push(Some(fullname.clone()));
                 let idx = fullnames.len() - 1;
-                groups_by_name
-                    .entry(fullname)
-                    .or_default()
-                    .push(idx);
+                groups_by_name.entry(fullname).or_default().push(idx);
                 continue;
             }
         }
@@ -289,11 +268,7 @@ fn lkv_visit_union(
 /// TypeTranslator.visit_callable_type default: copy_modified with translated
 /// arg_types and ret_type. variables are passed through unchanged
 /// (translate_variables returns them as-is).
-fn lkv_visit_callable(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_callable(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let arg_types = obj.getattr("arg_types")?.downcast::<PyList>()?;
     let mut translated_args: Vec<PyObject> = Vec::with_capacity(arg_types.len());
     for arg in arg_types.iter() {
@@ -335,11 +310,7 @@ fn lkv_visit_callable(
 
 /// TypeTranslator.visit_tuple_type default: TupleType(translated items,
 /// translated partial_fallback, line, column).
-fn lkv_visit_tuple(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_tuple(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let items = obj.getattr("items")?.downcast::<PyList>()?;
     let mut translated_items: Vec<PyObject> = Vec::with_capacity(items.len());
     for item in items.iter() {
@@ -359,16 +330,14 @@ fn lkv_visit_tuple(
     let line = obj.getattr("line")?;
     let column = obj.getattr("column")?;
     let items_list = PyList::new(py, &translated_items);
-    let result = refs.tuple_type.call1((items_list, translated_fallback, line, column))?;
+    let result = refs
+        .tuple_type
+        .call1((items_list, translated_fallback, line, column))?;
     Ok(result.into())
 }
 
 /// TypeTranslator.visit_overloaded default: Overloaded(items=[translated items]).
-fn lkv_visit_overloaded(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_overloaded(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let items = obj.getattr("items")?.downcast::<PyList>()?;
     let mut translated_items: Vec<PyObject> = Vec::with_capacity(items.len());
     for item in items.iter() {
@@ -387,11 +356,7 @@ fn lkv_visit_overloaded(
 
 /// TypeTranslator.visit_type_type default: TypeType.make_normalized(
 /// translated item, line, column, is_type_form).
-fn lkv_visit_type_type(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_type_type(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let item = obj.getattr("item")?;
     let translated = lkv_translate_one(py, item, refs)?;
     if is_fallback(&translated, py) {
@@ -411,11 +376,7 @@ fn lkv_visit_type_type(
 
 /// TypeTranslator.visit_literal_type default: LiteralType(value,
 /// translated fallback, line, column).
-fn lkv_visit_literal(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_literal(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let value = obj.getattr("value")?;
     let fallback = obj.getattr("fallback")?;
     let translated_fallback = lkv_translate_one(py, fallback, refs)?;
@@ -424,16 +385,14 @@ fn lkv_visit_literal(
     }
     let line = obj.getattr("line")?;
     let column = obj.getattr("column")?;
-    let result = refs.literal_type.call1((value, translated_fallback, line, column))?;
+    let result = refs
+        .literal_type
+        .call1((value, translated_fallback, line, column))?;
     Ok(result.into())
 }
 
 /// TypeTranslator.visit_unpack_type default: UnpackType(t.type.accept(self)).
-fn lkv_visit_unpack(
-    py: Python<'_>,
-    obj: &PyAny,
-    refs: &TypeRefs<'_>,
-) -> PyResult<PyObject> {
+fn lkv_visit_unpack(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
     let typ = obj.getattr("type")?;
     let translated = lkv_translate_one(py, typ, refs)?;
     if is_fallback(&translated, py) {
@@ -449,10 +408,7 @@ fn lkv_visit_unpack(
 /// sub-components; the Python caller falls back to the pure-Python
 /// `LastKnownValueEraser`. Stage 2 of the type-kernel migration.
 #[pyfunction]
-pub(crate) fn remove_instance_last_known_values(
-    py: Python<'_>,
-    typ: &PyAny,
-) -> PyResult<PyObject> {
+pub(crate) fn remove_instance_last_known_values(py: Python<'_>, typ: &PyAny) -> PyResult<PyObject> {
     let refs = match TypeRefs::try_new(py) {
         Ok(r) => r,
         Err(_) => return fallback_sentinel(py),
@@ -467,6 +423,7 @@ mod tests {
     /// Stage 2 parity: `remove_instance_last_known_values` on an Instance with
     /// a `last_known_value` strips it, matching the Python visitor. Compares
     /// Rust output against `mypy.erasetype.remove_instance_last_known_values`.
+    #[ignore = "requires librt built in venv; see AGENTS.md 'Type kernel build order'"]
     #[test]
     fn lkv_strips_last_known_value_from_instance() {
         pyo3::prepare_freethreaded_python();
@@ -516,6 +473,7 @@ expected = str(py_lkv(typ))
 
     /// Stage 2 parity: union dedup — `make_union([lit1_inst, lit2_inst, lit4_inst])`
     /// collapses to a single Instance after LKV erasure, matching the Python path.
+    #[ignore = "requires librt built in venv; see AGENTS.md 'Type kernel build order'"]
     #[test]
     fn lkv_merges_union_of_same_fullname_instances() {
         pyo3::prepare_freethreaded_python();

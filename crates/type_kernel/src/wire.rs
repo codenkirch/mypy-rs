@@ -293,8 +293,9 @@ fn read_bytes_bare(buf: &mut ReadBuffer<'_>) -> Result<Vec<u8>, WireError> {
 /// `read_float_internal`.
 fn read_float_bare(buf: &mut ReadBuffer<'_>) -> Result<f64, WireError> {
     let bytes = buf.read_slice(8)?;
-    let le = u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3],
-                                 bytes[4], bytes[5], bytes[6], bytes[7]]);
+    let le = u64::from_le_bytes([
+        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+    ]);
     Ok(f64::from_bits(le))
 }
 
@@ -306,7 +307,9 @@ fn read_float_bare(buf: &mut ReadBuffer<'_>) -> Result<f64, WireError> {
 fn read_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
     let tag = read_tag(buf)?;
     if tag != LITERAL_INT {
-        return Err(WireError::invalid(format!("expected LITERAL_INT, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LITERAL_INT, got tag {tag}"
+        )));
     }
     read_int_bare(buf)
 }
@@ -315,7 +318,9 @@ fn read_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
 fn read_str(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
     let tag = read_tag(buf)?;
     if tag != LITERAL_STR {
-        return Err(WireError::invalid(format!("expected LITERAL_STR, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LITERAL_STR, got tag {tag}"
+        )));
     }
     read_str_bare(buf)
 }
@@ -327,7 +332,9 @@ fn read_str_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<String>, WireError> {
         return Ok(None);
     }
     if tag != LITERAL_STR {
-        return Err(WireError::invalid(format!("expected LITERAL_STR or LITERAL_NONE, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LITERAL_STR or LITERAL_NONE, got tag {tag}"
+        )));
     }
     Ok(Some(read_str_bare(buf)?))
 }
@@ -336,7 +343,9 @@ fn read_str_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<String>, WireError> {
 fn read_int_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<i64>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_INT {
-        return Err(WireError::invalid(format!("expected LIST_INT, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_INT, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -353,7 +362,9 @@ fn read_int_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<i64>, WireError> {
 fn read_str_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<String>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_STR {
-        return Err(WireError::invalid(format!("expected LIST_STR, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_STR, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -371,7 +382,9 @@ fn read_str_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<String>, WireError> {
 fn read_str_opt_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Option<String>>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_GEN {
-        return Err(WireError::invalid(format!("expected LIST_GEN, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_GEN, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -588,7 +601,9 @@ fn read_type_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<Type>, WireError> {
 fn read_type_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_GEN {
-        return Err(WireError::invalid(format!("expected LIST_GEN, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_GEN, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -605,7 +620,9 @@ fn read_type_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError> {
 fn read_type_map(buf: &mut ReadBuffer<'_>) -> Result<Vec<(String, Type)>, WireError> {
     let tag = read_tag(buf)?;
     if tag != DICT_STR_GEN {
-        return Err(WireError::invalid(format!("expected DICT_STR_GEN, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected DICT_STR_GEN, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -625,7 +642,9 @@ fn read_type_map(buf: &mut ReadBuffer<'_>) -> Result<Vec<(String, Type)>, WireEr
 fn read_type_var_likes(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_GEN {
-        return Err(WireError::invalid(format!("expected LIST_GEN, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_GEN, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -831,9 +850,7 @@ fn read_unbound_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 fn read_unpack_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let typ = read_type(buf, None)?;
     expect_end_tag(buf)?;
-    Ok(Type::UnpackType {
-        typ: Box::new(typ),
-    })
+    Ok(Type::UnpackType { typ: Box::new(typ) })
 }
 
 /// Read an `AnyType` (tag already consumed).
@@ -882,9 +899,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let instance_type = read_type_opt(buf)?;
     let flags = read_flags(buf, 6)?;
     let mut flags_iter = flags.into_iter();
-    let mut next_flag = || -> bool {
-        flags_iter.next().unwrap_or(false)
-    };
+    let mut next_flag = || -> bool { flags_iter.next().unwrap_or(false) };
     let is_ellipsis_args = next_flag();
     let implicit = next_flag();
     let is_bound = next_flag();
@@ -925,7 +940,9 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 fn read_overloaded(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_GEN {
-        return Err(WireError::invalid(format!("expected LIST_GEN, got tag {tag}")));
+        return Err(WireError::invalid(format!(
+            "expected LIST_GEN, got tag {tag}"
+        )));
     }
     let size = read_int_bare(buf)?;
     if size < 0 {
@@ -1245,9 +1262,7 @@ impl fmt::Display for Type {
                 Ok(())
             }
             Type::TypeVarType { name, .. } => write!(f, "{name}"),
-            Type::ParamSpecType {
-                prefix, name, ..
-            } => {
+            Type::ParamSpecType { prefix, name, .. } => {
                 // visit_param_spec: optional `[args, **name]` prefix.
                 let mut s = String::new();
                 if !prefix.arg_types.is_empty() {
@@ -1602,9 +1617,8 @@ fn is_default_object(t: &Type) -> bool {
 #[pyfunction]
 pub(crate) fn read_type_to_str(bytes: &[u8]) -> PyResult<String> {
     let mut buf = ReadBuffer::new(bytes);
-    let typ = read_type(&mut buf, None).map_err(|e| {
-        pyo3::exceptions::PyValueError::new_err(e.to_string())
-    })?;
+    let typ = read_type(&mut buf, None)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
     Ok(typ.to_string())
 }
 
@@ -1655,7 +1669,8 @@ mod tests {
             vec![le[0], le[1]]
         } else if value >= MIN_FOUR_BYTES_INT && value <= 536860911 {
             // 4-byte form: low 3 bits = 011.
-            let encoded = ((value - MIN_FOUR_BYTES_INT) << 3) as u32 | FOUR_BYTES_INT_TRAILER as u32;
+            let encoded =
+                ((value - MIN_FOUR_BYTES_INT) << 3) as u32 | FOUR_BYTES_INT_TRAILER as u32;
             let le = encoded.to_le_bytes();
             vec![le[0], le[1], le[2], le[3]]
         } else {
@@ -1756,7 +1771,11 @@ mod tests {
         let mut buf = ReadBuffer::new(&bytes);
         let typ = read_type(&mut buf, None).unwrap();
         match &typ {
-            Type::AnyType { type_of_any, source_any, missing_import_name } => {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                missing_import_name,
+            } => {
                 assert_eq!(*type_of_any, 0);
                 assert!(source_any.is_none());
                 assert!(missing_import_name.is_none());
@@ -1813,7 +1832,14 @@ mod tests {
     ///   END_TAG(255).
     #[test]
     fn read_generic_instance_end_to_end() {
-        let any_bytes = [ANY_TYPE, LITERAL_NONE, LITERAL_INT, 0, LITERAL_NONE, END_TAG];
+        let any_bytes = [
+            ANY_TYPE,
+            LITERAL_NONE,
+            LITERAL_INT,
+            0,
+            LITERAL_NONE,
+            END_TAG,
+        ];
         let mut bytes = vec![INSTANCE, INSTANCE_GENERIC, LITERAL_STR];
         // bare str: short-int length + UTF-8 body.
         bytes.push((7i64 - MIN_ONE_BYTE_INT) as u8 * 2); // length 7, 1-byte form
@@ -1832,7 +1858,12 @@ mod tests {
         let mut buf = ReadBuffer::new(&bytes);
         let typ = read_type(&mut buf, None).unwrap();
         match &typ {
-            Type::Instance { type_ref, args, last_known_value, extra_attrs } => {
+            Type::Instance {
+                type_ref,
+                args,
+                last_known_value,
+                extra_attrs,
+            } => {
                 assert_eq!(type_ref, "foo.Bar");
                 assert_eq!(args.len(), 1);
                 assert!(last_known_value.is_none());
