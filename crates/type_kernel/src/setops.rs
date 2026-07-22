@@ -37,7 +37,7 @@
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{self, ExtraAttrs, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 use crate::subtypes::{
     is_subtype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT, VARIANCE_NOT_READY,
@@ -1772,14 +1772,118 @@ fn try_contracting_literals_in_union(
     Some(result)
 }
 
+/// `try_getting_instance_fallback` (typeops.py:1271-1288): return the
+/// `Instance` fallback for a type, if any. Mirrors the Python dispatch:
+/// Instance -> self, LiteralType -> fallback, FunctionLike -> fallback
+/// (Overloaded delegates to `items[0].fallback`), TypeVarType -> recurse
+/// on `upper_bound`, TupleType -> `partial_fallback`, TypedDictType ->
+/// `fallback`, NoneType/AnyType -> None.
+///
+/// Returns `None` for variants Python returns `None` for, or that the
+/// Rust subset doesn't carry a fallback for (UnboundType, UnpackType,
+/// UninhabitedType, DeletedType, TypeAliasType, ParamSpecType,
+/// TypeVarTupleType).
+fn try_getting_instance_fallback(t: &Type) -> Option<&Type> {
+    match t {
+        Type::Instance { .. } => Some(t),
+        Type::LiteralType { fallback, .. } => Some(fallback.as_ref()),
+        Type::CallableType { fallback, .. } => Some(fallback.as_ref()),
+        Type::Overloaded { items } => {
+            // Overloaded.fallback = items[0].fallback (types.py:2749).
+            if let Some(Type::CallableType { fallback, .. }) = items.first() {
+                Some(fallback.as_ref())
+            } else {
+                None
+            }
+        }
+        Type::TypeVarType { upper_bound, .. } => try_getting_instance_fallback(upper_bound),
+        Type::TupleType {
+            partial_fallback, ..
+        } => Some(partial_fallback.as_ref()),
+        Type::TypedDictType { fallback, .. } => Some(fallback.as_ref()),
+        _ => None,
+    }
+}
+
+/// `make_simplified_union` step 5 (typeops.py:656-691): erase
+/// inconsistent `extra_attrs` on the final union's fallback.
+///
+/// Collects the distinct `ExtraAttrs` across items that have a fallback
+/// Instance with `extra_attrs`. If there is more than one distinct
+/// `ExtraAttrs`, OR some item with the same fallback `type_ref` has no
+/// `extra_attrs` while another has, set `fallback.extra_attrs = None`
+/// on the final result's fallback.
+///
+/// Uses a `Vec` for the distinct-set (unions are small; avoids needing
+/// `Hash` on `ExtraAttrs` which would require `Hash` on `Type`).
+fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
+    // Collect distinct ExtraAttrs (linear; small N). Only Instances with
+    // extra_attrs contribute.
+    let mut distinct: Vec<&ExtraAttrs> = Vec::new();
+    for t in items {
+        let Some(fb) = try_getting_instance_fallback(t) else {
+            continue;
+        };
+        if let Type::Instance {
+            extra_attrs: Some(ea),
+            ..
+        } = fb
+        {
+            if !distinct.contains(&ea) {
+                distinct.push(ea);
+            }
+        }
+    }
+    if distinct.is_empty() {
+        return;
+    }
+    // Determine the result's fallback Instance. If result is a single
+    // Instance, it IS the fallback. If result is a UnionType, Python
+    // does `try_getting_instance_fallback(result)` on the union, which
+    // returns None (UnionType has no fallback) -> step 5 is a no-op.
+    // But the Python code path only reaches step 5 when nitems > 1 and
+    // the result is the make_union of the simplified set. When the set
+    // collapses to a single Instance (via dedup or contraction), the
+    // result IS that Instance and step 5 applies.
+    let erase = if distinct.len() > 1 {
+        true
+    } else {
+        // Single distinct ExtraAttrs: erase only if some item with the
+        // same fallback type_ref has NO extra_attrs.
+        let fb_ref = match try_getting_instance_fallback(result) {
+            Some(Type::Instance { type_ref, .. }) => type_ref,
+            _ => return, // no fallback Instance on result -> no-op
+        };
+        let mut should_erase = false;
+        for t in items {
+            if let Some(Type::Instance {
+                type_ref: item_ref,
+                extra_attrs: None,
+                ..
+            }) = try_getting_instance_fallback(t)
+            {
+                if item_ref == fb_ref {
+                    should_erase = true;
+                    break;
+                }
+            }
+        }
+        should_erase
+    };
+    if erase {
+        if let Type::Instance { extra_attrs, .. } = result {
+            *extra_attrs = None;
+        }
+    }
+}
+
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
 /// path (step 2), remove redundant items (step 3), literal contraction
-/// (step 4, bool + enum cases), `make_union` (final).
-/// Steps deferred: extra-attrs erasure (step 5, needs
-/// `try_getting_instance_fallback` and live TypeInfo). Returns `None`
-/// (defer to Python) when any step can't be completed.
+/// (step 4, bool + enum cases), extra-attrs erasure (step 5),
+/// `make_union` (final). Returns `None` (defer to Python) when any
+/// step can't be completed.
 fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
@@ -1799,7 +1903,12 @@ fn make_simplified_union(
     // whose full value set is covered.
     let contracted = try_contracting_literals_in_union(deduped, resolver)?;
     // Final: make_union (types.py:3483-3489).
-    Some(union_make_union(contracted))
+    let mut result = union_make_union(contracted);
+    // Step 5: erase inconsistent extra_attrs on the result's fallback.
+    // Runs on the original `items` (pre-contraction), matching Python
+    // (typeops.py:665 iterates `items`, not `simplified_set`).
+    erase_extra_attrs_in_union(items, &mut result);
+    Some(result)
 }
 
 /// `UnionType.make_union` (types.py:3483-3489): 0 items -> bottom,
@@ -2393,6 +2502,20 @@ mod tests {
         }
     }
 
+    /// Instance with `extra_attrs` set (for step 5 erasure tests).
+    fn instance_with_attrs(type_ref: &str, attrs: Vec<(&str, Type)>, immutable: Vec<&str>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: Some(ExtraAttrs {
+                attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+                immutable: immutable.into_iter().map(String::from).collect(),
+                mod_name: None,
+            }),
+        }
+    }
+
     /// Minimal `CallableType` for join tests. `fallback` is the
     /// `builtins.function` (or `builtins.type`) Instance. arg_kinds
     /// defaults to ARG_POS (0) per arg.
@@ -2954,6 +3077,62 @@ mod tests {
             };
             assert_eq!(decoded, expected);
         }
+    }
+
+    #[test]
+    fn make_simplified_union_erases_extra_attrs_when_one_item_lacks_them() {
+        // step 5 (typeops.py:656-691): when one item has extra_attrs and
+        // another item with the same fallback type_ref has none, the
+        // collapsed result's extra_attrs is erased.
+        // [A1(attrs={x:int}), A2(no attrs)] -> dedup keeps A1 (is_subtype
+        // of A2 True, same type_ref) -> single A1. step 5: distinct=1
+        // (from A1), but A2 has None -> erase -> A1.extra_attrs = None.
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, o]);
+        let items = vec![
+            instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
+            instance("a.A", vec![]),
+        ];
+        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        let expected = instance("a.A", vec![]);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn make_simplified_union_keeps_extra_attrs_when_consistent() {
+        // step 5: when all items with the same fallback type have the
+        // SAME ExtraAttrs (and none lacks them), erase does NOT fire.
+        // [A1(attrs={x:int}), A2(same attrs)] -> dedup keeps A1 ->
+        // single A1. step 5: distinct=1, no item has None -> erase=False
+        // -> attrs preserved.
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, o]);
+        let attrs_fn =
+            || instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]);
+        let items = vec![attrs_fn(), attrs_fn()];
+        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        assert_eq!(result, attrs_fn());
+    }
+
+    #[test]
+    fn make_simplified_union_erases_extra_attrs_when_distinct() {
+        // step 5: when items have >1 distinct ExtraAttrs sharing a
+        // fallback type_ref, erase fires on the collapsed result.
+        // [A1(attrs={x:int}), A2(attrs={y:str})] -> dedup keeps A1
+        // (is_subtype A1<:A2 True) -> single A1. step 5: distinct=2
+        // ({x}, {y}) -> erase -> A1.extra_attrs = None.
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, o]);
+        let items = vec![
+            instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
+            instance_with_attrs("a.A", vec![("y", instance("builtins.str", vec![]))], vec![]),
+        ];
+        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        let expected = instance("a.A", vec![]);
+        assert_eq!(result, expected);
     }
 
     #[test]
