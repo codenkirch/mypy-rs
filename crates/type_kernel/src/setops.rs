@@ -1553,6 +1553,114 @@ fn visit_callable_fallback(
     }
 }
 
+/// `flatten_nested_unions` (types.py:4267-4300): recursively expand
+/// UnionType items into a flat list. TypeAliasType is NOT expanded
+/// (the wire format carries only `type_ref`, not the live `TypeAlias`
+/// target needed for `_expand_once`); if one is present, return `None`
+/// so the caller defers to Python.
+fn flatten_nested_unions(items: &[Type]) -> Option<Vec<Type>> {
+    let mut flat = Vec::with_capacity(items.len());
+    for t in items {
+        match t {
+            Type::TypeAliasType { .. } => return None,
+            Type::UnionType { items: inner, .. } => {
+                flat.extend(flatten_nested_unions(inner)?);
+            }
+            _ => flat.push(t.clone()),
+        }
+    }
+    Some(flat)
+}
+
+/// `_remove_redundant_union_items` (typeops.py:695-771), Rust subset.
+///
+/// Two passes: forward (drop later items that are subtypes of earlier
+/// ones), then reverse (drop earlier items that are subtypes of later
+/// ones). UninhabitedType is always redundant and dropped. Duplicate
+/// detection uses `is_subtype` (the Rust port only handles Instance vs
+/// Instance; non-Instance pairs defer).
+///
+/// Skips the `can_be_true`/`can_be_false` truthiness adjustment
+/// (typeops.py:752-756): those flags are not modeled on the wire Type.
+/// Skips the LiteralType-fallback optimization (typeops.py:717-728):
+/// callers defer before reaching here when LiteralType is present.
+fn remove_redundant_union_items(
+    items: Vec<Type>,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let mut current = items;
+    for _direction in 0..2 {
+        let mut new_items: Vec<Type> = Vec::with_capacity(current.len());
+        for ti in current {
+            if matches!(ti, Type::UninhabitedType) {
+                continue;
+            }
+            let mut duplicate_index = None;
+            for (j, tj) in new_items.iter().enumerate() {
+                if is_subtype(&ti, tj, ctx, resolver)? {
+                    duplicate_index = Some(j);
+                    break;
+                }
+            }
+            if duplicate_index.is_some() {
+                // Truthiness adjustment skipped (not modeled).
+            } else {
+                new_items.push(ti);
+            }
+        }
+        current = new_items;
+        if current.len() <= 1 {
+            break;
+        }
+        current.reverse();
+    }
+    Some(current)
+}
+
+/// `make_simplified_union` (typeops.py:605-692), Rust subset.
+///
+/// Steps ported: flatten nested unions (step 1), single-item fast
+/// path (step 2), remove redundant items (step 3), `make_union` (final).
+/// Steps deferred: literal contraction (step 4, needs
+/// `try_contracting_literals_in_union`), extra-attrs erasure (step 5,
+/// needs `try_getting_instance_fallback` + live TypeInfo). Returns
+/// `None` (defer to Python) when any step can't be completed.
+fn make_simplified_union(
+    items: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    // Step 1: flatten nested unions. TypeAliasType defers.
+    let flat = flatten_nested_unions(items)?;
+    // Step 2: single-item fast path.
+    if flat.len() == 1 {
+        return Some(flat.into_iter().next().unwrap());
+    }
+    // Step 4 precondition: defer when LiteralType is present (the
+    // contraction step needs `try_contracting_literals_in_union`).
+    if flat.iter().any(|t| matches!(t, Type::LiteralType { .. })) {
+        return None;
+    }
+    // Step 3: remove redundant items.
+    let simplified = remove_redundant_union_items(flat, ctx, resolver)?;
+    // Final: make_union (types.py:3483-3489).
+    Some(union_make_union(simplified))
+}
+
+/// `UnionType.make_union` (types.py:3483-3489): 0 items -> bottom,
+/// 1 item -> that item, >1 -> UnionType.
+fn union_make_union(items: Vec<Type>) -> Type {
+    match items.len() {
+        0 => Type::UninhabitedType,
+        1 => items.into_iter().next().unwrap(),
+        _ => Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+        },
+    }
+}
+
 /// `TypeJoinVisitor.visit_union_type` (join.py:432-436), Rust subset.
 ///
 /// `is_subtype(s, Union[A, B])` is True iff `s <: A` or `s <: B`
@@ -1576,6 +1684,13 @@ fn visit_union_join(
     // s <: t iff s <: any item of t.
     let mut found_subtype = false;
     for item in items {
+        // UninhabitedType (bottom) is never a supertype: is_subtype(s,
+        // UninhabitedType) is False for all s. Rust is_subtype only
+        // handles Instance vs Instance, so short-circuit here to avoid
+        // a spurious None-defer.
+        if matches!(item, Type::UninhabitedType) {
+            continue;
+        }
         match is_subtype(s, item, ctx, resolver) {
             Some(true) => {
                 found_subtype = true;
@@ -1588,16 +1703,47 @@ fn visit_union_join(
     if found_subtype {
         return Some(SetOpResult::SameT);
     }
-    // t <: s iff every item of t is <: s. If any item is not a
-    // subtype, the simplified union won't collapse to s -> defer.
+    // t <: s iff every item of t is <: s. If every item is <: s, the
+    // simplified union collapses to s: SameS.
+    let mut all_subtype = true;
     for item in items {
+        // UninhabitedType is subtype of everything (bottom type).
+        // Rust is_subtype only handles Instance vs Instance, so
+        // short-circuit here to avoid a spurious None-defer.
+        if matches!(item, Type::UninhabitedType) {
+            continue;
+        }
         match is_subtype(item, s, ctx, resolver) {
             Some(true) => {}
-            Some(false) => return None,
+            Some(false) => {
+                all_subtype = false;
+                break;
+            }
             None => return None,
         }
     }
-    Some(SetOpResult::SameS)
+    if all_subtype {
+        return Some(SetOpResult::SameS);
+    }
+    // Neither s <: t nor t <: s: Python calls
+    // make_simplified_union([s, t]). Build the simplified union in
+    // Rust and return it Encoded. Returns None (defer) when
+    // make_simplified_union can't complete (LiteralType present,
+    // TypeAliasType, non-Instance subtype check, etc.).
+    let simplified = make_simplified_union(
+        &[
+            s.clone(),
+            Type::UnionType {
+                items: items.to_vec(),
+                uses_pep604_syntax: false,
+            },
+        ],
+        ctx,
+        resolver,
+    )?;
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &simplified).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
 }
 
 /// `TypeJoinVisitor.visit_instance` (join.py:421-454), the
@@ -2472,8 +2618,8 @@ mod tests {
     fn join_types_union_unrelated_defers() {
         // visit_union_type: s=A, t=Union[B, C] where A is not <: t
         // and t is not <: s (B, C unrelated to A). make_simplified_union
-        // would produce Union[A, B, C]. We can't express a new union
-        // without a Type encoder -> defer to Python.
+        // produces Union[A, B, C] via the Rust encoder + decoded/
+        // type_ref-fixed on the Python side. The result is Encoded.
         let a = snap("a.A", "A");
         let b = snap("a.B", "B");
         let c = snap("a.C", "C");
@@ -2484,7 +2630,58 @@ mod tests {
             items: vec![instance("a.B", vec![]), instance("a.C", vec![])],
             uses_pep604_syntax: false,
         };
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![
+                    instance("a.A", vec![]),
+                    instance("a.B", vec![]),
+                    instance("a.C", vec![]),
+                ],
+                uses_pep604_syntax: false,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn join_types_union_drops_uninhabited() {
+        // s=A, t=Union[UninhabitedType, B]. Neither is_subtype(A, t)
+        // (B unrelated) nor is_subtype(every item, A) (UninhabitedType
+        // <: A is True, but B is not <: A). So make_simplified_union
+        // fires: flatten -> [A, UninhabitedType, B], redundancy drops
+        // UninhabitedType, leaving [A, B]. Encoded.
+        let a = snap("a.A", "A");
+        let b = snap("a.B", "B");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, b, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![Type::UninhabitedType, instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+        };
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+                uses_pep604_syntax: false,
+            };
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]
