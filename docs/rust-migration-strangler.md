@@ -1513,3 +1513,130 @@ The default-off path is unchanged. Stage 3b introduces no production
 wiring: both `#[pyfunction]`s are parity-only and gated behind the
 `type_kernel` extension import (skipped when the `.so` is absent).
 
+## Milestone 7 (Phase 5 spike): Semantic-Analyzer Kernel Scoping
+
+### Objective
+
+Semantic analysis (`mypy/semanal.py`, 8466 LOC) is ~16% of build time
+(`semanal_time` in `--dump-build-stats`). Unlike Stage 3 (`is_subtype`,
+`join`/`meet`), `SemanticAnalyzer` is a stateful visitor that mutates
+the shared AST and symbol tables; a big-bang port is infeasible. This
+spike identifies the largest *pure* sub-operation that can sit behind a
+narrow strangler gate and reports the seam shape, snapshot inputs, and
+risk. No production code is required to close this milestone.
+
+### Candidate audit
+
+Surveyed all `def analyze_*` and `def visit_*` methods in
+`mypy/semanal.py`. Almost every entry mutates `defn.info` or
+`defn.metadata` in place and dispatches plugin hooks
+(`plugin.get_function_hook`, `plugin.get_method_hook`,
+`plugin.get_class_decorator_hook`, `plugin.get_customize_class_mro_hook`).
+Two clusters are pure enough to port:
+
+| Candidate | LOC | Purity | Plugin hooks | Mutates |
+|-----------|-----|--------|--------------|---------|
+| `mypy/mro.py` (`linearize_hierarchy` + `merge`) | 62 | High | None | `info.mro`, `info.fallback_to_any` (caller in `semanal.py:2755`), `type_state.reset_all_subtype_caches_for` |
+| `analyze_base_classes` (`semanal.py:2607`) | 52 | Low | None directly, but calls `expr_to_analyzed_type` which is plugin-aware (`get_function_hook` for `typing.Annotated`) | `bases` list (return value, not mutation) |
+| `calculate_class_mro` (`semanal.py:2755`) | 18 | Low | `plugin.get_customize_class_mro_hook` (rewrites MRO after the pure linearization) | `defn.info.mro` via `calculate_mro` |
+
+### Recommendation: `linearize_hierarchy` + `merge` (C3 MRO)
+
+`mypy/mro.py` is the largest pure sub-operation in the semantic-analysis
+pipeline. It is a textbook C3 linearization (Dylan-style): walk direct
+bases, recursively linearize each, then merge. No plugin hooks, no AST
+traversal, no `expr_to_analyzed_type`. Inputs are three `TypeInfo`
+fields (`bases`, `fullname`, `mro` for the cache-hit short-circuit);
+outputs are a `list[TypeInfo]`.
+
+### Seam shape
+
+`linearize_hierarchy` mutates `info.mro` indirectly via its caller
+`calculate_mro(info, obj_type)`. The Rust port stays read-only: it
+takes a list of `(type_ref, parent_type_refs)` snapshots and returns
+the linearized `Vec<type_ref>`. Python then writes `info.mro = result`
+and calls `reset_all_subtype_caches_for(info)`.
+
+```rust
+// crates/type_kernel/src/mro.rs
+pub fn c3_linearize(
+    info_ref: TypeRef,
+    direct_base_refs: &[TypeRef],
+    resolver: &TypeResolver,
+) -> Result<Vec<TypeRef>, MroError>;
+```
+
+Python dispatch (in `mypy/mro.py`):
+```python
+if _HAS_TYPE_KERNEL and _native_mro_active:
+    result = _rust_c3_linearize(info, resolver)
+    if result is not None:
+        return result  # Vec[TypeInfo], Python writes it back to info.mro
+    # fall through to Python
+```
+
+### Snapshot inputs
+
+The resolver needs, per `TypeInfo`:
+- `fullname: String` (for error messages and cache keys)
+- `bases: Vec<TypeRef>` (resolved parents; the wire format already
+  serializes each `Instance` base as a `Type::Instance { type_ref }`
+  in Stage 3b's `bases` enrichment)
+- `mro: Option<Vec<TypeRef>>` (the cached MRO; present when the
+  short-circuit fires)
+
+Stage 3b already collects `mro: Vec<String>` and `bases: Vec<Vec<u8>>`;
+Stage 5 only needs `bases` decoded to `Vec<TypeRef>` (cheap; the
+`Instance` wire blob carries `type_ref` directly).
+
+### Expected `semanal_time` impact
+
+C3 linearization itself is O(n*m) on small n (most classes have <=4
+bases), but it is called once per `ClassDef` and recurses into each
+base's MRO. Per-class wall time is ~0.1ms but accumulates: ~1500 class
+defs per medium project, ~150ms total. That is ~1% of `semanal_time`,
+small but not zero. The bigger win is the cache invalidation:
+`reset_all_subtype_caches_for` is the only side effect that touches
+global state, and it can stay Python-side while the pure walk moves to
+Rust (no Python attribute lookups per recursion).
+
+### Risk assessment
+
+- **Low** on parity: C3 is a closed-form algorithm, the Rust port is a
+  pure function with an `Option<MroError>` return (Python's `MroError`
+  is already a sentinel that `calculate_class_mro` catches). The
+  strangler contract (return `None` -> fall through to Python) covers
+  the snapshot-miss case.
+- **Medium** on FFI overhead: each recursion must look up the base's
+  `TypeInfo` in the resolver. The Stage 3b `TypeResolver` already
+  supports `get(type_ref)` in Rust, so the inner loop has zero FFI per
+  step. The only FFI is at the entry and exit boundaries.
+- **Low** on plugin coupling: `plugin.get_customize_class_mro_hook`
+  runs *after* `calculate_mro` returns, so the hook is unaffected by
+  the Rust walk. The hook stays Python-side.
+- **Medium** on the `obj_type` fallback: when a class has no bases and
+  is not `builtins.object`, Python synthesizes a dummy `object` base.
+  The Rust port needs the `obj_type` resolver ref too; either pass it
+  as an argument or store `is_builtins_object: bool` in the snapshot.
+
+### Out of scope for the spike
+
+- No production wiring (default-off, parity-only, like Stage 3a/3b).
+- No `analyze_base_classes` port (plugin-aware via
+  `expr_to_analyzed_type`).
+- No `calculate_class_mro` dispatch shim (lands with the implementation
+  milestone, not the spike).
+- No `type_state.reset_all_subtype_caches_for` port (Python-side, the
+  Rust walk returns the MRO; Python writes it back and calls reset).
+
+### Verdict
+
+Ship a Stage 5 implementation milestone that ports
+`linearize_hierarchy` + `merge` to `crates/type_kernel/src/mro.rs`
+behind the `_native_mro_active` gate, with a parity suite
+(`testtypes.py::NativeMroSuite` covering diamond, cycle-detection,
+`object` root, and the `obj_type` fallback). Expected `semanal_time`
+win is modest (~1%), but it establishes the seam for future semanal
+ports without the risk of touching plugin-aware paths. If profiling
+shows the linearization is below the FFI entry/exit cost, the gate
+stays default-off and the milestone closes as a no-op proof of parity.
