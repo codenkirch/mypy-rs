@@ -78,6 +78,42 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // visit_literal_type (subtypes.py:1068-1072): when both sides are
+    // LiteralType, subtype is structural equality. Needed by the
+    // `_remove_redundant_union_items` dedup pass for unions like
+    // [Literal[True], Literal[False]] (neither is a subtype of the
+    // other, so dedup keeps both before literal contraction collapses
+    // them to `bool`).
+    if let (Type::LiteralType { .. }, Type::LiteralType { .. }) = (left, right) {
+        return Some(left == right);
+    }
+    // visit_literal_type else-branch (subtypes.py:1072):
+    // is_subtype(LiteralType, Instance) = is_subtype(lit.fallback, right).
+    if let Type::LiteralType { fallback, .. } = left {
+        if let Type::Instance { .. } = right {
+            return is_subtype(fallback, right, ctx, resolver);
+        }
+    }
+    // visit_instance vs LiteralType right (subtypes.py:724-728): only
+    // fires when left.last_known_value is Some, recursing into
+    // is_subtype(left.last_known_value, right). When lkv is None,
+    // Instance is NOT a subtype of LiteralType (falls to else: False).
+    if let Type::LiteralType { .. } = right {
+        if let Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } = left
+        {
+            return is_subtype(lkv.as_ref(), right, ctx, resolver);
+        }
+        if let Type::Instance {
+            last_known_value: None,
+            ..
+        } = left
+        {
+            return Some(false);
+        }
+    }
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,

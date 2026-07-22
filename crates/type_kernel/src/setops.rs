@@ -37,7 +37,7 @@
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 use crate::subtypes::{
     is_subtype, SubtypeContext, CONTRAVARIANT, COVARIANT, INVARIANT, VARIANCE_NOT_READY,
@@ -1358,17 +1358,41 @@ fn visit_join(
             None
         }
 
-        // visit_literal_type (join.py:837-847), cases 1+4 only. Case 1
-        // (s is LiteralType, t==s) returns t -> SameT. Case 4 (s is
-        // Instance, s.last_known_value==t) returns t -> SameT. Case 2
-        // (enum simplified union) and case 3 (fallback join) produce
-        // types other than s/t -> defer. Case 5 (join_types(s,
-        // t.fallback)) recurses into Instance-vs-Instance but the
-        // result is neither s nor t in general -> defer.
+        // visit_literal_type (join.py:912-918). Cases:
+        // 1 (s is LiteralType, t == s) -> SameT.
+        // 2 (s is LiteralType, both fallbacks enum) -> make_simplified_union
+        //   ([s, t]) -> defer (needs enum contraction).
+        // 3 (s is LiteralType, neither enum) -> join_types(s.fallback,
+        //   t.fallback). When both fallbacks are the same Instance (the
+        //   common bool case: Literal[True] vs Literal[False]), the
+        //   recursive join returns SameS -> s.fallback, which we encode.
+        //   When fallbacks differ, the recursive join may defer -> None.
+        // 4 (s is Instance, s.last_known_value == t) -> SameT.
+        // 5 (else) -> join_types(s, t.fallback) -> defer (result not
+        //   generally s or t).
         Type::LiteralType { value: t_val, .. } => {
-            if let Type::LiteralType { value: s_val, .. } = s {
+            if let Type::LiteralType {
+                value: s_val,
+                fallback: s_fb,
+            } = s
+            {
                 if s_val == t_val {
                     return Some(SetOpResult::SameT);
+                }
+                // Case 2 (both enum) needs make_simplified_union with
+                // enum contraction -> defer.
+                if is_enum_fallback(s_fb, resolver) || is_enum_fallback(t, resolver) {
+                    return None;
+                }
+                // Case 3: join_types(s.fallback, t.fallback). Build the
+                // joined fallback and encode it (the result is an
+                // Instance, not s or t).
+                if let Type::LiteralType { fallback: t_fb, .. } = t {
+                    let joined =
+                        setop_result_to_type(join_types(s_fb, t_fb, ctx, resolver), s_fb, t_fb)?;
+                    let mut wbuf = WriteBuffer::new();
+                    wire::write_type(&mut wbuf, &joined).ok()?;
+                    return Some(SetOpResult::Encoded(wbuf.into_bytes()));
                 }
                 return None;
             }
@@ -1553,6 +1577,19 @@ fn visit_callable_fallback(
     }
 }
 
+/// `TypeInfo.is_enum` (nodes.py:3753) read for a LiteralType's fallback
+/// Instance. The snapshot carries `is_enum`; returns `false` when the
+/// fallback is not an Instance or the snapshot is missing (the Python
+/// path's `is_enum` defaults to `False` for non-enum types, so a missing
+/// snapshot is conservatively non-enum).
+fn is_enum_fallback(t: &Type, resolver: &TypeResolver) -> bool {
+    if let Type::Instance { type_ref, .. } = t {
+        resolver.get(type_ref).is_some_and(|s| s.is_enum)
+    } else {
+        false
+    }
+}
+
 /// `flatten_nested_unions` (types.py:4267-4300): recursively expand
 /// UnionType items into a flat list. TypeAliasType is NOT expanded
 /// (the wire format carries only `type_ref`, not the live `TypeAlias`
@@ -1618,14 +1655,99 @@ fn remove_redundant_union_items(
     Some(current)
 }
 
+/// `try_contracting_literals_in_union` (typeops.py:1121-1161), Rust
+/// subset. Contracts literals sharing a fallback back into the sum
+/// type when all values of the sum are present.
+///
+/// Ported: the `bool` case. When both `Literal[True]` and `Literal[False]`
+/// appear in the union, replace the first with `builtins.bool` and drop
+/// the rest.
+///
+/// Deferred: the enum case (needs `TypeInfo.enum_members` from the live
+/// graph, not carried in the wire snapshot). Returns `None` (defer) when
+/// any enum LiteralType is present.
+fn try_contracting_literals_in_union(
+    items: Vec<Type>,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    // First pass: defer if any enum LiteralType is present (needs
+    // `enum_members` which the snapshot doesn't carry).
+    for t in &items {
+        if let Type::LiteralType { fallback, .. } = t {
+            if is_enum_fallback(fallback, resolver) {
+                return None;
+            }
+        }
+    }
+    // Bool contraction: collect indices per bool-fallback, track which
+    // bool values are still missing. When the missing set is empty for
+    // a given fallback, contract: keep the first index (replace with the
+    // fallback Instance), drop the rest.
+    // fullname -> (missing_values: set, indices: vec)
+    let mut groups: std::collections::HashMap<
+        String,
+        (std::collections::HashSet<bool>, Vec<usize>),
+    > = std::collections::HashMap::new();
+    for (idx, t) in items.iter().enumerate() {
+        if let Type::LiteralType {
+            fallback,
+            value: LiteralValue::Bool(b),
+        } = t
+        {
+            if let Type::Instance { type_ref, .. } = fallback.as_ref() {
+                let entry = groups.entry(type_ref.clone()).or_insert_with(|| {
+                    let mut s = std::collections::HashSet::new();
+                    s.insert(true);
+                    s.insert(false);
+                    (s, Vec::new())
+                });
+                entry.0.remove(b);
+                entry.1.push(idx);
+            }
+        }
+    }
+    let mut replace_at: std::collections::HashMap<usize, Type> = std::collections::HashMap::new();
+    let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for (_, (missing, indices)) in groups {
+        if missing.is_empty() && indices.len() >= 2 {
+            let first = indices[0];
+            let rest = &indices[1..];
+            // Replace `first` with the fallback Instance from that
+            // LiteralType.
+            if let Type::LiteralType { fallback, .. } = &items[first] {
+                replace_at.insert(first, (**fallback).clone());
+            }
+            for &i in rest {
+                drop.insert(i);
+            }
+        }
+    }
+    if replace_at.is_empty() && drop.is_empty() {
+        return Some(items);
+    }
+    let mut result = Vec::with_capacity(items.len());
+    for (i, t) in items.into_iter().enumerate() {
+        if drop.contains(&i) {
+            continue;
+        }
+        if let Some(rep) = replace_at.remove(&i) {
+            result.push(rep);
+        } else {
+            result.push(t);
+        }
+    }
+    Some(result)
+}
+
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
-/// path (step 2), remove redundant items (step 3), `make_union` (final).
-/// Steps deferred: literal contraction (step 4, needs
-/// `try_contracting_literals_in_union`), extra-attrs erasure (step 5,
-/// needs `try_getting_instance_fallback` + live TypeInfo). Returns
-/// `None` (defer to Python) when any step can't be completed.
+/// path (step 2), remove redundant items (step 3), bool literal
+/// contraction (step 4, bool case only), `make_union` (final).
+/// Steps deferred: enum literal contraction (needs `enum_members`),
+/// extra-attrs erasure (step 5, needs `try_getting_instance_fallback`
+/// and live TypeInfo). Returns `None` (defer to Python) when any step
+/// can't be completed.
 fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
@@ -1637,15 +1759,15 @@ fn make_simplified_union(
     if flat.len() == 1 {
         return Some(flat.into_iter().next().unwrap());
     }
-    // Step 4 precondition: defer when LiteralType is present (the
-    // contraction step needs `try_contracting_literals_in_union`).
-    if flat.iter().any(|t| matches!(t, Type::LiteralType { .. })) {
-        return None;
-    }
-    // Step 3: remove redundant items.
-    let simplified = remove_redundant_union_items(flat, ctx, resolver)?;
+    // Step 3: remove redundant items. Defer when any is_subtype returns
+    // None (non-Instance pair, including LiteralType-vs-non-LiteralType
+    // where the Rust is_subtype only handles LiteralType == LiteralType).
+    let deduped = remove_redundant_union_items(flat, ctx, resolver)?;
+    // Step 4: contract bool literals (Literal[True, False] -> bool).
+    // Defer when any enum LiteralType is present.
+    let contracted = try_contracting_literals_in_union(deduped, resolver)?;
     // Final: make_union (types.py:3483-3489).
-    Some(union_make_union(simplified))
+    Some(union_make_union(contracted))
 }
 
 /// `UnionType.make_union` (types.py:3483-3489): 0 items -> bottom,
@@ -2652,6 +2774,68 @@ mod tests {
     }
 
     #[test]
+    fn join_types_literal_true_false_returns_bool() {
+        // visit_literal_type case 3 (join.py:915-917): s is LiteralType,
+        // s != t, neither fallback is_enum -> join_types(s.fallback,
+        // t.fallback). For Literal[True] and Literal[False] both fallbacks
+        // are builtins.bool, so join_types(bool, bool) = bool. The result
+        // is builtins.bool (Encoded Instance), not s or t.
+        let bool_snap = snap("builtins.bool", "bool");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![bool_snap, o]);
+        let s = literal(LiteralValue::Bool(true), "builtins.bool");
+        let t = literal(LiteralValue::Bool(false), "builtins.bool");
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("builtins.bool", vec![]));
+        }
+    }
+
+    #[test]
+    fn join_types_union_contracts_bool_literals() {
+        // s=A, t=Union[Literal[True], Literal[False]]. Neither s <: t
+        // nor t <: s. make_simplified_union flattens to
+        // [A, Literal[True], Literal[False]], dedup keeps all (A not
+        // subtype of bool literal, bool literals not subtype of A or
+        // each other), then try_contracting_literals_in_union collapses
+        // Literal[True] + Literal[False] -> bool. Result: Union[A, bool].
+        let a = snap("a.A", "A");
+        let bool_snap = snap("builtins.bool", "bool");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![a, bool_snap, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![
+                literal(LiteralValue::Bool(true), "builtins.bool"),
+                literal(LiteralValue::Bool(false), "builtins.bool"),
+            ],
+            uses_pep604_syntax: false,
+        };
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![instance("a.A", vec![]), instance("builtins.bool", vec![])],
+                uses_pep604_syntax: false,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
     fn join_types_union_drops_uninhabited() {
         // s=A, t=Union[UninhabitedType, B]. Neither is_subtype(A, t)
         // (B unrelated) nor is_subtype(every item, A) (UninhabitedType
@@ -3101,19 +3285,26 @@ mod tests {
 
     #[test]
     fn join_literal_with_unequal_literal_defers() {
-        // visit_literal_type case 1 (join.py:841-843): s is
-        // LiteralType, t != s, not enum -> join_types(s.fallback,
-        // t.fallback). The result is the joined fallback, which is
-        // neither s nor t in general. Defer (can't express as
-        // SameS/SameT unless the fallback equals s or t, which the
-        // Instance-Instance path handles separately when both sides
-        // are Instances — but here both sides are LiteralType).
+        // visit_literal_type case 3 (join.py:915-917): s is
+        // LiteralType, t != s, neither enum -> join_types(s.fallback,
+        // t.fallback). Both fallbacks are builtins.int, so the
+        // recursive join returns SameS -> builtins.int (Encoded).
         let o = snap("builtins.object", "object");
         let i = snap("builtins.int", "int");
         let r = make_resolver(vec![o, i]);
         let s = literal(LiteralValue::Int(1), "builtins.int");
         let t = literal(LiteralValue::Int(2), "builtins.int");
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("builtins.int", vec![]));
+        }
     }
 
     #[test]
@@ -4250,13 +4441,14 @@ mod tests {
     // SameT. Else -> Bottom (default).
 
     #[test]
-    fn meet_literal_equal_literal_returns_t() {
-        // visit_literal_type case 1 (meet.py:1237-1238): s is
-        // LiteralType, s == t -> return t (SameT).
+    fn meet_literal_equal_literal_returns_s() {
+        // meet.py:139-140 pre-check: is_proper_subtype(s, t) is True
+        // for LiteralType == LiteralType (visit_literal_type subtypes.py:1069:
+        // left == right). So meet(Literal[1], Literal[1]) returns s.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = literal(LiteralValue::Int(1), "a.A");
         let t = literal(LiteralValue::Int(1), "a.A");
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
