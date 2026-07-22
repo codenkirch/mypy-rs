@@ -40,6 +40,11 @@ pub(crate) struct TypeInfoSnapshot {
     pub is_protocol: bool,
     /// `TypeInfo.is_enum` (nodes.py:3753). subtypes.py:339,500; value_repr:3368.
     pub is_enum: bool,
+    /// `TypeInfo.enum_members` (nodes.py:3977, @property list[str]).
+    /// typeops.py:1144 uses it for enum literal contraction in
+    /// `try_contracting_literals_in_union`. Empty when `is_enum` is
+    /// false (the property returns [] for non-enum types).
+    pub enum_members: Vec<String>,
     /// `TypeInfo.fallback_to_any` (nodes.py:3759). subtypes.py:493,1494.
     pub fallback_to_any: bool,
     /// `TypeInfo.meta_fallback_to_any` (nodes.py:3763). subtypes.py:1494.
@@ -374,6 +379,13 @@ pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyO
             read_bool_attr(item, "is_protocol").unwrap_or(false),
         )?;
         snap_dict.set_item("is_enum", read_bool_attr(item, "is_enum").unwrap_or(false))?;
+        snap_dict.set_item(
+            "enum_members",
+            PyList::new(
+                py,
+                read_str_list_attr(item, "enum_members").unwrap_or_default(),
+            ),
+        )?;
         snap_dict.set_item(
             "fallback_to_any",
             read_bool_attr(item, "fallback_to_any").unwrap_or(false),
@@ -802,6 +814,7 @@ pub(crate) fn build_native_resolver(
             .unwrap_or_else(|| fullname.rsplit('.').next().unwrap_or(&fullname).to_owned());
         let is_protocol = read_bool_attr(item, "is_protocol").unwrap_or(false);
         let is_enum = read_bool_attr(item, "is_enum").unwrap_or(false);
+        let enum_members = read_str_list_attr(item, "enum_members").unwrap_or_default();
         let fallback_to_any = read_bool_attr(item, "fallback_to_any").unwrap_or(false);
         let meta_fallback_to_any = read_bool_attr(item, "meta_fallback_to_any").unwrap_or(false);
         let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
@@ -843,6 +856,7 @@ pub(crate) fn build_native_resolver(
             name,
             is_protocol,
             is_enum,
+            enum_members,
             fallback_to_any,
             meta_fallback_to_any,
             is_named_tuple,

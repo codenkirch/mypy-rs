@@ -1358,10 +1358,13 @@ fn visit_join(
             None
         }
 
-        // visit_literal_type (join.py:912-918). Cases:
+        // visit_literal_type (join.py:928-938). Cases:
         // 1 (s is LiteralType, t == s) -> SameT.
-        // 2 (s is LiteralType, both fallbacks enum) -> make_simplified_union
-        //   ([s, t]) -> defer (needs enum contraction).
+        // 2 (s is LiteralType, both fallbacks enum) ->
+        //   make_simplified_union([s, t]). When the enum has exactly
+        //   these 2 members, contraction collapses to the enum
+        //   Instance (Encoded). Partial coverage returns a 2-item
+        //   union, which is neither s nor t -> defer.
         // 3 (s is LiteralType, neither enum) -> join_types(s.fallback,
         //   t.fallback). When both fallbacks are the same Instance (the
         //   common bool case: Literal[True] vs Literal[False]), the
@@ -1379,15 +1382,28 @@ fn visit_join(
                 if s_val == t_val {
                     return Some(SetOpResult::SameT);
                 }
-                // Case 2 (both enum) needs make_simplified_union with
-                // enum contraction -> defer.
-                if is_enum_fallback(s_fb, resolver) || is_enum_fallback(t, resolver) {
-                    return None;
-                }
-                // Case 3: join_types(s.fallback, t.fallback). Build the
-                // joined fallback and encode it (the result is an
-                // Instance, not s or t).
                 if let Type::LiteralType { fallback: t_fb, .. } = t {
+                    // Case 2 (both enum): make_simplified_union([s, t]).
+                    // Contraction collapses to a single Instance when
+                    // the enum's full member set is covered; the result
+                    // is the fallback. Partial coverage yields a union
+                    // of 2 literals, which is neither s nor t -> defer.
+                    if is_enum_fallback(s_fb, resolver)
+                        && is_enum_fallback(t_fb, resolver)
+                        && s_fb.as_ref() == t_fb.as_ref()
+                    {
+                        let simplified =
+                            make_simplified_union(&[s.clone(), t.clone()], ctx, resolver)?;
+                        if matches!(simplified, Type::Instance { .. }) {
+                            let mut wbuf = WriteBuffer::new();
+                            wire::write_type(&mut wbuf, &simplified).ok()?;
+                            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                        }
+                        return None;
+                    }
+                    // Case 3: join_types(s.fallback, t.fallback). Build
+                    // the joined fallback and encode it (the result is
+                    // an Instance, not s or t).
                     let joined =
                         setop_result_to_type(join_types(s_fb, t_fb, ctx, resolver), s_fb, t_fb)?;
                     let mut wbuf = WriteBuffer::new();
@@ -1656,70 +1672,87 @@ fn remove_redundant_union_items(
 }
 
 /// `try_contracting_literals_in_union` (typeops.py:1121-1161), Rust
-/// subset. Contracts literals sharing a fallback back into the sum
-/// type when all values of the sum are present.
+/// port. Contracts literals sharing a fallback back into the sum type
+/// when all values of the sum are present.
 ///
-/// Ported: the `bool` case. When both `Literal[True]` and `Literal[False]`
-/// appear in the union, replace the first with `builtins.bool` and drop
-/// the rest.
+/// Ported: the `bool` case and the `enum` case. For bool, when both
+/// `Literal[True]` and `Literal[False]` appear, replace the first with
+/// `builtins.bool` and drop the rest. For enum, when every member in
+/// `TypeInfo.enum_members` appears as a `LiteralType(value=Str(name))`
+/// with the same enum fallback, replace the first with the fallback
+/// Instance and drop the rest.
 ///
-/// Deferred: the enum case (needs `TypeInfo.enum_members` from the live
-/// graph, not carried in the wire snapshot). Returns `None` (defer) when
-/// any enum LiteralType is present.
+/// Deferred: nothing in this function (enum_members is now in the
+/// snapshot). Returns `None` only if a snapshot lookup is needed but
+/// the fullname is absent (conservative defer; the Python path's
+/// `is_enum` defaults to false so a missing snapshot is non-enum).
 fn try_contracting_literals_in_union(
     items: Vec<Type>,
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
-    // First pass: defer if any enum LiteralType is present (needs
-    // `enum_members` which the snapshot doesn't carry).
-    for t in &items {
-        if let Type::LiteralType { fallback, .. } = t {
-            if is_enum_fallback(fallback, resolver) {
-                return None;
-            }
-        }
+    // Contraction groups keyed by fallback fullname. Each group tracks
+    // the set of sum-type values still missing and the indices of
+    // LiteralType items that participate. For bool, the "sum" is
+    // {true, false}; for enum, the "sum" is `TypeInfo.enum_members`.
+    // fullname -> (missing_values, indices, is_bool)
+    enum Sum {
+        Bool(std::collections::HashSet<bool>),
+        Enum(std::collections::HashSet<String>),
     }
-    // Bool contraction: collect indices per bool-fallback, track which
-    // bool values are still missing. When the missing set is empty for
-    // a given fallback, contract: keep the first index (replace with the
-    // fallback Instance), drop the rest.
-    // fullname -> (missing_values: set, indices: vec)
-    let mut groups: std::collections::HashMap<
-        String,
-        (std::collections::HashSet<bool>, Vec<usize>),
-    > = std::collections::HashMap::new();
+    let mut groups: std::collections::HashMap<String, (Sum, Vec<usize>)> =
+        std::collections::HashMap::new();
     for (idx, t) in items.iter().enumerate() {
-        if let Type::LiteralType {
-            fallback,
-            value: LiteralValue::Bool(b),
-        } = t
-        {
-            if let Type::Instance { type_ref, .. } = fallback.as_ref() {
-                let entry = groups.entry(type_ref.clone()).or_insert_with(|| {
-                    let mut s = std::collections::HashSet::new();
-                    s.insert(true);
-                    s.insert(false);
-                    (s, Vec::new())
-                });
-                entry.0.remove(b);
-                entry.1.push(idx);
+        let Type::LiteralType { fallback, value } = t else {
+            continue;
+        };
+        let Type::Instance { type_ref, .. } = fallback.as_ref() else {
+            continue;
+        };
+        let snap = resolver.get(type_ref)?;
+        if snap.is_enum {
+            let LiteralValue::Str(name) = value else {
+                continue;
+            };
+            let entry = groups.entry(type_ref.clone()).or_insert_with(|| {
+                (
+                    Sum::Enum(snap.enum_members.iter().cloned().collect()),
+                    Vec::new(),
+                )
+            });
+            if let Sum::Enum(missing) = &mut entry.0 {
+                missing.remove(name);
             }
+            entry.1.push(idx);
+        } else if let LiteralValue::Bool(b) = value {
+            let entry = groups.entry(type_ref.clone()).or_insert_with(|| {
+                let mut s = std::collections::HashSet::new();
+                s.insert(true);
+                s.insert(false);
+                (Sum::Bool(s), Vec::new())
+            });
+            if let Sum::Bool(missing) = &mut entry.0 {
+                missing.remove(b);
+            }
+            entry.1.push(idx);
         }
     }
     let mut replace_at: std::collections::HashMap<usize, Type> = std::collections::HashMap::new();
     let mut drop: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    for (_, (missing, indices)) in groups {
-        if missing.is_empty() && indices.len() >= 2 {
-            let first = indices[0];
-            let rest = &indices[1..];
-            // Replace `first` with the fallback Instance from that
-            // LiteralType.
-            if let Type::LiteralType { fallback, .. } = &items[first] {
-                replace_at.insert(first, (**fallback).clone());
-            }
-            for &i in rest {
-                drop.insert(i);
-            }
+    for (_, (sum, indices)) in groups {
+        let complete = match sum {
+            Sum::Bool(missing) => missing.is_empty() && indices.len() >= 2,
+            Sum::Enum(missing) => missing.is_empty() && !indices.is_empty(),
+        };
+        if !complete {
+            continue;
+        }
+        let first = indices[0];
+        let rest = &indices[1..];
+        if let Type::LiteralType { fallback, .. } = &items[first] {
+            replace_at.insert(first, (**fallback).clone());
+        }
+        for &i in rest {
+            drop.insert(i);
         }
     }
     if replace_at.is_empty() && drop.is_empty() {
@@ -1742,12 +1775,11 @@ fn try_contracting_literals_in_union(
 /// `make_simplified_union` (typeops.py:605-692), Rust subset.
 ///
 /// Steps ported: flatten nested unions (step 1), single-item fast
-/// path (step 2), remove redundant items (step 3), bool literal
-/// contraction (step 4, bool case only), `make_union` (final).
-/// Steps deferred: enum literal contraction (needs `enum_members`),
-/// extra-attrs erasure (step 5, needs `try_getting_instance_fallback`
-/// and live TypeInfo). Returns `None` (defer to Python) when any step
-/// can't be completed.
+/// path (step 2), remove redundant items (step 3), literal contraction
+/// (step 4, bool + enum cases), `make_union` (final).
+/// Steps deferred: extra-attrs erasure (step 5, needs
+/// `try_getting_instance_fallback` and live TypeInfo). Returns `None`
+/// (defer to Python) when any step can't be completed.
 fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
@@ -1763,8 +1795,8 @@ fn make_simplified_union(
     // None (non-Instance pair, including LiteralType-vs-non-LiteralType
     // where the Rust is_subtype only handles LiteralType == LiteralType).
     let deduped = remove_redundant_union_items(flat, ctx, resolver)?;
-    // Step 4: contract bool literals (Literal[True, False] -> bool).
-    // Defer when any enum LiteralType is present.
+    // Step 4: contract literals (bool + enum) sharing a fallback
+    // whose full value set is covered.
     let contracted = try_contracting_literals_in_union(deduped, resolver)?;
     // Final: make_union (types.py:3483-3489).
     Some(union_make_union(contracted))
@@ -2829,6 +2861,95 @@ mod tests {
             let decoded = read_type(&mut rbuf, None).expect("decode failed");
             let expected = Type::UnionType {
                 items: vec![instance("a.A", vec![]), instance("builtins.bool", vec![])],
+                uses_pep604_syntax: false,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn join_types_union_contracts_enum_literals() {
+        // s=A, t=Union[Literal[Color.RED], Literal[Color.BLUE],
+        // Literal[Color.GREEN]]. make_simplified_union flattens,
+        // dedup keeps all (enum literals with distinct str values are
+        // not subtypes of each other), then
+        // try_contracting_literals_in_union collects all 3 enum
+        // literals sharing the builtins.Color fallback, checks that
+        // every enum_member is covered (RED, BLUE, GREEN), and
+        // collapses the first to Color + drops the rest.
+        // Result: Union[A, Color].
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let mut color = snap("color.Color", "Color");
+        color.is_enum = true;
+        color.enum_members = vec!["RED".to_string(), "BLUE".to_string(), "GREEN".to_string()];
+        let r = make_resolver(vec![a, color, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![
+                literal(LiteralValue::Str("RED".to_string()), "color.Color"),
+                literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
+                literal(LiteralValue::Str("GREEN".to_string()), "color.Color"),
+            ],
+            uses_pep604_syntax: false,
+        };
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![instance("a.A", vec![]), instance("color.Color", vec![])],
+                uses_pep604_syntax: false,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn join_types_union_partial_enum_literals_defers() {
+        // s=A, t=Union[Literal[Color.RED], Literal[Color.BLUE]] with
+        // Color={RED, BLUE, GREEN}. Only 2 of 3 members present ->
+        // the enum is NOT fully covered, so contraction does NOT fire.
+        // Python keeps the union as-is ([A, Color.RED, Color.BLUE]).
+        // Rust defers (None): the wire format round-trip would need to
+        // emit the partial union, but that path is identical to the
+        // bool case's "missing member" branch, so we just defer.
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let mut color = snap("color.Color", "Color");
+        color.is_enum = true;
+        color.enum_members = vec!["RED".to_string(), "BLUE".to_string(), "GREEN".to_string()];
+        let r = make_resolver(vec![a, color, o]);
+        let s = instance("a.A", vec![]);
+        let t = Type::UnionType {
+            items: vec![
+                literal(LiteralValue::Str("RED".to_string()), "color.Color"),
+                literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
+            ],
+            uses_pep604_syntax: false,
+        };
+        // Partial enum coverage does not contract; Python returns the
+        // union unchanged. Rust emits the same union (no contraction).
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![
+                    instance("a.A", vec![]),
+                    literal(LiteralValue::Str("RED".to_string()), "color.Color"),
+                    literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
+                ],
                 uses_pep604_syntax: false,
             };
             assert_eq!(decoded, expected);
