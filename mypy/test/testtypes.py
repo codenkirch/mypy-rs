@@ -12,6 +12,9 @@ from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance
 # unit tests exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set.
 # Unset exercises the default (Python) path; =1 exercises the Rust path.
 _set_native_erase_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+from mypy.mro import _set_native_mro_active
+
+_set_native_mro_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
@@ -4000,6 +4003,211 @@ class NativeMeetTypeVarTupleSuite(Suite):
         # visit_type_type else (meet.py:1260-1261): s is Instance (not
         # builtins.type) -> default -> Bottom.
         assert meet_types(self.fx.a, self.fx.type_a) == UninhabitedType()
+
+
+# Stage 5 parity suite: exercises `mro::rust_linearize_hierarchy` through the
+# public `calculate_mro` entry. Each test builds a live TypeInfo graph with
+# explicit `bases` and empty `mro`, builds a `NativeTypeResolver` snapshot
+# from it, installs it via `_set_native_mro_resolver`, and asserts the MRO
+# `calculate_mro` assigns matches the expected C3 order. Gated by
+# `TEST_NATIVE_TYPE_KERNEL=1` plus the `type_kernel` extension; skipped
+# otherwise (the Python path is exercised by the existing suites).
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMroSuite(Suite):
+    """Parity tests for `mro::rust_linearize_hierarchy` (Stage 5).
+
+    Each test constructs a small TypeInfo hierarchy, builds the Rust
+    resolver snapshot, installs it, and calls the public `calculate_mro`.
+    The Rust path returns None for cycles, missing bases, the `obj_type`
+    callback edge, and inconsistent merges, so those cases fall through to
+    Python (which raises `MroError` on inconsistency); parity holds because
+    the end state (`info.mro` or a raised `MroError`) is identical.
+    """
+
+    def setUp(self) -> None:
+        from mypy.mro import _set_native_mro_resolver
+
+        self._set_native_mro_resolver = _set_native_mro_resolver
+        # Builtins.object TypeInfo, reused as the hierarchy root. Its mro is
+        # set to [self] so linearize_hierarchy short-circuits for it.
+        self.oi = self._make_class("builtins.object", bases=[], mro=None)
+
+    def tearDown(self) -> None:
+        # Clear the resolver so later suites (or the default Python path)
+        # are not affected by a stale install.
+        self._set_native_mro_resolver(None, None)
+
+    def _make_class(
+        self,
+        name: str,
+        *,
+        bases: list[Instance],
+        mro: list[TypeInfo] | None,
+    ) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = name
+        info = TypeInfo(SymbolTable(), defn, name)
+        info.bases = bases
+        # `mro=None` leaves info.mro empty so `calculate_mro` computes it;
+        # a non-None list sets the cached mro (for the short-circuit test
+        # and for builtins.object, which is its own root).
+        info.mro = mro if mro is not None else []
+        return info
+
+    def _install_resolver(self, infos: list[TypeInfo]) -> None:
+        import type_kernel as _type_kernel
+
+        resolver = _type_kernel.build_native_resolver(infos, [])
+        self._resolver = resolver
+        typeinfo_map = {info.fullname: info for info in infos}
+        self._set_native_mro_resolver(resolver, typeinfo_map)
+
+    def _mro_fullnames(self, info: TypeInfo) -> list[str]:
+        return [t.fullname for t in info.mro]
+
+    def test_object_root_linearizes_to_itself(self) -> None:
+        from mypy.mro import calculate_mro
+
+        self._install_resolver([self.oi])
+        calculate_mro(self.oi)
+        assert self._mro_fullnames(self.oi) == ["builtins.object"]
+
+    def test_direct_base_appends_object(self) -> None:
+        # B : object  ->  B, object
+        from mypy.mro import calculate_mro
+
+        b = self._make_class("mymod.B", bases=[Instance(self.oi, [])], mro=None)
+        self._install_resolver([b, self.oi])
+        calculate_mro(b)
+        assert self._mro_fullnames(b) == ["mymod.B", "builtins.object"]
+
+    def test_diamond_inheritance_c3_order(self) -> None:
+        # D : object, B : D, C : D, A : B, C  ->  A, B, C, D, object
+        from mypy.mro import calculate_mro
+
+        d = self._make_class("mymod.D", bases=[Instance(self.oi, [])], mro=None)
+        b = self._make_class("mymod.B", bases=[Instance(d, [])], mro=None)
+        c = self._make_class("mymod.C", bases=[Instance(d, [])], mro=None)
+        a = self._make_class(
+            "mymod.A", bases=[Instance(b, []), Instance(c, [])], mro=None
+        )
+        self._install_resolver([a, b, c, d, self.oi])
+        calculate_mro(a)
+        assert self._mro_fullnames(a) == [
+            "mymod.A",
+            "mymod.B",
+            "mymod.C",
+            "mymod.D",
+            "builtins.object",
+        ]
+
+    def test_consistent_merge_succeeds(self) -> None:
+        # A : object, B : A, object  ->  B, A, object
+        from mypy.mro import calculate_mro
+
+        a = self._make_class("mymod.A", bases=[Instance(self.oi, [])], mro=None)
+        b = self._make_class(
+            "mymod.B",
+            bases=[Instance(a, []), Instance(self.oi, [])],
+            mro=None,
+        )
+        self._install_resolver([b, a, self.oi])
+        calculate_mro(b)
+        assert self._mro_fullnames(b) == ["mymod.B", "mymod.A", "builtins.object"]
+
+    def test_inconsistent_merge_raises_mro_error(self) -> None:
+        # X : A, B  and  Y : B, A  with Z : X, Y  ->  merge fails. Rust
+        # returns None (declines), Python raises MroError. The end state
+        # (MroError propagated) is identical to the pure-Python path.
+        from mypy.mro import MroError, calculate_mro
+
+        a = self._make_class("mymod.Inc.A", bases=[Instance(self.oi, [])], mro=None)
+        b = self._make_class("mymod.Inc.B", bases=[Instance(self.oi, [])], mro=None)
+        x = self._make_class(
+            "mymod.Inc.X", bases=[Instance(a, []), Instance(b, [])], mro=None
+        )
+        y = self._make_class(
+            "mymod.Inc.Y", bases=[Instance(b, []), Instance(a, [])], mro=None
+        )
+        z = self._make_class(
+            "mymod.Inc.Z", bases=[Instance(x, []), Instance(y, [])], mro=None
+        )
+        self._install_resolver([z, x, y, a, b, self.oi])
+        with self.assertRaises(MroError):
+            calculate_mro(z)
+
+    def test_cycle_returns_none_at_rust_level(self) -> None:
+        # A : B, B : A  ->  cycle. Rust's `rust_linearize_hierarchy`
+        # returns None (its cycle guard), so the shim would fall through
+        # to Python. We test the Rust entry directly (NOT `calculate_mro`)
+        # because Python's `linearize_hierarchy` has no cycle guard of its
+        # own: it relies on `semanal.verify_base_classes` (nodes.py:2826)
+        # to reject raw inheritance cycles before MRO runs, so a synthetic
+        # cycle reaching `calculate_mro` would infinite-loop rather than
+        # raise MroError. The Rust None keeps the production path safe:
+        # a stale snapshot that reintroduces a cycle declines to Python,
+        # which would have rejected the cycle at semantic-analysis time.
+        import type_kernel as _type_kernel
+
+        a = self._make_class("mymod.Cyc.A", bases=[], mro=None)
+        b = self._make_class("mymod.Cyc.B", bases=[Instance(a, [])], mro=None)
+        a.bases = [Instance(b, [])]
+        self._install_resolver([a, b, self.oi])
+        # Call the Rust function directly (the shim would defer to Python,
+        # which is unsafe for a synthetic cycle).
+        result = _type_kernel.rust_linearize_hierarchy(
+            self._resolver, "mymod.Cyc.A"
+        )
+        assert result is None
+
+    def test_obj_type_fallback_edge_defers_to_python(self) -> None:
+        # A baseless non-object class needs the `obj_type` callback
+        # (mro.py:34) to synthesize a dummy `object` base. Rust has no
+        # callback and returns None; Python uses `obj_type` to build the
+        # mro. Here we pass `obj_type=lambda: Instance(self.oi, [])` so
+        # Python completes the MRO as [cls, object].
+        from mypy.mro import calculate_mro
+
+        standalone = self._make_class("mymod.Standalone", bases=[], mro=None)
+        self._install_resolver([standalone, self.oi])
+        calculate_mro(standalone, obj_type=lambda: Instance(self.oi, []))
+        assert self._mro_fullnames(standalone) == ["mymod.Standalone", "builtins.object"]
+
+    def test_missing_base_in_snapshot_defers_to_python(self) -> None:
+        # A : B, but B is absent from the resolver snapshot. Rust returns
+        # None; Python rebuilds from the live graph (B is reachable via
+        # `info.bases`), so the MRO is still computed correctly.
+        from mypy.mro import calculate_mro
+
+        b = self._make_class("mymod.Mb.B", bases=[Instance(self.oi, [])], mro=None)
+        a = self._make_class("mymod.Mb.A", bases=[Instance(b, [])], mro=None)
+        # Install a resolver that deliberately omits B (stale snapshot).
+        self._install_resolver([a, self.oi])
+        calculate_mro(a)
+        assert self._mro_fullnames(a) == ["mymod.Mb.A", "mymod.Mb.B", "builtins.object"]
+
+    def test_cached_mro_short_circuits_without_calling_rust(self) -> None:
+        # When `info.mro` is already set, `calculate_mro` re-assigns it
+        # (idempotent) and re-runs the side effects, but the shim must not
+        # call Rust (mro.py:31 short-circuit). To prove Rust is skipped, we
+        # build the resolver with `cls.mro` empty (so the snapshot's mro is
+        # empty and Rust WOULD walk the bases to [Cached, object]), then set
+        # the live `cls.mro` to a cached [object] list. If the short-circuit
+        # works, `linearize_hierarchy` returns the cached [object]; if Rust
+        # were called instead, it would return [Cached, object] (different).
+        from mypy.mro import calculate_mro
+
+        cls = self._make_class("mymod.Cached", bases=[Instance(self.oi, [])], mro=None)
+        # Build the resolver with empty cls.mro so the snapshot sees no cache.
+        self._install_resolver([cls, self.oi])
+        # Now set the live cache AFTER the resolver snapshot is frozen. Rust
+        # would still see an empty snapshot mro and recompute; the Python
+        # short-circuit must return this cached list instead.
+        cls.mro = [self.oi]
+        calculate_mro(cls)
+        assert self._mro_fullnames(cls) == ["builtins.object"]
 
 
 
