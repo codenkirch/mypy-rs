@@ -351,6 +351,13 @@ fn map_derivation_path(
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
     let left_snap = resolver.get(left_ref)?;
+    // Variadic left: expand_type_by_instance would need the
+    // split_with_prefix_and_suffix logic to substitute the TypeVarTuple
+    // middle. Not ported; defer to Python. Also guards mid-path bases
+    // that are variadic even when the original left isn't.
+    if left_snap.has_type_var_tuple_type {
+        return None;
+    }
     for base_blob in &left_snap.bases {
         let base = decode_type(base_blob)?;
         if let Type::Instance {
@@ -461,6 +468,18 @@ fn visit_instance_nominal(
 
     let right_snap = right_snap?;
 
+    // Variadic right (subtypes.py:644-670): Python takes a special path
+    // using split_with_prefix_and_suffix to splice the TypeVarTuple
+    // middle into left/right args. Not ported; defer to Python.
+    if right_snap.has_type_var_tuple_type {
+        return None;
+    }
+    // Variadic left when left != right: map_instance_to_supertype would
+    // need the same split logic to substitute the variadic tvar. Defer.
+    if left_ref != right_ref && left_snap.is_some_and(|s| s.has_type_var_tuple_type) {
+        return None;
+    }
+
     // Map left to right's type. Fast path: left.type == right.type (no
     // substitution needed). Slow path calls map_instance_to_supertype
     // to walk the bases blobs and substitute TypeVars.
@@ -493,7 +512,15 @@ fn visit_instance_nominal(
         return None;
     }
     let mut nominal = true;
-    for (i, (_tvar_name, variance, _kind)) in right_tvars.iter().enumerate() {
+    for (i, (_tvar_name, variance, kind)) in right_tvars.iter().enumerate() {
+        // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else
+        // branch (subtypes.py:691-696) treats them as COVARIANT, but
+        // the arg shapes (CallableType with ParamSpec prefix, TupleType
+        // for variadic middle) hit unsupported variants in the
+        // recursive is_subtype. Defer to Python.
+        if *kind != 0 {
+            return None;
+        }
         let lefta = &mapped_args[i];
         let righta = &right_args[i];
         let effective_variance = if ctx.always_covariant && *variance == INVARIANT {
@@ -506,9 +533,15 @@ fn visit_instance_nominal(
             // snapshot can't mirror that without re-reading. Fall through.
             return None;
         }
-        if !check_type_parameter(lefta, righta, effective_variance, ctx, resolver) {
-            nominal = false;
-            break;
+        match check_type_parameter(lefta, righta, effective_variance, ctx, resolver) {
+            Some(true) => {}
+            Some(false) => {
+                nominal = false;
+                break;
+            }
+            // Recursive is_subtype hit an unsupported variant. Don't
+            // assume not-subtype (would give wrong answers); defer.
+            None => return None,
         }
     }
     Some(nominal)
@@ -516,16 +549,21 @@ fn visit_instance_nominal(
 
 /// `check_type_parameter` (subtypes.py:379-410), Rust subset.
 ///
+/// Returns `Some(bool)` when Rust decided; `None` when a recursive
+/// `is_subtype` hit an unsupported variant. Propagating `None` (rather
+/// than swallowing it as `false` via `unwrap_or`) prevents wrong
+/// answers: if Rust can't decide `is_subtype(lefta, righta)`, the whole
+/// `visit_instance_nominal` must defer to Python, not assume not-subtype.
+///
 /// COVARIANT / VARIANCE_NOT_READY: `is_subtype(left, right)`.
 /// CONTRAVARIANT: `is_subtype(right, left)`.
 /// INVARIANT (non-proper): `is_equivalent(left, right)` — needs
-/// `is_same_type`, which is a two-way subtype check; we recurse
-/// `is_subtype(left, right) && is_subtype(right, left)` for the
-/// non-proper case (Python's `is_equivalent` does exactly this).
+/// `is_same_type`, a two-way subtype check; we recurse both directions
+/// (Python's `is_equivalent` does exactly this).
 ///
-/// `proper_subtype` + INVARIANT returns `true` conservatively so the
-/// caller's `nominal` flag isn't falsely lowered; the Python path will
-/// re-check via `is_same_type` (its `ignore_promotions` plumbing is
+/// `proper_subtype` + INVARIANT returns `Some(true)` conservatively so
+/// the caller's `nominal` flag isn't falsely lowered; the Python path
+/// re-checks via `is_same_type` (its `ignore_promotions` plumbing is
 /// deferred to M8c).
 fn check_type_parameter(
     left: &Type,
@@ -533,16 +571,17 @@ fn check_type_parameter(
     variance: i64,
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
-) -> bool {
+) -> Option<bool> {
     match variance {
-        COVARIANT | VARIANCE_NOT_READY => is_subtype(left, right, ctx, resolver).unwrap_or(false),
-        CONTRAVARIANT => is_subtype(right, left, ctx, resolver).unwrap_or(false),
+        COVARIANT | VARIANCE_NOT_READY => is_subtype(left, right, ctx, resolver),
+        CONTRAVARIANT => is_subtype(right, left, ctx, resolver),
         _ => {
             if ctx.proper_subtype {
-                true
+                Some(true)
             } else {
-                is_subtype(left, right, ctx, resolver).unwrap_or(false)
-                    && is_subtype(right, left, ctx, resolver).unwrap_or(false)
+                let fwd = is_subtype(left, right, ctx, resolver)?;
+                let bwd = is_subtype(right, left, ctx, resolver)?;
+                Some(fwd && bwd)
             }
         }
     }
