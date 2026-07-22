@@ -1311,6 +1311,14 @@ def define_options(
         default=False,
         help="Enable Rust-backed module resolution",
     )
+    # --native-type-kernel routes erase_type/is_subtype/join/meet through
+    # the type_kernel Rust extension. Default on after Stage 3c parity;
+    # --no-native-type-kernel is the escape hatch for differential testing.
+    add_invertible_flag(
+        "--native-type-kernel",
+        default=False,
+        help="Enable Rust-backed type kernel (erase_type, is_subtype, join, meet)",
+    )
     # --logical-deps adds some more dependencies that are not semantically needed, but
     # may be helpful to determine relative importance of classes and functions for overall
     # type precision in a code base. It also _removes_ some deps, so this flag should be never

@@ -139,7 +139,11 @@ class TypeCheckSuite(DataSuite):
         options.show_traceback = True
         options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
         options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
-        options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+        # native_type_kernel graduated to default-on (Stage 3c parity).
+        # Unset exercises the default (on); TEST_NATIVE_TYPE_KERNEL=0
+        # forces the pure-Python path for differential testing.
+        if os.environ.get("TEST_NATIVE_TYPE_KERNEL") == "0":
+            options.native_type_kernel = False
         options.reveal_verbose_types = not testcase.name.endswith("_no_verbose_reveal")
 
         if options.num_workers:
