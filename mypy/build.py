@@ -903,6 +903,13 @@ class BuildManager:
         from mypy.join import _set_native_join_active
 
         _set_native_join_active(self.options.native_type_kernel)
+        # Stage 4 (M8ba): gate the pure-positional/named branch of
+        # `map_actuals_to_formals`. The Rust path returns None for any call
+        # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
+        # so star-actual calls fall through to Python unchanged.
+        from mypy.argmap import _set_native_argmap_active
+
+        _set_native_argmap_active(self.options.native_type_kernel)
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()

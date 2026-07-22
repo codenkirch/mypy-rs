@@ -23,6 +23,33 @@ from mypy.types import (
 if TYPE_CHECKING:
     from mypy.infer import ArgumentInferContext
 
+# Stage 4 type-kernel seam: when the `type_kernel` Rust extension is
+# importable and `Options.native_type_kernel` is set, route the pure
+# positional/named branches of `map_actuals_to_formals` through Rust. The
+# Rust path returns `None` for any call with an ARG_STAR or ARG_STAR2 actual
+# (those branches need the `actual_arg_type` callback, which is deferred),
+# in which case we fall back to the pure-Python implementation. This is the
+# strangler-fig per-call gate, mirroring `erasetype.py` (Stage 1) and
+# `subtypes.py` (Stage 3c): no behavior change unless the option is set.
+try:
+    from type_kernel import rust_map_actuals_to_formals as _rust_map_actuals_to_formals
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_map_actuals_to_formals = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag read by the gate below. Set by the build manager from
+# `Options.native_type_kernel` at the start of each build, so the hot path
+# avoids an options lookup per call.
+_native_argmap_active: bool = False
+
+
+def _set_native_argmap_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust argmap path."""
+    global _native_argmap_active
+    _native_argmap_active = active
+
 
 def map_actuals_to_formals(
     actual_kinds: list[nodes.ArgKind],
@@ -39,6 +66,21 @@ def map_actuals_to_formals(
     The actual_arg_type argument should evaluate to the type of the actual
     argument with the given index.
     """
+    if _HAS_TYPE_KERNEL and _native_argmap_active:
+        # Mirror Python's `assert actual_names is not None` for named kinds:
+        # if a named kind is present with no names list, let Python raise the
+        # internal error rather than calling Rust with an empty names list.
+        has_named = any(k.is_named() for k in actual_kinds)
+        if not (has_named and actual_names is None):
+            result = _rust_map_actuals_to_formals(
+                [int(k.value) for k in actual_kinds],
+                list(actual_names) if actual_names is not None else [],
+                [int(k.value) for k in formal_kinds],
+                list(formal_names),
+            )
+            if result is not None:
+                return [list(slot) for slot in result]
+            # Rust returned None (star actual present) — fall through to Python.
     nformals = len(formal_kinds)
     formal_to_actual: list[list[int]] = [[] for i in range(nformals)]
     ambiguous_actual_kwargs: list[int] = []
