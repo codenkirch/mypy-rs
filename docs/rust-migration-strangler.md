@@ -1141,6 +1141,31 @@ Re-run with `--dump-build-stats` after changes to the parser or resolver
 seams and compare; a >10% regression in any row warrants investigation
 before merging.
 
+### Post-graduation baseline (native type kernel default-on)
+
+Recorded 2026-07-22 on the self-check corpus (`mypy_self_check.ini -p
+mypy`, 197 modules, 4 parallel workers), native parser + native
+resolver + native type kernel all default-on, extensions built
+`--release`. The kernel graduation (issue #27) flipped
+`Options.native_type_kernel` from `False` to `True` after Stage 3c
+full-suite parity was proven green (testtypes 302 passed, testsubtypes
+33 passed, testcheck 8205 passed under `TEST_NATIVE_TYPE_KERNEL=1`;
+testcheck 8205 passed again with no env var exercising the default-on
+path).
+
+| stat | pre-graduation (2026-07-06) | post-graduation (2026-07-22) |
+|------|------------------------------|------------------------------|
+| `type_check_time_implementation` | 2.938s | ~2.0s (range 1.66-2.78 across SCCs) |
+| `semanal_time` | 0.650s | ~0.6s (range 0.59-1.27) |
+| `parse_time` | 0.149s | ~0.13s |
+| `total_process_stale_time` | 4.109s | ~3.3s |
+
+The `type_check_time_implementation` improvement (~30%) is consistent
+with the kernel routing `erase_type`, `is_subtype`, `join_types`,
+`meet_types`, and `make_simplified_union` through Rust with zero FFI
+per recursion. The `--no-native-type-kernel` escape hatch preserves
+the two-way differential for regression detection.
+
 ## Milestone 3 (Phase 4): Type Kernel — Stage 1 (`erase_type`)
 
 The type kernel is the highest-risk slice in the migration: `mypy.types`
