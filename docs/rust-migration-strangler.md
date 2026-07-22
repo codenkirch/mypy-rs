@@ -1665,3 +1665,80 @@ win is modest (~1%), but it establishes the seam for future semanal
 ports without the risk of touching plugin-aware paths. If profiling
 shows the linearization is below the FFI entry/exit cost, the gate
 stays default-off and the milestone closes as a no-op proof of parity.
+
+## Stage 3c production wiring (M8bb): resolver infrastructure + kernel gap audit
+
+### Finding
+
+Issue #27 graduated `Options.native_type_kernel` to default-on (PR #58)
+claiming a ~30% `type_check_time_implementation` win. A post-graduation
+audit revealed the win was illusory: the `BuildManager.__init__` set the
+`_native_*_active` flags but never called `_set_native_subtype_resolver`
+or `_set_native_join_resolver`, so the shim's `and _native_*_resolver is
+not None` check short-circuited and every Rust call fell through to
+Python. The parity suites (testtypes.py / testsubtypes.py `Native*`)
+passed because they install the resolver in `setUp`; production never did.
+
+### Resolver infrastructure (shipped)
+
+`BuildManager` now builds the `NativeTypeResolver` snapshot from the live
+TypeInfo graph and exposes it via two helpers:
+
+- `_collect_type_infos()`: walks `manager.modules` -> each `MypyFile.names`
+  SymbolTable -> filters for `TypeInfo` nodes. Returns the full list of
+  loaded TypeInfos.
+- `_build_native_resolvers()`: calls `type_kernel.build_native_resolver`
+  with the collected TypeInfos, then installs the result on the
+  subtype/join shims. No-op unless `Options.native_type_kernel` is set
+  and the extension is importable.
+
+`process_stale_scc` calls `_build_native_resolvers()` after
+`semantic_analysis_for_scc` populates the TypeInfo graph for the SCC.
+The resolver sees the full graph (all previously-loaded modules plus the
+current SCC) by the time type checking runs.
+
+### Kernel gap (blocking production wiring)
+
+With the resolvers installed, the Stage 3c subtype kernel causes ~143
+testcheck regressions (out of ~1855 sampled). Sample failing case:
+
+  `is_subtype(list[tuple[str, int]], Iterable[tuple[str, int]])`
+
+Expected: `True` (list[X] <: Iterable[X] via covariant substitution).
+Rust returns: `False` (or a wrong `True` for the inverse direction).
+
+The failing cases cluster around generic-instance subtype checks where
+`map_instance_to_supertype` must substitute TypeVars across a multi-level
+inheritance path. The Rust `map_derivation_path` walks the snapshot's
+`bases` blobs and calls `expand_type_by_instance`, but a subset of
+substitution edges (variance, ParamSpec, TypeVarTuple, UnpackType)
+return wrong answers instead of `None`. The parity suites miss these
+because they only test the cases Rust handles correctly.
+
+The join kernel has the same shape: it shares the subtype resolver and
+returns wrong answers for generic-instance joins.
+
+### Fix path (deferred)
+
+1. Audit `visit_instance_nominal` + `map_instance_to_supertype` +
+   `check_type_parameter` in `crates/type_kernel/src/subtypes.rs` against
+   `mypy/subtypes.py:567-710` and `mypy/maptype.py:8-23`. Find every
+   branch that returns a non-None wrong answer and convert it to
+   `return None` (defer to Python).
+2. Add a `testcheck.py` parity gate to CI that runs with
+   `TEST_NATIVE_TYPE_KERNEL=1` AND the resolvers installed, so kernel
+   regressions block merge. (The parity suites alone are insufficient.)
+3. Once testcheck is green with the resolvers installed, uncomment the
+   two `_set_native_*_resolver` lines in `BuildManager._build_native_resolvers`.
+
+### Current shipping state
+
+- Resolver infrastructure: shipped, called per SCC, safe (no behavior
+  change since the resolvers stay None).
+- `_set_native_join_typeinfo_map`: installed (harmless without the join
+  resolver; ready for the moment the join resolver is uncommented).
+- `_set_native_subtype_resolver` / `_set_native_join_resolver`:
+  commented out with a pointer to this section.
+
+The parity suites (339 tests) and the full testcheck suite (8205 tests)
+stay green with this infrastructure in place.
