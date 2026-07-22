@@ -910,6 +910,16 @@ class BuildManager:
         from mypy.argmap import _set_native_argmap_active
 
         _set_native_argmap_active(self.options.native_type_kernel)
+        # Stage 5 (M8bc): gate the C3 `calculate_mro` linearization. The
+        # Rust path (`rust_linearize_hierarchy`) returns None for cycles,
+        # missing bases, the `obj_type` callback edge, and inconsistent
+        # merges, so those fall through to Python (which raises the real
+        # MroError on inconsistency). The resolver is installed separately
+        # (see `_build_native_resolvers`); without it the shim falls through
+        # to Python unchanged, so this gate is parity-only and default-off.
+        from mypy.mro import _set_native_mro_active
+
+        _set_native_mro_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1075,6 +1085,15 @@ class BuildManager:
         resolver (the join shim short-circuits on `_native_join_resolver
         is None`), but we install it so the Ancestor-disc path is ready
         the moment the join resolver is uncommented.
+
+        Stage 5 (M8bc) status: the MRO kernel (`rust_linearize_hierarchy`)
+        is parity-only and default-off. The `_set_native_mro_resolver`
+        install is commented out alongside the subtype/join installs so
+        no behavior change ships; the parity suite installs the resolver
+        directly. The kernel returns None for cycles, missing bases, the
+        `obj_type` callback edge, and inconsistent merges, so it cannot
+        return a wrong answer (only decline), which is why it ships
+        parity-ready rather than gated behind a correctness gap.
         """
         if not self.options.native_type_kernel:
             return
@@ -1083,17 +1102,24 @@ class BuildManager:
         except ImportError:
             return
         from mypy.join import _set_native_join_typeinfo_map
+        from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
         from mypy.join import _set_native_join_resolver
 
         type_infos = self._collect_type_infos()
         resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
         # Uncomment these once the Stage 3c kernels return `None` (not
         # wrong answers) for unsupported generic substitution. See
         # docs/rust-migration-strangler.md "Stage 3c production wiring".
         # _set_native_subtype_resolver(resolver)
         # _set_native_join_resolver(resolver)
-        _set_native_join_typeinfo_map({info.fullname: info for info in type_infos})
+        # Stage 5: parity-ready; the MRO kernel only declines (None),
+        # never returns a wrong answer, so the resolver install is the
+        # only thing gating production wiring. Left commented so no
+        # behavior change ships with this stage.
+        # _set_native_mro_resolver(resolver, typeinfo_map)
+        _set_native_join_typeinfo_map(typeinfo_map)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
