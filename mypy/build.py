@@ -910,6 +910,9 @@ class BuildManager:
         from mypy.argmap import _set_native_argmap_active
 
         _set_native_argmap_active(self.options.native_type_kernel)
+        # Stage 3c/4 production wiring (M8bb): the resolver is built per
+        # SCC in `process_stale_scc` (after semantic analysis populates
+        # the TypeInfo graph). See `_build_native_resolvers` for status.
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()
@@ -1028,6 +1031,69 @@ class BuildManager:
         self.options_snapshot_cache: dict[Options, tuple[str, str]] = {}
         # Packages for which we know presence or absence of __getattr__().
         self.known_partial_packages: dict[str, bool] = {}
+
+    def _collect_type_infos(self) -> list:
+        """Walk all loaded modules and collect every `TypeInfo` node.
+
+        The parity suites use a fixture-walk; production walks the same
+        `MypyFile.names` SymbolTable entries, filtering for `TypeInfo`.
+        Safe to call from `__init__` (returns `[]` when no modules are
+        loaded yet) and from `process_stale_scc` after semantic analysis
+        populates the graph.
+        """
+        from mypy.nodes import TypeInfo
+
+        infos: list[TypeInfo] = []
+        for module in self.modules.values():
+            if module is None:
+                continue
+            for sym in module.names.values():
+                node = sym.node
+                if isinstance(node, TypeInfo):
+                    infos.append(node)
+        return infos
+
+    def _build_native_resolvers(self) -> None:
+        """Build the `NativeTypeResolver` snapshot from the live TypeInfo
+        graph and install it on the subtype/join shims.
+
+        No-op unless `Options.native_type_kernel` is set and the
+        `type_kernel` extension is importable. Called per SCC in
+        `process_stale_scc` after semantic analysis populates the TypeInfo
+        graph for that SCC. Each rebuild picks up newly-loaded modules so
+        the resolver sees the full graph by the time type checking runs.
+
+        Stage 3c/4 status (M8bb): the infrastructure is in place and the
+        parity suites (testtypes.py / testsubtypes.py Native*) pass with
+        the resolvers installed, but the Stage 3c subtype/join kernels
+        still return wrong answers for some generic-instance cases
+        (`map_instance_to_supertype` substitution edges, variance). Wiring
+        the resolvers to production causes ~143 testcheck regressions,
+        so the `_set_native_*_resolver` calls are commented out until
+        the kernel correctness gaps are closed. The
+        `_set_native_join_typeinfo_map` call is harmless without the join
+        resolver (the join shim short-circuits on `_native_join_resolver
+        is None`), but we install it so the Ancestor-disc path is ready
+        the moment the join resolver is uncommented.
+        """
+        if not self.options.native_type_kernel:
+            return
+        try:
+            import type_kernel as _type_kernel
+        except ImportError:
+            return
+        from mypy.join import _set_native_join_typeinfo_map
+        from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.join import _set_native_join_resolver
+
+        type_infos = self._collect_type_infos()
+        resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Uncomment these once the Stage 3c kernels return `None` (not
+        # wrong answers) for unsupported generic substitution. See
+        # docs/rust-migration-strangler.md "Stage 3c production wiring".
+        # _set_native_subtype_resolver(resolver)
+        # _set_native_join_resolver(resolver)
+        _set_native_join_typeinfo_map({info.fullname: info for info in type_infos})
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
@@ -4835,6 +4901,10 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
     t3 = time.time()
+    # Stage 3c/4 production wiring (M8bb): rebuild the NativeTypeResolver
+    # snapshot now that semantic analysis populated the TypeInfo graph
+    # for this SCC. See `_build_native_resolvers` for the kernel status.
+    manager._build_native_resolvers()
     # Track what modules aren't yet done, so we can finish them as soon
     # as possible, saving memory.
     unfinished_modules = set(stale)
