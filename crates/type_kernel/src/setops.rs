@@ -4627,12 +4627,15 @@ mod tests {
 
     #[test]
     fn meet_types_none_t_strict_s_is_none_returns_t() {
-        // visit_none_type (meet.py:850-859), strict_optional, s is
-        // NoneType -> return t (SameT).
+        // meet_types pre-dispatch (meet.py:138-139): is_proper_subtype
+        // (s=None, t=None) is True (visit_none_type right=NoneType ->
+        // True), so the dispatch returns s = SameS. The visitor's
+        // visit_none_type would return SameT, but the pre-dispatch
+        // fires first.
         let r = make_resolver(vec![]);
         let s = Type::NoneType;
         let t = Type::NoneType;
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
@@ -5073,13 +5076,15 @@ mod tests {
         // Bottom (strict). Note: UninhabitedType as s would normally
         // be caught by visit_uninhabited_type if t were Uninhabited,
         // but here t is TypeType so visit_type_type fires.
+        //
+        // The meet_types pre-dispatch (meet.py:138-139) fires first
+        // now that is_proper_subtype(Uninhabited, TypeType) returns
+        // True (visit_uninhabited_type is subtype of everything):
+        // returns s = SameS, not the visitor's Bottom.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = Type::UninhabitedType;
         let t = type_type("a.A");
-        assert_eq!(
-            meet_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Bottom)
-        );
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     // ---- meet visit_unbound_type (M8r) ----

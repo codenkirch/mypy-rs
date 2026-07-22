@@ -78,6 +78,53 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
+    // a subtype of everything (bottom type). Fires before any right-side
+    // dispatch because the Python visitor's `accept` lands on
+    // `visit_uninhabited_type` regardless of `self.right`.
+    if matches!(left, Type::UninhabitedType) {
+        return Some(true);
+    }
+    // visit_deleted_type (subtypes.py:564): DeletedType is a subtype of
+    // everything (same rationale as UninhabitedType).
+    if matches!(left, Type::DeletedType { .. }) {
+        return Some(true);
+    }
+    // visit_none_type (subtypes.py:539-554). The shim already passes
+    // state.strict_optional as ctx.strict_optional.
+    if matches!(left, Type::NoneType) {
+        if !ctx.strict_optional {
+            // subtypes.py:553-554: when strict_optional is off, None
+            // is a subtype of everything.
+            return Some(true);
+        }
+        return match right {
+            // subtypes.py:539-541: right is NoneType or builtins.object
+            // -> True.
+            Type::NoneType => Some(true),
+            Type::Instance { type_ref, .. } if type_ref == "builtins.object" => Some(true),
+            Type::Instance { type_ref, .. } => {
+                // subtypes.py:543-549: right is a protocol Instance.
+                // When all protocol_members are __hash__/__str__ (or
+                // members is empty), Python returns True; else False.
+                // Non-protocol Instance -> False (subtypes.py:551).
+                let snap = resolver.get(type_ref)?;
+                if snap.is_protocol {
+                    let ok = snap.protocol_members.is_empty()
+                        || snap
+                            .protocol_members
+                            .iter()
+                            .all(|m| m == "__hash__" || m == "__str__");
+                    Some(ok)
+                } else {
+                    Some(false)
+                }
+            }
+            // Any other right (CallableType, TupleType, UnionType, etc.)
+            // falls to the `return False` at subtypes.py:551.
+            _ => Some(false),
+        };
+    }
     // visit_literal_type (subtypes.py:1068-1072): when both sides are
     // LiteralType, subtype is structural equality. Needed by the
     // `_remove_redundant_union_items` dedup pass for unions like
@@ -836,5 +883,148 @@ mod tests {
         let left = instance("a.Gen", vec![arg.clone()]);
         let right = instance("a.Gen", vec![arg]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    // ---- visit_none_type / visit_uninhabited_type / visit_deleted_type (M8aa) ----
+
+    fn ctx_strict_optional(strict_optional: bool) -> SubtypeContext {
+        SubtypeContext::new(false, false, false, false, false, strict_optional)
+    }
+
+    #[test]
+    fn none_subtype_of_none_strict_optional() {
+        // visit_none_type (subtypes.py:539-541): right is NoneType -> True.
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &Type::NoneType,
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_subtype_of_object_strict_optional() {
+        // visit_none_type (subtypes.py:539-541): right is builtins.object
+        // -> True (is_named_instance check).
+        let r = make_resolver(vec![snap("builtins.object", "object")]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &instance("builtins.object", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_not_subtype_of_instance_strict_optional() {
+        // visit_none_type (subtypes.py:551): strict_optional + right is
+        // Instance (non-protocol) -> False. Protocol detection needs the
+        // snapshot's is_protocol field; this test uses a non-protocol
+        // Instance, so we return False.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &instance("a.A", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_subtype_of_anything_when_optional_disabled() {
+        // visit_none_type (subtypes.py:553-554): strict_optional=False
+        // -> True for any right.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &instance("a.A", vec![]),
+                &ctx_strict_optional(false),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_subtype_of_protocol_with_hashable_members() {
+        // visit_none_type (subtypes.py:543-549): right is a protocol
+        // Instance. When all protocol_members are __hash__/__str__
+        // (or members is empty), Python returns True.
+        let mut proto = snap("typing.Hashable", "Hashable");
+        proto.is_protocol = true;
+        proto.protocol_members = vec!["__hash__".to_string()];
+        let r = make_resolver(vec![proto]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &instance("typing.Hashable", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_not_subtype_of_protocol_with_other_members() {
+        // visit_none_type (subtypes.py:543-549): right is a protocol
+        // Instance but members include something other than
+        // __hash__/__str__ -> False.
+        let mut proto = snap("typing.Iterable", "Iterable");
+        proto.is_protocol = true;
+        proto.protocol_members = vec!["__iter__".to_string()];
+        let r = make_resolver(vec![proto]);
+        assert_eq!(
+            is_subtype(
+                &Type::NoneType,
+                &instance("typing.Iterable", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn uninhabited_subtype_of_anything() {
+        // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType
+        // is a subtype of everything.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        assert_eq!(
+            is_subtype(
+                &Type::UninhabitedType,
+                &instance("a.A", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn deleted_subtype_of_anything() {
+        // visit_deleted_type (subtypes.py:564): DeletedType is a
+        // subtype of everything.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        assert_eq!(
+            is_subtype(
+                &Type::DeletedType { source: None },
+                &instance("a.A", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
     }
 }
