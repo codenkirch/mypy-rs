@@ -1775,6 +1775,52 @@ fn write_int(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
     write_int_bare(buf, value)
 }
 
+/// `write_bytes_bare`: short-int length prefix + body. Inverse of
+/// `read_bytes_bare` (wire.rs:279-290).
+fn write_bytes_bare(buf: &mut WriteBuffer, bytes: &[u8]) -> Result<(), WireError> {
+    write_int_bare(buf, bytes.len() as i64)?;
+    buf.extend(bytes);
+    Ok(())
+}
+
+/// `write_float_bare`: 8 bytes IEEE-754 little-endian. Inverse of
+/// `read_float_bare` (wire.rs:294-300).
+fn write_float_bare(buf: &mut WriteBuffer, value: f64) -> Result<(), WireError> {
+    buf.extend(&value.to_le_bytes());
+    Ok(())
+}
+
+/// `write_literal_value`: bare literal value, tag chosen by variant.
+/// Inverse of `read_literal` (wire.rs:424-434).
+fn write_literal_value(buf: &mut WriteBuffer, value: &LiteralValue) -> Result<(), WireError> {
+    match value {
+        LiteralValue::Int(i) => {
+            write_tag(buf, LITERAL_INT);
+            write_int_bare(buf, *i)
+        }
+        LiteralValue::Str(s) => {
+            write_tag(buf, LITERAL_STR);
+            write_str_bare(buf, s)
+        }
+        LiteralValue::Bytes(b) => {
+            write_tag(buf, LITERAL_BYTES);
+            write_bytes_bare(buf, b)
+        }
+        LiteralValue::Float(f) => {
+            write_tag(buf, LITERAL_FLOAT);
+            write_float_bare(buf, *f)
+        }
+        LiteralValue::Bool(true) => {
+            write_tag(buf, LITERAL_TRUE);
+            Ok(())
+        }
+        LiteralValue::Bool(false) => {
+            write_tag(buf, LITERAL_FALSE);
+            Ok(())
+        }
+    }
+}
+
 /// `write_type_opt`: `LITERAL_NONE` for None, else `write_type`. Inverse
 /// of `read_type_opt` (wire.rs:591-600).
 fn write_type_opt(buf: &mut WriteBuffer, value: Option<&Type>) -> Result<(), WireError> {
@@ -1982,8 +2028,18 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::LiteralType { fallback, value } => {
+            write_tag(buf, LITERAL_TYPE);
+            // `read_literal_type` requires the fallback to be an
+            // Instance (it asserts INSTANCE tag). `write_type` emits
+            // exactly that for an Instance.
+            write_type(buf, fallback)?;
+            write_literal_value(buf, value)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType)",
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType)",
             t.variant_name()
         ))),
     }
