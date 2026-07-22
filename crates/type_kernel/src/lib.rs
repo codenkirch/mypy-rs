@@ -29,6 +29,11 @@
 //!     `TypeAliasType` expansion. The `NativeTypeResolver` `#[pyclass]`
 //!     holds both resolvers in Rust for zero-FFI-per-lookup access by
 //!     Stage 3c `is_subtype`.
+//!   * **Stage 4** (`argmap::rust_map_actuals_to_formals`): ports the pure
+//!     `mypy.argmap.map_actuals_to_formals` binding step from `check_call`.
+//!     Handles non-star actuals; returns `None` for star actuals so Python
+//!     re-runs the function with the `actual_arg_type` callback. Foundation
+//!     for the `rust_check_call` kernel.
 //!
 //! Shared infrastructure (`TypeRefs` class cache, `fallback_sentinel`/
 //! `is_fallback`, `make_any`) lives in `refs` and is reused by both stages.
@@ -36,6 +41,7 @@
 //! full staging roadmap.
 
 mod aliases;
+mod argmap;
 mod erase;
 mod lkv;
 mod refs;
@@ -74,6 +80,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_meet_types, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        argmap::rust_map_actuals_to_formals,
+        module
+    )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }

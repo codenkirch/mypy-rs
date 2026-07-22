@@ -2,13 +2,23 @@
 
 from __future__ import annotations
 
-from mypy.argmap import map_actuals_to_formals
+import os
+from unittest import skipUnless
+
+from mypy.argmap import _set_native_argmap_active, map_actuals_to_formals
 from mypy.checker import DisjointDict, group_comparison_operands
 from mypy.literals import Key
 from mypy.nodes import ARG_NAMED, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, NameExpr
 from mypy.test.helpers import Suite, assert_equal
 from mypy.test.typefixture import TypeFixture
 from mypy.types import AnyType, TupleType, Type, TypeOfAny
+
+# Stage 4 parity: flip the argmap gate from the env var so the unit tests
+# exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set. Mirrors the
+# testtypes.py gate for the Stage 3a/3b/3c parity suites.
+_set_native_argmap_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+
+_NATIVE_ARGMAP_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
 
 
 class MapActualsToFormalsSuite(Suite):
@@ -115,6 +125,102 @@ class MapActualsToFormalsSuite(Suite):
         vararg_type: Type,
     ) -> None:
         result = map_actuals_to_formals(caller_kinds, [], callee_kinds, [], lambda i: vararg_type)
+        assert_equal(result, expected)
+
+
+@skipUnless(_NATIVE_ARGMAP_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeArgMapSuite(Suite):
+    """Parity tests for `argmap::rust_map_actuals_to_formals` (Stage 4).
+
+    Each test runs the same non-star-actual cases as `MapActualsToFormalsSuite`
+    through the public `map_actuals_to_formals` entry point with the Rust gate
+    active, asserting identical results. Star-actual cases are covered by the
+    `return None -> fall through to Python` contract (the Rust path declines,
+    Python handles them; parity holds trivially).
+    """
+
+    def test_basic_and_positional(self) -> None:
+        self.assert_map([], [], [])
+        self.assert_map([ARG_POS], [ARG_POS], [[0]])
+        self.assert_map([ARG_POS, ARG_POS], [ARG_POS, ARG_POS], [[0], [1]])
+
+    def test_optional_formals(self) -> None:
+        self.assert_map([], [ARG_OPT], [[]])
+        self.assert_map([ARG_POS], [ARG_OPT], [[0]])
+        self.assert_map([ARG_POS], [ARG_OPT, ARG_OPT], [[0], []])
+
+    def test_callee_star_formal(self) -> None:
+        self.assert_map([], [ARG_STAR], [[]])
+        self.assert_map([ARG_POS], [ARG_STAR], [[0]])
+        self.assert_map([ARG_POS, ARG_POS], [ARG_STAR], [[0, 1]])
+
+    def test_too_many_positional(self) -> None:
+        self.assert_map([ARG_POS], [], [])
+        self.assert_map([ARG_POS, ARG_POS], [ARG_POS], [[0]])
+
+    def test_named_args(self) -> None:
+        self.assert_map(["x"], [(ARG_POS, "x")], [[0]])
+        self.assert_map(["y", "x"], [(ARG_POS, "x"), (ARG_POS, "y")], [[1], [0]])
+
+    def test_some_and_missing_named(self) -> None:
+        self.assert_map(["y"], [(ARG_OPT, "x"), (ARG_OPT, "y"), (ARG_OPT, "z")], [[], [0], []])
+        self.assert_map(["y"], [(ARG_OPT, "x")], [[]])
+
+    def test_duplicate_named_arg(self) -> None:
+        self.assert_map(["x", "x"], [(ARG_OPT, "x")], [[0, 1]])
+
+    def test_named_into_star2(self) -> None:
+        self.assert_map(["x"], [ARG_STAR2], [[0]])
+        self.assert_map(["x", ARG_STAR2], [(ARG_POS, "x"), ARG_STAR2], [[0], [1]])
+        # Named actual matching a positional formal, with an ARG_STAR2 slot
+        # also present: the named actual binds by name (not to the varkwargs
+        # slot), so slot 0 gets [0, 1] and the varkwargs slot is empty.
+        self.assert_map([ARG_POS, "x"], [(ARG_POS, "x"), ARG_STAR2], [[0, 1], []])
+
+    def test_named_routes_to_star2_when_formal_is_star(self) -> None:
+        # Name matches an ARG_STAR formal: routes to ARG_STAR2 if present,
+        # dropped otherwise (mirrors argmap.py:81-84).
+        self.assert_map(["x"], [(ARG_STAR, "x"), ARG_STAR2], [[], [0]])
+        self.assert_map(["x"], [(ARG_STAR, "x")], [[]])
+
+    def test_pos_then_named_mixed(self) -> None:
+        self.assert_map([ARG_POS, "y"], [(ARG_POS, "x"), (ARG_POS, "y")], [[0], [1]])
+
+    def test_empty_caller(self) -> None:
+        self.assert_map([], [(ARG_POS, "x")], [[]])
+
+    def test_star_actuals_fall_through(self) -> None:
+        # Star actuals must produce the same result the pure-Python path would;
+        # the Rust path declines (returns None) and Python handles them.
+        self.assert_map([ARG_STAR], [ARG_STAR], [[0]])
+        self.assert_map([ARG_POS, ARG_STAR], [ARG_STAR], [[0, 1]])
+        self.assert_map([ARG_STAR], [ARG_POS, ARG_STAR], [[0], [0]])
+        self.assert_map([ARG_STAR], [ARG_OPT, ARG_STAR], [[0], [0]])
+        self.assert_map([ARG_STAR], [ARG_STAR, (ARG_NAMED, "x")], [[0], []])
+        self.assert_map([ARG_STAR, "x"], [ARG_STAR, (ARG_NAMED, "x")], [[0], [1]])
+        self.assert_map(["x", ARG_STAR2], [ARG_STAR2], [[0, 1]])
+        self.assert_map([ARG_POS, ARG_STAR2], [(ARG_POS, "x"), ARG_STAR2], [[0], [1]])
+        self.assert_map([ARG_STAR2], [(ARG_POS, "x"), ARG_STAR2], [[0], [0]])
+        self.assert_map([ARG_STAR2], [ARG_STAR2], [[0]])
+        self.assert_map([ARG_STAR, ARG_STAR2], [(ARG_POS, "x"), (ARG_POS, "y")], [[0, 1], [0, 1]])
+        self.assert_map([ARG_STAR], [ARG_STAR, ARG_STAR2], [[0], []])
+        self.assert_map([ARG_STAR, ARG_STAR2], [ARG_STAR, ARG_STAR2], [[0], [1]])
+
+    def assert_map(
+        self,
+        caller_kinds_: list[ArgKind | str],
+        callee_kinds_: list[ArgKind | tuple[ArgKind, str]],
+        expected: list[list[int]],
+    ) -> None:
+        caller_kinds, caller_names = expand_caller_kinds(caller_kinds_)
+        callee_kinds, callee_names = expand_callee_kinds(callee_kinds_)
+        result = map_actuals_to_formals(
+            caller_kinds,
+            caller_names,
+            callee_kinds,
+            callee_names,
+            lambda i: AnyType(TypeOfAny.special_form),
+        )
         assert_equal(result, expected)
 
 
