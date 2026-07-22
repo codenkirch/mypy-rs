@@ -1218,7 +1218,17 @@ fn visit_join(
                 // returns t (every arg_join is join(x, x) = x, ret_join
                 // is join(x, x) = x, fallback is t.fallback). So SameS
                 // is correct without building a new CallableType.
-                let identical = arg_kinds == s_arg_kinds
+                //
+                // BUT: when `variables` is non-empty, Python's
+                // `combine_similar_callables` always calls
+                // `match_generic_callables`, which renumbers the tvars
+                // via `TypeVarId.new` (a Python global counter). The
+                // result has fresh tvar ids that differ from the inputs,
+                // so `SameS` (= the original) would be wrong. Defer
+                // the both-generic identical case to Python.
+                let both_generic = !variables.is_empty() && !s_variables.is_empty();
+                let identical = !both_generic
+                    && arg_kinds == s_arg_kinds
                     && arg_names == s_arg_names
                     && arg_types == s_arg_types
                     && ret_type == s_ret_type
@@ -1256,9 +1266,23 @@ fn visit_join(
                     ctx,
                     resolver,
                 )?;
-                // Both-generic case (match_generic_callables) needs
-                // expand_type + fresh TypeVarId generation -> defer.
-                if !variables.is_empty() || !s_variables.is_empty() {
+                // match_generic_callables (join.py:1039-1053): renumber
+                // tvars so both callables share the same id space.
+                // When `min_len == 0` (one side has no variables), the
+                // renumber is a no-op (Python returns the callables
+                // unchanged), so the combine/join_similar path proceeds
+                // with the original fields.
+                //
+                // When `min_len > 0` (both sides have variables), Python
+                // allocates fresh `TypeVarId`s via `TypeVarId.new` (a
+                // Python global counter, types.py:559-562). The result's
+                // tvar ids differ from any deterministic Rust allocation,
+                // and `CallableType.__eq__` compares tvar ids in
+                // `arg_types`/`ret_type`. Rust can't replicate the
+                // counter without FFI back to Python, so the both-generic
+                // case defers to preserve parity.
+                let min_len = variables.len().min(s_variables.len());
+                if min_len > 0 {
                     return None;
                 }
                 if equivalent {
@@ -1427,13 +1451,18 @@ fn visit_join(
         }
 
         // visit_type_var (join.py:463-474), case 1 same-id-same-bound
-        // only. Case 1 (s is TypeVarType, s.id==t.id,
-        // s.upper_bound==t.upper_bound) returns self.s -> SameS. The
-        // copy_modified branch (case 1, upper_bounds differ) and
-        // case 2 (s.id != t.id -> join upper_bounds) both produce a
-        // new TypeVarType or the bound's join result — neither s nor
-        // t in general -> defer. Case 3 (s not TypeVarType ->
-        // default(s)) walks fallback chains -> defer.
+        // and case 3 (s is Instance). Case 1 (s is TypeVarType,
+        // s.id==t.id, s.upper_bound==t.upper_bound) returns self.s ->
+        // SameS. The copy_modified branch (case 1, upper_bounds differ)
+        // and case 2 (s.id != t.id -> join upper_bounds) both produce a
+        // new TypeVarType or the bound's join result — neither s nor t
+        // in general -> defer. Case 3 (s not TypeVarType -> default(s)):
+        // for Instance s, default(s) = object_from_instance(s) = object.
+        // The `Object` variant maps to object_or_any_from_type(t); for
+        // t=TypeVarType this recurses into object_or_any_from_type(
+        // t.upper_bound), which for an Instance upper_bound also returns
+        // object. Both paths yield `builtins.object`, so `Object` is
+        // parity-correct for the Instance-s + TypeVarType-t case.
         //
         // `TypeVarId.__eq__` (types.py:567-577) checks raw_id,
         // meta_level, AND namespace. The wire format serializes only
@@ -1458,7 +1487,20 @@ fn visit_join(
                 if s_raw == t_raw && s_ns == t_ns && s_ub == t_ub {
                     return Some(SetOpResult::SameS);
                 }
+                // Cases 1 (diff upper_bound) and 2 (diff id): produce
+                // a new TypeVarType or join upper_bounds -> defer.
+                return None;
             }
+            // Case 3 (s not TypeVarType): default(s). For Instance s,
+            // default(s) = object_from_instance(s) = object. The
+            // `Object` variant (object_or_any_from_type(t)) yields the
+            // same for t=TypeVarType with Instance upper_bound.
+            if let Type::Instance { .. } = s {
+                return Some(SetOpResult::Object);
+            }
+            // default(s) for non-Instance s (TypeType, TupleType,
+            // CallableType, etc.) walks fallback chains / recurses;
+            // defer to Python.
             None
         }
 
@@ -2542,6 +2584,38 @@ mod tests {
         }
     }
 
+    /// `CallableType` with explicit `variables` (TypeVarLikeType list).
+    /// Mirrors `def f[T](x: T) -> T`: `variables` carries the declared
+    /// TypeVars, `arg_types`/`ret_type` reference them by `TypeVarType`
+    /// nodes whose `(raw_id, namespace)` match the declared tvar.
+    fn callable_with_vars(
+        fallback_ref: &str,
+        arg_types: Vec<Type>,
+        ret_type: Type,
+        variables: Vec<Type>,
+    ) -> Type {
+        let arg_kinds = vec![0i64; arg_types.len()];
+        let arg_names = vec![None; arg_types.len()];
+        Type::CallableType {
+            fallback: Box::new(instance(fallback_ref, vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(ret_type),
+            name: None,
+            variables,
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
     fn ctx(strict_optional: bool) -> SubtypeContext {
         SubtypeContext::new(false, false, false, false, false, strict_optional)
     }
@@ -3390,6 +3464,155 @@ mod tests {
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
+    #[test]
+    fn join_similar_callables_one_generic_one_not_returns_encoded() {
+        // join(def f[T](x: T) -> T, def g(x: object) -> object) where
+        // only f is generic. min_len == 0 (s.variables empty), so
+        // match_generic_callables is a no-op (returns inputs unchanged,
+        // join.py:1048-1050). No renumber, no fresh-id parity gap.
+        //
+        // is_similar_callables=True (same arity). is_equivalent=False:
+        // is_subtype(T, object)=True (TypeVar upper_bound <: object),
+        // but is_subtype(object, T)=False (Instance not <: TypeVar).
+        // So join_similar_callables fires: per-arg safe_meet(T, object)
+        // = T (meet_types pre-check: is_proper_subtype(T, object)=True
+        // -> SameS=T), ret join_types(T, object)=object (trivial_join:
+        // T <: object -> return object=SameT). Result is a new
+        // CallableType(arg=[T], ret=object, variables=[]) returned as
+        // Encoded.
+        //
+        // Pre-M8z: the both-generic defer (line 1261) returned None for
+        // ANY non-empty variables, including this min_len==0 case.
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let ub = instance("builtins.object", vec![]);
+        let tvar = type_var(-1, "ns", ub.clone());
+        // s is generic (has variables=[T]); t is non-generic.
+        let s = callable_with_vars(
+            "builtins.function",
+            vec![tvar.clone()],
+            tvar.clone(),
+            vec![tvar],
+        );
+        let t = callable(
+            "builtins.function",
+            vec![instance("builtins.object", vec![])],
+            instance("builtins.object", vec![]),
+        );
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "one-generic join_similar: got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            // Expected: CallableType(arg=[T], ret=object, variables=[]).
+            // arg_types[0] is the TypeVar T (safe_meet(T, object)=T).
+            // ret_type is object (join(T, object)=object).
+            // variables is empty (combine/join_similar always sets
+            // variables=[] in the Rust port; Python's
+            // join_similar_callables preserves t.variables which for
+            // the non-generic t is empty).
+            let expected = Type::CallableType {
+                fallback: Box::new(instance("builtins.function", vec![])),
+                instance_type: None,
+                is_ellipsis_args: false,
+                implicit: false,
+                is_bound: false,
+                from_concatenate: false,
+                imprecise_arg_kinds: false,
+                unpack_kwargs: false,
+                arg_types: vec![type_var(-1, "ns", ub.clone())],
+                arg_kinds: vec![0],
+                arg_names: vec![None],
+                ret_type: Box::new(instance("builtins.object", vec![])),
+                name: None,
+                variables: Vec::new(),
+                type_guard: None,
+                type_is: None,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn combine_similar_callables_both_generic_defers() {
+        // join(def f[T](x: T) -> T, def g[T](x: T) -> T) where BOTH
+        // callables are generic (min_len > 0). Python's
+        // match_generic_callables renumbers both T's via
+        // TypeVarId.new (a Python global counter, types.py:559-562).
+        // The result's tvar ids differ from any deterministic Rust
+        // allocation, and CallableType.__eq__ compares tvar ids in
+        // arg_types/ret_type (types.py:2590-2604 + 699-706). Rust
+        // can't replicate the counter without FFI back to Python, so
+        // the both-generic case DEFERS to preserve parity.
+        //
+        // This test documents the defer (returns None) and guards
+        // against a future change that ports match_generic_callables
+        // without solving the fresh-id parity gap.
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let ub = instance("builtins.object", vec![]);
+        let tvar_s = type_var(-1, "ns_s", ub.clone());
+        let tvar_t = type_var(-1, "ns_t", ub.clone());
+        let s = callable_with_vars(
+            "builtins.function",
+            vec![tvar_s.clone()],
+            tvar_s.clone(),
+            vec![tvar_s],
+        );
+        let t = callable_with_vars(
+            "builtins.function",
+            vec![tvar_t.clone()],
+            tvar_t.clone(),
+            vec![tvar_t],
+        );
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert_eq!(
+            result, None,
+            "both-generic must defer (fresh-id parity gap): got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn identical_generic_callable_defers() {
+        // join(c, c) where c is a generic CallableType. Both sides are
+        // structurally identical, BUT Python's combine_similar_callables
+        // always calls match_generic_callables (join.py:1114), which
+        // renumbers the tvars via TypeVarId.new even when both sides
+        // share the same id (join.py:1047-1053). The result has fresh
+        // tvar ids, so it is NOT equal to c (CallableType.__eq__
+        // compares arg_types/ret_type which carry tvar ids). Returning
+        // SameS (= c) would be a parity bug.
+        //
+        // The M8z identical-check guard defers when both sides have
+        // non-empty variables (both_generic). This test documents that
+        // guard: join(c, c) for generic c returns None (defer to
+        // Python, which produces the correctly-renumbered result).
+        let o = snap("builtins.object", "object");
+        let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
+        let r = make_resolver(vec![o, func]);
+        let ub = instance("builtins.object", vec![]);
+        let tvar = type_var(-1, "ns", ub.clone());
+        let c = callable_with_vars(
+            "builtins.function",
+            vec![tvar.clone()],
+            tvar.clone(),
+            vec![tvar],
+        );
+        let result = join_types(&c, &c, &ctx(true), &r);
+        assert_eq!(
+            result, None,
+            "identical generic callable must defer (renumber parity): got {:?}",
+            result
+        );
+    }
+
     /// Minimal `Overloaded` for join tests. The fallback is
     /// `items[0].fallback` (mirrors `Overloaded.__init__` in
     /// types.py:2744). Each item is a `CallableType`.
@@ -4194,14 +4417,18 @@ mod tests {
     }
 
     #[test]
-    fn join_type_var_with_non_type_var_s_defers() {
+    fn join_type_var_with_non_type_var_s_returns_object() {
         // visit_type_var case 3 (join.py:474): s is NOT a TypeVarType ->
-        // return self.default(self.s). The default walks s's fallback
-        // chain (join.py:869-888) and produces object/Any/instance —
-        // generally neither s nor t -> defer.
+        // return self.default(self.s). For Instance s, default(s) =
+        // object_from_instance(s) = builtins.object. t's object side
+        // is object_or_any_from_type(upper_bound=object) = object. Both
+        // sides collapse to object -> SetOpResult::Object.
         let t = type_var(1, "~", instance("builtins.object", vec![]));
         let s = instance("builtins.int", vec![]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &make_resolver(vec![])),
+            Some(SetOpResult::Object)
+        );
     }
 
     #[test]
@@ -4723,16 +4950,23 @@ mod tests {
     }
 
     #[test]
-    fn meet_type_var_s_not_type_var_returns_bottom() {
-        // visit_type_var else (meet.py:883-884): s is not TypeVarType
-        // -> default(self.s) -> Bottom.
+    fn meet_type_var_s_not_type_var_returns_t() {
+        // meet_types(Instance, TypeVar) where the TypeVar's upper_bound
+        // is the Instance. The pre-dispatch is_proper_subtype(t, s)
+        // (meet.py:141) fires: is_subtype(TypeVar, Instance) recurses
+        // into is_subtype(upper_bound=Instance, Instance) = True, so
+        // the pre-check returns SameT (= t = the TypeVar). Python
+        // matches: meet_types(a, tv) = T.
+        //
+        // Pre-M8z this returned Bottom because the Rust is_subtype
+        // didn't handle TypeVarType on the left, so is_proper_subtype
+        // returned None and the visitor (visit_type_var else) returned
+        // default(s) = Bottom. The M8z is_subtype extension makes the
+        // pre-dispatch fire, which is the parity-correct behavior.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
         let t = type_var(1, "ns", instance("a.A", vec![]));
-        assert_eq!(
-            meet_types(&s, &t, &ctx(true), &r),
-            Some(SetOpResult::Bottom)
-        );
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
 
     // ---- meet visit_literal_type (M8q) ----

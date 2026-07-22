@@ -114,6 +114,68 @@ pub(crate) fn is_subtype(
             return Some(false);
         }
     }
+    // visit_type_var (subtypes.py:735-748), fast path only. When both
+    // sides are TypeVarType with the same id (raw_id + namespace, per
+    // TypeVarId.__eq__ types.py:567-577; meta_level is not in the wire
+    // format) and the same upper_bound, Python returns True. The
+    // values-with-upper_bound and upper_bound-recursion branches
+    // produce results that need a deeper walker; defer those.
+    //
+    // This fast path is what makes is_equivalent_callable return
+    // Some(true) for `def f[T](x: T) -> T` vs `def g[T](x: T) -> T`
+    // after match_generic_callables renumbers both T's to the same id.
+    if let Type::TypeVarType {
+        raw_id: l_raw,
+        namespace: l_ns,
+        upper_bound: l_ub,
+        values: l_values,
+        ..
+    } = left
+    {
+        if let Type::TypeVarType {
+            raw_id: r_raw,
+            namespace: r_ns,
+            upper_bound: r_ub,
+            ..
+        } = right
+        {
+            if l_raw == r_raw && l_ns == r_ns {
+                if l_ub == r_ub {
+                    return Some(true);
+                }
+                // Different upper_bound: Python recurses into
+                // _is_subtype(left.upper_bound, right.upper_bound) or
+                // returns True for self-types. Defer (no is_self on the
+                // wire; the recursive call may hit unsupported variants).
+                return None;
+            }
+            // Different id: Python checks `left.values` then falls back
+            // to `_is_subtype(left.upper_bound, right)`. The values
+            // branch needs a UnionType join; defer.
+            if !l_values.is_empty() {
+                return None;
+            }
+            return is_subtype(l_ub.as_ref(), right, ctx, resolver);
+        }
+        // right not TypeVarType: Python checks `left.values` then
+        // `_is_subtype(left.upper_bound, right)`. The values branch
+        // needs a UnionType; defer when non-empty.
+        if !l_values.is_empty() {
+            return None;
+        }
+        return is_subtype(l_ub.as_ref(), right, ctx, resolver);
+    }
+    // visit_instance (subtypes.py:567-710) when right is TypeVarType:
+    // Python falls through to `return False` (line 710) since right is
+    // not Instance/TupleType/TypeVarTupleType/TypeType. Mirror that
+    // for the common case (left=Instance, right=TypeVarType). The
+    // protocol/TypeType branches are not reachable here (right is
+    // TypeVarType, not those).
+    if let Type::Instance { .. } = left {
+        if let Type::TypeVarType { .. } = right {
+            return Some(false);
+        }
+    }
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,

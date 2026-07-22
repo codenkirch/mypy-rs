@@ -2038,8 +2038,31 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::TypeVarType {
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            values,
+            upper_bound,
+            default,
+            variance,
+        } => {
+            // Field order mirrors `read_type_var_type`.
+            write_tag(buf, TYPE_VAR_TYPE);
+            write_str(buf, name)?;
+            write_str(buf, fullname)?;
+            write_int(buf, *raw_id)?;
+            write_str(buf, namespace)?;
+            write_type_list(buf, values)?;
+            write_type(buf, upper_bound)?;
+            write_type(buf, default)?;
+            write_int(buf, *variance)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType)",
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType/TypeVarType)",
             t.variant_name()
         ))),
     }
