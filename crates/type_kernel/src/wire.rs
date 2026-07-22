@@ -1972,8 +1972,18 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+        } => {
+            write_tag(buf, UNION_TYPE);
+            write_type_list(buf, items)?;
+            write_bool(buf, *uses_pep604_syntax);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType)",
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType)",
             t.variant_name()
         ))),
     }
