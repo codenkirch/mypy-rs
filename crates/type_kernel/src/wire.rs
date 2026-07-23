@@ -246,7 +246,7 @@ fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
 
 /// Read a bare integer (the librt `read_int` / `read_int_bare` primitive).
 /// Dispatches short-int vs long-int based on the first byte.
-fn read_int_bare(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
+pub(crate) fn read_int_bare(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
     let first = buf.read_u8()?;
     if first != LONG_INT_TRAILER {
         read_short_int(buf, first)
@@ -315,7 +315,7 @@ fn read_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
 }
 
 /// `read_str`: tag byte must be `LITERAL_STR`, then bare str.
-fn read_str(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
+pub(crate) fn read_str(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
     let tag = read_tag(buf)?;
     if tag != LITERAL_STR {
         return Err(WireError::invalid(format!(
@@ -1757,6 +1757,32 @@ fn write_str(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
     write_str_bare(buf, s)
 }
 
+/// `write_str_set`: `LIST_STR` + bare size + N bare strs, iterating a
+/// `HashSet`. Inverse of `read_str_list` (wire.rs:362-378). Used for
+/// `TypedDictType.required_keys` / `readonly_keys`. Python's writer also
+/// iterates a set (via `list(...)`), so order parity is not guaranteed.
+fn write_str_set(buf: &mut WriteBuffer, items: &HashSet<String>) -> Result<(), WireError> {
+    let v: Vec<&String> = items.iter().collect();
+    write_tag(buf, LIST_STR);
+    write_int_bare(buf, v.len() as i64)?;
+    for item in v {
+        write_str_bare(buf, item)?;
+    }
+    Ok(())
+}
+
+/// `write_type_map`: `DICT_STR_GEN` + bare size + N (bare str, type). Inverse
+/// of `read_type_map` (wire.rs:620-638). Used for `TypedDictType.items`.
+fn write_type_map(buf: &mut WriteBuffer, items: &[(String, Type)]) -> Result<(), WireError> {
+    write_tag(buf, DICT_STR_GEN);
+    write_int_bare(buf, items.len() as i64)?;
+    for (key, value) in items {
+        write_str_bare(buf, key)?;
+        write_type(buf, value)?;
+    }
+    Ok(())
+}
+
 /// `write_str_opt`: `LITERAL_NONE` for None, else `write_str`. Inverse of
 /// `read_str_opt` (wire.rs:328-340).
 fn write_str_opt(buf: &mut WriteBuffer, value: Option<&str>) -> Result<(), WireError> {
@@ -2061,8 +2087,49 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            implicit,
+        } => {
+            write_tag(buf, TUPLE_TYPE);
+            // partial_fallback is always an Instance (reader asserts INSTANCE).
+            write_type(buf, partial_fallback)?;
+            write_type_list(buf, items)?;
+            write_bool(buf, *implicit);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::TypedDictType {
+            fallback,
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+        } => {
+            write_tag(buf, TYPED_DICT_TYPE);
+            write_type(buf, fallback)?;
+            write_type_map(buf, items)?;
+            write_str_set(buf, required_keys)?;
+            write_str_set(buf, readonly_keys)?;
+            write_bool(buf, *is_closed);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::DeletedType { source } => {
+            write_tag(buf, DELETED_TYPE);
+            write_str_opt(buf, source.as_deref())?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::UnpackType { typ } => {
+            write_tag(buf, UNPACK_TYPE);
+            write_type(buf, typ)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType/TypeVarType)",
+            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType/TypeVarType/TupleType/TypedDictType/DeletedType/UnpackType)",
             t.variant_name()
         ))),
     }

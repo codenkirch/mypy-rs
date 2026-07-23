@@ -43,6 +43,7 @@
 mod aliases;
 mod argmap;
 mod erase;
+mod expandtype;
 mod lkv;
 mod mro;
 mod refs;
@@ -86,6 +87,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(mro::rust_linearize_hierarchy, module)?)?;
+    module.add_function(wrap_pyfunction!(expandtype::rust_expand_type, module)?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
