@@ -2469,6 +2469,7 @@ fn join_instances_via_supertype(
         }
     }
     // join.py:228-234: for each base, recurse and pick the best.
+    // is_better compares the MRO of the RESULT type, not the base.
     let mut best: Option<(JoinResult, usize)> = None;
     for base_ref in &base_refs {
         let candidate = join_instances_nominal(base_ref, right_ref, ctx, resolver)?;
@@ -2479,7 +2480,12 @@ fn join_instances_via_supertype(
             JoinResult::Left => JoinResult::Ancestor(base_ref.clone()),
             other => other,
         };
-        let mro = mro_len(base_ref, resolver);
+        // MRO of the RESULT type, not the base (join.py:804+ is_better).
+        let mro = match &mapped {
+            JoinResult::Ancestor(fullname) => mro_len(fullname, resolver),
+            JoinResult::Left => mro_len(left_ref, resolver),
+            JoinResult::Object => 1, // builtins.object has MRO length 1
+        };
         match &best {
             None => best = Some((mapped, mro)),
             Some((_, best_mro)) if mro > *best_mro => best = Some((mapped, mro)),
