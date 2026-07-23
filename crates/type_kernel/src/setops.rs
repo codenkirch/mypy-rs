@@ -2489,6 +2489,11 @@ fn join_instances_via_supertype(
         match &best {
             None => best = Some((mapped, mro)),
             Some((_, best_mro)) if mro > *best_mro => best = Some((mapped, mro)),
+            // Tie: defer to Python. Python's is_better returns False on
+            // ties (keeping the first), but Python also has map_instance_to_supertype
+            // and the second promote loop that may change the result.
+            // Deferring on ties avoids wrong answers on complex MROs.
+            Some((_, best_mro)) if mro == *best_mro => return None,
             _ => {}
         }
     }
