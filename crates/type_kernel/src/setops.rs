@@ -98,11 +98,15 @@ pub(crate) fn trivial_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
-    if let Some(true) = is_subtype(s, t, ctx, resolver) {
-        return Some(SetOpResult::SameT);
+    match is_subtype(s, t, ctx, resolver) {
+        Some(true) => return Some(SetOpResult::SameT),
+        Some(false) => {}
+        None => return None,
     }
-    if let Some(true) = is_subtype(t, s, ctx, resolver) {
-        return Some(SetOpResult::SameS);
+    match is_subtype(t, s, ctx, resolver) {
+        Some(true) => return Some(SetOpResult::SameS),
+        Some(false) => {}
+        None => return None,
     }
     // object_or_any_from_type(t): Instance right -> Object. Other
     // variants walk fallbacks / upper_bound / union items in Python;
@@ -591,15 +595,13 @@ fn visit_meet(
                 // check. is_subtype returns None for unsupported
                 // (non-Instance) -> defer conservatively.
                 if let Type::LiteralType { fallback, .. } = t {
-                    if let Some(true) = is_subtype(fallback, s, ctx, resolver) {
-                        return Some(SetOpResult::SameT);
-                    }
-                    // is_subtype False or None. False -> Bottom
-                    // (default). None -> defer (can't decide).
-                    if let Some(false) = is_subtype(fallback, s, ctx, resolver) {
-                        return Some(SetOpResult::Bottom);
-                    }
-                    return None;
+                    // Match on the result once: True -> SameT,
+                    // False -> Bottom (default), None -> defer.
+                    return match is_subtype(fallback, s, ctx, resolver) {
+                        Some(true) => Some(SetOpResult::SameT),
+                        Some(false) => Some(SetOpResult::Bottom),
+                        None => None,
+                    };
                 }
             }
             // s is not LiteralType or Instance -> default -> Bottom.
@@ -696,12 +698,19 @@ fn visit_instance_meet(
     // is_proper_subtype, here — the pre-check already failed for
     // proper_subtype with ignore_promotions=True, but is_subtype may
     // still succeed via promotions).
-    if let Some(true) = is_subtype(t, s, ctx, resolver) {
-        Some(SetOpResult::SameT)
-    } else if let Some(true) = is_subtype(s, t, ctx, resolver) {
-        Some(SetOpResult::SameS)
-    } else {
-        Some(SetOpResult::Bottom)
+    //
+    // Python's is_subtype always returns bool; when Rust's is_subtype
+    // defers (None) it can't conclude either direction, so the meet
+    // must defer too. Falling through to Bottom would be a wrong answer
+    // when Python would have returned t or s (e.g. via a promotion).
+    match is_subtype(t, s, ctx, resolver) {
+        Some(true) => Some(SetOpResult::SameT),
+        Some(false) => match is_subtype(s, t, ctx, resolver) {
+            Some(true) => Some(SetOpResult::SameS),
+            Some(false) => Some(SetOpResult::Bottom),
+            None => None,
+        },
+        None => None,
     }
 }
 

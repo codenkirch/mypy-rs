@@ -447,20 +447,32 @@ fn visit_instance_nominal(
     let has_base = left_snap.is_some_and(|s| s.has_base(right_ref));
     let is_object = right_ref == "builtins.object";
     let right_is_protocol = right_snap.is_some_and(|s| s.is_protocol);
+    // Python's NamedTuple clause (subtypes.py:632-635) fires only when
+    // `rname in TYPED_NAMEDTUPLE_NAMES` (right is typing.NamedTuple or
+    // typing_extensions.NamedTuple literally) AND some class in left's
+    // mro is a NamedTuple. The snapshot's `is_named_tuple` flag is True
+    // for ANY NamedTuple subclass (e.g. __main__.A), not just the
+    // typing.NamedTuple base, so checking `right_snap.is_named_tuple`
+    // would wrongly apply the nominal branch to two unrelated
+    // NamedTuples (e.g. is_subtype(A, B) -> Some(true)). Rust can't read
+    // `rname in TYPED_NAMEDTUPLE_NAMES` from the snapshot alone without
+    // also special-casing the two base fullnames; defer the whole
+    // NamedTuple-right case so Python's exact condition decides.
     let is_named_tuple_right = right_snap.is_some_and(|s| s.is_named_tuple)
         && left_snap.is_some_and(|s| {
             s.mro
                 .iter()
                 .any(|m| resolver.get(m).is_some_and(|n| n.is_named_tuple))
         });
-    let nominal_applies =
-        (has_base || is_object || is_named_tuple_right) && !ctx.ignore_declared_variance;
+    let nominal_applies = (has_base || is_object) && !ctx.ignore_declared_variance;
     if !nominal_applies {
         // Nominal branch skipped. If right is a protocol, defer to the
-        // Python protocol-implementation path (M8c). Otherwise Python
-        // records a negative cache entry and returns False
-        // (subtypes.py:627-635).
-        if right_is_protocol {
+        // Python protocol-implementation path (M8c). The NamedTuple-right
+        // case (is_named_tuple_right) is a wrong approximation of
+        // Python's TYPED_NAMEDTUPLE_NAMES check; defer so Python decides.
+        // Otherwise Python records a negative cache entry and returns
+        // False (subtypes.py:627-635).
+        if right_is_protocol || is_named_tuple_right {
             return None;
         }
         return Some(false);
@@ -557,14 +569,12 @@ fn visit_instance_nominal(
 ///
 /// COVARIANT / VARIANCE_NOT_READY: `is_subtype(left, right)`.
 /// CONTRAVARIANT: `is_subtype(right, left)`.
-/// INVARIANT (non-proper): `is_equivalent(left, right)` — needs
-/// `is_same_type`, a two-way subtype check; we recurse both directions
-/// (Python's `is_equivalent` does exactly this).
-///
-/// `proper_subtype` + INVARIANT returns `Some(true)` conservatively so
-/// the caller's `nominal` flag isn't falsely lowered; the Python path
-/// re-checks via `is_same_type` (its `ignore_promotions` plumbing is
-/// deferred to M8c).
+/// INVARIANT: `is_equivalent(left, right)` — a two-way subtype check
+/// (both `is_subtype(left, right)` and `is_subtype(right, left)` must
+/// hold). This mirrors Python's `is_equivalent` / `is_same_type` for
+/// both proper and non-proper subtype checks. The `proper_subtype` flag
+/// flows through `ctx.proper_subtype` into the recursive `is_subtype`
+/// calls, so the two-way check respects properness at every depth.
 fn check_type_parameter(
     left: &Type,
     right: &Type,
@@ -576,13 +586,9 @@ fn check_type_parameter(
         COVARIANT | VARIANCE_NOT_READY => is_subtype(left, right, ctx, resolver),
         CONTRAVARIANT => is_subtype(right, left, ctx, resolver),
         _ => {
-            if ctx.proper_subtype {
-                Some(true)
-            } else {
-                let fwd = is_subtype(left, right, ctx, resolver)?;
-                let bwd = is_subtype(right, left, ctx, resolver)?;
-                Some(fwd && bwd)
-            }
+            let fwd = is_subtype(left, right, ctx, resolver)?;
+            let bwd = is_subtype(right, left, ctx, resolver)?;
+            Some(fwd && bwd)
         }
     }
 }

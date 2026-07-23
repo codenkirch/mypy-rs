@@ -903,6 +903,23 @@ class BuildManager:
         from mypy.join import _set_native_join_active
 
         _set_native_join_active(self.options.native_type_kernel)
+        # Clear stale resolvers from a previous build so the kernel
+        # defers to Python until the new snapshot is installed in
+        # `_build_native_resolvers` (process_stale_scc). Without this,
+        # semantic-analysis calls between __init__ and the resolver
+        # rebuild would use the previous build's TypeInfo graph,
+        # producing wrong MROs and subtype results.
+        from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.join import (
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.mro import _set_native_mro_resolver
+
+        _set_native_subtype_resolver(None)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+        _set_native_mro_resolver(None, None)
         # Stage 4 (M8ba): gate the pure-positional/named branch of
         # `map_actuals_to_formals`. The Rust path returns None for any call
         # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
