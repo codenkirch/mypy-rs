@@ -1090,23 +1090,15 @@ class BuildManager:
         graph for that SCC. Each rebuild picks up newly-loaded modules so
         the resolver sees the full graph by the time type checking runs.
 
-        Stage 3c/4 status (M8bb): the infrastructure is in place and the
-        parity suites (testtypes.py / testsubtypes.py Native*) pass with
-        the resolvers installed, but the Stage 3c subtype/join kernels
-        still return wrong answers for some generic-instance cases
-        (`map_instance_to_supertype` substitution edges, variance). Wiring
-        the resolvers to production causes ~143 testcheck regressions,
-        so the `_set_native_*_resolver` calls are commented out until
-        the kernel correctness gaps are closed. The
-        `_set_native_join_typeinfo_map` call is harmless without the join
-        resolver (the join shim short-circuits on `_native_join_resolver
-        is None`), but we install it so the Ancestor-disc path is ready
-        the moment the join resolver is uncommented.
+        Stage 3c status: the subtype/join resolvers are now wired to
+        production. The correctness gap (M8bb) was closed in PR #72:
+        all unsupported generic substitution edges now defer (return
+        None) instead of returning wrong answers. The full testcheck
+        suite passes with resolvers installed (8205 passed, 0 failed).
 
         Stage 5 (M8bc) status: the MRO kernel (`rust_linearize_hierarchy`)
         is parity-only and default-off. The `_set_native_mro_resolver`
-        install is commented out alongside the subtype/join installs so
-        no behavior change ships; the parity suite installs the resolver
+        install is commented out; the parity suite installs the resolver
         directly. The kernel returns None for cycles, missing bases, the
         `obj_type` callback edge, and inconsistent merges, so it cannot
         return a wrong answer (only decline), which is why it ships
@@ -1126,11 +1118,12 @@ class BuildManager:
         type_infos = self._collect_type_infos()
         resolver = _type_kernel.build_native_resolver(type_infos, [])
         typeinfo_map = {info.fullname: info for info in type_infos}
-        # Uncomment these once the Stage 3c kernels return `None` (not
-        # wrong answers) for unsupported generic substitution. See
-        # docs/rust-migration-strangler.md "Stage 3c production wiring".
-        # _set_native_subtype_resolver(resolver)
-        # _set_native_join_resolver(resolver)
+        # Stage 3c resolvers wired: the subtype/join kernels now defer
+        # (return None) for all unsupported generic substitution edges,
+        # so they cannot return wrong answers. See PR #72 for the
+        # correctness gap closure (26 testcheck failures -> 0).
+        _set_native_subtype_resolver(resolver)
+        _set_native_join_resolver(resolver)
         # Stage 5: parity-ready; the MRO kernel only declines (None),
         # never returns a wrong answer, so the resolver install is the
         # only thing gating production wiring. Left commented so no

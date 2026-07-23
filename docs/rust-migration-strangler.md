@@ -1160,11 +1160,16 @@ path).
 | `parse_time` | 0.149s | ~0.13s |
 | `total_process_stale_time` | 4.109s | ~3.3s |
 
-The `type_check_time_implementation` improvement (~30%) is consistent
-with the kernel routing `erase_type`, `is_subtype`, `join_types`,
-`meet_types`, and `make_simplified_union` through Rust with zero FFI
-per recursion. The `--no-native-type-kernel` escape hatch preserves
-the two-way differential for regression detection.
+The `type_check_time_implementation` improvement (~30%) was initially
+illusory: the Stage 3c subtype/join resolvers were NOT installed
+(commented out due to the M8bb correctness gap), so only `erase_type`
+and `make_simplified_union` actually ran in Rust. PR #72 closed the gap
+(26 testcheck failures -> 0) and PR #63 uncommented the resolver
+installs, making the subtype/join kernels execute in production for the
+first time. Re-run `--dump-build-stats` after PR #63 to measure the
+real `type_check_time_implementation` improvement with both kernels
+firing. The `--no-native-type-kernel` escape hatch preserves the
+two-way differential for regression detection.
 
 ## Milestone 3 (Phase 4): Type Kernel — Stage 1 (`erase_type`)
 
@@ -1733,12 +1738,14 @@ returns wrong answers for generic-instance joins.
 
 ### Current shipping state
 
-- Resolver infrastructure: shipped, called per SCC, safe (no behavior
-  change since the resolvers stay None).
-- `_set_native_join_typeinfo_map`: installed (harmless without the join
-  resolver; ready for the moment the join resolver is uncommented).
+- Resolver infrastructure: shipped, called per SCC, resolvers now
+  installed and active in production.
 - `_set_native_subtype_resolver` / `_set_native_join_resolver`:
-  commented out with a pointer to this section.
+  uncommented in PR #72 (issue #63). The correctness gap (M8bb) was
+  closed: all unsupported generic substitution edges now defer (return
+  None) instead of returning wrong answers. Full testcheck suite green
+  with resolvers installed (8205 passed, 0 failed).
+- `_set_native_mro_resolver`: still commented out (Stage 5 parity-only).
 
 The parity suites (339 tests) and the full testcheck suite (8205 tests)
-stay green with this infrastructure in place.
+stay green with resolvers wired to production.
