@@ -43,9 +43,11 @@
 mod aliases;
 mod argmap;
 mod erase;
+mod erase_typevars;
 mod expandtype;
 mod lkv;
 mod mro;
+mod operators;
 mod refs;
 mod setops;
 mod subtypes;
@@ -98,6 +100,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(typeops::rust_true_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_false_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_or_false, module)?)?;
+    module.add_function(wrap_pyfunction!(operators::rust_operator_tables, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        erase_typevars::rust_erase_typevars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        erase_typevars::rust_replace_meta_vars,
+        module
+    )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }

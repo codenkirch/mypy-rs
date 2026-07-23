@@ -43,26 +43,87 @@ from mypy.typevartuples import erased_vars
 # returns `None` for any type it does not handle, in which case we fall back to
 # the pure-Python visitor. This is the strangler-fig per-call gate — no
 # behavior change unless the option is explicitly enabled.
+#
+# Stage 4c: `erase_typevars` and `replace_meta_vars` also route through Rust
+# via the wire-format Type enum. Same gate pattern: Rust returns None for
+# TypeAliasType/UnboundType/TypeVarTuple-copy_modified cases, Python falls
+# back to the pure-Python TypeVarEraser visitor.
 try:
     from type_kernel import erase_type as _rust_erase_type
     from type_kernel import remove_instance_last_known_values as _rust_remove_lkv
+    from type_kernel import rust_erase_typevars as _rust_erase_typevars
+    from type_kernel import rust_replace_meta_vars as _rust_replace_meta_vars
+    from librt.internal import ReadBuffer as _ReadBuffer
+    from librt.internal import WriteBuffer as _WriteBuffer
+    from librt.internal import write_int as _write_int_bare
+
+    from mypy.cache import write_str as _write_str_tagged
+    from mypy.types import read_type as _read_type
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_erase_type = None  # type: ignore[assignment]
     _rust_remove_lkv = None  # type: ignore[assignment]
+    _rust_erase_typevars = None  # type: ignore[assignment]
+    _rust_replace_meta_vars = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _write_int_bare = None  # type: ignore[assignment]
+    _write_str_tagged = None  # type: ignore[assignment]
+    _read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag read by the gates below. Set by the build manager from
 # `Options.native_type_kernel` at the start of each build, so the hot path
 # avoids an attribute lookup on the options object per call.
 _native_erase_active: bool = False
+_native_erase_typevars_active: bool = False
 
 
 def _set_native_erase_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_erase_active
     _native_erase_active = active
+
+
+def _set_native_erase_typevars_active(active: bool) -> None:
+    """Stage 4c: enable/disable the wire-format erase_typevars path.
+
+    Separate from _native_erase_active because erase_typevars uses the
+    wire-format Type enum (which loses line/column/can_be_true/can_be_false
+    flags), while erase_type/remove_instance_last_known_values operate on
+    live Python Type objects. Parity-only until the truthiness-flag
+    preservation problem is solved.
+    """
+    global _native_erase_typevars_active
+    _native_erase_typevars_active = active
+
+
+def _serialize_type(t: Type) -> bytes:
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _serialize_typevar_ids(ids: Container[TypeVarId] | None) -> bytes:
+    """Serialize TypeVarId set for the wire format.
+
+    Empty bytes = None (erase ALL type vars). Otherwise: count + pairs
+    of (raw_id bare int + namespace tagged str).
+    """
+    if ids is None:
+        return b""
+    items = list(ids)
+    buf = _WriteBuffer()
+    _write_int_bare(buf, len(items))
+    for tv_id in items:
+        _write_int_bare(buf, tv_id.raw_id)
+        _write_str_tagged(buf, tv_id.namespace)
+    return buf.getvalue()
+
+
+def _deserialize_type(data: bytes) -> Type:
+    return _read_type(_ReadBuffer(data))
 
 
 def erase_type(typ: Type) -> ProperType:
@@ -178,7 +239,15 @@ def erase_typevars(t: Type, ids_to_erase: Container[TypeVarId] | None = None) ->
     """Replace all type variables in a type with any,
     or just the ones in the provided collection.
     """
-
+    if _HAS_TYPE_KERNEL and _native_erase_typevars_active:
+        try:
+            type_bytes = _serialize_type(t)
+            ids_bytes = _serialize_typevar_ids(ids_to_erase)
+            result = _rust_erase_typevars(type_bytes, ids_bytes)
+            if result is not None:
+                return _deserialize_type(bytes(result))
+        except (AssertionError, NotImplementedError):
+            pass
     if ids_to_erase is None:
         return t.accept(TypeVarEraser(None, AnyType(TypeOfAny.special_form)))
 
@@ -194,6 +263,15 @@ def erase_meta_id(id: TypeVarId) -> bool:
 
 def replace_meta_vars(t: Type, target_type: Type) -> Type:
     """Replace unification variables in a type with the target type."""
+    if _HAS_TYPE_KERNEL and _native_erase_typevars_active:
+        try:
+            type_bytes = _serialize_type(t)
+            target_bytes = _serialize_type(target_type)
+            result = _rust_replace_meta_vars(type_bytes, target_bytes)
+            if result is not None:
+                return _deserialize_type(bytes(result))
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(TypeVarEraser(erase_meta_id, target_type))
 
 
