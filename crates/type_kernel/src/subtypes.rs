@@ -78,6 +78,45 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // subtypes.py:352-359: non-proper subtype of Any/Unbound/Erased is
+    // always True (unless left is UnpackType, which the wire format
+    // doesn't produce in this recursive path). The Python shim handles
+    // this at the top-level entry, but recursive calls from
+    // check_type_parameter bypass the shim, so we must mirror it here.
+    if !ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
+        return Some(true);
+    }
+    // _is_subtype (subtypes.py:363-410): when right is UnionType and
+    // left is not, left <: right iff left <: some item. Python handles
+    // this BEFORE the visitor dispatch; mirror it here so recursive
+    // calls from check_type_parameter (which bypass the Python shim)
+    // get the right answer for union-typed type arguments. Must fire
+    // before the NoneType handler (visit_none_type returns False for
+    // UnionType right, but Python's _is_subtype short-circuit would
+    // have already found None <: some union item).
+    if let Type::UnionType { items, .. } = right {
+        if !matches!(left, Type::UnionType { .. }) {
+            if matches!(left, Type::TypeVarType { .. }) {
+                // TypeVarType left: Python falls through to the visitor
+                // (may match via upper_bound). Defer to preserve that.
+                return None;
+            }
+            let mut all_decided_false = true;
+            for item in items {
+                match is_subtype(left, item, ctx, resolver) {
+                    Some(true) => return Some(true),
+                    None => {
+                        all_decided_false = false;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if all_decided_false {
+                return Some(false);
+            }
+            return None;
+        }
+    }
     // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
     // a subtype of everything (bottom type). Fires before any right-side
     // dispatch because the Python visitor's `accept` lands on
@@ -405,6 +444,15 @@ fn visit_instance_nominal(
     let left_snap = resolver.get(left_ref);
     let right_snap = resolver.get(right_ref);
 
+    // If left's TypeInfo is not in the resolver, it may be a synthesized
+    // type (e.g. ad-hoc intersection from isinstance narrowing) whose
+    // MRO and bases are only available on the live Python TypeInfo.
+    // Defer rather than returning a wrong Some(false).
+    #[allow(clippy::question_mark)]
+    if left_snap.is_none() {
+        return None;
+    }
+
     // fallback_to_any short-circuit (subtypes.py:493-498): a class with
     // dynamic bases is a subtype of everything except None. We only
     // detect NoneType by tag; right is Instance here, so it never fires.
@@ -447,19 +495,36 @@ fn visit_instance_nominal(
     let has_base = left_snap.is_some_and(|s| s.has_base(right_ref));
     let is_object = right_ref == "builtins.object";
     let right_is_protocol = right_snap.is_some_and(|s| s.is_protocol);
-    let is_named_tuple_right = right_snap.is_some_and(|s| s.is_named_tuple)
-        && left_snap.is_some_and(|s| {
-            s.mro
-                .iter()
-                .any(|m| resolver.get(m).is_some_and(|n| n.is_named_tuple))
-        });
+    // Python's NamedTuple clause (subtypes.py:632-635) fires only when
+    // `rname in TYPED_NAMEDTUPLE_NAMES` (right is typing.NamedTuple or
+    // typing_extensions.NamedTuple literally) AND some class in left's
+    // mro is a NamedTuple. The snapshot's `is_named_tuple` flag is True
+    // for ANY NamedTuple subclass (e.g. __main__.A), not just the
+    // typing.NamedTuple base, so checking `right_snap.is_named_tuple`
+    // would wrongly apply the nominal branch to two unrelated
+    // NamedTuples (e.g. is_subtype(A, B) -> Some(true)). Rust can't read
+    // `rname in TYPED_NAMEDTUPLE_NAMES` from the snapshot alone without
+    // also special-casing the two base fullnames; defer the whole
+    // NamedTuple-right case so Python's exact condition decides.
+    // Python's NamedTuple clause (subtypes.py:632-637) fires when right
+    // is literally typing.NamedTuple or typing_extensions.NamedTuple (the
+    // only two names in TYPED_NAMEDTUPLE_NAMES) AND some class in left's
+    // mro is_named_tuple. Checking right_snap.is_named_tuple would be
+    // wrong because that flag is True for ANY NamedTuple subclass.
+    let is_named_tuple_right = matches!(
+        right_ref,
+        "typing.NamedTuple" | "typing_extensions.NamedTuple"
+    ) && left_snap.is_some_and(|s| {
+        s.mro
+            .iter()
+            .any(|m| resolver.get(m).is_some_and(|n| n.is_named_tuple))
+    });
     let nominal_applies =
         (has_base || is_object || is_named_tuple_right) && !ctx.ignore_declared_variance;
     if !nominal_applies {
         // Nominal branch skipped. If right is a protocol, defer to the
         // Python protocol-implementation path (M8c). Otherwise Python
-        // records a negative cache entry and returns False
-        // (subtypes.py:627-635).
+        // records a negative cache entry and returns False.
         if right_is_protocol {
             return None;
         }
@@ -557,14 +622,12 @@ fn visit_instance_nominal(
 ///
 /// COVARIANT / VARIANCE_NOT_READY: `is_subtype(left, right)`.
 /// CONTRAVARIANT: `is_subtype(right, left)`.
-/// INVARIANT (non-proper): `is_equivalent(left, right)` — needs
-/// `is_same_type`, a two-way subtype check; we recurse both directions
-/// (Python's `is_equivalent` does exactly this).
-///
-/// `proper_subtype` + INVARIANT returns `Some(true)` conservatively so
-/// the caller's `nominal` flag isn't falsely lowered; the Python path
-/// re-checks via `is_same_type` (its `ignore_promotions` plumbing is
-/// deferred to M8c).
+/// INVARIANT: `is_equivalent(left, right)` — a two-way subtype check
+/// (both `is_subtype(left, right)` and `is_subtype(right, left)` must
+/// hold). This mirrors Python's `is_equivalent` / `is_same_type` for
+/// both proper and non-proper subtype checks. The `proper_subtype` flag
+/// flows through `ctx.proper_subtype` into the recursive `is_subtype`
+/// calls, so the two-way check respects properness at every depth.
 fn check_type_parameter(
     left: &Type,
     right: &Type,
@@ -576,13 +639,9 @@ fn check_type_parameter(
         COVARIANT | VARIANCE_NOT_READY => is_subtype(left, right, ctx, resolver),
         CONTRAVARIANT => is_subtype(right, left, ctx, resolver),
         _ => {
-            if ctx.proper_subtype {
-                Some(true)
-            } else {
-                let fwd = is_subtype(left, right, ctx, resolver)?;
-                let bwd = is_subtype(right, left, ctx, resolver)?;
-                Some(fwd && bwd)
-            }
+            let fwd = is_subtype(left, right, ctx, resolver)?;
+            let bwd = is_subtype(right, left, ctx, resolver)?;
+            Some(fwd && bwd)
         }
     }
 }

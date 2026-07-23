@@ -75,17 +75,22 @@ def trivial_meet(s: Type, t: Type) -> ProperType:
         join._HAS_TYPE_KERNEL
         and join._native_join_active
         and join._native_join_resolver is not None
+        and not isinstance(s, ErasedType)
+        and not isinstance(t, ErasedType)
     ):
-        result = join._type_kernel.rust_trivial_meet(
-            join._serialize_type(s),
-            join._serialize_type(t),
-            False,  # ignore_type_params
-            False,  # ignore_declared_variance
-            False,  # always_covariant
-            False,  # ignore_promotions
-            state.strict_optional,
-            join._native_join_resolver,
-        )
+        try:
+            result = join._type_kernel.rust_trivial_meet(
+                join._serialize_type(s),
+                join._serialize_type(t),
+                False,  # ignore_type_params
+                False,  # ignore_declared_variance
+                False,  # always_covariant
+                False,  # ignore_promotions
+                state.strict_optional,
+                join._native_join_resolver,
+            )
+        except NotImplementedError:
+            result = None
         if result is not None:
             if result == 0:
                 return get_proper_type(s)
@@ -167,13 +172,18 @@ def meet_types(s: Type, t: Type) -> ProperType:
         join._HAS_TYPE_KERNEL
         and join._native_join_active
         and join._native_join_resolver is not None
+        and not isinstance(s, ErasedType)
+        and not isinstance(t, ErasedType)
     ):
-        result = join._type_kernel.rust_meet_types(
-            join._serialize_type(s),
-            join._serialize_type(t),
-            state.strict_optional,
-            join._native_join_resolver,
-        )
+        try:
+            result = join._type_kernel.rust_meet_types(
+                join._serialize_type(s),
+                join._serialize_type(t),
+                state.strict_optional,
+                join._native_join_resolver,
+            )
+        except NotImplementedError:
+            result = None
         if result is not None:
             disc, _fullname, _arg_discs, encoded = result
             if disc == 0:
