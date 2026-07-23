@@ -89,6 +89,16 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 4c erase_typevars (parity-only). Activates the wire-format
+        # erase_typevars/replace_meta_vars gate. No resolver needed.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_ERASEVARS"):
+            try:
+                from mypy.erasetype import _set_native_erase_typevars_active
+
+                _set_native_erase_typevars_active(True)
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched
 
 
