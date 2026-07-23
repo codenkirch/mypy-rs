@@ -49,6 +49,12 @@ pub(crate) fn rust_expand_type(
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
     let typ = decode_type(type_bytes)?;
     let env = decode_env(env_bytes)?;
+    // Empty env: expanding with no substitutions is a no-op. Defer to
+    // Python so the caller gets the original object (not a decoded copy),
+    // preserving object identity for the constraint solver and caches.
+    if env.is_empty() {
+        return None;
+    }
     let expanded = expand_type(&typ, &env)?;
     encode_type(&expanded)
 }
@@ -297,7 +303,10 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                     return None;
                 }
             }
-            let new_fallback = expand_type(fallback, env)?;
+            // Python ExpandTypeVisitor.visit_callable_type (expandtype.py:676)
+            // only expands arg_types, ret_type, type_guard, type_is,
+            // instance_type. It does NOT expand fallback or variables
+            // (the declared type vars are definitions, not uses).
             let new_instance_type = match instance_type {
                 Some(it) => Some(Box::new(expand_type(it, env)?)),
                 None => None,
@@ -307,10 +316,6 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                 new_arg_types.push(expand_type(at, env)?);
             }
             let new_ret_type = Box::new(expand_type(ret_type, env)?);
-            let mut new_variables = Vec::with_capacity(variables.len());
-            for v in variables {
-                new_variables.push(expand_type(v, env)?);
-            }
             let new_type_guard = match type_guard {
                 Some(tg) => Some(Box::new(expand_type(tg, env)?)),
                 None => None,
@@ -320,7 +325,7 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                 None => None,
             };
             Some(Type::CallableType {
-                fallback: Box::new(new_fallback),
+                fallback: fallback.clone(),
                 instance_type: new_instance_type,
                 is_ellipsis_args: *is_ellipsis_args,
                 implicit: *implicit,
@@ -333,7 +338,7 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                 arg_names: arg_names.clone(),
                 ret_type: new_ret_type,
                 name: name.clone(),
-                variables: new_variables,
+                variables: variables.clone(),
                 type_guard: new_type_guard,
                 type_is: new_type_is,
             })
