@@ -1103,12 +1103,9 @@ class BuildManager:
         suite passes with resolvers installed (8205 passed, 0 failed).
 
         Stage 5 (M8bc) status: the MRO kernel (`rust_linearize_hierarchy`)
-        is parity-only and default-off. The `_set_native_mro_resolver`
-        install is commented out; the parity suite installs the resolver
-        directly. The kernel returns None for cycles, missing bases, the
-        `obj_type` callback edge, and inconsistent merges, so it cannot
-        return a wrong answer (only decline), which is why it ships
-        parity-ready rather than gated behind a correctness gap.
+        is wired to production. The kernel returns None for cycles,
+        missing bases, the `obj_type` callback edge, and inconsistent
+        merges, so it cannot return a wrong answer (only decline).
         """
         if not self.options.native_type_kernel:
             return
@@ -1130,15 +1127,15 @@ class BuildManager:
         # correctness gap closure (26 testcheck failures -> 0).
         _set_native_subtype_resolver(resolver)
         _set_native_join_resolver(resolver)
-        # Stage 5: parity-ready; the MRO kernel only declines (None),
-        # never returns a wrong answer, so the resolver install is the
-        # only thing gating production wiring. Left commented so no
-        # behavior change ships with this stage.
-        # _set_native_mro_resolver(resolver, typeinfo_map)
+        # Stage 5: the MRO kernel only declines (None) for cycles,
+        # missing bases, and the obj_type callback edge, so it cannot
+        # return a wrong answer. Wired to production.
+        _set_native_mro_resolver(resolver, typeinfo_map)
         _set_native_join_typeinfo_map(typeinfo_map)
         # Stage 3d: expand_type shares the join typeinfo_map so
         # wire-decoded type_ref strings resolve to live TypeInfo.
-        # Resolver install left commented (parity-only, same as MRO).
+        # Resolver install left commented (parity-only): the port has
+        # ~316 testcheck failures (unexpanded TypeVars in edge cases).
         from mypy.expandtype import _set_native_expand_type_typeinfo_map
 
         _set_native_expand_type_typeinfo_map(typeinfo_map)
