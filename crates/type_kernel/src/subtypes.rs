@@ -405,6 +405,14 @@ fn visit_instance_nominal(
     let left_snap = resolver.get(left_ref);
     let right_snap = resolver.get(right_ref);
 
+    // If left's TypeInfo is not in the resolver, it may be a synthesized
+    // type (e.g. ad-hoc intersection from isinstance narrowing) whose
+    // MRO and bases are only available on the live Python TypeInfo.
+    // Defer rather than returning a wrong Some(false).
+    if left_snap.is_none() {
+        return None;
+    }
+
     // fallback_to_any short-circuit (subtypes.py:493-498): a class with
     // dynamic bases is a subtype of everything except None. We only
     // detect NoneType by tag; right is Instance here, so it never fires.

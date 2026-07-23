@@ -2122,11 +2122,18 @@ fn visit_instance_join(
         return None;
     }
 
-    // join.py:191-199: dispatch to join_instances_via_supertype.
-    // The recursive nominal join returns the fullname of the result
-    // Instance; convert to SameS/SameT/Ancestor relative to the
-    // original s/t frame.
-    let result_ref = if is_subtype(t, s, ctx, resolver)? {
+    // join.py:282-290: dispatch mirrors Python's join_instances.
+    // Python uses is_proper_subtype(t, s, ignore_type_params=True) to
+    // decide direction. proper_subtype=True bypasses the
+    // fallback_to_any short-circuit (subtypes.py:493), which would
+    // wrongly make D <: E when D has fallback_to_any. An
+    // ignore_type_params=True context is used because join_instances
+    // ignores type params at this stage (args are empty here anyway).
+    let proper_ctx = SubtypeContext {
+        proper_subtype: true,
+        ..*ctx
+    };
+    let result_ref = if is_subtype(t, s, &proper_ctx, resolver)? {
         join_instances_nominal(t_ref, s_ref, ctx, resolver)?
     } else {
         join_instances_nominal(s_ref, t_ref, ctx, resolver)?

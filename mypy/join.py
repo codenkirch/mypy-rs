@@ -333,10 +333,6 @@ class InstanceJoiner:
 
 def trivial_join(s: Type, t: Type) -> Type:
     """Return one of types (expanded) if it is a supertype of other, otherwise top type."""
-    # Stage 3c (M8d): try the Rust trivial_join path. Rust returns a
-    # discriminator (0=SameS, 1=SameT, 2=Object, 3=Bottom) or None
-    # (unsupported, e.g. non-Instance right in object_or_any_from_type).
-    # Mirrors the erasetype.py:80-86 strangler-fig contract.
     if (
         _HAS_TYPE_KERNEL
         and _native_join_active
