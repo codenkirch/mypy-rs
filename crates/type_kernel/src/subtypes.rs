@@ -458,21 +458,26 @@ fn visit_instance_nominal(
     // `rname in TYPED_NAMEDTUPLE_NAMES` from the snapshot alone without
     // also special-casing the two base fullnames; defer the whole
     // NamedTuple-right case so Python's exact condition decides.
-    let is_named_tuple_right = right_snap.is_some_and(|s| s.is_named_tuple)
-        && left_snap.is_some_and(|s| {
-            s.mro
-                .iter()
-                .any(|m| resolver.get(m).is_some_and(|n| n.is_named_tuple))
-        });
-    let nominal_applies = (has_base || is_object) && !ctx.ignore_declared_variance;
+    // Python's NamedTuple clause (subtypes.py:632-637) fires when right
+    // is literally typing.NamedTuple or typing_extensions.NamedTuple (the
+    // only two names in TYPED_NAMEDTUPLE_NAMES) AND some class in left's
+    // mro is_named_tuple. Checking right_snap.is_named_tuple would be
+    // wrong because that flag is True for ANY NamedTuple subclass.
+    let is_named_tuple_right = matches!(
+        right_ref,
+        "typing.NamedTuple" | "typing_extensions.NamedTuple"
+    ) && left_snap.is_some_and(|s| {
+        s.mro
+            .iter()
+            .any(|m| resolver.get(m).is_some_and(|n| n.is_named_tuple))
+    });
+    let nominal_applies =
+        (has_base || is_object || is_named_tuple_right) && !ctx.ignore_declared_variance;
     if !nominal_applies {
         // Nominal branch skipped. If right is a protocol, defer to the
-        // Python protocol-implementation path (M8c). The NamedTuple-right
-        // case (is_named_tuple_right) is a wrong approximation of
-        // Python's TYPED_NAMEDTUPLE_NAMES check; defer so Python decides.
-        // Otherwise Python records a negative cache entry and returns
-        // False (subtypes.py:627-635).
-        if right_is_protocol || is_named_tuple_right {
+        // Python protocol-implementation path (M8c). Otherwise Python
+        // records a negative cache entry and returns False.
+        if right_is_protocol {
             return None;
         }
         return Some(false);

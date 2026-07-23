@@ -4941,6 +4941,22 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         # SemanticAnalyzerPass2.add_builtin_aliases for details.
         typing_mod = graph["typing"].tree
         assert typing_mod, "The typing module was not parsed"
+    # Clear stale resolvers from the previous SCC so semantic-analysis
+    # calls (e.g. semanal_typeargs bound checks) in the next line use
+    # Python, not a snapshot missing the current SCC's classes.
+    if manager.options.native_type_kernel:
+        from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.join import (
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.mro import _set_native_mro_resolver
+
+        _set_native_subtype_resolver(None)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+        _set_native_mro_resolver(None, None)
+
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
     t3 = time.time()

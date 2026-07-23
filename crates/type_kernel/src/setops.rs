@@ -1019,6 +1019,17 @@ fn join_similar_callables(
     for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
         new_arg_types.push(safe_meet(ta, sa, ctx, resolver)?);
     }
+    // join.py:644-647: if any arg type is NoneType or UninhabitedType
+    // (Bottom), the callable is unusable. Python falls back to
+    // join_types(t.fallback, s). Defer so Python handles the fallback.
+    if new_arg_types.iter().any(|a| {
+        matches!(
+            a,
+            Type::NoneType { .. } | Type::UninhabitedType { .. }
+        )
+    }) {
+        return None;
+    }
     let new_ret = setop_result_to_type(
         join_types(t_ret_type, s_ret_type, ctx, resolver),
         s_ret_type,

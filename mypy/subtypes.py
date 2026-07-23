@@ -432,18 +432,25 @@ def _is_subtype(
         and _native_subtype_resolver is not None
         and not subtype_context.erase_instances
         and not subtype_context.keep_erased_types
+        and not isinstance(left, ErasedType)
+        and not isinstance(right, ErasedType)
     ):
-        result = _type_kernel.rust_is_subtype(
-            _serialize_type(left),
-            _serialize_type(right),
-            subtype_context.ignore_type_params,
-            subtype_context.ignore_declared_variance,
-            subtype_context.always_covariant,
-            subtype_context.ignore_promotions,
-            proper_subtype,
-            state.strict_optional,
-            _native_subtype_resolver,
-        )
+        try:
+            result = _type_kernel.rust_is_subtype(
+                _serialize_type(left),
+                _serialize_type(right),
+                subtype_context.ignore_type_params,
+                subtype_context.ignore_declared_variance,
+                subtype_context.always_covariant,
+                subtype_context.ignore_promotions,
+                proper_subtype,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+        except NotImplementedError:
+            # Type tree contains an unserializable variant (e.g.
+            # TypeGuardedType nested in a Union). Defer to Python.
+            result = None
         if result is not None:
             return result
         # Rust returned None (unsupported case) — fall through to Python.

@@ -341,17 +341,22 @@ def trivial_join(s: Type, t: Type) -> Type:
         _HAS_TYPE_KERNEL
         and _native_join_active
         and _native_join_resolver is not None
+        and not isinstance(s, ErasedType)
+        and not isinstance(t, ErasedType)
     ):
-        result = _type_kernel.rust_trivial_join(
-            _serialize_type(s),
-            _serialize_type(t),
-            False,  # ignore_type_params
-            False,  # ignore_declared_variance
-            False,  # always_covariant
-            False,  # ignore_promotions
-            state.strict_optional,
-            _native_join_resolver,
-        )
+        try:
+            result = _type_kernel.rust_trivial_join(
+                _serialize_type(s),
+                _serialize_type(t),
+                False,  # ignore_type_params
+                False,  # ignore_declared_variance
+                False,  # always_covariant
+                False,  # ignore_promotions
+                state.strict_optional,
+                _native_join_resolver,
+            )
+        except NotImplementedError:
+            result = None
         if result is not None:
             if result == 0:
                 return s
@@ -415,13 +420,18 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
         _HAS_TYPE_KERNEL
         and _native_join_active
         and _native_join_resolver is not None
+        and not isinstance(s, ErasedType)
+        and not isinstance(t, ErasedType)
     ):
-        result = _type_kernel.rust_join_types(
-            _serialize_type(s),
-            _serialize_type(t),
-            state.strict_optional,
-            _native_join_resolver,
-        )
+        try:
+            result = _type_kernel.rust_join_types(
+                _serialize_type(s),
+                _serialize_type(t),
+                state.strict_optional,
+                _native_join_resolver,
+            )
+        except NotImplementedError:
+            result = None
         if result is not None:
             disc, fullname, arg_discs, encoded = result
             if disc == 0:
