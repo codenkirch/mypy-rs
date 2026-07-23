@@ -248,7 +248,10 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 fixed = _fixup_decoded_type(decoded)
                 if fixed is not None:
                     return fixed
-        except NotImplementedError:
+        except (NotImplementedError, AssertionError):
+            # AssertionError: TypeInfo not yet fixed during semanal.
+            # NotImplementedError: unserializable variant.
+            # Both defer to Python.
             pass
     return typ.accept(ExpandTypeVisitor(env))
 
