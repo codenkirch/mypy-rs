@@ -2106,6 +2106,16 @@ fn visit_instance_join(
     };
 
     // join.py:114: t.type == s.type -> combine type args.
+    // Defer when either side has fallback_to_any: Python's join_instances
+    // uses is_proper_subtype (bypasses fallback_to_any) for dispatch,
+    // but the promote loop and join_instances_via_supertype need
+    // _promote lists and map_instance_to_supertype that the Rust path
+    // doesn't fully port. Deferring avoids wrong common-ancestor picks.
+    if resolver.get(s_ref).is_some_and(|s| s.fallback_to_any)
+        || resolver.get(t_ref).is_some_and(|t| t.fallback_to_any)
+    {
+        return None;
+    }
     if t_ref == s_ref {
         if s_args.is_empty() && t_args.is_empty() {
             return Some(SetOpResult::SameS);
