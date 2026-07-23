@@ -937,6 +937,12 @@ class BuildManager:
         from mypy.mro import _set_native_mro_active
 
         _set_native_mro_active(self.options.native_type_kernel)
+        # Stage 3d (M8c): gate the expand_type TypeVar substitution path.
+        # Rust returns None for ParamSpec, TypeAliasType, and other
+        # deferred variants, so those fall through to Python.
+        from mypy.expandtype import _set_native_expand_type_active
+
+        _set_native_expand_type_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1137,6 +1143,14 @@ class BuildManager:
         # behavior change ships with this stage.
         # _set_native_mro_resolver(resolver, typeinfo_map)
         _set_native_join_typeinfo_map(typeinfo_map)
+        # Stage 3d: expand_type shares the join typeinfo_map so
+        # wire-decoded type_ref strings resolve to live TypeInfo.
+        # Resolver install left commented (parity-only, same as MRO).
+        from mypy.expandtype import _set_native_expand_type_typeinfo_map
+
+        _set_native_expand_type_typeinfo_map(typeinfo_map)
+        # from mypy.expandtype import _set_native_expand_type_resolver
+        # _set_native_expand_type_resolver(resolver)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:

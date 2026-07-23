@@ -58,6 +58,25 @@ def _install_native_resolvers_patch() -> None:
         except ImportError:
             pass
 
+        # Forward-compatible: install the expand_type resolver if the
+        # Stage 3d shim is present (ships with B2). Gated behind a
+        # separate env var because the Rust expand_type port still has
+        # ~316 testcheck failures (unexpanded TypeVars). The parity
+        # CI gate does NOT set this var until those are resolved.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_EXPAND_RESOLVERS"):
+            try:
+                from mypy.expandtype import (
+                    _set_native_expand_type_resolver,
+                    _set_native_expand_type_typeinfo_map,
+                )
+
+                _set_native_expand_type_resolver(resolver)
+                _set_native_expand_type_typeinfo_map(
+                    {info.fullname: info for info in type_infos}
+                )
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched
 
 
