@@ -598,7 +598,7 @@ fn read_type_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<Type>, WireError> {
 }
 
 /// `read_type_list`: `LIST_GEN` tag, bare size, N `read_type`s.
-fn read_type_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError> {
+pub(crate) fn read_type_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Type>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_GEN {
         return Err(WireError::invalid(format!(

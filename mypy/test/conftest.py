@@ -77,6 +77,18 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 3e typeops helpers (parity-only). Install the resolver so
+        # the typeops shim can call rust_make_simplified_union,
+        # rust_is_simple_literal, rust_true_only, rust_false_only,
+        # rust_true_or_false. Gated behind the same env var as expand.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS"):
+            try:
+                from mypy.typeops import _set_native_typeops_resolver
+
+                _set_native_typeops_resolver(resolver)
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched
 
 
