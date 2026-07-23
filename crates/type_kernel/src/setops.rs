@@ -2435,7 +2435,8 @@ fn join_instances_via_supertype(
             }
         }
     }
-    // join.py:221-226: collect base type_refs from left's bases.
+    // join.py:312-317: collect base type_refs from left's bases,
+    // plus right's PROTOCOL bases where left <: base.
     let mut base_refs: Vec<String> = Vec::new();
     for base_blob in &left_snap.bases {
         let base = decode_type(base_blob)?;
@@ -2444,6 +2445,27 @@ fn join_instances_via_supertype(
         } else {
             // Non-Instance base (e.g. ParamSpec): defer.
             return None;
+        }
+    }
+    if let Some(snap) = right_snap {
+        for base_blob in &snap.bases {
+            let base = decode_type(base_blob)?;
+            if let Type::Instance { type_ref: base_ref, .. } = &base {
+                if let Some(base_snap) = resolver.get(base_ref) {
+                    if base_snap.is_protocol {
+                        // Only add if left <: base (join.py:316).
+                        let left_inst = Type::Instance {
+                            type_ref: left_ref.to_string(),
+                            args: vec![],
+                            last_known_value: None,
+                            extra_attrs: None,
+                        };
+                        if is_subtype(&left_inst, &base, ctx, resolver)? {
+                            base_refs.push(base_ref.clone());
+                        }
+                    }
+                }
+            }
         }
     }
     // join.py:228-234: for each base, recurse and pick the best.
@@ -2465,7 +2487,22 @@ fn join_instances_via_supertype(
         }
     }
     match best {
-        Some((result, _)) => Some(result),
+        Some((result, _)) => {
+            // Defer when the result is an Ancestor with type vars:
+            // Python's join_instances_via_supertype calls
+            // map_instance_to_supertype + join_instances which produces
+            // Instance(ancestor, [joined_args]). Rust returns bare
+            // Instance(ancestor, []), which is wrong for generic
+            // ancestors like Sequence[object].
+            if let JoinResult::Ancestor(ref fullname) = result {
+                if let Some(snap) = resolver.get(fullname) {
+                    if !snap.type_vars_with_variance.is_empty() {
+                        return None;
+                    }
+                }
+            }
+            Some(result)
+        }
         // No bases: if left is builtins.object, return Object. Else
         // defer (Python asserts best is not None when bases non-empty).
         None => {
