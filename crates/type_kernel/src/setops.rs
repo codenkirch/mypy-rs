@@ -691,18 +691,33 @@ fn visit_instance_meet(
         return None;
     }
 
-    // meet.py:970-979 (alt_promote branches skipped — snapshot has no
-    // alt_promote; is_subtype covers the nominal case): is_subtype(t,
-    // s) -> return t; is_subtype(s, t) -> return s; else Bottom.
-    // Use non-proper is_subtype (visit_instance uses is_subtype, not
-    // is_proper_subtype, here — the pre-check already failed for
-    // proper_subtype with ignore_promotions=True, but is_subtype may
-    // still succeed via promotions).
-    //
-    // Python's is_subtype always returns bool; when Rust's is_subtype
-    // defers (None) it can't conclude either direction, so the meet
-    // must defer too. Falling through to Bottom would be a wrong answer
-    // when Python would have returned t or s (e.g. via a promotion).
+    // meet.py:1024-1029: alt_promote check BEFORE is_subtype. Python
+    // checks t.alt_promote == s.type -> return t, then s.alt_promote ==
+    // t.type -> return s. This is needed for native int types where
+    // i32.alt_promote = int (so meet(i32, int) = i32, NOT int, even
+    // though is_subtype(int, i32) is also True via int._promote).
+    let t_snap = resolver.get(t_ref);
+    let s_snap = resolver.get(s_ref);
+    if let Some(snap) = t_snap {
+        if let Some(alt) = &snap.alt_promote_fullname {
+            if alt == s_ref {
+                return Some(SetOpResult::SameT);
+            }
+        }
+    }
+    if let Some(snap) = s_snap {
+        if let Some(alt) = &snap.alt_promote_fullname {
+            if alt == t_ref {
+                return Some(SetOpResult::SameS);
+            }
+        }
+    }
+
+    // meet.py:1030-1039: is_subtype(t, s) -> return t; is_subtype(s, t)
+    // -> return s; else Bottom. Python's is_subtype always returns
+    // bool; when Rust's is_subtype defers (None) the meet must defer
+    // too. Falling through to Bottom would be a wrong answer when
+    // Python would have returned t or s (e.g. via a promotion).
     match is_subtype(t, s, ctx, resolver) {
         Some(true) => Some(SetOpResult::SameT),
         Some(false) => match is_subtype(s, t, ctx, resolver) {
@@ -2143,16 +2158,23 @@ fn visit_instance_join(
         proper_subtype: true,
         ..*ctx
     };
-    let result_ref = if is_subtype(t, s, &proper_ctx, resolver)? {
+    let t_is_subtype = is_subtype(t, s, &proper_ctx, resolver)?;
+    let result_ref = if t_is_subtype {
         join_instances_nominal(t_ref, s_ref, ctx, resolver)?
     } else {
         join_instances_nominal(s_ref, t_ref, ctx, resolver)?
     };
     Some(match result_ref {
-        // Left/Right never escape via_supertype (Left -> Ancestor(base)
-        // inside via_supertype). The top-level call only produces
-        // Ancestor/Object after the t==s early return.
-        JoinResult::Left => SetOpResult::SameS,
+        // Left means the first arg to via_supertype won. When t <: s,
+        // via_supertype(t, s) was called, so Left = t -> SameT.
+        // Otherwise via_supertype(s, t), so Left = s -> SameS.
+        JoinResult::Left => {
+            if t_is_subtype {
+                SetOpResult::SameT
+            } else {
+                SetOpResult::SameS
+            }
+        }
         JoinResult::Ancestor(fullname) => SetOpResult::Ancestor(fullname),
         JoinResult::Object => SetOpResult::Object,
     })
@@ -2332,19 +2354,31 @@ fn join_instances_nominal(
     if t_ref == s_ref {
         return Some(JoinResult::Left);
     }
-    let t = Type::Instance {
+    // Python's join_instances calls join_instances_via_supertype
+    // directly (no inner is_subtype check). But via_supertype's bases
+    // walk recurses into join_instances, which checks is_subtype(t, s)
+    // at the TOP of join_instances (the is_proper_subtype dispatch).
+    // Since we're in a recursive call without that dispatch, we need
+    // the is_subtype check here to detect when one is already a
+    // subtype of the other (the common-ancestor walk would otherwise
+    // miss it and return Object). When t <: s, the join is s (Right);
+    // when s <: t, the join is t (Left).
+    let t_inst = Type::Instance {
         type_ref: t_ref.to_string(),
         args: vec![],
         last_known_value: None,
         extra_attrs: None,
     };
-    let s = Type::Instance {
+    let s_inst = Type::Instance {
         type_ref: s_ref.to_string(),
         args: vec![],
         last_known_value: None,
         extra_attrs: None,
     };
-    if is_subtype(&t, &s, ctx, resolver)? {
+    if is_subtype(&t_inst, &s_inst, ctx, resolver)? {
+        // t <: s: join is s. But via_supertype may find a better
+        // answer via promotes. Fall through to via_supertype which
+        // checks promotes first, then bases.
         join_instances_via_supertype(t_ref, s_ref, ctx, resolver)
     } else {
         join_instances_via_supertype(s_ref, t_ref, ctx, resolver)
@@ -2365,6 +2399,42 @@ fn join_instances_via_supertype(
     resolver: &TypeResolver,
 ) -> Option<JoinResult> {
     let left_snap = resolver.get(left_ref)?;
+    let right_snap = resolver.get(right_ref);
+
+    // join.py:298-303: walk _promote lists for duck-type joins.
+    // First loop: if left has a promote p where p <: right, return
+    // join_types(p, right). Since p <: right, join = right. Return
+    // Ancestor(right_ref) so the caller builds Instance(right, []).
+    // Second loop: if right has a promote p where p <: left, return
+    // join_types(left, p). Since p <: left, join = left. Return Left.
+    if !ctx.ignore_promotions {
+        for promote_blob in &left_snap.promote_bytes {
+            if let Some(promote) = decode_type(promote_blob) {
+                if is_subtype(&promote, &Type::Instance {
+                    type_ref: right_ref.to_string(),
+                    args: vec![],
+                    last_known_value: None,
+                    extra_attrs: None,
+                }, ctx, resolver)? {
+                    return Some(JoinResult::Ancestor(right_ref.to_string()));
+                }
+            }
+        }
+        if let Some(snap) = right_snap {
+            for promote_blob in &snap.promote_bytes {
+                if let Some(promote) = decode_type(promote_blob) {
+                    if is_subtype(&promote, &Type::Instance {
+                        type_ref: left_ref.to_string(),
+                        args: vec![],
+                        last_known_value: None,
+                        extra_attrs: None,
+                    }, ctx, resolver)? {
+                        return Some(JoinResult::Left);
+                    }
+                }
+            }
+        }
+    }
     // join.py:221-226: collect base type_refs from left's bases.
     let mut base_refs: Vec<String> = Vec::new();
     for base_blob in &left_snap.bases {
