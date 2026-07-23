@@ -78,6 +78,16 @@ pub(crate) fn is_subtype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // subtypes.py:352-359: non-proper subtype of Any/Unbound/Erased is
+    // always True (unless left is UnpackType, which the wire format
+    // doesn't produce in this recursive path). The Python shim handles
+    // this at the top-level entry, but recursive calls from
+    // check_type_parameter bypass the shim, so we must mirror it here.
+    if !ctx.proper_subtype {
+        if matches!(right, Type::AnyType { .. }) {
+            return Some(true);
+        }
+    }
     // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
     // a subtype of everything (bottom type). Fires before any right-side
     // dispatch because the Python visitor's `accept` lands on
