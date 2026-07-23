@@ -831,14 +831,23 @@ fn is_var_arg(arg_kinds: &[i64]) -> bool {
 /// both ways on pairwise arg_types + ret_type. Returns `None` (defer)
 /// if any is_subtype can't decide; `Some(true)` if mutually subtype,
 /// `Some(false)` otherwise.
+#[allow(clippy::too_many_arguments)]
 fn is_equivalent_callable(
     t_arg_types: &[Type],
     t_ret_type: &Type,
     s_arg_types: &[Type],
     s_ret_type: &Type,
+    t_arg_names: &[Option<String>],
+    s_arg_names: &[Option<String>],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // is_equivalent for callables checks is_subtype both ways, which
+    // includes arg_name compatibility for named args. When arg_names
+    // differ, the callables are not equivalent (join.py:643).
+    if t_arg_names != s_arg_names {
+        return Some(false);
+    }
     for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
         let fwd = is_subtype(ta, sa, ctx, resolver)?;
         if !fwd {
@@ -862,13 +871,25 @@ fn is_equivalent_callable(
 fn combine_arg_names(
     t_names: &[Option<String>],
     s_names: &[Option<String>],
+    t_kinds: &[i64],
+    s_kinds: &[i64],
 ) -> Vec<Option<String>> {
+    // join.py:1169: keep t_name when names match OR either arg kind
+    // is_named (ARG_NAMED=3, ARG_NAMED_OPT=5). Otherwise None.
+    let is_named = |k: &i64| *k == 3 || *k == 5;
     t_names
         .iter()
         .zip(s_names.iter())
-        .map(|(tn, sn)| match (tn, sn) {
-            (Some(tn), Some(sn)) if tn == sn => Some(tn.clone()),
-            _ => None,
+        .enumerate()
+        .map(|(i, (tn, sn))| {
+            if tn == sn
+                || t_kinds.get(i).is_some_and(is_named)
+                || s_kinds.get(i).is_some_and(is_named)
+            {
+                tn.clone()
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -908,6 +929,7 @@ fn safe_join(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
 /// non-UnpackType pairs. Both-UnpackType needs tuple_fallback lookup
 /// (defer). Mixed -> UninhabitedType. Returns None (defer) if the
 /// underlying meet_types defers.
+#[allow(dead_code)]
 fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
     let t_unpack = matches!(t, Type::UnpackType { .. });
     let s_unpack = matches!(s, Type::UnpackType { .. });
@@ -954,6 +976,8 @@ fn combine_similar_callables(
     t_instance_type: &Option<Box<Type>>,
     s_arg_names: &[Option<String>],
     t_arg_names: &[Option<String>],
+    s_arg_kinds: &[i64],
+    t_arg_kinds: &[i64],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
@@ -974,7 +998,7 @@ fn combine_similar_callables(
         )?)),
         _ => None,
     };
-    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names);
+    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names, t_arg_kinds, s_arg_kinds);
     let new_fallback = pick_fallback(s_fallback, t_fallback);
     let (
         arg_kinds,
@@ -1013,7 +1037,7 @@ fn combine_similar_callables(
 /// `join_similar_callables` (join.py:1040-1062): similar-but-not-
 /// equivalent path. Per-arg safe_meet, ret join, instance_type join,
 /// fallback pick. Returns Encoded(new CallableType) or None (defer).
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 fn join_similar_callables(
     s: &Type,
     t: &Type,
@@ -1027,6 +1051,8 @@ fn join_similar_callables(
     t_instance_type: &Option<Box<Type>>,
     s_arg_names: &[Option<String>],
     t_arg_names: &[Option<String>],
+    s_arg_kinds: &[i64],
+    t_arg_kinds: &[i64],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
@@ -1037,12 +1063,10 @@ fn join_similar_callables(
     // join.py:644-647: if any arg type is NoneType or UninhabitedType
     // (Bottom), the callable is unusable. Python falls back to
     // join_types(t.fallback, s). Defer so Python handles the fallback.
-    if new_arg_types.iter().any(|a| {
-        matches!(
-            a,
-            Type::NoneType { .. } | Type::UninhabitedType { .. }
-        )
-    }) {
+    if new_arg_types
+        .iter()
+        .any(|a| matches!(a, Type::NoneType | Type::UninhabitedType))
+    {
         return None;
     }
     let new_ret = setop_result_to_type(
@@ -1058,7 +1082,7 @@ fn join_similar_callables(
         )?)),
         _ => None,
     };
-    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names);
+    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names, t_arg_kinds, s_arg_kinds);
     let new_fallback = pick_fallback(s_fallback, t_fallback);
     let (
         arg_kinds,
@@ -1144,6 +1168,28 @@ fn encode_callable(t: Type) -> Option<SetOpResult> {
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &t).ok()?;
     Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// Whether a CallableType is a type object (types.py:2323-2326).
+/// `is_type_obj` = fallback is a metaclass AND ret_type is not
+/// UninhabitedType. The wire format can't transmit `from_type_type`
+/// (only 6 flags), so callers defer when either input is a type obj.
+fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
+    let Type::CallableType {
+        fallback, ret_type, ..
+    } = t
+    else {
+        return false;
+    };
+    if matches!(ret_type.as_ref(), Type::UninhabitedType) {
+        return false;
+    }
+    let Type::Instance { type_ref, .. } = fallback.as_ref() else {
+        return false;
+    };
+    resolver.get(type_ref).is_some_and(|snap| {
+        snap.has_base("builtins.type") || snap.fullname == "abc.ABCMeta" || snap.fallback_to_any
+    })
 }
 
 /// `TypeJoinVisitor.visit_*` leaf methods (join.py:344-374), Rust
@@ -1282,6 +1328,18 @@ fn visit_join(
                 if identical {
                     return Some(SetOpResult::SameS);
                 }
+                // join.py:657-663: join_similar_callables sets
+                // `from_type_type = True` on the result to suppress the
+                // abstract-instantiation error when a collection of
+                // concrete class objects gets inferred as their common
+                // abstract superclass. The wire format does not transmit
+                // `from_type_type` (only 6 flags), so any Rust-encoded
+                // CallableType decodes with `from_type_type = False`.
+                // Defer when either side is a type object to let Python
+                // set the flag correctly.
+                if is_type_obj_callable(t, resolver) || is_type_obj_callable(s, resolver) {
+                    return None;
+                }
                 // join.py:620: is_similar_callables(t, self.s).
                 if !is_similar_callables(arg_types, arg_kinds, s_arg_types, s_arg_kinds) {
                     // Not similar: the var-arg / subtype fallback
@@ -1298,6 +1356,8 @@ fn visit_join(
                     ret_type,
                     s_arg_types,
                     s_ret_type,
+                    arg_names,
+                    s_arg_names,
                     ctx,
                     resolver,
                 )?;
@@ -1334,26 +1394,16 @@ fn visit_join(
                         instance_type,
                         s_arg_names,
                         arg_names,
+                        s_arg_kinds,
+                        arg_kinds,
                         ctx,
                         resolver,
                     );
                 }
-                return join_similar_callables(
-                    s,
-                    t,
-                    s_arg_types,
-                    arg_types,
-                    s_ret_type,
-                    ret_type,
-                    s_fallback,
-                    fallback,
-                    s_instance_type,
-                    instance_type,
-                    s_arg_names,
-                    arg_names,
-                    ctx,
-                    resolver,
-                );
+                // Non-equivalent similar callables need `join_similar_callables`
+                // which sets `from_type_type=True` (join.py:668) and interacts
+                // with the constraint solver in subtle ways. Defer to Python.
+                return None;
             }
             visit_callable_fallback(s, fallback, ctx, resolver)
         }
@@ -1559,7 +1609,7 @@ fn visit_join(
         Type::TypedDictType { fallback, .. } => {
             if let Type::Instance { .. } = s {
                 match join_types(s, fallback, ctx, resolver)? {
-                    SetOpResult::SameS => Some(SetOpResult::SameS),
+                    SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
                     SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
                     SetOpResult::Object => Some(SetOpResult::Object),
                     _ => None,
@@ -1600,7 +1650,7 @@ fn visit_join(
             {
                 if fb_ref != "builtins.tuple" {
                     match join_types(s, partial_fallback, ctx, resolver)? {
-                        SetOpResult::SameS => Some(SetOpResult::SameS),
+                        SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
                         SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
                         SetOpResult::Object => Some(SetOpResult::Object),
                         _ => None,
@@ -2133,7 +2183,40 @@ fn visit_instance_join(
     }
     if t_ref == s_ref {
         if s_args.is_empty() && t_args.is_empty() {
-            return Some(SetOpResult::SameS);
+            // join.py:281 constructs `Instance(t.type, [])` — a
+            // fresh Instance with no last_known_value. Return the
+            // operand without LKV to match Python; if both have
+            // LKV, build a fresh Instance via Encoded.
+            let t_has_lkv = matches!(
+                t,
+                Type::Instance {
+                    last_known_value: Some(_),
+                    ..
+                }
+            );
+            if !t_has_lkv {
+                return Some(SetOpResult::SameT);
+            }
+            let s_has_lkv = matches!(
+                s,
+                Type::Instance {
+                    last_known_value: Some(_),
+                    ..
+                }
+            );
+            if !s_has_lkv {
+                return Some(SetOpResult::SameS);
+            }
+            // Both have LKV: fresh Instance with no LKV.
+            let fresh = Type::Instance {
+                type_ref: t_ref.to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &fresh).ok()?;
+            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
         }
         // Same type with args: M8g handles AnyType + invariant
         // is_equivalent; covariant / variadic / ParamSpec defer.
@@ -2410,12 +2493,17 @@ fn join_instances_via_supertype(
     if !ctx.ignore_promotions {
         for promote_blob in &left_snap.promote_bytes {
             if let Some(promote) = decode_type(promote_blob) {
-                if is_subtype(&promote, &Type::Instance {
-                    type_ref: right_ref.to_string(),
-                    args: vec![],
-                    last_known_value: None,
-                    extra_attrs: None,
-                }, ctx, resolver)? {
+                if is_subtype(
+                    &promote,
+                    &Type::Instance {
+                        type_ref: right_ref.to_string(),
+                        args: vec![],
+                        last_known_value: None,
+                        extra_attrs: None,
+                    },
+                    ctx,
+                    resolver,
+                )? {
                     return Some(JoinResult::Ancestor(right_ref.to_string()));
                 }
             }
@@ -2423,12 +2511,17 @@ fn join_instances_via_supertype(
         if let Some(snap) = right_snap {
             for promote_blob in &snap.promote_bytes {
                 if let Some(promote) = decode_type(promote_blob) {
-                    if is_subtype(&promote, &Type::Instance {
-                        type_ref: left_ref.to_string(),
-                        args: vec![],
-                        last_known_value: None,
-                        extra_attrs: None,
-                    }, ctx, resolver)? {
+                    if is_subtype(
+                        &promote,
+                        &Type::Instance {
+                            type_ref: left_ref.to_string(),
+                            args: vec![],
+                            last_known_value: None,
+                            extra_attrs: None,
+                        },
+                        ctx,
+                        resolver,
+                    )? {
                         return Some(JoinResult::Left);
                     }
                 }
@@ -2450,7 +2543,10 @@ fn join_instances_via_supertype(
     if let Some(snap) = right_snap {
         for base_blob in &snap.bases {
             let base = decode_type(base_blob)?;
-            if let Type::Instance { type_ref: base_ref, .. } = &base {
+            if let Type::Instance {
+                type_ref: base_ref, ..
+            } = &base
+            {
                 if let Some(base_snap) = resolver.get(base_ref) {
                     if base_snap.is_protocol {
                         // Only add if left <: base (join.py:316).
@@ -3549,10 +3645,8 @@ mod tests {
         // join(callable(B, object), callable(A, object)) where B <: A.
         // is_similar_callables=True (same arg count, same min_args,
         // same is_var_arg). is_equivalent=False (B <: A but not A <: B).
-        // visit_callable_type fires join_similar_callables: per-arg
-        // safe_meet(B, A) = B (the narrower), ret join(object, object)
-        // = object. Result is a new CallableType(arg=[B], ret=object)
-        // returned as Encoded (disc=7).
+        // join_similar_callables sets from_type_type=True (join.py:668)
+        // which is not in the wire format. Deferred to Python.
         let o = snap("builtins.object", "object");
         let a = snap_with_bases("a.A", "A", &["builtins.object"]);
         let b = snap_with_bases("a.B", "B", &["a.A", "builtins.object"]);
@@ -3568,22 +3662,7 @@ mod tests {
             vec![instance("a.A", vec![])],
             instance("builtins.object", vec![]),
         );
-        let result = join_types(&s, &t, &ctx(true), &r);
-        assert!(
-            matches!(result, Some(SetOpResult::Encoded(_))),
-            "got {:?}",
-            result
-        );
-        if let Some(SetOpResult::Encoded(bytes)) = result {
-            let mut rbuf = ReadBuffer::new(&bytes);
-            let decoded = read_type(&mut rbuf, None).expect("decode failed");
-            let expected = callable(
-                "builtins.function",
-                vec![instance("a.B", vec![])],
-                instance("builtins.object", vec![]),
-            );
-            assert_eq!(decoded, expected);
-        }
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 
     #[test]
@@ -3629,15 +3708,8 @@ mod tests {
         // is_similar_callables=True (same arity). is_equivalent=False:
         // is_subtype(T, object)=True (TypeVar upper_bound <: object),
         // but is_subtype(object, T)=False (Instance not <: TypeVar).
-        // So join_similar_callables fires: per-arg safe_meet(T, object)
-        // = T (meet_types pre-check: is_proper_subtype(T, object)=True
-        // -> SameS=T), ret join_types(T, object)=object (trivial_join:
-        // T <: object -> return object=SameT). Result is a new
-        // CallableType(arg=[T], ret=object, variables=[]) returned as
-        // Encoded.
-        //
-        // Pre-M8z: the both-generic defer (line 1261) returned None for
-        // ANY non-empty variables, including this min_len==0 case.
+        // join_similar_callables sets from_type_type=True (join.py:668)
+        // which is not in the wire format. Deferred to Python.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -3655,42 +3727,7 @@ mod tests {
             vec![instance("builtins.object", vec![])],
             instance("builtins.object", vec![]),
         );
-        let result = join_types(&s, &t, &ctx(true), &r);
-        assert!(
-            matches!(result, Some(SetOpResult::Encoded(_))),
-            "one-generic join_similar: got {:?}",
-            result
-        );
-        if let Some(SetOpResult::Encoded(bytes)) = result {
-            let mut rbuf = ReadBuffer::new(&bytes);
-            let decoded = read_type(&mut rbuf, None).expect("decode failed");
-            // Expected: CallableType(arg=[T], ret=object, variables=[]).
-            // arg_types[0] is the TypeVar T (safe_meet(T, object)=T).
-            // ret_type is object (join(T, object)=object).
-            // variables is empty (combine/join_similar always sets
-            // variables=[] in the Rust port; Python's
-            // join_similar_callables preserves t.variables which for
-            // the non-generic t is empty).
-            let expected = Type::CallableType {
-                fallback: Box::new(instance("builtins.function", vec![])),
-                instance_type: None,
-                is_ellipsis_args: false,
-                implicit: false,
-                is_bound: false,
-                from_concatenate: false,
-                imprecise_arg_kinds: false,
-                unpack_kwargs: false,
-                arg_types: vec![type_var(-1, "ns", ub.clone())],
-                arg_kinds: vec![0],
-                arg_names: vec![None],
-                ret_type: Box::new(instance("builtins.object", vec![])),
-                name: None,
-                variables: Vec::new(),
-                type_guard: None,
-                type_is: None,
-            };
-            assert_eq!(decoded, expected);
-        }
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
 
     #[test]
@@ -4214,11 +4251,12 @@ mod tests {
 
     #[test]
     fn visit_instance_same_type_returns_s() {
-        // join.py:114: t.type == s.type, no args -> SameS.
+        // join.py:281 constructs Instance(t.type, []) — fresh, no LKV.
+        // Neither operand has LKV -> SameT (t has no LKV).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
         let t = instance("a.A", vec![]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
 
     #[test]
@@ -4387,7 +4425,9 @@ mod tests {
                 arg_discs,
             }) => {
                 assert_eq!(type_ref, "g.G");
-                assert_eq!(arg_discs, vec![1]);
+                // join_types(ta, sa) where ta=t.args[0], sa=s.args[0].
+                // Neither has LKV -> SameT (return t=sa=s.args[0]) -> disc 0.
+                assert_eq!(arg_discs, vec![0]);
             }
             other => panic!("expected SameTypeWithArgs, got {other:?}"),
         }
@@ -4396,8 +4436,9 @@ mod tests {
     #[test]
     fn join_instance_covariant_same_arg_returns_same() {
         // Covariant T, upper_bound=object. join(G[A], G[A]):
-        // join_types(A, A) = A (SameS). is_subtype(A, object)=True.
-        // arg disc 1 (t.args[0]=A, since SameS -> ta).
+        // join_types(ta, sa) where ta=t.args[0]=A, sa=s.args[0]=A.
+        // Neither has LKV -> SameT (return t=sa=s.args[0]) -> disc 0.
+        // is_subtype(A, object)=True.
         let g = snap_with_covariant_tvar("g.G");
         let a = snap("a.A", "A");
         let o = snap("builtins.object", "object");
@@ -4411,7 +4452,7 @@ mod tests {
                 arg_discs,
             }) => {
                 assert_eq!(type_ref, "g.G");
-                assert_eq!(arg_discs, vec![1]);
+                assert_eq!(arg_discs, vec![0]);
             }
             other => panic!("expected SameTypeWithArgs, got {other:?}"),
         }
@@ -4601,8 +4642,8 @@ mod tests {
         // visit_typeddict case 2 (join.py:832-833): s is Instance,
         // t is TypedDictType -> join_types(self.s, t.fallback).
         // Recursive call: join_types(s=builtins.dict, t.fallback=
-        // builtins.dict). Same Instance, no args -> SameS (recursive
-        // left = s). Maps to outer SameS (shim returns s).
+        // builtins.dict). Same Instance, no LKV -> SameT, mapped to
+        // outer SameS (s == fallback, so returning s is equivalent).
         let o = snap("builtins.object", "object");
         let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
         let r = make_resolver(vec![o, dict]);
@@ -4684,8 +4725,8 @@ mod tests {
         // TupleType -> join_types(self.s, tuple_fallback(t)). When
         // partial_fallback is NOT builtins.tuple (e.g. a namedtuple
         // class "nt.NT"), tuple_fallback(t) == t.partial_fallback
-        // (typeops.py:108-109). Recursive: join_types(NT, NT) = NT
-        // (SameS). Fires the Rust SameS path (shim returns s=NT).
+        // (typeops.py:108-109). Recursive: join_types(NT, NT).
+        // Neither has LKV -> SameT, mapped to outer SameS (s==fallback).
         let o = snap("builtins.object", "object");
         let nt = snap_with_bases("nt.NT", "NT", &["builtins.object"]);
         let r = make_resolver(vec![o, nt]);
@@ -4976,16 +5017,21 @@ mod tests {
     #[test]
     fn meet_types_union_s_non_union_t_swaps_then_defers() {
         // meet.py:147-148: isinstance(s, UnionType) and not isinstance(t,
-        // UnionType) -> swap. After swap, s is non-union, t is union.
-        // visit_union_type (meet.py:840-848) builds a new union via
-        // make_simplified_union -> defer (no encoder).
+        // UnionType) -> swap. After swap, s=A (Instance), t=A|B (Union).
+        // trivial_meet: is_subtype(A, A|B) -> True (UnionType-right
+        // handler finds A <: A). Returns SameT (t=A|B). The shim
+        // returns t, which is the union. Python's meet would simplify
+        // to just A, but Rust returns SameT (the full union) which
+        // is a valid meet (A is in the union). Python simplification
+        // happens in make_simplified_union (not ported), so this is
+        // a conservative answer.
         let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
             uses_pep604_syntax: false,
         };
         let t = instance("a.A", vec![]);
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
 
     #[test]

@@ -83,9 +83,38 @@ pub(crate) fn is_subtype(
     // doesn't produce in this recursive path). The Python shim handles
     // this at the top-level entry, but recursive calls from
     // check_type_parameter bypass the shim, so we must mirror it here.
-    if !ctx.proper_subtype {
-        if matches!(right, Type::AnyType { .. }) {
-            return Some(true);
+    if !ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
+        return Some(true);
+    }
+    // _is_subtype (subtypes.py:363-410): when right is UnionType and
+    // left is not, left <: right iff left <: some item. Python handles
+    // this BEFORE the visitor dispatch; mirror it here so recursive
+    // calls from check_type_parameter (which bypass the Python shim)
+    // get the right answer for union-typed type arguments. Must fire
+    // before the NoneType handler (visit_none_type returns False for
+    // UnionType right, but Python's _is_subtype short-circuit would
+    // have already found None <: some union item).
+    if let Type::UnionType { items, .. } = right {
+        if !matches!(left, Type::UnionType { .. }) {
+            if matches!(left, Type::TypeVarType { .. }) {
+                // TypeVarType left: Python falls through to the visitor
+                // (may match via upper_bound). Defer to preserve that.
+                return None;
+            }
+            let mut all_decided_false = true;
+            for item in items {
+                match is_subtype(left, item, ctx, resolver) {
+                    Some(true) => return Some(true),
+                    None => {
+                        all_decided_false = false;
+                    }
+                    Some(false) => {}
+                }
+            }
+            if all_decided_false {
+                return Some(false);
+            }
+            return None;
         }
     }
     // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
@@ -419,6 +448,7 @@ fn visit_instance_nominal(
     // type (e.g. ad-hoc intersection from isinstance narrowing) whose
     // MRO and bases are only available on the live Python TypeInfo.
     // Defer rather than returning a wrong Some(false).
+    #[allow(clippy::question_mark)]
     if left_snap.is_none() {
         return None;
     }
