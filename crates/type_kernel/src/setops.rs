@@ -2011,7 +2011,7 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
 /// (step 4, bool + enum cases), extra-attrs erasure (step 5),
 /// `make_union` (final). Returns `None` (defer to Python) when any
 /// step can't be completed.
-fn make_simplified_union(
+pub(crate) fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,

@@ -73,6 +73,58 @@ from mypy.types import (
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.typevars import fill_typevars
 
+# Stage 3e type-kernel seam: when the `type_kernel` Rust extension is
+# importable and `Options.native_type_kernel` is set, `make_simplified_union`,
+# `simple_literal_type`, `is_simple_literal`, `true_only`, `false_only`, and
+# `true_or_false` route through Rust. Rust returns `None` for any case it
+# does not handle, in which case we fall back to the pure-Python path. This
+# is the strangler-fig per-call gate, parity-only and default-off.
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import ReadBuffer as _ReadBuffer
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    from mypy.types import read_type as _read_type
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _read_type = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_typeops_active: bool = False
+_native_typeops_resolver: Any = None
+
+
+def _set_native_typeops_active(active: bool) -> None:
+    global _native_typeops_active
+    _native_typeops_active = active
+
+
+def _set_native_typeops_resolver(resolver: Any) -> None:
+    global _native_typeops_resolver
+    _native_typeops_resolver = resolver
+
+
+def _serialize_type(t: Type) -> bytes:
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _serialize_type_list(items: Sequence[Type]) -> bytes:
+    buf = _WriteBuffer()
+    from mypy.types import write_type_list
+
+    write_type_list(buf, items)
+    return buf.getvalue()
+
+
+def _deserialize_type(data: bytes) -> Type:
+    return _read_type(_ReadBuffer(data))
+
 
 def is_recursive_pair(s: Type, t: Type) -> bool:
     """Is this a pair of recursive types?
@@ -587,6 +639,20 @@ def callable_corresponding_argument(
 
 def simple_literal_type(t: ProperType | None) -> Instance | None:
     """Extract the underlying fallback Instance type for a simple Literal"""
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+        and t is not None
+    ):
+        try:
+            result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if isinstance(decoded, Instance):
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, Instance) and t.last_known_value is not None:
         t = t.last_known_value
     if isinstance(t, LiteralType):
@@ -595,6 +661,19 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
 
 
 def is_simple_literal(t: ProperType) -> bool:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_is_simple_literal(
+                _serialize_type(t), _native_typeops_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, LiteralType):
         return t.fallback.type.is_enum or t.fallback.type.fullname == "builtins.str"
     if isinstance(t, Instance):
@@ -634,6 +713,27 @@ def make_simplified_union(
     back into a sum type. Set it to False when called by try_expanding_sum_type_
     to_union().
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+        and len(items) > 1
+    ):
+        try:
+            result = _type_kernel.rust_make_simplified_union(
+                _serialize_type_list(items),
+                line,
+                column,
+                keep_erased,
+                contract_literals,
+                handle_recursive,
+                _native_typeops_resolver,
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                return get_proper_type(decoded)
+        except (AssertionError, NotImplementedError):
+            pass
     # Step 1: expand all nested unions
     items = flatten_nested_unions(items, handle_recursive=handle_recursive)
 
@@ -787,12 +887,80 @@ def _get_type_method_ret_type(t: ProperType, *, name: str) -> Type | None:
     return None
 
 
+def _interpret_truthiness_result(disc: tuple, t: ProperType) -> ProperType | None:
+    """Map a Rust truthiness discriminator to a live Python `ProperType`.
+
+    Returns `None` if the discriminator can't be interpreted (the caller
+    falls through to the Python path). Tags:
+      0=Uninhabited, 1=NoneType, 2=SameType, 3=CopyTrueOnly,
+      4=CopyFalseOnly, 5=CopyReset, 6=LiteralEmptyStr(fallback_bytes),
+      7=LiteralZero(fallback_bytes), 8=UnionNarrow(item_discs).
+    """
+    tag = disc[0]
+    if tag == 0:
+        return UninhabitedType(line=t.line, column=t.column)
+    elif tag == 1:
+        return NoneType(line=t.line)
+    elif tag == 2:
+        return t
+    elif tag == 3:
+        new_t = copy_type(t)
+        new_t.can_be_false = False
+        return new_t
+    elif tag == 4:
+        new_t = copy_type(t)
+        new_t.can_be_true = False
+        return new_t
+    elif tag == 5:
+        new_t = copy_type(t)
+        new_t.can_be_true = new_t.can_be_true_default()
+        new_t.can_be_false = new_t.can_be_false_default()
+        return new_t
+    elif tag == 6:
+        fallback = _deserialize_type(bytes(disc[1]))
+        if isinstance(fallback, Instance):
+            return LiteralType("", fallback=fallback)
+        return None
+    elif tag == 7:
+        fallback = _deserialize_type(bytes(disc[1]))
+        if isinstance(fallback, Instance):
+            return LiteralType(0, fallback=fallback)
+        return None
+    elif tag == 8:
+        item_discs = disc[1]
+        new_items: list[Type] = []
+        for i, item_disc in enumerate(item_discs):
+            if not isinstance(t, UnionType):
+                return None
+            item = t.items[i]
+            item_proper = get_proper_type(item)
+            result = _interpret_truthiness_result(item_disc, item_proper)
+            if result is None:
+                return None
+            new_items.append(result)
+        return make_simplified_union(new_items, line=t.line, column=t.column)
+    return None
+
+
 def true_only(t: Type) -> ProperType:
     """
     Restricted version of t with only True-ish values
     """
     t = get_proper_type(t)
 
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_true_only(_serialize_type(t))
+            if result is not None:
+                interpreted = _interpret_truthiness_result(result, t)
+                if interpreted is not None:
+                    return interpreted
+        except (AssertionError, NotImplementedError):
+            pass
     if not t.can_be_true:
         # All values of t are False-ish, so there are no true values in it
         return UninhabitedType(line=t.line, column=t.column)
@@ -823,6 +991,21 @@ def false_only(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_false_only(
+                _serialize_type(t), state.strict_optional
+            )
+            if result is not None:
+                interpreted = _interpret_truthiness_result(result, t)
+                if interpreted is not None:
+                    return interpreted
+        except (AssertionError, NotImplementedError):
+            pass
     if not t.can_be_false:
         if state.strict_optional:
             # All values of t are True-ish, so there are no false values in it
@@ -868,6 +1051,19 @@ def true_or_false(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_true_or_false(_serialize_type(t))
+            if result is not None:
+                interpreted = _interpret_truthiness_result(result, t)
+                if interpreted is not None:
+                    return interpreted
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, UnionType):
         new_items = [true_or_false(item) for item in t.items]
         return make_simplified_union(new_items, line=t.line, column=t.column)

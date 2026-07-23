@@ -943,6 +943,11 @@ class BuildManager:
         from mypy.expandtype import _set_native_expand_type_active
 
         _set_native_expand_type_active(self.options.native_type_kernel)
+        # Stage 3e typeops helpers (parity-only, default-off). Rust returns
+        # None for cases needing live TypeInfo (method lookup, is_final).
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1141,6 +1146,11 @@ class BuildManager:
         _set_native_expand_type_typeinfo_map(typeinfo_map)
         # from mypy.expandtype import _set_native_expand_type_resolver
         # _set_native_expand_type_resolver(resolver)
+        # Stage 3e typeops helpers (parity-only). Resolver install left
+        # commented (parity-only): install via conftest.py with
+        # MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS=1.
+        # from mypy.typeops import _set_native_typeops_resolver
+        # _set_native_typeops_resolver(resolver)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
