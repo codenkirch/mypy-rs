@@ -99,6 +99,29 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 7 visitor framework (parity-only). Activates the wire-format
+        # has_type_vars, flatten_nested_unions, etc. gate. No resolver needed.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_VISITOR"):
+            try:
+                from mypy.types import _set_native_visitor_active
+
+                _set_native_visitor_active(True)
+                # Type-returning functions (remove_dups, type_vars_as_args,
+                # callable_with_ellipsis, split_with_prefix_and_suffix,
+                # flatten_nested_unions, flatten_nested_tuples) lose
+                # truthiness flags on wire round-trip. Separate gate.
+                if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_VISITOR_TYPES"):
+                    from mypy.types import _set_native_visitor_types_active
+
+                    _set_native_visitor_types_active(True)
+                # copy_type gate: round-trip loses truthiness flags.
+                if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_COPYTYPE"):
+                    from mypy.copytype import _set_native_copy_active
+
+                    _set_native_copy_active(True)
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched
 
 

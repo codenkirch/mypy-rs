@@ -4202,8 +4202,110 @@ class HasTypeVars(BoolTypeQuery):
         return True
 
 
+# ---------------------------------------------------------------------------
+# Stage 7: native visitor-framework shims (parity-only).
+#
+# Routes has_type_vars, has_recursive_types, is_literal_type,
+# is_unannotated_any, remove_dups, type_vars_as_args,
+# callable_with_ellipsis, find_unpack_in_list,
+# split_with_prefix_and_suffix, flatten_nested_unions,
+# flatten_nested_tuples, copy_type through the wire-format Type enum.
+# Rust returns None for TypeAliasType (no alias target on the wire);
+# Python falls back to the pure-Python visitor.
+try:
+    from type_kernel import rust_has_type_vars as _rust_has_type_vars
+    from type_kernel import rust_has_recursive_types as _rust_has_recursive_types
+    from type_kernel import rust_is_literal_type as _rust_is_literal_type
+    from type_kernel import rust_is_unannotated_any as _rust_is_unannotated_any
+    from type_kernel import rust_remove_dups as _rust_remove_dups
+    from type_kernel import rust_type_vars_as_args as _rust_type_vars_as_args
+    from type_kernel import rust_callable_with_ellipsis as _rust_callable_with_ellipsis
+    from type_kernel import rust_find_unpack_in_list as _rust_find_unpack_in_list
+    from type_kernel import rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix
+    from type_kernel import rust_flatten_nested_unions as _rust_flatten_nested_unions
+    from type_kernel import rust_flatten_nested_tuples as _rust_flatten_nested_tuples
+    from type_kernel import rust_copy_type as _rust_copy_type
+    from librt.internal import ReadBuffer as _ReadBuffer
+    from librt.internal import WriteBuffer as _VisitorWriteBuffer
+    from mypy.types import read_type as _visitor_read_type
+
+    _VISITOR_HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_has_type_vars = None  # type: ignore[assignment]
+    _rust_has_recursive_types = None  # type: ignore[assignment]
+    _rust_is_literal_type = None  # type: ignore[assignment]
+    _rust_is_unannotated_any = None  # type: ignore[assignment]
+    _rust_remove_dups = None  # type: ignore[assignment]
+    _rust_type_vars_as_args = None  # type: ignore[assignment]
+    _rust_callable_with_ellipsis = None  # type: ignore[assignment]
+    _rust_find_unpack_in_list = None  # type: ignore[assignment]
+    _rust_split_with_prefix_and_suffix = None  # type: ignore[assignment]
+    _rust_flatten_nested_unions = None  # type: ignore[assignment]
+    _rust_flatten_nested_tuples = None  # type: ignore[assignment]
+    _rust_copy_type = None  # type: ignore[assignment]
+    _VisitorWriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _visitor_read_type = None  # type: ignore[assignment]
+    _VISITOR_HAS_TYPE_KERNEL = False
+
+_native_visitor_active: bool = False
+_native_visitor_types_active: bool = False
+
+
+def _set_native_visitor_active(active: bool) -> None:
+    """Enable/disable the Rust visitor path (parity-only)."""
+    global _native_visitor_active
+    _native_visitor_active = active
+
+
+def _set_native_visitor_types_active(active: bool) -> None:
+    """Enable type-returning visitor functions (lose truthiness flags)."""
+    global _native_visitor_types_active
+    _native_visitor_types_active = active
+
+
+def _serialize_type_for_visitor(t: Type) -> bytes:
+    buf = _VisitorWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _deserialize_type_from_visitor(b: bytes) -> Type:
+    buf = _ReadBuffer(b)
+    return _visitor_read_type(buf)
+
+
+def _serialize_type_list_for_visitor(types: Iterable[Type]) -> list[bytes]:
+    return [_serialize_type_for_visitor(t) for t in types]
+
+
+def _deserialize_type_list_from_visitor(bs: list[bytes]) -> list[Type]:
+    return [_deserialize_type_from_visitor(b) for b in bs]
+
+
+def _encode_literal_value(value: LiteralValue) -> tuple[str, str]:
+    """Encode a Python literal value for rust_is_literal_type."""
+    if isinstance(value, bool):
+        return ("bool", "T" if value else "F")
+    if isinstance(value, int):
+        return ("int", str(value))
+    if isinstance(value, float):
+        return ("float", repr(value))
+    if isinstance(value, str):
+        return ("str", value)
+    if isinstance(value, bytes):
+        return ("bytes", value.decode("latin-1"))
+    return ("", "")
+
+
 def has_type_vars(typ: Type) -> bool:
     """Check if a type contains any type variables (recursively)."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
+        try:
+            type_bytes = _serialize_type_for_visitor(typ)
+            return _rust_has_type_vars(type_bytes)
+        except (AssertionError, NotImplementedError):
+            pass
     return typ.accept(HasTypeVars())
 
 
@@ -4221,6 +4323,14 @@ _has_recursive_type: Final = HasRecursiveType()
 
 def has_recursive_types(typ: Type) -> bool:
     """Check if a type contains any recursive aliases (recursively)."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
+        try:
+            type_bytes = _serialize_type_for_visitor(typ)
+            result = _rust_has_recursive_types(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     _has_recursive_type.reset()
     return typ.accept(_has_recursive_type)
 
@@ -4228,6 +4338,19 @@ def has_recursive_types(typ: Type) -> bool:
 def split_with_prefix_and_suffix(
     types: tuple[Type, ...], prefix: int, suffix: int
 ) -> tuple[tuple[Type, ...], tuple[Type, ...], tuple[Type, ...]]:
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(types)
+            head_b, mid_b, tail_b = _rust_split_with_prefix_and_suffix(
+                type_bytes_list, prefix, suffix
+            )
+            return (
+                tuple(_deserialize_type_list_from_visitor(head_b)),
+                tuple(_deserialize_type_list_from_visitor(mid_b)),
+                tuple(_deserialize_type_list_from_visitor(tail_b)),
+            )
+        except (AssertionError, NotImplementedError):
+            pass
     if len(types) <= prefix + suffix:
         types = extend_args_for_prefix_and_suffix(types, prefix, suffix)
     if suffix:
@@ -4268,6 +4391,16 @@ def flatten_nested_unions(
     types: Sequence[Type], *, handle_type_alias_type: bool = True, handle_recursive: bool = True
 ) -> list[Type]:
     """Flatten nested unions in a type list."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(types)
+            result = _rust_flatten_nested_unions(
+                type_bytes_list, handle_type_alias_type, handle_recursive
+            )
+            if result is not None:
+                return _deserialize_type_list_from_visitor(result)
+        except (AssertionError, NotImplementedError):
+            pass
     if not isinstance(types, list):
         typelist = list(types)
     else:
@@ -4301,6 +4434,13 @@ def flatten_nested_unions(
 
 
 def find_unpack_in_list(items: Sequence[Type]) -> int | None:
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(items)
+            idx = _rust_find_unpack_in_list(type_bytes_list)
+            return idx if idx >= 0 else None
+        except (AssertionError, NotImplementedError):
+            pass
     unpack_index: int | None = None
     for i, item in enumerate(items):
         if isinstance(item, UnpackType):
@@ -4323,6 +4463,14 @@ def flatten_nested_tuples(types: Iterable[Type], handle_recursive: bool = True) 
         Tuple[A, B, C, D]
     """
     res = []
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(types)
+            result = _rust_flatten_nested_tuples(type_bytes_list, handle_recursive)
+            if result is not None:
+                return _deserialize_type_list_from_visitor(result)
+        except (AssertionError, NotImplementedError):
+            pass
     for typ in types:
         if not isinstance(typ, UnpackType):
             res.append(typ)
@@ -4356,6 +4504,13 @@ def flatten_nested_tuples(types: Iterable[Type], handle_recursive: bool = True) 
 
 def is_literal_type(typ: ProperType, fallback_fullname: str, value: LiteralValue) -> bool:
     """Check if this type is a LiteralType with the given fallback type and value."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
+        try:
+            type_bytes = _serialize_type_for_visitor(typ)
+            kind, payload = _encode_literal_value(value)
+            return _rust_is_literal_type(type_bytes, fallback_fullname, kind, payload)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(typ, Instance) and typ.last_known_value:
         typ = typ.last_known_value
     return (
@@ -4370,6 +4525,12 @@ def is_unannotated_any(t: Type) -> bool:
 
     This is used to check for functions with unspecified/not fully specified types.
     """
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_active:
+        try:
+            type_bytes = _serialize_type_for_visitor(t)
+            return _rust_is_unannotated_any(type_bytes)
+        except (AssertionError, NotImplementedError):
+            pass
     if not isinstance(t, ProperType):
         return False
     return isinstance(t, AnyType) and t.type_of_any == TypeOfAny.unannotated
@@ -4386,6 +4547,16 @@ deserialize_map: Final = {
 
 def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance) -> CallableType:
     """Construct type Callable[..., ret_type]."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
+        try:
+            any_bytes = _serialize_type_for_visitor(any_type)
+            ret_bytes = _serialize_type_for_visitor(ret_type)
+            fb_bytes = _serialize_type_for_visitor(fallback)
+            result = _rust_callable_with_ellipsis(any_bytes, ret_bytes, fb_bytes)
+            if result is not None:
+                return _deserialize_type_from_visitor(result)  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
     return CallableType(
         [any_type, any_type],
         [ARG_STAR, ARG_STAR2],
@@ -4397,6 +4568,13 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
 
 
 def remove_dups(types: list[T]) -> list[T]:
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active and len(types) > 1:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(types)
+            result = _rust_remove_dups(type_bytes_list)
+            return _deserialize_type_list_from_visitor(result)  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
     if len(types) <= 1:
         return types
     # Get unique elements in order of appearance
@@ -4411,6 +4589,13 @@ def remove_dups(types: list[T]) -> list[T]:
 
 def type_vars_as_args(type_vars: Sequence[TypeVarLikeType]) -> tuple[Type, ...]:
     """Represent type variables as they would appear in a type argument list."""
+    if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active:
+        try:
+            type_bytes_list = _serialize_type_list_for_visitor(type_vars)
+            result = _rust_type_vars_as_args(type_bytes_list)
+            return tuple(_deserialize_type_list_from_visitor(result))
+        except (AssertionError, NotImplementedError):
+            pass
     args: list[Type] = []
     for tv in type_vars:
         if isinstance(tv, TypeVarTupleType):
