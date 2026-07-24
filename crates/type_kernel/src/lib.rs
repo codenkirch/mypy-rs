@@ -53,6 +53,7 @@ mod setops;
 mod subtypes;
 mod typeinfo;
 mod typeops;
+mod visitor;
 mod wire;
 
 use pyo3::prelude::*;
@@ -109,6 +110,30 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         erase_typevars::rust_replace_meta_vars,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_has_type_vars, module)?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_has_recursive_types, module)?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_is_literal_type, module)?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_is_unannotated_any, module)?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_remove_dups, module)?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_type_vars_as_args, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        visitor::rust_callable_with_ellipsis,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_find_unpack_in_list, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        visitor::rust_split_with_prefix_and_suffix,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        visitor::rust_flatten_nested_unions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        visitor::rust_flatten_nested_tuples,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(visitor::rust_copy_type, module)?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }

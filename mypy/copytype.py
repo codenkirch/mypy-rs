@@ -30,6 +30,32 @@ from mypy.types import (
 # type_visitor needs to be imported after types
 from mypy.type_visitor import TypeVisitor  # ruff: isort: skip
 
+# Stage 7: native copy_type shim (parity-only). The wire Type enum is
+# Clone, so copy_type is trivially clone(). The Python visitor's purpose
+# (shallow copy for truthiness mutation) is preserved by round-tripping
+# through the wire format, which produces a structurally identical copy.
+try:
+    from type_kernel import rust_copy_type as _rust_copy_type
+    from librt.internal import WriteBuffer as _CopyWriteBuffer
+    from librt.internal import ReadBuffer as _CopyReadBuffer
+    from mypy.types import read_type as _copy_read_type
+
+    _COPY_HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_copy_type = None  # type: ignore[assignment]
+    _CopyWriteBuffer = None  # type: ignore[assignment]
+    _CopyReadBuffer = None  # type: ignore[assignment]
+    _copy_read_type = None  # type: ignore[assignment]
+    _COPY_HAS_TYPE_KERNEL = False
+
+_native_copy_active: bool = False
+
+
+def _set_native_copy_active(active: bool) -> None:
+    """Enable/disable the Rust copy_type path (parity-only)."""
+    global _native_copy_active
+    _native_copy_active = active
+
 
 def copy_type(t: ProperType) -> ProperType:
     """Create a shallow copy of a type.
@@ -39,6 +65,16 @@ def copy_type(t: ProperType) -> ProperType:
     Classes compiled with mypyc don't support copy.copy(), so we need
     a custom implementation.
     """
+    if _COPY_HAS_TYPE_KERNEL and _native_copy_active:
+        try:
+            buf = _CopyWriteBuffer()
+            t.write(buf)
+            result = _rust_copy_type(buf.getvalue())
+            if result is not None:
+                rbuf = _CopyReadBuffer(result)
+                return _copy_read_type(rbuf)  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(TypeShallowCopier())
 
 
