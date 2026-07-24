@@ -405,6 +405,38 @@ pub(crate) fn neg_op(op: &str) -> Option<&'static str> {
     }
 }
 
+/// Check if a method short name is an operator method (value of
+/// `op_methods`, `reverse_op_methods`, or `unary_op_methods`).
+/// Mirrors `mypy.checkexpr.is_operator_method`.
+pub(crate) fn is_operator_method_name(short_name: &str) -> bool {
+    // Check op_methods values.
+    for op in [
+        "+", "-", "*", "/", "%", "divmod", "//", "**", "@", "&", "|", "^", "<<", ">>", "==", "!=",
+        "<", ">=", ">", "<=", "in",
+    ] {
+        if let Some(m) = get_op_method(op) {
+            if m == short_name {
+                return true;
+            }
+        }
+    }
+    // Check reverse_op_methods values (reverse of op_methods).
+    for op in [
+        "+", "-", "*", "/", "%", "divmod", "//", "**", "@", "&", "|", "^", "<<", ">>", "==", "!=",
+        "<", ">=", ">", "<=",
+    ] {
+        if let Some(m) = get_op_method(op) {
+            if let Some(rm) = get_reverse_op_method(m) {
+                if rm == short_name {
+                    return true;
+                }
+            }
+        }
+    }
+    // Check unary_op_methods values.
+    matches!(short_name, "__pos__" | "__neg__" | "__invert__")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

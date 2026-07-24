@@ -306,6 +306,66 @@ from mypy.typevars import fill_typevars, fill_typevars_with_any, has_no_typevars
 from mypy.util import is_dunder, is_sunder
 from mypy.visitor import NodeVisitor
 
+# Native type_kernel seam for standalone checker functions (Stage 9).
+# Gates: _native_checker_active enables scalar-returning functions,
+# _native_checker_types_active enables type-returning functions.
+# Rust returns None for TypeAliasType (no alias target on the wire);
+# Python falls back to get_proper_type + the pure-Python path.
+try:
+    from type_kernel import rust_has_bool_item as _rust_has_bool_item
+    from type_kernel import rust_is_typed_callable as _rust_is_typed_callable
+    from type_kernel import rust_is_private as _rust_is_private
+    from type_kernel import rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping
+    from type_kernel import rust_flatten_types_if_tuple as _rust_flatten_types_if_tuple
+    from type_kernel import rust_is_string_literal as _rust_is_string_literal
+    from type_kernel import rust_is_untyped_decorator as _rust_is_untyped_decorator
+    from type_kernel import rust_is_typeddict_type_context as _rust_is_typeddict_type_context
+    from librt.internal import ReadBuffer as _CheckerReadBuffer
+    from librt.internal import WriteBuffer as _CheckerWriteBuffer
+    from mypy.types import read_type as _checker_read_type
+
+    _CHECKER_HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_has_bool_item = None  # type: ignore[assignment]
+    _rust_is_typed_callable = None  # type: ignore[assignment]
+    _rust_is_private = None  # type: ignore[assignment]
+    _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
+    _rust_flatten_types_if_tuple = None  # type: ignore[assignment]
+    _rust_is_string_literal = None  # type: ignore[assignment]
+    _rust_is_untyped_decorator = None  # type: ignore[assignment]
+    _rust_is_typeddict_type_context = None  # type: ignore[assignment]
+    _CheckerReadBuffer = None  # type: ignore[assignment]
+    _CheckerWriteBuffer = None  # type: ignore[assignment]
+    _checker_read_type = None  # type: ignore[assignment]
+    _CHECKER_HAS_TYPE_KERNEL = False
+
+_native_checker_active: bool = False
+_native_checker_types_active: bool = False
+
+
+def _set_native_checker_active(active: bool) -> None:
+    """Enable scalar-returning checker functions (parity-only)."""
+    global _native_checker_active
+    _native_checker_active = active
+
+
+def _set_native_checker_types_active(active: bool) -> None:
+    """Enable type-returning checker functions (parity-only)."""
+    global _native_checker_types_active
+    _native_checker_types_active = active
+
+
+def _serialize_type_for_checker(t: Type) -> bytes:
+    buf = _CheckerWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _deserialize_type_from_checker(b: bytes) -> Type:
+    buf = _CheckerReadBuffer(b)
+    return _checker_read_type(buf)
+
+
 T = TypeVar("T")
 
 DEFAULT_LAST_PASS: Final = 2  # Pass numbers start at 0
@@ -9086,6 +9146,8 @@ def flatten(t: Expression) -> list[Expression]:
 
 def flatten_types_if_tuple(t: Type) -> list[Type]:
     """Flatten a nested sequence of tuples into one list of nodes."""
+    # NOTE: flatten_types_if_tuple returns list[Type]. Wire round-trip loses
+    # live TypeInfo references, so the Rust path is not production-wired.
     t = get_proper_type(t)
     if isinstance(t, UnionType):
         return [UnionType.make_union([b for a in t.items for b in flatten_types_if_tuple(a)])]
@@ -9114,6 +9176,15 @@ class TypeTransformVisitor(TransformVisitor):
 
 def are_argument_counts_overlapping(t: CallableType, s: CallableType) -> bool:
     """Can a single call match both t and s, based just on positional argument counts?"""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            t_bytes = _serialize_type_for_checker(t)
+            s_bytes = _serialize_type_for_checker(s)
+            result = _rust_are_argument_counts_overlapping(t_bytes, s_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     min_args = max(t.min_args, s.min_args)
     max_args = min(t.max_possible_positional_args(), s.max_possible_positional_args())
     return min_args <= max_args
@@ -9611,6 +9682,14 @@ def group_comparison_operands(
 
 
 def is_typed_callable(c: Type | None) -> bool:
+    if c is not None and _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            type_bytes = _serialize_type_for_checker(c)
+            result = _rust_is_typed_callable(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     c = get_proper_type(c)
     if not c or not isinstance(c, CallableType):
         return False
@@ -9621,6 +9700,14 @@ def is_typed_callable(c: Type | None) -> bool:
 
 
 def is_untyped_decorator(typ: Type | None) -> bool:
+    if typ is not None and _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            type_bytes = _serialize_type_for_checker(typ)
+            result = _rust_is_untyped_decorator(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     typ = get_proper_type(typ)
     if not typ:
         return True
@@ -9720,16 +9807,37 @@ def is_overlapping_types_for_overload(left: Type, right: Type) -> bool:
 
 def is_private(node_name: str) -> bool:
     """Check if node is private to class definition."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            return _rust_is_private(node_name)
+        except (AssertionError, NotImplementedError):
+            pass
     return node_name.startswith("__") and not node_name.endswith("__")
 
 
 def is_string_literal(typ: Type) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            type_bytes = _serialize_type_for_checker(typ)
+            result = _rust_is_string_literal(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     strs = try_getting_str_literals_from_type(typ)
     return strs is not None and len(strs) == 1
 
 
 def has_bool_item(typ: ProperType) -> bool:
     """Return True if type is 'bool' or a union with a 'bool' item."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            type_bytes = _serialize_type_for_checker(typ)
+            result = _rust_has_bool_item(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if is_named_instance(typ, "builtins.bool"):
         return True
     if isinstance(typ, UnionType):
@@ -9976,6 +10084,14 @@ def combine_equality_value_info(infos: Iterable[EqualityValueInfo]) -> EqualityV
 
 
 def is_typeddict_type_context(lvalue_type: Type) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            type_bytes = _serialize_type_for_checker(lvalue_type)
+            result = _rust_is_typeddict_type_context(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     lvalue_type = get_proper_type(lvalue_type)
     if isinstance(lvalue_type, TypedDictType):
         return True

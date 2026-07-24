@@ -122,6 +122,27 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 9 standalone checker/checkexpr functions (parity-only).
+        # Scalar-returning functions use _native_checker_active /
+        # _native_checkexpr_active. Type-returning functions
+        # (flatten_types_if_tuple, try_getting_literal) use the types
+        # gate since wire round-trip loses truthiness flags.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKEXPR"):
+            try:
+                from mypy.checkexpr import _set_native_checkexpr_active
+
+                _set_native_checkexpr_active(True)
+                from mypy.checker import (
+                    _set_native_checker_active,
+                    _set_native_checker_types_active,
+                )
+
+                _set_native_checker_active(True)
+                if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKEXPR_TYPES"):
+                    _set_native_checker_types_active(True)
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched
 
 

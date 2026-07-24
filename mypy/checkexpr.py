@@ -214,6 +214,57 @@ from mypy.typestate import type_state
 from mypy.typevars import fill_typevars
 from mypy.visitor import ExpressionVisitor
 
+# Native type_kernel seam for standalone checkexpr functions (Stage 9).
+# Gates: _native_checkexpr_active enables scalar-returning functions.
+# Rust returns None for TypeAliasType (no alias target on the wire);
+# Python falls back to get_proper_type + the pure-Python visitor.
+try:
+    from type_kernel import rust_has_any_type as _rust_has_any_type
+    from type_kernel import rust_has_uninhabited_component as _rust_has_uninhabited_component
+    from type_kernel import rust_has_bytes_component as _rust_has_bytes_component
+    from type_kernel import rust_is_non_empty_tuple as _rust_is_non_empty_tuple
+    from type_kernel import rust_has_coroutine_decorator as _rust_has_coroutine_decorator
+    from type_kernel import rust_is_operator_method as _rust_is_operator_method
+    from type_kernel import rust_is_type_type_context as _rust_is_type_type_context
+    from type_kernel import rust_try_getting_literal as _rust_try_getting_literal
+    from librt.internal import ReadBuffer as _CheckExprReadBuffer
+    from librt.internal import WriteBuffer as _CheckExprWriteBuffer
+    from mypy.types import read_type as _checkexpr_read_type
+
+    _CHECKEXPR_HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_has_any_type = None  # type: ignore[assignment]
+    _rust_has_uninhabited_component = None  # type: ignore[assignment]
+    _rust_has_bytes_component = None  # type: ignore[assignment]
+    _rust_is_non_empty_tuple = None  # type: ignore[assignment]
+    _rust_has_coroutine_decorator = None  # type: ignore[assignment]
+    _rust_is_operator_method = None  # type: ignore[assignment]
+    _rust_is_type_type_context = None  # type: ignore[assignment]
+    _rust_try_getting_literal = None  # type: ignore[assignment]
+    _CheckExprReadBuffer = None  # type: ignore[assignment]
+    _CheckExprWriteBuffer = None  # type: ignore[assignment]
+    _checkexpr_read_type = None  # type: ignore[assignment]
+    _CHECKEXPR_HAS_TYPE_KERNEL = False
+
+_native_checkexpr_active: bool = False
+
+
+def _set_native_checkexpr_active(active: bool) -> None:
+    """Enable/disable the Rust checkexpr path (parity-only)."""
+    global _native_checkexpr_active
+    _native_checkexpr_active = active
+
+
+def _serialize_type_for_checkexpr(t: Type) -> bytes:
+    buf = _CheckExprWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _deserialize_type_from_checkexpr(b: bytes) -> Type:
+    buf = _CheckExprReadBuffer(b)
+    return _checkexpr_read_type(buf)
+
 # Type of callback user for checking individual function arguments. See
 # check_args() below for details.
 ArgChecker: _TypeAlias = Callable[
@@ -6632,6 +6683,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
 def has_any_type(t: Type, ignore_in_type_obj: bool = False) -> bool:
     """Whether t contains an Any type"""
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_has_any_type(type_bytes, ignore_in_type_obj)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(HasAnyType(ignore_in_type_obj))
 
 
@@ -6663,6 +6722,14 @@ class HasAnyType(types.BoolTypeQuery):
 
 def has_coroutine_decorator(t: Type) -> bool:
     """Whether t came from a function decorated with `@coroutine`."""
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_has_coroutine_decorator(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     t = get_proper_type(t)
     return isinstance(t, Instance) and t.type.fullname == "typing.AwaitableGenerator"
 
@@ -6692,6 +6759,14 @@ def is_async_def(t: Type) -> bool:
 
 
 def is_non_empty_tuple(t: Type) -> bool:
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_is_non_empty_tuple(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     t = get_proper_type(t)
     return isinstance(t, TupleType) and bool(t.items)
 
@@ -6757,6 +6832,14 @@ class HasErasedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_uninhabited_component(t: Type | None) -> bool:
+    if t is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_has_uninhabited_component(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t is not None and t.accept(HasUninhabitedComponentsQuery())
 
 
@@ -6958,6 +7041,8 @@ def merge_typevars_in_callables_by_name(
 
 def try_getting_literal(typ: Type) -> ProperType:
     """If possible, get a more precise literal type for a given type."""
+    # NOTE: try_getting_literal returns a ProperType. Wire round-trip loses
+    # live TypeInfo references, so the Rust path is not production-wired.
     typ = get_proper_type(typ)
     if isinstance(typ, Instance) and typ.last_known_value is not None:
         return typ.last_known_value
@@ -6979,6 +7064,14 @@ def is_expr_literal_type(node: Expression) -> bool:
 
 def has_bytes_component(typ: Type) -> bool:
     """Is this one of builtin byte types, or a union that contains it?"""
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(typ)
+            result = _rust_has_bytes_component(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     typ = get_proper_type(typ)
     byte_types = {"builtins.bytes", "builtins.bytearray"}
     if isinstance(typ, UnionType):
@@ -7008,6 +7101,11 @@ def type_info_from_type(typ: Type) -> TypeInfo | None:
 
 
 def is_operator_method(fullname: str | None) -> bool:
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            return _rust_is_operator_method(fullname)
+        except (AssertionError, NotImplementedError):
+            pass
     if not fullname:
         return False
     short_name = fullname.split(".")[-1]
@@ -7025,6 +7123,14 @@ def get_partial_instance_type(t: Type | None) -> PartialType | None:
 
 
 def is_type_type_context(context: Type | None) -> bool:
+    if context is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(context)
+            result = _rust_is_type_type_context(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     context = get_proper_type(context)
     if isinstance(context, TypeType):
         return True
