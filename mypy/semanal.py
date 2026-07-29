@@ -367,6 +367,44 @@ Tag: _TypeAlias = int
 _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 
 
+# Stage 15: native semanal_algebra seam (parity-only, default-off).
+
+# When `type_kernel` is importable and the gate is active, the pure
+# Type-transformation helpers `make_any_non_explicit` and
+# `make_any_non_unimported` route through Rust via the wire format.
+# Rust returns None for types it cannot handle (decode failure),
+# falling back to the pure-Python TrivialSyntheticTypeTranslator.
+try:
+    from type_kernel import rust_make_any_non_explicit as _rust_make_any_non_explicit
+    from type_kernel import rust_make_any_non_unimported as _rust_make_any_non_unimported
+    from librt.internal import WriteBuffer as _SemanalWriteBuffer
+    from librt.internal import ReadBuffer as _SemanalReadBuffer
+
+    from mypy.types import read_type as _semanal_read_type
+
+    _SEMANAL_HAS_KERNEL = True
+except ImportError:
+    _rust_make_any_non_explicit = None  # type: ignore[assignment]
+    _rust_make_any_non_unimported = None  # type: ignore[assignment]
+    _SemanalWriteBuffer = None  # type: ignore[assignment]
+    _SemanalReadBuffer = None  # type: ignore[assignment]
+    _semanal_read_type = None  # type: ignore[assignment]
+    _SEMANAL_HAS_KERNEL = False
+
+_native_semanal_active: bool = False
+
+
+def _set_native_semanal_active(active: bool) -> None:
+    global _native_semanal_active
+    _native_semanal_active = active
+
+
+def _serialize_semanal_type(t: Type) -> bytes:
+    buf = _SemanalWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
 class SemanticAnalyzer(
     NodeVisitor[None], SemanticAnalyzerInterface, SemanticAnalyzerPluginInterface, SplittingVisitor
 ):
@@ -8299,6 +8337,15 @@ def remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None
 
 def make_any_non_explicit(t: Type) -> Type:
     """Replace all Any types within in with Any that has attribute 'explicit' set to False"""
+    if _SEMANAL_HAS_KERNEL and _native_semanal_active:
+        try:
+            data = _serialize_semanal_type(t)
+            result = _rust_make_any_non_explicit(data)
+            if result is not None:
+                buf = _SemanalReadBuffer(result)
+                return _semanal_read_type(buf)
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(MakeAnyNonExplicit())
 
 
@@ -8314,6 +8361,15 @@ class MakeAnyNonExplicit(TrivialSyntheticTypeTranslator):
 
 def make_any_non_unimported(t: Type) -> Type:
     """Replace all Any types that come from unimported types with special form Any."""
+    if _SEMANAL_HAS_KERNEL and _native_semanal_active:
+        try:
+            data = _serialize_semanal_type(t)
+            result = _rust_make_any_non_unimported(data)
+            if result is not None:
+                buf = _SemanalReadBuffer(result)
+                return _semanal_read_type(buf)
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(MakeAnyNonUnimported())
 
 
