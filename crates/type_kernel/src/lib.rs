@@ -57,6 +57,7 @@ mod messages;
 mod mro;
 mod nodes;
 mod operators;
+mod plugin_hooks;
 mod refs;
 mod setops;
 mod subtypes;
@@ -243,6 +244,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         types_codec::rust_is_valid_type_codec_tag,
         module
     )?)?;
+    module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
