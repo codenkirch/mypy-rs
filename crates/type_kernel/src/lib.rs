@@ -71,6 +71,7 @@ mod mega_kernel_a;
 mod mega_kernel_b;
 mod mega_kernel_c;
 mod mega_kernel_d;
+mod mega_kernel_e;
 mod messages;
 mod mro;
 mod mypyc_port;
@@ -443,6 +444,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         mega_kernel_d::rust_mega_type_rule_eval_12001,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_e::rust_mega_type_rule_eval_17001,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
