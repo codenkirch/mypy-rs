@@ -128,7 +128,7 @@ fn is_meta_var(raw_id: i64) -> bool {
 /// The core TypeVarEraser visitor. Mirrors `TypeVarEraser` (erasetype.py:204-285).
 /// Recursively transforms the type tree, replacing TypeVar references that
 /// match the `ids` predicate with `replacement`.
-fn erase_typevars_inner(
+pub(crate) fn erase_typevars_inner(
     typ: &Type,
     ids: Option<&HashSet<IdKey>>,
     replacement: &Type,
@@ -205,12 +205,9 @@ fn erase_typevars_inner(
             min_len,
         } => {
             if should_erase(*raw_id, namespace, ids) {
-                // TypeVarEraser.visit_type_var_tuple:
-                // t.tuple_fallback.copy_modified(args=[self.replacement])
-                // We need to produce a TupleType(replacement) with the
-                // tuple_fallback. But tuple_fallback is an Instance, and
-                // copy_modified(args=[replacement]) means the new tuple has
-                // a single arg = replacement.
+                // Produce a TupleType(replacement) with tuple_fallback.
+                // tuple_fallback is Instance; copy_modified(args=[replacement])
+                // means the new tuple has a single arg = replacement.
                 // However, the wire format TypeVarTupleType.tuple_fallback is
                 // an Instance Type. copy_modified(args=[repl]) would create
                 // an Instance with args=[repl]. We can't do copy_modified on

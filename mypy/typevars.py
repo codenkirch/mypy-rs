@@ -13,8 +13,31 @@ from mypy.types import (
     TypeVarTupleType,
     TypeVarType,
     UnpackType,
+    read_type,
 )
 from mypy.typevartuples import erased_vars
+
+# Stage 6c type-kernel seam: when type_kernel is importable and the gate
+# is active, has_no_typevars routes through Rust. Rust returns None for
+# unsupported cases (TypeAliasType, UnboundType); we fall back to Python.
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import ReadBuffer as _ReadBuffer
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_typevars_active: bool = False
+
+
+def _set_native_typevars_active(active: bool) -> None:
+    global _native_typevars_active
+    _native_typevars_active = active
 
 
 def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
@@ -75,10 +98,16 @@ def fill_typevars_with_any(typ: TypeInfo) -> Instance | TupleType:
 
 
 def has_no_typevars(typ: Type) -> bool:
-    # We test if a type contains type variables by erasing all type variables
-    # and comparing the result to the original type. We use comparison by equality that
-    # in turn uses `__eq__` defined for types. Note: we can't use `is_same_type` because
-    # it is not safe with unresolved forward references, while this function may be called
-    # before forward references resolution patch pass. Note also that it is not safe to use
-    # `is` comparison because `erase_typevars` doesn't preserve type identity.
+    # Test if type contains type variables by erasing and comparing.
+    # We use equality comparison __eq__ defined for types.
+    # Note: cannot use is_same_type or identity 'is' comparison.
+    if _HAS_TYPE_KERNEL and _native_typevars_active:
+        try:
+            buf = _WriteBuffer()
+            typ.write(buf)
+            result = _type_kernel.rust_has_no_typevars(buf.getvalue())
+            if result is not None:
+                return result
+        except (NotImplementedError, AssertionError):
+            pass
     return typ == erase_typevars(typ)

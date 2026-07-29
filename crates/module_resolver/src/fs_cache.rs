@@ -189,7 +189,11 @@ impl PyOSErrorEntry {
         }
     }
     fn raise(&self, _py: Python<'_>) -> PyErr {
-        PyOSError::new_err((self.errno, io::Error::from_raw_os_error(self.errno).to_string(), self.filename.clone()))
+        PyOSError::new_err((
+            self.errno,
+            io::Error::from_raw_os_error(self.errno).to_string(),
+            self.filename.clone(),
+        ))
     }
 }
 
@@ -238,7 +242,11 @@ impl FsCache {
     ///
     /// Returns a tuple `(st_mode, st_size, st_mtime, st_ino, st_dev, st_nlink)`
     /// matching the fields mypy reads off `os.stat_result`.
-    fn stat_or_none(&self, _py: Python<'_>, path: String) -> PyResult<Option<(u32, u64, f64, u64, u64, u64)>> {
+    fn stat_or_none(
+        &self,
+        _py: Python<'_>,
+        path: String,
+    ) -> PyResult<Option<(u32, u64, f64, u64, u64, u64)>> {
         if let Some(cached) = self.stat_cache.borrow().get(&path) {
             return Ok(cached.map(|s| (s.mode, s.size, s.mtime, s.ino, s.dev, s.nlink)));
         }
@@ -279,11 +287,12 @@ impl FsCache {
         };
         // dirname basename must be a Python identifier (can't hold an
         // __init__.py in a non-identifier directory).
-        let dirname_basename = dirname
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        if !dirname_basename.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+        let dirname_basename = dirname.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !dirname_basename
+            .chars()
+            .next()
+            .map(|c| c.is_alphabetic() || c == '_')
+            .unwrap_or(false)
             || !dirname_basename
                 .chars()
                 .all(|c| c.is_alphanumeric() || c == '_')
@@ -374,7 +383,9 @@ impl FsCache {
                         }
                     }
                 }
-                self.listdir_cache.borrow_mut().insert(norm.clone(), Some(entries.clone()));
+                self.listdir_cache
+                    .borrow_mut()
+                    .insert(norm.clone(), Some(entries.clone()));
                 if self.fake_package_cache.borrow().contains(&norm)
                     && !entries.iter().any(|e| e == "__init__.py")
                 {
@@ -394,7 +405,9 @@ impl FsCache {
     }
 
     fn isfile(&self, path: String) -> bool {
-        self.stat_cached(&path).map(|s| s.is_file()).unwrap_or(false)
+        self.stat_cached(&path)
+            .map(|s| s.is_file())
+            .unwrap_or(false)
     }
 
     fn isdir(&self, path: String) -> bool {
@@ -507,10 +520,8 @@ impl FsCache {
         if let Some(err) = self.read_error_cache.borrow().get(&path) {
             return Err(err.clone().raise(py));
         }
-        // Stat first: the Python original documents that the contents of a
-        // file must be from the same or later instant than the reported
-        // mtime. We stat into the stat cache so a subsequent stat_or_none
-        // call returns the pre-read mtime.
+        // Stat first: file contents must be from same or later instant than mtime.
+        // Stat into cache so subsequent stat_or_none returns pre-read mtime.
         self.stat_cached(&path);
         let dirname = Path::new(&path)
             .parent()
@@ -520,8 +531,7 @@ impl FsCache {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("");
-        let fake = basename == "__init__.py"
-            && self.fake_package_cache.borrow().contains(&dirname);
+        let fake = basename == "__init__.py" && self.fake_package_cache.borrow().contains(&dirname);
         let data: Vec<u8> = if fake {
             Vec::new()
         } else {
@@ -532,7 +542,9 @@ impl FsCache {
                         errno: err.raw_os_error().unwrap_or(0),
                         filename: path.clone(),
                     };
-                    self.read_error_cache.borrow_mut().insert(path, entry.clone());
+                    self.read_error_cache
+                        .borrow_mut()
+                        .insert(path, entry.clone());
                     return Err(entry.raise(py));
                 }
             }
@@ -592,7 +604,9 @@ impl FsCache {
                 }
             }
         };
-        self.stat_cache.borrow_mut().insert(path.to_string(), result);
+        self.stat_cache
+            .borrow_mut()
+            .insert(path.to_string(), result);
         result
     }
 
@@ -602,7 +616,11 @@ impl FsCache {
     fn fake_init(&self, path: &str) -> io::Result<StatResult> {
         let p = Path::new(path);
         let basename = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        debug_assert_eq!(basename, "__init__.py", "fake_init on non-init path: {}", path);
+        debug_assert_eq!(
+            basename, "__init__.py",
+            "fake_init on non-init path: {}",
+            path
+        );
         let dirname = p.parent().unwrap_or(Path::new("."));
         let dirname_norm = normalize_path(&dirname.to_string_lossy());
         let meta = fs::metadata(dirname)?;
@@ -653,7 +671,10 @@ fn splitdrive(path: &str) -> (String, String) {
             if let Some(idx) = path[2..].find(r"\") {
                 let rest = &path[2 + idx + 1..];
                 if let Some(end) = rest.find(r"\") {
-                    return (path[..2 + idx + 1 + end + 1].to_string(), rest[end + 1..].to_string());
+                    return (
+                        path[..2 + idx + 1 + end + 1].to_string(),
+                        rest[end + 1..].to_string(),
+                    );
                 }
             }
         }
@@ -813,7 +834,8 @@ mod tests {
         let cache = FsCache::new();
         let path = file_path.to_string_lossy().to_string();
 
-        let bytes = Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
+        let bytes =
+            Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
         assert_eq!(bytes, b"x = 1\n");
 
         // Second call hits the cache (returns the same PyBytes object).
@@ -910,7 +932,8 @@ mod tests {
         let path = file_path.to_string_lossy().to_string();
 
         let st1 = cache.stat_cached(file_path.to_str().unwrap()).unwrap();
-        let bytes1 = Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
+        let bytes1 =
+            Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
         assert_eq!(bytes1, b"v1");
 
         // Mutate the underlying file within the same transaction.
@@ -918,10 +941,14 @@ mod tests {
 
         // Snapshot: stat returns the cached (older) result.
         let st2 = cache.stat_cached(file_path.to_str().unwrap()).unwrap();
-        assert_eq!(st1.size, st2.size, "stat should be cached within transaction");
+        assert_eq!(
+            st1.size, st2.size,
+            "stat should be cached within transaction"
+        );
 
         // And read returns the cached (older) contents.
-        let bytes2 = Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
+        let bytes2 =
+            Python::with_gil(|py| cache.read(py, path.clone()).unwrap().as_bytes().to_vec());
         assert_eq!(bytes2, b"v1", "read should be cached within transaction");
 
         // After flush, a new transaction sees the new contents.
@@ -940,10 +967,8 @@ mod tests {
         let init_path = pkg.join("__init__.py");
         assert!(!cache.init_under_package_root(init_path.to_str().unwrap()));
 
-        // We cannot easily exercise the full init_under_package_root path
-        // without chdir'ing (it normalizes against cwd). Instead, exercise
-        // fake_init directly and verify it populates fake_package_cache so
-        // listdir/read/exists see the synthesized file.
+        // Exercise fake_init directly without chdir'ing (cwd normalization).
+        // Verify it populates fake_package_cache for listdir/read/exists.
         let st = cache.fake_init(init_path.to_str().unwrap()).unwrap();
         assert!(st.is_file(), "fake_init must produce a regular-file stat");
         assert_eq!(st.size, 0);

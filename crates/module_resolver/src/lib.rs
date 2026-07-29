@@ -217,8 +217,6 @@ fn split_dot(id: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // In-memory FsProbe for unit tests
 // ---------------------------------------------------------------------------
-// In-memory FsProbe for unit tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 struct HashMapFs {
@@ -1122,20 +1120,15 @@ impl<'a, F: FsProbe> Resolver<'a, F> {
             Some(t) => t,
             None => return None,
         };
-        // Flat lookup is keyed by top-level; the Python function returns the
-        // dist for the top-level name. We don't have the dist string here
-        // (only the name set), but the approved-stubs branch only needs to
-        // know *whether* a dist exists, not its name. So a flat match means
-        // "approved, dist name is the top-level's entry".
+        // Flat lookup is keyed by top-level. The approved-stubs branch only
+        // needs to know whether a dist exists, not its name. So a flat match
+        // means approved.
         if self.inp.stub_flat.contains(top_level) {
             return Some(top_level.to_string());
         }
-        // Namespace lookup: the Python function checks whether the top-level
-        // is a key in non_bundled_packages_namespace (a nested dict). Our
-        // flattened stub_namespace map contains the FULL dotted module names
-        // as keys (e.g. "google.cloud.ndb"), not the top-level. So we check
-        // whether ANY key starts with the top-level prefix, then walk
-        // components longest-first to find the most specific match.
+        // Namespace lookup: check if any stub_namespace key starts with
+        // top-level prefix, then walk components longest-first to find
+        // the most specific match.
         let has_namespace = self
             .inp
             .stub_namespace
@@ -1314,12 +1307,9 @@ impl<'a, F: FsProbe> Resolver<'a, F> {
             return (FOUND, Some(ancestor), true);
         }
 
-        // Approved-stubs branch. Mirrors mypy.modulefinder._find_module
-        // lines 639-653. The control flow is subtle:
-        //   * If no parent shares our dist name (the `for...else` falls through),
-        //     this id IS the approved-stubs root → return APPROVED.
-        //   * If a parent shares our dist name (the loop `break`s), recurse on
-        //     that parent: if it's APPROVED, we're APPROVED too; otherwise NOT_FOUND.
+        // Approved-stubs branch: if no parent shares our dist name,
+        // this id IS the approved-stubs root → return APPROVED.
+        // Otherwise, recurse on that parent.
         let approved_dist = self.stub_distribution_name(id);
         if let Some(dist_str) = approved_dist {
             if components.len() == 1 {
@@ -1570,10 +1560,8 @@ mod tests {
         assert_eq!(basename("/"), "");
     }
 
-    // --- Dependency-record extraction tests ---
-    // These exercise `dep_records_with` (the core of
-    // `NativeResolver::compute_dep_records`) using `HashMapFs` as the
-    // filesystem. They mirror the cases in `mypy/build.py:all_imported_modules_in_file`.
+    // Dependency-record extraction tests: exercise dep_records_with
+    // using HashMapFs. Mirrors mypy/build.py:all_imported_modules_in_file.
 
     use std::cell::RefCell as TestRefCell;
 
@@ -1923,11 +1911,9 @@ mod tests {
         assert_eq!(ids, vec!["a.b", "c", "a"]);
     }
 
-    // --- stdlib version-gating regression tests ---
-    // `is_module_inline` must replicate `FindModuleCache.find_module`'s
-    // `use_typeshed` computation (`_typeshed_has_version`): a stdlib module
-    // outside the target Python version range must NOT be looked up in
-    // typeshed. This is what makes `import tomllib` (added in 3.11) resolve
+    // stdlib version-gating regression tests: is_module_inline must
+    // replicate FindModuleCache.find_module typeshed version checks.
+    // Modules outside Python version range must NOT resolve in typeshed.
     // as NOT_FOUND when targeting 3.10, so the dependency walk skips it via
     // `include_only_if_resolvable` instead of including it as a phantom dep.
 
@@ -2072,9 +2058,7 @@ mod tests {
         // One found module, one not-found, one found under a different name:
         // the batched call must return one result per id in input order,
         // matching what `resolve` would return for each id individually.
-        let f = fs()
-            .file("/lib/pkg1/a.py", "")
-            .file("/lib/pkg1/c.py", "");
+        let f = fs().file("/lib/pkg1/a.py", "").file("/lib/pkg1/c.py", "");
         let res = resolve_many(
             &f,
             &[("a", false), ("missing", false), ("c", false)],
@@ -2102,12 +2086,7 @@ mod tests {
             .file("/lib/pkg/__init__.py", "")
             .file("/lib/pkg/a.py", "")
             .file("/lib/pkg/b.py", "");
-        let res = resolve_many(
-            &f,
-            &[("pkg.a", false), ("pkg.b", false)],
-            &["/lib"],
-            false,
-        );
+        let res = resolve_many(&f, &[("pkg.a", false), ("pkg.b", false)], &["/lib"], false);
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].0, FOUND);
         assert_eq!(res[0].1.as_deref(), Some("/lib/pkg/a.py"));
@@ -2128,8 +2107,10 @@ mod tests {
         let flat = BTreeSet::<String>::new();
         let ns_map = BTreeMap::<String, String>::new();
         let stdlib_map = HashMap::<String, ((u8, u8), Option<(u8, u8)>)>::new();
-        let input: Vec<(String, bool)> =
-            vec![("untyped".to_string(), false), ("untyped".to_string(), true)];
+        let input: Vec<(String, bool)> = vec![
+            ("untyped".to_string(), false),
+            ("untyped".to_string(), true),
+        ];
         let ic = TestRefCell::new(HashMap::new());
         let ns_anc = TestRefCell::new(HashMap::new());
         let res = resolve_many_with(
