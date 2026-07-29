@@ -46,6 +46,7 @@ mod argmap;
 mod astwire;
 mod checker_algebra;
 mod checkexpr_algebra;
+mod checkexpr_engine;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
@@ -334,6 +335,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_check_call_dispatch,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_engine::rust_infer_binary_op_simple,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
