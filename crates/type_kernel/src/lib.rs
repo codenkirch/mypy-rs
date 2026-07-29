@@ -72,6 +72,17 @@ mod mega_kernel_b;
 mod mega_kernel_c;
 mod mega_kernel_d;
 mod mega_kernel_e;
+mod mega_kernel_f;
+mod mega_kernel_g;
+mod mega_kernel_h;
+mod mega_kernel_i;
+mod mega_kernel_j;
+mod mega_kernel_k;
+mod mega_kernel_l;
+mod mega_kernel_m;
+mod mega_kernel_n;
+mod mega_kernel_o;
+mod mega_kernel_p;
 mod messages;
 mod mro;
 mod mypyc_port;
@@ -450,6 +461,36 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mega_kernel_e::rust_mega_type_rule_eval_17001,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_f::rust_run_type_inference,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_f::rust_unify_types, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_g::rust_flowbinder_run,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_h::rust_pluginhook_run,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_i::rust_protostruct_run,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_j::rust_importgraph_run,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_k::rust_diagformat_run,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_l::rust_dataxform_run, module)?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_m::rust_varcovar_run, module)?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_n::rust_matchpat_run, module)?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_o::rust_tdmerge_run, module)?)?;
+    module.add_function(wrap_pyfunction!(mega_kernel_p::rust_callproto_run, module)?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
