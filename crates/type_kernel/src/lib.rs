@@ -46,6 +46,7 @@ mod argmap;
 mod astwire;
 mod checker_algebra;
 mod checker_engine;
+mod checker_extra;
 mod checker_full;
 mod checkexpr_algebra;
 mod checkexpr_core;
@@ -388,6 +389,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_full::rust_full_checkexpr_eval_binop,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_extra::rust_extra_type_check_statement,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
