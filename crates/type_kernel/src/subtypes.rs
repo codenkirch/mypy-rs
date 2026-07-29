@@ -257,6 +257,9 @@ pub(crate) fn is_subtype(
     // for the common case (left=Instance, right=TypeVarType). The
     // protocol/TypeType branches are not reachable here (right is
     // TypeVarType, not those).
+    if let (Type::TypedDictType { .. }, Type::TypedDictType { .. }) = (left, right) {
+        return Some(left == right);
+    }
     if let Type::Instance { .. } = left {
         if let Type::TypeVarType { .. } = right {
             return Some(false);
@@ -1112,8 +1115,6 @@ mod tests {
 
     #[test]
     fn deleted_subtype_of_anything() {
-        // visit_deleted_type (subtypes.py:564): DeletedType is a
-        // subtype of everything.
         let r = make_resolver(vec![snap("a.A", "A")]);
         assert_eq!(
             is_subtype(
@@ -1122,6 +1123,29 @@ mod tests {
                 &ctx_strict_optional(true),
                 &r
             ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_subtyping_structure() {
+        let t1 = Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        let t2 = Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
             Some(true)
         );
     }

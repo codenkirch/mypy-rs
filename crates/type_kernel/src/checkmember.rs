@@ -49,9 +49,17 @@ mod tests {
 
     #[test]
     fn test_classify_member_access() {
-        assert_eq!(classify_member_access("foo", false, "Instance"), MemberAccessKind::Instance);
-        assert_eq!(classify_member_access("bar", false, "AnyType"), MemberAccessKind::Any);
-        assert_eq!(classify_member_access("", false, "Instance"), MemberAccessKind::Unsupported);
+        assert_eq!(
+            classify_member_access("foo", false, "Instance"),
+            MemberAccessKind::Instance
+        );
+        assert_eq!(
+            classify_member_access("bar", false, "AnyType"),
+            MemberAccessKind::Any
+        );
+        assert_eq!(
+            classify_member_access("", false, "Instance"),
+            MemberAccessKind::Unsupported
+        );
     }
 }
-
