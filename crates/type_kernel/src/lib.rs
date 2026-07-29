@@ -48,6 +48,7 @@ mod checker_algebra;
 mod checkexpr_algebra;
 mod checkexpr_core;
 mod checkexpr_engine;
+mod checkexpr_evaluator;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
@@ -67,6 +68,7 @@ mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
 mod semanal_core;
+mod semanal_pass;
 mod setops;
 mod subtypes;
 mod traverser;
@@ -353,6 +355,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_core::rust_check_overload_call_core,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_evaluator::rust_evaluate_binary_expression,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_pass::rust_run_semanal_pass_check,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

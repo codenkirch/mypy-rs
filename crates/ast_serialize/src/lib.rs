@@ -1,4 +1,5 @@
 pub mod nodes_codec;
+pub mod visitor_engine;
 
 use pyo3::exceptions::{PyNotImplementedError, PyUnicodeDecodeError};
 use pyo3::prelude::*;
