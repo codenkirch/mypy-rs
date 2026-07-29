@@ -62,6 +62,7 @@ mod nodes;
 mod operators;
 mod plugin_hooks;
 mod refs;
+mod semanal_algebra;
 mod setops;
 mod subtypes;
 mod traverser;
@@ -316,6 +317,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         traverser::rust_count_name_and_member_expressions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_algebra::rust_make_any_non_explicit,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_algebra::rust_make_any_non_unimported,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

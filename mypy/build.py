@@ -948,6 +948,12 @@ class BuildManager:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(self.options.native_type_kernel)
+        # Stage 15: gate the semanal Type-transformation helpers
+        # (make_any_non_explicit / make_any_non_unimported). Rust returns
+        # None on decode failure, falling back to Python.
+        from mypy.semanal import _set_native_semanal_active
+
+        _set_native_semanal_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
