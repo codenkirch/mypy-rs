@@ -82,6 +82,8 @@ mod typeinfo;
 mod typeops;
 mod types_codec;
 mod types_engine;
+mod ultra_engine_1;
+mod ultra_engine_2;
 mod visitor;
 mod wire;
 
@@ -393,6 +395,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checker_extra::rust_extra_type_check_statement,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        ultra_engine_1::rust_ultra_kernel_eval_1,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        ultra_engine_2::rust_ultra_kernel_eval_2501,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
