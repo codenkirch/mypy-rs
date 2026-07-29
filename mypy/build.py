@@ -978,10 +978,11 @@ class BuildManager:
         # Stage 9: gate standalone checker/checkexpr scalar-returning
         # helpers (no resolver needed). Type-returning helpers stay
         # parity-only (_native_checker_types_active).
-        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_check_call_active
         from mypy.checker import _set_native_checker_active
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
+        _set_native_check_call_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         # Stage 6c: gate apply_generic_arguments + has_no_typevars.
         # Resolver installed in _build_native_resolvers.
