@@ -46,6 +46,13 @@ def _install_native_resolvers_patch() -> None:
             {info.fullname: info for info in type_infos}
         )
 
+        try:
+            from mypy.errors import _set_native_errors_active
+
+            _set_native_errors_active(True)
+        except ImportError:
+            pass
+
         # Forward-compatible: install the MRO resolver if the Stage 5
         # shim is present (ships with B1 / PR #69). Wrapped so the
         # parity gate works on main before B1 merges.

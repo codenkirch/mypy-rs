@@ -46,6 +46,7 @@ mod argmap;
 mod checkexpr_functions;
 mod erase;
 mod erase_typevars;
+mod errors;
 mod expandtype;
 mod lkv;
 mod mro;
@@ -203,6 +204,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_is_typeddict_type_context,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors::rust_format_messages_default,
         module
     )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;

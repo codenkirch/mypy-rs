@@ -174,7 +174,7 @@ fn read_tag(buf: &mut ReadBuffer<'_>) -> Result<u8, WireError> {
 }
 
 /// Read a bool (1 byte: 0=False, 1=True, else Invalid). Mirrors `read_bool`.
-fn read_bool(buf: &mut ReadBuffer<'_>) -> Result<bool, WireError> {
+pub(crate) fn read_bool(buf: &mut ReadBuffer<'_>) -> Result<bool, WireError> {
     match buf.read_u8()? {
         0 => Ok(false),
         1 => Ok(true),
@@ -300,7 +300,7 @@ fn read_float_bare(buf: &mut ReadBuffer<'_>) -> Result<f64, WireError> {
 // ---------------------------------------------------------------------------
 
 /// `read_int`: tag byte must be `LITERAL_INT`, then bare int.
-fn read_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
+pub(crate) fn read_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
     let tag = read_tag(buf)?;
     if tag != LITERAL_INT {
         return Err(WireError::invalid(format!(
@@ -322,7 +322,7 @@ pub(crate) fn read_str(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
 }
 
 /// `read_str_opt`: `LITERAL_NONE` → None, else `LITERAL_STR` + bare str.
-fn read_str_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<String>, WireError> {
+pub(crate) fn read_str_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<String>, WireError> {
     let tag = read_tag(buf)?;
     if tag == LITERAL_NONE {
         return Ok(None);
@@ -336,7 +336,7 @@ fn read_str_opt(buf: &mut ReadBuffer<'_>) -> Result<Option<String>, WireError> {
 }
 
 /// `read_int_list`: `LIST_INT` tag, bare size, N bare ints.
-fn read_int_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<i64>, WireError> {
+pub(crate) fn read_int_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<i64>, WireError> {
     let tag = read_tag(buf)?;
     if tag != LIST_INT {
         return Err(WireError::invalid(format!(
@@ -1679,7 +1679,7 @@ fn write_tag(buf: &mut WriteBuffer, tag: u8) {
 }
 
 /// `write_bool`: 0 or 1.
-fn write_bool(buf: &mut WriteBuffer, value: bool) {
+pub(crate) fn write_bool(buf: &mut WriteBuffer, value: bool) {
     buf.push(if value { 1 } else { 0 });
 }
 
@@ -1749,7 +1749,7 @@ fn write_str_bare(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
 }
 
 /// `write_str`: tagged `LITERAL_STR` + bare str. Inverse of `read_str`.
-fn write_str(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
+pub(crate) fn write_str(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
     write_tag(buf, LITERAL_STR);
     write_str_bare(buf, s)
 }
@@ -1782,7 +1782,7 @@ fn write_type_map(buf: &mut WriteBuffer, items: &[(String, Type)]) -> Result<(),
 
 /// `write_str_opt`: `LITERAL_NONE` for None, else `write_str`. Inverse of
 /// `read_str_opt` (wire.rs:328-340).
-fn write_str_opt(buf: &mut WriteBuffer, value: Option<&str>) -> Result<(), WireError> {
+pub(crate) fn write_str_opt(buf: &mut WriteBuffer, value: Option<&str>) -> Result<(), WireError> {
     match value {
         Some(s) => write_str(buf, s),
         None => {
@@ -1793,7 +1793,7 @@ fn write_str_opt(buf: &mut WriteBuffer, value: Option<&str>) -> Result<(), WireE
 }
 
 /// `write_int`: tagged `LITERAL_INT` + bare int. Inverse of `read_int`.
-fn write_int(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
+pub(crate) fn write_int(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
     write_tag(buf, LITERAL_INT);
     write_int_bare(buf, value)
 }
@@ -1869,7 +1869,7 @@ fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireErro
 
 /// `write_int_list`: `LIST_INT` + bare size + N bare ints. Inverse of
 /// `read_int_list` (wire.rs:343-359). Used for `CallableType.arg_kinds`.
-fn write_int_list(buf: &mut WriteBuffer, items: &[i64]) -> Result<(), WireError> {
+pub(crate) fn write_int_list(buf: &mut WriteBuffer, items: &[i64]) -> Result<(), WireError> {
     write_tag(buf, LIST_INT);
     write_int_bare(buf, items.len() as i64)?;
     for &item in items {
