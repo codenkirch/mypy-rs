@@ -53,6 +53,7 @@ mod expandtype;
 mod lkv;
 mod messages;
 mod mro;
+mod nodes;
 mod operators;
 mod refs;
 mod setops;
@@ -222,6 +223,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkstrformat::rust_is_numeric_format_type,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(nodes::rust_is_builtin_type, module)?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
