@@ -487,12 +487,9 @@ fn parse_errors_to_py(
 ) -> PyResult<Vec<PyObject>> {
     let line_starts = line_starts(source);
 
-    // Ruff produces more specific syntax-error messages than CPython (e.g.
-    // "Simple statements must be separated by newlines or semicolons" vs
-    // CPython's "invalid syntax"). The strangler-fig contract requires the
-    // native parser to produce byte-identical output to the Python path,
-    // which uses CPython's SyntaxError.msg and offset. So when ruff reports
-    // syntax errors, re-parse with CPython's ast.parse to get its exact
+    // Ruff produces more specific syntax error messages than CPython.
+    // The strangler-fig contract requires byte-identical output to Python.
+    // Re-parse with CPython's ast.parse on ruff syntax errors to match.
     // message and location. Syntax errors are rare in production (users fix
     // them), so the double-parse cost is negligible.
     let cpython_error = cpython_syntax_error(py, source).ok();
@@ -511,9 +508,9 @@ fn parse_errors_to_py(
         let (line, column, message) = match &cpython_error {
             Some(cpe) => {
                 let line = cpe.lineno.unwrap_or(ruff_line_index as i64 + 1);
-                let column = cpe.offset.unwrap_or(
-                    (source[ruff_line_start..ruff_offset].chars().count() + 1) as i64,
-                );
+                let column = cpe
+                    .offset
+                    .unwrap_or((source[ruff_line_start..ruff_offset].chars().count() + 1) as i64);
                 (line, column, cpe.message.clone())
             }
             None => {
@@ -564,7 +561,11 @@ fn cpython_syntax_error(py: Python<'_>, source: &str) -> PyResult<CpythonSyntaxE
             let message: String = value.getattr("msg")?.extract()?;
             let lineno: Option<i64> = value.getattr("lineno").ok().and_then(|a| a.extract().ok());
             let offset: Option<i64> = value.getattr("offset").ok().and_then(|a| a.extract().ok());
-            Ok(CpythonSyntaxError { message, lineno, offset })
+            Ok(CpythonSyntaxError {
+                message,
+                lineno,
+                offset,
+            })
         }
         Err(err) => Err(err),
     }
@@ -1615,7 +1616,8 @@ fn serialize_with_stmt(serializer: &mut Serializer<'_>, with_stmt: &ast::StmtWit
     }
     serialize_block(serializer, &with_stmt.body, &loc)?;
     serializer.writer.bool(with_stmt.is_async);
-    // Type comment on the with-statement target (e.g. `with open(f) as d:  # type: io.TextIO`).
+    // Type comment on the with-statement target
+    // (e.g. `with open(f) as d:  # type: io.TextIO`).
     if let Some(type_comment) = serializer.type_comments.get(&loc.line).cloned() {
         let parsed_type = parse_expression(&type_comment)
             .map_err(to_parse_error)?

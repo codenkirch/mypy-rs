@@ -95,7 +95,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// Substitute TypeVar references in `typ` using `env`, mirroring
 /// `ExpandTypeVisitor`. Returns `None` for deferred cases (ParamSpec,
 /// TypeAliasType, Overloaded, etc.) so the caller falls through to Python.
-fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
+pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
     match typ {
         // Leaf types that carry no TypeVars: returned as-is.
         // (expandtype.py:189-211)
@@ -115,9 +115,8 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                 return Some(typ.clone());
             }
             let new_args = expand_type_tuple_with_unpack(args, env)?;
-            // builtins.tuple normalization (expandtype.py:228-237):
-            // Tuple[*Tuple[X, ...], ...] -> Tuple[X, ...]. When the single
-            // arg is an UnpackType wrapping a builtins.tuple Instance,
+            // Tuple[*Tuple[X, ...], ...] -> Tuple[X, ...].
+            // When single arg is UnpackType wrapping builtins.tuple,
             // unwrap to that Instance's args.
             let final_args = if type_ref == "builtins.tuple" && new_args.len() == 1 {
                 normalize_tuple_unpack(&new_args[0])
@@ -190,10 +189,9 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
             items,
             uses_pep604_syntax,
         } => {
-            // (expandtype.py:569-592) We expand each item and drop trivial
-            // bottom duplicates, but defer the full remove_trivial +
-            // make_union + get_proper_type simplification to Python when
-            // it would change the item set beyond simple expansion.
+            // Expand each item and drop trivial bottom duplicates.
+            // Defer full simplify to Python when item set changes beyond
+            // simple expansion.
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
                 new_items.push(expand_type(item, env)?);
@@ -230,10 +228,9 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
         } => {
             // (expandtype.py:534-554)
             let new_items = expand_type_list_with_unpack(items, env)?;
-            // Normalize Tuple[*Tuple[X, ...]] -> Tuple[X, ...]
-            // (expandtype.py:536-551). When the single resulting item is an
-            // UnpackType wrapping a builtins.tuple Instance, return that
-            // Instance instead.
+            // Normalize Tuple[*Tuple[X, ...]] -> Tuple[X, ...].
+            // When single resulting item is UnpackType wrapping builtins.tuple
+            // Instance, return that Instance instead.
             if new_items.len() == 1 {
                 if let Some(unpacked) = normalize_tuple_unpack_to_instance(&new_items[0]) {
                     return Some(unpacked);
@@ -303,10 +300,9 @@ fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
                     return None;
                 }
             }
-            // Python ExpandTypeVisitor.visit_callable_type (expandtype.py:676)
-            // only expands arg_types, ret_type, type_guard, type_is,
-            // instance_type. It does NOT expand fallback or variables
-            // (the declared type vars are definitions, not uses).
+            // ExpandTypeVisitor (expandtype.py:676) expands arg_types, ret_type,
+            // type_guard, type_is, instance_type. Does NOT expand fallback or
+            // variables (declared type vars are definitions).
             let new_instance_type = match instance_type {
                 Some(it) => Some(Box::new(expand_type(it, env)?)),
                 None => None,

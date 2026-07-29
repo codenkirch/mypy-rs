@@ -148,7 +148,7 @@ impl<'a> ReadBuffer<'a> {
     }
 
     /// Read 1 byte as a raw u8 (the `read_tag` primitive).
-    fn read_u8(&mut self) -> Result<u8, WireError> {
+    pub(crate) fn read_u8(&mut self) -> Result<u8, WireError> {
         self.ensure(1)?;
         let b = self.data[self.pos];
         self.pos += 1;
@@ -216,13 +216,9 @@ fn read_short_int(buf: &mut ReadBuffer<'_>, first: u8) -> Result<i64, WireError>
 /// then a short-int encoding `(size << 1) | sign`, then `size` bytes of
 /// little-endian unsigned magnitude.
 fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
-    // The LONG_INT_TRAILER byte is already consumed by the caller; the next
-    // byte is the short-int encoding of (size << 1) | sign.
-    //
-    // Note: the C reader (`read_int_internal`) extracts size/sign from the
-    // CPyTagged form (value << 1) that `_read_short_int` returns. Our
-    // `read_short_int` returns the raw value, so we extract directly:
-    //   sign = size_and_sign & 1
+    // Short-int encoding: (size << 1) | sign.
+    // read_short_int returns raw value, so we extract directly:
+    // sign = size_and_sign & 1
     //   size = size_and_sign >> 1
     let first = buf.read_u8()?;
     let size_and_sign = read_short_int(buf, first)?;
@@ -1052,7 +1048,8 @@ fn read_type_alias_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     Ok(Type::TypeAliasType { args, type_ref })
 }
 
-/// Assert the next byte is `END_TAG`. Mirrors the Python `assert read_tag(data) == END_TAG`.
+/// Assert the next byte is `END_TAG`.
+/// Mirrors Python `assert read_tag(data) == END_TAG`.
 fn expect_end_tag(buf: &mut ReadBuffer<'_>) -> Result<(), WireError> {
     let tag = read_tag(buf)?;
     if tag != END_TAG {
@@ -1667,7 +1664,7 @@ impl WriteBuffer {
         self.out
     }
 
-    fn push(&mut self, byte: u8) {
+    pub(crate) fn push(&mut self, byte: u8) {
         self.out.push(byte);
     }
 
@@ -1701,7 +1698,7 @@ fn write_bool(buf: &mut WriteBuffer, value: bool) {
 /// serializes i64 ints that fit the short-int range (TypeVarId.raw_id is
 /// tiny; Enum int values are small); we return `Err` for values outside
 /// i32 short-int range rather than silently truncate.
-fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
+pub(crate) fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
     if value >= MIN_ONE_BYTE_INT {
         let payload = (value - MIN_ONE_BYTE_INT) << 1;
         debug_assert!(payload <= 0x7F);
@@ -2320,7 +2317,8 @@ mod tests {
     // ----- End-to-end reader cases -----
 
     /// Build the bytes for `AnyType(TypeOfAny.special_form)` by hand.
-    /// Wire: ANY_TYPE(106), source_any=LITERAL_NONE(2), type_of_any=LITERAL_INT(3)+bare_int(0),
+    /// Wire: ANY_TYPE(106), source_any=LITERAL_NONE(2),
+    /// type_of_any=LITERAL_INT(3)+bare_int(0),
     /// missing_import_name=LITERAL_NONE(2), END_TAG(255).
     #[test]
     fn read_any_type_end_to_end() {
@@ -2388,7 +2386,8 @@ mod tests {
     /// Build the bytes for a generic `Instance("foo.Bar", [AnyType])`.
     /// Wire: INSTANCE(80), INSTANCE_GENERIC(82),
     ///   LITERAL_STR(4) + bare str "foo.Bar",
-    ///   LIST_GEN(20) + size=1 + ANY_TYPE(106) + LITERAL_NONE + LITERAL_INT+0 + LITERAL_NONE + END_TAG,
+    ///   LIST_GEN(20) + size=1 + ANY_TYPE(106) + LITERAL_NONE + LITERAL_INT+0
+    ///   + LITERAL_NONE + END_TAG,
     ///   LITERAL_NONE (no last_known_value),
     ///   LITERAL_NONE (no extra_attrs),
     ///   END_TAG(255).

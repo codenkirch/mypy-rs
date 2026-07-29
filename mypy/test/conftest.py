@@ -58,11 +58,9 @@ def _install_native_resolvers_patch() -> None:
         except ImportError:
             pass
 
-        # Forward-compatible: install the expand_type resolver if the
-        # Stage 3d shim is present (ships with B2). Gated behind a
-        # separate env var because the Rust expand_type port still has
-        # ~316 testcheck failures (unexpanded TypeVars). The parity
-        # CI gate does NOT set this var until those are resolved.
+        # Install expand_type resolver if Stage 3d shim is present.
+        # Gated behind env var because Rust expand_type port still has
+        # ~316 testcheck failures. Parity CI does not set this var.
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_EXPAND_RESOLVERS"):
             try:
                 from mypy.expandtype import (
@@ -140,6 +138,29 @@ def _install_native_resolvers_patch() -> None:
                 _set_native_checker_active(True)
                 if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKEXPR_TYPES"):
                     _set_native_checker_types_active(True)
+            except ImportError:
+                pass
+
+        # Stage 6c small pure modules batch (parity-only).
+        # apply_generic_arguments needs the resolver + typeinfo_map
+        # (shares the subtype/expand resolvers). has_no_typevars needs
+        # no resolver. Both gated behind the APPLYTYPE env var.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_APPLYTYPE"):
+            try:
+                from mypy.applytype import (
+                    _set_native_applytype_active,
+                    _set_native_applytype_resolver,
+                    _set_native_applytype_typeinfo_map,
+                )
+
+                _set_native_applytype_active(True)
+                _set_native_applytype_resolver(resolver)
+                _set_native_applytype_typeinfo_map(
+                    {info.fullname: info for info in type_infos}
+                )
+                from mypy.typevars import _set_native_typevars_active
+
+                _set_native_typevars_active(True)
             except ImportError:
                 pass
 
