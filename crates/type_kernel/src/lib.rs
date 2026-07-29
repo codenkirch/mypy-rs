@@ -46,10 +46,12 @@ mod argmap;
 mod astwire;
 mod checker_algebra;
 mod checker_engine;
+mod checker_full;
 mod checkexpr_algebra;
 mod checkexpr_core;
 mod checkexpr_engine;
 mod checkexpr_evaluator;
+mod checkexpr_full;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
@@ -69,6 +71,7 @@ mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
 mod semanal_core;
+mod semanal_full;
 mod semanal_pass;
 mod setops;
 mod subtypes;
@@ -373,6 +376,18 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checker_engine::rust_checker_engine_evaluate_binop,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_full::rust_full_type_check_statement,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_full::rust_full_semanal_analyze_symbol,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_full::rust_full_checkexpr_eval_binop,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

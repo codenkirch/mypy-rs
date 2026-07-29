@@ -1,5 +1,6 @@
 pub mod full_ast_codec;
 pub mod nodes_codec;
+pub mod nodes_full;
 pub mod visitor_engine;
 
 use pyo3::exceptions::{PyNotImplementedError, PyUnicodeDecodeError};
