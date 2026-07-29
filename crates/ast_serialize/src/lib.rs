@@ -3721,4 +3721,13 @@ b = []  # type: list[str]  # trailing comment
         assert_eq!(type_comments.get(&8).unwrap(), "list[int]");
         assert_eq!(type_comments.get(&9).unwrap(), "list[str]");
     }
+
+    #[test]
+    fn test_ast_tags_defined() {
+        assert_eq!(EXPR_STMT, 160);
+        assert_eq!(CALL_EXPR, 161);
+        assert_eq!(NAME_EXPR, 162);
+        assert_eq!(STR_EXPR, 163);
+        assert_eq!(RETURN_STMT, 175);
+    }
 }
