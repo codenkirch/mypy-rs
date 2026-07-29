@@ -542,3 +542,21 @@ mod tests {
         assert!(matches!(result, Type::UninhabitedType));
     }
 }
+
+#[pyfunction]
+pub fn rust_clean_up_type_aliases(type_name: &str) -> String {
+    type_name.trim().to_string()
+}
+
+#[cfg(test)]
+mod phase4_tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_up_type_aliases() {
+        assert_eq!(
+            rust_clean_up_type_aliases("  builtins.int  "),
+            "builtins.int"
+        );
+    }
+}

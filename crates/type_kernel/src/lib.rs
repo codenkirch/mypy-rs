@@ -341,6 +341,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_engine::rust_infer_binary_op_simple,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_algebra::rust_clean_up_type_aliases,
+        module
+    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
