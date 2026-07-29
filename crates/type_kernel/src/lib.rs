@@ -44,45 +44,22 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
-mod build_engine;
 mod checker_algebra;
 mod checker_engine;
-mod checker_extra;
-mod checker_full;
 mod checkexpr_algebra;
 mod checkexpr_core;
 mod checkexpr_engine;
 mod checkexpr_evaluator;
-mod checkexpr_full;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
 mod checkstrformat;
-mod constraint_solver;
 mod constraints;
-mod diagnostics_engine;
 mod erase;
 mod erase_typevars;
 mod errors;
 mod expandtype;
-mod incremental_engine;
 mod lkv;
-mod mega_kernel_a;
-mod mega_kernel_b;
-mod mega_kernel_c;
-mod mega_kernel_d;
-mod mega_kernel_e;
-mod mega_kernel_f;
-mod mega_kernel_g;
-mod mega_kernel_h;
-mod mega_kernel_i;
-mod mega_kernel_j;
-mod mega_kernel_k;
-mod mega_kernel_l;
-mod mega_kernel_m;
-mod mega_kernel_n;
-mod mega_kernel_o;
-mod mega_kernel_p;
 mod messages;
 mod mro;
 mod mypyc_port;
@@ -92,7 +69,6 @@ mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
 mod semanal_core;
-mod semanal_full;
 mod semanal_pass;
 mod setops;
 mod subtypes;
@@ -102,8 +78,6 @@ mod typeinfo;
 mod typeops;
 mod types_codec;
 mod types_engine;
-mod ultra_engine_1;
-mod ultra_engine_2;
 mod visitor;
 mod wire;
 
@@ -401,96 +375,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_engine::rust_checker_engine_evaluate_binop,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(
-        checker_full::rust_full_type_check_statement,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        semanal_full::rust_full_semanal_analyze_symbol,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_full::rust_full_checkexpr_eval_binop,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checker_extra::rust_extra_type_check_statement,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        ultra_engine_1::rust_ultra_kernel_eval_1,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        ultra_engine_2::rust_ultra_kernel_eval_2501,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        build_engine::rust_build_engine_process_module,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        diagnostics_engine::rust_diagnostics_render,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        constraint_solver::rust_constraint_solve,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        incremental_engine::rust_incremental_check_dep,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_a::rust_mega_type_rule_eval_1,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_b::rust_mega_type_rule_eval_3501,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_c::rust_mega_type_rule_eval_7001,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_d::rust_mega_type_rule_eval_12001,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_e::rust_mega_type_rule_eval_17001,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_f::rust_run_type_inference,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_f::rust_unify_types, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_g::rust_flowbinder_run,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_h::rust_pluginhook_run,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_i::rust_protostruct_run,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_j::rust_importgraph_run,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mega_kernel_k::rust_diagformat_run,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_l::rust_dataxform_run, module)?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_m::rust_varcovar_run, module)?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_n::rust_matchpat_run, module)?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_o::rust_tdmerge_run, module)?)?;
-    module.add_function(wrap_pyfunction!(mega_kernel_p::rust_callproto_run, module)?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
