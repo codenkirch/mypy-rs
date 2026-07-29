@@ -5,7 +5,7 @@
 //! - Container literal element type joining
 //! - Call expression dispatch logic
 
-use crate::wire::{LiteralValue, Type};
+use crate::wire::Type;
 use pyo3::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

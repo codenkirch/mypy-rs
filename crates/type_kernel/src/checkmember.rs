@@ -21,7 +21,7 @@ pub fn rust_analyze_member_access(name: &str, is_lvalue: bool) -> bool {
     !name.is_empty() && !is_lvalue
 }
 
-pub fn classify_member_access(name: &str, is_lvalue: bool, type_kind: &str) -> MemberAccessKind {
+pub fn classify_member_access(name: &str, _is_lvalue: bool, type_kind: &str) -> MemberAccessKind {
     if name.is_empty() {
         return MemberAccessKind::Unsupported;
     }
