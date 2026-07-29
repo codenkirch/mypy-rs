@@ -76,8 +76,8 @@ pub fn rust_format_messages_default(
         };
 
         if !hide_error_codes {
-            if let Some(c) = code {
-                if severity != "note" {
+            if let Some(c) = &code {
+                if severity != "note" || c == "annotation-unchecked" || c == "deprecated" {
                     s.push_str(&format!("  [{}]", c));
                 }
             }
