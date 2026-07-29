@@ -125,6 +125,18 @@ DUMMY_FIELD_NAME: Final = "__dummy_name__"
 NUMERIC_TYPES_OLD: Final = {"d", "i", "o", "u", "x", "X", "e", "E", "f", "F", "g", "G"}
 NUMERIC_TYPES_NEW: Final = {"b", "d", "o", "e", "E", "f", "F", "g", "G", "n", "x", "X", "%"}
 
+
+def is_numeric_format_type(conv_type: str, is_new_style: bool) -> bool:
+    try:
+        import type_kernel as _type_kernel
+
+        return _type_kernel.rust_is_numeric_format_type(conv_type, is_new_style)
+    except (ImportError, AttributeError):
+        pass
+    if is_new_style:
+        return conv_type in NUMERIC_TYPES_NEW
+    return conv_type in NUMERIC_TYPES_OLD
+
 # These types accept _only_ int.
 REQUIRE_INT_OLD: Final = {"o", "x", "X"}
 REQUIRE_INT_NEW: Final = {"b", "d", "o", "x", "X"}

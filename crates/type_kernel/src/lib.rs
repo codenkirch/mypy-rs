@@ -44,6 +44,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod checkexpr_functions;
+mod checkstrformat;
 mod constraints;
 mod erase;
 mod erase_typevars;
@@ -217,6 +218,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkstrformat::rust_is_numeric_format_type,
+        module
+    )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
