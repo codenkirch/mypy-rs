@@ -156,7 +156,7 @@ impl<'a> ReadBuffer<'a> {
     }
 
     /// Read `n` bytes as a slice (advances cursor; caller does not copy).
-    fn read_slice(&mut self, n: usize) -> Result<&'a [u8], WireError> {
+    pub(crate) fn read_slice(&mut self, n: usize) -> Result<&'a [u8], WireError> {
         self.ensure(n)?;
         let s = &self.data[self.pos..self.pos + n];
         self.pos += n;
@@ -1668,7 +1668,7 @@ impl WriteBuffer {
         self.out.push(byte);
     }
 
-    fn extend(&mut self, bytes: &[u8]) {
+    pub(crate) fn extend(&mut self, bytes: &[u8]) {
         self.out.extend_from_slice(bytes);
     }
 }

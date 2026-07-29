@@ -47,6 +47,13 @@ def _install_native_resolvers_patch() -> None:
         )
 
         try:
+            from mypy.constraints import _set_native_constraints_active
+
+            _set_native_constraints_active(True)
+        except ImportError:
+            pass
+
+        try:
             from mypy.errors import _set_native_errors_active
 
             _set_native_errors_active(True)
