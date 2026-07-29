@@ -46,6 +46,7 @@ mod argmap;
 mod astwire;
 mod checker_algebra;
 mod checkexpr_algebra;
+mod checkexpr_core;
 mod checkexpr_engine;
 mod checkexpr_functions;
 mod checkmember;
@@ -65,6 +66,7 @@ mod operators;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
+mod semanal_core;
 mod setops;
 mod subtypes;
 mod traverser;
@@ -343,6 +345,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_algebra::rust_clean_up_type_aliases,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_core::rust_analyze_symbol_table_entry,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_core::rust_check_overload_call_core,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

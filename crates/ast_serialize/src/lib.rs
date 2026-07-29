@@ -1,3 +1,5 @@
+pub mod nodes_codec;
+
 use pyo3::exceptions::{PyNotImplementedError, PyUnicodeDecodeError};
 use pyo3::prelude::*;
 use ruff_python_ast::{self as ast, token::TokenKind, AnyParameterRef, ArgOrKeyword, PySourceType};
