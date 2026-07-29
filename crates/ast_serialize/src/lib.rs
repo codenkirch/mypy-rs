@@ -1,3 +1,4 @@
+pub mod full_ast_codec;
 pub mod nodes_codec;
 pub mod visitor_engine;
 

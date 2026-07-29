@@ -45,6 +45,7 @@ mod applytype;
 mod argmap;
 mod astwire;
 mod checker_algebra;
+mod checker_engine;
 mod checkexpr_algebra;
 mod checkexpr_core;
 mod checkexpr_engine;
@@ -76,6 +77,7 @@ mod typeanal;
 mod typeinfo;
 mod typeops;
 mod types_codec;
+mod types_engine;
 mod visitor;
 mod wire;
 
@@ -363,6 +365,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_pass::rust_run_semanal_pass_check,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_engine::rust_types_engine_classify_tag,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_engine::rust_checker_engine_evaluate_binop,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
