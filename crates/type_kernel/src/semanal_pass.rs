@@ -1,9 +1,11 @@
-//! Semantic Analysis Symbol Binder & Pass Engine (Phase 6, Module 3) for Issue #136.
+//! Semantic Analysis Symbol Binder & Pass Engine (Phase 6, #136).
 //!
-//! Implements semantic analysis pass routines, symbol binding validation, and scope analysis.
+//! Implements semantic analysis pass routines, symbol binding
+//! validation, and scope analysis.
 
 use pyo3::prelude::*;
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanalPassKind {
     FirstPass,

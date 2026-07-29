@@ -40,6 +40,10 @@
 //! See `docs/rust-migration-strangler.md` ("Milestone 3/4/5 (Phase 4)") for the
 //! full staging roadmap.
 
+// Scaffolding modules for the upcoming check_call port (#147)
+// define structs/enums not yet wired into pyfunctions.
+#![allow(dead_code)]
+
 mod aliases;
 mod applytype;
 mod argmap;
