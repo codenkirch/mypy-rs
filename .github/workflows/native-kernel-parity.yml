@@ -79,3 +79,54 @@ jobs:
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow"
+
+  parity-expand:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-parity-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-parity-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: Build type_kernel extension
+        run: |
+          SCRATCH=/tmp/type-kernel-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-type-kernel --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Parity testcheck (expand resolvers installed)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_EXPAND_RESOLVERS: "1"
+        run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow"
