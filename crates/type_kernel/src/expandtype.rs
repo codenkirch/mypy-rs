@@ -185,55 +185,51 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             }
         }
 
-        Type::UnionType {
-            items,
-            uses_pep604_syntax,
-        } => {
-            // Expand each item and drop trivial bottom duplicates.
-            // Defer full simplify to Python when item set changes beyond
-            // simple expansion.
-            let mut new_items = Vec::with_capacity(items.len());
-            for item in items {
-                new_items.push(expand_type(item, env)?);
-            }
-            Some(Type::UnionType {
-                items: new_items,
-                uses_pep604_syntax: *uses_pep604_syntax,
-            })
-        }
+        // UnionType: Python calls make_union(remove_trivial(flatten_nested_unions(expanded)))
+        // then get_proper_type, which can collapse single-item unions, deduplicate, and
+        // resolve aliases. Rust cannot replicate this without porting the full
+        // simplification pipeline, so defer to Python to avoid wrong results.
+        Type::UnionType { .. } => None,
 
-        Type::TypeType { item, is_type_form } => {
-            // (expandtype.py:597-602)
-            let new_item = expand_type(item, env)?;
-            Some(Type::TypeType {
-                item: Box::new(new_item),
-                is_type_form: *is_type_form,
-            })
-        }
+        // TypeType: Python calls TypeType.make_normalized(item), which unwraps
+        // nested TypeType and distributes over unions. Defer to Python.
+        Type::TypeType { .. } => None,
 
-        Type::LiteralType { fallback, value } => {
-            // (expandtype.py:565-567) Expand the fallback if it has type
-            // vars (i.e. is a generic Instance).
-            let new_fallback = expand_type(fallback, env)?;
-            Some(Type::LiteralType {
-                fallback: Box::new(new_fallback),
-                value: value.clone(),
-            })
-        }
+        // LiteralType: Python's visit_literal_type returns t as-is
+        // (expandtype.py:751-753). Do not expand the fallback.
+        Type::LiteralType { .. } => Some(typ.clone()),
 
         Type::TupleType {
             partial_fallback,
             items,
             implicit,
         } => {
-            // (expandtype.py:534-554)
+            // (expandtype.py:720-740)
             let new_items = expand_type_list_with_unpack(items, env)?;
             // Normalize Tuple[*Tuple[X, ...]] -> Tuple[X, ...].
-            // When single resulting item is UnpackType wrapping builtins.tuple
-            // Instance, return that Instance instead.
             if new_items.len() == 1 {
-                if let Some(unpacked) = normalize_tuple_unpack_to_instance(&new_items[0]) {
-                    return Some(unpacked);
+                if let Type::UnpackType { typ: inner } = &new_items[0] {
+                    // Python checks: not (TypeAliasType and is_recursive).
+                    // Rust defers TypeAliasType entirely, so inner is never
+                    // a TypeAliasType here.
+                    let unpacked = inner.as_ref();
+                    if let Type::Instance { type_ref, .. } = unpacked {
+                        if type_ref == "builtins.tuple" {
+                            // If partial_fallback is NOT builtins.tuple
+                            // (named tuple), preserve the fallback.
+                            let fb_is_tuple = matches!(
+                                partial_fallback.as_ref(),
+                                Type::Instance { type_ref: fb_ref, .. } if fb_ref == "builtins.tuple"
+                            );
+                            if fb_is_tuple {
+                                return Some(unpacked.clone());
+                            }
+                            // Named tuple: return expanded fallback.
+                            return expand_type(partial_fallback, env);
+                        }
+                        // unpacked is not builtins.tuple: return fallback.
+                        return expand_type(partial_fallback, env);
+                    }
                 }
             }
             let new_fallback = expand_type(partial_fallback, env)?;
