@@ -954,6 +954,42 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_active
 
         _set_native_semanal_active(self.options.native_type_kernel)
+        # Stage 4c: gate erase_typevars (no resolver needed).
+        from mypy.erasetype import _set_native_erase_typevars_active
+
+        _set_native_erase_typevars_active(self.options.native_type_kernel)
+        # Stage 4b: gate constraint solver helpers (no resolver needed).
+        from mypy.constraints import _set_native_constraints_active
+
+        _set_native_constraints_active(self.options.native_type_kernel)
+        # Stage 8b: gate error collection helpers (no resolver needed).
+        from mypy.errors import _set_native_errors_active
+
+        _set_native_errors_active(self.options.native_type_kernel)
+        # Stage 7: gate visitor scalar-returning functions (no resolver
+        # needed). Type-returning functions stay parity-only (truthiness
+        # flag loss on wire round-trip).
+        from mypy.types import _set_native_visitor_active
+
+        _set_native_visitor_active(self.options.native_type_kernel)
+        from mypy.copytype import _set_native_copy_active
+
+        _set_native_copy_active(self.options.native_type_kernel)
+        # Stage 9: gate standalone checker/checkexpr scalar-returning
+        # helpers (no resolver needed). Type-returning helpers stay
+        # parity-only (_native_checker_types_active).
+        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checkexpr_active(self.options.native_type_kernel)
+        _set_native_checker_active(self.options.native_type_kernel)
+        # Stage 6c: gate apply_generic_arguments + has_no_typevars.
+        # Resolver installed in _build_native_resolvers.
+        from mypy.applytype import _set_native_applytype_active
+        from mypy.typevars import _set_native_typevars_active
+
+        _set_native_applytype_active(self.options.native_type_kernel)
+        _set_native_typevars_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
@@ -1157,6 +1193,14 @@ class BuildManager:
         # MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS=1.
         # from mypy.typeops import _set_native_typeops_resolver
         # _set_native_typeops_resolver(resolver)
+        # Stage 6c: applytype shares the subtype/expand resolvers.
+        from mypy.applytype import (
+            _set_native_applytype_resolver,
+            _set_native_applytype_typeinfo_map,
+        )
+
+        _set_native_applytype_resolver(resolver)
+        _set_native_applytype_typeinfo_map(typeinfo_map)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
