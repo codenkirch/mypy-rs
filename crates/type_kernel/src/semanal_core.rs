@@ -2,8 +2,8 @@
 //!
 //! Implements native symbol table representation, scope tracking, and semantic passes.
 
-use std::collections::HashMap;
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SymbolKind {
