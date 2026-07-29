@@ -2072,9 +2072,7 @@ mod tests {
         // One found module, one not-found, one found under a different name:
         // the batched call must return one result per id in input order,
         // matching what `resolve` would return for each id individually.
-        let f = fs()
-            .file("/lib/pkg1/a.py", "")
-            .file("/lib/pkg1/c.py", "");
+        let f = fs().file("/lib/pkg1/a.py", "").file("/lib/pkg1/c.py", "");
         let res = resolve_many(
             &f,
             &[("a", false), ("missing", false), ("c", false)],
@@ -2102,12 +2100,7 @@ mod tests {
             .file("/lib/pkg/__init__.py", "")
             .file("/lib/pkg/a.py", "")
             .file("/lib/pkg/b.py", "");
-        let res = resolve_many(
-            &f,
-            &[("pkg.a", false), ("pkg.b", false)],
-            &["/lib"],
-            false,
-        );
+        let res = resolve_many(&f, &[("pkg.a", false), ("pkg.b", false)], &["/lib"], false);
         assert_eq!(res.len(), 2);
         assert_eq!(res[0].0, FOUND);
         assert_eq!(res[0].1.as_deref(), Some("/lib/pkg/a.py"));
@@ -2128,8 +2121,10 @@ mod tests {
         let flat = BTreeSet::<String>::new();
         let ns_map = BTreeMap::<String, String>::new();
         let stdlib_map = HashMap::<String, ((u8, u8), Option<(u8, u8)>)>::new();
-        let input: Vec<(String, bool)> =
-            vec![("untyped".to_string(), false), ("untyped".to_string(), true)];
+        let input: Vec<(String, bool)> = vec![
+            ("untyped".to_string(), false),
+            ("untyped".to_string(), true),
+        ];
         let ic = TestRefCell::new(HashMap::new());
         let ns_anc = TestRefCell::new(HashMap::new());
         let res = resolve_many_with(

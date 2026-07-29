@@ -511,9 +511,9 @@ fn parse_errors_to_py(
         let (line, column, message) = match &cpython_error {
             Some(cpe) => {
                 let line = cpe.lineno.unwrap_or(ruff_line_index as i64 + 1);
-                let column = cpe.offset.unwrap_or(
-                    (source[ruff_line_start..ruff_offset].chars().count() + 1) as i64,
-                );
+                let column = cpe
+                    .offset
+                    .unwrap_or((source[ruff_line_start..ruff_offset].chars().count() + 1) as i64);
                 (line, column, cpe.message.clone())
             }
             None => {
@@ -564,7 +564,11 @@ fn cpython_syntax_error(py: Python<'_>, source: &str) -> PyResult<CpythonSyntaxE
             let message: String = value.getattr("msg")?.extract()?;
             let lineno: Option<i64> = value.getattr("lineno").ok().and_then(|a| a.extract().ok());
             let offset: Option<i64> = value.getattr("offset").ok().and_then(|a| a.extract().ok());
-            Ok(CpythonSyntaxError { message, lineno, offset })
+            Ok(CpythonSyntaxError {
+                message,
+                lineno,
+                offset,
+            })
         }
         Err(err) => Err(err),
     }

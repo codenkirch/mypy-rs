@@ -19,6 +19,22 @@ from librt.internal import (
 )
 
 from mypy import errorcodes as codes
+
+try:
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _HAS_TYPE_KERNEL = False
+
+_native_errors_active: bool = False
+
+
+def _set_native_errors_active(active: bool) -> None:
+    global _native_errors_active
+    _native_errors_active = active
+
+
 from mypy.cache import (
     ErrorTuple,
     read_int,
@@ -1027,6 +1043,16 @@ class Errors:
         is True also append a relevant trimmed source code line (only for
         severity 'error').
         """
+        if _HAS_TYPE_KERNEL and _native_errors_active and not self.options.pretty:
+            try:
+                return _type_kernel.rust_format_messages_default(
+                    error_tuples,
+                    self.options.show_column_numbers,
+                    self.options.show_error_end,
+                    self.hide_error_codes,
+                )
+            except (NotImplementedError, AssertionError):
+                pass
         a: list[str] = []
         for file, line, column, end_line, end_column, severity, message, code in error_tuples:
             s = ""
