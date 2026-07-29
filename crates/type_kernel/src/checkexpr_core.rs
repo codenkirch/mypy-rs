@@ -2,8 +2,9 @@
 //!
 //! Implements core expression evaluation, call argument matching, and overload resolution.
 
+#![allow(dead_code)]
+
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallArgumentKind {
@@ -57,7 +58,7 @@ impl OverloadResolutionEngine {
         self.alternatives.push(alt_type_ref.to_string());
     }
 
-    pub fn select_best_match(&self, args: &[CallArgument]) -> Option<usize> {
+    pub fn select_best_match(&self, _args: &[CallArgument]) -> Option<usize> {
         if self.alternatives.is_empty() {
             None
         } else {
@@ -69,12 +70,10 @@ impl OverloadResolutionEngine {
 
 #[pyfunction]
 pub fn rust_check_overload_call_core(callee_name: &str, arg_count: usize) -> Option<usize> {
-    if arg_count == 0 && !callee_name.is_empty() {
-        Some(0)
-    } else if arg_count > 0 {
-        Some(0)
-    } else {
+    if arg_count == 0 && callee_name.is_empty() {
         None
+    } else {
+        Some(0)
     }
 }
 
