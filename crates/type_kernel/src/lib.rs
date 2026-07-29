@@ -43,6 +43,7 @@
 mod aliases;
 mod applytype;
 mod argmap;
+mod astwire;
 mod checker_algebra;
 mod checkexpr_algebra;
 mod checkexpr_functions;
@@ -63,6 +64,7 @@ mod plugin_hooks;
 mod refs;
 mod setops;
 mod subtypes;
+mod traverser;
 mod typeanal;
 mod typeinfo;
 mod typeops;
@@ -282,6 +284,38 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_algebra::rust_all_same_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_has_return_statement,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_has_str_expression,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_has_yield_expression,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_has_yield_from_expression,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_has_await_expression,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_return_statements,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_yield_expressions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_name_and_member_expressions,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

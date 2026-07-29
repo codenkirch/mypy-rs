@@ -112,7 +112,7 @@ pub(crate) enum WireError {
 }
 
 impl WireError {
-    fn invalid(msg: impl Into<String>) -> Self {
+    pub(crate) fn invalid(msg: impl Into<String>) -> Self {
         WireError::Invalid(msg.into())
     }
 }
@@ -169,7 +169,7 @@ impl<'a> ReadBuffer<'a> {
 // ---------------------------------------------------------------------------
 
 /// Read a tag byte (1 byte u8). Mirrors `read_tag`.
-fn read_tag(buf: &mut ReadBuffer<'_>) -> Result<u8, WireError> {
+pub(crate) fn read_tag(buf: &mut ReadBuffer<'_>) -> Result<u8, WireError> {
     buf.read_u8()
 }
 
