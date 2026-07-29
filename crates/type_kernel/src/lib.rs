@@ -43,6 +43,7 @@
 mod aliases;
 mod applytype;
 mod argmap;
+mod checker_algebra;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
@@ -242,6 +243,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         types_codec::rust_is_valid_type_codec_tag,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_algebra::rust_is_type_overlap,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
