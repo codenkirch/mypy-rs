@@ -44,6 +44,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod checker_algebra;
+mod checkexpr_algebra;
 mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
@@ -267,6 +268,22 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(typeanal::rust_unknown_unpack, module)?)?;
     module.add_function(wrap_pyfunction!(typeanal::rust_find_self_type, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_algebra::rust_allow_fast_container_literal,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_algebra::rust_has_erased_component,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_algebra::rust_replace_callable_return_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_algebra::rust_all_same_types,
+        module
+    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
