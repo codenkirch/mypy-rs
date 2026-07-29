@@ -44,6 +44,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
+mod build_engine;
 mod checker_algebra;
 mod checker_engine;
 mod checker_extra;
@@ -57,11 +58,14 @@ mod checkexpr_functions;
 mod checkmember;
 mod checkpattern;
 mod checkstrformat;
+mod constraint_solver;
 mod constraints;
+mod diagnostics_engine;
 mod erase;
 mod erase_typevars;
 mod errors;
 mod expandtype;
+mod incremental_engine;
 mod lkv;
 mod messages;
 mod mro;
@@ -403,6 +407,22 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         ultra_engine_2::rust_ultra_kernel_eval_2501,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        build_engine::rust_build_engine_process_module,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        diagnostics_engine::rust_diagnostics_render,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraint_solver::rust_constraint_solve,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        incremental_engine::rust_incremental_check_dep,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
