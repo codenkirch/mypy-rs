@@ -246,13 +246,28 @@ except ImportError:
     _checkexpr_read_type = None  # type: ignore[assignment]
     _CHECKEXPR_HAS_TYPE_KERNEL = False
 
+try:
+    from type_kernel import rust_check_call_fast_path as _rust_check_call_fast_path
+
+    _HAS_CHECK_CALL_KERNEL = True
+except ImportError:
+    _rust_check_call_fast_path = None  # type: ignore[assignment]
+    _HAS_CHECK_CALL_KERNEL = False
+
 _native_checkexpr_active: bool = False
+_native_check_call_active: bool = False
 
 
 def _set_native_checkexpr_active(active: bool) -> None:
-    """Enable/disable the Rust checkexpr path (parity-only)."""
+    """Called by build manager to enable/disable native checkexpr helpers."""
     global _native_checkexpr_active
     _native_checkexpr_active = active
+
+
+def _set_native_check_call_active(active: bool) -> None:
+    """Called by build manager to enable/disable native check_call fast-path."""
+    global _native_check_call_active
+    _native_check_call_active = active
 
 
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
@@ -1627,6 +1642,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 on which the method is being called
         """
         callee = get_proper_type(callee)
+
+        if _HAS_CHECK_CALL_KERNEL and _native_check_call_active:
+            has_star = any(k.is_star() for k in arg_kinds)
+            n_named = sum(1 for k in arg_kinds if k.is_named())
+            n_pos = sum(1 for k in arg_kinds if k == nodes.ARG_POS)
+            callee_bytes = _serialize_type_for_checkexpr(callee)
+            _rust_check_call_fast_path(callee_bytes, n_pos, n_named, has_star)
 
         if isinstance(callee, CallableType):
             if callee.variables:

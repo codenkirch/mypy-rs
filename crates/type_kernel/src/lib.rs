@@ -48,6 +48,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
+mod checkcall;
 mod checker_algebra;
 mod checker_engine;
 mod checkexpr_algebra;
@@ -381,5 +382,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
+    module.add_function(wrap_pyfunction!(
+        checkcall::rust_check_call_fast_path,
+        module
+    )?)?;
     Ok(())
 }
