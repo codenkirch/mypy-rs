@@ -44,6 +44,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod checkexpr_functions;
+mod checkmember;
 mod checkstrformat;
 mod constraints;
 mod erase;
@@ -224,6 +225,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(nodes::rust_is_builtin_type, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_member_access,
+        module
+    )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
