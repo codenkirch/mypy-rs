@@ -954,6 +954,12 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_active
 
         _set_native_semanal_active(self.options.native_type_kernel)
+        from mypy.erasetype import _set_native_erase_typevars_active
+
+        _set_native_erase_typevars_active(self.options.native_type_kernel)
+        from mypy.constraints import _set_native_constraints_active
+
+        _set_native_constraints_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
