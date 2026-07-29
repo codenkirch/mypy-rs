@@ -101,11 +101,12 @@ from mypy.visitor import NodeVisitor
 
 # ---------------------------------------------------------------------------
 # Stage 14: native traverser shims (parity-only).
-#
+
 # Routes has_return_statement, has_str_expression, has_yield_expression,
 # has_yield_from_expression, has_await_expression through the AST wire-format
-# (mypy/astwire.py) into the Rust type_kernel extension. Rust traverses the
-# serialized tree; falls back to the pure-Python seeker on any error.
+# (mypy/astwire.py) into the Rust type_kernel extension.
+
+# Rust traverses the serialized tree; falls back to pure-Python on error.
 try:
     from type_kernel import rust_has_return_statement as _rust_has_return_statement
     from type_kernel import rust_has_str_expression as _rust_has_str_expression
@@ -133,7 +134,7 @@ def _serialize_ast_node(node: Node) -> bytes:
     """Serialize a node for the Rust traverser (returns bytes)."""
     buf = _AstWriteBuffer()
     _ast_serialize_node(node, buf)
-    return bytes(buf.getvalue())
+    return buf.getvalue()
 
 
 @trait
@@ -997,7 +998,7 @@ def has_return_statement(fdef: FuncBase) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_return_statement(_serialize_ast_node(fdef))
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, RecursionError):
             pass
     seeker = ReturnSeeker()
     fdef.accept(seeker)
@@ -1037,7 +1038,7 @@ def has_str_expression(node: Expression) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_str_expression(_serialize_ast_node(node))
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, RecursionError):
             pass
     v = StringSeeker()
     node.accept(v)
@@ -1068,7 +1069,7 @@ def has_yield_expression(fdef: FuncBase) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_yield_expression(_serialize_ast_node(fdef))
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, RecursionError):
             pass
     seeker = YieldSeeker()
     fdef.accept(seeker)
@@ -1088,7 +1089,7 @@ def has_yield_from_expression(fdef: FuncBase) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_yield_from_expression(_serialize_ast_node(fdef))
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, RecursionError):
             pass
     seeker = YieldFromSeeker()
     fdef.accept(seeker)
@@ -1108,7 +1109,7 @@ def has_await_expression(expr: Expression) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_await_expression(_serialize_ast_node(expr))
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, RecursionError):
             pass
     seeker = AwaitSeeker()
     expr.accept(seeker)

@@ -164,50 +164,70 @@ def _get_all_slots(cls: type) -> list[str]:
 
 
 def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
-    """Serialize a node into ``buf`` as tag + child fields."""
+    """Serialize a node into ``buf`` as tag + child fields (iterative).
+
+    Uses an explicit task stack instead of recursion so that deeply nested
+    ASTs don't hit Python's recursion limit.
+    """
     if node is None:
         write_tag(buf, LITERAL_NONE)
         return
 
-    cls = type(node)
-    tag = _NODE_TAGS.get(cls)
-    if tag is None:
-        # Unknown node type — write LITERAL_NONE so the Rust side defers.
-        write_tag(buf, LITERAL_NONE)
-        return
-
-    write_tag(buf, tag)
-    slots = _get_all_slots(cls)
-
-    # Collect child fields (Node or list-of-Node).
-    child_fields: list = []
-    for slot in slots:
-        value = getattr(node, slot, None)
-        if value is None:
-            child_fields.append(None)
-        elif isinstance(value, nodes.Node):
-            child_fields.append(value)
-        elif isinstance(value, (list, tuple)):
-            # Only serialize if all items are Nodes (or None).
-            items = list(value)
-            if all(isinstance(item, (nodes.Node, type(None))) for item in items) and len(items) > 0:
-                child_fields.append(items)
-            else:
-                child_fields.append(None)
-        else:
-            # Scalar field — skip.
-            child_fields.append(None)
-
-    # Write child count + children.
-    write_int_bare(buf, len(child_fields))
-    for field in child_fields:
-        if field is None:
+    # Task stack: ("end",), ("none",), ("list", items), ("node", node)
+    stack: list = [("node", node)]
+    while stack:
+        task = stack.pop()
+        kind = task[0]
+        if kind == "end":
+            write_tag(buf, END_TAG)
+        elif kind == "none":
             write_tag(buf, LITERAL_NONE)
-        elif isinstance(field, nodes.Node):
-            serialize_node(field, buf)
-        elif isinstance(field, list):
+        elif kind == "list":
+            items = task[1]
             write_tag(buf, LIST_GEN)
-            write_int_bare(buf, len(field))
-            for item in field:
-                serialize_node(item if isinstance(item, nodes.Node) else None, buf)
-    write_tag(buf, END_TAG)
+            write_int_bare(buf, len(items))
+            for item in reversed(items):
+                if isinstance(item, nodes.Node):
+                    stack.append(("node", item))
+                else:
+                    stack.append(("none",))
+        elif kind == "node":
+            n = task[1]
+            cls = type(n)
+            tag = _NODE_TAGS.get(cls)
+            if tag is None:
+                write_tag(buf, LITERAL_NONE)
+                continue
+            write_tag(buf, tag)
+            slots = _get_all_slots(cls)
+
+            # Collect child fields (Node or list-of-Node).
+            child_fields: list = []
+            for slot in slots:
+                value = getattr(n, slot, None)
+                if value is None:
+                    child_fields.append(None)
+                elif isinstance(value, nodes.Node):
+                    child_fields.append(value)
+                elif isinstance(value, (list, tuple)):
+                    items = list(value)
+                    if all(
+                        isinstance(item, (nodes.Node, type(None))) for item in items
+                    ) and len(items) > 0:
+                        child_fields.append(items)
+                    else:
+                        child_fields.append(None)
+                else:
+                    child_fields.append(None)
+
+            write_int_bare(buf, len(child_fields))
+            # Push END_TAG first (LIFO → processed last), then fields
+            # in reverse order so they pop in forward order.
+            stack.append(("end",))
+            for field in reversed(child_fields):
+                if field is None:
+                    stack.append(("none",))
+                elif isinstance(field, nodes.Node):
+                    stack.append(("node", field))
+                else:
+                    stack.append(("list", field))
