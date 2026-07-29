@@ -332,6 +332,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mypyc_port::rust_can_subclass_builtin,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_check_call_dispatch,
+        module
+    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())

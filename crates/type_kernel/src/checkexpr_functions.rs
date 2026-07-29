@@ -807,6 +807,27 @@ fn all_children(typ: &Type) -> Vec<&Type> {
     out
 }
 
+#[pyfunction]
+pub fn rust_check_call_dispatch(callee_bytes: Vec<u8>) -> PyResult<Option<String>> {
+    let t = match decode_type(&callee_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let proper = match get_proper_or_none(&t) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let dispatch_kind = match proper {
+        Type::CallableType { .. } => "callable",
+        Type::Overloaded { .. } => "overloaded",
+        Type::AnyType { .. } => "any",
+        Type::UnionType { .. } => "union",
+        Type::Instance { .. } => "instance",
+        _ => "other",
+    };
+    Ok(Some(dispatch_kind.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
