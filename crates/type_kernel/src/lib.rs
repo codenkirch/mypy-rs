@@ -62,6 +62,7 @@ mod plugin_hooks;
 mod refs;
 mod setops;
 mod subtypes;
+mod typeanal;
 mod typeinfo;
 mod typeops;
 mod types_codec;
@@ -249,6 +250,23 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_algebra::rust_is_type_overlap,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal::rust_is_type_constructor,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(typeanal::rust_is_self_type_name, module)?)?;
+    module.add_function(wrap_pyfunction!(typeanal::rust_make_optional_type, module)?)?;
+    module.add_function(wrap_pyfunction!(typeanal::rust_has_explicit_any, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal::rust_has_any_from_unimported_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal::rust_collect_all_inner_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(typeanal::rust_unknown_unpack, module)?)?;
+    module.add_function(wrap_pyfunction!(typeanal::rust_find_self_type, module)?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
