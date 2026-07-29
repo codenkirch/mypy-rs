@@ -45,9 +45,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// (returns None) for recursive `TypeAliasType` since the wire format lacks
 /// the `is_recursive` field.
 #[pyfunction]
-pub(crate) fn rust_allow_fast_container_literal(
-    type_bytes: &[u8],
-) -> PyResult<Option<bool>> {
+pub(crate) fn rust_allow_fast_container_literal(type_bytes: &[u8]) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
@@ -153,10 +151,7 @@ pub(crate) fn rust_replace_callable_return_type(
     Ok(result.and_then(|r| encode_type(&r)))
 }
 
-pub(crate) fn replace_callable_return_type_inner(
-    callable: &Type,
-    new_ret: &Type,
-) -> Option<Type> {
+pub(crate) fn replace_callable_return_type_inner(callable: &Type, new_ret: &Type) -> Option<Type> {
     if let Type::CallableType {
         fallback,
         instance_type,
@@ -384,7 +379,9 @@ mod tests {
         let result = replace_callable_return_type_inner(&original, &new_ret);
         assert!(result.is_some());
         if let Some(Type::CallableType { ret_type, .. }) = result {
-            assert!(matches!(*ret_type, Type::Instance { type_ref, .. } if type_ref == "builtins.str"));
+            assert!(
+                matches!(*ret_type, Type::Instance { type_ref, .. } if type_ref == "builtins.str")
+            );
         } else {
             panic!("expected CallableType");
         }
