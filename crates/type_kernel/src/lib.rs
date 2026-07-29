@@ -50,6 +50,7 @@ mod erase_typevars;
 mod errors;
 mod expandtype;
 mod lkv;
+mod messages;
 mod mro;
 mod operators;
 mod refs;
@@ -215,6 +216,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints::rust_infer_constraints,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())
 }
