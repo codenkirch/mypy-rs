@@ -44,6 +44,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod checkexpr_functions;
+mod constraints;
 mod erase;
 mod erase_typevars;
 mod errors;
@@ -208,6 +209,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         errors::rust_format_messages_default,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints::rust_infer_constraints,
         module
     )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;

@@ -7,6 +7,20 @@ from typing import TYPE_CHECKING, Final, TypeGuard, cast
 
 import mypy.subtypes
 import mypy.typeops
+
+try:
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _HAS_TYPE_KERNEL = False
+
+_native_constraints_active: bool = False
+
+
+def _set_native_constraints_active(active: bool) -> None:
+    global _native_constraints_active
+    _native_constraints_active = active
 from mypy.argmap import ArgTypeExpander
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type_by_instance
@@ -304,6 +318,20 @@ def infer_constraints(
     then skip adding reverse (polymorphic) constraints (since this is already a call
     to infer such constraints).
     """
+    if _HAS_TYPE_KERNEL and _native_constraints_active:
+        try:
+            native_res = _type_kernel.rust_infer_constraints(
+                type_state.native_resolver,
+                template.write(),
+                actual.write(),
+                direction,
+            )
+            if native_res is not None:
+                # Decoded constraints return from Rust
+                pass
+        except (NotImplementedError, AttributeError):
+            pass
+
     if any(
         get_proper_type(template) == get_proper_type(t)
         and get_proper_type(actual) == get_proper_type(a)
