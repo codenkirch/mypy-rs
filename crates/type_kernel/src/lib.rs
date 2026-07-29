@@ -62,6 +62,7 @@ mod setops;
 mod subtypes;
 mod typeinfo;
 mod typeops;
+mod types_codec;
 mod visitor;
 mod wire;
 
@@ -236,6 +237,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkpattern::rust_is_non_sequence_match_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_codec::rust_is_valid_type_codec_tag,
         module
     )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
