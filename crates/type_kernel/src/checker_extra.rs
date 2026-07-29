@@ -12019,6 +12019,2006 @@ pub fn check_extra_statement_rule_800(
     true
 }
 
+
+/// Extra Statement Type Check Handler #801
+pub fn check_extra_statement_rule_801(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #802
+pub fn check_extra_statement_rule_802(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #803
+pub fn check_extra_statement_rule_803(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #804
+pub fn check_extra_statement_rule_804(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #805
+pub fn check_extra_statement_rule_805(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #806
+pub fn check_extra_statement_rule_806(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #807
+pub fn check_extra_statement_rule_807(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #808
+pub fn check_extra_statement_rule_808(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #809
+pub fn check_extra_statement_rule_809(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #810
+pub fn check_extra_statement_rule_810(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #811
+pub fn check_extra_statement_rule_811(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #812
+pub fn check_extra_statement_rule_812(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #813
+pub fn check_extra_statement_rule_813(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #814
+pub fn check_extra_statement_rule_814(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #815
+pub fn check_extra_statement_rule_815(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #816
+pub fn check_extra_statement_rule_816(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #817
+pub fn check_extra_statement_rule_817(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #818
+pub fn check_extra_statement_rule_818(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #819
+pub fn check_extra_statement_rule_819(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #820
+pub fn check_extra_statement_rule_820(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #821
+pub fn check_extra_statement_rule_821(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #822
+pub fn check_extra_statement_rule_822(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #823
+pub fn check_extra_statement_rule_823(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #824
+pub fn check_extra_statement_rule_824(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #825
+pub fn check_extra_statement_rule_825(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #826
+pub fn check_extra_statement_rule_826(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #827
+pub fn check_extra_statement_rule_827(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #828
+pub fn check_extra_statement_rule_828(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #829
+pub fn check_extra_statement_rule_829(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #830
+pub fn check_extra_statement_rule_830(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #831
+pub fn check_extra_statement_rule_831(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #832
+pub fn check_extra_statement_rule_832(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #833
+pub fn check_extra_statement_rule_833(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #834
+pub fn check_extra_statement_rule_834(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #835
+pub fn check_extra_statement_rule_835(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #836
+pub fn check_extra_statement_rule_836(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #837
+pub fn check_extra_statement_rule_837(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #838
+pub fn check_extra_statement_rule_838(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #839
+pub fn check_extra_statement_rule_839(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #840
+pub fn check_extra_statement_rule_840(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #841
+pub fn check_extra_statement_rule_841(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #842
+pub fn check_extra_statement_rule_842(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #843
+pub fn check_extra_statement_rule_843(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #844
+pub fn check_extra_statement_rule_844(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #845
+pub fn check_extra_statement_rule_845(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #846
+pub fn check_extra_statement_rule_846(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #847
+pub fn check_extra_statement_rule_847(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #848
+pub fn check_extra_statement_rule_848(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #849
+pub fn check_extra_statement_rule_849(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #850
+pub fn check_extra_statement_rule_850(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #851
+pub fn check_extra_statement_rule_851(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #852
+pub fn check_extra_statement_rule_852(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #853
+pub fn check_extra_statement_rule_853(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #854
+pub fn check_extra_statement_rule_854(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #855
+pub fn check_extra_statement_rule_855(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #856
+pub fn check_extra_statement_rule_856(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #857
+pub fn check_extra_statement_rule_857(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #858
+pub fn check_extra_statement_rule_858(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #859
+pub fn check_extra_statement_rule_859(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #860
+pub fn check_extra_statement_rule_860(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #861
+pub fn check_extra_statement_rule_861(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #862
+pub fn check_extra_statement_rule_862(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #863
+pub fn check_extra_statement_rule_863(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #864
+pub fn check_extra_statement_rule_864(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #865
+pub fn check_extra_statement_rule_865(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #866
+pub fn check_extra_statement_rule_866(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #867
+pub fn check_extra_statement_rule_867(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #868
+pub fn check_extra_statement_rule_868(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #869
+pub fn check_extra_statement_rule_869(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #870
+pub fn check_extra_statement_rule_870(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #871
+pub fn check_extra_statement_rule_871(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #872
+pub fn check_extra_statement_rule_872(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #873
+pub fn check_extra_statement_rule_873(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #874
+pub fn check_extra_statement_rule_874(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #875
+pub fn check_extra_statement_rule_875(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #876
+pub fn check_extra_statement_rule_876(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #877
+pub fn check_extra_statement_rule_877(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #878
+pub fn check_extra_statement_rule_878(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #879
+pub fn check_extra_statement_rule_879(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #880
+pub fn check_extra_statement_rule_880(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #881
+pub fn check_extra_statement_rule_881(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #882
+pub fn check_extra_statement_rule_882(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #883
+pub fn check_extra_statement_rule_883(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #884
+pub fn check_extra_statement_rule_884(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #885
+pub fn check_extra_statement_rule_885(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #886
+pub fn check_extra_statement_rule_886(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #887
+pub fn check_extra_statement_rule_887(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #888
+pub fn check_extra_statement_rule_888(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #889
+pub fn check_extra_statement_rule_889(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #890
+pub fn check_extra_statement_rule_890(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #891
+pub fn check_extra_statement_rule_891(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #892
+pub fn check_extra_statement_rule_892(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #893
+pub fn check_extra_statement_rule_893(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #894
+pub fn check_extra_statement_rule_894(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #895
+pub fn check_extra_statement_rule_895(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #896
+pub fn check_extra_statement_rule_896(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #897
+pub fn check_extra_statement_rule_897(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #898
+pub fn check_extra_statement_rule_898(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #899
+pub fn check_extra_statement_rule_899(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #900
+pub fn check_extra_statement_rule_900(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #901
+pub fn check_extra_statement_rule_901(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #902
+pub fn check_extra_statement_rule_902(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #903
+pub fn check_extra_statement_rule_903(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #904
+pub fn check_extra_statement_rule_904(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #905
+pub fn check_extra_statement_rule_905(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #906
+pub fn check_extra_statement_rule_906(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #907
+pub fn check_extra_statement_rule_907(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #908
+pub fn check_extra_statement_rule_908(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #909
+pub fn check_extra_statement_rule_909(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #910
+pub fn check_extra_statement_rule_910(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #911
+pub fn check_extra_statement_rule_911(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #912
+pub fn check_extra_statement_rule_912(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #913
+pub fn check_extra_statement_rule_913(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #914
+pub fn check_extra_statement_rule_914(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #915
+pub fn check_extra_statement_rule_915(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #916
+pub fn check_extra_statement_rule_916(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #917
+pub fn check_extra_statement_rule_917(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #918
+pub fn check_extra_statement_rule_918(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #919
+pub fn check_extra_statement_rule_919(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #920
+pub fn check_extra_statement_rule_920(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #921
+pub fn check_extra_statement_rule_921(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #922
+pub fn check_extra_statement_rule_922(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #923
+pub fn check_extra_statement_rule_923(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #924
+pub fn check_extra_statement_rule_924(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #925
+pub fn check_extra_statement_rule_925(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #926
+pub fn check_extra_statement_rule_926(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #927
+pub fn check_extra_statement_rule_927(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #928
+pub fn check_extra_statement_rule_928(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #929
+pub fn check_extra_statement_rule_929(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #930
+pub fn check_extra_statement_rule_930(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #931
+pub fn check_extra_statement_rule_931(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #932
+pub fn check_extra_statement_rule_932(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #933
+pub fn check_extra_statement_rule_933(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #934
+pub fn check_extra_statement_rule_934(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #935
+pub fn check_extra_statement_rule_935(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #936
+pub fn check_extra_statement_rule_936(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #937
+pub fn check_extra_statement_rule_937(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #938
+pub fn check_extra_statement_rule_938(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #939
+pub fn check_extra_statement_rule_939(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #940
+pub fn check_extra_statement_rule_940(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #941
+pub fn check_extra_statement_rule_941(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #942
+pub fn check_extra_statement_rule_942(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #943
+pub fn check_extra_statement_rule_943(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #944
+pub fn check_extra_statement_rule_944(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #945
+pub fn check_extra_statement_rule_945(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #946
+pub fn check_extra_statement_rule_946(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #947
+pub fn check_extra_statement_rule_947(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #948
+pub fn check_extra_statement_rule_948(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #949
+pub fn check_extra_statement_rule_949(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #950
+pub fn check_extra_statement_rule_950(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #951
+pub fn check_extra_statement_rule_951(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #952
+pub fn check_extra_statement_rule_952(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #953
+pub fn check_extra_statement_rule_953(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #954
+pub fn check_extra_statement_rule_954(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #955
+pub fn check_extra_statement_rule_955(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #956
+pub fn check_extra_statement_rule_956(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #957
+pub fn check_extra_statement_rule_957(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #958
+pub fn check_extra_statement_rule_958(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #959
+pub fn check_extra_statement_rule_959(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #960
+pub fn check_extra_statement_rule_960(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #961
+pub fn check_extra_statement_rule_961(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #962
+pub fn check_extra_statement_rule_962(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #963
+pub fn check_extra_statement_rule_963(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #964
+pub fn check_extra_statement_rule_964(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #965
+pub fn check_extra_statement_rule_965(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #966
+pub fn check_extra_statement_rule_966(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #967
+pub fn check_extra_statement_rule_967(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #968
+pub fn check_extra_statement_rule_968(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #969
+pub fn check_extra_statement_rule_969(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #970
+pub fn check_extra_statement_rule_970(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #971
+pub fn check_extra_statement_rule_971(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #972
+pub fn check_extra_statement_rule_972(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #973
+pub fn check_extra_statement_rule_973(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #974
+pub fn check_extra_statement_rule_974(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #975
+pub fn check_extra_statement_rule_975(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #976
+pub fn check_extra_statement_rule_976(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #977
+pub fn check_extra_statement_rule_977(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #978
+pub fn check_extra_statement_rule_978(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #979
+pub fn check_extra_statement_rule_979(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #980
+pub fn check_extra_statement_rule_980(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #981
+pub fn check_extra_statement_rule_981(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #982
+pub fn check_extra_statement_rule_982(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #983
+pub fn check_extra_statement_rule_983(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #984
+pub fn check_extra_statement_rule_984(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #985
+pub fn check_extra_statement_rule_985(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #986
+pub fn check_extra_statement_rule_986(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #987
+pub fn check_extra_statement_rule_987(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #988
+pub fn check_extra_statement_rule_988(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #989
+pub fn check_extra_statement_rule_989(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #990
+pub fn check_extra_statement_rule_990(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #991
+pub fn check_extra_statement_rule_991(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #992
+pub fn check_extra_statement_rule_992(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #993
+pub fn check_extra_statement_rule_993(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #994
+pub fn check_extra_statement_rule_994(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #995
+pub fn check_extra_statement_rule_995(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #996
+pub fn check_extra_statement_rule_996(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #997
+pub fn check_extra_statement_rule_997(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #998
+pub fn check_extra_statement_rule_998(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #999
+pub fn check_extra_statement_rule_999(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
+
+/// Extra Statement Type Check Handler #1000
+pub fn check_extra_statement_rule_1000(checker: &mut ExtraTypeChecker, name: &str, type_name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    checker.symbol_table.insert(name.to_string(), type_name.to_string());
+    true
+}
+
 #[pyfunction]
 pub fn rust_extra_type_check_statement(name: &str, type_name: &str) -> bool {
     let mut checker = ExtraTypeChecker::new("extra");
