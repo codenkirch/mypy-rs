@@ -67,6 +67,8 @@ mod errors;
 mod expandtype;
 mod incremental_engine;
 mod lkv;
+mod mega_kernel_a;
+mod mega_kernel_b;
 mod messages;
 mod mro;
 mod mypyc_port;
@@ -423,6 +425,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         incremental_engine::rust_incremental_check_dep,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_a::rust_mega_type_rule_eval_1,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mega_kernel_b::rust_mega_type_rule_eval_3501,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
