@@ -16,12 +16,6 @@
 
 use std::collections::HashMap;
 
-use pyo3::prelude::*;
-use pyo3::types::PyList;
-use pyo3::PyObject;
-
-use crate::typeinfo::serialize_type_to_bytes;
-
 /// Frozen snapshot of a `mypy.nodes.TypeAlias`, keyed by `fullname`.
 ///
 /// Field set is the union of Stage 3c `is_subtype` consumers:
@@ -94,79 +88,6 @@ impl Default for TypeAliasResolver {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Read `TypeAlias.alias_tvars` (a `list[TypeVarLikeType]`) as a Vec
-/// of the tvar names. Skips entries whose `.name` is unreadable.
-fn read_alias_tvar_names(obj: &PyAny) -> Vec<String> {
-    let tvars = match obj.getattr("alias_tvars") {
-        Ok(t) => match t.downcast::<PyList>() {
-            Ok(l) => l,
-            Err(_) => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
-    };
-    let mut out = Vec::with_capacity(tvars.len());
-    for item in tvars.iter() {
-        if let Ok(n) = item.getattr("name").and_then(|n| n.extract::<String>()) {
-            out.push(n);
-        }
-    }
-    out
-}
-
-/// Read `TypeAlias.tvar_tuple_index` as `Option<usize>`. `None` when
-/// the alias has no variadic tvar (nodes.py:4622).
-fn read_tvar_tuple_index(obj: &PyAny) -> Option<usize> {
-    let v = obj.getattr("tvar_tuple_index").ok()?;
-    if v.is_none() {
-        return None;
-    }
-    v.extract::<usize>().ok()
-}
-
-/// Build a `TypeAliasResolver` (Python `dict[str, dict]`) from an
-/// iterable of live `mypy.nodes.TypeAlias` objects.
-///
-/// Each alias is read into a snapshot-fields dict. On any per-item read
-/// failure (missing `fullname`, unserializable `target`) the item is
-/// skipped, mirroring the strangler-fig degrade-gracefully pattern from
-/// `typeinfo::build_resolver`.
-///
-/// The returned dict is consumed by `NativeTypeResolver` (typeinfo.rs),
-/// which holds both the `TypeResolver` and `TypeAliasResolver` HashMaps
-/// in Rust for zero-FFI-per-lookup access by Stage 3c.
-#[pyfunction]
-pub(crate) fn build_alias_resolver(py: Python<'_>, aliases: &PyAny) -> PyResult<PyObject> {
-    let result = pyo3::types::PyDict::new(py);
-    for item in aliases.iter()? {
-        let item = item?;
-        let fullname: String = match item.getattr("fullname").and_then(|f| f.extract()) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let target_bytes = match serialize_type_to_bytes(py, item) {
-            Some(b) => b,
-            None => continue,
-        };
-        let snap_dict = pyo3::types::PyDict::new(py);
-        snap_dict.set_item("fullname", &fullname)?;
-        snap_dict.set_item("target", pyo3::types::PyBytes::new(py, &target_bytes))?;
-        let tvar_names = read_alias_tvar_names(item);
-        snap_dict.set_item("alias_tvars", PyList::new(py, &tvar_names))?;
-        match read_tvar_tuple_index(item) {
-            Some(i) => snap_dict.set_item("tvar_tuple_index", i)?,
-            None => snap_dict.set_item("tvar_tuple_index", py.None())?,
-        }
-        let no_args: bool = item
-            .getattr("no_args")
-            .ok()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(false);
-        snap_dict.set_item("no_args", no_args)?;
-        result.set_item(fullname, snap_dict)?;
-    }
-    Ok(result.into())
 }
 
 #[cfg(test)]

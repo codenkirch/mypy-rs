@@ -312,16 +312,17 @@ from mypy.visitor import NodeVisitor
 # Rust returns None for TypeAliasType (no alias target on the wire);
 # Python falls back to get_proper_type + the pure-Python path.
 try:
-    from type_kernel import rust_has_bool_item as _rust_has_bool_item
-    from type_kernel import rust_is_typed_callable as _rust_is_typed_callable
-    from type_kernel import rust_is_private as _rust_is_private
-    from type_kernel import rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping
-    from type_kernel import rust_flatten_types_if_tuple as _rust_flatten_types_if_tuple
-    from type_kernel import rust_is_string_literal as _rust_is_string_literal
-    from type_kernel import rust_is_untyped_decorator as _rust_is_untyped_decorator
-    from type_kernel import rust_is_typeddict_type_context as _rust_is_typeddict_type_context
-    from librt.internal import ReadBuffer as _CheckerReadBuffer
-    from librt.internal import WriteBuffer as _CheckerWriteBuffer
+    from librt.internal import ReadBuffer as _CheckerReadBuffer, WriteBuffer as _CheckerWriteBuffer
+    from type_kernel import (
+        rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
+        rust_has_bool_item as _rust_has_bool_item,
+        rust_is_private as _rust_is_private,
+        rust_is_string_literal as _rust_is_string_literal,
+        rust_is_typed_callable as _rust_is_typed_callable,
+        rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
+        rust_is_untyped_decorator as _rust_is_untyped_decorator,
+    )
+
     from mypy.types import read_type as _checker_read_type
 
     _CHECKER_HAS_TYPE_KERNEL = True
@@ -330,7 +331,6 @@ except ImportError:
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
-    _rust_flatten_types_if_tuple = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]

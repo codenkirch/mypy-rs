@@ -61,8 +61,7 @@ from mypy.types import (
 # Rust returns None for unhandled (non-Instance right).
 try:
     import type_kernel as _type_kernel
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -351,7 +350,7 @@ def trivial_join(s: Type, t: Type) -> Type:
                 state.strict_optional,
                 _native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             if result == 0:
@@ -426,7 +425,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 state.strict_optional,
                 _native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             disc, fullname, arg_discs, encoded = result
