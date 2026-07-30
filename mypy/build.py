@@ -909,12 +909,12 @@ class BuildManager:
         # semantic-analysis calls between __init__ and the resolver
         # rebuild would use the previous build's TypeInfo graph,
         # producing wrong MROs and subtype results.
-        from mypy.subtypes import _set_native_subtype_resolver
         from mypy.join import (
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
         from mypy.mro import _set_native_mro_resolver
+        from mypy.subtypes import _set_native_subtype_resolver
 
         _set_native_subtype_resolver(None)
         _set_native_join_resolver(None)
@@ -978,12 +978,17 @@ class BuildManager:
         # Stage 9: gate standalone checker/checkexpr scalar-returning
         # helpers (no resolver needed). Type-returning helpers stay
         # parity-only (_native_checker_types_active).
-        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_check_call_active
         from mypy.checker import _set_native_checker_active
+        from mypy.checkexpr import _set_native_checkexpr_active
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
-        _set_native_check_call_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
+        # Stage 4: clear stale plugin-hook snapshot, then build the
+        # registry. Plugins are config-static, so build once here.
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+
+        _set_native_plugin_hook_registry(None, False)
+        self._build_plugin_hook_registry()
         # Stage 6c: gate apply_generic_arguments + has_no_typevars.
         # Resolver installed in _build_native_resolvers.
         from mypy.applytype import _set_native_applytype_active
@@ -1161,10 +1166,9 @@ class BuildManager:
             import type_kernel as _type_kernel
         except ImportError:
             return
-        from mypy.join import _set_native_join_typeinfo_map
+        from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
-        from mypy.join import _set_native_join_resolver
 
         type_infos = self._collect_type_infos()
         resolver = _type_kernel.build_native_resolver(type_infos, [])
@@ -1202,6 +1206,41 @@ class BuildManager:
 
         _set_native_applytype_resolver(resolver)
         _set_native_applytype_typeinfo_map(typeinfo_map)
+
+    def _build_plugin_hook_registry(self) -> None:
+        """Build the Stage 4 plugin-hook snapshot and install it.
+
+        Collects the DefaultPlugin's call-hook fullnames (the four
+        ``get_*_hook`` methods, all literal equality / finite-set
+        membership) into a Rust ``PluginHookRegistry`` so that
+        ``checkexpr.plugin_call_hook_known_absent`` can short-circuit the
+        Python ``Plugin.get_*_hook`` chain with one Rust ``HashSet::contains``.
+
+        When user plugins are present (``len(self.plugin._plugins) > 1``),
+        the registry is installed with ``has_user_plugins=True`` so all
+        lookups defer to Python (user-plugin hooks are not enumerable
+        without a declaration API). No-op unless
+        ``Options.native_type_kernel`` is set and the ``type_kernel``
+        extension is importable.
+        """
+        if not self.options.native_type_kernel:
+            return
+        try:
+            import type_kernel as _type_kernel
+        except ImportError:
+            return
+        from mypy.checkexpr import _set_native_plugin_hook_registry
+        from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES
+
+        # self.plugin is always a ChainedPlugin after __init__ (a bare
+        # DefaultPlugin is wrapped in ChainedPlugin(options, [plugin])).
+        # _plugins is ordered custom-plugins-first, DefaultPlugin last.
+        plugins = self.plugin._plugins
+        has_user_plugins = len(plugins) > 1
+        registry = _type_kernel.PluginHookRegistry(
+            list(DEFAULT_CALL_HOOK_FULLNAMES)
+        )
+        _set_native_plugin_hook_registry(registry, has_user_plugins)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
@@ -5010,12 +5049,12 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     # calls (e.g. semanal_typeargs bound checks) in the next line use
     # Python, not a snapshot missing the current SCC's classes.
     if manager.options.native_type_kernel:
-        from mypy.subtypes import _set_native_subtype_resolver
         from mypy.join import (
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
         from mypy.mro import _set_native_mro_resolver
+        from mypy.subtypes import _set_native_subtype_resolver
 
         _set_native_subtype_resolver(None)
         _set_native_join_resolver(None)

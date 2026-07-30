@@ -1283,8 +1283,13 @@ default.
   - **Stage 3c**: `is_subtype`/`is_proper_subtype` on the Rust enum,
     wired through the seam (the perf win).
 - **Stage 4**: `check_call` / `ExpressionChecker.visit_call_expr_inner`
-  — the big one, highest value, needs the plugin-hook snapshot
-  protocol.
+  (the big one, highest value). The plugin-hook snapshot protocol
+  (first slice) is shipped: `PluginHookRegistry` holds the union of
+  `DefaultPlugin`'s ~46 call-hook fullnames; `checkexpr` short-circuits
+  the four `get_*_hook` lookups via `plugin_call_hook_known_absent`
+  (one Rust `HashSet::contains`). The full `check_callable_call`
+  arg-binding port remains future work; see the Stage 4 design spike
+  below.
 - **Stage 5**: Semantic analyzer kernel (`semanal_time`, 16% of build).
 
 
@@ -1745,7 +1750,159 @@ returns wrong answers for generic-instance joins.
   closed: all unsupported generic substitution edges now defer (return
   None) instead of returning wrong answers. Full testcheck suite green
   with resolvers installed (8205 passed, 0 failed).
-- `_set_native_mro_resolver`: still commented out (Stage 5 parity-only).
+- `_set_native_mro_resolver`: **uncommented and wired to production**
+  (build.py:1181, issue #65). The Stage 5 MRO kernel
+  (`rust_linearize_hierarchy`) ships default-on alongside the
+  subtype/join kernels; `NativeMroSuite` (testtypes.py) covers diamond,
+  cycle-detection, `builtins.object` root, and the `obj_type` fallback.
+  The kernel returns `None` (defers to Python) for cycles, missing
+  bases, the `obj_type` callback edge, and inconsistent merges, so it
+  cannot return a wrong answer.
 
 The parity suites (339 tests) and the full testcheck suite (8205 tests)
 stay green with resolvers wired to production.
+
+## Stage 4 Design Spike: `check_call` / `ExpressionChecker`
+
+### Objective
+
+`check_call` and `ExpressionChecker.visit_call_expr_inner` are the
+highest-value remaining port target. The type checker is ~71% of build
+time (`type_check_time_implementation`); `check_call` is its hottest
+dispatch. This spike enumerates the mutation surface, the plugin-hook
+interaction, and the seam shape for a future full port. The first
+slice (plugin-hook snapshot, shipped) is described under "Shipped
+slice" below; the rest is design for future implementation milestones.
+
+### Call chain and mutation sites
+
+`visit_call_expr_inner` (checkexpr.py) is mostly orchestration; the
+plugin surface concentrates one level down:
+
+1. `check_call_expr_with_callee_type` calls
+   `transform_callee_type` (signature hooks), then `check_call`.
+   Writes `e.callee.type_guard` / `e.callee.type_is` onto the AST
+   (checkexpr.py, post-`check_call`); *shared AST mutation*.
+2. `check_call` dispatches by `get_proper_type(callee)`:
+   `CallableType` -> `check_callable_call`, `Overloaded` ->
+   `check_overload_call`, `AnyType` -> `check_any_type_call`,
+   `UnionType` -> `check_union_call`, `Instance` -> recurse via
+   `analyze_member_access("__call__")`. The `Instance` branch writes
+   `self.chk.store_type(callable_node, callee)`.
+3. `check_callable_call` does arg-to-formal binding, type-var
+   inference (`freshen_all_functions_type_vars`,
+   `freeze_all_type_vars`), `store_type(callable_node, callee)`, and
+   the four plugin hooks (see below). Emits protocol-instantiation,
+   abstract-instantiation, and variadic-unpack errors via `self.msg.*`.
+
+### Plugin-hook surface (four call hooks)
+
+The four `Plugin` hooks that fire inside `check_call`:
+
+| Hook | Site | Returns | Closes over |
+|------|------|---------|-------------|
+| `get_function_signature_hook` | `transform_callee_type` | `FunctionLike` | `self.chk` (live `TypeChecker`) |
+| `get_method_signature_hook` | `transform_callee_type` | `FunctionLike` | `self.chk` |
+| `get_function_hook` | `check_callable_call` (post-binding) | `Type` | `self.chk` |
+| `get_method_hook` | `check_callable_call` (post-binding) | `Type` | `self.chk` |
+
+The callbacks take a `*Context` object carrying `api=self.chk`. The
+callback can call arbitrary checker methods (`ctx.api.fail`,
+`ctx.api.named_generic_type`, `ctx.api.expr_to_analyzed_type`). So a
+hook "snapshot" cannot replay the callback in Rust; Rust can only
+decide whether a hook exists and defer to Python to run it.
+
+### Shipped slice: plugin-hook snapshot (first functional Stage 4 work)
+
+`PluginHookRegistry` (crates/type_kernel/src/plugin_hooks.rs) holds a
+`HashSet<String>` of `DefaultPlugin`'s call-hook fullnames (~46 distinct
+dotted strings, all literal equality / finite-set membership in
+`mypy/plugins/default.py`). `BuildManager._build_plugin_hook_registry`
+builds the registry once in `__init__` from the live `ChainedPlugin`
+(`self.plugin._plugins`).
+
+`checkexpr.plugin_call_hook_known_absent(callable_name)` returns
+`True` only when: the registry is installed, no user plugins are
+present, and `callable_name` is not in the `DefaultPlugin` set. The
+four `get_*_hook` lookup sites are gated so the Python plugin chain is
+skipped entirely when absence is proven:
+
+- `transform_callee_type` (signature hooks): skip both branches when
+  known-absent.
+- `check_callable_call` (function/method hooks): skip the
+  `apply_function_plugin` gate when known-absent.
+
+When user plugins are present (`len(self.plugin._plugins) > 1`),
+`has_user_plugins=True` is installed so all lookups defer to Python
+(conservative: user-plugin hooks are not enumerable without a
+declaration API). Correctness: a `True` return never skips a real hook
+(it only reports absence); a `False` return always falls through to the
+Python `get_*_hook` chain, which is the source of truth.
+
+The dead `rust_check_call_fast_path` call (checkexpr.py) was removed:
+it serialized the callee to bytes + FFI + Rust decode, then discarded
+the `Option<String>` result (pure overhead). The classifier logic is
+retained in `checkcall.rs` for the future full port.
+
+### Future port: `check_callable_call` arg-binding (not started)
+
+A full port of `check_callable_call`'s arg-binding and type-var
+inference is the remaining Stage 4 work. Open design questions:
+
+1. **Defer-mutation boundary.** `check_callable_call` writes
+   `store_type(callable_node, callee)` and `transform_callee_type`
+   writes `e.callee.type_guard`/`type_is`. Which writes does Rust
+   perform vs. which does Python re-apply after Rust returns? The
+   Stage 5 pattern ("Rust returns the MRO, Python writes it back") is
+   the template, but `check_call` has more write sites
+   (`store_type`, `type_guard`, `type_is`, `binder.unreachable`,
+   error emission).
+2. **Plugin hook replay.** Rust cannot replay the callbacks (they
+   close over `self.chk`). Split: Rust runs the pre-hook arity/dispatch,
+   returns the (possibly-transformed) callee, Python applies the hook.
+   The `transform_callee_type` ordering (signature hook before
+   `check_call`, function/method hook after `check_callable_call`)
+   suggests a split is feasible.
+3. **Recursive `self.accept` coupling.** `visit_call_expr_inner`
+   calls `self.accept(e.callee, ...)` and `self.accept(e.args[i])`
+   (full recursive expression visiting). Scope decision: fast-path
+   classifier that returns early (low risk) vs. full arg-binding
+   port (high risk, needs `freshen_function_type_vars`,
+   `infer_type_vars`, `applytype`). Note: `applytype` resolver is
+   installed (Stage 6c) but `expand_type` is *commented out* with ~316
+   known failures, a warning that generic-substitution in Rust is not
+   yet parity-safe.
+4. **Scope of the snapshot.** `PluginHookRegistry` currently holds one
+   combined `HashSet<String>`. The 4 hooks are one set because
+   `plugin_call_hook_known_absent` only needs to prove absence across
+   all four. A future full port may split into four sets if per-hook
+   deferral granularity is needed.
+5. **`object_type` / `member` resolution.** `check_call_expr_with_callee_type`
+   computes `callable_name = method_fullname(object_type, member)`,
+   walking `TypeInfo.mro`. Rust has `mro` in `TypeInfoSnapshot`
+   (Stage 3b/5), so this is solvable by reusing the resolver.
+6. **Error emission.** Rust computes the error condition and returns
+   a tag for Python to emit, or Rust defers whenever an error path is
+   possible. Defer-on-error is safest but limits the fast-path hit
+   rate.
+7. **Parity baseline.** Re-run `--dump-build-stats` to record a
+   post-plugin-hook-snapshot baseline. The pre-kernel baseline (71%
+   type-check, 16% semanal) and the post-Stage-3c-graduation numbers
+   are in the "Performance baseline" section above.
+
+### Risk assessment
+
+- **Low** on parity for the shipped slice: the registry only reports
+  absence (never a false positive), and user plugins always defer.
+- **Medium** on FFI overhead for the shipped slice: one `HashSet::contains`
+  per `check_call` when no hook matches, replacing a Python iteration
+  over `self._plugins` with string compares. Net win only if the
+  common case is "no hook"; the `DefaultPlugin` set is small (~46), so
+  the Python path was already cheap. The win is removing dead FFI
+  overhead (the discarded fast-path) more than the snapshot lookup.
+- **High** on the future full port: `check_callable_call` touches
+  type-var inference, `store_type`, and the plugin callbacks. The
+  `expand_type` parity gap (316 failures) warns that generic
+  substitution in Rust is not yet safe. The full port should follow
+  the same incremental staging as Stage 3 (a/b/c sub-stages,
+  parity-only first, then production wiring).
