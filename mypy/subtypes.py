@@ -81,9 +81,8 @@ from mypy.typevars import fill_typevars, fill_typevars_with_any
 # native_type_kernel is set, and a resolver is installed, the nominal
 # is_subtype path routes through Rust. Rust returns None for unhandled.
 try:
-    from librt.internal import WriteBuffer as _WriteBuffer
-
     import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -447,7 +446,7 @@ def _is_subtype(
                 state.strict_optional,
                 _native_subtype_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             # Type tree contains an unserializable variant (e.g.
             # TypeGuardedType nested in a Union). Defer to Python.
             result = None

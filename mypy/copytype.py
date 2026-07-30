@@ -35,9 +35,9 @@ from mypy.type_visitor import TypeVisitor  # ruff: isort: skip
 # (shallow copy for truthiness mutation) is preserved by round-tripping
 # through the wire format, which produces a structurally identical copy.
 try:
+    from librt.internal import ReadBuffer as _CopyReadBuffer, WriteBuffer as _CopyWriteBuffer
     from type_kernel import rust_copy_type as _rust_copy_type
-    from librt.internal import WriteBuffer as _CopyWriteBuffer
-    from librt.internal import ReadBuffer as _CopyReadBuffer
+
     from mypy.types import read_type as _copy_read_type
 
     _COPY_HAS_TYPE_KERNEL = True
@@ -73,7 +73,7 @@ def copy_type(t: ProperType) -> ProperType:
             if result is not None:
                 rbuf = _CopyReadBuffer(result)
                 return _copy_read_type(rbuf)  # type: ignore[return-value]
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, TypeError, ValueError):
             pass
     return t.accept(TypeShallowCopier())
 
