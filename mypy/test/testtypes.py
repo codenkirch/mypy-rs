@@ -53,8 +53,8 @@ from mypy.types import (
     TypeOfAny,
     TypeType,
     TypeVarId,
-    TypeVarType,
     TypeVarTupleType,
+    TypeVarType,
     UnboundType,
     UninhabitedType,
     UnionType,
@@ -2007,7 +2007,11 @@ class NativeJoinMeetSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.fx = TypeFixture(INVARIANT)
@@ -2021,7 +2025,11 @@ class NativeJoinMeetSuite(Suite):
         _set_native_join_typeinfo_map(typeinfo_map)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
@@ -2105,7 +2113,11 @@ class NativeJoinTypesSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.fx = TypeFixture(INVARIANT)
@@ -2119,7 +2131,11 @@ class NativeJoinTypesSuite(Suite):
         _set_native_join_typeinfo_map(typeinfo_map)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
@@ -2220,7 +2236,11 @@ class NativeJoinInstanceSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.fx = TypeFixture(INVARIANT)
@@ -2234,7 +2254,11 @@ class NativeJoinInstanceSuite(Suite):
         _set_native_join_typeinfo_map(typeinfo_map)
 
     def tearDown(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
         from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         _set_native_subtype_active(False)
@@ -4208,6 +4232,91 @@ class NativeMroSuite(Suite):
         cls.mro = [self.oi]
         calculate_mro(cls)
         assert self._mro_fullnames(cls) == ["builtins.object"]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativePluginHookSuite(Suite):
+    """Parity tests for the Stage 4 plugin-hook snapshot.
+
+    Verifies that `PluginHookRegistry.has_hook(fullname)` agrees with the
+    DefaultPlugin's `get_*_hook(fullname) is not None` for the four
+    call-related hooks, and that the `plugin_call_hook_known_absent`
+    short-circuit only reports "known absent" when no DefaultPlugin hook
+    matches.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _type_kernel
+
+        from mypy.checkexpr import (
+            _set_native_plugin_hook_registry,
+            plugin_call_hook_known_absent,
+        )
+        from mypy.options import Options
+        from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES, DefaultPlugin
+
+        self._set_native_plugin_hook_registry = _set_native_plugin_hook_registry
+        self._plugin_call_hook_known_absent = plugin_call_hook_known_absent
+        self._default_plugin = DefaultPlugin(Options())
+        self._fullnames = DEFAULT_CALL_HOOK_FULLNAMES
+        self._registry = _type_kernel.PluginHookRegistry(
+            list(DEFAULT_CALL_HOOK_FULLNAMES)
+        )
+        _set_native_plugin_hook_registry(self._registry, has_user_plugins=False)
+
+    def tearDown(self) -> None:
+        self._set_native_plugin_hook_registry(None, False)
+
+    def test_registry_has_hook_for_every_default_fullname(self) -> None:
+        for fullname in self._fullnames:
+            assert self._registry.has_hook(fullname), (
+                f"registry missing {fullname!r}"
+            )
+
+    def test_registry_absent_for_unrelated_fullname(self) -> None:
+        assert not self._registry.has_hook("builtins.print")
+        assert not self._registry.has_hook("os.path.join")
+        assert not self._registry.has_hook("collections.OrderedDict")
+
+    def test_known_absent_false_for_default_hook_fullnames(self) -> None:
+        # Fullnames in the DefaultPlugin set are never "known absent".
+        for fullname in self._fullnames:
+            assert not self._plugin_call_hook_known_absent(fullname), (
+                f"{fullname!r} should not be known-absent (it has a hook)"
+            )
+
+    def test_known_absent_true_for_unrelated_fullname(self) -> None:
+        assert self._plugin_call_hook_known_absent("builtins.print")
+        assert self._plugin_call_hook_known_absent("os.path.join")
+
+    def test_known_absent_false_for_none_callable_name(self) -> None:
+        assert not self._plugin_call_hook_known_absent(None)
+
+    def test_known_absent_defers_when_user_plugins_present(self) -> None:
+        # With user plugins, the registry cannot prove absence, so all
+        # lookups must defer to Python (known-absent returns False).
+        self._set_native_plugin_hook_registry(self._registry, has_user_plugins=True)
+        assert not self._plugin_call_hook_known_absent("builtins.print")
+        assert not self._plugin_call_hook_known_absent("os.path.join")
+
+    def test_known_absent_defers_when_registry_unset(self) -> None:
+        self._set_native_plugin_hook_registry(None, has_user_plugins=False)
+        assert not self._plugin_call_hook_known_absent("builtins.print")
+
+    def test_default_plugin_fullnames_cover_all_four_hooks(self) -> None:
+        # Cross-check: every fullname in DEFAULT_CALL_HOOK_FULLNAMES must
+        # be matched by at least one of the four DefaultPlugin call-hooks.
+        for fullname in self._fullnames:
+            has_hook = (
+                self._default_plugin.get_function_hook(fullname) is not None
+                or self._default_plugin.get_function_signature_hook(fullname) is not None
+                or self._default_plugin.get_method_signature_hook(fullname) is not None
+                or self._default_plugin.get_method_hook(fullname) is not None
+            )
+            assert has_hook, (
+                f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
+            )
+
 
 
 

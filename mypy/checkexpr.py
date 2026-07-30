@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager, nullcontext
-from typing import ClassVar, Final, TypeAlias as _TypeAlias, cast, overload
+from typing import Any, ClassVar, Final, TypeAlias as _TypeAlias, cast, overload
 from typing_extensions import assert_never
 
 import mypy.checker
@@ -219,16 +219,21 @@ from mypy.visitor import ExpressionVisitor
 # Rust returns None for TypeAliasType (no alias target on the wire);
 # Python falls back to get_proper_type + the pure-Python visitor.
 try:
-    from type_kernel import rust_has_any_type as _rust_has_any_type
-    from type_kernel import rust_has_uninhabited_component as _rust_has_uninhabited_component
-    from type_kernel import rust_has_bytes_component as _rust_has_bytes_component
-    from type_kernel import rust_is_non_empty_tuple as _rust_is_non_empty_tuple
-    from type_kernel import rust_has_coroutine_decorator as _rust_has_coroutine_decorator
-    from type_kernel import rust_is_operator_method as _rust_is_operator_method
-    from type_kernel import rust_is_type_type_context as _rust_is_type_type_context
-    from type_kernel import rust_try_getting_literal as _rust_try_getting_literal
-    from librt.internal import ReadBuffer as _CheckExprReadBuffer
-    from librt.internal import WriteBuffer as _CheckExprWriteBuffer
+    from librt.internal import (
+        ReadBuffer as _CheckExprReadBuffer,
+        WriteBuffer as _CheckExprWriteBuffer,
+    )
+    from type_kernel import (
+        rust_has_any_type as _rust_has_any_type,
+        rust_has_bytes_component as _rust_has_bytes_component,
+        rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
+        rust_has_uninhabited_component as _rust_has_uninhabited_component,
+        rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
+        rust_is_operator_method as _rust_is_operator_method,
+        rust_is_type_type_context as _rust_is_type_type_context,
+        rust_try_getting_literal as _rust_try_getting_literal,
+    )
+
     from mypy.types import read_type as _checkexpr_read_type
 
     _CHECKEXPR_HAS_TYPE_KERNEL = True
@@ -246,16 +251,13 @@ except ImportError:
     _checkexpr_read_type = None  # type: ignore[assignment]
     _CHECKEXPR_HAS_TYPE_KERNEL = False
 
-try:
-    from type_kernel import rust_check_call_fast_path as _rust_check_call_fast_path
-
-    _HAS_CHECK_CALL_KERNEL = True
-except ImportError:
-    _rust_check_call_fast_path = None  # type: ignore[assignment]
-    _HAS_CHECK_CALL_KERNEL = False
-
 _native_checkexpr_active: bool = False
-_native_check_call_active: bool = False
+
+# Stage 4 plugin-hook snapshot: a Rust `PluginHookRegistry` holding
+# DefaultPlugin's call-hook fullnames. See `plugin_call_hook_known_absent`.
+# Installed per build by BuildManager (None when user plugins present).
+_native_plugin_hook_registry: Any = None
+_native_plugin_hook_has_user_plugins: bool = False
 
 
 def _set_native_checkexpr_active(active: bool) -> None:
@@ -264,10 +266,48 @@ def _set_native_checkexpr_active(active: bool) -> None:
     _native_checkexpr_active = active
 
 
-def _set_native_check_call_active(active: bool) -> None:
-    """Called by build manager to enable/disable native check_call fast-path."""
-    global _native_check_call_active
-    _native_check_call_active = active
+def _set_native_plugin_hook_registry(
+    registry: Any, has_user_plugins: bool
+) -> None:
+    """Install the Stage 4 plugin-hook snapshot.
+
+    Pass (None, False) to clear. When `has_user_plugins` is True the
+    registry is ignored and all lookups defer to Python, since user
+    plugins may match arbitrary fullnames that the registry does not
+    capture.
+    """
+    global _native_plugin_hook_registry, _native_plugin_hook_has_user_plugins
+    _native_plugin_hook_registry = registry
+    _native_plugin_hook_has_user_plugins = has_user_plugins
+
+
+def plugin_call_hook_known_absent(callable_name: str | None) -> bool:
+    """Stage 4 fast-path for the four call-hook existence checks.
+
+    Returns True when we can prove that no plugin call hook exists for
+    `callable_name`, so the caller may skip the Python
+    `Plugin.get_*_hook` chain entirely. Returns False (a hook may exist)
+    when:
+
+    - the registry is not installed (no native kernel), or
+    - user plugins are present (their hooks are not enumerable), or
+    - `callable_name` is None, or
+    - `callable_name` is in the DefaultPlugin hook set.
+
+    Correctness: only returns True when the registry is installed, no
+    user plugins are present, and `callable_name` is not among the
+    DefaultPlugin's literal hook fullnames. So a True return never skips a
+    real hook, and a False return always falls through to the Python
+    `Plugin.get_*_hook` chain (which is the source of truth).
+    """
+    if (
+        not _native_plugin_hook_has_user_plugins
+        and _native_plugin_hook_registry is not None
+        and callable_name is not None
+        and not _native_plugin_hook_registry.has_hook(callable_name)
+    ):
+        return True
+    return False
 
 
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
@@ -1467,18 +1507,22 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         callee = get_proper_type(callee)
         if callable_name is not None and isinstance(callee, FunctionLike):
-            if object_type is not None:
-                method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
-                if method_sig_hook:
-                    return self.apply_method_signature_hook(
-                        callee, args, arg_kinds, context, arg_names, object_type, method_sig_hook
-                    )
-            else:
-                function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
-                if function_sig_hook:
-                    return self.apply_function_signature_hook(
-                        callee, args, arg_kinds, context, arg_names, function_sig_hook
-                    )
+            # Stage 4: skip the Python plugin chain when the registry can
+            # prove no signature hook matches. Falls through to Python
+            # otherwise (user plugins, registry absent, or a real match).
+            if not plugin_call_hook_known_absent(callable_name):
+                if object_type is not None:
+                    method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
+                    if method_sig_hook:
+                        return self.apply_method_signature_hook(
+                            callee, args, arg_kinds, context, arg_names, object_type, method_sig_hook
+                        )
+                else:
+                    function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
+                    if function_sig_hook:
+                        return self.apply_function_signature_hook(
+                            callee, args, arg_kinds, context, arg_names, function_sig_hook
+                        )
 
         return callee
 
@@ -1643,12 +1687,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         callee = get_proper_type(callee)
 
-        if _HAS_CHECK_CALL_KERNEL and _native_check_call_active:
-            has_star = any(k.is_star() for k in arg_kinds)
-            n_named = sum(1 for k in arg_kinds if k.is_named())
-            n_pos = sum(1 for k in arg_kinds if k == nodes.ARG_POS)
-            callee_bytes = _serialize_type_for_checkexpr(callee)
-            _rust_check_call_fast_path(callee_bytes, n_pos, n_named, has_star)
+        # Stage 4: `rust_check_call_fast_path` was wired here but its
+        # return was discarded (pure FFI overhead). Removed per YAGNI;
+        # classifier logic kept in `checkcall.rs` for the future port.
+        # Functional Stage 4 = plugin-hook snapshot gating `get_*_hook`.
 
         if isinstance(callee, CallableType):
             if callee.variables:
@@ -1965,7 +2007,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Store the inferred callable type.
             self.chk.store_type(callable_node, callee)
 
-        if callable_name and (
+        if callable_name and not plugin_call_hook_known_absent(callable_name) and (
             (object_type is None and self.plugin.get_function_hook(callable_name))
             or (object_type is not None and self.plugin.get_method_hook(callable_name))
         ):

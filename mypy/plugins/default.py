@@ -92,6 +92,47 @@ TD_UPDATE_METHOD_NAMES: Final = (
     | {n + ".__ior__" for n in TPDICT_FB_NAMES}
 )
 
+# Fullnames matched by the four call-related hooks on DefaultPlugin.
+# Stage 4 plugin-hook snapshot: literal equality / finite-set
+# membership (no wildcards). Kept in sync with the get_*_hook methods.
+DEFAULT_CALL_HOOK_FULLNAMES: Final[frozenset[str]] = frozenset(
+    {
+        # get_function_hook
+        "_ctypes.Array",
+        "functools.singledispatch",
+        "functools.partial",
+        "enum.member",
+        "builtins.len",
+        # get_function_signature_hook
+        "attr.evolve",
+        "attrs.evolve",
+        "attr.assoc",
+        "attrs.assoc",
+        "attr.fields",
+        "attrs.fields",
+        "dataclasses.replace",
+        # get_method_signature_hook
+        "typing.Mapping.get",
+        "_ctypes.Array.__setitem__",
+        SINGLEDISPATCH_CALLABLE_CALL_METHOD,
+        # get_method_hook
+        "builtins.int.__pow__",
+        "builtins.int.__neg__",
+        "builtins.int.__pos__",
+        "builtins.tuple.__mul__",
+        "builtins.tuple.__rmul__",
+        "_ctypes.Array.__getitem__",
+        "_ctypes.Array.__iter__",
+        SINGLEDISPATCH_REGISTER_METHOD,
+        SINGLEDISPATCH_REGISTER_CALLABLE_CALL_METHOD,
+        "functools.partial.__call__",
+    }
+    | TD_SETDEFAULT_NAMES
+    | TD_POP_NAMES
+    | TD_DELITEM_NAMES
+    | TD_UPDATE_METHOD_NAMES
+)
+
 
 class DefaultPlugin(Plugin):
     """Type checker plugin that is enabled by default."""
