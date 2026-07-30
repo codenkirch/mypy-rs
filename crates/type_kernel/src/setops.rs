@@ -925,26 +925,6 @@ fn safe_join(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
     None
 }
 
-/// `safe_meet` (meet.py equivalent of safe_join): meet_types for
-/// non-UnpackType pairs. Both-UnpackType needs tuple_fallback lookup
-/// (defer). Mixed -> UninhabitedType. Returns None (defer) if the
-/// underlying meet_types defers.
-#[allow(dead_code)]
-fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
-    let t_unpack = matches!(t, Type::UnpackType { .. });
-    let s_unpack = matches!(s, Type::UnpackType { .. });
-    if !t_unpack && !s_unpack {
-        return setop_result_to_type(meet_types(t, s, ctx, resolver), t, s);
-    }
-    if t_unpack && s_unpack {
-        // meet.py:1082-1093: needs tuple_fallback.type from the
-        // unpacked TypeVarTupleType/TupleType/Instance. Defer.
-        return None;
-    }
-    // Mixed: meet.py:1094 returns UninhabitedType().
-    Some(Type::UninhabitedType)
-}
-
 /// Pick the fallback per join.py:1106-1109 (combine) / 1048-1051
 /// (join_similar): if t.fallback is builtins.function, use t.fallback,
 /// else s.fallback. The "t" here is the second operand (self.s in
@@ -1031,90 +1011,6 @@ fn combine_similar_callables(
     };
     let _ = t;
     let _ = s;
-    encode_callable(new_callable)
-}
-
-/// `join_similar_callables` (join.py:1040-1062): similar-but-not-
-/// equivalent path. Per-arg safe_meet, ret join, instance_type join,
-/// fallback pick. Returns Encoded(new CallableType) or None (defer).
-#[allow(clippy::too_many_arguments, dead_code)]
-fn join_similar_callables(
-    s: &Type,
-    t: &Type,
-    s_arg_types: &[Type],
-    t_arg_types: &[Type],
-    s_ret_type: &Type,
-    t_ret_type: &Type,
-    s_fallback: &Type,
-    t_fallback: &Type,
-    s_instance_type: &Option<Box<Type>>,
-    t_instance_type: &Option<Box<Type>>,
-    s_arg_names: &[Option<String>],
-    t_arg_names: &[Option<String>],
-    s_arg_kinds: &[i64],
-    t_arg_kinds: &[i64],
-    ctx: &SubtypeContext,
-    resolver: &TypeResolver,
-) -> Option<SetOpResult> {
-    let mut new_arg_types = Vec::with_capacity(t_arg_types.len());
-    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
-        new_arg_types.push(safe_meet(ta, sa, ctx, resolver)?);
-    }
-    // join.py:644-647: if any arg type is NoneType or UninhabitedType
-    // (Bottom), the callable is unusable. Python falls back to
-    // join_types(t.fallback, s). Defer so Python handles the fallback.
-    if new_arg_types
-        .iter()
-        .any(|a| matches!(a, Type::NoneType | Type::UninhabitedType))
-    {
-        return None;
-    }
-    let new_ret = setop_result_to_type(
-        join_types(t_ret_type, s_ret_type, ctx, resolver),
-        s_ret_type,
-        t_ret_type,
-    )?;
-    let new_instance_type = match (s_instance_type, t_instance_type) {
-        (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
-            join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
-            si.as_ref(),
-            ti.as_ref(),
-        )?)),
-        _ => None,
-    };
-    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names, t_arg_kinds, s_arg_kinds);
-    let new_fallback = pick_fallback(s_fallback, t_fallback);
-    let (
-        arg_kinds,
-        is_ellipsis_args,
-        implicit,
-        is_bound,
-        from_concatenate,
-        imprecise_arg_kinds,
-        unpack_kwargs,
-        type_guard,
-        type_is,
-    ) = extract_callable_invariants(t);
-    let new_callable = Type::CallableType {
-        fallback: Box::new(new_fallback),
-        instance_type: new_instance_type,
-        is_ellipsis_args,
-        implicit,
-        is_bound,
-        from_concatenate,
-        imprecise_arg_kinds,
-        unpack_kwargs,
-        arg_types: new_arg_types,
-        arg_kinds,
-        arg_names: new_arg_names,
-        ret_type: Box::new(new_ret),
-        name: None,
-        variables: Vec::new(),
-        type_guard,
-        type_is,
-    };
-    let _ = s;
-    let _ = t;
     encode_callable(new_callable)
 }
 

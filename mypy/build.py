@@ -896,7 +896,7 @@ class BuildManager:
         # production wiring lands when `native_type_kernel` defaults on).
         from mypy.subtypes import _set_native_subtype_active
 
-        _set_native_subtype_active(self.options.native_type_kernel)
+        _set_native_subtype_active(False)
         # Stage 3c (M8d): gate the trivial_join/trivial_meet fallbacks.
         # Reuses the same resolver as the subtype path (trivial_* only
         # need is_subtype, which shares NativeTypeResolver).
@@ -943,21 +943,25 @@ class BuildManager:
         from mypy.expandtype import _set_native_expand_type_active
 
         _set_native_expand_type_active(self.options.native_type_kernel)
-        # Stage 3e typeops helpers (parity-only, default-off). Rust returns
-        # None for cases needing live TypeInfo (method lookup, is_final).
+        # Stage 3e typeops helpers DISABLED. They round-trip types through
+        # wire format (make_simplified_union, simple_literal_type,
+        # true_only/false_only/true_or_false). Instance.read creates
+        # NOT_READY FakeInfo entries that pollute the type graph. See #154.
         from mypy.typeops import _set_native_typeops_active
 
-        _set_native_typeops_active(self.options.native_type_kernel)
-        # Stage 15: gate the semanal Type-transformation helpers
-        # (make_any_non_explicit / make_any_non_unimported). Rust returns
-        # None on decode failure, falling back to Python.
+        _set_native_typeops_active(False)
+        # Stage 15: semanal Type-transformation helpers DISABLED.
+        # make_any_non_explicit / make_any_non_unimported round-trip
+        # through wire format, same NOT_READY pollution. See #154.
         from mypy.semanal import _set_native_semanal_active
 
-        _set_native_semanal_active(self.options.native_type_kernel)
-        # Stage 4c: gate erase_typevars (no resolver needed).
+        _set_native_semanal_active(False)
+        # Stage 4c: erase_typevars native path DISABLED. It round-trips
+        # through wire format, and Instance.read creates NOT_READY FakeInfo
+        # entries that pollute the type graph (TypeInfo loss). See #154.
         from mypy.erasetype import _set_native_erase_typevars_active
 
-        _set_native_erase_typevars_active(self.options.native_type_kernel)
+        _set_native_erase_typevars_active(False)
         # Stage 4b: gate constraint solver helpers (no resolver needed).
         from mypy.constraints import _set_native_constraints_active
 
@@ -972,9 +976,11 @@ class BuildManager:
         from mypy.types import _set_native_visitor_active
 
         _set_native_visitor_active(self.options.native_type_kernel)
+        # Stage 3c copy_type DISABLED. Round-trips through wire format,
+        # same NOT_READY pollution as erase_typevars/typeops. See #154.
         from mypy.copytype import _set_native_copy_active
 
-        _set_native_copy_active(self.options.native_type_kernel)
+        _set_native_copy_active(False)
         # Stage 9: gate standalone checker/checkexpr scalar-returning
         # helpers (no resolver needed). Type-returning helpers stay
         # parity-only (_native_checker_types_active).
