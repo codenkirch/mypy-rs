@@ -563,59 +563,6 @@ pub(crate) fn try_getting_literal_inner(typ: &Type) -> Option<Type> {
 }
 
 // ---------------------------------------------------------------------------
-// flatten_types_if_tuple
-// ---------------------------------------------------------------------------
-
-/// `mypy.checker.flatten_types_if_tuple` — flatten a nested sequence of
-/// tuples into one list of types.
-///
-/// Mirrors `flatten_types_if_tuple` (checker.py:9087-9097). Defers on alias.
-/// Returns a list of wire-format type bytes.
-#[pyfunction]
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_flatten_types_if_tuple(type_bytes: &[u8]) -> PyResult<Option<Vec<Vec<u8>>>> {
-    let typ = match decode_type(type_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    let result = match flatten_types_if_tuple_inner(&typ) {
-        Some(r) => r,
-        None => return Ok(None),
-    };
-    let encoded: Vec<Vec<u8>> = result.iter().filter_map(encode_type).collect();
-    Ok(Some(encoded))
-}
-
-pub(crate) fn flatten_types_if_tuple_inner(typ: &Type) -> Option<Vec<Type>> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
-        Type::UnionType { items, .. } => {
-            // Flatten each item, then wrap in a single-element union.
-            let mut flat: Vec<Type> = Vec::new();
-            for t in items {
-                flat.extend(flatten_types_if_tuple_inner(t)?);
-            }
-            Some(vec![Type::UnionType {
-                items: flat,
-                uses_pep604_syntax: false,
-            }])
-        }
-        Type::TupleType { items, .. } => {
-            let mut flat: Vec<Type> = Vec::new();
-            for t in items {
-                flat.extend(flatten_types_if_tuple_inner(t)?);
-            }
-            Some(flat)
-        }
-        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
-            // is_named_instance(t, "builtins.tuple") -> return [t.args[0]]
-            Some(args.first().cloned().map(|t| vec![t]).unwrap_or_default())
-        }
-        _ => Some(vec![proper.clone()]),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // is_string_literal
 // ---------------------------------------------------------------------------
 
@@ -805,27 +752,6 @@ fn all_children(typ: &Type) -> Vec<&Type> {
         out.extend(p.arg_types.iter());
     }
     out
-}
-
-#[pyfunction]
-pub fn rust_check_call_dispatch(callee_bytes: Vec<u8>) -> PyResult<Option<String>> {
-    let t = match decode_type(&callee_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    let proper = match get_proper_or_none(&t) {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    let dispatch_kind = match proper {
-        Type::CallableType { .. } => "callable",
-        Type::Overloaded { .. } => "overloaded",
-        Type::AnyType { .. } => "any",
-        Type::UnionType { .. } => "union",
-        Type::Instance { .. } => "instance",
-        _ => "other",
-    };
-    Ok(Some(dispatch_kind.to_string()))
 }
 
 #[cfg(test)]
@@ -1085,23 +1011,5 @@ mod tests {
             value: LiteralValue::Int(42),
         };
         assert_eq!(is_string_literal_inner(&lit), Some(false));
-    }
-
-    #[test]
-    fn test_flatten_types_if_tuple_simple() {
-        let t = Type::TupleType {
-            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
-            items: vec![make_instance("int", vec![]), make_instance("str", vec![])],
-            implicit: false,
-        };
-        let result = flatten_types_if_tuple_inner(&t).unwrap();
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_flatten_types_if_tuple_non_tuple() {
-        let t = make_instance("int", vec![]);
-        let result = flatten_types_if_tuple_inner(&t).unwrap();
-        assert_eq!(result.len(), 1);
     }
 }

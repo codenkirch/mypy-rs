@@ -1687,9 +1687,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         callee = get_proper_type(callee)
 
-        # Stage 4: `rust_check_call_fast_path` was wired here but its
-        # return was discarded (pure FFI overhead). Removed per YAGNI;
-        # classifier logic kept in `checkcall.rs` for the future port.
+        # Stage 4: the fast-path pyfunction was wired here but its
+        # return was discarded (pure FFI overhead). Removed per YAGNI.
         # Functional Stage 4 = plugin-hook snapshot gating `get_*_hook`.
 
         if isinstance(callee, CallableType):

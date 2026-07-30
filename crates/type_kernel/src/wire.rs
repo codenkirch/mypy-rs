@@ -1619,23 +1619,6 @@ pub(crate) fn read_type_to_str(bytes: &[u8]) -> PyResult<String> {
     Ok(typ.to_string())
 }
 
-/// Parity entry point for Stage 3c M8s: read one serialized `Type` from
-/// `bytes`, then re-encode it via `write_type` and return the resulting
-/// bytes. Lets the Python suite assert
-/// `Type.read(ReadBuffer(rust_bytes)) == Type.read(ReadBuffer(python_bytes))`,
-/// proving the Rust encoder produces bytes Python's `Type.read()` decodes
-/// identically. Unsupported variants raise `ValueError`.
-#[pyfunction]
-pub(crate) fn round_trip_type_bytes(bytes: &[u8]) -> PyResult<Vec<u8>> {
-    let mut rbuf = ReadBuffer::new(bytes);
-    let typ = read_type(&mut rbuf, None)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    let mut wbuf = WriteBuffer::new();
-    write_type(&mut wbuf, &typ)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    Ok(wbuf.into_bytes())
-}
-
 // ---------------------------------------------------------------------------
 // WriteBuffer + write_type (Stage 3c M8s)
 // ---------------------------------------------------------------------------

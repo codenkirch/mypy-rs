@@ -22,13 +22,12 @@
 //!     Stage 3a deferred renderings (prefix-strip, enum/bytes literal,
 //!     `[()]` variadic-tuple). Foundation for Stage 3c (`is_subtype`).
 //!   * **Stage 3c / M8a** (`typeinfo::build_native_resolver` +
-//!     `typeinfo::read_type_to_str_with_native_resolver` +
-//!     `aliases::build_alias_resolver`): enriches the snapshot with
-//!     `bases`, `tuple_type`, `type_var_tuple_prefix/suffix`,
-//!     `type_vars_with_variance`, and adds a `TypeAliasResolver` for
-//!     `TypeAliasType` expansion. The `NativeTypeResolver` `#[pyclass]`
-//!     holds both resolvers in Rust for zero-FFI-per-lookup access by
-//!     Stage 3c `is_subtype`.
+//!     `typeinfo::read_type_to_str_with_native_resolver`): enriches the
+//!     snapshot with `bases`, `tuple_type`,
+//!     `type_var_tuple_prefix/suffix`, `type_vars_with_variance`, and
+//!     adds a `TypeAliasResolver` for `TypeAliasType` expansion. The
+//!     `NativeTypeResolver` `#[pyclass]` holds both resolvers in Rust
+//!     for zero-FFI-per-lookup access by Stage 3c `is_subtype`.
 //!   * **Stage 4** (`argmap::rust_map_actuals_to_formals`): ports the pure
 //!     `mypy.argmap.map_actuals_to_formals` binding step from `check_call`.
 //!     Handles non-star actuals; returns `None` for star actuals so Python
@@ -48,16 +47,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
-mod checkcall;
-mod checker_algebra;
-mod checker_engine;
-mod checkexpr_algebra;
-mod checkexpr_core;
-mod checkexpr_engine;
-mod checkexpr_evaluator;
 mod checkexpr_functions;
-mod checkmember;
-mod checkpattern;
 mod checkstrformat;
 mod constraints;
 mod erase;
@@ -68,21 +58,15 @@ mod lkv;
 mod messages;
 mod mro;
 mod mypyc_port;
-mod nodes;
 mod operators;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
-mod semanal_core;
-mod semanal_pass;
 mod setops;
 mod subtypes;
 mod traverser;
-mod typeanal;
 mod typeinfo;
 mod typeops;
-mod types_codec;
-mod types_engine;
 mod visitor;
 mod wire;
 
@@ -99,13 +83,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
-    module.add_function(wrap_pyfunction!(wire::round_trip_type_bytes, module)?)?;
     module.add_function(wrap_pyfunction!(typeinfo::build_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(
         typeinfo::read_type_to_str_with_resolver,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(aliases::build_alias_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(typeinfo::build_native_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(
         typeinfo::read_type_to_str_with_native_resolver,
@@ -218,10 +200,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
-        checkexpr_functions::rust_flatten_types_if_tuple,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_is_string_literal,
         module
     )?)?;
@@ -244,60 +222,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(nodes::rust_is_builtin_type, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        checkmember::rust_analyze_member_access,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkpattern::rust_is_self_match_type,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkpattern::rust_is_non_sequence_match_type,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        types_codec::rust_is_valid_type_codec_tag,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checker_algebra::rust_is_type_overlap,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        typeanal::rust_is_type_constructor,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(typeanal::rust_is_self_type_name, module)?)?;
-    module.add_function(wrap_pyfunction!(typeanal::rust_make_optional_type, module)?)?;
-    module.add_function(wrap_pyfunction!(typeanal::rust_has_explicit_any, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        typeanal::rust_has_any_from_unimported_type,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        typeanal::rust_collect_all_inner_types,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(typeanal::rust_unknown_unpack, module)?)?;
-    module.add_function(wrap_pyfunction!(typeanal::rust_find_self_type, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_algebra::rust_allow_fast_container_literal,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_algebra::rust_has_erased_component,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_algebra::rust_replace_callable_return_type,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_algebra::rust_all_same_types,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
@@ -344,47 +268,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         mypyc_port::rust_can_subclass_builtin,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_functions::rust_check_call_dispatch,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_engine::rust_infer_binary_op_simple,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        semanal_algebra::rust_clean_up_type_aliases,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        semanal_core::rust_analyze_symbol_table_entry,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_core::rust_check_overload_call_core,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_evaluator::rust_evaluate_binary_expression,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        semanal_pass::rust_run_semanal_pass_check,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        types_engine::rust_types_engine_classify_tag,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checker_engine::rust_checker_engine_evaluate_binop,
-        module
-    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
-    module.add_function(wrap_pyfunction!(
-        checkcall::rust_check_call_fast_path,
-        module
-    )?)?;
     Ok(())
 }
