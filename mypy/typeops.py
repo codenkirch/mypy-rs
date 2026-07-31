@@ -107,6 +107,31 @@ def _set_native_typeops_resolver(resolver: Any) -> None:
     _native_typeops_resolver = resolver
 
 
+def _has_mutated_truthiness(t: Type) -> bool:
+    """Does ``t`` (recursively) carry non-default truthiness flags?
+
+    Wire serialization drops ``can_be_true``/``can_be_false``, so any
+    type whose flags were explicitly mutated (e.g. by ``narrow_declared_type``
+    setting ``can_be_false = False``) would be corrupted by the roundtrip.
+    When this returns True, ``make_simplified_union`` must defer to Python
+    to avoid wrong dedup survivor selection in ``_remove_redundant_union_items``.
+    """
+    # -1 = unset (lazy = default). 0/1 = cached. Lazy init sets
+    # to default; explicit mutation makes it differ. Compare against
+    # default, not != -1, since some types default to False.
+    cbt = t._can_be_true
+    cbf = t._can_be_false
+    if cbt != -1 and bool(cbt) != t.can_be_true_default():
+        return True
+    if cbf != -1 and bool(cbf) != t.can_be_false_default():
+        return True
+    # Recurse into union items (flattened by make_simplified_union).
+    proper = get_proper_type(t)
+    if isinstance(proper, UnionType):
+        return any(_has_mutated_truthiness(item) for item in proper.items)
+    return False
+
+
 def _serialize_type(t: Type) -> bytes:
     buf = _WriteBuffer()
     t.write(buf)
@@ -721,6 +746,7 @@ def make_simplified_union(
         and _native_typeops_active
         and _native_typeops_resolver is not None
         and len(items) > 1
+        and not any(_has_mutated_truthiness(item) for item in items)
     ):
         try:
             result = _type_kernel.rust_make_simplified_union(
