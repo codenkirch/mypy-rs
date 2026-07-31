@@ -81,8 +81,7 @@ from mypy.typevars import fill_typevars
 # is the strangler-fig per-call gate, parity-only and default-off.
 try:
     import type_kernel as _type_kernel
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
 
     from mypy.types import read_type as _read_type
 
@@ -122,8 +121,16 @@ def _serialize_type_list(items: Sequence[Type]) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_type(data: bytes) -> Type:
-    return _read_type(_ReadBuffer(data))
+def _deserialize_type(data: bytes) -> Type | None:
+    """Deserialize wire bytes to a Type, fixing type_ref strings.
+
+    Returns None if any type_ref cannot be resolved to a live TypeInfo
+    (so the caller defers to Python).
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    decoded = _read_type(_ReadBuffer(data))
+    return fixup_wire_type(decoded)
 
 
 def is_recursive_pair(s: Type, t: Type) -> bool:
@@ -661,11 +668,7 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
 
 
 def is_simple_literal(t: ProperType) -> bool:
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_is_simple_literal(
                 _serialize_type(t), _native_typeops_resolver
@@ -948,11 +951,7 @@ def true_only(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_true_only(_serialize_type(t))
             if result is not None:
@@ -991,15 +990,9 @@ def false_only(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
-            result = _type_kernel.rust_false_only(
-                _serialize_type(t), state.strict_optional
-            )
+            result = _type_kernel.rust_false_only(_serialize_type(t), state.strict_optional)
             if result is not None:
                 interpreted = _interpret_truthiness_result(result, t)
                 if interpreted is not None:
@@ -1051,11 +1044,7 @@ def true_or_false(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
-    if (
-        _HAS_TYPE_KERNEL
-        and _native_typeops_active
-        and _native_typeops_resolver is not None
-    ):
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
             result = _type_kernel.rust_true_or_false(_serialize_type(t))
             if result is not None:

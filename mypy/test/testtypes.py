@@ -1709,9 +1709,7 @@ class NativeTypeWireSuite(Suite):
     def test_union(self) -> None:
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.nonet]))
-        self.assert_wire_par(
-            UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet])
-        )
+        self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet]))
 
     def test_overloaded(self) -> None:
         ov = Overloaded(
@@ -1786,9 +1784,7 @@ class NativeTypeWireResolverSuite(Suite):
         actual = _type_kernel.read_type_to_str_with_native_resolver(
             self._bytes_of(t), self.resolver
         )
-        assert_equal(
-            actual, expected, f"wire-resolver str({t!r}) = {{}} ({{}} expected)"
-        )
+        assert_equal(actual, expected, f"wire-resolver str({t!r}) = {{}} ({{}} expected)")
 
     def test_instance_no_args(self) -> None:
         self.assert_wire_par(self.fx.a)
@@ -1837,9 +1833,7 @@ class NativeTypeWireResolverSuite(Suite):
 
     def test_union(self) -> None:
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
-        self.assert_wire_par(
-            UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet])
-        )
+        self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet]))
 
 
 class ShallowOverloadMatchingSuite(Suite):
@@ -3969,7 +3963,6 @@ class NativeMeetTypeVarTupleSuite(Suite):
         with state.strict_optional_set(True):
             assert meet_types(self.fx.a, t) == UninhabitedType()
 
-
     # ---- visit_type_var (M8q) ----
 
     def test_meet_type_var_same_id_same_upper_bound_returns_s(self) -> None:
@@ -4114,9 +4107,7 @@ class NativeMroSuite(Suite):
         d = self._make_class("mymod.D", bases=[Instance(self.oi, [])], mro=None)
         b = self._make_class("mymod.B", bases=[Instance(d, [])], mro=None)
         c = self._make_class("mymod.C", bases=[Instance(d, [])], mro=None)
-        a = self._make_class(
-            "mymod.A", bases=[Instance(b, []), Instance(c, [])], mro=None
-        )
+        a = self._make_class("mymod.A", bases=[Instance(b, []), Instance(c, [])], mro=None)
         self._install_resolver([a, b, c, d, self.oi])
         calculate_mro(a)
         assert self._mro_fullnames(a) == [
@@ -4149,15 +4140,9 @@ class NativeMroSuite(Suite):
 
         a = self._make_class("mymod.Inc.A", bases=[Instance(self.oi, [])], mro=None)
         b = self._make_class("mymod.Inc.B", bases=[Instance(self.oi, [])], mro=None)
-        x = self._make_class(
-            "mymod.Inc.X", bases=[Instance(a, []), Instance(b, [])], mro=None
-        )
-        y = self._make_class(
-            "mymod.Inc.Y", bases=[Instance(b, []), Instance(a, [])], mro=None
-        )
-        z = self._make_class(
-            "mymod.Inc.Z", bases=[Instance(x, []), Instance(y, [])], mro=None
-        )
+        x = self._make_class("mymod.Inc.X", bases=[Instance(a, []), Instance(b, [])], mro=None)
+        y = self._make_class("mymod.Inc.Y", bases=[Instance(b, []), Instance(a, [])], mro=None)
+        z = self._make_class("mymod.Inc.Z", bases=[Instance(x, []), Instance(y, [])], mro=None)
         self._install_resolver([z, x, y, a, b, self.oi])
         with self.assertRaises(MroError):
             calculate_mro(z)
@@ -4181,9 +4166,7 @@ class NativeMroSuite(Suite):
         self._install_resolver([a, b, self.oi])
         # Call the Rust function directly (the shim would defer to Python,
         # which is unsafe for a synthetic cycle).
-        result = _type_kernel.rust_linearize_hierarchy(
-            self._resolver, "mymod.Cyc.A"
-        )
+        result = _type_kernel.rust_linearize_hierarchy(self._resolver, "mymod.Cyc.A")
         assert result is None
 
     def test_obj_type_fallback_edge_defers_to_python(self) -> None:
@@ -4259,9 +4242,7 @@ class NativePluginHookSuite(Suite):
         self._plugin_call_hook_known_absent = plugin_call_hook_known_absent
         self._default_plugin = DefaultPlugin(Options())
         self._fullnames = DEFAULT_CALL_HOOK_FULLNAMES
-        self._registry = _type_kernel.PluginHookRegistry(
-            list(DEFAULT_CALL_HOOK_FULLNAMES)
-        )
+        self._registry = _type_kernel.PluginHookRegistry(list(DEFAULT_CALL_HOOK_FULLNAMES))
         _set_native_plugin_hook_registry(self._registry, has_user_plugins=False)
 
     def tearDown(self) -> None:
@@ -4269,9 +4250,7 @@ class NativePluginHookSuite(Suite):
 
     def test_registry_has_hook_for_every_default_fullname(self) -> None:
         for fullname in self._fullnames:
-            assert self._registry.has_hook(fullname), (
-                f"registry missing {fullname!r}"
-            )
+            assert self._registry.has_hook(fullname), f"registry missing {fullname!r}"
 
     def test_registry_absent_for_unrelated_fullname(self) -> None:
         assert not self._registry.has_hook("builtins.print")
@@ -4318,5 +4297,108 @@ class NativePluginHookSuite(Suite):
             )
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeWireFixupSuite(Suite):
+    """Parity suite for the wire round-trip fixup (#156).
 
+    Serialization to wire format loses live TypeInfo references: decoded
+    Instances carry only a type_ref fullname string and a FakeInfo
+    placeholder. Every kernel returning a wire-decoded Type must run it
+    through mypy.wirefixup before it re-enters the type graph. The four
+    gates re-enabled here (typeops, semanal, erase_typevars, copy_type)
+    were disabled in #155 because unfixed decode crashed production.
+    """
 
+    def setUp(self) -> None:
+        from mypy.applytype import _set_native_applytype_typeinfo_map
+        from mypy.copytype import _set_native_copy_active
+        from mypy.erasetype import _set_native_erase_typevars_active
+        from mypy.semanal import _set_native_semanal_active
+        from mypy.typeops import _set_native_typeops_active
+
+        self.fx = TypeFixture(INVARIANT)
+        typeinfos = []
+        for name in dir(self.fx):
+            if name.endswith("i"):
+                value = getattr(self.fx, name)
+                if _is_type_info(value):
+                    typeinfos.append(value)
+        typeinfo_map = {info.fullname: info for info in typeinfos}
+        # Installs the shared wirefixup map as well.
+        _set_native_applytype_typeinfo_map(typeinfo_map)
+        self._py: list[tuple] = [
+            ("typeops", _set_native_typeops_active),
+            ("semanal", _set_native_semanal_active),
+            ("erase", _set_native_erase_typevars_active),
+            ("copy", _set_native_copy_active),
+        ]
+        for _, setter in self._py:
+            setter(True)
+
+    def tearDown(self) -> None:
+        from mypy.applytype import _set_native_applytype_typeinfo_map
+
+        for _, setter in self._py:
+            setter(False)
+        _set_native_applytype_typeinfo_map(None)
+
+    def _assert_no_fake_info(self, t) -> None:
+        from mypy.wirefixup import check_no_fake_info
+
+        assert check_no_fake_info(t), "wire decode leaked a FakeInfo-bearing Type"
+
+    def test_make_simplified_union_fixes_up_instances(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(False)
+        expected = make_simplified_union([self.fx.b, self.fx.c])
+        _set_native_typeops_active(True)
+        actual = make_simplified_union([self.fx.b, self.fx.c])
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)
+
+    def test_true_only_fixes_up_literal_fallback(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(False)
+        expected = true_only(self.fx.a)
+        _set_native_typeops_active(True)
+        actual = true_only(self.fx.a)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+
+    def test_make_any_non_explicit_fixes_up(self) -> None:
+        from mypy.semanal import _set_native_semanal_active, make_any_non_explicit
+
+        _set_native_semanal_active(False)
+        expected = make_any_non_explicit(AnyType(TypeOfAny.explicit))
+        _set_native_semanal_active(True)
+        actual = make_any_non_explicit(AnyType(TypeOfAny.explicit))
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, AnyType)
+        assert actual.type_of_any == TypeOfAny.special_form
+
+    def test_erase_typevars_fixes_up_typevars_in_instance(self) -> None:
+        from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
+
+        generic = Instance(self.fx.gi, [self.fx.s1])
+        _set_native_erase_typevars_active(False)
+        expected = erase_typevars(generic)
+        _set_native_erase_typevars_active(True)
+        actual = erase_typevars(generic)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, Instance)
+
+    def test_copy_type_fixes_up_instance(self) -> None:
+        from mypy.copytype import _set_native_copy_active, copy_type
+
+        _set_native_copy_active(False)
+        expected = copy_type(self.fx.b)
+        _set_native_copy_active(True)
+        actual = copy_type(self.fx.b)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert actual is not self.fx.b

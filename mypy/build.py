@@ -943,22 +943,22 @@ class BuildManager:
         from mypy.expandtype import _set_native_expand_type_active
 
         _set_native_expand_type_active(self.options.native_type_kernel)
-        # Stage 3e typeops helpers DISABLED. They round-trip types through
-        # wire format (make_simplified_union, simple_literal_type,
-        # true_only/false_only/true_or_false). Instance.read creates
-        # NOT_READY FakeInfo entries that pollute the type graph. See #154.
+        # Stage 3e typeops helpers DISABLED. Wire round-trip fixup works
+        # (no FakeInfo pollution via mypy.wirefixup), but the Rust
+        # make_simplified_union kernel absorbs `Any | C` into `Any`
+        # where Python keeps both. 7 testcheck regressions. See #156.
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(False)
-        # Stage 15: semanal Type-transformation helpers DISABLED.
-        # make_any_non_explicit / make_any_non_unimported round-trip
-        # through wire format, same NOT_READY pollution. See #154.
+        # Stage 15 semanal helpers DISABLED. Wirefixup protection in place,
+        # but deferred pending typeops parity confirmation. See #156.
         from mypy.semanal import _set_native_semanal_active
 
         _set_native_semanal_active(False)
-        # Stage 4c: erase_typevars native path DISABLED. It round-trips
-        # through wire format, and Instance.read creates NOT_READY FakeInfo
-        # entries that pollute the type graph (TypeInfo loss). See #154.
+        # Stage 4c erase_typevars DISABLED. Wirefixup resolves type_ref
+        # strings correctly, but the Rust kernel produces different
+        # join-ordering determinism than Python (testDeterminism...).
+        # See #156.
         from mypy.erasetype import _set_native_erase_typevars_active
 
         _set_native_erase_typevars_active(False)
@@ -976,8 +976,9 @@ class BuildManager:
         from mypy.types import _set_native_visitor_active
 
         _set_native_visitor_active(self.options.native_type_kernel)
-        # Stage 3c copy_type DISABLED. Round-trips through wire format,
-        # same NOT_READY pollution as erase_typevars/typeops. See #154.
+        # Stage 3c copy_type DISABLED. Wirefixup resolves type_ref strings,
+        # but the Rust kernel causes join-ordering determinism divergence
+        # (same root cause as erase_typevars). See #156.
         from mypy.copytype import _set_native_copy_active
 
         _set_native_copy_active(False)
@@ -1243,9 +1244,7 @@ class BuildManager:
         # _plugins is ordered custom-plugins-first, DefaultPlugin last.
         plugins = self.plugin._plugins
         has_user_plugins = len(plugins) > 1
-        registry = _type_kernel.PluginHookRegistry(
-            list(DEFAULT_CALL_HOOK_FULLNAMES)
-        )
+        registry = _type_kernel.PluginHookRegistry(list(DEFAULT_CALL_HOOK_FULLNAMES))
         _set_native_plugin_hook_registry(registry, has_user_plugins)
 
     def dump_stats(self) -> None:
@@ -1665,8 +1664,7 @@ class BuildManager:
             #   * Heap key is *negative* size (so that larger SCCs appear first).
             #   * Each batch must have at least one item.
             #   * Adding another SCC to batch should not exceed maximum allowed size.
-            size_in_batch - self.scc_queue[0][0] <= max_size_in_batch
-            or not batch
+            size_in_batch - self.scc_queue[0][0] <= max_size_in_batch or not batch
         ):
             size_key, _, scc = heappop(self.scc_queue)
             size_in_batch -= size_key
@@ -3350,9 +3348,9 @@ class State:
             assert self.path is not None
             _, data_file, _ = get_cache_names(self.id, self.path, self.manager.options)
         else:
-            assert (
-                self.meta is not None
-            ), "Internal error: this method must be called only for cached modules"
+            assert self.meta is not None, (
+                "Internal error: this method must be called only for cached modules"
+            )
             data_file = self.meta.data_file
 
         data: bytes | dict[str, Any] | None
@@ -3870,9 +3868,9 @@ class State:
         dep_prios = self.dependency_priorities()
         dep_lines = self.dependency_lines()
         assert self.source_hash is not None
-        assert len(set(self.dependencies)) == len(
-            self.dependencies
-        ), f"Duplicates in dependencies list for {self.id} ({self.dependencies})"
+        assert len(set(self.dependencies)) == len(self.dependencies), (
+            f"Duplicates in dependencies list for {self.id} ({self.dependencies})"
+        )
         new_interface_hash, meta_tuple = write_cache(
             self.id,
             self.path,
@@ -4232,7 +4230,7 @@ def module_not_found(
                     errors.report(
                         line,
                         0,
-                        f'Did you mean {pretty_seq(matches, "or")}?',
+                        f"Did you mean {pretty_seq(matches, 'or')}?",
                         severity="note",
                         code=code,
                     )
@@ -4477,7 +4475,7 @@ def dump_line_checking_stats(path: str, graph: Graph) -> None:
             f.write(f"{id}:\n")
             for line in sorted(graph[id].per_line_checking_time_ns):
                 line_time = graph[id].per_line_checking_time_ns[line]
-                f.write(f"{line:>5} {line_time/1000:8.1f}\n")
+                f.write(f"{line:>5} {line_time / 1000:8.1f}\n")
 
 
 def dump_graph(graph: Graph, stdout: TextIO | None = None) -> None:
