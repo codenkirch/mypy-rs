@@ -18,7 +18,6 @@ from mypy.subtypes import (
     is_protocol_implementation,
     is_subtype,
 )
-from mypy.type_visitor import TypeTranslator
 from mypy.types import (
     AnyType,
     CallableType,
@@ -91,85 +90,17 @@ def _set_native_join_active(active: bool) -> None:
 
 
 def _set_native_join_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
-    """Install the fullname -> TypeInfo map for the Ancestor result."""
+    """Install the fullname -> TypeInfo map for the Ancestor result.
+
+    Also installs the same map into the shared wirefixup module so
+    `fixup_wire_type` resolves type_ref strings for all wire-round-trip
+    kernel paths.
+    """
     global _native_join_typeinfo_map
     _native_join_typeinfo_map = typeinfo_map
+    from mypy.wirefixup import set_wire_typeinfo_map
 
-
-def _fixup_decoded_type(typ: Type) -> Type | None:
-    """Resolve `type_ref` strings in a wire-decoded Type to live TypeInfo.
-
-    `read_type` produces Instances whose `type` is `NOT_READY` (a
-    FakeInfo) and whose `type_ref` holds the fullname. This mirrors
-    `fixup.TypeFixer.visit_instance` but consults the fullname ->
-    TypeInfo map held by this module (the same one used for `disc == 5`
-    Ancestor reconstruction), avoiding the need for a full
-    `modules: dict[str, MypyFile]` graph.
-
-    Returns None if any Instance's `type_ref` is absent from the map,
-    so the caller can defer to Python. Mutates Instances in place when
-    possible (each Instance is freshly built by `read_type`, so there
-    is no aliasing risk).
-    """
-    if _native_join_typeinfo_map is None:
-        return None
-    fixer = _TypeRefFixer(_native_join_typeinfo_map)
-    result = typ.accept(fixer)
-    return None if fixer.missing else result
-
-
-class _TypeRefFixer(TypeTranslator):
-    """Resolve wire-decoded `Instance.type_ref` to live TypeInfo in place.
-
-    Overrides only `visit_instance` (and `visit_type_type` to descend
-    into the item); other variants carry no `Instance` references. Sets
-    `self.missing` when a `type_ref` is absent from the map so the
-    caller can defer to Python.
-    """
-
-    def __init__(self, typeinfo_map: dict[str, Any]) -> None:
-        super().__init__()
-        self.typeinfo_map = typeinfo_map
-        self.missing = False
-
-    def visit_instance(self, t: Instance, /) -> Type:
-        if t.type_ref is not None:
-            info = self.typeinfo_map.get(t.type_ref)
-            if info is None:
-                self.missing = True
-                return t
-            t.type = info
-            t.type_ref = None
-        if self.missing:
-            return t
-        return super().visit_instance(t)
-
-    def visit_callable_type(self, t: CallableType, /) -> Type:
-        # The default TypeTranslator.visit_callable_type recurses into
-        # arg_types, ret_type, instance_type, and variables, but NOT
-        # into `t.fallback` (an Instance). The wire-encoded fallback
-        # carries an unresolved `type_ref` that must be fixed here, or
-        # downstream `==` on the decoded CallableType fails.
-        if self.missing:
-            return t
-        fallback = t.fallback.accept(self)
-        if self.missing:
-            return t
-        result = super().visit_callable_type(t)
-        if isinstance(result, CallableType):
-            result = result.copy_modified(fallback=fallback)
-        return result
-
-    def visit_type_type(self, t: TypeType, /) -> Type:
-        if self.missing:
-            return t
-        return super().visit_type_type(t)
-
-    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        # TypeAliasType carries its own `type_ref` -> `alias` fixup,
-        # but the Rust encoder does not emit TypeAliasType today.
-        # Leave it untouched to avoid masking a missing alias.
-        return t
+    set_wire_typeinfo_map(typeinfo_map)
 
 
 def _set_native_join_resolver(resolver: Any) -> None:
@@ -446,7 +377,9 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # TypeInfo via the fullname -> TypeInfo map. If any
                 # type_ref is missing, defer to Python.
                 decoded = read_type(_ReadBuffer(bytes(encoded)))
-                fixed = _fixup_decoded_type(decoded)
+                from mypy.wirefixup import fixup_wire_type
+
+                fixed = fixup_wire_type(decoded)
                 if fixed is not None:
                     return fixed
                 # Fall through to Python.
@@ -463,10 +396,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # [i] is 0 (s.args[i]), 1 (t.args[i]), or 4 (AnyType).
                 # Covariant args yield 0/1 (SameS/SameT on equal args);
                 # invariant equivalent args yield 0/1; AnyType yields 4.
-                if (
-                    _native_join_typeinfo_map is None
-                    or fullname not in _native_join_typeinfo_map
-                ):
+                if _native_join_typeinfo_map is None or fullname not in _native_join_typeinfo_map:
                     # Fall through to Python.
                     pass
                 else:
@@ -482,9 +412,11 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                         elif ad == 4:
                             # AnyType(from_another_any, source): mirror
                             # join.py:131-135, pick the AnyType side.
-                            src = s_args[i] if isinstance(
-                                get_proper_type(s_args[i]), AnyType
-                            ) else t_args[i]
+                            src = (
+                                s_args[i]
+                                if isinstance(get_proper_type(s_args[i]), AnyType)
+                                else t_args[i]
+                            )
                             new_args.append(
                                 AnyType(TypeOfAny.from_another_any, get_proper_type(src))
                             )

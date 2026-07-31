@@ -71,8 +71,12 @@ def copy_type(t: ProperType) -> ProperType:
             t.write(buf)
             result = _rust_copy_type(buf.getvalue())
             if result is not None:
+                from mypy.wirefixup import fixup_wire_type
+
                 rbuf = _CopyReadBuffer(result)
-                return _copy_read_type(rbuf)  # type: ignore[return-value]
+                decoded = fixup_wire_type(_copy_read_type(rbuf))
+                if decoded is not None:
+                    return cast(ProperType, decoded)
         except (AssertionError, NotImplementedError, TypeError, ValueError):
             pass
     return t.accept(TypeShallowCopier())

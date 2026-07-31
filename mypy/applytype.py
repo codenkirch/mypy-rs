@@ -6,7 +6,7 @@ from typing import Any
 import mypy.subtypes
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type
-from mypy.nodes import ARG_STAR, Context, FakeInfo, TypeInfo
+from mypy.nodes import Context, TypeInfo
 from mypy.type_visitor import TypeTranslator
 from mypy.typeops import get_all_type_vars
 from mypy.types import (
@@ -21,7 +21,6 @@ from mypy.types import (
     TupleType,
     Type,
     TypeAliasType,
-    TypeType,
     TypeVarId,
     TypeVarLikeType,
     TypeVarTupleType,
@@ -41,10 +40,12 @@ import mypy.type_visitor  # ruff: isort: skip
 # This is the strangler-fig per-call gate.
 try:
     import type_kernel as _type_kernel
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
-    from librt.internal import write_int as _write_int_bare
-    from librt.internal import write_tag as _write_tag
+    from librt.internal import (
+        ReadBuffer as _ReadBuffer,
+        WriteBuffer as _WriteBuffer,
+        write_int as _write_int_bare,
+        write_tag as _write_tag,
+    )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -73,6 +74,9 @@ def _set_native_applytype_resolver(resolver: Any) -> None:
 def _set_native_applytype_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
     global _native_applytype_typeinfo_map
     _native_applytype_typeinfo_map = typeinfo_map
+    from mypy.wirefixup import set_wire_typeinfo_map
+
+    set_wire_typeinfo_map(typeinfo_map)
 
 
 def _serialize_type(t: Type) -> bytes:
@@ -91,130 +95,6 @@ def _serialize_optional_type_list(types: Sequence[Type | None]) -> bytes:
             _write_tag(buf, 1)
             t.write(buf)
     return buf.getvalue()
-
-
-class _TypeRefFixer(mypy.type_visitor.TypeTranslator):
-    def __init__(self, typeinfo_map: dict[str, Any]) -> None:
-        super().__init__()
-        self.typeinfo_map = typeinfo_map
-        self.missing = False
-
-    def visit_instance(self, t: Instance, /) -> Type:
-        # Wire compact tags (INSTANCE_STR etc.) return SHARED cached
-        # Instances, so never mutate `t` in place: fix the copy that
-        # super() builds instead.
-        result = super().visit_instance(t)
-        if self.missing:
-            return t
-        if t.type_ref is not None:
-            info = self.typeinfo_map.get(t.type_ref)
-            if info is None:
-                self.missing = True
-                return t
-            if isinstance(result, Instance):
-                result.type = info
-                result.type_ref = None
-        if isinstance(result, Instance) and result.extra_attrs is not None:
-            attrs = {k: v.accept(self) for k, v in result.extra_attrs.attrs.items()}
-            if self.missing:
-                return t
-            extra = result.extra_attrs.copy()
-            extra.attrs = attrs
-            result.extra_attrs = extra
-        return result
-
-    def visit_callable_type(self, t: CallableType, /) -> Type:
-        if self.missing:
-            return t
-        fallback = t.fallback.accept(self)
-        if self.missing:
-            return t
-        result = super().visit_callable_type(t)
-        if not isinstance(result, CallableType):
-            return result
-        # translate_variables returns vars as-is (base translator
-        # skips them). Visit each variable so upper_bound/values
-        # get TypeInfo fixed up.
-        variables = [v.accept(self) for v in result.variables]
-        if self.missing:
-            return t
-        # Base translator also skips type_guard/type_is.
-        type_guard = None
-        if t.type_guard is not None:
-            tg = t.type_guard.accept(self)
-            if self.missing:
-                return t
-            type_guard = tg
-        type_is = None
-        if t.type_is is not None:
-            ti = t.type_is.accept(self)
-            if self.missing:
-                return t
-            type_is = ti
-        return result.copy_modified(
-            fallback=fallback,
-            variables=variables,
-            type_guard=type_guard,
-            type_is=type_is,
-        )
-
-    def visit_type_type(self, t: TypeType, /) -> Type:
-        if self.missing:
-            return t
-        return super().visit_type_type(t)
-
-    def visit_type_var(self, t: TypeVarType, /) -> Type:
-        if self.missing:
-            return t
-        upper_bound = t.upper_bound.accept(self)
-        if self.missing:
-            return t
-        values = [v.accept(self) for v in t.values]
-        if self.missing:
-            return t
-        default = t.default.accept(self)
-        if self.missing:
-            return t
-        return t.copy_modified(upper_bound=upper_bound, values=values, default=default)
-
-    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
-        if self.missing:
-            return t
-        default = t.default.accept(self)
-        if self.missing:
-            return t
-        prefix = t.prefix.accept(self)
-        if self.missing:
-            return t
-        assert isinstance(prefix, Parameters)
-        # copy_modified keeps upper_bound (it is determined by flavor).
-        return t.copy_modified(default=default, prefix=prefix)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
-        if self.missing:
-            return t
-        tuple_fallback = t.tuple_fallback.accept(self)
-        if self.missing:
-            return t
-        upper_bound = t.upper_bound.accept(self)
-        if self.missing:
-            return t
-        default = t.default.accept(self)
-        if self.missing:
-            return t
-        result = t.copy_modified(upper_bound=upper_bound, default=default)
-        # copy_modified keeps tuple_fallback; swap it on the fresh copy.
-        assert isinstance(result, TypeVarTupleType)
-        result.tuple_fallback = tuple_fallback
-        return result
-
-    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        if self.missing:
-            return t
-        args = [a.accept(self) for a in t.args]
-        if self.missing:
-            return t
-        return t.copy_modified(args=args)
 
 
 # Wire codec drops TypeVarId.meta_level. Collector snapshots meta_level
@@ -325,59 +205,6 @@ class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list]):
             if extra is not None:
                 extra.accept(self)
         return result
-
-
-class _FakeInfoGuard(mypy.type_visitor.TypeQuery[bool]):
-    """Detect residual fake TypeInfos (unfixed wire type_refs) in a tree."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        # Decoded aliases have no alias node to expand.
-        self.skip_alias_target = True
-        # Instance.__hash__ dereferences `.type`, which raises on fake
-        # infos, so track visited instances by id() instead.
-        self.seen_instance_ids: set[int] = set()
-
-    def strategy(self, items: list[bool]) -> bool:
-        return any(items)
-
-    def visit_instance(self, t: Instance, /) -> bool:
-        # `type()` bypasses FakeInfo.__getattribute__, which raises.
-        if type(t.type) is FakeInfo:
-            return True
-        if id(t) in self.seen_instance_ids:
-            return False
-        self.seen_instance_ids.add(id(t))
-        result = super().visit_instance(t)
-        if result:
-            return True
-        if t.extra_attrs is not None:
-            return any(v.accept(self) for v in t.extra_attrs.attrs.values())
-        return False
-
-    def visit_callable_type(self, t: CallableType, /) -> bool:
-        # Base TypeQuery skips fallback, variables, type_guard, type_is.
-        if super().visit_callable_type(t):
-            return True
-        if t.fallback.accept(self):
-            return True
-        if any(v.accept(self) for v in t.variables):
-            return True
-        return bool(
-            (t.type_guard is not None and t.type_guard.accept(self))
-            or (t.type_is is not None and t.type_is.accept(self))
-        )
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> bool:
-        # Base TypeQuery skips tuple_fallback.
-        if super().visit_type_var_tuple(t):
-            return True
-        return t.tuple_fallback.accept(self)
-
-
-def _check_no_fake_info(t: Type) -> bool:
-    """Return True when the tree has no residual fake TypeInfos."""
-    return not t.accept(_FakeInfoGuard())
 
 
 def get_target_type(
@@ -507,13 +334,17 @@ def apply_generic_arguments(
                             definition=callable.definition,
                         )
                     if _native_applytype_typeinfo_map is not None:
-                        fixer = _TypeRefFixer(_native_applytype_typeinfo_map)
-                        fixed = decoded.accept(fixer)
-                        if not fixer.missing:
+                        from mypy.wirefixup import (
+                            check_no_fake_info,
+                            fixup_wire_type,
+                        )
+
+                        fixed = fixup_wire_type(decoded)
+                        if fixed is not None:
                             assert isinstance(fixed, CallableType)
                             # Any residual fake TypeInfo crashes later
                             # serialization, so defer instead.
-                            if _check_no_fake_info(fixed):
+                            if check_no_fake_info(fixed):
                                 return fixed
                     else:
                         assert isinstance(decoded, CallableType)

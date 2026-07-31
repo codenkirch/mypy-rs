@@ -407,7 +407,10 @@ pub(crate) fn rust_make_simplified_union(
         contract_literals,
         handle_recursive,
     );
-    let ctx = SubtypeContext::new(false, false, false, true, false, true);
+    // Match Python's _remove_redundant_union_items which calls
+    // is_proper_subtype. proper_subtype=True prevents Any-absorption:
+    // Instance is NOT <: AnyType, so Any | C is preserved.
+    let ctx = SubtypeContext::new(false, false, false, true, true, true);
     let result = setops::make_simplified_union(&items, &ctx, resolver.resolver())?;
     encode_type(&result)
 }

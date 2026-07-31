@@ -375,12 +375,14 @@ _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 # Rust returns None for types it cannot handle (decode failure),
 # falling back to the pure-Python TrivialSyntheticTypeTranslator.
 try:
-    from type_kernel import rust_make_any_non_explicit as _rust_make_any_non_explicit
-    from type_kernel import rust_make_any_non_unimported as _rust_make_any_non_unimported
-    from librt.internal import WriteBuffer as _SemanalWriteBuffer
-    from librt.internal import ReadBuffer as _SemanalReadBuffer
+    from librt.internal import ReadBuffer as _SemanalReadBuffer, WriteBuffer as _SemanalWriteBuffer
+    from type_kernel import (
+        rust_make_any_non_explicit as _rust_make_any_non_explicit,
+        rust_make_any_non_unimported as _rust_make_any_non_unimported,
+    )
 
     from mypy.types import read_type as _semanal_read_type
+    from mypy.wirefixup import fixup_wire_type
 
     _SEMANAL_HAS_KERNEL = True
 except ImportError:
@@ -801,9 +803,9 @@ class SemanticAnalyzer(
                     "builtins.dict", [str_type, AnyType(TypeOfAny.special_form)]
                 )
                 if inst is None:
-                    assert (
-                        not self.final_iteration
-                    ), "Cannot find builtins.dict to add __annotations__"
+                    assert not self.final_iteration, (
+                        "Cannot find builtins.dict to add __annotations__"
+                    )
                     self.defer()
                     return
                 typ = inst
@@ -1903,9 +1905,9 @@ class SemanticAnalyzer(
             if self.is_defined_type_param(p.name):
                 self.fail(f'"{p.name}" already defined as a type parameter', context)
             else:
-                assert self.add_symbol(
-                    p.name, tv, context, no_progress=True, type_param=True
-                ), "Type parameter should not be discarded"
+                assert self.add_symbol(p.name, tv, context, no_progress=True, type_param=True), (
+                    "Type parameter should not be discarded"
+                )
 
         return tvs
 
@@ -7544,9 +7546,9 @@ class SemanticAnalyzer(
                             names = self.globals
                         else:
                             names_candidate = self.locals[-1 - i]
-                            assert (
-                                names_candidate is not None
-                            ), "Escaping comprehension from invalid scope"
+                            assert names_candidate is not None, (
+                                "Escaping comprehension from invalid scope"
+                            )
                             names = names_candidate
                         break
                 else:
@@ -8342,8 +8344,10 @@ def make_any_non_explicit(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_explicit(data)
             if result is not None:
-                buf = _SemanalReadBuffer(result)
-                return _semanal_read_type(buf)
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
+                if decoded is not None:
+                    return decoded
         except (AssertionError, NotImplementedError):
             pass
     return t.accept(MakeAnyNonExplicit())
@@ -8366,8 +8370,10 @@ def make_any_non_unimported(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_unimported(data)
             if result is not None:
-                buf = _SemanalReadBuffer(result)
-                return _semanal_read_type(buf)
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
+                if decoded is not None:
+                    return decoded
         except (AssertionError, NotImplementedError):
             pass
     return t.accept(MakeAnyNonUnimported())

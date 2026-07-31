@@ -57,10 +57,12 @@ import mypy.type_visitor  # ruff: isort: skip
 # visitor. This is the strangler-fig per-call gate.
 try:
     import type_kernel as _type_kernel
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
-    from librt.internal import write_int as _write_int_bare
-    from librt.internal import write_str as _write_str_tagged
+    from librt.internal import (
+        ReadBuffer as _ReadBuffer,
+        WriteBuffer as _WriteBuffer,
+        write_int as _write_int_bare,
+        write_str as _write_str_tagged,
+    )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -100,9 +102,16 @@ def _set_native_expand_type_resolver(resolver: Any) -> None:
 
 
 def _set_native_expand_type_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
-    """Install the fullname -> TypeInfo map for type_ref resolution."""
+    """Install the fullname -> TypeInfo map for type_ref resolution.
+
+    Delegates to the shared wirefixup module. Kept for build.py
+    compatibility (build.py calls this alongside the join setter).
+    """
     global _native_expand_type_typeinfo_map
     _native_expand_type_typeinfo_map = typeinfo_map
+    from mypy.wirefixup import set_wire_typeinfo_map
+
+    set_wire_typeinfo_map(typeinfo_map)
 
 
 def _serialize_type(t: Type) -> bytes:
@@ -126,90 +135,6 @@ def _serialize_env(env: Mapping[TypeVarId, Type]) -> bytes:
         _write_str_tagged(buf, tv_id.namespace)
         typ.write(buf)
     return buf.getvalue()
-
-
-class _TypeRefFixer(mypy.type_visitor.TypeTranslator):
-    """Resolve wire-decoded `Instance.type_ref` to live TypeInfo in place.
-
-    Mirrors `join._TypeRefFixer`: `read_type` produces Instances whose
-    `type` is `NOT_READY` and whose `type_ref` holds the fullname. Sets
-    `self.missing` when a `type_ref` is absent from the map so the caller
-    can defer to Python.
-    """
-
-    def __init__(self, typeinfo_map: dict[str, Any]) -> None:
-        super().__init__()
-        self.typeinfo_map = typeinfo_map
-        self.missing = False
-
-    def visit_instance(self, t: Instance, /) -> Type:
-        if t.type_ref is not None:
-            info = self.typeinfo_map.get(t.type_ref)
-            if info is None:
-                self.missing = True
-                return t
-            t.type = info
-            t.type_ref = None
-        if self.missing:
-            return t
-        return super().visit_instance(t)
-
-    def visit_callable_type(self, t: CallableType, /) -> Type:
-        if self.missing:
-            return t
-        fallback = t.fallback.accept(self)
-        if self.missing:
-            return t
-        result = super().visit_callable_type(t)
-        if isinstance(result, CallableType):
-            result = result.copy_modified(fallback=fallback)
-        return result
-
-    def visit_type_type(self, t: TypeType, /) -> Type:
-        if self.missing:
-            return t
-        return super().visit_type_type(t)
-
-    def visit_type_var(self, t: TypeVarType, /) -> Type:
-        # TypeTranslator.visit_type_var returns `t` WITHOUT visiting
-        # upper_bound/values. The Rust expand_type path produces
-        # TypeVarTypes whose upper_bound Instances carry unresolved
-        # type_ref strings, so we must traverse them here.
-        if self.missing:
-            return t
-        upper_bound = t.upper_bound.accept(self)
-        if self.missing:
-            return t
-        values = [v.accept(self) for v in t.values]
-        if self.missing:
-            return t
-        return t.copy_modified(upper_bound=upper_bound, values=values)
-
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
-        # Same issue: TypeTranslator.visit_type_var_tuple returns `t`
-        # without visiting tuple_fallback (an Instance).
-        if self.missing:
-            return t
-        tuple_fallback = t.tuple_fallback.accept(self)
-        if self.missing:
-            return t
-        return t.copy_modified(tuple_fallback=tuple_fallback)
-
-    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        return t
-
-
-def _fixup_decoded_type(typ: Type) -> Type | None:
-    """Resolve `type_ref` strings in a wire-decoded Type to live TypeInfo.
-
-    Returns None if any Instance's `type_ref` is absent from the map, so
-    the caller can defer to Python. Mirrors `join._fixup_decoded_type`.
-    """
-    if _native_expand_type_typeinfo_map is None:
-        return None
-    fixer = _TypeRefFixer(_native_expand_type_typeinfo_map)
-    result = typ.accept(fixer)
-    return None if fixer.missing else result
 
 
 @overload
@@ -245,7 +170,9 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
             )
             if result is not None:
                 decoded = read_type(_ReadBuffer(bytes(result)))
-                fixed = _fixup_decoded_type(decoded)
+                from mypy.wirefixup import fixup_wire_type
+
+                fixed = fixup_wire_type(decoded)
                 if fixed is not None:
                     return fixed
         except (NotImplementedError, AssertionError):

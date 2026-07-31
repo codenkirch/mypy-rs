@@ -49,13 +49,17 @@ from mypy.typevartuples import erased_vars
 # TypeAliasType/UnboundType/TypeVarTuple-copy_modified cases, Python falls
 # back to the pure-Python TypeVarEraser visitor.
 try:
-    from type_kernel import erase_type as _rust_erase_type
-    from type_kernel import remove_instance_last_known_values as _rust_remove_lkv
-    from type_kernel import rust_erase_typevars as _rust_erase_typevars
-    from type_kernel import rust_replace_meta_vars as _rust_replace_meta_vars
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
-    from librt.internal import write_int as _write_int_bare
+    from librt.internal import (
+        ReadBuffer as _ReadBuffer,
+        WriteBuffer as _WriteBuffer,
+        write_int as _write_int_bare,
+    )
+    from type_kernel import (
+        erase_type as _rust_erase_type,
+        remove_instance_last_known_values as _rust_remove_lkv,
+        rust_erase_typevars as _rust_erase_typevars,
+        rust_replace_meta_vars as _rust_replace_meta_vars,
+    )
 
     from mypy.cache import write_str as _write_str_tagged
     from mypy.types import read_type as _read_type
@@ -122,8 +126,14 @@ def _serialize_typevar_ids(ids: Container[TypeVarId] | None) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_type(data: bytes) -> Type:
-    return _read_type(_ReadBuffer(data))
+def _deserialize_type(data: bytes) -> Type | None:
+    """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
+
+    Returns None when a type_ref is unresolvable so callers defer to Python.
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    return fixup_wire_type(_read_type(_ReadBuffer(data)))
 
 
 def erase_type(typ: Type) -> ProperType:
@@ -245,7 +255,9 @@ def erase_typevars(t: Type, ids_to_erase: Container[TypeVarId] | None = None) ->
             ids_bytes = _serialize_typevar_ids(ids_to_erase)
             result = _rust_erase_typevars(type_bytes, ids_bytes)
             if result is not None:
-                return _deserialize_type(bytes(result))
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
         except (AssertionError, NotImplementedError):
             pass
     if ids_to_erase is None:
@@ -269,7 +281,9 @@ def replace_meta_vars(t: Type, target_type: Type) -> Type:
             target_bytes = _serialize_type(target_type)
             result = _rust_replace_meta_vars(type_bytes, target_bytes)
             if result is not None:
-                return _deserialize_type(bytes(result))
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
         except (AssertionError, NotImplementedError):
             pass
     return t.accept(TypeVarEraser(erase_meta_id, target_type))
