@@ -24,19 +24,17 @@ identifies them.
 
 from __future__ import annotations
 
+from librt.internal import (
+    write_int as write_int_bare,
+)
+
 from mypy import nodes
 from mypy.cache import (
-    DICT_STR_GEN,
     END_TAG,
     LIST_GEN,
     LITERAL_NONE,
-    ReadBuffer,
     WriteBuffer,
     write_tag,
-)
-from librt.internal import (
-    read_int as read_int_bare,
-    write_int as write_int_bare,
 )
 
 # Build the tag lookup: class name -> tag value.
@@ -173,6 +171,9 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
         write_tag(buf, LITERAL_NONE)
         return
 
+    # Track visited nodes to break cycles (e.g. NameExpr.node → FuncDef
+    # → body → NameExpr). Re-serialized nodes write LITERAL_NONE.
+    visited: set[int] = set()
     # Task stack: ("end",), ("none",), ("list", items), ("node", node)
     stack: list = [("node", node)]
     while stack:
@@ -195,9 +196,14 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             n = task[1]
             cls = type(n)
             tag = _NODE_TAGS.get(cls)
-            if tag is None:
+            if tag is None or isinstance(n, nodes.TypeInfo):
                 write_tag(buf, LITERAL_NONE)
                 continue
+            # Break cycles: skip already-visited nodes.
+            if id(n) in visited:
+                write_tag(buf, LITERAL_NONE)
+                continue
+            visited.add(id(n))
             write_tag(buf, tag)
             slots = _get_all_slots(cls)
 
