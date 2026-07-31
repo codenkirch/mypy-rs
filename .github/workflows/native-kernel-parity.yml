@@ -4,8 +4,8 @@ name: native-kernel-parity
 # with TEST_NATIVE_TYPE_KERNEL=1 and the Stage 3c resolvers installed.
 # Resolver install lives in mypy/test/conftest.py, not in build.py.
 
-# STATUS: non-gating. The join kernel (setops.rs) has ~173 pre-existing
-# failures with resolvers installed (issue #70). Gating once #70 closes.
+# STATUS: gating. The join-kernel blocker (issue #70) is closed; the corpus
+# passes 8205/0 on current main. Keep green before merging.
 
 on:
   pull_request:
@@ -19,6 +19,9 @@ on:
       - mypy/mro.py
       - mypy/build.py
       - mypy/test/conftest.py
+      - mypy/checkexpr.py
+      - mypy/test/testcheck.py
+      - mypy/test/testinfer.py
       - .github/workflows/native-kernel-parity.yml
   workflow_dispatch:
 
@@ -32,7 +35,6 @@ concurrency:
 jobs:
   parity:
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
