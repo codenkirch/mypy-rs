@@ -22,7 +22,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import module_resolver
+# The compiled Rust extension is environment-dependent (built for a
+# specific interpreter). Degrade to the Python resolver when absent.
+try:
+    import module_resolver
+except ImportError:  # pragma: no cover - extension missing
+    module_resolver = None  # type: ignore[assignment]
 
 from mypy.fscache import FileSystemCache
 from mypy.modulefinder import ModuleNotFoundReason

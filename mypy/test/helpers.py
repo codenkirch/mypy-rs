@@ -409,6 +409,11 @@ def parse_options(
         options.error_summary = False
         options.hide_error_codes = True
 
+    # The native parser/resolver need compiled Rust extensions (ast_serialize,
+    # module_resolver) that may be absent; opt in via env vars like testcheck.
+    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+    options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+
     # Allow custom python version to override testfile_pyversion.
     if all(flag.split("=")[0] != "--python-version" for flag in flag_list):
         options.python_version = testfile_pyversion(testcase.file)

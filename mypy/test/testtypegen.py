@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 from mypy import build
@@ -36,6 +37,8 @@ class TypeExportSuite(DataSuite):
             options.preserve_asts = True
             options.allow_empty_bodies = True
             options.reveal_verbose_types = True
+            options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+            options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
             result = build.build(
                 sources=[BuildSource("main", None, src)],
                 options=options,
