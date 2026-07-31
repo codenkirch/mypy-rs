@@ -79,3 +79,12 @@ jobs:
 
       - name: Python subtypes baseline (pre-Stage-3c)
         run: uv run python -m pytest mypy/test/testsubtypes.py -q
+
+      - name: Python check_call argmap parity (native-on)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+        run: uv run python -m pytest mypy/test/testinfer.py -q
+
+      - name: Python check_call argmap baseline (native-off)
+        run: uv run python -m pytest mypy/test/testinfer.py -q
