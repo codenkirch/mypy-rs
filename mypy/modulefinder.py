@@ -410,7 +410,15 @@ class FindModuleCache:
         each fine-grained increment, and ``FileSystemCache.flush()`` flushes
         the shared FS caches, so both stay consistent within a transaction.
         """
-        return self.options is not None and self.options.native_resolver and not self.options.bazel
+        # The compiled `module_resolver` extension is only present on
+        # interpreters where it was built; fall back to the Python resolver.
+        if not self.options or not self.options.native_resolver or self.options.bazel:
+            return False
+        try:
+            import module_resolver  # noqa: F401
+        except ImportError:
+            return False
+        return True
 
     def _ensure_native_resolver(self) -> None:
         """Lazily construct the long-lived ``NativeResolver`` if not yet built.

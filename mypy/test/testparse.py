@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 
 from pytest import skip
@@ -39,6 +40,9 @@ def test_parser(testcase: DataDrivenTestCase) -> None:
     """
     options = Options()
     options.hide_error_codes = True
+    # The native parser requires the ast_serialize extension built for this
+    # interpreter; fall back to the Python parser unless explicitly requested.
+    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
 
     if testcase.file.endswith("python310.test"):
         options.python_version = (3, 10)

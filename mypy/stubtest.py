@@ -2394,6 +2394,9 @@ def test_stubs(args: _Arguments, use_builtins_fixtures: bool = False) -> int:
     options.show_traceback = args.show_traceback
     options.pdb = args.pdb
     options.pos_only_special_methods = False
+    # The native parser requires the ast_serialize extension built for this
+    # interpreter; fall back to the Python parser unless explicitly requested.
+    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
 
     if options.config_file:
 

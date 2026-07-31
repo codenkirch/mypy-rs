@@ -24,6 +24,8 @@ class RefInfoSuite(DataSuite):
         options.show_traceback = True
         options.export_ref_info = True  # This is the flag we are testing
         options.sqlite_cache = False
+        options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+        options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
 
         src = "\n".join(testcase.input)
         result = build.build(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from mypy import build
 from mypy.errors import CompileError
 from mypy.modulefinder import BuildSource
@@ -27,6 +29,8 @@ def test_error_stream(testcase: DataDrivenTestCase) -> None:
     options = Options()
     options.show_traceback = True
     options.hide_error_codes = True
+    options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+    options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
 
     logged_messages: list[str] = []
 

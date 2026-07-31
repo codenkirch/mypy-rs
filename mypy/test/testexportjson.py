@@ -33,6 +33,8 @@ class TypeExportSuite(DataSuite):
             options.allow_empty_bodies = True
             options.fixed_format_cache = True
             options.sqlite_cache = False
+            options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
+            options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
             fnam = os.path.join(self.base_path, "main.py")
             with open(fnam, "w") as f:
                 f.write(src)
