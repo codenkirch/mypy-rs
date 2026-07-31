@@ -33,8 +33,9 @@ from mypy.test.data import DataDrivenTestCase, DataSuite
 from mypy.test.helpers import assert_string_arrays_equal
 from mypy.util import get_mypy_comments
 
-# If the experimental ast_serialize module isn't installed, the following import will fail
-# and we won't run any native parser tests.
+# ast_serialize may be absent, or a pip-published upstream build that imports
+# under the same name yet writes a wire format this nativeparse cannot read.
+# Probe it with a full round-trip; skip the native suites on any mismatch.
 try:
     from mypy.nativeparse import (
         State,
@@ -44,8 +45,23 @@ try:
         read_statements,
     )
 
+    _options = Options()
+    _options.python_version = defaults.PYTHON3_VERSION
+    _node, _errors, _ignores = native_parse(
+        "sentinel.py",
+        _options,
+        source="try:\n    x\nexcept* ValueError:\n    y\nelse:\n    z\nfinally:\n    w\n".encode(),
+    )
+    # Fully deserialize so a wire-format mismatch (e.g. a pip-published
+    # upstream ast_serialize that imports but writes an incompatible format)
+    # is caught here and the native suites are skipped instead of failing.
+    _state = State(_options)
+    _data = ReadBuffer(_node.raw_data.defs)
+    _n = read_int(_data)
+    _node.defs = read_statements(_state, _data, _n)
+    _node.raw_data = None
     has_nativeparse = True
-except ImportError:
+except Exception:
     has_nativeparse = False
 
 

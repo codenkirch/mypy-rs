@@ -31,6 +31,7 @@ def test_error_stream(testcase: DataDrivenTestCase) -> None:
     options.hide_error_codes = True
     options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
     options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+    options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
 
     logged_messages: list[str] = []
 

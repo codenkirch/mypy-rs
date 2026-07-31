@@ -35,6 +35,7 @@ class TypeExportSuite(DataSuite):
             options.sqlite_cache = False
             options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
             options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+            options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
             fnam = os.path.join(self.base_path, "main.py")
             with open(fnam, "w") as f:
                 f.write(src)

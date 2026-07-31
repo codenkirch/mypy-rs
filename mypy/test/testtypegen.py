@@ -39,6 +39,7 @@ class TypeExportSuite(DataSuite):
             options.reveal_verbose_types = True
             options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
             options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+            options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
             result = build.build(
                 sources=[BuildSource("main", None, src)],
                 options=options,

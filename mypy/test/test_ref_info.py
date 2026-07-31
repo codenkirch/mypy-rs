@@ -26,6 +26,7 @@ class RefInfoSuite(DataSuite):
         options.sqlite_cache = False
         options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
         options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+        options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
 
         src = "\n".join(testcase.input)
         result = build.build(
