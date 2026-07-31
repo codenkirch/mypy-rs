@@ -8,15 +8,16 @@ TypeInfo objects before the result can re-enter the type graph, or
 FakeInfo.__getattribute__ raises AssertionError downstream.
 
 This module provides the shared `_TypeRefFixer` (a TypeTranslator that
-resolves type_ref strings to live TypeInfo) and `_fixup_wire_type` (the
+resolves type_ref strings to live TypeInfo) and `fixup_wire_type` (the
 convenience entry point). The fixer defers to Python (returns None) when
 any type_ref is absent from the fullname -> TypeInfo map, so callers
 can fall back gracefully.
 
-Previously duplicated in join.py, expandtype.py, and applytype.py.
-The applytype version is the superset: it does NOT mutate Instances in
-place (wire compact tags INSTANCE_STR etc. return shared cached objects,
-so in-place mutation would corrupt the cache for all future callers).
+The fixer mutates Instances in place. This is intentional: wire compact
+tags (INSTANCE_STR etc.) return shared cached Instance objects, so
+mutating the cache entry resolves it for all future callers. Without
+in-place mutation, a later `read_type` returning the same cached
+Instance would get a FakeInfo, leaking into the type graph.
 """
 
 from __future__ import annotations
@@ -65,9 +66,10 @@ def fixup_wire_type(typ: Type) -> Type | None:
 class _TypeRefFixer(TypeTranslator):
     """Resolve wire-decoded Instance.type_ref to live TypeInfo.
 
-    Does NOT mutate Instances in place: wire compact tags (INSTANCE_STR
-    etc.) return SHARED cached Instances, so in-place mutation would
-    corrupt the cache. Instead, fix the copy that super() builds.
+    Mutates Instances in place: wire compact tags (INSTANCE_STR etc.)
+    return SHARED cached Instances, so in-place mutation resolves the
+    cache entry for all future callers. Without it, a later read_type
+    returning the same cached Instance would get a FakeInfo.
     Sets self.missing when a type_ref is absent from the map so the
     caller can defer to Python.
     """
@@ -78,17 +80,19 @@ class _TypeRefFixer(TypeTranslator):
         self.missing = False
 
     def visit_instance(self, t: Instance, /) -> Type:
-        result = super().visit_instance(t)
-        if self.missing:
-            return t
         if t.type_ref is not None:
             info = self.typeinfo_map.get(t.type_ref)
             if info is None:
                 self.missing = True
                 return t
-            if isinstance(result, Instance):
-                result.type = info
-                result.type_ref = None
+            # Mutate in place: wire compact tags (INSTANCE_STR etc.)
+            # return shared cached Instance objects. Mutating resolves
+            # the cache entry so future read_type calls get live TypeInfo.
+            t.type = info
+            t.type_ref = None
+        if self.missing:
+            return t
+        result = super().visit_instance(t)
         if isinstance(result, Instance) and result.extra_attrs is not None:
             attrs = {k: v.accept(self) for k, v in result.extra_attrs.attrs.items()}
             if self.missing:
