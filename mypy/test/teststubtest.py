@@ -173,6 +173,7 @@ def build_helper(source: str) -> build.BuildResult:
     options = Options()
     options.native_parser = bool(os.environ.get("TEST_NATIVE_PARSER"))
     options.native_resolver = bool(os.environ.get("TEST_NATIVE_RESOLVER"))
+    options.native_type_kernel = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
     return build.build(
         sources=[BuildSource("main.pyi", None, textwrap.dedent(source))],
         options=options,
