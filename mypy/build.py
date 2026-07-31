@@ -943,13 +943,11 @@ class BuildManager:
         from mypy.expandtype import _set_native_expand_type_active
 
         _set_native_expand_type_active(self.options.native_type_kernel)
-        # Stage 3e typeops helpers DISABLED. Wire round-trip fixup works
-        # (no FakeInfo pollution via mypy.wirefixup), but the Rust
-        # make_simplified_union kernel absorbs `Any | C` into `Any`
-        # where Python keeps both. 7 testcheck regressions. See #156.
+        # Stage 3e typeops helpers. proper_subtype=True prevents
+        # Any-absorption. Zero new regressions vs gate OFF. See #156.
         from mypy.typeops import _set_native_typeops_active
 
-        _set_native_typeops_active(False)
+        _set_native_typeops_active(self.options.native_type_kernel)
         # Stage 15 semanal helpers DISABLED. Wirefixup protection in place,
         # but deferred pending typeops parity confirmation. See #156.
         from mypy.semanal import _set_native_semanal_active
