@@ -174,6 +174,17 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 from mypy.wirefixup import fixup_wire_type
 
                 fixed = fixup_wire_type(decoded)
+                # Clear the process-global primitive decode singletons after
+                # a read so NOT_READY Instances cannot leak into later builds
+                # (read_type lazily fills instance_cache with
+                # Instance(NOT_READY, []) singletons for str/int/bool/etc).
+                from mypy.types import instance_cache
+
+                instance_cache.int_type = None
+                instance_cache.str_type = None
+                instance_cache.bool_type = None
+                instance_cache.object_type = None
+                instance_cache.function_type = None
                 if fixed is not None:
                     return fixed
         except (NotImplementedError, AssertionError):

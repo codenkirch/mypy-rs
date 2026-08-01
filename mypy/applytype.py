@@ -324,6 +324,15 @@ def apply_generic_arguments(
                 )
                 if result is not None:
                     decoded = read_type(_ReadBuffer(bytes(result)))
+                    # Clear instance_cache primitives after read_type so
+                    # NOT_READY singletons cannot leak into later builds.
+                    from mypy.types import instance_cache
+
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
                     # Wire round-trip loses line/column/definition.
                     # Restore them from the original callable so error
                     # locations and special-signature dispatch agree.
