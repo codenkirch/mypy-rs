@@ -55,6 +55,7 @@ mod constraints;
 mod erase;
 mod erase_typevars;
 mod errors;
+mod expand;
 mod expandtype;
 mod lkv;
 mod messages;
@@ -115,6 +116,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         argmap::rust_map_actuals_to_formals_with_types,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(expand::rust_expand_actual_type, module)?)?;
     module.add_function(wrap_pyfunction!(mro::rust_linearize_hierarchy, module)?)?;
     module.add_function(wrap_pyfunction!(expandtype::rust_expand_type, module)?)?;
     module.add_function(wrap_pyfunction!(

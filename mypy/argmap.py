@@ -41,6 +41,7 @@ except ImportError:
 # `subtypes.py` (Stage 3c): no behavior change unless the option is set.
 try:
     from type_kernel import (
+        rust_expand_actual_type as _rust_expand_actual_type,
         rust_map_actuals_to_formals as _rust_map_actuals_to_formals,
         rust_map_actuals_to_formals_with_types as _rust_map_actuals_to_formals_with_types,
         rust_map_formals_to_actuals as _rust_map_formals_to_actuals,
@@ -48,6 +49,7 @@ try:
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
+    _rust_expand_actual_type = None  # type: ignore[assignment]
     _rust_map_actuals_to_formals = None  # type: ignore[assignment]
     _rust_map_actuals_to_formals_with_types = None  # type: ignore[assignment]
     _rust_map_formals_to_actuals = None  # type: ignore[assignment]
@@ -57,6 +59,12 @@ except ImportError:
 # `Options.native_type_kernel` at the start of each build, so the hot path
 # avoids an options lookup per call.
 _native_argmap_active: bool = False
+
+# Decision tags returned by `_rust_expand_actual_type` (mirror expand.rs).
+_DECISION_TUPLE = 0
+_DECISION_KWARG = 1
+_DECISION_PASSTHROUGH = 2
+_DECISION_ANY_ERROR = 3
 
 
 def _set_native_argmap_active(active: bool) -> None:
@@ -287,6 +295,61 @@ class ArgTypeExpander:
         """
         original_actual = actual_type
         actual_type = get_proper_type(actual_type)
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_argmap_active
+            and _HAS_LIBRT
+            and (
+                (actual_kind == nodes.ARG_STAR and isinstance(actual_type, TupleType))
+                or (actual_kind == nodes.ARG_STAR2 and isinstance(actual_type, TypedDictType))
+            )
+        ):
+            # Stage 4 seam: the structural branches (tuple *args item indexing,
+            # TypedDict **kwargs key carving) are pure structure, so Rust
+            # resolves them and this shim executes the decision against our
+            # own Type objects. Rust returns None for anything needing
+            # `is_subtype` (Iterable/Mapping unpacking) or an undecodable
+            # blob; fall through to Python then.
+            try:
+                buf = _ArgMapWriteBuffer()
+                actual_type.write(buf)
+                kwargs_used = sorted(self.kwargs_used) if self.kwargs_used is not None else []
+                result = _rust_expand_actual_type(
+                    buf.getvalue(),
+                    int(actual_kind.value),
+                    formal_name,
+                    int(formal_kind.value),
+                    allow_unpack,
+                    self.tuple_index,
+                    kwargs_used,
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                result = None
+            if result is not None:
+                decision, name, new_tuple_index, _ = result
+                if decision == _DECISION_TUPLE:
+                    self.tuple_index = new_tuple_index
+                    item = actual_type.items[self.tuple_index - 1]
+                    if isinstance(item, UnpackType) and not allow_unpack:
+                        # An unpack item that doesn't have special handling,
+                        # use upper bound as above (mirror Python's branch).
+                        unpacked = get_proper_type(item.type)
+                        if isinstance(unpacked, TypeVarTupleType):
+                            fallback = get_proper_type(unpacked.upper_bound)
+                        else:
+                            fallback = unpacked
+                        assert (
+                            isinstance(fallback, Instance)
+                            and fallback.type.fullname == "builtins.tuple"
+                        )
+                        item = fallback.args[0]
+                    return item
+                elif decision == _DECISION_KWARG:
+                    assert name is not None
+                    if self.kwargs_used is None:
+                        self.kwargs_used = set()
+                    self.kwargs_used.add(name)
+                    return actual_type.items[name]
         if actual_kind == nodes.ARG_STAR:
             if isinstance(actual_type, TypeVarTupleType):
                 # This code path is hit when *Ts is passed to a callable and various
