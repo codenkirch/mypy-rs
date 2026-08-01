@@ -232,6 +232,7 @@ try:
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
+        rust_normalize_callable as _rust_normalize_callable,
         rust_try_getting_literal as _rust_try_getting_literal,
     )
 
@@ -248,6 +249,7 @@ except ImportError:
     _rust_is_type_type_context = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
+    _rust_normalize_callable = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment]
     _CheckExprWriteBuffer = None  # type: ignore[assignment]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -345,6 +347,30 @@ def _try_native_classify_call(callee: ProperType) -> int | None:
         return None
     try:
         return _rust_classify_call(_serialize_type_for_checkexpr(callee))
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_normalize_callable(callee: ProperType) -> bool | None:
+    """Parity check: does the Rust normalization agree with Python?
+
+    Applies `with_unpacked_kwargs().with_normalized_var_args()` in Rust
+    and compares the serialized result with the Python-computed
+    normalization. Returns True on byte-equality, False on mismatch,
+    None to defer (kernel off, non-CallableType, or wire failure). The
+    caller uses the Python normalization either way; this never changes
+    behavior, it only proves the kernel agrees.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        rust_bytes = _rust_normalize_callable(_serialize_type_for_checkexpr(callee))
+        if rust_bytes is None:
+            return None
+        normalized = callee.with_unpacked_kwargs().with_normalized_var_args()
+        buf = _CheckExprWriteBuffer()
+        normalized.write(buf)
+        return bytes(rust_bytes) == buf.getvalue()
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
