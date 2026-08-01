@@ -254,7 +254,7 @@ pub(crate) fn read_int_bare(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> 
 /// Read a bare string (short-int length prefix + UTF-8 body). Mirrors
 /// `read_str_internal`. Rejects `LONG_INT_TRAILER` as a length prefix and
 /// negative lengths (both are fail-fast cases in the C reader).
-fn read_str_bare(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
+pub(crate) fn read_str_bare(buf: &mut ReadBuffer<'_>) -> Result<String, WireError> {
     let first = buf.read_u8()?;
     if first == LONG_INT_TRAILER {
         return Err(WireError::invalid("invalid str size"));

@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 
 use crate::typeinfo::NativeTypeResolver;
-use crate::wire::{read_int_bare, read_str, read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 /// Key for the env: `(raw_id, namespace)`. Mirrors `TypeVarId.__eq__`
 /// (types.py:574-576), which compares `raw_id` and `namespace`.
@@ -38,7 +38,7 @@ type EnvKey = (i64, String);
 /// `read_type`.
 ///
 /// The env wire format is: count (bare int) + pairs of
-/// (TypeVarId raw_id bare int + TypeVarId namespace tagged str + Type).
+/// (TypeVarId raw_id bare int + TypeVarId namespace bare str + Type).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_expand_type(
@@ -76,8 +76,9 @@ fn decode_env(bytes: &[u8]) -> Option<HashMap<EnvKey, Type>> {
     let mut env = HashMap::with_capacity(count as usize);
     for _ in 0..count {
         let raw_id = read_int_bare(&mut buf).ok()?;
-        // namespace is a fullname string written via `write_str` (tagged).
-        let namespace = read_str(&mut buf).ok()?;
+        // namespace is a fullname string written via `librt write_str`
+        // (bare short-int size + utf8, no tag). Must use the bare reader.
+        let namespace = read_str_bare(&mut buf).ok()?;
         let typ = read_type(&mut buf, None).ok()?;
         env.insert((raw_id, namespace), typ);
     }

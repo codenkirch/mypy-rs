@@ -89,7 +89,7 @@ def trivial_meet(s: Type, t: Type) -> ProperType:
                 state.strict_optional,
                 join._native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             if result == 0:
@@ -182,7 +182,7 @@ def meet_types(s: Type, t: Type) -> ProperType:
                 state.strict_optional,
                 join._native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             disc, _fullname, _arg_discs, encoded = result

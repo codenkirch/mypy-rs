@@ -4554,7 +4554,7 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
             fb_bytes = _serialize_type_for_visitor(fallback)
             result = _rust_callable_with_ellipsis(any_bytes, ret_bytes, fb_bytes)
             if result is not None:
-                return _deserialize_type_from_visitor(result)  # type: ignore[return-value]
+                return _deserialize_type_from_visitor(bytes(result))  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     return CallableType(
