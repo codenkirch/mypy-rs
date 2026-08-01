@@ -54,13 +54,26 @@ pub(crate) fn rust_expand_type(
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
     let typ = decode_type(type_bytes)?;
     let env = decode_env(env_bytes)?;
-    // Empty env: expanding with no substitutions is a no-op. Defer to
-    // Python so the caller gets the original object (not a decoded copy),
-    // preserving object identity for the constraint solver and caches.
     if env.is_empty() {
         return None;
     }
+    // Leaf types (Any, None, Never, etc.) carry no TypeVars to substitute.
+    // Python's visitor returns `t` (the original object), preserving
+    // identity for the checker's partial-type tracker. A wire round-trip
+    // yields a fresh object, so defer to Python for leaves.
+    if is_leaf_type(&typ) {
+        return None;
+    }
     let expanded = expand_type(&typ, &env)?;
+    // If the result still carries any TypeVar-like node that was NOT
+    // substituted (env miss), defer to Python. Python's visitor returns
+    // the original TypeVar object on env miss (`self.variables.get(t.id,
+    // t)`), preserving object identity for the solver/binder. A wire
+    // round-trip yields fresh objects that break that identity, so
+    // shipping a result with unmatched TypeVars corrupts inference.
+    if result_has_unmatched_typevar(&expanded, &env) {
+        return None;
+    }
     encode_type(&expanded)
 }
 
@@ -470,6 +483,128 @@ fn normalize_tuple_unpack(arg: &Type) -> Vec<Type> {
         return args.clone();
     }
     vec![arg.clone()]
+}
+
+/// Check if `typ` is a leaf type with no TypeVar references to substitute.
+/// Python's `ExpandTypeVisitor` returns `t` unchanged for these, so the
+/// wire round-trip must defer to preserve object identity.
+fn is_leaf_type(typ: &Type) -> bool {
+    matches!(
+        typ,
+        Type::AnyType { .. }
+            | Type::NoneType
+            | Type::UninhabitedType
+            | Type::DeletedType { .. }
+            | Type::UnboundType { .. }
+    )
+}
+
+/// Check if `typ` contains any TypeVar-like node (TypeVarType,
+/// ParamSpecType, TypeVarTupleType) whose key is NOT in `env`. If so,
+/// the result would ship a fresh TypeVar object that breaks Python's
+/// identity-based solver/binder — the caller must defer to Python.
+fn result_has_unmatched_typevar(typ: &Type, env: &HashMap<EnvKey, Type>) -> bool {
+    fn typevar_key(t: &Type) -> Option<EnvKey> {
+        match t {
+            Type::TypeVarType {
+                raw_id,
+                namespace,
+                meta_level,
+                ..
+            } => Some((*raw_id, *meta_level, namespace.clone())),
+            Type::ParamSpecType {
+                raw_id, namespace, ..
+            } => Some((*raw_id, 0, namespace.clone())),
+            Type::TypeVarTupleType {
+                raw_id, namespace, ..
+            } => Some((*raw_id, 0, namespace.clone())),
+            _ => None,
+        }
+    }
+    let mut stack = vec![typ];
+    while let Some(cur) = stack.pop() {
+        if let Some(key) = typevar_key(cur) {
+            if !env.contains_key(&key) {
+                return true;
+            }
+        }
+        match cur {
+            Type::Instance { args, .. } => stack.extend(args.iter()),
+            Type::TypeAliasType { args, .. } => stack.extend(args.iter()),
+            Type::TypeVarType {
+                values,
+                upper_bound,
+                default,
+                ..
+            } => {
+                stack.extend(values.iter());
+                stack.push(upper_bound);
+                stack.push(default);
+            }
+            Type::ParamSpecType {
+                upper_bound,
+                default,
+                prefix,
+                ..
+            } => {
+                stack.push(upper_bound);
+                stack.push(default);
+                stack.extend(prefix.arg_types.iter());
+                stack.extend(prefix.variables.iter());
+            }
+            Type::TypeVarTupleType {
+                tuple_fallback,
+                upper_bound,
+                default,
+                ..
+            } => {
+                stack.push(tuple_fallback);
+                stack.push(upper_bound);
+                stack.push(default);
+            }
+            Type::CallableType {
+                arg_types,
+                ret_type,
+                fallback,
+                instance_type,
+                variables,
+                ..
+            } => {
+                stack.extend(arg_types.iter());
+                stack.push(ret_type);
+                stack.push(fallback);
+                if let Some(it) = instance_type {
+                    stack.push(it);
+                }
+                stack.extend(variables.iter());
+            }
+            Type::TupleType {
+                items,
+                partial_fallback,
+                ..
+            } => {
+                stack.extend(items.iter());
+                stack.push(partial_fallback);
+            }
+            Type::TypedDictType {
+                items, fallback, ..
+            } => {
+                stack.extend(items.iter().map(|(_, t)| t));
+                stack.push(fallback);
+            }
+            Type::UnionType { items, .. } => stack.extend(items.iter()),
+            Type::Overloaded { items, .. } => stack.extend(items.iter()),
+            Type::Parameters(params) => {
+                stack.extend(params.arg_types.iter());
+                stack.extend(params.variables.iter());
+            }
+            Type::TypeType { item, .. } => stack.push(item),
+            Type::UnpackType { typ } => stack.push(typ),
+            Type::LiteralType { fallback, .. } => stack.push(fallback),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// If `arg` is an UnpackType wrapping a builtins.tuple Instance, return
