@@ -28,9 +28,10 @@ use crate::wire::{
     read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
 };
 
-/// Key for the env: `(raw_id, namespace)`. Mirrors `TypeVarId.__eq__`
-/// (types.py:574-576), which compares `raw_id` and `namespace`.
-type EnvKey = (i64, String);
+/// Key for the env: `(raw_id, meta_level, namespace)`. Mirrors
+/// `TypeVarId.__eq__` (types.py:574-576), which compares `raw_id`,
+/// `meta_level`, and `namespace`.
+type EnvKey = (i64, i64, String);
 
 /// `#[pyfunction]` entry for `expand_type`. The Python-side shim
 /// (mypy/expandtype.py) calls this with the serialized `typ` blob, the
@@ -40,7 +41,9 @@ type EnvKey = (i64, String);
 /// `read_type`.
 ///
 /// The env wire format is: count (bare int) + pairs of
-/// (TypeVarId raw_id bare int + TypeVarId namespace bare str + Type).
+/// (TypeVarId raw_id bare int + TypeVarId meta_level bare int +
+/// TypeVarId namespace bare str + Type). Mirrors the Python-side
+/// `_serialize_env` in mypy/expandtype.py.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_expand_type(
@@ -78,11 +81,12 @@ fn decode_env(bytes: &[u8]) -> Option<HashMap<EnvKey, Type>> {
     let mut env = HashMap::with_capacity(count as usize);
     for _ in 0..count {
         let raw_id = read_int_bare(&mut buf).ok()?;
+        let meta_level = read_int_bare(&mut buf).ok()?;
         // namespace is a fullname string written via `librt write_str`
         // (bare short-int size + utf8, no tag). Must use the bare reader.
         let namespace = read_str_bare(&mut buf).ok()?;
         let typ = read_type(&mut buf, None).ok()?;
-        env.insert((raw_id, namespace), typ);
+        env.insert((raw_id, meta_level, namespace), typ);
     }
     Some(env)
 }
@@ -143,6 +147,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             upper_bound,
             default,
             variance,
+            meta_level,
         } => {
             // Self type (raw_id == 0): expand upper_bound first
             // (expandtype.py:243-244), since Self`0 <: C[T, S] may reference
@@ -152,7 +157,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             } else {
                 upper_bound.clone()
             };
-            let key = (*raw_id, namespace.clone());
+            let key = (*raw_id, *meta_level, namespace.clone());
             let repl = env.get(&key);
             match repl {
                 Some(Type::Instance {
@@ -183,6 +188,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
                         upper_bound,
                         default: default.clone(),
                         variance: *variance,
+                        meta_level: *meta_level,
                     })
                 }
             }
@@ -400,7 +406,8 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         raw_id, namespace, ..
     } = tvt
     {
-        let key = (*raw_id, namespace.clone());
+        // TypeVarTupleType wire has no meta_level yet; env meta is 0.
+        let key = (*raw_id, 0, namespace.clone());
         // Unmatched TypeVarTuple: defer to Python.
         env.get(&key)?
     } else {

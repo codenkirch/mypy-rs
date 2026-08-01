@@ -849,6 +849,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(any_type()),
             variance: COVARIANT,
+            meta_level: 0,
         };
         let base = instance("a.Gen", vec![tvar]);
         let left_arg = instance("a.A", vec![]);
@@ -870,6 +871,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(any_type()),
             variance: COVARIANT,
+            meta_level: 0,
         };
         let base = instance("a.Gen", vec![tvar]);
         let left_arg = instance("a.A", vec![]);
@@ -890,6 +892,7 @@ mod tests {
             upper_bound: Box::new(instance("builtins.object", vec![])),
             default: Box::new(any_type()),
             variance: COVARIANT,
+            meta_level: 0,
         };
         let inner = instance("a.Gen", vec![tvar()]);
         let outer = instance("a.Gen", vec![inner]);

@@ -33,6 +33,7 @@ from mypy.cache import (
     END_TAG,
     EXTRA_ATTRS,
     LIST_GEN,
+    LITERAL_INT,
     LITERAL_NONE,
     ReadBuffer,
     Tag,
@@ -742,21 +743,35 @@ class TypeVarType(TypeVarLikeType):
         self.upper_bound.write(data)
         self.default.write(data)
         write_int(data, self.variance)
+        if self.id.meta_level:
+            write_int(data, self.id.meta_level)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> TypeVarType:
-        ret = TypeVarType(
-            read_str(data),
-            read_str(data),
-            TypeVarId(read_int(data), namespace=read_str(data)),
-            read_type_list(data),
-            read_type(data),
-            read_type(data),
-            read_int(data),
+        name = read_str(data)
+        fullname = read_str(data)
+        raw_id = read_int(data)
+        namespace = read_str(data)
+        values = read_type_list(data)
+        upper_bound = read_type(data)
+        default = read_type(data)
+        variance = read_int(data)
+        tag = read_tag(data)
+        meta_level = 0
+        if tag == LITERAL_INT:
+            meta_level = read_int_bare(data)
+            tag = read_tag(data)
+        assert tag == END_TAG
+        return TypeVarType(
+            name,
+            fullname,
+            TypeVarId(raw_id, meta_level, namespace=namespace),
+            values,
+            upper_bound,
+            default,
+            variance,
         )
-        assert read_tag(data) == END_TAG
-        return ret
 
 
 class ParamSpecFlavor:
@@ -4018,7 +4033,7 @@ class TypeStrVisitor(SyntheticTypeVisitor[str]):
                         )
                     else:
                         vs.append(
-                            f"{var.name}{f' = {var.default.accept(self)}' if var.has_default()  else ''}"
+                            f"{var.name}{f' = {var.default.accept(self)}' if var.has_default() else ''}"
                         )
                 else:
                     # For other TypeVarLikeTypes, use the name and default
@@ -4213,20 +4228,22 @@ class HasTypeVars(BoolTypeQuery):
 # Rust returns None for TypeAliasType (no alias target on the wire);
 # Python falls back to the pure-Python visitor.
 try:
-    from type_kernel import rust_has_type_vars as _rust_has_type_vars
-    from type_kernel import rust_has_recursive_types as _rust_has_recursive_types
-    from type_kernel import rust_is_literal_type as _rust_is_literal_type
-    from type_kernel import rust_is_unannotated_any as _rust_is_unannotated_any
-    from type_kernel import rust_remove_dups as _rust_remove_dups
-    from type_kernel import rust_type_vars_as_args as _rust_type_vars_as_args
-    from type_kernel import rust_callable_with_ellipsis as _rust_callable_with_ellipsis
-    from type_kernel import rust_find_unpack_in_list as _rust_find_unpack_in_list
-    from type_kernel import rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix
-    from type_kernel import rust_flatten_nested_unions as _rust_flatten_nested_unions
-    from type_kernel import rust_flatten_nested_tuples as _rust_flatten_nested_tuples
-    from type_kernel import rust_copy_type as _rust_copy_type
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _VisitorWriteBuffer
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _VisitorWriteBuffer
+    from type_kernel import (
+        rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
+        rust_copy_type as _rust_copy_type,
+        rust_find_unpack_in_list as _rust_find_unpack_in_list,
+        rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
+        rust_flatten_nested_unions as _rust_flatten_nested_unions,
+        rust_has_recursive_types as _rust_has_recursive_types,
+        rust_has_type_vars as _rust_has_type_vars,
+        rust_is_literal_type as _rust_is_literal_type,
+        rust_is_unannotated_any as _rust_is_unannotated_any,
+        rust_remove_dups as _rust_remove_dups,
+        rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix,
+        rust_type_vars_as_args as _rust_type_vars_as_args,
+    )
+
     from mypy.types import read_type as _visitor_read_type
 
     _VISITOR_HAS_TYPE_KERNEL = True

@@ -490,6 +490,7 @@ pub(crate) enum Type {
         upper_bound: Box<Type>,
         default: Box<Type>,
         variance: i64,
+        meta_level: i64,
     },
     ParamSpecType {
         prefix: Box<Parameters>,
@@ -737,7 +738,19 @@ fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let upper_bound = read_type(buf, None)?;
     let default = read_type(buf, None)?;
     let variance = read_int(buf)?;
-    expect_end_tag(buf)?;
+    // Backward-compatible meta_level append: written only when non-zero,
+    // so the next tag is either LITERAL_INT (meta_level present) or
+    // END_TAG (absent, defaults to 0).
+    let peek = read_tag(buf)?;
+    let meta_level = match peek {
+        LITERAL_INT => read_int_bare(buf)?,
+        END_TAG => 0,
+        other => {
+            return Err(WireError::invalid(format!(
+                "expected END_TAG (255) or LITERAL_INT (meta_level), got tag {other}"
+            )));
+        }
+    };
     Ok(Type::TypeVarType {
         name,
         fullname,
@@ -747,6 +760,7 @@ fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         upper_bound: Box::new(upper_bound),
         default: Box::new(default),
         variance,
+        meta_level,
     })
 }
 
@@ -2053,8 +2067,10 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             upper_bound,
             default,
             variance,
+            meta_level,
         } => {
-            // Field order mirrors `read_type_var_type`.
+            // Field order mirrors `read_type_var_type`. meta_level is
+            // written only when non-zero (backward-compatible append).
             write_tag(buf, TYPE_VAR_TYPE);
             write_str(buf, name)?;
             write_str(buf, fullname)?;
@@ -2064,6 +2080,9 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_type(buf, upper_bound)?;
             write_type(buf, default)?;
             write_int(buf, *variance)?;
+            if *meta_level != 0 {
+                write_int(buf, *meta_level)?;
+            }
             write_tag(buf, END_TAG);
             Ok(())
         }

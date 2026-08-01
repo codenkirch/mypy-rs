@@ -125,13 +125,14 @@ def _serialize_env(env: Mapping[TypeVarId, Type]) -> bytes:
     """Serialize a `Mapping[TypeVarId, Type]` to the env wire format.
 
     Layout: count (bare int) + pairs of (TypeVarId raw_id bare int +
-    TypeVarId namespace tagged str + Type blob). Mirrors the Rust
-    `decode_env` reader in expandtype.rs.
+    TypeVarId meta_level bare int + TypeVarId namespace tagged str +
+    Type blob). Mirrors the Rust `decode_env` reader in expandtype.rs.
     """
     buf = _WriteBuffer()
     _write_int_bare(buf, len(env))
     for tv_id, typ in env.items():
         _write_int_bare(buf, tv_id.raw_id)
+        _write_int_bare(buf, tv_id.meta_level)
         _write_str_tagged(buf, tv_id.namespace)
         typ.write(buf)
     return buf.getvalue()
