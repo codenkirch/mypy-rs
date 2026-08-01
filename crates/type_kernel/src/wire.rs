@@ -743,7 +743,21 @@ fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     // END_TAG (absent, defaults to 0).
     let peek = read_tag(buf)?;
     let meta_level = match peek {
-        LITERAL_INT => read_int_bare(buf)?,
+        LITERAL_INT => {
+            let ml = read_int_bare(buf)?;
+            // The writer always appends END_TAG after an optional
+            // meta_level; when the tag was LITERAL_INT the END_TAG is
+            // still in the stream (unlike the absent case above, where
+            // the peek consumed it). Consume it so back-to-back records
+            // (e.g. `read_type_list`) stay aligned.
+            let end = read_tag(buf)?;
+            if end != END_TAG {
+                return Err(WireError::invalid(format!(
+                    "expected END_TAG (255) after meta_level, got tag {end}"
+                )));
+            }
+            ml
+        }
         END_TAG => 0,
         other => {
             return Err(WireError::invalid(format!(

@@ -8,11 +8,74 @@ from typing import TYPE_CHECKING, Final, TypeGuard, cast
 import mypy.subtypes
 import mypy.typeops
 
+# Stage 4b type-kernel seam: when type_kernel is importable and the
+# constraints gate is on, proxy + top-level TypeVarType inference routes
+# through Rust, deferring to Python on decode/unsupported failures.
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag, set by the build manager from
+# `Options.native_type_kernel` at the start of each build. When active
+# but no Rust result, the shim falls through to Python.
+_native_constraints_active: bool = False
+
+
 def _set_native_constraints_active(active: bool) -> None:
-    # No-op for build.py / conftest.py compat. Constraint inference is not
-    # Rust-ported (wire drops `origin_type_var`; trivial port is net-slower
-    # than Python's O(1) isinstance check). Old gate never returned a result.
-    _ = active
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_constraints_active
+    _native_constraints_active = active
+
+
+def _try_native_infer_constraints(
+    template: Type, actual: Type, direction: int
+) -> list[Constraint]:
+    """Route a top-level TypeVarType inference through the Rust kernel.
+
+    Only the template-is-a-TypeVarType case is ported (the Python branch
+    is O(1)); anything else or any decode failure falls back to Python by
+    raising, which the caller treats as a deferral.
+    """
+    template_buf = _WriteBuffer()
+    template.write(template_buf)
+    actual_buf = _WriteBuffer()
+    actual.write(actual_buf)
+    raw = _type_kernel.rust_infer_constraints(
+        template_buf.getvalue(), actual_buf.getvalue(), direction
+    )
+    if raw is None:
+        raise NotImplementedError("template not a TypeVarType")
+    from mypy.cache import read_int
+    from mypy.types import read_type
+    from mypy.wirefixup import fixup_wire_type
+
+    constraints: list[Constraint] = []
+    for blob in raw:
+        data = _ReadBuffer(bytes(blob))
+        origin = fixup_wire_type(read_type(data))
+        if not isinstance(origin, TypeVarType):
+            raise NotImplementedError("origin not a TypeVarType")
+        op = read_int(data)
+        if op != direction:
+            raise NotImplementedError("op mismatch on wire")
+        target = fixup_wire_type(read_type(data))
+        if target is None:
+            raise NotImplementedError("target unresolvable on wire")
+        # The wire round-trip rebuilds types as fresh objects; Rust validates
+        # the result but the rebuilt target must not re-enter the type
+        # graph (identity loss changes solver behavior). Use the original
+        # `actual` object when Rust agrees with it, else defer.
+        if target != actual:
+            raise NotImplementedError("target not wire-safe")
+        constraints.append(Constraint(template, op, actual))
+    return constraints
 from mypy.argmap import ArgTypeExpander
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type_by_instance
@@ -369,6 +432,11 @@ def _infer_constraints(
     #     T :> U2", but they are not equivalent to the constraint solver,
     #     which never introduces new Union types (it uses join() instead).
     if isinstance(template, TypeVarType):
+        if _native_constraints_active and _HAS_TYPE_KERNEL:
+            try:
+                return _try_native_infer_constraints(template, actual, direction)
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         return [Constraint(template, direction, actual)]
 
     if (
