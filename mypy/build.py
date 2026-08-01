@@ -69,6 +69,8 @@ from mypy.cache import (
     ReadBuffer,
     Tag,
     WriteBuffer,
+    _try_native_read_cache_meta,
+    _try_native_read_cache_meta_ex,
     read_bytes,
     read_int,
     read_int_list,
@@ -909,10 +911,7 @@ class BuildManager:
         # semantic-analysis calls between __init__ and the resolver
         # rebuild would use the previous build's TypeInfo graph,
         # producing wrong MROs and subtype results.
-        from mypy.join import (
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
+        from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
 
@@ -997,6 +996,12 @@ class BuildManager:
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
+        # M4: gate the fixed-format cache meta read seam; raw bytes are
+        # present only in build.py, so this is a module-level flag checked
+        # by cache_load (the read() helpers stay pure-Python).
+        from mypy.cache import _set_native_cache_active
+
+        _set_native_cache_active(self.options.native_type_kernel)
         # Stage 4: clear stale plugin-hook snapshot, then build the
         # registry. Plugins are config-static, so build once here.
         from mypy.checkexpr import _set_native_plugin_hook_registry
@@ -1676,7 +1681,8 @@ class BuildManager:
             #   * Heap key is *negative* size (so that larger SCCs appear first).
             #   * Each batch must have at least one item.
             #   * Adding another SCC to batch should not exceed maximum allowed size.
-            size_in_batch - self.scc_queue[0][0] <= max_size_in_batch or not batch
+            size_in_batch - self.scc_queue[0][0] <= max_size_in_batch
+            or not batch
         ):
             size_key, _, scc = heappop(self.scc_queue)
             size_in_batch -= size_key
@@ -2089,6 +2095,26 @@ def _load_ff_file(
     return data
 
 
+def cache_load(blob: bytes, data_file: str | None, cls: type[Any]) -> Any | None:
+    """Read a fixed-format cache record, via the Rust kernel when enabled.
+
+    The kernel decodes the wire format and returns a dict of fields, which
+    we reconstruct into the requested class. Any failure (kernel absent,
+    gate off, or a record the kernel can't parse) falls back to the
+    pure-Python reader, so the kernel can only ever be an accelerator,
+    never a correctness divergence.
+    """
+    if data_file is None:
+        m = _try_native_read_cache_meta_ex(blob)
+        if m is not None:
+            return m
+        return cls.read(ReadBuffer(blob))
+    m = _try_native_read_cache_meta(blob, data_file)
+    if m is not None:
+        return m
+    return cls.read(ReadBuffer(blob), data_file)
+
+
 def _load_json_file(
     file: str, manager: BuildManager, log_success: str, log_error: str
 ) -> dict[str, Any] | None:
@@ -2293,8 +2319,7 @@ def find_cache_meta(
         if meta[0] != cache_version() or meta[1] != CACHE_VERSION:
             manager.log(f"Metadata abandoned for {id}: incompatible cache format")
             return None
-        data_io = ReadBuffer(meta[2:])
-        m = CacheMeta.read(data_io, data_file)
+        m = cache_load(meta[2:], data_file, CacheMeta)
     else:
         m = CacheMeta.deserialize(meta, data_file)
     if m is None:
@@ -2373,8 +2398,7 @@ def find_cache_meta(
     if meta_ex is None:
         return None
     if isinstance(meta_ex, bytes):
-        data_io = ReadBuffer(meta_ex)
-        me = CacheMetaEx.read(data_io)
+        me = cache_load(meta_ex, None, CacheMetaEx)
     else:
         me = CacheMetaEx.deserialize(meta_ex)
     if me is None:
@@ -3360,9 +3384,9 @@ class State:
             assert self.path is not None
             _, data_file, _ = get_cache_names(self.id, self.path, self.manager.options)
         else:
-            assert self.meta is not None, (
-                "Internal error: this method must be called only for cached modules"
-            )
+            assert (
+                self.meta is not None
+            ), "Internal error: this method must be called only for cached modules"
             data_file = self.meta.data_file
 
         data: bytes | dict[str, Any] | None
@@ -3880,9 +3904,9 @@ class State:
         dep_prios = self.dependency_priorities()
         dep_lines = self.dependency_lines()
         assert self.source_hash is not None
-        assert len(set(self.dependencies)) == len(self.dependencies), (
-            f"Duplicates in dependencies list for {self.id} ({self.dependencies})"
-        )
+        assert len(set(self.dependencies)) == len(
+            self.dependencies
+        ), f"Duplicates in dependencies list for {self.id} ({self.dependencies})"
         new_interface_hash, meta_tuple = write_cache(
             self.id,
             self.path,
@@ -5065,10 +5089,7 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     # calls (e.g. semanal_typeargs bound checks) in the next line use
     # Python, not a snapshot missing the current SCC's classes.
     if manager.options.native_type_kernel:
-        from mypy.join import (
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
+        from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
 

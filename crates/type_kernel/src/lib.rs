@@ -47,6 +47,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
+mod cache;
 mod checkexpr_functions;
 mod checkstrformat;
 mod constraints;
@@ -83,6 +84,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         lkv::remove_instance_last_known_values,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta, module)?)?;
+    module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta_ex, module)?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
     module.add_function(wrap_pyfunction!(typeinfo::build_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(
