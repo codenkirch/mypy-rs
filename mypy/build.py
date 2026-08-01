@@ -920,6 +920,9 @@ class BuildManager:
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
         _set_native_mro_resolver(None, None)
+        from mypy.solve import _set_native_solve_resolver
+
+        _set_native_solve_resolver(None)
         # Stage 4 (M8ba): gate the pure-positional/named branch of
         # `map_actuals_to_formals`. The Rust path returns None for any call
         # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
@@ -968,6 +971,12 @@ class BuildManager:
         from mypy.errors import _set_native_errors_active
 
         _set_native_errors_active(self.options.native_type_kernel)
+        # Stage 11: gate the solve_one constraint solver. No resolver
+        # needed; join/meet/subtype use the already-installed global
+        # resolvers when constructing candidate types.
+        from mypy.solve import _set_native_solve_active
+
+        _set_native_solve_active(self.options.native_type_kernel)
         # Stage 7: gate visitor scalar-returning functions (no resolver
         # needed). Type-returning functions stay parity-only (truthiness
         # flag loss on wire round-trip).
@@ -1184,6 +1193,11 @@ class BuildManager:
         # correctness gap closure (26 testcheck failures -> 0).
         _set_native_subtype_resolver(resolver)
         _set_native_join_resolver(resolver)
+        # Stage 11: solve_one shares the subtype/join resolver (Instance
+        # construction for Object/Ancestor setop results, is_subtype).
+        from mypy.solve import _set_native_solve_resolver
+
+        _set_native_solve_resolver(resolver)
         # Stage 5: the MRO kernel only declines (None) for cycles,
         # missing bases, and the obj_type callback edge, so it cannot
         # return a wrong answer. Wired to production.
@@ -5062,6 +5076,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
         _set_native_mro_resolver(None, None)
+        from mypy.solve import _set_native_solve_resolver
+
+        _set_native_solve_resolver(None)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
