@@ -9,6 +9,7 @@ from mypy.argmap import _set_native_argmap_active, map_actuals_to_formals
 from mypy.checker import DisjointDict, group_comparison_operands
 from mypy.literals import Key
 from mypy.nodes import ARG_NAMED, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, NameExpr
+from mypy.solve import solve_one
 from mypy.test.helpers import Suite, assert_equal
 from mypy.test.typefixture import TypeFixture
 from mypy.types import AnyType, TupleType, Type, TypeOfAny
@@ -19,6 +20,88 @@ from mypy.types import AnyType, TupleType, Type, TypeOfAny
 _set_native_argmap_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 
 _NATIVE_ARGMAP_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class SolveOneParitySuite(Suite):
+    """Parity: solve_one native vs pure-Python.
+
+    Asserts the Rust solve path returns the same candidate as the
+    pure-Python solve_one for the join/meet/selection corner cases.
+    Only runs when the kernel is importable (env-gated like the other
+    native suites in this file).
+    """
+
+    def test_join_lowers_single(self) -> None:
+        fixture = TypeFixture()
+        self.assert_equal_solve([fixture.a], [], fixture)
+
+    def test_join_lowers_two_classes(self) -> None:
+        # join(B, C) with B, C sharing base A -> A
+        fixture = TypeFixture()
+        self.assert_equal_solve([fixture.b, fixture.c], [], fixture)
+
+    def test_join_lowers_union(self) -> None:
+        # join of a union and a class -> union preserves
+        fixture = TypeFixture()
+        self.assert_equal_solve([fixture.b, fixture.c], [], fixture)
+
+    def test_upper_single(self) -> None:
+        # no lowers, one upper -> the upper itself
+        fixture = TypeFixture()
+        self.assert_equal_solve([], [fixture.a], fixture)
+
+    def test_lower_upper_subtype(self) -> None:
+        # B <: A, so candidate = B
+        fixture = TypeFixture()
+        self.assert_equal_solve([fixture.b], [fixture.a], fixture)
+
+    def test_lower_upper_not_subtype(self) -> None:
+        # D not <: A -> None (no solution)
+        fixture = TypeFixture()
+        self.assert_equal_solve([fixture.d], [fixture.a], fixture)
+
+    def test_no_bounds(self) -> None:
+        fixture = TypeFixture()
+        self.assert_equal_solve([], [], fixture)
+
+    def assert_equal_solve(
+        self, lowers: list[Type], uppers: list[Type], fixture: TypeFixture
+    ) -> None:
+        # Pure-Python path (gate off).
+        from mypy.solve import (
+            _native_solve_active,
+            _native_solve_resolver,
+            _set_native_solve_active,
+            _set_native_solve_resolver,
+        )
+
+        saved_active = _native_solve_active
+        saved_resolver = _native_solve_resolver
+        try:
+            _set_native_solve_active(False)
+            expected = solve_one(lowers, uppers)
+            # Native path (gate on, fixture resolver installed).
+            import type_kernel
+
+            from mypy.wirefixup import set_wire_typeinfo_map
+
+            type_infos = [v for v in vars(fixture).values() if hasattr(v, "fullname")]
+            native = type_kernel.build_native_resolver(type_infos, [])
+            set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+            _set_native_solve_resolver(native)
+            _set_native_solve_active(True)
+            actual = solve_one(lowers, uppers)
+            assert_equal(actual, expected)
+        finally:
+            _set_native_solve_active(saved_active)
+            _set_native_solve_resolver(saved_resolver)
+            from mypy.wirefixup import set_wire_typeinfo_map
+
+            set_wire_typeinfo_map(None)
 
 
 class MapActualsToFormalsSuite(Suite):

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
-from typing import TypeAlias as _TypeAlias
+from typing import Any, TypeAlias as _TypeAlias
 
 from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF, Constraint, infer_constraints, neg_op
 from mypy.expandtype import expand_type
 from mypy.graph_utils import prepare_sccs, strongly_connected_components, topsort
 from mypy.join import join_type_list
 from mypy.meet import meet_type_list, meet_types
+from mypy.state import state
 from mypy.subtypes import is_subtype
 from mypy.typeops import get_all_type_vars
 from mypy.types import (
@@ -31,8 +32,58 @@ from mypy.types import (
     UnionType,
     UnpackType,
     get_proper_type,
+    read_type,
 )
 from mypy.typestate import type_state
+
+# Stage 4b type-kernel seam: when type_kernel is importable and the
+# solve gate is on, single-variable constraint solving routes through
+# Rust, deferring to Python on join/meet/is_subtype/union gaps.
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag, set by the build manager from
+# `Options.native_type_kernel` at the start of each build. When active
+# but no Rust result, the shim falls through to Python.
+_native_solve_active: bool = False
+
+
+def _set_native_solve_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_solve_active
+    _native_solve_active = active
+
+
+# TypeInfo resolver for the Rust path, installed by
+# `_build_native_resolvers` alongside the subtype/join resolvers.
+# `rust_solve_one` needs it to build `Instance` types (Object/Ancestor
+# setop results) and run `is_subtype`. None until a resolver is installed.
+_native_solve_resolver: Any = None
+
+
+def _set_native_solve_resolver(resolver: Any) -> None:
+    """Called by the build manager to install the Rust TypeInfo resolver."""
+    global _native_solve_resolver
+    _native_solve_resolver = resolver
+
+
+def _serialize_type_list(types: Iterable[Type]) -> list[bytes]:
+    """Serialize a `Type` iterable to wire-format blobs for the Rust reader."""
+    blobs: list[bytes] = []
+    for t in types:
+        buf = _WriteBuffer()
+        t.write(buf)
+        blobs.append(buf.getvalue())
+    return blobs
+
 
 Bounds: _TypeAlias = "dict[TypeVarId, set[Type]]"
 Graph: _TypeAlias = "set[tuple[TypeVarId, TypeVarId]]"
@@ -279,6 +330,36 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
         candidate = UninhabitedType()
         candidate.ambiguous = True
         return candidate
+
+    if _HAS_TYPE_KERNEL and _native_solve_active and _native_solve_resolver is not None:
+        try:
+            result = _type_kernel.rust_solve_one(
+                _serialize_type_list(lowers),
+                _serialize_type_list(uppers),
+                type_state.infer_unions,
+                state.strict_optional,
+                _native_solve_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            kind, blob = result
+            if kind == 0 and blob is not None:
+                from mypy.wirefixup import fixup_wire_type
+
+                decoded = read_type(_ReadBuffer(bytes(blob)))
+                return fixup_wire_type(decoded)
+            if kind == 1:
+                if blob is not None:
+                    from mypy.wirefixup import fixup_wire_type
+
+                    decoded = read_type(_ReadBuffer(bytes(blob)))
+                    return fixup_wire_type(decoded)
+                return None
+            # kind == 2: no bounds at all, ambiguous Never.
+            candidate = UninhabitedType()
+            candidate.ambiguous = True
+            return candidate
 
     bottom: Type | None = None
     top: Type | None = None

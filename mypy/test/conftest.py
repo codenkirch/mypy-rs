@@ -60,6 +60,16 @@ def _install_native_resolvers_patch() -> None:
         except ImportError:
             pass
 
+        # Stage 11: install the solve resolver (parity path). The solve
+        # shim needs the resolver to build Instance types (Object/Ancestor
+        # setop results) and run is_subtype.
+        try:
+            from mypy.solve import _set_native_solve_resolver
+
+            _set_native_solve_resolver(resolver)
+        except ImportError:
+            pass
+
         # Forward-compatible: install the MRO resolver if the Stage 5
         # shim is present (ships with B1 / PR #69). Wrapped so the
         # parity gate works on main before B1 merges.

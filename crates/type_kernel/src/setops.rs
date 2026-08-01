@@ -1634,7 +1634,7 @@ fn is_enum_fallback(t: &Type, resolver: &TypeResolver) -> bool {
 /// (the wire format carries only `type_ref`, not the live `TypeAlias`
 /// target needed for `_expand_once`); if one is present, return `None`
 /// so the caller defers to Python.
-fn flatten_nested_unions(items: &[Type]) -> Option<Vec<Type>> {
+pub(crate) fn flatten_nested_unions(items: &[Type]) -> Option<Vec<Type>> {
     let mut flat = Vec::with_capacity(items.len());
     for t in items {
         match t {
@@ -1936,7 +1936,7 @@ pub(crate) fn make_simplified_union(
 
 /// `UnionType.make_union` (types.py:3483-3489): 0 items -> bottom,
 /// 1 item -> that item, >1 -> UnionType.
-fn union_make_union(items: Vec<Type>) -> Type {
+pub(crate) fn union_make_union(items: Vec<Type>) -> Type {
     match items.len() {
         0 => Type::UninhabitedType,
         1 => items.into_iter().next().unwrap(),
