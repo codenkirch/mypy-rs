@@ -22,6 +22,7 @@ from mypy.checkexpr import (
     CALL_UNION,
     CALL_WITH_VARS,
     _try_native_classify_call,
+    _try_native_normalize_callable,
 )
 from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.literals import Key
@@ -31,13 +32,16 @@ from mypy.test.helpers import Suite, assert_equal
 from mypy.test.typefixture import TypeFixture
 from mypy.types import (
     AnyType,
+    CallableType,
     Overloaded,
     TupleType,
     Type,
+    TypedDictType,
     TypeOfAny,
     TypeVarId,
     TypeVarType,
     UnionType,
+    UnpackType,
 )
 
 # Stage 4 parity: flip the argmap gate from the env var so the unit tests
@@ -361,6 +365,84 @@ class ClassifyCallParitySuite(Suite):
             _set_native_checkexpr_active(True)
             kind = _try_native_classify_call(callee)
             assert_equal(kind, expected)
+        finally:
+            _set_native_checkexpr_active(saved_active)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class NormalizeCallableParitySuite(Suite):
+    """Parity: check_callable_call callee normalization native vs Python.
+
+    Asserts the Rust-normalized callee equals the Python
+    `with_unpacked_kwargs().with_normalized_var_args()` result for the
+    shapes the head of check_callable_call normalizes: unpacked
+    **kwargs (TypedDict tail), plain *args, non-tuple *args.
+    """
+
+    def test_plain_callable_unchanged(self) -> None:
+        fixture = TypeFixture()
+        callee = fixture.callable(fixture.a, fixture.b)
+        self.assert_normalize(callee)
+
+    def test_unpacked_kwargs_typeddict(self) -> None:
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        callee = CallableType(
+            [fixture.a, td],
+            [ARG_POS, ARG_STAR2],
+            [None, "kwargs"],
+            fixture.b,
+            fixture.function,
+            unpack_kwargs=True,
+        )
+        self.assert_normalize(callee)
+        assert callee.unpack_kwargs
+
+    def test_var_args_plain_tuple(self) -> None:
+        fixture = TypeFixture()
+        callee = CallableType(
+            [UnpackType(fixture.std_tuple)],
+            [ARG_STAR],
+            [None],
+            fixture.b,
+            fixture.function,
+        )
+        self.assert_normalize(callee)
+
+    def test_var_args_non_tuple_unpack_unchanged(self) -> None:
+        fixture = TypeFixture()
+        # *args: *tuple[X, ...] is a nested UnpackType of Instance, which
+        # with_normalized_var_args leaves unchanged.
+        nested = UnpackType(fixture.lsta)
+        callee = CallableType(
+            [UnpackType(nested)],
+            [ARG_STAR],
+            [None],
+            fixture.b,
+            fixture.function,
+        )
+        self.assert_normalize(callee)
+
+    def assert_normalize(self, callee: CallableType) -> None:
+        from mypy.checkexpr import (
+            _native_checkexpr_active,
+            _set_native_checkexpr_active,
+        )
+
+        saved_active = _native_checkexpr_active
+        try:
+            _set_native_checkexpr_active(True)
+            agreed = _try_native_normalize_callable(callee)
+            assert_equal(agreed, True)
         finally:
             _set_native_checkexpr_active(saved_active)
 

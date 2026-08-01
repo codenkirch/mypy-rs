@@ -225,6 +225,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkcall::rust_normalize_callable,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(
