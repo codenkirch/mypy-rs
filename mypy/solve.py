@@ -16,22 +16,32 @@ from mypy.subtypes import is_subtype
 from mypy.typeops import get_all_type_vars
 from mypy.types import (
     AnyType,
+    CallableType,
+    DeletedType,
+    ErasedType,
     Instance,
     NoneType,
     Overloaded,
+    Parameters,
     ParamSpecType,
     ProperType,
     TupleType,
     Type,
+    TypeAliasType,
+    TypedDictType,
+    TypeGuardedType,
     TypeOfAny,
+    TypeType,
     TypeVarId,
     TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
+    UnboundType,
     UninhabitedType,
     UnionType,
     UnpackType,
     get_proper_type,
+    has_recursive_types,
     read_type,
 )
 from mypy.typestate import type_state
@@ -83,6 +93,49 @@ def _serialize_type_list(types: Iterable[Type]) -> list[bytes]:
         t.write(buf)
         blobs.append(buf.getvalue())
     return blobs
+
+
+_WIRE_SAFE_UNSAFE_TYPES: tuple[type[Type], ...] = (
+    TupleType,
+    CallableType,
+    Overloaded,
+    TypeAliasType,
+    TypeVarType,
+    ParamSpecType,
+    TypeVarTupleType,
+    TypedDictType,
+    UnboundType,
+    Parameters,
+    TypeType,
+    TypeGuardedType,
+    ErasedType,
+    DeletedType,
+)
+
+
+def _bounds_wire_safe(bounds: Iterable[Type]) -> bool:
+    """Whether solve bounds can round-trip through the wire format.
+
+    The wire round-trip rebuilds types as fresh objects, losing
+    identity-bearing structure: tuple fallbacks, callable/ParamSpec
+    variables, alias nodes, and recursive expansions. Feeding such a
+    candidate back into inference breaks identity-dependent checks, so
+    only bounds free of those structures take the native path.
+    """
+
+    def walk(t: Type) -> bool:
+        pt = get_proper_type(t)
+        if isinstance(pt, _WIRE_SAFE_UNSAFE_TYPES):
+            return False
+        if has_recursive_types(pt):
+            return False
+        if isinstance(pt, UnionType):
+            return all(walk(item) for item in pt.items)
+        if isinstance(pt, Instance):
+            return all(walk(arg) for arg in pt.args)
+        return True
+
+    return all(walk(t) for t in bounds)
 
 
 Bounds: _TypeAlias = "dict[TypeVarId, set[Type]]"
@@ -331,35 +384,46 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
         candidate.ambiguous = True
         return candidate
 
-    if _HAS_TYPE_KERNEL and _native_solve_active and _native_solve_resolver is not None:
-        try:
-            result = _type_kernel.rust_solve_one(
-                _serialize_type_list(lowers),
-                _serialize_type_list(uppers),
-                type_state.infer_unions,
-                state.strict_optional,
-                _native_solve_resolver,
-            )
-        except (AssertionError, NotImplementedError):
-            result = None
-        if result is not None:
-            kind, blob = result
-            if kind == 0 and blob is not None:
-                from mypy.wirefixup import fixup_wire_type
+    # Single-bound no-op solves return the bound itself; defer so the
+    # original object (identity) survives, since the wire round-trip
+    # would rebuild a fresh instance that breaks identity checks.
+    _noop = (len(lowers) == 1 and not uppers) or (len(uppers) == 1 and not lowers)
 
-                decoded = read_type(_ReadBuffer(bytes(blob)))
-                return fixup_wire_type(decoded)
-            if kind == 1:
-                if blob is not None:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_solve_active
+        and _native_solve_resolver is not None
+        and not _noop
+    ):
+        if _bounds_wire_safe(list(lowers) + list(uppers)):
+            try:
+                result = _type_kernel.rust_solve_one(
+                    _serialize_type_list(lowers),
+                    _serialize_type_list(uppers),
+                    type_state.infer_unions,
+                    state.strict_optional,
+                    _native_solve_resolver,
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                kind, blob = result
+                if kind == 0 and blob is not None:
                     from mypy.wirefixup import fixup_wire_type
 
                     decoded = read_type(_ReadBuffer(bytes(blob)))
                     return fixup_wire_type(decoded)
-                return None
-            # kind == 2: no bounds at all, ambiguous Never.
-            candidate = UninhabitedType()
-            candidate.ambiguous = True
-            return candidate
+                if kind == 1:
+                    if blob is not None:
+                        from mypy.wirefixup import fixup_wire_type
+
+                        decoded = read_type(_ReadBuffer(bytes(blob)))
+                        return fixup_wire_type(decoded)
+                    return None
+                # kind == 2: no bounds at all, ambiguous Never.
+                candidate = UninhabitedType()
+                candidate.ambiguous = True
+                return candidate
 
     bottom: Type | None = None
     top: Type | None = None
