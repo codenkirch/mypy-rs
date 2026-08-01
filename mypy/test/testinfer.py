@@ -540,6 +540,87 @@ class MapFormalsToActualsParitySuite(Suite):
         self.assert_reverse_parity([ARG_POS, ARG_NAMED], [None, "y"], [], [])
 
 
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class MapActualsToFormalsStarParitySuite(Suite):
+    """Parity: map_actuals_to_formals with star actuals native vs Python.
+
+    Runs the mapping with the argmap gate off (pure Python, callback used)
+    and on (Rust kernel, wire-serialized actual types) and asserts identical
+    results for tuple *args, iterable *args, TypedDict **kwargs, and
+    ambiguous non-TypedDict **kwargs.
+    """
+
+    def assert_star_parity(
+        self,
+        actual_kinds: list[ArgKind],
+        actual_names: list[str | None] | None,
+        formal_kinds: list[ArgKind],
+        formal_names: list[str | None],
+        actual_types: list[Type],
+    ) -> None:
+        from mypy.argmap import (
+            _native_argmap_active,
+            _set_native_argmap_active,
+            map_actuals_to_formals,
+        )
+
+        def run() -> list[list[int]]:
+            return map_actuals_to_formals(
+                actual_kinds,
+                actual_names,
+                formal_kinds,
+                formal_names,
+                lambda i: actual_types[i],
+            )
+
+        saved_active = _native_argmap_active
+        try:
+            _set_native_argmap_active(False)
+            expected = run()
+            _set_native_argmap_active(True)
+            actual = run()
+        finally:
+            _set_native_argmap_active(saved_active)
+        assert_equal(actual, expected)
+
+    def test_star_tuple_fixed_formals(self) -> None:
+        fixture = TypeFixture()
+        tup = TupleType([fixture.a, fixture.b], fixture.std_tuple, line=1, column=1)
+        self.assert_star_parity(
+            [ARG_STAR], [None], [ARG_POS, ARG_POS, ARG_POS], [None, None, None], [tup]
+        )
+
+    def test_star_iterable_while(self) -> None:
+        fixture = TypeFixture()
+        lst = fixture.lsta  # list[A]
+        self.assert_star_parity(
+            [ARG_STAR], [None], [ARG_POS, ARG_STAR], ["x", None], [lst]
+        )
+
+    def test_star2_typeddict_routes(self) -> None:
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        self.assert_star_parity(
+            [ARG_STAR2], [None], [ARG_POS, ARG_STAR2], ["x", None], [td]
+        )
+
+    def test_star2_non_typeddict_ambiguous(self) -> None:
+        fixture = TypeFixture()
+        lst = fixture.lsta
+        self.assert_star_parity(
+            [ARG_STAR2], [None], [ARG_POS, ARG_POS], ["x", "y"], [lst]
+        )
+
+
 class MapActualsToFormalsSuite(Suite):
     """Test cases for argmap.map_actuals_to_formals."""
 
