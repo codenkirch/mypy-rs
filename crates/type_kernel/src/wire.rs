@@ -2052,6 +2052,12 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::Overloaded { items } => {
+            write_tag(buf, OVERLOADED);
+            write_type_list(buf, items)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         Type::UnionType {
             items,
             uses_pep604_syntax,
@@ -2626,9 +2632,12 @@ mod tests {
 
     #[test]
     fn write_type_rejects_unsupported_variant() {
-        // Overloaded is not in the implemented set; must error rather
+        // TypeAliasType is not in the implemented set; must error rather
         // than emit bytes Type.read() would reject.
-        let t = Type::Overloaded { items: Vec::new() };
+        let t = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.A".to_string(),
+        };
         let mut buf = WriteBuffer::new();
         assert!(matches!(
             write_type(&mut buf, &t),

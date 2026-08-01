@@ -48,6 +48,7 @@ mod applytype;
 mod argmap;
 mod astwire;
 mod cache;
+mod checkcall;
 mod checkexpr_functions;
 mod checkstrformat;
 mod constraints;
@@ -223,6 +224,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints::rust_infer_constraints,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(

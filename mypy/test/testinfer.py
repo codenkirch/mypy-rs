@@ -10,13 +10,35 @@ from librt.internal import ReadBuffer, WriteBuffer
 from mypy.argmap import _set_native_argmap_active, map_actuals_to_formals
 from mypy.cache import CacheMeta, CacheMetaEx
 from mypy.checker import DisjointDict, group_comparison_operands
+
+# Stage 4 dispatch kinds, mirrored from checkcall.rs via checkexpr.
+from mypy.checkexpr import (
+    CALL_ANY,
+    CALL_INSTANCE,
+    CALL_OTHER,
+    CALL_OVERLOADED,
+    CALL_PLAIN,
+    CALL_TYPE_TYPE,
+    CALL_UNION,
+    CALL_WITH_VARS,
+    _try_native_classify_call,
+)
 from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.literals import Key
 from mypy.nodes import ARG_NAMED, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, NameExpr
 from mypy.solve import solve_one
 from mypy.test.helpers import Suite, assert_equal
 from mypy.test.typefixture import TypeFixture
-from mypy.types import AnyType, TupleType, Type, TypeOfAny, TypeVarId, TypeVarType
+from mypy.types import (
+    AnyType,
+    Overloaded,
+    TupleType,
+    Type,
+    TypeOfAny,
+    TypeVarId,
+    TypeVarType,
+    UnionType,
+)
 
 # Stage 4 parity: flip the argmap gate from the env var so the unit tests
 # exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set. Mirrors the
@@ -262,6 +284,85 @@ class ConstraintInferParitySuite(Suite):
             assert_equal(native_result, expected)
         finally:
             _set_native_constraints_active(saved_active)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class ClassifyCallParitySuite(Suite):
+    """Parity: check_call dispatch classification native vs Python.
+
+    Asserts the Rust classifier returns the same CALL_* kind as the
+    Python isinstance chain in check_call would choose, for each callee
+    shape. This is the verification surface for the Stage 4 dispatch
+    classifier; the check_call call sites remain pure Python until a
+    later slice gates a branch behind it.
+    """
+
+    def test_plain_callable(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(fixture.callable(fixture.a), CALL_PLAIN)
+
+    def test_callable_with_vars(self) -> None:
+        fixture = TypeFixture()
+        callable_t = fixture.callable(fixture.a)
+        callable_t.variables = [fixture.t]
+        self.assert_classify(callable_t, CALL_WITH_VARS)
+
+    def test_overloaded(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(
+            Overloaded([fixture.callable(fixture.a), fixture.callable(fixture.b)]),
+            CALL_OVERLOADED,
+        )
+
+    def test_any(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(fixture.anyt, CALL_ANY)
+
+    def test_union(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(
+            UnionType.make_union([fixture.a, fixture.b]), CALL_UNION
+        )
+
+    def test_instance(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(fixture.a, CALL_INSTANCE)
+
+    def test_type_type(self) -> None:
+        fixture = TypeFixture()
+        self.assert_classify(fixture.type_any, CALL_TYPE_TYPE)
+
+    def test_other_shapes(self) -> None:
+        # TypeVarType, TupleType, UninhabitedType fall through to
+        # CALL_OTHER in the classifier (Python recurses or errors).
+        fixture = TypeFixture()
+        tuple_t = TupleType([fixture.a], fixture.std_tuple)
+        self.assert_classify(fixture.t, CALL_OTHER)
+        self.assert_classify(tuple_t, CALL_OTHER)
+        self.assert_classify(fixture.uninhabited, CALL_OTHER)
+
+    def test_typevar_as_callable(self) -> None:
+        # TypeVarType with an upper bound that is a callable still falls
+        # through to CALL_OTHER (the isinstance chain recurses).
+        fixture = TypeFixture()
+        self.assert_classify(fixture.t, CALL_OTHER)
+
+    def assert_classify(self, callee: Type, expected: int) -> None:
+        from mypy.checkexpr import (
+            _native_checkexpr_active,
+            _set_native_checkexpr_active,
+        )
+
+        saved_active = _native_checkexpr_active
+        try:
+            _set_native_checkexpr_active(True)
+            kind = _try_native_classify_call(callee)
+            assert_equal(kind, expected)
+        finally:
+            _set_native_checkexpr_active(saved_active)
 
 
 class MapActualsToFormalsSuite(Suite):
