@@ -32,11 +32,15 @@ if TYPE_CHECKING:
 # strangler-fig per-call gate, mirroring `erasetype.py` (Stage 1) and
 # `subtypes.py` (Stage 3c): no behavior change unless the option is set.
 try:
-    from type_kernel import rust_map_actuals_to_formals as _rust_map_actuals_to_formals
+    from type_kernel import (
+        rust_map_actuals_to_formals as _rust_map_actuals_to_formals,
+        rust_map_formals_to_actuals as _rust_map_formals_to_actuals,
+    )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_map_actuals_to_formals = None  # type: ignore[assignment]
+    _rust_map_formals_to_actuals = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag read by the gate below. Set by the build manager from
@@ -80,7 +84,7 @@ def map_actuals_to_formals(
             )
             if result is not None:
                 return [list(slot) for slot in result]
-            # Rust returned None (star actual present) — fall through to Python.
+            # Rust returned None (star actual present), fall through to Python.
     nformals = len(formal_kinds)
     formal_to_actual: list[list[int]] = [[] for i in range(nformals)]
     ambiguous_actual_kwargs: list[int] = []
@@ -172,6 +176,19 @@ def map_formals_to_actuals(
     actual_arg_type: Callable[[int], Type],
 ) -> list[list[int]]:
     """Calculate the reverse mapping of map_actuals_to_formals."""
+    if _HAS_TYPE_KERNEL and _native_argmap_active:
+        # Mirror Python's `assert actual_names is not None` for named kinds.
+        has_named = any(k.is_named() for k in actual_kinds)
+        if not (has_named and actual_names is None):
+            result = _rust_map_formals_to_actuals(
+                [int(k.value) for k in actual_kinds],
+                list(actual_names) if actual_names is not None else [],
+                [int(k.value) for k in formal_kinds],
+                list(formal_names),
+            )
+            if result is not None:
+                return [list(slot) for slot in result]
+            # Rust returned None (star actual present), fall through to Python.
     formal_to_actual = map_actuals_to_formals(
         actual_kinds, actual_names, formal_kinds, formal_names, actual_arg_type
     )

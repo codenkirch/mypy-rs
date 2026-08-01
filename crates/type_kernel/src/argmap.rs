@@ -96,6 +96,35 @@ pub fn rust_map_actuals_to_formals(
     Some(formal_to_actual)
 }
 
+/// Rust port of `map_formals_to_actuals` (argmap.py:167-183).
+///
+/// Computes the forward mapping via `rust_map_actuals_to_formals`, then
+/// reverses it into `actual_to_formal` (indexed by actual argument index,
+/// each entry the list of formals that actual binds to). Deferral contract
+/// matches the forward function: returns `None` for any star actual
+/// (needs the callback) or unexpected actual kind.
+#[pyfunction]
+pub fn rust_map_formals_to_actuals(
+    actual_kinds: Vec<i64>,
+    actual_names: Vec<Option<String>>,
+    formal_kinds: Vec<i64>,
+    formal_names: Vec<Option<String>>,
+) -> Option<Vec<Vec<i64>>> {
+    let formal_to_actual = rust_map_actuals_to_formals(
+        actual_kinds.clone(),
+        actual_names,
+        formal_kinds,
+        formal_names,
+    )?;
+    let mut actual_to_formal: Vec<Vec<i64>> = vec![Vec::new(); actual_kinds.len()];
+    for (formal, actuals) in formal_to_actual.iter().enumerate() {
+        for &actual in actuals {
+            actual_to_formal[actual as usize].push(formal as i64);
+        }
+    }
+    Some(actual_to_formal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +352,157 @@ mod tests {
     fn test_named_missing_name_falls_through() {
         // Named kind with no name entry: Python would assert; fall through.
         let r = rust_map_actuals_to_formals(
+            kinds(&[ARG_NAMED]),
+            names(&[None]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, None);
+    }
+
+    // Reverse mapping (map_formals_to_actuals).
+
+    #[test]
+    fn test_reverse_pos_to_pos() {
+        // One positional actual binds to one formal; reverse maps actual 0 -> [formal 0].
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS]),
+            names(&[None]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, Some(vec![vec![0]]));
+    }
+
+    #[test]
+    fn test_reverse_pos_to_star_formal() {
+        // Two positional actuals into one ARG_STAR formal: each actual lists formal 0.
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS, ARG_POS]),
+            names(&[None, None]),
+            kinds(&[ARG_STAR]),
+            names(&[None]),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![0]]));
+    }
+
+    #[test]
+    fn test_reverse_pos_overflow_dropped() {
+        // Second positional with no formal: it has an empty actual_to_formal slot.
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS, ARG_POS]),
+            names(&[None, None]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![]]));
+    }
+
+    #[test]
+    fn test_reverse_pos_into_star2_dropped() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS]),
+            names(&[None]),
+            kinds(&[ARG_STAR2]),
+            names(&[None]),
+        );
+        assert_eq!(r, Some(vec![vec![]]));
+    }
+
+    #[test]
+    fn test_reverse_named_to_named() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_NAMED]),
+            names(&[Some("x")]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, Some(vec![vec![0]]));
+    }
+
+    #[test]
+    fn test_reverse_named_to_star2_when_no_formal_match() {
+        // Named actual with no formal match routes to ARG_STAR2 (formal 1).
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_NAMED]),
+            names(&[Some("z")]),
+            kinds(&[ARG_POS, ARG_STAR2]),
+            names(&[Some("x"), None]),
+        );
+        assert_eq!(r, Some(vec![vec![1]]));
+    }
+
+    #[test]
+    fn test_reverse_named_not_found_no_star2_dropped() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_NAMED]),
+            names(&[Some("z")]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, Some(vec![vec![]]));
+    }
+
+    #[test]
+    fn test_reverse_multiple_named() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_NAMED, ARG_NAMED]),
+            names(&[Some("x"), Some("y")]),
+            kinds(&[ARG_POS, ARG_POS]),
+            names(&[Some("x"), Some("y")]),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![1]]));
+    }
+
+    #[test]
+    fn test_reverse_pos_then_named() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS, ARG_NAMED]),
+            names(&[None, Some("y")]),
+            kinds(&[ARG_POS, ARG_POS]),
+            names(&[Some("x"), Some("y")]),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![1]]));
+    }
+
+    #[test]
+    fn test_reverse_returns_none_for_star_actual() {
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_STAR]),
+            names(&[None]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn test_reverse_empty_caller() {
+        // No actuals: empty actual_to_formal even with a formal present.
+        let r = rust_map_formals_to_actuals(
+            kinds(&[]),
+            names(&[]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+        );
+        assert_eq!(r, Some(vec![]));
+    }
+
+    #[test]
+    fn test_reverse_empty_callee() {
+        // No formals: every actual has an empty list.
+        let r = rust_map_formals_to_actuals(
+            kinds(&[ARG_POS, ARG_NAMED]),
+            names(&[None, Some("y")]),
+            kinds(&[]),
+            names(&[]),
+        );
+        assert_eq!(r, Some(vec![vec![], vec![]]));
+    }
+
+    #[test]
+    fn test_reverse_named_missing_name_falls_through() {
+        let r = rust_map_formals_to_actuals(
             kinds(&[ARG_NAMED]),
             names(&[None]),
             kinds(&[ARG_POS]),
