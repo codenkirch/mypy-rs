@@ -621,6 +621,142 @@ class MapActualsToFormalsStarParitySuite(Suite):
         )
 
 
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class ExpandActualTypeParitySuite(Suite):
+    """Parity: ArgTypeExpander.expand_actual_type native vs Python.
+
+    Exercises the deterministic structural branches (tuple *args item
+    indexing with wrap-around, named-key TypedDict **kwargs lookup) that the
+    Rust kernel resolves via wire-serialized actual types. The graph-
+    dependent and hash-order-dependent branches run Python-side in both
+    regimes.
+    """
+
+    def assert_expand_parity(
+        self, calls: list[tuple[Type, ArgKind, str | None, ArgKind, bool]]
+    ) -> None:
+        from mypy.argmap import ArgTypeExpander, _native_argmap_active
+        from mypy.infer import ArgumentInferContext
+
+        fixture = TypeFixture()
+        # Structural branches never touch the context; provide a valid one so
+        # Iterable/Mapping branches (if reached) behave identically in both
+        # regimes.
+        context = ArgumentInferContext(fixture.std_tuple, fixture.std_tuple)
+
+        def run() -> tuple[list[Type], int, set[str] | None]:
+            mapper = ArgTypeExpander(context)
+            out = []
+            for actual_type, actual_kind, formal_name, formal_kind, allow_unpack in calls:
+                out.append(
+                    mapper.expand_actual_type(
+                        actual_type,
+                        actual_kind,
+                        formal_name,
+                        formal_kind,
+                        allow_unpack,
+                    )
+                )
+            return out, mapper.tuple_index, mapper.kwargs_used
+
+        saved_active = _native_argmap_active
+        try:
+            _set_native_argmap_active(False)
+            expected = run()
+            _set_native_argmap_active(True)
+            actual = run()
+        finally:
+            _set_native_argmap_active(saved_active)
+        assert_equal(actual, expected)
+
+    def test_tuple_star_first_item(self) -> None:
+        fixture = TypeFixture()
+        tup = TupleType([fixture.a, fixture.b], fixture.std_tuple, line=1, column=1)
+        self.assert_expand_parity([(tup, ARG_STAR, None, ARG_POS, False)])
+
+    def test_tuple_star_sequence(self) -> None:
+        fixture = TypeFixture()
+        tup = TupleType([fixture.a, fixture.b], fixture.std_tuple, line=1, column=1)
+        self.assert_expand_parity(
+            [
+                (tup, ARG_STAR, None, ARG_POS, False),
+                (tup, ARG_STAR, None, ARG_POS, False),
+            ]
+        )
+
+    def test_tuple_star_wrap_after_exhaustion(self) -> None:
+        fixture = TypeFixture()
+        tup = TupleType([fixture.a, fixture.b], fixture.std_tuple, line=1, column=1)
+        self.assert_expand_parity(
+            [
+                (tup, ARG_STAR, None, ARG_POS, False),
+                (tup, ARG_STAR, None, ARG_POS, False),
+                (tup, ARG_STAR, None, ARG_POS, False),
+            ]
+        )
+
+    def test_tuple_star_unpack_allow(self) -> None:
+        fixture = TypeFixture()
+        item = UnpackType(fixture.a)
+        tup = TupleType([item, fixture.b], fixture.std_tuple, line=1, column=1)
+        self.assert_expand_parity([(tup, ARG_STAR, None, ARG_POS, True)])
+
+    def test_star2_typeddict_named_key(self) -> None:
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        self.assert_expand_parity([(td, ARG_STAR2, "x", ARG_POS, False)])
+
+    def test_star2_typeddict_two_keys(self) -> None:
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        self.assert_expand_parity(
+            [
+                (td, ARG_STAR2, "x", ARG_POS, False),
+                (td, ARG_STAR2, "y", ARG_POS, False),
+            ]
+        )
+
+    def test_star2_typeddict_star2_formal(self) -> None:
+        # formal_kind == ARG_STAR2: Python's arbitrary pop, both regimes
+        # run Python (Rust defers), so parity must hold.
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        self.assert_expand_parity([(td, ARG_STAR2, None, ARG_STAR2, False)])
+
+    def test_star2_typeddict_unmatched_name(self) -> None:
+        # Name not among keys: arbitrary pop path, Python runs both.
+        fixture = TypeFixture()
+        td = TypedDictType(
+            {"x": fixture.a, "y": fixture.b},
+            {"x"},
+            set(),
+            fixture.a,
+            is_closed=True,
+        )
+        self.assert_expand_parity([(td, ARG_STAR2, "z", ARG_POS, False)])
+
+
 class MapActualsToFormalsSuite(Suite):
     """Test cases for argmap.map_actuals_to_formals."""
 
