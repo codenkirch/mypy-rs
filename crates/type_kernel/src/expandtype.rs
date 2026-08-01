@@ -24,7 +24,9 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 
 use crate::typeinfo::NativeTypeResolver;
-use crate::wire::{read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{
+    read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
+};
 
 /// Key for the env: `(raw_id, namespace)`. Mirrors `TypeVarId.__eq__`
 /// (types.py:574-576), which compares `raw_id` and `namespace`.
