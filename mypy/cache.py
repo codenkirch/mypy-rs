@@ -76,6 +76,91 @@ CACHE_VERSION: Final = 10
 ErrorTuple: _TypeAlias = tuple[str | None, int, int, int, int, str, str, str | None]
 
 
+# M4 cache seam: when type_kernel is importable and the cache gate is on,
+# CacheMeta/CacheMetaEx fixed-format reads route through Rust, falling back
+# to pure Python on any decode failure. Mirrors the solve seam (M3).
+try:
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Set by the build manager from `Options.native_type_kernel` at the start of
+# each build (mypy/build.py `_set_native_cache_active`).
+_native_cache_active: bool = False
+
+
+def _set_native_cache_active(active: bool) -> None:
+    """Enable/disable the Rust fixed-format cache read seam."""
+    global _native_cache_active
+    _native_cache_active = active
+
+
+def _try_native_read_cache_meta(blob: bytes, data_file: str) -> CacheMeta | None:
+    """Decode cache meta via the Rust kernel; None on any failure.
+
+    The Rust reader returns the decoded fields as a dict (minus `data_file`,
+    which is not serialized). We rebuild a `CacheMeta` from it, so the rest
+    of the pipeline sees an ordinary object. Any mismatch falls back to None
+    and the caller uses the pure-Python reader.
+    """
+    if not (_HAS_TYPE_KERNEL and _native_cache_active):
+        return None
+    try:
+        decoded = _type_kernel.rust_read_cache_meta(blob)
+    except (AssertionError, NotImplementedError, ValueError, OverflowError):
+        return None
+    if decoded is None:
+        return None
+    try:
+        return CacheMeta(
+            id=decoded["id"],
+            path=decoded["path"],
+            mtime=decoded["mtime"],
+            size=decoded["size"],
+            hash=decoded["hash"],
+            dependencies=decoded["dependencies"],
+            data_mtime=decoded["data_mtime"],
+            data_file=data_file,
+            suppressed=decoded["suppressed"],
+            imports_ignored=decoded["imports_ignored"],
+            options=decoded["options"],
+            suppressed_deps_opts=decoded["suppressed_deps_opts"],
+            dep_prios=decoded["dep_prios"],
+            dep_lines=decoded["dep_lines"],
+            dep_hashes=decoded["dep_hashes"],
+            interface_hash=decoded["interface_hash"],
+            trans_dep_hash=decoded["trans_dep_hash"],
+            version_id=decoded["version_id"],
+            ignore_all=decoded["ignore_all"],
+            plugin_data=decoded["plugin_data"],
+        )
+    except (KeyError, TypeError):
+        return None
+
+
+def _try_native_read_cache_meta_ex(blob: bytes) -> CacheMetaEx | None:
+    if not (_HAS_TYPE_KERNEL and _native_cache_active):
+        return None
+    try:
+        decoded = _type_kernel.rust_read_cache_meta_ex(blob)
+    except (AssertionError, NotImplementedError, ValueError, OverflowError):
+        return None
+    if decoded is None:
+        return None
+    try:
+        return CacheMetaEx(
+            dependencies=decoded["dependencies"],
+            suppressed=decoded["suppressed"],
+            dep_hashes=decoded["dep_hashes"],
+            error_lines=decoded["error_lines"],
+        )
+    except (KeyError, TypeError):
+        return None
+
+
 class CacheMeta:
     """Class representing cache metadata for a module.
 

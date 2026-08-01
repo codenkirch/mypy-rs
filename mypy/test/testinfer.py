@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 from unittest import skipUnless
 
+from librt.internal import ReadBuffer, WriteBuffer
+
 from mypy.argmap import _set_native_argmap_active, map_actuals_to_formals
+from mypy.cache import CacheMeta, CacheMetaEx
 from mypy.checker import DisjointDict, group_comparison_operands
 from mypy.literals import Key
 from mypy.nodes import ARG_NAMED, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, NameExpr
@@ -102,6 +105,115 @@ class SolveOneParitySuite(Suite):
             from mypy.wirefixup import set_wire_typeinfo_map
 
             set_wire_typeinfo_map(None)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class CacheMetaParitySuite(Suite):
+    """Parity: rust_read_cache_meta native vs pure-Python decode.
+
+    The Rust kernel's fixed-format decode of `CacheMeta.write` bytes must
+    match Python's `CacheMeta.read` field-for-field, including the error
+    tuples and JSON values in `CacheMetaEx`.
+    """
+
+    def test_cache_meta_roundtrip(self) -> None:
+        self.assert_equal_decode(self.sample_meta())
+
+    def test_cache_meta_json_value(self) -> None:
+        meta = self.sample_meta()
+        meta.options["list_value"] = [1, "two", None]
+        meta.options["tuple_value"] = (1, "two", None)
+        self.assert_equal_decode(meta)
+
+    def test_cache_meta_ex_errors(self) -> None:
+        meta = CacheMetaEx(
+            dependencies=["mod.a", "mod.b"],
+            suppressed=["mod.c"],
+            dep_hashes=[b"\x01\x02", b"\x03"],
+            error_lines=[
+                (None, 1, 2, 3, 4, "error", "msg", "code"),
+                ("file.py", 10, 20, 30, 40, "note", "other", None),
+            ],
+        )
+        self.assert_equal_decode_ex(meta)
+
+    def sample_meta(self) -> CacheMeta:
+        return CacheMeta(
+            id="mod",
+            path="/src/mod.py",
+            mtime=1000,
+            size=100,
+            hash="abc123",
+            dependencies=["dep.a", "dep.b"],
+            data_mtime=2000,
+            data_file="mod.data.ff",
+            suppressed=["s1"],
+            imports_ignored={1: ["unused-ignore"], 2: []},
+            options={"platform": "darwin", "n": 42, "b": True, "f": 1.5},
+            suppressed_deps_opts=b"\x00\x01",
+            dep_prios=[1, 2],
+            dep_lines=[3, 4],
+            dep_hashes=[b"\xaa", b"\xbb"],
+            interface_hash=b"\xcc",
+            trans_dep_hash=b"\xdd",
+            version_id="1.0",
+            ignore_all=False,
+            plugin_data={"k": "v"},
+        )
+
+    def assert_equal_decode(self, meta: CacheMeta) -> None:
+        buffer = WriteBuffer()
+        meta.write(buffer)
+        blob = buffer.getvalue()
+        import type_kernel
+
+        native = type_kernel.rust_read_cache_meta(blob)
+        assert native is not None
+        expected = CacheMeta.read(ReadBuffer(blob), meta.data_file)
+        assert expected is not None
+        expected_dict = {
+            "id": expected.id,
+            "path": expected.path,
+            "mtime": expected.mtime,
+            "size": expected.size,
+            "hash": expected.hash,
+            "dependencies": expected.dependencies,
+            "data_mtime": expected.data_mtime,
+            "suppressed": expected.suppressed,
+            "imports_ignored": expected.imports_ignored,
+            "options": expected.options,
+            "suppressed_deps_opts": expected.suppressed_deps_opts,
+            "dep_prios": expected.dep_prios,
+            "dep_lines": expected.dep_lines,
+            "dep_hashes": expected.dep_hashes,
+            "interface_hash": expected.interface_hash,
+            "trans_dep_hash": expected.trans_dep_hash,
+            "version_id": expected.version_id,
+            "ignore_all": expected.ignore_all,
+            "plugin_data": expected.plugin_data,
+        }
+        assert_equal(native, expected_dict)
+
+    def assert_equal_decode_ex(self, meta: CacheMetaEx) -> None:
+        buffer = WriteBuffer()
+        meta.write(buffer)
+        blob = buffer.getvalue()
+        import type_kernel
+
+        native = type_kernel.rust_read_cache_meta_ex(blob)
+        assert native is not None
+        expected = CacheMetaEx.read(ReadBuffer(blob))
+        assert expected is not None
+        expected_dict = {
+            "dependencies": expected.dependencies,
+            "suppressed": expected.suppressed,
+            "dep_hashes": expected.dep_hashes,
+            "error_lines": expected.error_lines,
+        }
+        assert_equal(native, expected_dict)
 
 
 class MapActualsToFormalsSuite(Suite):

@@ -190,7 +190,7 @@ pub(crate) fn read_bool(buf: &mut ReadBuffer<'_>) -> Result<bool, WireError> {
 /// - 1-byte  (low bit 0):  7 bits payload, range -10..=117
 /// - 2-byte (low 2 bits 01): 14 bits payload, range -100..=16283
 /// - 4-byte (low 3 bits 011): 29 bits payload, range -10000..=536860911
-fn read_short_int(buf: &mut ReadBuffer<'_>, first: u8) -> Result<i64, WireError> {
+pub(crate) fn read_short_int(buf: &mut ReadBuffer<'_>, first: u8) -> Result<i64, WireError> {
     if (first & TWO_BYTES_INT_BIT) == 0 {
         // 1-byte form: 7 bits.
         Ok(((first >> 1) as i64) + MIN_ONE_BYTE_INT)
