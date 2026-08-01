@@ -447,6 +447,99 @@ class NormalizeCallableParitySuite(Suite):
             _set_native_checkexpr_active(saved_active)
 
 
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class MapFormalsToActualsParitySuite(Suite):
+    """Parity: map_formals_to_actuals reverse mapping native vs Python.
+
+    Runs the mapping with the argmap gate off (pure Python) and on (Rust
+    kernel) and asserts identical results for the non-star shapes the Rust
+    path handles. Star actuals defer to Python in both regimes.
+    """
+
+    def assert_reverse_parity(
+        self,
+        actual_kinds: list[ArgKind],
+        actual_names: list[str | None] | None,
+        formal_kinds: list[ArgKind],
+        formal_names: list[str | None],
+    ) -> None:
+        from mypy.argmap import (
+            _native_argmap_active,
+            _set_native_argmap_active,
+            map_formals_to_actuals,
+        )
+
+        def run() -> list[list[int]]:
+            return map_formals_to_actuals(
+                actual_kinds,
+                actual_names,
+                formal_kinds,
+                formal_names,
+                lambda i: fixture.anyt,  # only used for star actuals (deferred)
+            )
+
+        fixture = TypeFixture()
+        saved_active = _native_argmap_active
+        try:
+            _set_native_argmap_active(False)
+            expected = run()
+            _set_native_argmap_active(True)
+            actual = run()
+        finally:
+            _set_native_argmap_active(saved_active)
+        assert_equal(actual, expected)
+
+    def test_pos_to_pos_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_POS], [None], [ARG_POS], ["x"]
+        )
+
+    def test_pos_to_star_formal_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_POS, ARG_POS], [None, None], [ARG_STAR], [None]
+        )
+
+    def test_pos_overflow_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_POS, ARG_POS], [None, None], [ARG_POS], ["x"]
+        )
+
+    def test_pos_into_star2_reverse(self) -> None:
+        self.assert_reverse_parity([ARG_POS], [None], [ARG_STAR2], [None])
+
+    def test_named_to_named_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_NAMED], ["x"], [ARG_POS], ["x"]
+        )
+
+    def test_named_to_star2_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_NAMED], ["z"], [ARG_POS, ARG_STAR2], ["x", None]
+        )
+
+    def test_named_not_found_reverse(self) -> None:
+        self.assert_reverse_parity([ARG_NAMED], ["z"], [ARG_POS], ["x"])
+
+    def test_multiple_named_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_NAMED, ARG_NAMED], ["x", "y"], [ARG_POS, ARG_POS], ["x", "y"]
+        )
+
+    def test_pos_then_named_reverse(self) -> None:
+        self.assert_reverse_parity(
+            [ARG_POS, ARG_NAMED], [None, "y"], [ARG_POS, ARG_POS], ["x", "y"]
+        )
+
+    def test_empty_caller_reverse(self) -> None:
+        self.assert_reverse_parity([], [], [ARG_POS], ["x"])
+
+    def test_empty_callee_reverse(self) -> None:
+        self.assert_reverse_parity([ARG_POS, ARG_NAMED], [None, "y"], [], [])
+
+
 class MapActualsToFormalsSuite(Suite):
     """Test cases for argmap.map_actuals_to_formals."""
 
