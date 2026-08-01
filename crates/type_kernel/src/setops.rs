@@ -3747,6 +3747,7 @@ mod tests {
                 missing_import_name: None,
             }),
             variance: INVARIANT,
+            meta_level: 0,
         }
     }
 

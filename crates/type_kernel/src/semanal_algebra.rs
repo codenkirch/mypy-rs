@@ -280,6 +280,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             upper_bound,
             default,
             variance,
+            meta_level,
         } => Type::TypeVarType {
             name,
             fullname,
@@ -289,6 +290,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             upper_bound: Box::new(f(*upper_bound)),
             default: Box::new(f(*default)),
             variance,
+            meta_level,
         },
         Type::ParamSpecType {
             prefix,

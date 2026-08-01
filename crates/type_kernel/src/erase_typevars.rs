@@ -149,6 +149,7 @@ pub(crate) fn erase_typevars_inner(
             upper_bound,
             default,
             variance,
+            meta_level,
         } => {
             if should_erase(*raw_id, namespace, ids) {
                 Some(replacement.clone())
@@ -162,6 +163,7 @@ pub(crate) fn erase_typevars_inner(
                     upper_bound: upper_bound.clone(),
                     default: default.clone(),
                     variance: *variance,
+                    meta_level: *meta_level,
                 })
             }
         }
@@ -756,6 +758,7 @@ mod tests {
                 missing_import_name: None,
             }),
             variance: 0,
+            meta_level: 0,
         }
     }
 

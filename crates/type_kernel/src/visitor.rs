@@ -801,6 +801,7 @@ mod tests {
                 missing_import_name: None,
             }),
             variance: 0,
+            meta_level: 0,
         }
     }
 

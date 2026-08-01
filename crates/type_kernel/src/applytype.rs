@@ -44,7 +44,10 @@ const ARG_STAR: i64 = 2;
 #[allow(dead_code)]
 const ARG_STAR2: i64 = 4;
 
-type EnvKey = (i64, String);
+// Key for typevar identity: `(raw_id, meta_level, namespace)`. Mirrors
+// `TypeVarId.__eq__` (types.py). meta_level is wire-serialized only for
+// TypeVarType; ParamSpec/TypeVarTuple keys use 0.
+type EnvKey = (i64, i64, String);
 
 // ---------------------------------------------------------------------------
 // apply_generic_arguments
@@ -376,18 +379,21 @@ fn get_proper_type(typ: &Type) -> Option<Type> {
     }
 }
 
-/// Extract the `(raw_id, namespace)` key from a TypeVar-like type.
+/// Extract the `(raw_id, meta_level, namespace)` key from a TypeVar-like type.
 fn typevar_id_key(tvar: &Type) -> Option<EnvKey> {
     match tvar {
         Type::TypeVarType {
-            raw_id, namespace, ..
-        } => Some((*raw_id, namespace.clone())),
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => Some((*raw_id, *meta_level, namespace.clone())),
         Type::ParamSpecType {
             raw_id, namespace, ..
-        } => Some((*raw_id, namespace.clone())),
+        } => Some((*raw_id, 0, namespace.clone())),
         Type::TypeVarTupleType {
             raw_id, namespace, ..
-        } => Some((*raw_id, namespace.clone())),
+        } => Some((*raw_id, 0, namespace.clone())),
         _ => None,
     }
 }
@@ -531,6 +537,7 @@ mod tests {
             }),
             default: Box::new(make_any()),
             variance: 0,
+            meta_level: 0,
         }
     }
 
@@ -549,6 +556,7 @@ mod tests {
             }),
             default: Box::new(default),
             variance: 0,
+            meta_level: 0,
         }
     }
 
@@ -599,7 +607,7 @@ mod tests {
     fn test_typevar_id_key_typevar() {
         let tv = make_typevar(42, "ns");
         let key = typevar_id_key(&tv).unwrap();
-        assert_eq!(key, (42, "ns".to_string()));
+        assert_eq!(key, (42, 0, "ns".to_string()));
     }
 
     #[test]

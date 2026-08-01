@@ -1706,6 +1706,29 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(self.fx.s)
         self.assert_wire_par(self.fx.u)
 
+    def test_typevar_meta_level_roundtrip(self) -> None:
+        # meta_level=0 records must be byte-identical to the old format
+        # (no meta_level field written). meta_level=1 (metavar) must survive
+        # the round-trip so env lookups keyed on TypeVarId.__eq__ match.
+        any_type = AnyType(TypeOfAny.special_form)
+        declared = TypeVarType(
+            "T", "mod.T", TypeVarId(1, namespace="mod"), [], self.fx.o, any_type
+        )
+        meta = TypeVarType(
+            "T", "mod.T", TypeVarId(1, meta_level=1, namespace="mod"), [], self.fx.o, any_type
+        )
+        self.assert_wire_par(declared)
+        self.assert_wire_par(meta)
+        # Assert id equality is preserved across the wire, not just str().
+        from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+        from mypy.types import read_type
+
+        for t in (declared, meta):
+            buf = _WB()
+            t.write(buf)
+            rt = read_type(_RB(buf.getvalue()))
+            assert rt.id == t.id, f"{rt.id} != {t.id} after round-trip"
+
     def test_union(self) -> None:
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.nonet]))
