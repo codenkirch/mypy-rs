@@ -23,6 +23,14 @@ from mypy.types import (
 if TYPE_CHECKING:
     from mypy.infer import ArgumentInferContext
 
+try:
+    from librt.internal import WriteBuffer as _ArgMapWriteBuffer
+
+    _HAS_LIBRT = True
+except ImportError:
+    _ArgMapWriteBuffer = None  # type: ignore[assignment]
+    _HAS_LIBRT = False
+
 # Stage 4 type-kernel seam: when the `type_kernel` Rust extension is
 # importable and `Options.native_type_kernel` is set, route the pure
 # positional/named branches of `map_actuals_to_formals` through Rust. The
@@ -34,12 +42,14 @@ if TYPE_CHECKING:
 try:
     from type_kernel import (
         rust_map_actuals_to_formals as _rust_map_actuals_to_formals,
+        rust_map_actuals_to_formals_with_types as _rust_map_actuals_to_formals_with_types,
         rust_map_formals_to_actuals as _rust_map_formals_to_actuals,
     )
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_map_actuals_to_formals = None  # type: ignore[assignment]
+    _rust_map_actuals_to_formals_with_types = None  # type: ignore[assignment]
     _rust_map_formals_to_actuals = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -53,6 +63,21 @@ def _set_native_argmap_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust argmap path."""
     global _native_argmap_active
     _native_argmap_active = active
+
+
+def _serialize_actual_type(actual: Type) -> bytes | None:
+    """Serialize an actual type for wire inspection; None on write failure.
+
+    Uses `get_proper_type` so the wire carries the resolved
+    TypedDictType/TupleType (Python resolves before branching in
+    map_actuals_to_formals; the Rust side has no type_state).
+    """
+    try:
+        buf = _ArgMapWriteBuffer()
+        get_proper_type(actual).write(buf)
+        return buf.getvalue()
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
 
 
 def map_actuals_to_formals(
@@ -76,12 +101,23 @@ def map_actuals_to_formals(
         # internal error rather than calling Rust with an empty names list.
         has_named = any(k.is_named() for k in actual_kinds)
         if not (has_named and actual_names is None):
-            result = _rust_map_actuals_to_formals(
-                [int(k.value) for k in actual_kinds],
-                list(actual_names) if actual_names is not None else [],
-                [int(k.value) for k in formal_kinds],
-                list(formal_names),
-            )
+            kinds = [int(k.value) for k in actual_kinds]
+            names = list(actual_names) if actual_names is not None else []
+            fk = [int(k.value) for k in formal_kinds]
+            fn = list(formal_names)
+            has_star = any(k.is_star() for k in actual_kinds)
+            if has_star and _HAS_LIBRT:
+                # Serialize each star actual's type so Rust can inspect
+                # tuple/TypedDict structure; other actuals get None.
+                type_blobs = [
+                    _serialize_actual_type(actual_arg_type(ai)) if k.is_star() else None
+                    for ai, k in enumerate(actual_kinds)
+                ]
+                result = _rust_map_actuals_to_formals_with_types(
+                    kinds, names, fk, fn, type_blobs
+                )
+            else:
+                result = _rust_map_actuals_to_formals(kinds, names, fk, fn)
             if result is not None:
                 return [list(slot) for slot in result]
             # Rust returned None (star actual present), fall through to Python.

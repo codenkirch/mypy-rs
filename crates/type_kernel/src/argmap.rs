@@ -16,6 +16,8 @@
 
 use pyo3::prelude::*;
 
+use crate::wire::{read_type, ReadBuffer, Type};
+
 // ArgKind integer values, mirroring `mypy.nodes.ARG_*` (nodes.py:2480-2517).
 // The wire format and the Python shim both pass `int(ArgKind.value)`.
 const ARG_POS: i64 = 0;
@@ -30,6 +32,11 @@ fn is_star(kind: i64) -> bool {
 
 fn is_named(kind: i64) -> bool {
     kind == ARG_NAMED || kind == ARG_NAMED_OPT
+}
+
+/// `ArgKind.is_named(star=True)`: named or `**kwargs` (ARG_STAR2).
+fn is_named_or_star2(kind: i64) -> bool {
+    kind == ARG_NAMED || kind == ARG_NAMED_OPT || kind == ARG_STAR2
 }
 
 /// Rust port of `map_actuals_to_formals` (argmap.py:27-122).
@@ -125,9 +132,153 @@ pub fn rust_map_formals_to_actuals(
     Some(actual_to_formal)
 }
 
+/// Rust port of `map_actuals_to_formals` for calls with star actuals
+/// (argmap.py:96-140 plus the ambiguous-kwargs fill at 142-163).
+///
+/// The non-star branches share logic with `rust_map_actuals_to_formals`;
+/// the star branches additionally need the actual type per star actual to
+/// decide tuple/TypedDict unpacking. Python serializes each star actual's
+/// type on the wire (`actual_types[ai]`), so this fn can inspect
+/// TupleType/TypedDictType structurally without any type identity round-trip
+/// (M5 wire-safety rule: Rust only validates; the caller keeps the original
+/// Python objects). Returns `None` to defer to Python when a star actual
+/// lacks a wire type or the kinds are unexpected, matching the fall-through
+/// contract of the non-star fn.
+#[pyfunction]
+pub fn rust_map_actuals_to_formals_with_types(
+    actual_kinds: Vec<i64>,
+    actual_names: Vec<Option<String>>,
+    formal_kinds: Vec<i64>,
+    formal_names: Vec<Option<String>>,
+    actual_types: Vec<Option<Vec<u8>>>,
+) -> Option<Vec<Vec<i64>>> {
+    let nformals = formal_kinds.len();
+    let mut formal_to_actual: Vec<Vec<i64>> = vec![Vec::new(); nformals];
+    let mut ambiguous_actual_kwargs: Vec<i64> = Vec::new();
+    let mut fi: usize = 0;
+    for (ai, &actual_kind) in actual_kinds.iter().enumerate() {
+        if actual_kind == ARG_POS {
+            if fi < nformals {
+                if !is_star(formal_kinds[fi]) {
+                    formal_to_actual[fi].push(ai as i64);
+                    fi += 1;
+                } else if formal_kinds[fi] == ARG_STAR {
+                    formal_to_actual[fi].push(ai as i64);
+                }
+            }
+        } else if actual_kind == ARG_STAR {
+            // Python: `actualt = get_proper_type(actual_arg_type(ai))`.
+            let blob = actual_types.get(ai).and_then(|b| b.as_deref())?;
+            let actualt = read_type_lone(blob)?;
+            match &actualt {
+                Type::TupleType { items, .. } => {
+                    // A tuple actual maps to a fixed number of formals.
+                    for _ in 0..items.len() {
+                        if fi >= nformals {
+                            break;
+                        }
+                        if formal_kinds[fi] != ARG_STAR2 {
+                            formal_to_actual[fi].push(ai as i64);
+                        } else {
+                            break;
+                        }
+                        if formal_kinds[fi] != ARG_STAR {
+                            fi += 1;
+                        }
+                    }
+                }
+                _ => {
+                    // Assume iterable; if not, an error surfaces later.
+                    while fi < nformals {
+                        if is_named_or_star2(formal_kinds[fi]) {
+                            break;
+                        }
+                        formal_to_actual[fi].push(ai as i64);
+                        if formal_kinds[fi] == ARG_STAR {
+                            break;
+                        }
+                        fi += 1;
+                    }
+                }
+            }
+        } else if is_named(actual_kind) {
+            let name = actual_names.get(ai).and_then(|n| n.as_deref())?;
+            if let Some(idx) = formal_names.iter().position(|n| n.as_deref() == Some(name)) {
+                if formal_kinds[idx] != ARG_STAR {
+                    formal_to_actual[idx].push(ai as i64);
+                } else if let Some(s2) = formal_kinds.iter().position(|&k| k == ARG_STAR2) {
+                    formal_to_actual[s2].push(ai as i64);
+                }
+            } else if let Some(s2) = formal_kinds.iter().position(|&k| k == ARG_STAR2) {
+                formal_to_actual[s2].push(ai as i64);
+            }
+        } else if actual_kind == ARG_STAR2 {
+            let blob = actual_types.get(ai).and_then(|b| b.as_deref())?;
+            let actualt = read_type_lone(blob)?;
+            match &actualt {
+                Type::TypedDictType { items, .. } => {
+                    for (name, _) in items {
+                        if let Some(idx) = formal_names
+                            .iter()
+                            .position(|n| n.as_deref() == Some(name.as_str()))
+                        {
+                            formal_to_actual[idx].push(ai as i64);
+                        } else if let Some(s2) = formal_kinds.iter().position(|&k| k == ARG_STAR2) {
+                            formal_to_actual[s2].push(ai as i64);
+                        }
+                    }
+                }
+                _ => {
+                    // We don't know which **kwargs the caller provides; defer.
+                    ambiguous_actual_kwargs.push(ai as i64);
+                }
+            }
+        } else {
+            // ARG_OPT actuals are unreachable in calls.
+            return None;
+        }
+    }
+    if !ambiguous_actual_kwargs.is_empty() {
+        // Assume the ambiguous kwargs fill the remaining arguments.
+        let unmatched_formals: Vec<usize> = (0..nformals)
+            .filter(|&fi| {
+                // `formal_names[fi]` is falsy for None or "" (Python truthiness).
+                let name_truthy = formal_names
+                    .get(fi)
+                    .and_then(|n| n.as_deref())
+                    .is_some_and(|n| !n.is_empty());
+                (name_truthy
+                    && (formal_to_actual[fi].is_empty()
+                        || actual_kinds[formal_to_actual[fi][0] as usize] == ARG_STAR)
+                    && formal_kinds[fi] != ARG_STAR)
+                    || formal_kinds[fi] == ARG_STAR2
+            })
+            .collect();
+        for &ai in &ambiguous_actual_kwargs {
+            for &fi in &unmatched_formals {
+                formal_to_actual[fi].push(ai);
+            }
+        }
+    }
+    Some(formal_to_actual)
+}
+
+/// Parse a single wire type blob; on any decode failure, defer to Python.
+fn read_type_lone(blob: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(blob);
+    read_type(&mut buf, None).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wire::{write_type, WriteBuffer};
+
+    fn types_blob(t: &Type) -> Vec<Option<Vec<u8>>> {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, t).ok();
+        vec![Some(buf.into_bytes())]
+    }
 
     fn kinds(ks: &[i64]) -> Vec<i64> {
         ks.to_vec()
@@ -507,6 +658,118 @@ mod tests {
             names(&[None]),
             kinds(&[ARG_POS]),
             names(&[Some("x")]),
+        );
+        assert_eq!(r, None);
+    }
+
+    // Star actuals (with wire type blobs).
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 2,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn object_type() -> Type {
+        Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn tuple2_type() -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(object_type()),
+            items: vec![any_type(), any_type()],
+            implicit: false,
+        }
+    }
+
+    fn list_type() -> Type {
+        Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![any_type()],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_star_tuple_to_fixed_formals() {
+        // *args: tuple[int, str] against (int, str, str): binds first two.
+        let r = rust_map_actuals_to_formals_with_types(
+            kinds(&[ARG_STAR]),
+            names(&[None]),
+            kinds(&[ARG_POS, ARG_POS, ARG_POS]),
+            names(&[None, None, None]),
+            types_blob(&tuple2_type()),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![0], vec![]]));
+    }
+
+    #[test]
+    fn test_star_iterable_while_loop() {
+        // *args: list (iterable) against (int, *int): binds both to first, then star.
+        let lst = list_type();
+        let r = rust_map_actuals_to_formals_with_types(
+            kinds(&[ARG_STAR]),
+            names(&[None]),
+            kinds(&[ARG_POS, ARG_STAR]),
+            names(&[Some("x"), None]),
+            types_blob(&lst),
+        );
+        assert_eq!(r, Some(vec![vec![0], vec![0]]));
+    }
+
+    #[test]
+    fn test_star2_typeddict_routes_names() {
+        // **kwargs: TypedDict{x:int, y:str} against (x: int, **kwargs).
+        let td = Type::TypedDictType {
+            fallback: Box::new(object_type()),
+            items: vec![("x".to_string(), any_type()), ("y".to_string(), any_type())],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: true,
+        };
+        let r = rust_map_actuals_to_formals_with_types(
+            kinds(&[ARG_STAR2]),
+            names(&[None]),
+            kinds(&[ARG_POS, ARG_STAR2]),
+            names(&[Some("x"), None]),
+            types_blob(&td),
+        );
+        // x routes to formal 0, y has no formal match so routes to ARG_STAR2 (1).
+        assert_eq!(r, Some(vec![vec![0], vec![0]]));
+    }
+
+    #[test]
+    fn test_star2_non_typeddict_ambiguous_fill() {
+        // **kwargs: list (not a TypedDict): ambiguous; fills all unmatched formals.
+        let lst = list_type();
+        let r = rust_map_actuals_to_formals_with_types(
+            kinds(&[ARG_STAR2]),
+            names(&[None]),
+            kinds(&[ARG_POS, ARG_POS]),
+            names(&[Some("x"), Some("y")]),
+            types_blob(&lst),
+        );
+        // Both formals are named with no match yet, so both get the ambiguous actual.
+        assert_eq!(r, Some(vec![vec![0], vec![0]]));
+    }
+
+    #[test]
+    fn test_star_missing_type_blob_defer() {
+        // Star actual without a wire type: fall through to Python (None).
+        let r = rust_map_actuals_to_formals_with_types(
+            kinds(&[ARG_STAR]),
+            names(&[None]),
+            kinds(&[ARG_POS]),
+            names(&[Some("x")]),
+            vec![None],
         );
         assert_eq!(r, None);
     }
