@@ -10,12 +10,13 @@ from librt.internal import ReadBuffer, WriteBuffer
 from mypy.argmap import _set_native_argmap_active, map_actuals_to_formals
 from mypy.cache import CacheMeta, CacheMetaEx
 from mypy.checker import DisjointDict, group_comparison_operands
+from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.literals import Key
 from mypy.nodes import ARG_NAMED, ARG_OPT, ARG_POS, ARG_STAR, ARG_STAR2, ArgKind, NameExpr
 from mypy.solve import solve_one
 from mypy.test.helpers import Suite, assert_equal
 from mypy.test.typefixture import TypeFixture
-from mypy.types import AnyType, TupleType, Type, TypeOfAny
+from mypy.types import AnyType, TupleType, Type, TypeOfAny, TypeVarId, TypeVarType
 
 # Stage 4 parity: flip the argmap gate from the env var so the unit tests
 # exercise the Rust path when TEST_NATIVE_TYPE_KERNEL is set. Mirrors the
@@ -214,6 +215,53 @@ class CacheMetaParitySuite(Suite):
             "error_lines": expected.error_lines,
         }
         assert_equal(native, expected_dict)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class ConstraintInferParitySuite(Suite):
+    """Parity: top-level TypeVarType infer_constraints native vs Python.
+
+    Asserts the Rust constraint-inference path returns the same
+    Constraint set (origin TypeVarType identity, op, target) as the
+    pure-Python branch for the top-level TypeVarType case.
+    """
+
+    def test_simple_subtype(self) -> None:
+        fixture = TypeFixture()
+        self.assert_equal_infer(fixture.t, fixture.a)
+
+    def test_supertype(self) -> None:
+        fixture = TypeFixture()
+        self.assert_equal_infer(fixture.t, fixture.a, SUPERTYPE_OF)
+
+    def test_meta_var(self) -> None:
+        # Template with a meta type variable (meta_level=1) round-trips
+        # the id.meta_level through the wire.
+        fixture = TypeFixture()
+        fixture.t.id = TypeVarId.new(meta_level=1)
+        self.assert_equal_infer(fixture.t, fixture.a)
+
+    def assert_equal_infer(
+        self, template: TypeVarType, actual: Type, direction: int = SUBTYPE_OF
+    ) -> None:
+        from mypy.constraints import (
+            _native_constraints_active,
+            _set_native_constraints_active,
+            infer_constraints,
+        )
+
+        saved_active = _native_constraints_active
+        try:
+            _set_native_constraints_active(False)
+            expected = infer_constraints(template, actual, direction)
+            _set_native_constraints_active(True)
+            native_result = infer_constraints(template, actual, direction)
+            assert_equal(native_result, expected)
+        finally:
+            _set_native_constraints_active(saved_active)
 
 
 class MapActualsToFormalsSuite(Suite):
