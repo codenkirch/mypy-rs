@@ -1190,6 +1190,15 @@ class BuildManager:
         try:
             import type_kernel as _type_kernel
         except ImportError:
+            # Kernel is an optional accelerator: fall back to pure Python
+            # unless parity CI required the native path
+            # (MYPY_NATIVE_TYPE_KERNEL_REQUIRED=1).
+            if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
+                raise CompileError(
+                    "native_type_kernel is enabled but the type_kernel "
+                    "extension failed to import (required by "
+                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                ) from None
             return
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
@@ -1258,6 +1267,12 @@ class BuildManager:
         try:
             import type_kernel as _type_kernel
         except ImportError:
+            if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
+                raise CompileError(
+                    "native_type_kernel is enabled but the type_kernel "
+                    "extension failed to import (required by "
+                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                ) from None
             return
         from mypy.checkexpr import _set_native_plugin_hook_registry
         from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES

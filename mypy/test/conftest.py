@@ -31,6 +31,10 @@ def _install_native_resolvers_patch() -> None:
         try:
             import type_kernel as _type_kernel
         except ImportError:
+            # A parity run that demands the native path must not silently
+            # fall back: that would verify nothing. Fail loudly instead.
+            if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
+                raise
             return
         from mypy.join import (
             _set_native_join_resolver,
