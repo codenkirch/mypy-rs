@@ -88,10 +88,12 @@ def _install_native_resolvers_patch() -> None:
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_EXPAND_RESOLVERS"):
             try:
                 from mypy.expandtype import (
+                    _set_native_expand_type_active,
                     _set_native_expand_type_resolver,
                     _set_native_expand_type_typeinfo_map,
                 )
 
+                _set_native_expand_type_active(True)
                 _set_native_expand_type_resolver(resolver)
                 _set_native_expand_type_typeinfo_map(
                     {info.fullname: info for info in type_infos}
