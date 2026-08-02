@@ -3540,11 +3540,21 @@ class UnionType(ProperType):
         write_tag(data, UNION_TYPE)
         write_type_list(data, self.items)
         write_bool(data, self.uses_pep604_syntax)
+        # Truthiness flags (cache wire layout >= 11): reading back the
+        # effective values force lazy init, so the round-trip preserves
+        # can_be_true/can_be_false instead of resetting them to defaults
+        # (issue #201). Consumed by UnionType.read and the Rust reader.
+        write_bool(data, self.can_be_true)
+        write_bool(data, self.can_be_false)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> UnionType:
         ret = UnionType(read_type_list(data), uses_pep604_syntax=read_bool(data))
+        can_be_true = read_bool(data)
+        can_be_false = read_bool(data)
+        ret._can_be_true = can_be_true
+        ret._can_be_false = can_be_false
         assert read_tag(data) == END_TAG
         return ret
 

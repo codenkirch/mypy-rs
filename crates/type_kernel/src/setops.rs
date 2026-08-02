@@ -1941,10 +1941,35 @@ pub(crate) fn union_make_union(items: Vec<Type>) -> Type {
     match items.len() {
         0 => Type::UninhabitedType { ambiguous: false },
         1 => items.into_iter().next().unwrap(),
-        _ => Type::UnionType {
-            items,
-            uses_pep604_syntax: false,
-        },
+        _ => {
+            let can_be_true = items.iter().any(|i| union_item_can_be_true(i));
+            let can_be_false = items.iter().any(|i| union_item_can_be_false(i));
+            Type::UnionType {
+                items,
+                uses_pep604_syntax: false,
+                can_be_true,
+                can_be_false,
+            }
+        }
+    }
+}
+
+/// Mirror `UnionType.can_be_true_default`: the union can be true if any
+/// item can be true. Reads the stored flag on wire-decoded types; falls
+/// back to the per-variant default (via `typeops::can_be_true_default`)
+/// otherwise.
+pub(crate) fn union_item_can_be_true(t: &Type) -> bool {
+    match t {
+        Type::UnionType { can_be_true, .. } => *can_be_true,
+        _ => crate::typeops::can_be_true_default(t).unwrap_or(true),
+    }
+}
+
+/// Mirror `UnionType.can_be_false_default` (see `union_item_can_be_true`).
+pub(crate) fn union_item_can_be_false(t: &Type) -> bool {
+    match t {
+        Type::UnionType { can_be_false, .. } => *can_be_false,
+        _ => crate::typeops::can_be_false_default(t).unwrap_or(true),
     }
 }
 
@@ -2023,6 +2048,8 @@ fn visit_union_join(
             Type::UnionType {
                 items: items.to_vec(),
                 uses_pep604_syntax: false,
+                can_be_true: items.iter().any(union_item_can_be_true),
+                can_be_false: items.iter().any(union_item_can_be_false),
             },
         ],
         ctx,
@@ -3064,6 +3091,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -3089,6 +3118,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![instance("a.B", vec![]), instance("a.C", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
@@ -3109,6 +3140,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -3128,6 +3161,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![instance("a.B", vec![]), instance("a.C", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -3145,6 +3180,8 @@ mod tests {
                     instance("a.C", vec![]),
                 ],
                 uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
             };
             assert_eq!(decoded, expected);
         }
@@ -3194,6 +3231,8 @@ mod tests {
                 literal(LiteralValue::Bool(false), "builtins.bool"),
             ],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -3207,6 +3246,8 @@ mod tests {
             let expected = Type::UnionType {
                 items: vec![instance("a.A", vec![]), instance("builtins.bool", vec![])],
                 uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
             };
             assert_eq!(decoded, expected);
         }
@@ -3237,6 +3278,8 @@ mod tests {
                 literal(LiteralValue::Str("GREEN".to_string()), "color.Color"),
             ],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -3250,6 +3293,8 @@ mod tests {
             let expected = Type::UnionType {
                 items: vec![instance("a.A", vec![]), instance("color.Color", vec![])],
                 uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
             };
             assert_eq!(decoded, expected);
         }
@@ -3277,6 +3322,8 @@ mod tests {
                 literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
             ],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         // Partial enum coverage does not contract; Python returns the
         // union unchanged. Rust emits the same union (no contraction).
@@ -3296,6 +3343,8 @@ mod tests {
                     literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
                 ],
                 uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
             };
             assert_eq!(decoded, expected);
         }
@@ -3375,6 +3424,8 @@ mod tests {
                 instance("a.B", vec![]),
             ],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
         assert!(
@@ -3388,6 +3439,8 @@ mod tests {
             let expected = Type::UnionType {
                 items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
                 uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
             };
             assert_eq!(decoded, expected);
         }
@@ -3406,10 +3459,14 @@ mod tests {
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let t = Type::UnionType {
             items: vec![instance("a.B", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
     }
@@ -4930,6 +4987,8 @@ mod tests {
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let t = instance("a.A", vec![]);
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
@@ -4942,10 +5001,14 @@ mod tests {
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let t = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
     }

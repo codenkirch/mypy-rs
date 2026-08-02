@@ -575,6 +575,8 @@ pub(crate) enum Type {
     UnionType {
         items: Vec<Type>,
         uses_pep604_syntax: bool,
+        can_be_true: bool,
+        can_be_false: bool,
     },
     TypeType {
         item: Box<Type>,
@@ -1067,10 +1069,17 @@ fn read_literal_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
 fn read_union_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let items = read_type_list(buf)?;
     let uses_pep604_syntax = read_bool(buf)?;
+    // Truthiness flags (cache wire layout >= 11): written by
+    // `UnionType.write` after the uses_pep604_syntax bool. The Python
+    // `read` consumes them in the same order.
+    let can_be_true = read_bool(buf)?;
+    let can_be_false = read_bool(buf)?;
     expect_end_tag(buf)?;
     Ok(Type::UnionType {
         items,
         uses_pep604_syntax,
+        can_be_true,
+        can_be_false,
     })
 }
 
@@ -2079,10 +2088,18 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
         Type::UnionType {
             items,
             uses_pep604_syntax,
+            can_be_true,
+            can_be_false,
         } => {
             write_tag(buf, UNION_TYPE);
             write_type_list(buf, items)?;
             write_bool(buf, *uses_pep604_syntax);
+            // Truthiness flags (cache wire layout >= 11): must mirror
+            // `UnionType.write`/`read` in types.py so round-trips
+            // preserve can_be_true/can_be_false instead of resetting
+            // them to defaults (issue #201).
+            write_bool(buf, *can_be_true);
+            write_bool(buf, *can_be_false);
             write_tag(buf, END_TAG);
             Ok(())
         }

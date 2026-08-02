@@ -438,6 +438,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![any_type(), instance()],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(classify_bytes(&t), Some(CALL_UNION));
     }

@@ -337,14 +337,21 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
         Type::UnionType {
             items,
             uses_pep604_syntax,
+            ..
         } => {
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
                 new_items.push(expand_type_by_instance(item, left_ref, left_args)?);
             }
+            // Python's visit_union_type rebuilds via UnionType.make_union,
+            // so truthiness is recomputed from the (expanded) items.
+            let can_be_true = new_items.iter().any(|i| crate::setops::union_item_can_be_true(i));
+            let can_be_false = new_items.iter().any(|i| crate::setops::union_item_can_be_false(i));
             Some(Type::UnionType {
                 items: new_items,
                 uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true,
+                can_be_false,
             })
         }
         Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
@@ -947,6 +954,8 @@ mod tests {
         let right = Type::UnionType {
             items: vec![instance("a.A", vec![])],
             uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
         };
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }

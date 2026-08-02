@@ -825,6 +825,8 @@ mod tests {
         Type::UnionType {
             items,
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         }
     }
 
