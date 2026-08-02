@@ -249,7 +249,8 @@ pub(crate) fn join_types(
 
     // join.py:323-324: isinstance(s, UninhabitedType) and not
     // isinstance(t, UninhabitedType) -> swap.
-    let (s, t, swap3) = if matches!(s, Type::UninhabitedType { .. }) && !matches!(t, Type::UninhabitedType { .. })
+    let (s, t, swap3) = if matches!(s, Type::UninhabitedType { .. })
+        && !matches!(t, Type::UninhabitedType { .. })
     {
         (t, s, true)
     } else {
@@ -3369,7 +3370,10 @@ mod tests {
         let r = make_resolver(vec![a, b, o]);
         let s = instance("a.A", vec![]);
         let t = Type::UnionType {
-            items: vec![Type::UninhabitedType { ambiguous: false }, instance("a.B", vec![])],
+            items: vec![
+                Type::UninhabitedType { ambiguous: false },
+                instance("a.B", vec![]),
+            ],
             uses_pep604_syntax: false,
         };
         let result = join_types(&s, &t, &ctx(true), &r);

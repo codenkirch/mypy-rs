@@ -526,7 +526,9 @@ pub(crate) enum Type {
         source_any: Option<Box<Type>>,
         missing_import_name: Option<String>,
     },
-    UninhabitedType { ambiguous: bool },
+    UninhabitedType {
+        ambiguous: bool,
+    },
     NoneType,
     DeletedType {
         source: Option<String>,
@@ -906,7 +908,11 @@ fn read_uninhabited_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         u8::MAX => false, // old format: END_TAG, no bool written
         0 => false,
         1 => true,
-        other => return Err(WireError::invalid(format!("invalid ambiguous value {other}"))),
+        other => {
+            return Err(WireError::invalid(format!(
+                "invalid ambiguous value {other}"
+            )))
+        }
     };
     if first != u8::MAX {
         expect_end_tag(buf)?;
