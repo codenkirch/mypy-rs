@@ -1444,12 +1444,17 @@ class UninhabitedType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, UNINHABITED_TYPE)
+        # Preserve the ambiguous flag: inference for an unconstrained var
+        # yields an ambiguous Never, which is_valid_inferred_type rejects.
+        # Older readers omit this bool and default to False.
+        write_bool(data, self.ambiguous)
         write_tag(data, END_TAG)
 
     @classmethod
     def read(cls, data: ReadBuffer) -> UninhabitedType:
+        ambiguous = read_bool(data)
         assert read_tag(data) == END_TAG
-        return UninhabitedType()
+        return UninhabitedType(ambiguous=ambiguous)
 
 
 class NoneType(ProperType):
@@ -4764,7 +4769,7 @@ def read_type_map(data: ReadBuffer) -> dict[str, Type]:
 def write_type_map(data: WriteBuffer, value: dict[str, Type]) -> None:
     write_tag(data, DICT_STR_GEN)
     write_int_bare(data, len(value))
-    for key in sorted(value):
+    for key in value:
         write_str_bare(data, key)
         value[key].write(data)
 

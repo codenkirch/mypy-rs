@@ -219,7 +219,7 @@ pub(crate) fn has_uninhabited_component_inner(typ: &Type) -> Option<bool> {
     if let Type::TypeAliasType { .. } = typ {
         return None;
     }
-    if matches!(typ, Type::UninhabitedType) {
+    if matches!(typ, Type::UninhabitedType { .. }) {
         return Some(true);
     }
     for child in all_children(typ) {
@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn test_has_uninhabited_component_true() {
         assert_eq!(
-            has_uninhabited_component_inner(&Type::UninhabitedType),
+            has_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: false }),
             Some(true)
         );
     }

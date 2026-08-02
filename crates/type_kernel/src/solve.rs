@@ -175,7 +175,7 @@ fn materialize_meet(
     match r {
         SetOpResult::SameS => Some(s.clone()),
         SetOpResult::SameT => Some(t.clone()),
-        SetOpResult::Bottom => Some(Type::UninhabitedType),
+        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
         SetOpResult::Any => Some(any_type()),
         _ => None, // meet never produces these; defer if it ever does.
     }
@@ -192,7 +192,7 @@ fn materialize_setop(
         SetOpResult::SameS => Some(s.clone()),
         SetOpResult::SameT => Some(t.clone()),
         SetOpResult::Object => Some(object_or_any_from_type(t, resolver)),
-        SetOpResult::Bottom => Some(Type::UninhabitedType),
+        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
         SetOpResult::Any => Some(any_type()),
         SetOpResult::Ancestor(fullname) => {
             resolver.get(&fullname)?;

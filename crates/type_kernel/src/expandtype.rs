@@ -121,7 +121,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
         // (expandtype.py:189-211)
         Type::AnyType { .. }
         | Type::NoneType
-        | Type::UninhabitedType
+        | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. } => Some(typ.clone()),
 
@@ -443,7 +443,7 @@ fn expand_unpack(tvt: &Type, env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
         Type::TypeVarTupleType { .. } => Some(vec![Type::UnpackType {
             typ: Box::new(repl.clone()),
         }]),
-        Type::AnyType { .. } | Type::UninhabitedType => {
+        Type::AnyType { .. } | Type::UninhabitedType { .. } => {
             // (expandtype.py:395-398) Replace *Ts = Any/Never with
             // *tuple[Any, ...] using the TypeVarTuple's tuple_fallback.
             let fallback = match tvt {
@@ -493,7 +493,7 @@ fn is_leaf_type(typ: &Type) -> bool {
         typ,
         Type::AnyType { .. }
             | Type::NoneType
-            | Type::UninhabitedType
+            | Type::UninhabitedType { .. }
             | Type::DeletedType { .. }
             | Type::UnboundType { .. }
     )
