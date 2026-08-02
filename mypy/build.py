@@ -1210,13 +1210,17 @@ class BuildManager:
         _set_native_join_typeinfo_map(typeinfo_map)
         # Stage 3d: expand_type shares the join typeinfo_map so
         # wire-decoded type_ref strings resolve to live TypeInfo.
-        # Resolver install left commented (parity-only): the port has
-        # ~316 testcheck failures (unexpanded TypeVars in edge cases).
-        from mypy.expandtype import _set_native_expand_type_typeinfo_map
+        from mypy.expandtype import (
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
 
         _set_native_expand_type_typeinfo_map(typeinfo_map)
-        # from mypy.expandtype import _set_native_expand_type_resolver
-        # _set_native_expand_type_resolver(resolver)
+        # Stage 3d graduation (#199): write_type_map now preserves
+        # TypedDict item order (2d209e90f), so round-tripping through
+        # the kernel no longer reorders types. Testcheck parity
+        # 8198/0 both with and without the expand resolver.
+        _set_native_expand_type_resolver(resolver)
         # Stage 3e typeops helpers (parity-only). Resolver install left
         # commented (parity-only): install via conftest.py with
         # MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS=1.
