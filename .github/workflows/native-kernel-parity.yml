@@ -1,11 +1,16 @@
 name: native-kernel-parity
 
-# Parity gate for the Rust type-kernel. Runs the full testcheck corpus
-# with TEST_NATIVE_TYPE_KERNEL=1 and the Stage 3c resolvers installed.
+# Parity gates for the Rust type-kernel. Each job runs the full testcheck
+# corpus with TEST_NATIVE_TYPE_KERNEL=1 and the Stage 3c resolvers.
 # Resolver install lives in mypy/test/conftest.py, not in build.py.
 
-# STATUS: gating. The join-kernel blocker (issue #70) is closed; the corpus
-# passes 8205/0 on current main. Keep green before merging.
+# STATUS: gating. The join-kernel blocker (issue #70) closed via #72; the
+# corpus passes 8205/0 (8187 with -k "not slow") on current main. The
+# parity job below has no continue-on-error: keep it green before merging.
+
+# env-var -> issue (conftest.py): base = Stage 3c subtype/join/mro/solve.
+# TYPEOPS -> #203 (M16, blocked on #201); ERASEVARS/COPYTYPE/VISITOR_TYPES/
+# CHECKEXPR_TYPES -> #201 (M14); EXPAND_RESOLVERS -> #199 (M12).
 
 on:
   pull_request:
@@ -89,3 +94,57 @@ jobs:
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
         run: uv run python -m pytest mypy/test/testinfer.py -q --timeout=30 --timeout-method=thread
+
+  parity-typeops:
+    # Non-gating: typeops graduation (#203, M16) is blocked on the #201
+    # truthiness fix and the gate is unverified in CI. Flip to gating
+    # after #201 merges and CI confirms the typeops corpus passes.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "0.11.14"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-parity-${{ runner.os }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: cargo-parity-${{ runner.os }}-
+
+      - name: Sync Python deps (uv)
+        run: uv sync --group test
+
+      - name: Build type_kernel extension
+        run: |
+          SCRATCH=/tmp/type-kernel-ext
+          mkdir -p "$SCRATCH"
+          cargo rustc -p mypy-type-kernel --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
+          echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
+
+      - name: Parity testcheck (typeops resolvers installed)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
+        run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
