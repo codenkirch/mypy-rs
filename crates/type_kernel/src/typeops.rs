@@ -100,7 +100,7 @@ fn is_simple_literal(t: &Type, resolver: &TypeResolver) -> Option<bool> {
 /// Mirrors `Type.can_be_true_default()` for each variant (types.py:295-3459).
 /// Returns `None` for variants where the default depends on live Python state
 /// (TypeAliasType needs `alias.target`, TupleType needs `can_be_any_bool`).
-fn can_be_true_default(t: &Type) -> Option<bool> {
+pub(crate) fn can_be_true_default(t: &Type) -> Option<bool> {
     match t {
         Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(false),
@@ -146,7 +146,7 @@ fn can_be_true_default(t: &Type) -> Option<bool> {
 }
 
 /// Mirrors `Type.can_be_false_default()` for each variant (types.py:298-3459).
-fn can_be_false_default(t: &Type) -> Option<bool> {
+pub(crate) fn can_be_false_default(t: &Type) -> Option<bool> {
     match t {
         Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(true),
@@ -603,6 +603,8 @@ mod tests {
                 },
             ],
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = true_only(&t).unwrap();
         match result {

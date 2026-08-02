@@ -335,11 +335,19 @@ pub(crate) fn erase_typevars_inner(
         Type::UnionType {
             items,
             uses_pep604_syntax,
+            ..
         } => {
             let new_items = erase_typevars_list(items, ids, replacement)?;
+            // Python's TypeVarEraser.visit_union_type rebuilds via
+            // make_simplified_union, so truthiness is recomputed from the
+            // erased items.
+            let can_be_true = new_items.iter().any(crate::setops::union_item_can_be_true);
+            let can_be_false = new_items.iter().any(crate::setops::union_item_can_be_false);
             Some(Type::UnionType {
                 items: new_items,
                 uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true,
+                can_be_false,
             })
         }
 
@@ -640,14 +648,19 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         Type::UnionType {
             items,
             uses_pep604_syntax,
+            ..
         } => {
             let new_items: Vec<Type> = items
                 .iter()
                 .map(|t| replace_meta_vars_inner(t, target))
                 .collect::<Option<Vec<_>>>()?;
+            let can_be_true = new_items.iter().any(crate::setops::union_item_can_be_true);
+            let can_be_false = new_items.iter().any(crate::setops::union_item_can_be_false);
             Some(Type::UnionType {
                 items: new_items,
                 uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true,
+                can_be_false,
             })
         }
         Type::TypeType { item, is_type_form } => {
@@ -816,6 +829,8 @@ mod tests {
         let t = Type::UnionType {
             items: vec![tvar, make_instance("builtins.int", vec![])],
             uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
         };
         let result = erase_typevars_inner(&t, None, &make_any()).unwrap();
         match result {
