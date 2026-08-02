@@ -955,13 +955,12 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_active
 
         _set_native_semanal_active(False)
-        # Stage 4c erase_typevars DISABLED. Wirefixup resolves type_ref
-        # strings correctly, but the Rust kernel produces different
-        # join-ordering determinism than Python (testDeterminism...).
-        # See #156.
+        # Stage 4c erase_typevars. Wirefixup resolves type_ref strings.
+        # Truthiness flags on UnionType round-trip loss-free since the
+        # wire fix (#201); parity verified 8198/0 with the gate on.
         from mypy.erasetype import _set_native_erase_typevars_active
 
-        _set_native_erase_typevars_active(False)
+        _set_native_erase_typevars_active(self.options.native_type_kernel)
         # Stage 4b: gate constraint solver helpers (no resolver needed).
         from mypy.constraints import _set_native_constraints_active
 
@@ -976,26 +975,33 @@ class BuildManager:
         from mypy.solve import _set_native_solve_active
 
         _set_native_solve_active(self.options.native_type_kernel)
-        # Stage 7: gate visitor scalar-returning functions (no resolver
-        # needed). Type-returning functions stay parity-only (truthiness
-        # flag loss on wire round-trip).
-        from mypy.types import _set_native_visitor_active
+        # Stage 7: gate visitor scalar-returning and type-returning
+        # functions. Parity verified 8198/0 with the type-returning gate
+        # on since the truthiness wire fix (#201).
+        from mypy.types import (
+            _set_native_visitor_active,
+            _set_native_visitor_types_active,
+        )
 
         _set_native_visitor_active(self.options.native_type_kernel)
-        # Stage 3c copy_type DISABLED. Wirefixup resolves type_ref strings,
-        # but the Rust kernel causes join-ordering determinism divergence
-        # (same root cause as erase_typevars). See #156.
+        _set_native_visitor_types_active(self.options.native_type_kernel)
+        # Stage 3c copy_type. Truthiness flags survive wire round-trip
+        # since #201; parity verified 8198/0 with the gate on.
         from mypy.copytype import _set_native_copy_active
 
-        _set_native_copy_active(False)
+        _set_native_copy_active(self.options.native_type_kernel)
         # Stage 9: gate standalone checker/checkexpr scalar-returning
-        # helpers (no resolver needed). Type-returning helpers stay
-        # parity-only (_native_checker_types_active).
-        from mypy.checker import _set_native_checker_active
+        # and type-returning helpers. Parity verified 8198/0 with the
+        # type-returning gate on since the truthiness wire fix (#201).
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_types_active,
+        )
         from mypy.checkexpr import _set_native_checkexpr_active
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
+        _set_native_checker_types_active(self.options.native_type_kernel)
         # M4: gate the fixed-format cache meta read seam; raw bytes are
         # present only in build.py, so this is a module-level flag checked
         # by cache_load (the read() helpers stay pure-Python).
