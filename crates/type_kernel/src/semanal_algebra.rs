@@ -268,12 +268,8 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             let new_items: Vec<Type> = items.into_iter().map(&f).collect();
             // Python's visitor rebuilds unions via make_union, so truthiness
             // is recomputed from the mapped items.
-            let can_be_true = new_items
-                .iter()
-                .any(|i| crate::setops::union_item_can_be_true(i));
-            let can_be_false = new_items
-                .iter()
-                .any(|i| crate::setops::union_item_can_be_false(i));
+            let can_be_true = new_items.iter().any(crate::setops::union_item_can_be_true);
+            let can_be_false = new_items.iter().any(crate::setops::union_item_can_be_false);
             Type::UnionType {
                 items: new_items,
                 uses_pep604_syntax,

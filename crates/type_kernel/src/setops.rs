@@ -1942,8 +1942,8 @@ pub(crate) fn union_make_union(items: Vec<Type>) -> Type {
         0 => Type::UninhabitedType { ambiguous: false },
         1 => items.into_iter().next().unwrap(),
         _ => {
-            let can_be_true = items.iter().any(|i| union_item_can_be_true(i));
-            let can_be_false = items.iter().any(|i| union_item_can_be_false(i));
+            let can_be_true = items.iter().any(union_item_can_be_true);
+            let can_be_false = items.iter().any(union_item_can_be_false);
             Type::UnionType {
                 items,
                 uses_pep604_syntax: false,

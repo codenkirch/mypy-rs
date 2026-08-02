@@ -345,12 +345,8 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
             }
             // Python's visit_union_type rebuilds via UnionType.make_union,
             // so truthiness is recomputed from the (expanded) items.
-            let can_be_true = new_items
-                .iter()
-                .any(|i| crate::setops::union_item_can_be_true(i));
-            let can_be_false = new_items
-                .iter()
-                .any(|i| crate::setops::union_item_can_be_false(i));
+            let can_be_true = new_items.iter().any(crate::setops::union_item_can_be_true);
+            let can_be_false = new_items.iter().any(crate::setops::union_item_can_be_false);
             Some(Type::UnionType {
                 items: new_items,
                 uses_pep604_syntax: *uses_pep604_syntax,
