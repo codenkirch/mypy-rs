@@ -86,6 +86,7 @@ jobs:
           PYTHONPATH: ${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
 
       - name: Parity solve_one (testinfer)
@@ -93,6 +94,7 @@ jobs:
           PYTHONPATH: ${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testinfer.py -q --timeout=30 --timeout-method=thread
 
   parity-typeops:
@@ -147,4 +149,5 @@ jobs:
           TEST_NATIVE_TYPE_KERNEL: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
