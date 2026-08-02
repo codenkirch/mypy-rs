@@ -60,7 +60,6 @@ mod expandtype;
 mod lkv;
 mod messages;
 mod mro;
-mod mypyc_port;
 mod operators;
 mod plugin_hooks;
 mod refs;
@@ -283,10 +282,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_algebra::rust_make_any_non_unimported,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        mypyc_port::rust_can_subclass_builtin,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
