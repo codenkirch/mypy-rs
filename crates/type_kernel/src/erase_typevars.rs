@@ -341,7 +341,9 @@ pub(crate) fn erase_typevars_inner(
             // Python's TypeVarEraser.visit_union_type rebuilds via
             // make_simplified_union, so truthiness is recomputed from the
             // erased items.
-            let can_be_true = new_items.iter().any(|i| crate::setops::union_item_can_be_true(i));
+            let can_be_true = new_items
+                .iter()
+                .any(|i| crate::setops::union_item_can_be_true(i));
             let can_be_false = new_items
                 .iter()
                 .any(|i| crate::setops::union_item_can_be_false(i));
@@ -656,7 +658,9 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
                 .iter()
                 .map(|t| replace_meta_vars_inner(t, target))
                 .collect::<Option<Vec<_>>>()?;
-            let can_be_true = new_items.iter().any(|i| crate::setops::union_item_can_be_true(i));
+            let can_be_true = new_items
+                .iter()
+                .any(|i| crate::setops::union_item_can_be_true(i));
             let can_be_false = new_items
                 .iter()
                 .any(|i| crate::setops::union_item_can_be_false(i));
