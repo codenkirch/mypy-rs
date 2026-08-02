@@ -248,7 +248,7 @@ fn get_target_type(
 
     // Gradual default expansion for ambiguous UninhabitedType.
     // Wire format lacks `ambiguous` field; defer this case to Python.
-    if matches!(p_type, Type::UninhabitedType) {
+    if matches!(p_type, Type::UninhabitedType { .. }) {
         return None;
     }
 

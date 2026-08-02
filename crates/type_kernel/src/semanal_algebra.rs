@@ -331,7 +331,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
             min_len,
         },
         Type::DeletedType { source } => Type::DeletedType { source },
-        Type::UninhabitedType => Type::UninhabitedType,
+        Type::UninhabitedType { .. } => Type::UninhabitedType { ambiguous: false },
         Type::NoneType => Type::NoneType,
         Type::Parameters(_) => t,
     }
@@ -539,9 +539,9 @@ mod tests {
 
     #[test]
     fn test_transform_children_identity_for_uninhabited() {
-        let t = Type::UninhabitedType;
+        let t = Type::UninhabitedType { ambiguous: false };
         let result = transform_children(t, |x| x);
-        assert!(matches!(result, Type::UninhabitedType));
+        assert!(matches!(result, Type::UninhabitedType { .. }));
     }
 }
 

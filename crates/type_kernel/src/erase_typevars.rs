@@ -137,7 +137,7 @@ pub(crate) fn erase_typevars_inner(
         // Leaf types with no TypeVars: return as-is.
         Type::AnyType { .. }
         | Type::NoneType
-        | Type::UninhabitedType
+        | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
 
         Type::TypeVarType {
@@ -704,7 +704,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         // Leaf types: return as-is.
         Type::AnyType { .. }
         | Type::NoneType
-        | Type::UninhabitedType
+        | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
         // Deferred.
         Type::TypeAliasType { .. } => None,

@@ -121,7 +121,7 @@ pub(crate) fn is_subtype(
     // a subtype of everything (bottom type). Fires before any right-side
     // dispatch because the Python visitor's `accept` lands on
     // `visit_uninhabited_type` regardless of `self.right`.
-    if matches!(left, Type::UninhabitedType) {
+    if matches!(left, Type::UninhabitedType { .. }) {
         return Some(true);
     }
     // visit_deleted_type (subtypes.py:564): DeletedType is a subtype of
@@ -347,7 +347,7 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
                 uses_pep604_syntax: *uses_pep604_syntax,
             })
         }
-        Type::NoneType | Type::UninhabitedType => Some(typ.clone()),
+        Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
         Type::AnyType { .. } | Type::DeletedType { .. } | Type::LiteralType { .. } => {
             Some(typ.clone())
         }
@@ -1107,7 +1107,7 @@ mod tests {
         let r = make_resolver(vec![snap("a.A", "A")]);
         assert_eq!(
             is_subtype(
-                &Type::UninhabitedType,
+                &Type::UninhabitedType { ambiguous: false },
                 &instance("a.A", vec![]),
                 &ctx_strict_optional(true),
                 &r

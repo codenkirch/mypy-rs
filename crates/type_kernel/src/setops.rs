@@ -249,7 +249,7 @@ pub(crate) fn join_types(
 
     // join.py:323-324: isinstance(s, UninhabitedType) and not
     // isinstance(t, UninhabitedType) -> swap.
-    let (s, t, swap3) = if matches!(s, Type::UninhabitedType) && !matches!(t, Type::UninhabitedType)
+    let (s, t, swap3) = if matches!(s, Type::UninhabitedType { .. }) && !matches!(t, Type::UninhabitedType { .. })
     {
         (t, s, true)
     } else {
@@ -453,7 +453,7 @@ fn visit_meet(
         }
 
         // visit_uninhabited_type (meet.py:861): return t (SameT).
-        Type::UninhabitedType => Some(SetOpResult::SameT),
+        Type::UninhabitedType { .. } => Some(SetOpResult::SameT),
 
         // visit_deleted_type (meet.py:864-873).
         Type::DeletedType { .. } => {
@@ -467,7 +467,7 @@ fn visit_meet(
                 } else {
                     Some(SetOpResult::SameS)
                 }
-            } else if matches!(s, Type::UninhabitedType) {
+            } else if matches!(s, Type::UninhabitedType { .. }) {
                 // return self.s (Uninhabited).
                 Some(SetOpResult::SameS)
             } else {
@@ -493,7 +493,7 @@ fn visit_meet(
                 } else {
                     Some(SetOpResult::SameS)
                 }
-            } else if matches!(s, Type::UninhabitedType) {
+            } else if matches!(s, Type::UninhabitedType { .. }) {
                 Some(SetOpResult::SameS)
             } else {
                 Some(SetOpResult::Any)
@@ -754,7 +754,7 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
             source_any: None,
             missing_import_name: None,
         }),
-        SetOpResult::Bottom => Some(Type::UninhabitedType),
+        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: true }),
         SetOpResult::Object => {
             // Prefer the fixed s/t operand if it is already
             // builtins.object (avoids decoding an unfixed Instance).
@@ -1077,7 +1077,7 @@ fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
     else {
         return false;
     };
-    if matches!(ret_type.as_ref(), Type::UninhabitedType) {
+    if matches!(ret_type.as_ref(), Type::UninhabitedType { .. }) {
         return false;
     }
     let Type::Instance { type_ref, .. } = fallback.as_ref() else {
@@ -1104,7 +1104,7 @@ fn visit_join(
         Type::NoneType => {
             if ctx.strict_optional {
                 match s {
-                    Type::NoneType | Type::UninhabitedType => Some(SetOpResult::SameT),
+                    Type::NoneType | Type::UninhabitedType { .. } => Some(SetOpResult::SameT),
                     Type::UnboundType { .. } | Type::AnyType { .. } => Some(SetOpResult::Any),
                     // Else branch: make_simplified_union([s, t])
                     // (join.py:363) — deferred.
@@ -1117,7 +1117,7 @@ fn visit_join(
         }
 
         // visit_uninhabited_type (join.py:367-368): return s.
-        Type::UninhabitedType => Some(SetOpResult::SameS),
+        Type::UninhabitedType { .. } => Some(SetOpResult::SameS),
 
         // visit_deleted_type (join.py:370-371): return s.
         Type::DeletedType { .. } => Some(SetOpResult::SameS),
@@ -1669,7 +1669,7 @@ fn remove_redundant_union_items(
     for _direction in 0..2 {
         let mut new_items: Vec<Type> = Vec::with_capacity(current.len());
         for ti in current {
-            if matches!(ti, Type::UninhabitedType) {
+            if matches!(ti, Type::UninhabitedType { .. }) {
                 continue;
             }
             let mut duplicate_index = None;
@@ -1938,7 +1938,7 @@ pub(crate) fn make_simplified_union(
 /// 1 item -> that item, >1 -> UnionType.
 pub(crate) fn union_make_union(items: Vec<Type>) -> Type {
     match items.len() {
-        0 => Type::UninhabitedType,
+        0 => Type::UninhabitedType { ambiguous: false },
         1 => items.into_iter().next().unwrap(),
         _ => Type::UnionType {
             items,
@@ -1974,7 +1974,7 @@ fn visit_union_join(
         // UninhabitedType) is False for all s. Rust is_subtype only
         // handles Instance vs Instance, so short-circuit here to avoid
         // a spurious None-defer.
-        if matches!(item, Type::UninhabitedType) {
+        if matches!(item, Type::UninhabitedType { .. }) {
             continue;
         }
         match is_subtype(s, item, ctx, resolver) {
@@ -1996,7 +1996,7 @@ fn visit_union_join(
         // UninhabitedType is subtype of everything (bottom type).
         // Rust is_subtype only handles Instance vs Instance, so
         // short-circuit here to avoid a spurious None-defer.
-        if matches!(item, Type::UninhabitedType) {
+        if matches!(item, Type::UninhabitedType { .. }) {
             continue;
         }
         match is_subtype(item, s, ctx, resolver) {
@@ -2983,7 +2983,7 @@ mod tests {
         // visit_uninhabited_type returns s (NoneType, post-swap).
         // flip_if(SameS, swapped=true) -> SameT (original t = None).
         let r = make_resolver(vec![]);
-        let s = Type::UninhabitedType;
+        let s = Type::UninhabitedType { ambiguous: false };
         let t = Type::NoneType;
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -3015,7 +3015,7 @@ mod tests {
         // visit_uninhabited_type -> return s.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
-        let t = Type::UninhabitedType;
+        let t = Type::UninhabitedType { ambiguous: false };
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
@@ -3369,7 +3369,7 @@ mod tests {
         let r = make_resolver(vec![a, b, o]);
         let s = instance("a.A", vec![]);
         let t = Type::UnionType {
-            items: vec![Type::UninhabitedType, instance("a.B", vec![])],
+            items: vec![Type::UninhabitedType { ambiguous: false }, instance("a.B", vec![])],
             uses_pep604_syntax: false,
         };
         let result = join_types(&s, &t, &ctx(true), &r);
@@ -4111,7 +4111,7 @@ mod tests {
         // visit_uninhabited_type returns s (Instance, post-swap).
         // flip_if(SameS, swapped=true) -> SameT (original t = Instance).
         let r = make_resolver(vec![snap("a.A", "A")]);
-        let s = Type::UninhabitedType;
+        let s = Type::UninhabitedType { ambiguous: false };
         let t = instance("a.A", vec![]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
@@ -4770,7 +4770,7 @@ mod tests {
         // visit_uninhabited_type (meet.py:861): return t (SameT).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
-        let t = Type::UninhabitedType;
+        let t = Type::UninhabitedType { ambiguous: false };
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
     }
 
@@ -4789,7 +4789,7 @@ mod tests {
         // visit_deleted_type: s is UninhabitedType -> return self.s
         // (SameS = Uninhabited).
         let r = make_resolver(vec![]);
-        let s = Type::UninhabitedType;
+        let s = Type::UninhabitedType { ambiguous: false };
         let t = Type::DeletedType { source: None };
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
@@ -5180,7 +5180,7 @@ mod tests {
         // True (visit_uninhabited_type is subtype of everything):
         // returns s = SameS, not the visitor's Bottom.
         let r = make_resolver(vec![snap("a.A", "A")]);
-        let s = Type::UninhabitedType;
+        let s = Type::UninhabitedType { ambiguous: false };
         let t = type_type("a.A");
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
@@ -5224,7 +5224,7 @@ mod tests {
         // visit_unbound_type (meet.py:870-871): s is UninhabitedType ->
         // return self.s (SameS).
         let r = make_resolver(vec![]);
-        let s = Type::UninhabitedType;
+        let s = Type::UninhabitedType { ambiguous: false };
         let t = unbound_type();
         assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }

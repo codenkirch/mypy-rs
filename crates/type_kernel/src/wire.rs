@@ -526,7 +526,7 @@ pub(crate) enum Type {
         source_any: Option<Box<Type>>,
         missing_import_name: Option<String>,
     },
-    UninhabitedType,
+    UninhabitedType { ambiguous: bool },
     NoneType,
     DeletedType {
         source: Option<String>,
@@ -897,10 +897,21 @@ fn read_none_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     Ok(Type::NoneType)
 }
 
-/// Read an `UninhabitedType` (tag already consumed) — just the END_TAG.
+/// Read an `UninhabitedType` (tag already consumed): the ambiguous flag
+/// bool, then END_TAG. Older writers omit the bool (END_TAG follows the
+/// tag directly); that reads back as ambiguous=false.
 fn read_uninhabited_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
-    expect_end_tag(buf)?;
-    Ok(Type::UninhabitedType)
+    let first = buf.read_u8()?;
+    let ambiguous = match first {
+        u8::MAX => false, // old format: END_TAG, no bool written
+        0 => false,
+        1 => true,
+        other => return Err(WireError::invalid(format!("invalid ambiguous value {other}"))),
+    };
+    if first != u8::MAX {
+        expect_end_tag(buf)?;
+    }
+    Ok(Type::UninhabitedType { ambiguous })
 }
 
 /// Read a `DeletedType` (tag already consumed).
@@ -1223,7 +1234,7 @@ impl fmt::Display for Type {
         match self {
             Type::AnyType { .. } => write!(f, "Any"),
             Type::NoneType => write!(f, "None"),
-            Type::UninhabitedType => write!(f, "Never"),
+            Type::UninhabitedType { .. } => write!(f, "Never"),
             Type::DeletedType { source } => match source {
                 None => write!(f, "<Deleted>"),
                 Some(s) => write!(f, "<Deleted '{s}'>"),
@@ -1959,8 +1970,9 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
-        Type::UninhabitedType => {
+        Type::UninhabitedType { ambiguous } => {
             write_tag(buf, UNINHABITED_TYPE);
+            write_bool(buf, *ambiguous);
             write_tag(buf, END_TAG);
             Ok(())
         }
@@ -2166,7 +2178,7 @@ impl Type {
             Type::UnboundType { .. } => "UnboundType",
             Type::UnpackType { .. } => "UnpackType",
             Type::AnyType { .. } => "AnyType",
-            Type::UninhabitedType => "UninhabitedType",
+            Type::UninhabitedType { .. } => "UninhabitedType",
             Type::NoneType => "NoneType",
             Type::DeletedType { .. } => "DeletedType",
             Type::CallableType { .. } => "CallableType",
@@ -2498,7 +2510,14 @@ mod tests {
 
     #[test]
     fn write_then_read_uninhabited_type_round_trips() {
-        assert_eq!(round_trip(&Type::UninhabitedType), Type::UninhabitedType);
+        assert_eq!(
+            round_trip(&Type::UninhabitedType { ambiguous: true }),
+            Type::UninhabitedType { ambiguous: true }
+        );
+        assert_eq!(
+            round_trip(&Type::UninhabitedType { ambiguous: false }),
+            Type::UninhabitedType { ambiguous: false }
+        );
     }
 
     #[test]

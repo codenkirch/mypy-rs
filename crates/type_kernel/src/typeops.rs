@@ -102,7 +102,7 @@ fn is_simple_literal(t: &Type, resolver: &TypeResolver) -> Option<bool> {
 /// (TypeAliasType needs `alias.target`, TupleType needs `can_be_any_bool`).
 fn can_be_true_default(t: &Type) -> Option<bool> {
     match t {
-        Type::UninhabitedType => Some(false),
+        Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(false),
         Type::LiteralType { value, fallback } => {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
@@ -148,7 +148,7 @@ fn can_be_true_default(t: &Type) -> Option<bool> {
 /// Mirrors `Type.can_be_false_default()` for each variant (types.py:298-3459).
 fn can_be_false_default(t: &Type) -> Option<bool> {
     match t {
-        Type::UninhabitedType => Some(false),
+        Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(true),
         Type::LiteralType { value, fallback } => {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
