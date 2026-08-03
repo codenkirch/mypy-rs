@@ -174,6 +174,16 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 from mypy.wirefixup import fixup_wire_type
 
                 fixed = fixup_wire_type(decoded)
+                # The wire format does not carry line/column; decoded
+                # types default to line -1. Preserve the input type's
+                # location so derived contexts (e.g. plugin
+                # default_return_type) report errors at the call site
+                # instead of a phantom line 0/-1.
+                if fixed is not None and isinstance(fixed, ProperType):
+                    fixed.line = typ.line
+                    fixed.column = typ.column
+                    if isinstance(fixed, CallableType):
+                        fixed.fallback.line = fixed.line
                 # Clear the process-global primitive decode singletons after
                 # a read so NOT_READY Instances cannot leak into later builds
                 # (read_type lazily fills instance_cache with
