@@ -65,13 +65,9 @@ pub(crate) fn rust_expand_type(
         return None;
     }
     let expanded = expand_type(&typ, &env)?;
-    // If the result still carries any TypeVar-like node that was NOT
-    // substituted (env miss), defer to Python. Python's visitor returns
-    // the original TypeVar object on env miss (`self.variables.get(t.id,
-    // t)`), preserving object identity for the solver/binder. A wire
-    // round-trip yields fresh objects that break that identity, so
-    // shipping a result with unmatched TypeVars corrupts inference.
-    if result_has_unmatched_typevar(&expanded, &env) {
+    // Ship only concrete (typevar-free) results: any leftover TypeVar
+    // breaks Python's identity-based solver after a wire round-trip.
+    if result_has_typevar(&expanded) {
         return None;
     }
     encode_type(&expanded)
@@ -310,6 +306,12 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
                     return None;
                 }
             }
+            // Bound methods (is_bound) defer: `__self`/`__cls` identity
+            // does not survive a wire round-trip, and mypy's
+            // bind_self/extract_callable_type relies on it.
+            if *is_bound {
+                return None;
+            }
             // The Unpack interpolation branch
             // (expandtype.py:482-488, interpolate_args_for_unpack) is
             // deferred: if a var_arg is an UnpackType, defer to Python.
@@ -499,69 +501,23 @@ fn is_leaf_type(typ: &Type) -> bool {
     )
 }
 
-/// Check if `typ` contains any TypeVar-like node (TypeVarType,
-/// ParamSpecType, TypeVarTupleType) whose key is NOT in `env`. If so,
-/// the result would ship a fresh TypeVar object that breaks Python's
-/// identity-based solver/binder — the caller must defer to Python.
-fn result_has_unmatched_typevar(typ: &Type, env: &HashMap<EnvKey, Type>) -> bool {
-    fn typevar_key(t: &Type) -> Option<EnvKey> {
-        match t {
-            Type::TypeVarType {
-                raw_id,
-                namespace,
-                meta_level,
-                ..
-            } => Some((*raw_id, *meta_level, namespace.clone())),
-            Type::ParamSpecType {
-                raw_id, namespace, ..
-            } => Some((*raw_id, 0, namespace.clone())),
-            Type::TypeVarTupleType {
-                raw_id, namespace, ..
-            } => Some((*raw_id, 0, namespace.clone())),
-            _ => None,
-        }
-    }
+/// True if `typ` contains any TypeVar-like node. Such results do not
+/// survive a wire round-trip intact (object identity is lost), so the
+/// caller defers to Python.
+fn result_has_typevar(typ: &Type) -> bool {
     let mut stack = vec![typ];
     while let Some(cur) = stack.pop() {
-        if let Some(key) = typevar_key(cur) {
-            if !env.contains_key(&key) {
+        match cur {
+            Type::TypeVarType { .. }
+            | Type::ParamSpecType { .. }
+            | Type::TypeVarTupleType { .. } => {
+                // A TypeVar-like node means the expansion keeps a TypeVar that Python
+                // preserves by object identity; defer. Nested contents
+                // cannot matter for identity.
                 return true;
             }
-        }
-        match cur {
             Type::Instance { args, .. } => stack.extend(args.iter()),
             Type::TypeAliasType { args, .. } => stack.extend(args.iter()),
-            Type::TypeVarType {
-                values,
-                upper_bound,
-                default,
-                ..
-            } => {
-                stack.extend(values.iter());
-                stack.push(upper_bound);
-                stack.push(default);
-            }
-            Type::ParamSpecType {
-                upper_bound,
-                default,
-                prefix,
-                ..
-            } => {
-                stack.push(upper_bound);
-                stack.push(default);
-                stack.extend(prefix.arg_types.iter());
-                stack.extend(prefix.variables.iter());
-            }
-            Type::TypeVarTupleType {
-                tuple_fallback,
-                upper_bound,
-                default,
-                ..
-            } => {
-                stack.push(tuple_fallback);
-                stack.push(upper_bound);
-                stack.push(default);
-            }
             Type::CallableType {
                 arg_types,
                 ret_type,
