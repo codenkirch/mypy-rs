@@ -1,7 +1,7 @@
 //! Stage 3e: typeops helpers from `mypy/typeops.py`.
 //!
 //! Ports pure-algebra helpers as standalone `#[pyfunction]`s:
-//! * `rust_make_simplified_union` — wraps the existing `setops::make_simplified_union`.
+//! * `rust_make_simplified_union` — wraps `setops::make_simplified_union`.
 //! * `rust_simple_literal_type` — extracts fallback Instance for simple literals.
 //! * `rust_is_simple_literal` — checks if a type is a simple literal.
 //! * `rust_true_only` / `rust_false_only` / `rust_true_or_false` — truthiness
@@ -108,18 +108,12 @@ pub(crate) fn can_be_true_default(t: &Type) -> Option<bool> {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
                 return Some(true);
             };
-            // Enum literal: depends on fallback's truthiness. For enum, the
-            // Python code returns `self.fallback.can_be_true`, which for an
-            // Instance defaults to True. Defer to be safe (snapshot lookup
-            // might reveal is_enum, but the enum Instance's own truthiness
-            // is the default True anyway).
-            // Non-enum: bool(value)
+            // Enum literals get TRUE from the Instance fallback, plain ones use
+            // bool(value). Kernel cannot tell them apart without a snapshot
+            // resolver, so defer non-Bool truthiness.
             match value {
                 LiteralValue::Bool(b) => Some(*b),
-                LiteralValue::Int(i) => Some(*i != 0),
-                LiteralValue::Str(s) => Some(!s.is_empty()),
-                LiteralValue::Bytes(b) => Some(!b.is_empty()),
-                LiteralValue::Float(f) => Some(*f != 0.0),
+                _ => None,
             }
         }
         Type::UnionType { items, .. } => {
@@ -154,12 +148,11 @@ pub(crate) fn can_be_false_default(t: &Type) -> Option<bool> {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
                 return Some(true);
             };
+            // See can_be_true_default: defer non-Bool literal truthiness
+            // (enum-vs-plain needs the snapshot resolver).
             match value {
                 LiteralValue::Bool(b) => Some(!*b),
-                LiteralValue::Int(i) => Some(*i == 0),
-                LiteralValue::Str(s) => Some(s.is_empty()),
-                LiteralValue::Bytes(b) => Some(b.is_empty()),
-                LiteralValue::Float(f) => Some(*f == 0.0),
+                _ => None,
             }
         }
         Type::UnionType { items, .. } => {
@@ -199,7 +192,7 @@ pub(crate) fn can_be_false_default(t: &Type) -> Option<bool> {
 /// * `LiteralZero(fallback_bytes)` -> `LiteralType(0, fallback)`
 /// * `UnionNarrow(item_discs)` -> recurse on each union item (discs[i] is
 ///   the discriminator for items[i])
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 #[allow(dead_code)]
 enum TruthinessResult {
     Uninhabited,
@@ -241,14 +234,12 @@ fn true_only(t: &Type) -> Option<TruthinessResult> {
         return Some(TruthinessResult::SameType);
     }
     if let Type::UnionType { items, .. } = t {
+        // Keep position-ordered discs for every item: the Python side maps
+        // disc[i] back to t.items[i] then filters via make_simplified_union.
+        // Filtering here would shift positions and mis-decode other items.
         let mut item_results = Vec::with_capacity(items.len());
         for item in items {
-            let r = true_only(item)?;
-            // Filter: only keep items that can_be_true.
-            let item_cbt = can_be_true_default(item)?;
-            if item_cbt {
-                item_results.push(r);
-            }
+            item_results.push(true_only(item)?);
         }
         return Some(TruthinessResult::UnionNarrow(item_results));
     }
@@ -291,13 +282,10 @@ fn false_only(t: &Type, strict_optional: bool) -> Option<TruthinessResult> {
         return Some(TruthinessResult::SameType);
     }
     if let Type::UnionType { items, .. } = t {
+        // Position-ordered discs for every item (see true_only).
         let mut item_results = Vec::with_capacity(items.len());
         for item in items {
-            let r = false_only(item, strict_optional)?;
-            let item_cbf = can_be_false_default(item)?;
-            if item_cbf {
-                item_results.push(r);
-            }
+            item_results.push(false_only(item, strict_optional)?);
         }
         return Some(TruthinessResult::UnionNarrow(item_results));
     }
@@ -400,18 +388,13 @@ pub(crate) fn rust_make_simplified_union(
     // items_bytes is a LIST_GEN-tagged list of serialized types.
     let mut buf = ReadBuffer::new(items_bytes);
     let items = wire::read_type_list(&mut buf).ok()?;
-    let _ = (
-        line,
-        column,
-        keep_erased,
-        contract_literals,
-        handle_recursive,
-    );
+    let _ = (line, column, keep_erased, handle_recursive);
     // Match Python's _remove_redundant_union_items which calls
     // is_proper_subtype. proper_subtype=True prevents Any-absorption:
     // Instance is NOT <: AnyType, so Any | C is preserved.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
-    let result = setops::make_simplified_union(&items, &ctx, resolver.resolver())?;
+    let result =
+        setops::make_simplified_union(&items, &ctx, resolver.resolver(), contract_literals)?;
     encode_type(&result)
 }
 
@@ -585,10 +568,8 @@ mod tests {
 
     #[test]
     fn true_only_union_narrows_items() {
-        // NoneType can_be_true=False -> filtered out.
-        // LiteralType(True) can_be_true=True, can_be_false=False -> SameType.
-        // The Instance(builtins.int) would defer (step 4 needs live TypeInfo),
-        // so use a literal to avoid deferral.
+        // NoneType can_be_true=False -> discarded (Uninhabited, position kept).
+        // LiteralType(True): can_be_false=False -> SameType.
         let t = Type::UnionType {
             items: vec![
                 Type::NoneType,
@@ -609,9 +590,12 @@ mod tests {
         let result = true_only(&t).unwrap();
         match result {
             TruthinessResult::UnionNarrow(items) => {
-                // NoneType filtered out (can_be_true=False).
-                // LiteralType(True) kept -> SameType (can_be_false=False).
-                assert_eq!(items.len(), 1);
+                // Positions preserved: NoneType -> Uninhabited, LiteralType(True)
+                // -> SameType. Python remaps result[i] to t.items[i]
+                // positionally (typeops.py:878).
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], TruthinessResult::Uninhabited);
+                assert_eq!(items[1], TruthinessResult::SameType);
             }
             _ => panic!("expected UnionNarrow"),
         }

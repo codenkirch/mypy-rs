@@ -77,7 +77,7 @@ pub(crate) fn solve_one_inner(
         // UnionType.make_union = make_simplified_union (flatten +
         // dedupe + literal contraction + primitive union), which already
         // returns Option (defers internally).
-        setops::make_simplified_union(lowers, &ctx, resolver)
+        setops::make_simplified_union(lowers, &ctx, resolver, true)
     } else {
         // join_type_list preserves sorted_lowers[0] even for an AnyType
         // (mypy TypeAlias). Wire types are never alias shadows, so a

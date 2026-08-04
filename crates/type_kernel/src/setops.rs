@@ -224,12 +224,9 @@ pub(crate) fn join_types(
         _ => (s, t, false),
     };
 
-    // join.py:314-315: isinstance(s, AnyType) -> return s.
-    // `swapped` is irrelevant: AnyType short-circuit returns the
-    // (post-swap) s, which is the original t if swapped. But the
-    // AnyType is on the left after swap, so SameS is correct relative
-    // to post-swap s. The caller maps SameS/SameT to original s/t via
-    // the `swapped` flag (see `rust_join_types`).
+    // join.py:314-315: isinstance(s, AnyType) -> return s. The AnyType
+    // is on the left after swap, so SameS is correct relative to the
+    // post-swap s; the caller maps SameS/SameT back via `swapped`.
     if matches!(s, Type::AnyType { .. }) {
         return Some(flip_if(SetOpResult::SameS, swapped));
     }
@@ -259,15 +256,8 @@ pub(crate) fn join_types(
     let swapped = swapped ^ swap3;
 
     // normalize_callables (join.py:327) is a no-op for the Rust path:
-    // the Python shim serializes the post-normalization form. The
-    // both-FunctionLike case where either side is Overloaded or
-    // Parameters needs combine logic that produces a new
-    // CallableType/Overloaded -> defer. The
-    // CallableType-vs-CallableType case is handled in visit_join
-    // (identical shape returns SameS; everything else defers). The
-    // fallback case (t=CallableType/Overloaded, s non-callable)
-    // recurses into join_types(t.fallback, s), which the Rust
-    // Instance-Instance path handles.
+    // the Python shim serializes the post-normalization form. Both
+    // FunctionLike without identical shape defers (see visit_join).
     let s_is_callable = matches!(
         s,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
@@ -370,8 +360,7 @@ pub(crate) fn meet_types(
 ) -> Option<SetOpResult> {
     // meet.py:137-141: is_proper_subtype pre-check (ignore_promotions).
     // Only fires for Instance-Instance (Rust is_subtype returns None
-    // for non-Instance). Both directions must not be UnboundType
-    // (ErasedType has no wire variant -> never UnboundType here).
+    // for non-Instance, so ErasedType never reaches the check).
     let proper_ctx = {
         let mut c = ctx.clone();
         c.proper_subtype = true;
@@ -403,8 +392,7 @@ pub(crate) fn meet_types(
 
     // normalize_callables (meet.py:151) is a no-op for the Rust path:
     // the Python shim serializes the post-normalization form. The
-    // both-FunctionLike case needs meet_similar_callables (produces a
-    // new CallableType) -> defer.
+    // both-FunctionLike case needs meet_similar_callables -> defer.
     let s_is_callable = matches!(
         s,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
@@ -456,13 +444,11 @@ fn visit_meet(
         // visit_uninhabited_type (meet.py:861): return t (SameT).
         Type::UninhabitedType { .. } => Some(SetOpResult::SameT),
 
-        // visit_deleted_type (meet.py:864-873).
+        // visit_deleted_type (meet.py:864-873): if s is NoneType, return
+        // t when strict_optional else s. If s is Uninhabited, return s.
+        // Otherwise return t. The Python shim maps via SameS/SameT.
         Type::DeletedType { .. } => {
             if matches!(s, Type::NoneType) {
-                // strict_optional: return t (DeletedType); non-strict:
-                // return self.s (NoneType). The Python shim maps both
-                // via the SameS/SameT discriminator + strict_optional
-                // flag.
                 if ctx.strict_optional {
                     Some(SetOpResult::SameT)
                 } else {
@@ -480,13 +466,9 @@ fn visit_meet(
         // visit_erased_type (meet.py:875) is unreachable: ErasedType
         // has no wire-format variant.
 
-        // visit_unbound_type (meet.py:864-873). Three branches on s:
-        //   * NoneType + strict_optional -> UninhabitedType (Bottom).
-        //     Non-strict -> self.s (SameS).
-        //   * UninhabitedType -> self.s (SameS).
-        //   * else -> AnyType (Any). AnyType-s never reaches here (the
-        //     meet_types AnyType-s short-circuit at meet.py:145 returns
-        //     t before the visitor fires).
+        // visit_unbound_type (meet.py:864-873): NoneType + strict_optional
+        // -> Bottom; UninhabitedType -> SameS; else -> AnyType. AnyType
+        // never reaches here (meet.py:145 short-circuits).
         Type::UnboundType { .. } => {
             if matches!(s, Type::NoneType) {
                 if ctx.strict_optional {
@@ -504,17 +486,9 @@ fn visit_meet(
         // visit_instance (meet.py:913-996), args-less nominal subset.
         Type::Instance { .. } => visit_instance_meet(s, t, ctx, resolver),
 
-        // visit_type_var (meet.py:878-884), case 1 same-id-same-bound
-        // only. Case 1 (s is TypeVarType, s.id==t.id,
-        // s.upper_bound==t.upper_bound) returns self.s -> SameS. The
-        // copy_modified branch (upper_bounds differ) produces a new
-        // TypeVarType -> defer. The else (s not TypeVarType or
-        // different id) -> default(self.s) -> Bottom.
-        //
-        // TypeVarId.__eq__ (types.py:567-577) checks raw_id,
-        // meta_level, namespace. Wire format omits meta_level
-        // (types.py:739-740, 752); meta variables don't cross FFI.
-        // raw_id + namespace equality matches wire-roundtrip semantics.
+        // visit_type_var (meet.py:878-884), same-id same-upper-bound only:
+        // -> SameS. Differing upper bounds or non-TypeVar s -> defer.
+        // TypeVarId.__eq__: raw_id + namespace (meta_level not on wire).
         Type::TypeVarType {
             raw_id: t_raw,
             namespace: t_ns,
@@ -541,15 +515,9 @@ fn visit_meet(
             Some(SetOpResult::Bottom)
         }
 
-        // visit_type_var_tuple (meet.py:930-934). Same id (raw_id +
-        // namespace) -> `self.s if self.s.min_len > t.min_len else t`.
-        // Different id / s not TypeVarTupleType -> default(self.s) ->
-        // Bottom (strict) / NoneType (non-strict).
-        //
-        // TypeVarId.__eq__ (types.py:567-577) checks raw_id,
-        // meta_level, namespace; wire format omits meta_level (meta
-        // variables don't cross FFI), so raw_id + namespace equality
-        // matches wire-roundtrip semantics.
+        // visit_type_var_tuple (meet.py:930-934): same id (raw_id +
+        // namespace) -> min_len-ordered; different id -> Bottom or
+        // NoneType (non-strict). TypeVarId: raw_id + namespace.
         Type::TypeVarTupleType {
             raw_id: t_raw,
             namespace: t_ns,
@@ -1399,7 +1367,7 @@ fn visit_join(
                         && s_fb.as_ref() == t_fb.as_ref()
                     {
                         let simplified =
-                            make_simplified_union(&[s.clone(), t.clone()], ctx, resolver)?;
+                            make_simplified_union(&[s.clone(), t.clone()], ctx, resolver, true)?;
                         if matches!(simplified, Type::Instance { .. }) {
                             let mut wbuf = WriteBuffer::new();
                             wire::write_type(&mut wbuf, &simplified).ok()?;
@@ -1675,6 +1643,25 @@ fn remove_redundant_union_items(
             }
             let mut duplicate_index = None;
             for (j, tj) in new_items.iter().enumerate() {
+                // An Instance with a last_known_value never removes
+                // another item, unless it is an Instance with the same
+                // last_known_value (typeops.py:878-890). Without this,
+                // `Literal[1]? | Literal[2]?` collapses to `Literal[1]?`.
+                if let Type::Instance {
+                    last_known_value: Some(tj_lkv),
+                    ..
+                } = tj
+                {
+                    let ti_lkv = match &ti {
+                        Type::Instance {
+                            last_known_value, ..
+                        } => last_known_value.as_deref(),
+                        _ => None,
+                    };
+                    if ti_lkv != Some(tj_lkv.as_ref()) {
+                        continue;
+                    }
+                }
                 if is_subtype(&ti, tj, ctx, resolver)? {
                     duplicate_index = Some(j);
                     break;
@@ -1912,6 +1899,7 @@ pub(crate) fn make_simplified_union(
     items: &[Type],
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
+    contract_literals: bool,
 ) -> Option<Type> {
     // Step 1: flatten nested unions. TypeAliasType defers.
     let flat = flatten_nested_unions(items)?;
@@ -1924,8 +1912,22 @@ pub(crate) fn make_simplified_union(
     // where the Rust is_subtype only handles LiteralType == LiteralType).
     let deduped = remove_redundant_union_items(flat, ctx, resolver)?;
     // Step 4: contract literals (bool + enum) sharing a fallback
-    // whose full value set is covered.
-    let contracted = try_contracting_literals_in_union(deduped, resolver)?;
+    // whose full value set is covered. Gated on >1 LiteralType item,
+    // matching Python (typeops.py:785): a lone enum literal must stay a
+    // literal (e.g. a single-member enum's sole value), never contract
+    // back to the enum Instance. contract_literals=False (call from
+    // try_expanding_sum_type_to_union) skips contraction entirely.
+    let contracted = if contract_literals
+        && deduped
+            .iter()
+            .filter(|t| matches!(t, Type::LiteralType { .. }))
+            .count()
+            > 1
+    {
+        try_contracting_literals_in_union(deduped, resolver)?
+    } else {
+        deduped
+    };
     // Final: make_union (types.py:3483-3489).
     let mut result = union_make_union(contracted);
     // Step 5: erase inconsistent extra_attrs on the result's fallback.
@@ -2054,6 +2056,7 @@ fn visit_union_join(
         ],
         ctx,
         resolver,
+        true,
     )?;
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &simplified).ok()?;
@@ -3365,7 +3368,7 @@ mod tests {
             instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
             instance("a.A", vec![]),
         ];
-        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
         let expected = instance("a.A", vec![]);
         assert_eq!(result, expected);
     }
@@ -3383,7 +3386,7 @@ mod tests {
         let attrs_fn =
             || instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]);
         let items = vec![attrs_fn(), attrs_fn()];
-        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
         assert_eq!(result, attrs_fn());
     }
 
@@ -3401,7 +3404,7 @@ mod tests {
             instance_with_attrs("a.A", vec![("x", instance("builtins.int", vec![]))], vec![]),
             instance_with_attrs("a.A", vec![("y", instance("builtins.str", vec![]))], vec![]),
         ];
-        let result = make_simplified_union(&items, &ctx(true), &r).expect("deferred");
+        let result = make_simplified_union(&items, &ctx(true), &r, true).expect("deferred");
         let expected = instance("a.A", vec![]);
         assert_eq!(result, expected);
     }
