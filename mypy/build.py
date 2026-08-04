@@ -1223,15 +1223,19 @@ class BuildManager:
         # return a wrong answer. Wired to production.
         _set_native_mro_resolver(resolver, typeinfo_map)
         _set_native_join_typeinfo_map(typeinfo_map)
-        # Stage 3d: expand_type shares the join typeinfo_map so
-        # wire-decoded type_ref strings resolve to live TypeInfo.
-        # Resolver install left commented (parity-only): the port has
-        # ~316 testcheck failures (unexpanded TypeVars in edge cases).
-        from mypy.expandtype import _set_native_expand_type_typeinfo_map
+        # Stage 3d: expand_type is wired to production. It defers
+        # (returns None) for bound methods, ParamSpec/Unpack args,
+        # empty envs, and any result still carrying a TypeVar-like node,
+        # so it cannot return a wrong answer across the wire.
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
 
+        _set_native_expand_type_active(True)
         _set_native_expand_type_typeinfo_map(typeinfo_map)
-        # from mypy.expandtype import _set_native_expand_type_resolver
-        # _set_native_expand_type_resolver(resolver)
+        _set_native_expand_type_resolver(resolver)
         # Stage 3e typeops helpers (parity-only). Resolver install left
         # commented (parity-only): install via conftest.py with
         # MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS=1.
