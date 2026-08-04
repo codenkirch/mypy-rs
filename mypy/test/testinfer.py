@@ -1213,3 +1213,135 @@ class OperandComparisonGroupingSuite(Suite):
 
         self.assertEqual(group_comparison_operands([], {}, set()), [])
         self.assertEqual(group_comparison_operands([], {}, {"=="}), [])
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class InferFunctionTypeArgumentsParitySuite(Suite):
+    """Parity: infer_function_type_arguments native vs Python.
+
+    Asserts the whole inference loop (constraints + solve leaves) returns
+    the same inferred argument list with the native gates on as with them
+    off, for the generic-callee shapes the production path serves.
+    """
+
+    def _generic_callee(self, fixture: TypeFixture, nvars: int) -> CallableType:
+        tvars = [
+            TypeVarType(
+                f"T{i}",
+                f"T{i}",
+                TypeVarId(-1 - i),
+                [],
+                fixture.o,
+                AnyType(TypeOfAny.from_omitted_generics),
+            )
+            for i in range(nvars)
+        ]
+        return CallableType(
+            [t for t in tvars],
+            [ARG_POS] * nvars,
+            [None] * nvars,
+            tvars[-1],
+            fixture.function,
+            variables=tvars,
+        )
+
+    def setUp(self) -> None:
+        # Install a native resolver over the fixture type graph so the
+        # expand_type and solve_one leaves route through the Rust kernel.
+        import type_kernel
+
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        fixture = TypeFixture()
+        self.fixture = fixture
+        type_infos = [v for v in vars(fixture).values() if hasattr(v, "fullname")]
+        native = type_kernel.build_native_resolver(type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        from mypy.expandtype import _set_native_expand_type_resolver
+        from mypy.solve import _set_native_solve_resolver
+
+        _set_native_expand_type_resolver(native)
+        _set_native_solve_resolver(native)
+
+    def tearDown(self) -> None:
+        from mypy.expandtype import _set_native_expand_type_resolver
+        from mypy.solve import _set_native_solve_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_expand_type_resolver(None)
+        _set_native_solve_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def test_single_var_identity(self) -> None:
+        fixture = TypeFixture()
+        callee = self._generic_callee(fixture, 1)
+        self.assert_equal_infer(fixture, callee, [fixture.a])
+
+    def test_two_var_mapping(self) -> None:
+        fixture = TypeFixture()
+        callee = self._generic_callee(fixture, 2)
+        self.assert_equal_infer(fixture, callee, [fixture.a, fixture.b])
+
+    def test_join_two_classes(self) -> None:
+        # T inferred from two lowers (B, C) sharing base A -> A.
+        fixture = TypeFixture()
+        callee = self._generic_callee(fixture, 1)
+        self.assert_equal_infer(fixture, callee, [fixture.b, fixture.c], two_lowers=True)
+
+    def test_freshen_expands_to_fresh_vars(self) -> None:
+        # freshen_function_type_vars substitutes fresh unification vars for
+        # the callee's generic variables; with the expand resolver
+        # installed the substitution runs through the Rust expand_type leaf.
+        fixture = TypeFixture()
+        callee = self._generic_callee(fixture, 1)
+        from mypy.expandtype import freshen_function_type_vars
+
+        fresh = freshen_function_type_vars(callee)
+        assert fresh.is_generic()
+        assert fresh.variables[0].id != callee.variables[0].id
+        assert_equal(fresh.arg_types[0], fresh.variables[0])
+
+    def assert_equal_infer(
+        self,
+        fixture: TypeFixture,
+        callee: CallableType,
+        arg_types: list[Type],
+        two_lowers: bool = False,
+    ) -> None:
+        from mypy.constraints import _native_constraints_active, _set_native_constraints_active
+        from mypy.infer import ArgumentInferContext, infer_function_type_arguments
+        from mypy.solve import _native_solve_active, _set_native_solve_active
+
+        if two_lowers:
+            formal_to_actual: list[list[int]] = [[0, 1]]
+            arg_kinds = [ARG_POS, ARG_POS]
+        else:
+            formal_to_actual = [[i] for i in range(len(callee.arg_types))]
+            arg_kinds = [ARG_POS] * len(callee.arg_types)
+        context = ArgumentInferContext(fixture.std_tuple, fixture.std_tuple)
+
+        def run() -> list[Type | None]:
+            return infer_function_type_arguments(
+                callee, arg_types, arg_kinds, None, formal_to_actual, context, strict=True
+            )[0]
+
+        # Resolver is installed in setUp; toggle the leaf gates here.
+        saved_solve_active = _native_solve_active
+        saved_constraints_active = _native_constraints_active
+        try:
+            _set_native_constraints_active(False)
+            _set_native_solve_active(False)
+            expected = run()
+            _set_native_constraints_active(True)
+            _set_native_solve_active(True)
+            actual = run()
+            # Compare semantically: the native path rebuilds type nodes
+            # through the wire, so results are string-identical but not
+            # necessarily the same Python objects as the fixture's.
+            assert_equal([str(t) for t in actual], [str(t) for t in expected])
+        finally:
+            _set_native_constraints_active(saved_constraints_active)
+            _set_native_solve_active(saved_solve_active)
