@@ -760,6 +760,10 @@ def make_simplified_union(
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
+                # Defer when a type_ref is unresolvable: returning None here
+                # crashes semanal's check_type_arguments on .accept().
+                if decoded is None:
+                    raise NotImplementedError("unresolvable type_ref in simplified union")
                 return get_proper_type(decoded)
         except (AssertionError, NotImplementedError):
             pass
