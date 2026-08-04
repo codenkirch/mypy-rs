@@ -55,6 +55,78 @@ import mypy.type_visitor  # ruff: isort: skip
 # is installed, expand_type routes through Rust. Rust returns None for any
 # type it does not handle, in which case we fall back to the pure-Python
 # visitor. This is the strangler-fig per-call gate.
+
+
+def _needs_python(typ: Type) -> bool:
+    """True if `typ` nests a node a kernel round-trip cannot carry.
+
+    Named callables lose their FuncDef/Decorator definition node, breaking
+    error formatting that names the function; recursive TypeAliasType would
+    loop while decoding. Both must defer to the pure-Python visitor.
+    """
+    stack: list[Type] = [typ]
+    visited: set[int] = set()
+    while stack:
+        t = stack.pop()
+        p = get_proper_type(t)
+        if id(p) in visited:
+            continue
+        visited.add(id(p))
+        if isinstance(p, CallableType):
+            if p.definition is not None:
+                return True
+            stack.append(p.ret_type)
+            stack.extend(p.arg_types)
+            stack.append(p.fallback)
+        elif isinstance(p, TypeAliasType):
+            return True
+        elif isinstance(p, Instance):
+            stack.extend(p.args)
+        elif isinstance(p, UnionType):
+            stack.extend(p.items)
+        elif isinstance(p, TupleType):
+            stack.extend(p.items)
+        elif isinstance(p, TypeType):
+            stack.append(p.item)
+    return False
+
+
+def _env_substitutes_unsafe(typ: Type, env: Mapping[TypeVarId, Type]) -> bool:
+    """True if substituting `env` into `typ` would introduce an unsafe node.
+
+    Only the env entries for typevars actually referenced by `typ` are
+    substituted by expand_type, so only those values can lose a definition
+    or alias on a kernel round-trip. Walking just those bounds the cost to
+    the substituted subset, keeping large unrelated envs (e.g. big dict
+    literals) on the fast kernel path.
+    """
+    used: set[tuple[int, str]] = set()
+    stack: list[Type] = [typ]
+    visited: set[int] = set()
+    while stack:
+        t = stack.pop()
+        p = get_proper_type(t)
+        if id(p) in visited:
+            continue
+        visited.add(id(p))
+        if isinstance(p, TypeVarType):
+            used.add((p.id.raw_id, p.id.namespace))
+        elif isinstance(p, Instance):
+            stack.extend(p.args)
+        elif isinstance(p, CallableType):
+            for v in p.variables:
+                used.add((v.id.raw_id, v.id.namespace))
+            stack.append(p.ret_type)
+            stack.extend(p.arg_types)
+        elif isinstance(p, UnionType):
+            stack.extend(p.items)
+        elif isinstance(p, TupleType):
+            stack.extend(p.items)
+        elif isinstance(p, TypeType):
+            stack.append(p.item)
+    return any((v.raw_id, v.namespace) in used and _needs_python(t) for v, t in env.items())
+
+
 try:
     import type_kernel as _type_kernel
     from librt.internal import (
@@ -162,12 +234,12 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
         _HAS_TYPE_KERNEL
         and _native_expand_type_active
         and _native_expand_type_resolver is not None
+        and not _needs_python(typ)
+        and not _env_substitutes_unsafe(typ, env)
     ):
         try:
             result = _type_kernel.rust_expand_type(
-                _native_expand_type_resolver,
-                _serialize_type(typ),
-                _serialize_env(env),
+                _native_expand_type_resolver, _serialize_type(typ), _serialize_env(env)
             )
             if result is not None:
                 decoded = read_type(_ReadBuffer(bytes(result)))

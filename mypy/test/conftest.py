@@ -86,25 +86,6 @@ def _install_native_resolvers_patch() -> None:
         except ImportError:
             pass
 
-        # Install expand_type resolver if Stage 3d shim is present.
-        # Gated behind env var because Rust expand_type port still has
-        # ~316 testcheck failures. Parity CI does not set this var.
-        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_EXPAND_RESOLVERS"):
-            try:
-                from mypy.expandtype import (
-                    _set_native_expand_type_active,
-                    _set_native_expand_type_resolver,
-                    _set_native_expand_type_typeinfo_map,
-                )
-
-                _set_native_expand_type_active(True)
-                _set_native_expand_type_resolver(resolver)
-                _set_native_expand_type_typeinfo_map(
-                    {info.fullname: info for info in type_infos}
-                )
-            except ImportError:
-                pass
-
         # Stage 3e typeops helpers (parity-only). Install the resolver so
         # the typeops shim can call rust_make_simplified_union,
         # rust_is_simple_literal, rust_true_only, rust_false_only,
@@ -185,9 +166,7 @@ def _install_native_resolvers_patch() -> None:
 
                 _set_native_applytype_active(True)
                 _set_native_applytype_resolver(resolver)
-                _set_native_applytype_typeinfo_map(
-                    {info.fullname: info for info in type_infos}
-                )
+                _set_native_applytype_typeinfo_map({info.fullname: info for info in type_infos})
                 from mypy.typevars import _set_native_typevars_active
 
                 _set_native_typevars_active(True)
@@ -197,8 +176,7 @@ def _install_native_resolvers_patch() -> None:
     BuildManager._build_native_resolvers = patched
 
 
-if (
-    os.environ.get("MYPY_NATIVE_PARITY_INSTALL_RESOLVERS")
-    and os.environ.get("TEST_NATIVE_TYPE_KERNEL")
+if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_RESOLVERS") and os.environ.get(
+    "TEST_NATIVE_TYPE_KERNEL"
 ):
     _install_native_resolvers_patch()

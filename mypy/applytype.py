@@ -26,6 +26,7 @@ from mypy.types import (
     TypeVarTupleType,
     TypeVarType,
     UninhabitedType,
+    UnionType,
     UnpackType,
     get_proper_type,
     read_type,
@@ -64,6 +65,42 @@ _native_applytype_typeinfo_map: dict[str, Any] | None = None
 def _set_native_applytype_active(active: bool) -> None:
     global _native_applytype_active
     _native_applytype_active = active
+
+
+def _contains_named_callable(types: Sequence[Type | None]) -> bool:
+    """True if any type nests a node a kernel round-trip cannot carry.
+
+    The wire format cannot carry FuncDef/Decorator nodes, so a kernel
+    round-trip would strip `definition` from a substituted callable arg,
+    breaking error formatting that names the function; recursive
+    TypeAliasType would loop while decoding. Both defer to Python.
+    """
+    stack: list[Type] = [t for t in types if t is not None]
+    visited: set[int] = set()
+    while stack:
+        t = get_proper_type(stack.pop())
+        if id(t) in visited:
+            continue
+        visited.add(id(t))
+        if isinstance(t, CallableType):
+            if t.definition is not None:
+                return True
+            stack.append(t.ret_type)
+            stack.extend(t.arg_types)
+            stack.append(t.fallback)
+        elif isinstance(t, TypeAliasType):
+            return True
+        elif isinstance(t, Instance):
+            stack.extend(t.args)
+        elif isinstance(t, UnionType):
+            stack.extend(t.items)
+        elif isinstance(t, TupleType):
+            stack.extend(t.items)
+    return False
+
+
+class _TypeVarMetaCollector(mypy.type_visitor.TypeQuery[dict[tuple[int, str], int]]):
+    """Walk a live type tree, mapping (raw_id, namespace) -> meta_level."""
 
 
 def _set_native_applytype_resolver(resolver: Any) -> None:
@@ -287,6 +324,7 @@ def apply_generic_arguments(
         and _native_applytype_active
         and _native_applytype_resolver is not None
         and skip_unsatisfied
+        and not _contains_named_callable(orig_types)
     ):
         try:
             # Wire codec drops TypeVarId.meta_level. Returning a callable

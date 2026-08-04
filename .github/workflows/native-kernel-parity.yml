@@ -2,7 +2,8 @@ name: native-kernel-parity
 
 # Parity gates for the Rust type-kernel. Each job runs the full testcheck
 # corpus with TEST_NATIVE_TYPE_KERNEL=1 and the Stage 3c resolvers.
-# Resolver install lives in mypy/test/conftest.py, not in build.py.
+# The base resolvers install in mypy/test/conftest.py; graduated stages
+# (expand_type) install unconditionally in mypy/build.py.
 
 # STATUS: gating. The join-kernel blocker (issue #70) closed via #72; the
 # corpus passes 8205/0 (8187 with -k "not slow") on current main. The
@@ -10,7 +11,7 @@ name: native-kernel-parity
 
 # env-var -> issue (conftest.py): base = Stage 3c subtype/join/mro/solve.
 # TYPEOPS -> #203 (M16, blocked on #201); ERASEVARS/COPYTYPE/VISITOR_TYPES/
-# CHECKEXPR_TYPES -> #201 (M14); EXPAND_RESOLVERS -> #199 (M12).
+# CHECKEXPR_TYPES -> #201 (M14). expand_type graduated (#199): no gate.
 
 on:
   pull_request:
@@ -21,6 +22,8 @@ on:
       - mypy/join.py
       - mypy/argmap.py
       - mypy/erasetype.py
+      - mypy/expandtype.py
+      - mypy/applytype.py
       - mypy/mro.py
       - mypy/build.py
       - mypy/test/conftest.py
