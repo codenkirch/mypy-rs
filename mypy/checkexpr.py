@@ -1707,6 +1707,28 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             )
         return make_simplified_union(res)
 
+    def _dispatch_kind(self, callee: ProperType) -> int:
+        """Return the structural dispatch kind for a callee.
+
+        Mirrors the Rust classifier in checkcall.rs exactly: flat, no
+        recursion, purely structural (TypeVar/TupleType/UninhabitedType
+        all classify CALL_OTHER because the Rust classifier does not
+        descend; the isinstance chain separately recurses on them).
+        """
+        if isinstance(callee, CallableType):
+            return CALL_WITH_VARS if callee.variables else CALL_PLAIN
+        if isinstance(callee, Overloaded):
+            return CALL_OVERLOADED
+        if isinstance(callee, AnyType):
+            return CALL_ANY
+        if isinstance(callee, UnionType):
+            return CALL_UNION
+        if isinstance(callee, Instance):
+            return CALL_INSTANCE
+        if isinstance(callee, TypeType):
+            return CALL_TYPE_TYPE
+        return CALL_OTHER
+
     def check_call(
         self,
         callee: Type,
@@ -1741,9 +1763,21 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         callee = get_proper_type(callee)
 
-        # Stage 4: the fast-path pyfunction was wired here but its
-        # return was discarded (pure FFI overhead). Removed per YAGNI.
-        # Functional Stage 4 = plugin-hook snapshot gating `get_*_hook`.
+        # Stage 4: the Rust classifier must agree with the dispatch chain;
+        # disagreement fails loudly. CALL_OTHER defers to the chain
+        # (Python recurses on TypeVar/TupleType there).
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                native_kind = _try_native_classify_call(callee)
+                if native_kind is not None and native_kind != CALL_OTHER:
+                    py_kind = self._dispatch_kind(callee)
+                    if native_kind != py_kind:
+                        raise RuntimeError(
+                            "native classify_call mismatch: "
+                            f"rust={native_kind} python={py_kind} type={callee}"
+                        )
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
 
         if isinstance(callee, CallableType):
             if callee.variables:

@@ -152,6 +152,17 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 4b check_call dispatch (parity-only). The guard reads
+        # _native_checkexpr_active, so flipping it here activates the
+        # dispatch verification; makes CHECKCALL alone sufficient.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKCALL"):
+            try:
+                from mypy.checkexpr import _set_native_checkexpr_active
+
+                _set_native_checkexpr_active(True)
+            except ImportError:
+                pass
+
         # Stage 6c small pure modules batch (parity-only).
         # apply_generic_arguments needs the resolver + typeinfo_map
         # (shares the subtype/expand resolvers). has_no_typevars needs

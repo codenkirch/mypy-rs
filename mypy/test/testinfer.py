@@ -373,6 +373,83 @@ class ClassifyCallParitySuite(Suite):
     os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
     "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
 )
+class CheckCallDispatchParitySuite(Suite):
+    """Parity: check_call dispatch guard native vs Python.
+
+    Asserts the structural `_dispatch_kind` used by the dispatch guard
+    agrees with the Rust classifier for the shapes the isinstance chain
+    routes. The guard in check_call raises on disagreement; these tests
+    prove the guard is silent on the canonical shapes before the corpus
+    runs.
+    """
+
+    def assert_dispatch_agrees(self, callee: Type) -> None:
+        from mypy.checkexpr import (
+            ExpressionChecker,
+            _native_checkexpr_active,
+            _set_native_checkexpr_active,
+            _try_native_classify_call,
+        )
+
+        saved_active = _native_checkexpr_active
+        try:
+            _set_native_checkexpr_active(True)
+            native_kind = _try_native_classify_call(callee)
+            py_kind = ExpressionChecker._dispatch_kind(None, callee)  # type: ignore[arg-type]
+            if native_kind is not None and native_kind != CALL_OTHER:
+                assert_equal(native_kind, py_kind)
+        finally:
+            _set_native_checkexpr_active(saved_active)
+
+    def test_plain_callable(self) -> None:
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(fixture.callable(fixture.a, fixture.b))
+
+    def test_generic_callable(self) -> None:
+        fixture = TypeFixture()
+        tvar = TypeVarType(
+            "T", "T", TypeVarId(-1), [], fixture.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        callee = CallableType(
+            [tvar], [ARG_POS], [None], fixture.b, fixture.function, variables=[tvar]
+        )
+        self.assert_dispatch_agrees(callee)
+
+    def test_overloaded(self) -> None:
+        fixture = TypeFixture()
+        c1 = fixture.callable(fixture.a, fixture.b)
+        c2 = fixture.callable(fixture.b, fixture.a)
+        self.assert_dispatch_agrees(Overloaded([c1, c2]))
+
+    def test_any(self) -> None:
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(fixture.anyt)
+
+    def test_union(self) -> None:
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(UnionType([fixture.a, fixture.b]))
+
+    def test_instance(self) -> None:
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(fixture.a)
+
+    def test_type_type(self) -> None:
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(fixture.type_any)
+
+    def test_other_shapes_defer(self) -> None:
+        # TypeVar/TupleType/UninhabitedType classify CALL_OTHER in Rust;
+        # the guard skips verification and the chain recurses.
+        fixture = TypeFixture()
+        self.assert_dispatch_agrees(fixture.t)
+        self.assert_dispatch_agrees(TupleType([fixture.a], fixture.std_tuple))
+        self.assert_dispatch_agrees(fixture.uninhabited)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
 class NormalizeCallableParitySuite(Suite):
     """Parity: check_callable_call callee normalization native vs Python.
 
