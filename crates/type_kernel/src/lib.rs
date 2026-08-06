@@ -122,6 +122,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_simple_literal_type, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_is_simple_literal, module)?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_is_literal_type_like, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_false_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_or_false, module)?)?;

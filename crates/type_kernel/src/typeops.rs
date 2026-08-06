@@ -419,6 +419,68 @@ pub(crate) fn rust_is_simple_literal(
     is_simple_literal(&t, resolver.resolver())
 }
 
+/// `#[pyfunction]` entry for `is_simple_literal`'s sibling
+/// `is_literal_type_like` (typeops.py:1241-1257). Accepts a serialized type
+/// and returns `Some(bool)` when the wire form can be fully decoded and no
+/// TypeAliasType is encountered; `None` (defer to Python) otherwise.
+#[pyfunction]
+pub(crate) fn rust_is_literal_type_like(t_bytes: &[u8]) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    is_literal_type_like(&t)
+}
+
+/// `mypy.typeops.is_literal_type_like` — whether a (proper) type is
+/// potentially a LiteralType, a Union whose items all qualify, or a TypeVar
+/// whose upper bound / values qualify.
+///
+/// Mirrors typeops.py:1241-1257:
+/// ```
+/// t = get_proper_type(t)
+/// if t is None: return False
+/// elif isinstance(t, LiteralType): return True
+/// elif isinstance(t, UnionType): return any(is_literal_type_like(item) for item in t.items)
+/// elif isinstance(t, TypeVarType):
+///     return is_literal_type_like(t.upper_bound) or any(is_literal_type_like(item) for item in t.values)
+/// else: return False
+/// ```
+///
+/// TypeAliasType can't be resolved to a proper type here (no target in the
+/// wire form), so it returns `None` and the Python shim defers.
+fn is_literal_type_like(t: &Type) -> Option<bool> {
+    match t {
+        Type::TypeAliasType { .. } => None,
+        Type::LiteralType { .. } => Some(true),
+        Type::UnionType { items, .. } => {
+            for item in items {
+                match is_literal_type_like(item) {
+                    Some(true) => return Some(true),
+                    None => return None,
+                    Some(false) => {}
+                }
+            }
+            Some(false)
+        }
+        Type::TypeVarType {
+            upper_bound, values, ..
+        } => {
+            match is_literal_type_like(upper_bound) {
+                Some(true) => return Some(true),
+                None => return None,
+                Some(false) => {}
+            }
+            for v in values {
+                match is_literal_type_like(v) {
+                    Some(true) => return Some(true),
+                    None => return None,
+                    Some(false) => {}
+                }
+            }
+            Some(false)
+        }
+        _ => Some(false),
+    }
+}
+
 /// `#[pyfunction]` entry for `true_only`. Returns a truthiness discriminator
 /// tuple or `None` (defer to Python).
 #[pyfunction]
@@ -629,5 +691,136 @@ mod tests {
             TruthinessResult::LiteralZero(_) => {}
             _ => panic!("expected LiteralZero"),
         }
+    }
+
+    // ------------------------------------------------------------------
+    // is_literal_type_like
+    // ------------------------------------------------------------------
+
+    fn lit_str(value: &str) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.str".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            value: LiteralValue::Str(value.to_string()),
+        }
+    }
+
+    fn plain_instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn literal_type_like_is_true() {
+        assert_eq!(is_literal_type_like(&lit_str("x")), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_instance_is_false() {
+        assert_eq!(is_literal_type_like(&plain_instance("builtins.str")), Some(false));
+    }
+
+    #[test]
+    fn literal_type_like_union_of_literals_is_true() {
+        let t = Type::UnionType {
+            items: vec![lit_str("a"), lit_str("b")],
+            uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(is_literal_type_like(&t), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_union_mixed_is_true_via_any() {
+        // Python uses `any(...)` over union items, so a single literal item
+        // makes the whole union "literal-like" regardless of the others.
+        let t = Type::UnionType {
+            items: vec![lit_str("a"), plain_instance("builtins.int")],
+            uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(is_literal_type_like(&t), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_typevar_bound_to_literal_is_true() {
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "1".to_string(),
+            values: vec![],
+            upper_bound: Box::new(lit_str("x")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 1,
+            meta_level: 0,
+        };
+        assert_eq!(is_literal_type_like(&t), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_typevar_values_literal_is_true() {
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "1".to_string(),
+            values: vec![lit_str("v")],
+            upper_bound: Box::new(plain_instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 1,
+            meta_level: 0,
+        };
+        assert_eq!(is_literal_type_like(&t), Some(true));
+    }
+
+    #[test]
+    fn literal_type_like_alias_defers() {
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.Alias".to_string(),
+        };
+        assert_eq!(is_literal_type_like(&t), None);
+    }
+
+    #[test]
+    fn literal_type_like_callable_is_false() {
+        let t = Type::CallableType {
+            fallback: Box::new(plain_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        assert_eq!(is_literal_type_like(&t), Some(false));
     }
 }
