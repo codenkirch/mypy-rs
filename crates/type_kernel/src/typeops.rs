@@ -553,6 +553,154 @@ pub(crate) fn rust_try_getting_instance_fallback(t_bytes: &[u8]) -> Option<Vec<u
     encode_type(&fallback)
 }
 
+/// `#[pyfunction]` entry for `try_expanding_sum_type_to_union`
+/// (typeops.py:1292-1333). Returns the expanded type encoded as wire bytes,
+/// or `None` to defer to Python when a Union branch needs recursive-flatten
+/// semantics the wire format cannot express (a recursive TypeAliasType), or
+/// an Instance's enum snapshot is missing from the resolver.
+#[pyfunction]
+#[pyo3(signature = (t_bytes, target_fullname, strict_optional, resolver))]
+pub(crate) fn rust_try_expanding_sum_type_to_union(
+    t_bytes: &[u8],
+    target_fullname: Option<String>,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let t = decode_type(t_bytes)?;
+    let result =
+        try_expanding_sum_type_to_union_inner(&t, target_fullname.as_deref(), strict_optional, resolver.resolver())?;
+    encode_type(&result)
+}
+
+/// `UnionType.make_union` (types.py:3502-3509): more than one item makes a
+/// fresh `UnionType`, one item returns the item itself, and zero items
+/// returns `UninhabitedType`. The union is always `uses_pep604_syntax=False`
+/// (make_union's default) and its truthiness flags are computed eagerly from
+/// the items exactly as Python's lazy `can_be_true/can_be_false_default`
+/// (`any(item.can_be_true)`) would compute them.
+fn make_union(items: Vec<Type>) -> Type {
+    match items.len() {
+        0 => Type::UninhabitedType { ambiguous: false },
+        1 => items.into_iter().next().unwrap(),
+        _ => {
+            // UnionType.__init__ flattens nested unions (types.py:3465) with
+            // handle_type_alias_type=False, so type aliases pass through and
+            // the helper never returns None here. Truthiness iterates the
+            // flattened items, matching Python's lazy any(item.can_be_true).
+            let flat = crate::visitor::flatten_nested_unions_inner(&items, false, true)
+                .unwrap_or_else(|| items.clone());
+            let can_be_true = flat.iter().any(crate::setops::union_item_can_be_true);
+            let can_be_false = flat.iter().any(crate::setops::union_item_can_be_false);
+            Type::UnionType {
+                items: flat,
+                uses_pep604_syntax: false,
+                can_be_true,
+                can_be_false,
+            }
+        }
+    }
+}
+
+/// `mypy.typeops.try_expanding_sum_type_to_union` (typeops.py:1292-1333):
+/// expand a bool Instance into `Literal[True, False]` or an enum Instance
+/// into the union of its member literals, recursively down a Union.
+///
+/// ```
+/// typ = get_proper_type(typ)
+/// if isinstance(typ, UnionType):
+///     items = [try_expanding_sum_type_to_union(item, target_fullname) for
+///              item in remove_dups(flatten_nested_unions(typ.relevant_items()))]
+///     return UnionType.make_union(items)
+/// if isinstance(typ, Instance) and
+///         (target_fullname is None or typ.type.fullname == target_fullname):
+///     if typ.type.fullname == "builtins.bool":
+///         return UnionType([LiteralType(True, typ), LiteralType(False, typ)])
+///     if typ.type.is_enum:
+///         items = [LiteralType(name, typ) for name in typ.type.enum_members]
+///         if not items: return typ
+///         return UnionType.make_union(items)
+/// return typ
+/// ```
+///
+/// A `TypeAliasType` cannot be resolved here (no target in the wire form), so
+/// it returns `None` and the Python shim defers — matching `get_proper_type`.
+/// Same deferral when a Union branch needs recursive alias flattening or an
+/// enum snapshot is missing from the resolver.
+fn try_expanding_sum_type_to_union_inner(
+    typ: &Type,
+    target_fullname: Option<&str>,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    // get_proper_type: a TypeAliasType has no proper form in the wire format.
+    match typ {
+        Type::TypeAliasType { .. } => return None,
+        _ => {}
+    }
+    match typ {
+        Type::UnionType { items, .. } => {
+            // typ.relevant_items(): with strict_optional off, NoneType items
+            // are dropped (types.py:3517-3522).
+            let relevant: Vec<Type> = if strict_optional {
+                items.clone()
+            } else {
+                items
+                    .iter()
+                    .filter(|i| !matches!(i, Type::NoneType))
+                    .cloned()
+                    .collect()
+            };
+            // flatten_nested_unions(relevant, type_alias_type=True, recursive=True).
+            // A recursive TypeAliasType inside yields None (defer); by then the
+            // relevant items may include NoneTypes, which must not be dropped
+            // twice, so `relevant` is the pre-None-filtered input.
+            let flat = crate::visitor::flatten_nested_unions_inner(&relevant, true, true)?;
+            let deduped = crate::visitor::remove_dups_inner(&flat);
+            let mut out = Vec::with_capacity(deduped.len());
+            for item in &deduped {
+                out.push(try_expanding_sum_type_to_union_inner(
+                    item,
+                    target_fullname,
+                    strict_optional,
+                    resolver,
+                )?);
+            }
+            Some(make_union(out))
+        }
+        Type::Instance { type_ref, .. } => {
+            if let Some(tf) = target_fullname {
+                if type_ref != tf {
+                    return Some(typ.clone());
+                }
+            }
+            if type_ref == "builtins.bool" {
+                let lit = |value: bool| Type::LiteralType {
+                    fallback: Box::new(typ.clone()),
+                    value: LiteralValue::Bool(value),
+                };
+                return Some(make_union(vec![lit(true), lit(false)]));
+            }
+            let snap = resolver.get(type_ref)?;
+            if !snap.is_enum {
+                return Some(typ.clone());
+            }
+            let items: Vec<Type> = snap
+                .enum_members
+                .iter()
+                .map(|name| Type::LiteralType {
+                    fallback: Box::new(typ.clone()),
+                    value: LiteralValue::Str(name.clone()),
+                })
+                .collect();
+            if items.is_empty() {
+                return Some(typ.clone());
+            }
+            Some(make_union(items))
+        }
+        _ => Some(typ.clone()),
+    }
+}
+
 /// `mypy.typeops.try_getting_instance_fallback` — the Instance fallback for
 /// a proper type, or `None` if it has no such fallback.
 ///
@@ -695,6 +843,7 @@ pub(crate) fn rust_true_or_false(t_bytes: &[u8]) -> Option<TruthinessOut> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
     use crate::wire::{LiteralValue, Type};
 
     #[test]
@@ -1355,5 +1504,182 @@ mod tests {
             args: vec![],
         };
         assert_eq!(try_getting_instance_fallback(&alias), None);
+    }
+
+    // ------------------------------------------------------------------
+    // try_expanding_sum_type_to_union
+    // ------------------------------------------------------------------
+
+    fn lit_enum(color: &Type, member: &str) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(color.clone()),
+            value: LiteralValue::Str(member.to_string()),
+        }
+    }
+
+    fn resolver_with_enum(members: Vec<String>) -> TypeResolver {
+        let mut r = TypeResolver::new();
+        // builtins.int must resolve (as a non-enum) for non-target Instance
+        // branches: otherwise lookup fails and the whole expansion defers.
+        let mut int_snap = TypeInfoSnapshot::default();
+        int_snap.fullname = "builtins.int".to_string();
+        r.insert("builtins.int".to_string(), int_snap);
+        let mut color = TypeInfoSnapshot::default();
+        color.fullname = "tests.Color".to_string();
+        color.is_enum = true;
+        color.enum_members = members;
+        r.insert("tests.Color".to_string(), color);
+        r
+    }
+
+    #[test]
+    fn expand_sum_enum_expands_to_member_literals() {
+        let color = plain_instance("tests.Color");
+        let r = resolver_with_enum(vec!["RED".to_string(), "GREEN".to_string(), "BLUE".to_string()]);
+        let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
+        match &result {
+            Type::UnionType { items, uses_pep604_syntax, .. } => {
+                assert!(!uses_pep604_syntax);
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], lit_enum(&color, "RED"));
+                assert_eq!(items[1], lit_enum(&color, "GREEN"));
+                assert_eq!(items[2], lit_enum(&color, "BLUE"));
+            }
+            _ => panic!("expected Union"),
+        }
+        // truthiness: enum member literals inherit fallback Instance truthiness
+        // (both True in Python, canonical Type defaults), so the member union
+        // can_be_true and can_be_false are both true.
+        assert!(crate::setops::union_item_can_be_true(&result));
+        assert!(crate::setops::union_item_can_be_false(&result));
+    }
+
+    #[test]
+    fn expand_sum_enum_with_no_members_returns_instance() {
+        let color = plain_instance("tests.Color");
+        let r = resolver_with_enum(vec![]);
+        let result =
+            try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
+        assert_eq!(result, color);
+    }
+
+    #[test]
+    fn expand_sum_bool_expands_to_literals() {
+        let b = plain_instance("builtins.bool");
+        let r = resolver_with_enum(vec![]);
+        let result = try_expanding_sum_type_to_union_inner(&b, None, true, &r).unwrap();
+        match result {
+            Type::UnionType { items, .. } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    Type::LiteralType {
+                        fallback: Box::new(b.clone()),
+                        value: LiteralValue::Bool(true),
+                    }
+                );
+                assert_eq!(
+                    items[1],
+                    Type::LiteralType {
+                        fallback: Box::new(b.clone()),
+                        value: LiteralValue::Bool(false),
+                    }
+                );
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn expand_sum_bool_requires_matching_target() {
+        let b = plain_instance("builtins.bool");
+        let r = resolver_with_enum(vec![]);
+        // target different from the instance fullname -> returned unchanged.
+        let result =
+            try_expanding_sum_type_to_union_inner(&b, Some("builtins.int"), true, &r).unwrap();
+        assert_eq!(result, b);
+    }
+
+    #[test]
+    fn expand_sum_non_enum_instance_unchanged() {
+        let i = plain_instance("builtins.int");
+        let r = resolver_with_enum(vec![]);
+        let result = try_expanding_sum_type_to_union_inner(&i, None, true, &r).unwrap();
+        assert_eq!(result, i);
+    }
+
+    #[test]
+    fn expand_sum_union_expands_enum_but_not_int() {
+        let color = plain_instance("tests.Color");
+        let i = plain_instance("builtins.int");
+        let r = resolver_with_enum(vec!["RED".to_string(), "GREEN".to_string()]);
+        let t = Type::UnionType {
+            items: vec![color.clone(), i.clone()],
+            uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r).unwrap();
+        match result {
+            Type::UnionType { items, .. } => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], lit_enum(&color, "RED"));
+                assert_eq!(items[1], lit_enum(&color, "GREEN"));
+                assert_eq!(items[2], i);
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn expand_sum_union_drops_none_without_strict_optional() {
+        let color = plain_instance("tests.Color");
+        let r = resolver_with_enum(vec!["RED".to_string()]);
+        let t = Type::UnionType {
+            items: vec![Type::NoneType, color.clone()],
+            uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = try_expanding_sum_type_to_union_inner(&t, None, false, &r).unwrap();
+        // NoneType dropped (strict_optional off), enum expands to a single
+        // literal, make_union of one item returns the literal itself.
+        assert_eq!(result, lit_enum(&color, "RED"));
+    }
+
+    #[test]
+    fn expand_sum_union_strict_optional_keeps_none() {
+        let i = plain_instance("builtins.int");
+        let r = resolver_with_enum(vec![]);
+        let t = Type::UnionType {
+            items: vec![Type::NoneType, i.clone()],
+            uses_pep604_syntax: true,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r).unwrap();
+        match result {
+            Type::UnionType { items, .. } => {
+                // strict_optional on: NoneType is a relevant item; no enum or
+                // bool to expand, so both items survive as-is (NoneType is not
+                // removed by make_union, and remove_dups keeps both).
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0], Type::NoneType);
+                assert_eq!(items[1], i);
+            }
+            _ => panic!("expected Union"),
+        }
+    }
+
+    #[test]
+    fn expand_sum_alias_defers() {
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            try_expanding_sum_type_to_union_inner(&alias, None, true, &TypeResolver::new()),
+            None
+        );
     }
 }
