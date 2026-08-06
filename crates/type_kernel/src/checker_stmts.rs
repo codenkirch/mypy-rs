@@ -23,6 +23,7 @@
 //! it here with an empty resolver would always defer).
 
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyList};
 
 use crate::astwire::{decode_node, AstNode};
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
@@ -219,36 +220,66 @@ fn with_exit_suppresses_inner(typ: &Type, strict_optional: bool) -> bool {
 /// defer).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_try_handler_union(
+pub(crate) fn rust_try_handler_union<'py>(
+    py: Python<'py>,
     type_bytes: &[u8],
     strict_optional: bool,
-) -> PyResult<Option<Vec<Vec<u8>>>> {
+) -> PyResult<Option<&'py PyList>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
     let types = try_handler_union_inner(&typ, strict_optional);
-    Ok(Some(
-        types.iter().map(encode_type_owned).collect::<Vec<_>>(),
-    ))
+    let out = PyList::empty(py);
+    for t in &types {
+        out.append(PyBytes::new(py, &encode_type_owned(t)))?;
+    }
+    Ok(Some(out))
 }
 
 fn try_handler_union_inner(typ: &Type, strict_optional: bool) -> Vec<Type> {
     match typ {
+        // Ordinary tuple: mirror make_simplified_union(typ.items), which
+        // keeps nested tuples as tuples (invalid exception types) and only
+        // flattens UnionType items.
         Type::TupleType { items, .. } => items
             .iter()
-            .flat_map(|item| try_handler_union_inner(item, strict_optional))
+            .flat_map(|item| expand_item(item, strict_optional))
             .collect(),
         Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+            // Variadic tuple: mirror make_simplified_union((typ.args[0],)),
+            // single level, flattening a union arg.
             let Some(item) = args.first() else {
                 return Vec::new();
             };
-            try_handler_union_inner(item, strict_optional)
+            expand_item(item, strict_optional)
         }
         Type::UnionType { items, .. } => items
             .iter()
             .filter(|item| strict_optional || !matches!(item, Type::NoneType))
             .flat_map(|item| try_handler_union_inner(item, strict_optional))
+            .collect(),
+        _ => vec![typ.clone()],
+    }
+}
+
+/// Flatten one union member like make_simplified_union's flatten does:
+/// recurse into UnionType items but keep any other member (including nested
+/// tuples) as-is.
+fn expand_item(item: &Type, strict_optional: bool) -> Vec<Type> {
+    match item {
+        Type::UnionType { .. } => expand_union_items(item, strict_optional),
+        _ => vec![item.clone()],
+    }
+}
+
+// Flatten union items with no tuple expansion: mirrors flatten_nested_unions.
+fn expand_union_items(typ: &Type, strict_optional: bool) -> Vec<Type> {
+    match typ {
+        Type::UnionType { items, .. } => items
+            .iter()
+            .filter(|item| strict_optional || !matches!(item, Type::NoneType))
+            .flat_map(|item| expand_item(item, strict_optional))
             .collect(),
         _ => vec![typ.clone()],
     }
@@ -529,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn handler_union_nested_tuples_flatten() {
+    fn handler_union_nested_tuples_kept() {
         let inner = Type::TupleType {
             partial_fallback: Box::new(instance("builtins.tuple")),
             items: vec![instance("builtins.KeyError")],
@@ -537,8 +568,30 @@ mod tests {
         };
         let t = Type::TupleType {
             partial_fallback: Box::new(instance("builtins.tuple")),
-            items: vec![instance("builtins.ValueError"), inner],
+            items: vec![instance("builtins.ValueError"), inner.clone()],
             implicit: false,
+        };
+        let types = try_handler_union_inner(&t, true);
+        // Nested tuples are kept as tuples (invalid exception types) to
+        // match make_simplified_union, which only flattens UnionType items.
+        assert_eq!(types, vec![instance("builtins.ValueError"), inner]);
+    }
+
+    #[test]
+    fn handler_union_nested_tuple_inside_union_flattened() {
+        // Union[E1, Tuple[E3]]: the union branch recurses into every item, so
+        // a nested tuple is expanded to its items (testExpectWithMultipleTypes4
+        // expects Tuple[E2,E3] inside Union to become E2 | E3).
+        let inner = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![instance("builtins.KeyError")],
+            implicit: false,
+        };
+        let t = Type::UnionType {
+            items: vec![instance("builtins.ValueError"), inner],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let types = try_handler_union_inner(&t, true);
         assert_eq!(
@@ -549,15 +602,20 @@ mod tests {
             ]
         );
     }
-
     #[test]
     fn handler_union_round_trip_encode() {
+        pyo3::prepare_freethreaded_python();
         let t = instance("builtins.ValueError");
-        let blobs = rust_try_handler_union(&encode_type(&t), true)
-            .unwrap()
-            .unwrap();
-        assert_eq!(blobs.len(), 1);
-        let mut buf = ReadBuffer::new(&blobs[0]);
-        assert_eq!(read_type(&mut buf, None).unwrap(), t);
+        let mut blob = None;
+        Python::with_gil(|py| {
+            let blobs = rust_try_handler_union(py, &encode_type(&t), true)
+                .unwrap()
+                .unwrap();
+            assert_eq!(blobs.len(), 1);
+            let b: &[u8] = blobs[0].extract().unwrap();
+            let mut buf = ReadBuffer::new(b);
+            blob = Some(read_type(&mut buf, None).unwrap());
+        });
+        assert_eq!(blob.unwrap(), t);
     }
 }
