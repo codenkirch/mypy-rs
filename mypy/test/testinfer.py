@@ -1422,3 +1422,78 @@ class InferFunctionTypeArgumentsParitySuite(Suite):
         finally:
             _set_native_constraints_active(saved_constraints_active)
             _set_native_solve_active(saved_solve_active)
+
+
+@skipUnless(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL"),
+    "requires TEST_NATIVE_TYPE_KERNEL (Rust type-kernel build)",
+)
+class CheckExprScalarQueryParitySuite(Suite):
+    """Parity: scalar checkexpr query helpers native vs Python.
+
+    Toggles _native_checkexpr_active and asserts the Rust wire kernels
+    agree with the pure-Python visitors for has_ambiguous_uninhabited_
+    component and allow_fast_container_literal on fixture types. The
+    ambiguous flag round-trips through the wire (UninhabitedType.write),
+    so the ambiguous-narrowing branches are exercised on both sides.
+    """
+
+    def assert_agrees(self, t: Type | None) -> None:
+        from mypy.checkexpr import (
+            _native_checkexpr_active,
+            _set_native_checkexpr_active,
+            allow_fast_container_literal,
+            has_ambiguous_uninhabited_component,
+        )
+
+        saved_active = _native_checkexpr_active
+        try:
+            _set_native_checkexpr_active(False)
+            py_amb = has_ambiguous_uninhabited_component(t)
+            py_fast = allow_fast_container_literal(t) if t is not None else None
+            _set_native_checkexpr_active(True)
+            rust_amb = has_ambiguous_uninhabited_component(t)
+            rust_fast = allow_fast_container_literal(t) if t is not None else None
+            assert_equal(rust_amb, py_amb, f"has_ambiguous mismatch for {t}")
+            assert_equal(rust_fast, py_fast, f"allow_fast mismatch for {t}")
+        finally:
+            _set_native_checkexpr_active(saved_active)
+
+    def test_uninhabited_plain(self) -> None:
+        # TypeFixture().uninhabited is UninhabitedType() with
+        # ambiguous left at the default False.
+        self.assert_agrees(TypeFixture().uninhabited)
+
+    def test_uninhabited_ambiguous(self) -> None:
+        # TypeFixture().a_uninhabited has ambiguous=True, which the
+        # ambiguous query must surface as a hit.
+        self.assert_agrees(TypeFixture().a_uninhabited)
+
+    def test_uninhabited_in_union(self) -> None:
+        fixture = TypeFixture()
+        self.assert_agrees(
+            UnionType.make_union([fixture.a, fixture.a_uninhabited])
+        )
+
+    def test_bare_never_in_union(self) -> None:
+        fixture = TypeFixture()
+        self.assert_agrees(UnionType.make_union([fixture.a, fixture.uninhabited]))
+
+    def test_instance_no_ambiguous(self) -> None:
+        self.assert_agrees(TypeFixture().a)
+
+    def test_tuple_of_instances(self) -> None:
+        fixture = TypeFixture()
+        self.assert_agrees(TupleType([fixture.a, fixture.b], fixture.std_tuple))
+
+    def test_allow_fast_empty_tuple(self) -> None:
+        fixture = TypeFixture()
+        self.assert_agrees(TupleType([], fixture.std_tuple))
+
+    def test_allow_fast_tuple_with_union_item(self) -> None:
+        # A union item inside the tuple is not an Instance, so
+        # allow_fast_container_literal must be False.
+        fixture = TypeFixture()
+        self.assert_agrees(
+            TupleType([UnionType.make_union([fixture.a, fixture.b])], fixture.std_tuple)
+        )
