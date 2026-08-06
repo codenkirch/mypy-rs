@@ -522,6 +522,27 @@ pub(crate) fn rust_try_getting_int_literals_from_type(
     )
 }
 
+/// `#[pyfunction]` entry for `try_getting_literals_from_type` with bool
+/// target (typeops.py:1236-1256, called from dataclasses.py:897 with
+/// `target_literal_type=bool`). Returns the Python `list[bool]` of literal
+/// values (real Python bools, not 0/1: dataclasses uses the value directly
+/// as the field's default), or `None` to defer to Python.
+#[pyfunction]
+pub(crate) fn rust_try_getting_bool_literals_from_type(
+    py: Python<'_>,
+    t_bytes: &[u8],
+) -> Option<PyObject> {
+    let t = decode_type(t_bytes)?;
+    let vals = try_getting_literals(&t, "builtins.bool", LiteralKind::Bool)?;
+    Some(
+        pyo3::types::PyList::new(
+            py,
+            vals.into_iter().map(|v| v.into_pyobject(py)),
+        )
+        .into(),
+    )
+}
+
 /// The shared walk behind `try_getting_str/int_literals_from_type`
 /// (typeops.py:1211-1264). Returns the scalar literal values when every
 /// candidate is a `LiteralType` whose fallback fullname equals
@@ -561,6 +582,7 @@ fn try_getting_literals(t: &Type, target_fullname: &str, expect: LiteralKind) ->
                         // counts as an int literal.
                         Scalar::Int(if b { 1 } else { 0 })
                     }
+                    LiteralValue::Bool(b) if expect == LiteralKind::Bool => Scalar::Bool(b),
                     _ => return None,
                 };
                 out.push(s);
@@ -575,14 +597,16 @@ fn try_getting_literals(t: &Type, target_fullname: &str, expect: LiteralKind) ->
 enum LiteralKind {
     Str,
     Int,
+    Bool,
 }
 
-/// The scalar values returned by `try_getting_literals`: Python strings or
-/// ints (including bools-as-ints).
+/// The scalar values returned by `try_getting_literals`: Python strings,
+/// ints (including bools-as-ints), or bools.
 #[derive(Debug, PartialEq)]
 enum Scalar {
     Str(String),
     Int(i64),
+    Bool(bool),
 }
 
 impl Scalar {
@@ -590,6 +614,7 @@ impl Scalar {
         match self {
             Scalar::Str(s) => s.into_py(py),
             Scalar::Int(i) => i.into_py(py),
+            Scalar::Bool(b) => b.into_py(py),
         }
     }
 }
@@ -1066,6 +1091,59 @@ mod tests {
         };
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
+            None
+        );
+    }
+
+    fn lit_bool_typed(value: bool) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.bool".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            value: LiteralValue::Bool(value),
+        }
+    }
+
+    #[test]
+    fn literals_bool_kind_returns_bool() {
+        assert_eq!(
+            try_getting_literals(&lit_bool_typed(true), "builtins.bool", LiteralKind::Bool),
+            Some(vec![Scalar::Bool(true)])
+        );
+        assert_eq!(
+            try_getting_literals(&lit_bool_typed(false), "builtins.bool", LiteralKind::Bool),
+            Some(vec![Scalar::Bool(false)])
+        );
+    }
+
+    #[test]
+    fn literals_bool_kind_union_returns_all() {
+        let t = union_of(vec![lit_bool_typed(true), lit_bool_typed(false)]);
+        assert_eq!(
+            try_getting_literals(&t, "builtins.bool", LiteralKind::Bool),
+            Some(vec![Scalar::Bool(true), Scalar::Bool(false)])
+        );
+    }
+
+    #[test]
+    fn literals_bool_kind_wrong_fallback_defers() {
+        // Python requires lit.fallback.type.fullname == "builtins.bool"; an
+        // int-backed Literal[True] does not match the bool target.
+        assert_eq!(
+            try_getting_literals(&lit_bool(true), "builtins.bool", LiteralKind::Bool),
+            None
+        );
+    }
+
+    #[test]
+    fn literals_bool_kind_int_literal_defers() {
+        // Literal[1] has an int fallback: not a bool literal for the bool
+        // target.
+        assert_eq!(
+            try_getting_literals(&lit_int(1), "builtins.bool", LiteralKind::Bool),
             None
         );
     }
