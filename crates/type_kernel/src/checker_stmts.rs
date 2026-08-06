@@ -15,11 +15,17 @@
 //! statement node (the `mypy/astwire.py` wire format) and returns a
 //! structural summary string, proving the kernel reads the statement wire
 //! format that M17 statement visitors will consume.
+//!
+//! `rust_with_exit_suppresses` and `rust_try_handler_union` (M17 Phase 2,
+//! issue #208) mirror statement-visitor helpers. Both are pure structural
+//! work on the wire type alone; neither calls `make_simplified_union` (that
+//! real simplification hot path stays native via `typeops`, and re-running
+//! it here with an empty resolver would always defer).
 
 use pyo3::prelude::*;
 
 use crate::astwire::{decode_node, AstNode};
-use crate::wire::{read_type, ReadBuffer, Type};
+use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // type_requires_usage
@@ -138,6 +144,120 @@ fn summarize(node: &AstNode) -> String {
 #[pyfunction]
 pub(crate) fn rust_stmt_outcome(node_bytes: &[u8]) -> PyResult<Option<String>> {
     Ok(decode_node(node_bytes).map(|n| summarize(&n)))
+}
+
+// ---------------------------------------------------------------------------
+// rust_with_exit_suppresses (M17 Phase 2, issue #208)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checker.visit_with_stmt` exit-suppression heuristic.
+///
+/// Mirrors checker.py:6020-6031. The Python side calls `get_proper_type`
+/// first and then `is_literal_type`, whose fallback unwraps an
+/// `Instance.last_known_value` into the underlying `LiteralType`. A
+/// `TypeAliasType` on the wire therefore defers (mirroring Python's
+/// `get_proper_type`); the alias is never conflated with a bare non-bool
+/// instance. Returns `Ok(false)` (not suppressed) whenever the native
+/// path cannot establish suppression, matching Python's default.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_with_exit_suppresses(
+    type_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<bool> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(false),
+    };
+    Ok(with_exit_suppresses_inner(&typ, strict_optional))
+}
+
+fn with_exit_suppresses_inner(typ: &Type, strict_optional: bool) -> bool {
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return false;
+    }
+    let typ = match typ {
+        Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } => lkv.as_ref(),
+        other => other,
+    };
+    match typ {
+        Type::LiteralType { fallback, value } => {
+            matches!(
+                (&**fallback, value),
+                (
+                    Type::Instance { type_ref, .. },
+                    LiteralValue::Bool(true),
+                ) if type_ref == "builtins.bool"
+            )
+        }
+        Type::Instance {
+            type_ref,
+            last_known_value: None,
+            ..
+        } => type_ref == "builtins.bool" && strict_optional,
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rust_try_handler_union (M17 Phase 2, issue #208)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checker.get_types_from_except_handler`: handler union classification.
+///
+/// Mirrors checker.py:5723-5744 by returning the handler types the except
+/// clause binds, but is purely structural: the union is flattened for
+/// nested tuples/variadic tuples/unions without invoking
+/// `make_simplified_union`. The caller (`check_except_handler_test`) already
+/// folds the collected types through `make_simplified_union` at the end
+/// (checker.py:5705), so parity holds. A value that is neither a tuple nor a
+/// union is returned as a single-item list. `None` means the input could not
+/// be decoded (parity-only usage serializes live types, so this signals
+/// defer).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_try_handler_union(
+    type_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let types = try_handler_union_inner(&typ, strict_optional);
+    Ok(Some(
+        types.iter().map(encode_type_owned).collect::<Vec<_>>(),
+    ))
+}
+
+fn try_handler_union_inner(typ: &Type, strict_optional: bool) -> Vec<Type> {
+    match typ {
+        Type::TupleType { items, .. } => items
+            .iter()
+            .flat_map(|item| try_handler_union_inner(item, strict_optional))
+            .collect(),
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+            let Some(item) = args.first() else {
+                return Vec::new();
+            };
+            try_handler_union_inner(item, strict_optional)
+        }
+        Type::UnionType { items, .. } => items
+            .iter()
+            .filter(|item| strict_optional || !matches!(item, Type::NoneType))
+            .flat_map(|item| try_handler_union_inner(item, strict_optional))
+            .collect(),
+        _ => vec![typ.clone()],
+    }
+}
+
+fn encode_type_owned(t: &Type) -> Vec<u8> {
+    let mut buf = WriteBuffer::new();
+    write_type(&mut buf, t).expect("write type");
+    buf.into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -277,5 +397,167 @@ mod tests {
             rust_stmt_outcome(&encode_node(&node)).unwrap(),
             Some("OTHER[]".to_string())
         );
+    }
+
+    // -- rust_with_exit_suppresses --
+
+    fn bool_literal(value: bool) -> Type {
+        let fallback = instance("builtins.bool");
+        Type::LiteralType {
+            fallback: Box::new(fallback),
+            value: LiteralValue::Bool(value),
+        }
+    }
+
+    fn bool_instance() -> Type {
+        instance("builtins.bool")
+    }
+
+    #[test]
+    fn exit_suppresses_literal_true() {
+        let t = bool_literal(true);
+        assert!(with_exit_suppresses_inner(&t, true));
+        assert!(with_exit_suppresses_inner(&t, false));
+    }
+
+    #[test]
+    fn exit_suppresses_literal_false() {
+        let t = bool_literal(false);
+        assert!(!with_exit_suppresses_inner(&t, true));
+    }
+
+    #[test]
+    fn exit_suppresses_plain_bool_strict() {
+        let t = bool_instance();
+        assert!(with_exit_suppresses_inner(&t, true));
+        assert!(!with_exit_suppresses_inner(&t, false));
+    }
+
+    #[test]
+    fn exit_suppresses_non_bool_instance() {
+        let t = instance("builtins.str");
+        assert!(!with_exit_suppresses_inner(&t, true));
+    }
+
+    #[test]
+    fn exit_suppresses_literal_non_bool_fallback() {
+        let t = Type::LiteralType {
+            fallback: Box::new(instance("builtins.str")),
+            value: LiteralValue::Str("x".to_string()),
+        };
+        assert!(!with_exit_suppresses_inner(&t, true));
+    }
+
+    #[test]
+    fn exit_suppresses_lkv_wrapped_bool_instance() {
+        let t = Type::Instance {
+            type_ref: "builtins.bool".to_string(),
+            args: Vec::new(),
+            last_known_value: Some(Box::new(bool_literal(true))),
+            extra_attrs: None,
+        };
+        assert!(with_exit_suppresses_inner(&t, true));
+    }
+
+    #[test]
+    fn exit_suppresses_garbage_bytes_false() {
+        assert!(!rust_with_exit_suppresses(b"\xff\xff", true).unwrap());
+    }
+
+    // -- rust_try_handler_union --
+
+    #[test]
+    fn handler_union_leaf() {
+        let t = instance("builtins.ValueError");
+        let types = try_handler_union_inner(&t, true);
+        assert_eq!(types, vec![t]);
+    }
+
+    #[test]
+    fn handler_union_plain_tuple() {
+        let t = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![
+                instance("builtins.ValueError"),
+                instance("builtins.KeyError"),
+            ],
+            implicit: false,
+        };
+        let types = try_handler_union_inner(&t, true);
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn handler_union_variadic_tuple() {
+        let t = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![instance("builtins.ValueError")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let types = try_handler_union_inner(&t, true);
+        assert_eq!(types, vec![instance("builtins.ValueError")]);
+    }
+
+    #[test]
+    fn handler_union_flat_union_items() {
+        let t = Type::UnionType {
+            items: vec![
+                instance("builtins.ValueError"),
+                instance("builtins.KeyError"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let types = try_handler_union_inner(&t, true);
+        assert_eq!(types.len(), 2);
+    }
+
+    #[test]
+    fn handler_union_strict_optional_filters_none() {
+        let t = Type::UnionType {
+            items: vec![instance("builtins.ValueError"), Type::NoneType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let types_strict = try_handler_union_inner(&t, true);
+        assert_eq!(types_strict.len(), 2);
+        let types_non_strict = try_handler_union_inner(&t, false);
+        assert_eq!(types_non_strict.len(), 1);
+    }
+
+    #[test]
+    fn handler_union_nested_tuples_flatten() {
+        let inner = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![instance("builtins.KeyError")],
+            implicit: false,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![instance("builtins.ValueError"), inner],
+            implicit: false,
+        };
+        let types = try_handler_union_inner(&t, true);
+        assert_eq!(
+            types,
+            vec![
+                instance("builtins.ValueError"),
+                instance("builtins.KeyError")
+            ]
+        );
+    }
+
+    #[test]
+    fn handler_union_round_trip_encode() {
+        let t = instance("builtins.ValueError");
+        let blobs = rust_try_handler_union(&encode_type(&t), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blobs.len(), 1);
+        let mut buf = ReadBuffer::new(&blobs[0]);
+        assert_eq!(read_type(&mut buf, None).unwrap(), t);
     }
 }

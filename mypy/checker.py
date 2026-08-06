@@ -324,6 +324,8 @@ try:
         rust_type_requires_usage as _rust_type_requires_usage,
         rust_is_unreachable_map as _rust_is_unreachable_map,
         rust_stmt_outcome as _rust_stmt_outcome,
+        rust_with_exit_suppresses as _rust_with_exit_suppresses,
+        rust_try_handler_union as _rust_try_handler_union,
     )
 
     from mypy.astwire import serialize_node as _checker_serialize_node
@@ -342,6 +344,8 @@ except ImportError:
     _rust_type_requires_usage = None  # type: ignore[assignment]
     _rust_is_unreachable_map = None  # type: ignore[assignment]
     _rust_stmt_outcome = None  # type: ignore[assignment]
+    _rust_with_exit_suppresses = None  # type: ignore[assignment]
+    _rust_try_handler_union = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
     _CheckerStmtWriteBuffer = None  # type: ignore[misc, assignment]
     _CheckerReadBuffer = None  # type: ignore[assignment]
@@ -413,6 +417,40 @@ def _try_native_stmt_outcome(s: Statement) -> str | None:
         _checker_serialize_node(s, buf)
         return _rust_stmt_outcome(buf.getvalue())
     except (AssertionError, NotImplementedError, ValueError, TypeError):
+        return None
+
+
+def _try_native_with_exit_suppresses(exit_ret_type: Type) -> bool | None:
+    """Native fast path for visit_with_stmt exit suppression (parity-only).
+
+    Mirrors checker.py:6020-6031. Called after get_proper_type; returns True
+    when the context manager __exit__ returns Literal[True], False otherwise.
+    """
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        return _rust_with_exit_suppresses(
+            _serialize_type_for_checker(exit_ret_type), state.strict_optional
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_try_handler_union(typ: Type) -> list[bytes] | None:
+    """Native fast path for get_types_from_except_handler (parity-only).
+
+    Mirrors checker.py:5723-5744 by returning the handler types the except
+    clause binds, flattened without make_simplified_union. The caller folds
+    the result through make_simplified_union at the end (checker.py:5705),
+    so parity holds. Returns None to defer to the pure-Python path.
+    """
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        return _rust_try_handler_union(
+            _serialize_type_for_checker(typ), state.strict_optional
+        )
+    except (AssertionError, NotImplementedError, ValueError):
         return None
 
 
@@ -5723,6 +5761,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def get_types_from_except_handler(self, typ: Type, n: Expression) -> list[Type]:
         """Helper for check_except_handler_test to retrieve handler types."""
         typ = get_proper_type(typ)
+        res = _try_native_try_handler_union(typ)
+        if res is not None:
+            return [_deserialize_type_from_checker(b) for b in res]
         if isinstance(typ, TupleType):
             merged_type = make_simplified_union(typ.items)
             if isinstance(merged_type, UnionType):
@@ -6018,10 +6059,16 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # for more details.
 
             exit_ret_type = get_proper_type(exit_ret_type)
-            if is_literal_type(exit_ret_type, "builtins.bool", False):
+            res = _try_native_with_exit_suppresses(exit_ret_type)
+            if res is True:
+                # Note: if strict-optional is disabled, this bool instance
+                # could actually be an Optional[bool].
+                exceptions_maybe_suppressed = True
+            elif res is False:
                 continue
-
-            if is_literal_type(exit_ret_type, "builtins.bool", True) or (
+            elif is_literal_type(exit_ret_type, "builtins.bool", False):
+                continue
+            elif is_literal_type(exit_ret_type, "builtins.bool", True) or (
                 isinstance(exit_ret_type, Instance)
                 and exit_ret_type.type.fullname == "builtins.bool"
                 and state.strict_optional

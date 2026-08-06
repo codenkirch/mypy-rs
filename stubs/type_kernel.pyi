@@ -26,6 +26,8 @@ __all__ = [
     "rust_is_unreachable_map",
     "rust_stmt_outcome",
     "rust_type_requires_usage",
+    "rust_with_exit_suppresses",
+    "rust_try_handler_union",
 ]
 
 
@@ -42,3 +44,11 @@ def rust_is_unreachable_map(type_bytes_list: list[bytes]) -> Optional[bool]: ...
 
 
 def rust_stmt_outcome(node_bytes: bytes) -> Optional[str]: ...
+
+
+def rust_with_exit_suppresses(type_bytes: bytes, strict_optional: bool) -> Optional[bool]: ...
+
+
+def rust_try_handler_union(
+    type_bytes: bytes, strict_optional: bool
+) -> Optional[list[bytes]]: ...
