@@ -383,10 +383,11 @@ fn are_args_compatible(
     // name mismatch (`is_different` with allow_overlap=allow_partial_overlap):
     // right has a name left lacks (or a different one) → False, unless we
     // ignore pos arg names and the right arg is positional.
-    if right.name.is_some() && left.name != right.name {
-        if !ignore_pos_arg_names || right.pos.is_none() {
-            return Some(false);
-        }
+    if right.name.is_some()
+        && left.name != right.name
+        && (!ignore_pos_arg_names || right.pos.is_none())
+    {
+        return Some(false);
     }
     // position mismatch (`is_different` with allow_overlap=False): Some !=
     // None counts as a mismatch, so `right.pos != left.pos` handles a
@@ -499,8 +500,9 @@ fn are_parameters_compatible(
 
     // Phase 1c (subtypes.py:2016-2038).
     if right_star.is_some() && !trivial_vararg_suffix {
+        let right_star_pos = right_star.as_ref().and_then(|a| a.pos).unwrap_or(0);
         let right_by_position = try_synthesizing_arg_from_vararg(right_types, right_kinds, None)?;
-        let mut i = right_star.as_ref().unwrap().pos.unwrap_or(0);
+        let mut i = right_star_pos;
         while i < left_kinds.len() && kind_is_positional(left_kinds[i], false) {
             if allow_partial_overlap && kind_is_optional(left_kinds[i]) {
                 break;
