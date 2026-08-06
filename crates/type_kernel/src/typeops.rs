@@ -462,7 +462,9 @@ fn is_literal_type_like(t: &Type) -> Option<bool> {
             Some(false)
         }
         Type::TypeVarType {
-            upper_bound, values, ..
+            upper_bound,
+            values,
+            ..
         } => {
             match is_literal_type_like(upper_bound) {
                 Some(true) => return Some(true),
@@ -493,13 +495,7 @@ pub(crate) fn rust_try_getting_str_literals_from_type(
 ) -> Option<PyObject> {
     let t = decode_type(t_bytes)?;
     let vals = try_getting_literals(&t, "builtins.str", LiteralKind::Str)?;
-    Some(
-        pyo3::types::PyList::new(
-            py,
-            vals.into_iter().map(|v| v.into_pyobject(py)),
-        )
-        .into(),
-    )
+    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
 }
 
 /// `#[pyfunction]` entry for `try_getting_int_literals_from_type`
@@ -513,13 +509,7 @@ pub(crate) fn rust_try_getting_int_literals_from_type(
 ) -> Option<PyObject> {
     let t = decode_type(t_bytes)?;
     let vals = try_getting_literals(&t, "builtins.int", LiteralKind::Int)?;
-    Some(
-        pyo3::types::PyList::new(
-            py,
-            vals.into_iter().map(|v| v.into_pyobject(py)),
-        )
-        .into(),
-    )
+    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
 }
 
 /// `#[pyfunction]` entry for `try_getting_literals_from_type` with bool
@@ -534,13 +524,7 @@ pub(crate) fn rust_try_getting_bool_literals_from_type(
 ) -> Option<PyObject> {
     let t = decode_type(t_bytes)?;
     let vals = try_getting_literals(&t, "builtins.bool", LiteralKind::Bool)?;
-    Some(
-        pyo3::types::PyList::new(
-            py,
-            vals.into_iter().map(|v| v.into_pyobject(py)),
-        )
-        .into(),
-    )
+    Some(pyo3::types::PyList::new(py, vals.into_iter().map(|v| v.into_pyobject(py))).into())
 }
 
 /// `#[pyfunction]` entry for `try_getting_instance_fallback`
@@ -567,8 +551,12 @@ pub(crate) fn rust_try_expanding_sum_type_to_union(
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let t = decode_type(t_bytes)?;
-    let result =
-        try_expanding_sum_type_to_union_inner(&t, target_fullname.as_deref(), strict_optional, resolver.resolver())?;
+    let result = try_expanding_sum_type_to_union_inner(
+        &t,
+        target_fullname.as_deref(),
+        strict_optional,
+        resolver.resolver(),
+    )?;
     encode_type(&result)
 }
 
@@ -727,7 +715,9 @@ fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
         Type::CallableType { fallback, .. } => Some((**fallback).clone()),
         Type::Overloaded { items } => items.first().and_then(try_getting_instance_fallback),
         Type::TypeVarType { upper_bound, .. } => try_getting_instance_fallback(upper_bound),
-        Type::TupleType { partial_fallback, .. } => Some((**partial_fallback).clone()),
+        Type::TupleType {
+            partial_fallback, ..
+        } => Some((**partial_fallback).clone()),
         Type::TypedDictType { fallback, .. } => Some((**fallback).clone()),
         // NoneType (fast path) and AnyType have no fallback, matching Python.
         Type::NoneType | Type::AnyType { .. } => None,
@@ -743,7 +733,11 @@ fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
 ///
 /// Mirrors the Python walk exactly: one candidate (the type itself or its
 /// `last_known_value`) or the union items, each checked against the target.
-fn try_getting_literals(t: &Type, target_fullname: &str, expect: LiteralKind) -> Option<Vec<Scalar>> {
+fn try_getting_literals(
+    t: &Type,
+    target_fullname: &str,
+    expect: LiteralKind,
+) -> Option<Vec<Scalar>> {
     let candidates = match t {
         Type::Instance {
             last_known_value, ..
@@ -1056,7 +1050,10 @@ mod tests {
 
     #[test]
     fn literal_type_like_instance_is_false() {
-        assert_eq!(is_literal_type_like(&plain_instance("builtins.str")), Some(false));
+        assert_eq!(
+            is_literal_type_like(&plain_instance("builtins.str")),
+            Some(false)
+        );
     }
 
     #[test]
@@ -1233,7 +1230,11 @@ mod tests {
     #[test]
     fn literals_plain_instance_defers() {
         assert_eq!(
-            try_getting_literals(&plain_instance("builtins.str"), "builtins.str", LiteralKind::Str),
+            try_getting_literals(
+                &plain_instance("builtins.str"),
+                "builtins.str",
+                LiteralKind::Str
+            ),
             None
         );
     }
@@ -1252,7 +1253,10 @@ mod tests {
         let t = union_of(vec![lit_str("a"), lit_str("b")]);
         assert_eq!(
             try_getting_literals(&t, "builtins.str", LiteralKind::Str),
-            Some(vec![Scalar::Str("a".to_string()), Scalar::Str("b".to_string())])
+            Some(vec![
+                Scalar::Str("a".to_string()),
+                Scalar::Str("b".to_string())
+            ])
         );
     }
 
@@ -1355,10 +1359,7 @@ mod tests {
     fn instance_fallback_unwraps_literal_to_literal_fallback() {
         let lit = lit_str("hello");
         let result = try_getting_instance_fallback(&lit).unwrap();
-        assert_eq!(
-            result,
-            plain_instance("builtins.str")
-        );
+        assert_eq!(result, plain_instance("builtins.str"));
     }
 
     #[test]
@@ -1535,10 +1536,18 @@ mod tests {
     #[test]
     fn expand_sum_enum_expands_to_member_literals() {
         let color = plain_instance("tests.Color");
-        let r = resolver_with_enum(vec!["RED".to_string(), "GREEN".to_string(), "BLUE".to_string()]);
+        let r = resolver_with_enum(vec![
+            "RED".to_string(),
+            "GREEN".to_string(),
+            "BLUE".to_string(),
+        ]);
         let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
         match &result {
-            Type::UnionType { items, uses_pep604_syntax, .. } => {
+            Type::UnionType {
+                items,
+                uses_pep604_syntax,
+                ..
+            } => {
                 assert!(!uses_pep604_syntax);
                 assert_eq!(items.len(), 3);
                 assert_eq!(items[0], lit_enum(&color, "RED"));
@@ -1558,8 +1567,7 @@ mod tests {
     fn expand_sum_enum_with_no_members_returns_instance() {
         let color = plain_instance("tests.Color");
         let r = resolver_with_enum(vec![]);
-        let result =
-            try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
+        let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
         assert_eq!(result, color);
     }
 

@@ -44,6 +44,7 @@ mod applytype;
 mod argmap;
 mod astwire;
 mod cache;
+mod callable_compat;
 mod checkcall;
 mod checker_stmts;
 mod checkexpr_functions;
@@ -98,6 +99,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        callable_compat::rust_callables_compatible,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
@@ -123,11 +128,26 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_simple_literal_type, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_is_simple_literal, module)?)?;
-    module.add_function(wrap_pyfunction!(typeops::rust_is_literal_type_like, module)?)?;
-    module.add_function(wrap_pyfunction!(typeops::rust_try_getting_str_literals_from_type, module)?)?;
-    module.add_function(wrap_pyfunction!(typeops::rust_try_getting_int_literals_from_type, module)?)?;
-    module.add_function(wrap_pyfunction!(typeops::rust_try_getting_bool_literals_from_type, module)?)?;
-    module.add_function(wrap_pyfunction!(typeops::rust_try_getting_instance_fallback, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_is_literal_type_like,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_try_getting_str_literals_from_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_try_getting_int_literals_from_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_try_getting_bool_literals_from_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_try_getting_instance_fallback,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_false_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_or_false, module)?)?;

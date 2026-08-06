@@ -818,6 +818,30 @@ class SubtypeVisitor(TypeVisitor[bool]):
                 # Similarly, if one function has `TypeIs` and the other does not,
                 # they are not compatible.
                 return False
+            # Native callable-compat engine (Stage 3c/M8c). Returns None for
+            # unhandled shapes (Parameters, generics, unpack, unpacked-kwargs,
+            # resolver misses), falling through to the Python engine below.
+            if (
+                _HAS_TYPE_KERNEL
+                and _native_subtype_active
+                and _native_subtype_resolver is not None
+            ):
+                try:
+                    result = _type_kernel.rust_callables_compatible(
+                        _serialize_type(left),
+                        _serialize_type(right),
+                        self.proper_subtype,
+                        self.subtype_context.ignore_pos_arg_names,
+                        (self.options.extra_checks or self.options.strict_concatenate)
+                        if self.options
+                        else False,
+                        state.strict_optional,
+                        _native_subtype_resolver,
+                    )
+                except (AssertionError, NotImplementedError):
+                    result = None
+                if result is not None:
+                    return result
             return is_callable_compatible(
                 left,
                 right,
