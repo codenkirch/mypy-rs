@@ -38,6 +38,12 @@ from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
+from mypy.typeanal import (
+    collect_all_inner_types,
+    has_any_from_unimported_type,
+    has_explicit_any,
+    make_optional_type,
+)
 from mypy.typeops import false_only, make_simplified_union, true_only
 from mypy.types import (
     AnyType,
@@ -1721,6 +1727,7 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(meta)
         # Assert id equality is preserved across the wire, not just str().
         from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+
         from mypy.types import read_type
 
         for t in (declared, meta):
@@ -4444,3 +4451,129 @@ class NativeWireFixupSuite(Suite):
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
         assert actual is not self.fx.b
+
+    def test_has_explicit_any_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(AnyType(TypeOfAny.explicit))
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(AnyType(TypeOfAny.explicit))
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_nested_in_instance(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        t = Instance(self.fx.std_listi, [AnyType(TypeOfAny.explicit)])
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(t)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_false_for_unimported(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        t = AnyType(TypeOfAny.from_unimported_type)
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(t)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_has_explicit_any_false_for_typeddict(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
+
+        td = TypedDictType(
+            {"x": self.fx.a},
+            {"x"},
+            set(),
+            Instance(self.fx.std_listi, []),
+        )
+        _set_native_typeanal_active(False)
+        expected = has_explicit_any(td)
+        _set_native_typeanal_active(True)
+        actual = has_explicit_any(td)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_has_any_from_unimported_type_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = has_any_from_unimported_type(AnyType(TypeOfAny.from_unimported_type))
+        _set_native_typeanal_active(True)
+        actual = has_any_from_unimported_type(AnyType(TypeOfAny.from_unimported_type))
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_collect_all_inner_types_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = make_simplified_union([self.fx.b, self.fx.c])
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(t)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(t)
+        for item in actual:
+            self._assert_no_fake_info(item)
+        assert_equal(actual, expected)
+        assert_equal(actual, [self.fx.b, self.fx.c])
+
+    def test_collect_all_inner_types_instance_args(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = Instance(self.fx.std_listi, [self.fx.b])
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(t)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(t)
+        for item in actual:
+            self._assert_no_fake_info(item)
+        assert_equal(actual, expected)
+        assert_equal(actual, [self.fx.b])
+
+    def test_collect_all_inner_types_leaf_is_empty(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = collect_all_inner_types(self.fx.b)
+        _set_native_typeanal_active(True)
+        actual = collect_all_inner_types(self.fx.b)
+        assert_equal(actual, expected)
+        assert_equal(actual, [])
+
+    def test_make_optional_type_fixes_up(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = make_optional_type(self.fx.b)
+        _set_native_typeanal_active(True)
+        actual = make_optional_type(self.fx.b)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)
+        assert_equal(
+            actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}"
+        )
+
+    def test_make_optional_type_union_strips_none(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        t = make_simplified_union([self.fx.b, self.fx.c])
+        union_none = UnionType([t, NoneType()])
+        _set_native_typeanal_active(False)
+        expected = make_optional_type(union_none)
+        _set_native_typeanal_active(True)
+        actual = make_optional_type(union_none)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)
+        assert NoneType() in actual.items
+        # Optional[B|C] == B|C|None, and None is absorbed.
+        assert_equal(
+            actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}"
+        )
