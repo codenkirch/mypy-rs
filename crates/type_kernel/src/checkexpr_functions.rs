@@ -400,6 +400,47 @@ pub(crate) fn has_coroutine_decorator_inner(typ: &Type) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// is_async_def
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.is_async_def` — whether t came from a function defined
+/// using `async def`.
+///
+/// An `async def` decorated with `@typing.coroutine` (or `@asyncio.coroutine`)
+/// has return type `typing.AwaitableGenerator[...]`, which preserves the
+/// original return type as its 4th type argument. That argument is unwrapped
+/// and checked for `typing.Coroutine` (the actual `async def` return type).
+///
+/// Mirrors `is_async_def` (checkexpr.py:6900-6909). Defers on alias.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_is_async_def(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(is_async_def_inner(&typ))
+}
+
+pub(crate) fn is_async_def_inner(typ: &Type) -> Option<bool> {
+    let mut proper = get_proper_or_none(typ)?;
+    if let Type::Instance {
+        type_ref,
+        args,
+        ..
+    } = proper
+    {
+        if type_ref == "typing.AwaitableGenerator" && args.len() >= 4 {
+            proper = get_proper_or_none(&args[3])?;
+        }
+    }
+    match proper {
+        Type::Instance { type_ref, .. } => Some(type_ref == "typing.Coroutine"),
+        _ => Some(false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // is_typed_callable
 // ---------------------------------------------------------------------------
 
@@ -1094,6 +1135,70 @@ mod tests {
             has_coroutine_decorator_inner(&make_instance("builtins.int", vec![])),
             Some(false)
         );
+    }
+
+    #[test]
+    fn test_is_async_def_plain_coroutine() {
+        assert_eq!(
+            is_async_def_inner(&make_instance("typing.Coroutine", vec![])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_async_def_awaitable_generator() {
+        // AwaitableGenerator[Any, Any, Any, Coroutine] unwraps args[3].
+        let inner = make_instance("typing.Coroutine", vec![]);
+        let gen = make_instance(
+            "typing.AwaitableGenerator",
+            vec![
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                inner,
+            ],
+        );
+        assert_eq!(is_async_def_inner(&gen), Some(true));
+    }
+
+    #[test]
+    fn test_is_async_def_awaitable_generator_non_coroutine() {
+        let gen = make_instance(
+            "typing.AwaitableGenerator",
+            vec![
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                make_instance("builtins.list", vec![]),
+            ],
+        );
+        assert_eq!(is_async_def_inner(&gen), Some(false));
+    }
+
+    #[test]
+    fn test_is_async_def_awaitable_generator_few_args() {
+        let gen = make_instance(
+            "typing.AwaitableGenerator",
+            vec![make_instance("int", vec![])],
+        );
+        assert_eq!(is_async_def_inner(&gen), Some(false));
+    }
+
+    #[test]
+    fn test_is_async_def_false_non_coroutine() {
+        assert_eq!(
+            is_async_def_inner(&make_instance("builtins.int", vec![])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_async_def_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        assert_eq!(is_async_def_inner(&alias), None);
     }
 
     #[test]
