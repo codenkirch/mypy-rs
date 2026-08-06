@@ -467,15 +467,11 @@ fn are_parameters_compatible(
 
     // Phase 1b (subtypes.py:1991-2005).
     for right_arg in formal_arguments(right_types, right_kinds, right_names) {
-        let left_arg = match callable_corresponding_argument(
-            left_types,
-            left_kinds,
-            left_names,
-            &right_arg,
-        ) {
-            Err(Defer) => return None,
-            Ok(x) => x,
-        };
+        let left_arg =
+            match callable_corresponding_argument(left_types, left_kinds, left_names, &right_arg) {
+                Err(Defer) => return None,
+                Ok(x) => x,
+            };
         let Some(left_arg) = left_arg else {
             if allow_partial_overlap && !right_arg.required {
                 continue;
@@ -595,7 +591,9 @@ fn are_parameters_compatible(
 fn any_unpack_anywhere(t: &Type) -> bool {
     match t {
         Type::CallableType {
-            arg_types, ret_type, ..
+            arg_types,
+            ret_type,
+            ..
         } => {
             arg_types
                 .iter()
@@ -613,7 +611,10 @@ fn any_unpack_anywhere(t: &Type) -> bool {
 /// We can only see the fallback as an `Instance` type_ref; when the resolver
 /// cannot resolve it, return `None` (unknown → defer).
 fn is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
-    let Type::CallableType { fallback, ret_type, .. } = t else {
+    let Type::CallableType {
+        fallback, ret_type, ..
+    } = t
+    else {
         return None;
     };
     let Type::Instance { type_ref, .. } = &**fallback else {
@@ -623,11 +624,7 @@ fn is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
     if is_uninhabited_proper(ret_type) {
         return Some(false);
     }
-    Some(
-        info.has_base("builtins.type")
-            || info.fullname == "abc.ABCMeta"
-            || info.fallback_to_any,
-    )
+    Some(info.has_base("builtins.type") || info.fullname == "abc.ABCMeta" || info.fallback_to_any)
 }
 
 fn is_uninhabited_proper(t: &Type) -> bool {
@@ -688,9 +685,8 @@ pub(crate) fn rust_callables_compatible(
         return None;
     }
 
-    let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> = &|l, r| {
-        crate::subtypes::is_subtype(l, r, &ctx, res)
-    };
+    let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> =
+        &|l, r| crate::subtypes::is_subtype(l, r, &ctx, res);
 
     is_callable_compatible(
         &left,
@@ -749,7 +745,8 @@ fn is_callable_compatible(
     // check_args_covariantly=False, so is_compat stays contravariant.
 
     // strict_concatenate_check (subtypes.py:1872-1875).
-    let strict_concatenate_check = strict_concatenate || !(lf.from_concatenate || rf.from_concatenate);
+    let strict_concatenate_check =
+        strict_concatenate || !(lf.from_concatenate || rf.from_concatenate);
 
     // is_ellipsis_args on the right is read inside are_parameters_compatible.
     are_parameters_compatible(
