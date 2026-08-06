@@ -17,6 +17,10 @@ module and re-applies the patch before any test runs.
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from typing import Any
+
+import pytest
 
 from mypy.build import BuildManager
 
@@ -36,19 +40,14 @@ def _install_native_resolvers_patch() -> None:
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
                 raise
             return
-        from mypy.join import (
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
+        from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.subtypes import _set_native_subtype_resolver
 
         type_infos = self._collect_type_infos()
         resolver = _type_kernel.build_native_resolver(type_infos, [])
         _set_native_subtype_resolver(resolver)
         _set_native_join_resolver(resolver)
-        _set_native_join_typeinfo_map(
-            {info.fullname: info for info in type_infos}
-        )
+        _set_native_join_typeinfo_map({info.fullname: info for info in type_infos})
 
         try:
             from mypy.constraints import _set_native_constraints_active
@@ -80,9 +79,7 @@ def _install_native_resolvers_patch() -> None:
         try:
             from mypy.mro import _set_native_mro_resolver
 
-            _set_native_mro_resolver(
-                resolver, {info.fullname: info for info in type_infos}
-            )
+            _set_native_mro_resolver(resolver, {info.fullname: info for info in type_infos})
         except ImportError:
             pass
 
@@ -191,3 +188,46 @@ if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_RESOLVERS") and os.environ.get(
     "TEST_NATIVE_TYPE_KERNEL"
 ):
     _install_native_resolvers_patch()
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_sessionstart(session: Any) -> None:
+    """Fail loudly when the installed type_kernel extension is stale.
+
+    The editable install's `type_kernel.abi3.so` silently goes stale when
+    `crates/type_kernel/src/**` changes but the build step is skipped,
+    producing confusing type errors and 'De-serialization failure' crashes
+    that look like code bugs (issue #228). Compare the installed binary's
+    mtime against the newest source file; on mismatch fail with the exact
+    rebuild command instead of running tests against a stale kernel.
+
+    Only active when `TEST_NATIVE_TYPE_KERNEL` is set (the parity runs).
+    No-op when the source tree is absent (e.g. installed wheel without the
+    Rust source) — there is nothing to compare against.
+    """
+    if not os.environ.get("TEST_NATIVE_TYPE_KERNEL"):
+        return
+    try:
+        import type_kernel
+    except ImportError:
+        return
+    kernel_root = Path(__file__).resolve().parents[2] / "crates" / "type_kernel"
+    src_dir = kernel_root / "src"
+    # Installed wheel without the Rust source tree: nothing to compare.
+    if not src_dir.is_dir():
+        return
+    installed = Path(type_kernel.__file__).parent / "type_kernel.abi3.so"
+    if not installed.exists():
+        return
+    newest_source = max(
+        (p.stat().st_mtime for p in src_dir.rglob("*.rs") if p.is_file()), default=0
+    )
+    if installed.stat().st_mtime < newest_source:
+        raise RuntimeError(
+            "Installed type_kernel extension is stale (built before "
+            f"{src_dir}/** changed). Rebuild:\n"
+            "  cargo rustc -p mypy-type-kernel --features extension-module --lib "
+            "--crate-type cdylib --release "
+            "-- -C link-arg=-undefined -C link-arg=dynamic_lookup\n"
+            f"  cp target/release/libtype_kernel.dylib {installed}"
+        )
