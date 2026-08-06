@@ -8337,6 +8337,24 @@ def remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None
         del names[name]
 
 
+def _clear_instance_cache_after_read() -> None:
+    """After a wire read_type, drop NOT_READY singletons from instance_cache.
+
+    read_type fills int/str/bool/object/function singletons so it can
+    represent them before any TypeInfo exists. A freshly-read singleton
+    still carries a type_ref; one already fixed by fix_cross_refs has a
+    None type_ref. Voiding only the unresolved ones prevents poisoned
+    singletons leaking into later named_type lookups without clobbering
+    already-fixed singletons.
+    """
+    from mypy.types import instance_cache
+
+    for attr in ("int_type", "str_type", "bool_type", "object_type", "function_type"):
+        s = getattr(instance_cache, attr)
+        if s is not None and s.type_ref is not None:
+            setattr(instance_cache, attr, None)
+
+
 def make_any_non_explicit(t: Type) -> Type:
     """Replace all Any types within in with Any that has attribute 'explicit' set to False"""
     if _SEMANAL_HAS_KERNEL and _native_semanal_active:
@@ -8346,6 +8364,7 @@ def make_any_non_explicit(t: Type) -> Type:
             if result is not None:
                 buf = _SemanalReadBuffer(bytes(result))
                 decoded = fixup_wire_type(_semanal_read_type(buf))
+                _clear_instance_cache_after_read()
                 if decoded is not None:
                     return decoded
         except (AssertionError, NotImplementedError):
@@ -8372,6 +8391,7 @@ def make_any_non_unimported(t: Type) -> Type:
             if result is not None:
                 buf = _SemanalReadBuffer(bytes(result))
                 decoded = fixup_wire_type(_semanal_read_type(buf))
+                _clear_instance_cache_after_read()
                 if decoded is not None:
                     return decoded
         except (AssertionError, NotImplementedError):
