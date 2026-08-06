@@ -543,6 +543,50 @@ pub(crate) fn rust_try_getting_bool_literals_from_type(
     )
 }
 
+/// `#[pyfunction]` entry for `try_getting_instance_fallback`
+/// (typeops.py:1525-1539). Returns the Instance fallback for the type when
+/// one exists, encoded as wire bytes, or `None` to defer to Python.
+#[pyfunction]
+pub(crate) fn rust_try_getting_instance_fallback(t_bytes: &[u8]) -> Option<Vec<u8>> {
+    let t = decode_type(t_bytes)?;
+    let fallback = try_getting_instance_fallback(&t)?;
+    encode_type(&fallback)
+}
+
+/// `mypy.typeops.try_getting_instance_fallback` — the Instance fallback for
+/// a proper type, or `None` if it has no such fallback.
+///
+/// Mirrors typeops.py:1525-1539:
+/// ```
+/// t = get_proper_type(t)
+/// if isinstance(t, Instance): return t
+/// elif isinstance(t, LiteralType): return t.fallback
+/// elif isinstance(t, (NoneType, AnyType)): return None
+/// elif isinstance(t, FunctionLike): return t.fallback
+/// elif isinstance(t, TypeVarType): return try_getting_instance_fallback(t.upper_bound)
+/// elif isinstance(t, TupleType): return t.partial_fallback
+/// elif isinstance(t, TypedDictType): return t.fallback
+/// else: return None
+/// ```
+/// `Overloaded.fallback` is `items[0].fallback` (types.py:2758), so the
+/// Overloaded arm recurses through the first item. A TypeAliasType can't be
+/// resolved here (no target in the wire form), so it returns `None` and the
+/// caller defers to Python.
+fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
+    match t {
+        Type::Instance { .. } => Some(t.clone()),
+        Type::LiteralType { fallback, .. } => Some((**fallback).clone()),
+        Type::CallableType { fallback, .. } => Some((**fallback).clone()),
+        Type::Overloaded { items } => items.first().and_then(try_getting_instance_fallback),
+        Type::TypeVarType { upper_bound, .. } => try_getting_instance_fallback(upper_bound),
+        Type::TupleType { partial_fallback, .. } => Some((**partial_fallback).clone()),
+        Type::TypedDictType { fallback, .. } => Some((**fallback).clone()),
+        // NoneType (fast path) and AnyType have no fallback, matching Python.
+        Type::NoneType | Type::AnyType { .. } => None,
+        _ => None,
+    }
+}
+
 /// The shared walk behind `try_getting_str/int_literals_from_type`
 /// (typeops.py:1211-1264). Returns the scalar literal values when every
 /// candidate is a `LiteralType` whose fallback fullname equals
@@ -1146,5 +1190,170 @@ mod tests {
             try_getting_literals(&lit_int(1), "builtins.bool", LiteralKind::Bool),
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // try_getting_instance_fallback
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn instance_fallback_returns_instance_itself() {
+        let inst = plain_instance("builtins.int");
+        assert_eq!(try_getting_instance_fallback(&inst), Some(inst.clone()));
+    }
+
+    #[test]
+    fn instance_fallback_unwraps_literal_to_literal_fallback() {
+        let lit = lit_str("hello");
+        let result = try_getting_instance_fallback(&lit).unwrap();
+        assert_eq!(
+            result,
+            plain_instance("builtins.str")
+        );
+    }
+
+    #[test]
+    fn instance_fallback_none_type_defers() {
+        assert_eq!(try_getting_instance_fallback(&Type::NoneType), None);
+    }
+
+    #[test]
+    fn instance_fallback_any_type_defers() {
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(try_getting_instance_fallback(&any), None);
+    }
+
+    #[test]
+    fn instance_fallback_typevar_recurses_upper_bound() {
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "test".to_string(),
+            values: vec![],
+            upper_bound: Box::new(plain_instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 1,
+            meta_level: 1,
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&tv),
+            Some(plain_instance("builtins.object"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_typevar_none_upper_bound_defers() {
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "test".to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::NoneType),
+            default: Box::new(Type::NoneType),
+            variance: 1,
+            meta_level: 1,
+        };
+        assert_eq!(try_getting_instance_fallback(&tv), None);
+    }
+
+    #[test]
+    fn instance_fallback_tuple_uses_partial_fallback() {
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(plain_instance("builtins.tuple")),
+            items: vec![],
+            implicit: true,
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&tup),
+            Some(plain_instance("builtins.tuple"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_typeddict_uses_fallback() {
+        let td = Type::TypedDictType {
+            fallback: Box::new(plain_instance("builtins.dict")),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: true,
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&td),
+            Some(plain_instance("builtins.dict"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_callable_uses_fallback() {
+        let callable = Type::CallableType {
+            fallback: Box::new(plain_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&callable),
+            Some(plain_instance("builtins.function"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_overloaded_uses_first_item() {
+        let overloaded = Type::Overloaded {
+            items: vec![Type::CallableType {
+                fallback: Box::new(plain_instance("builtins.function")),
+                instance_type: None,
+                is_ellipsis_args: false,
+                implicit: false,
+                is_bound: false,
+                from_concatenate: false,
+                imprecise_arg_kinds: false,
+                unpack_kwargs: false,
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                ret_type: Box::new(Type::NoneType),
+                name: None,
+                variables: vec![],
+                type_guard: None,
+                type_is: None,
+            }],
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&overloaded),
+            Some(plain_instance("builtins.function"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_alias_defers() {
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert_eq!(try_getting_instance_fallback(&alias), None);
     }
 }
