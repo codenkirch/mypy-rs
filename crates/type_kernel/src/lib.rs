@@ -125,6 +125,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(typeops::rust_is_literal_type_like, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_try_getting_str_literals_from_type, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_try_getting_int_literals_from_type, module)?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_try_getting_bool_literals_from_type, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_false_only, module)?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_true_or_false, module)?)?;

@@ -1234,6 +1234,20 @@ def try_getting_literals_from_type(
     target type, returns a list of those underlying values. Otherwise,
     returns None.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and target_literal_type is bool
+        and target_fullname == "builtins.bool"
+    ):
+        try:
+            result = _type_kernel.rust_try_getting_bool_literals_from_type(
+                _serialize_type(typ)
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     typ = get_proper_type(typ)
 
     if isinstance(typ, Instance) and typ.last_known_value is not None:
