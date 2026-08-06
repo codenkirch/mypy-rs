@@ -232,6 +232,7 @@ try:
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_is_async_def as _rust_is_async_def,
+        rust_is_duplicate_mapping as _rust_is_duplicate_mapping,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
@@ -250,6 +251,7 @@ except ImportError:
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
+    _rust_is_duplicate_mapping = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
@@ -6947,6 +6949,18 @@ def is_non_empty_tuple(t: Type) -> bool:
 def is_duplicate_mapping(
     mapping: list[int], actual_types: list[Type], actual_kinds: list[ArgKind]
 ) -> bool:
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = [
+                _serialize_type_for_checkexpr(actual_types[m]) for m in mapping
+            ]
+            result = _rust_is_duplicate_mapping(
+                mapping, type_bytes, [int(k.value) for k in actual_kinds]
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return (
         len(mapping) > 1
         # Multiple actuals can map to the same formal if they both come from

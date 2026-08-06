@@ -200,6 +200,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_is_duplicate_mapping,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_is_typed_callable,
         module
     )?)?;
