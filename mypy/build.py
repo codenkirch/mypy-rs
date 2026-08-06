@@ -950,11 +950,12 @@ class BuildManager:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(self.options.native_type_kernel)
-        # Stage 15 semanal helpers DISABLED. Wirefixup protection in place,
-        # but deferred pending typeops parity confirmation. See #156.
+        # Stage 15 semanal helpers. Wirefixup protection in place; enabled
+        # once typeops parity confirmed (typeops/semanal truthiness parity
+        # reached via #224, residual recursive-alias gap fixed via #225/#231).
         from mypy.semanal import _set_native_semanal_active
 
-        _set_native_semanal_active(False)
+        _set_native_semanal_active(self.options.native_type_kernel)
         # Stage 4c erase_typevars. Wirefixup resolves type_ref strings.
         # Truthiness flags on UnionType round-trip loss-free since the
         # wire fix (#201); parity verified 8198/0 with the gate on.
