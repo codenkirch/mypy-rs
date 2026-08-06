@@ -321,8 +321,13 @@ try:
         rust_is_typed_callable as _rust_is_typed_callable,
         rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
+        rust_type_requires_usage as _rust_type_requires_usage,
+        rust_is_unreachable_map as _rust_is_unreachable_map,
+        rust_stmt_outcome as _rust_stmt_outcome,
     )
 
+    from mypy.astwire import serialize_node as _checker_serialize_node
+    from mypy.cache import WriteBuffer as _CheckerStmtWriteBuffer
     from mypy.types import read_type as _checker_read_type
 
     _CHECKER_HAS_TYPE_KERNEL = True
@@ -334,6 +339,11 @@ except ImportError:
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
+    _rust_type_requires_usage = None  # type: ignore[assignment]
+    _rust_is_unreachable_map = None  # type: ignore[assignment]
+    _rust_stmt_outcome = None  # type: ignore[assignment]
+    _checker_serialize_node = None  # type: ignore[assignment]
+    _CheckerStmtWriteBuffer = None  # type: ignore[misc, assignment]
     _CheckerReadBuffer = None  # type: ignore[assignment]
     _CheckerWriteBuffer = None  # type: ignore[assignment]
     _checker_read_type = None  # type: ignore[assignment]
@@ -341,6 +351,7 @@ except ImportError:
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
+_native_checker_stmts_active: bool = False
 
 
 def _set_native_checker_active(active: bool) -> None:
@@ -353,6 +364,56 @@ def _set_native_checker_types_active(active: bool) -> None:
     """Enable type-returning checker functions (parity-only)."""
     global _native_checker_types_active
     _native_checker_types_active = active
+
+
+def _set_native_checker_stmts_active(active: bool) -> None:
+    """Enable statement-helper checker functions (M17, parity-only)."""
+    global _native_checker_stmts_active
+    _native_checker_stmts_active = active
+
+
+def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
+    """Native fast path for type_requires_usage (parity-only).
+
+    Returns the note/code for the typing.Coroutine branch, or None to
+    defer to the pure-Python implementation.
+    """
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        if _rust_type_requires_usage(_serialize_type_for_checker(typ)) == 0:
+            return ("Are you missing an await?", UNUSED_COROUTINE)
+    except (AssertionError, NotImplementedError, ValueError):
+        pass
+    return None
+
+
+def _try_native_is_unreachable_map(map: TypeMap) -> bool | None:
+    """Native fast path for is_unreachable_map (parity-only)."""
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        blobs = [_serialize_type_for_checker(v) for v in map.values()]
+        return _rust_is_unreachable_map(blobs)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_stmt_outcome(s: Statement) -> str | None:
+    """Statement-wire parity oracle (M17). Parity-only.
+
+    Serializes a statement through mypy/astwire.py and reads back the
+    kernel's structural summary. Returns None when the native path is
+    disabled or a node cannot be serialized.
+    """
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        buf = _CheckerStmtWriteBuffer()
+        _checker_serialize_node(s, buf)
+        return _rust_stmt_outcome(buf.getvalue())
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
+        return None
 
 
 def _serialize_type_for_checker(t: Type) -> bytes:
@@ -5226,6 +5287,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         In the case that it does require usage, returns a note to attach
         to the error message.
         """
+        note_and_code = _try_native_type_requires_usage(typ)
+        if note_and_code is not None:
+            return note_and_code
         proper_type = get_proper_type(typ)
         if isinstance(proper_type, Instance):
             # We use different error codes for generic awaitable vs coroutine.
@@ -8972,6 +9036,9 @@ def builtin_item_type(tp: Type) -> Type | None:
 
 
 def is_unreachable_map(map: TypeMap) -> bool:
+    res = _try_native_is_unreachable_map(map)
+    if res is not None:
+        return res
     return any(isinstance(get_proper_type(v), UninhabitedType) for v in map.values())
 
 

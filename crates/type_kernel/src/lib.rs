@@ -45,6 +45,7 @@ mod argmap;
 mod astwire;
 mod cache;
 mod checkcall;
+mod checker_stmts;
 mod checkexpr_functions;
 mod checkstrformat;
 mod constraints;
@@ -234,6 +235,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkcall::rust_normalize_callable,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_type_requires_usage,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_is_unreachable_map,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checker_stmts::rust_stmt_outcome, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(
