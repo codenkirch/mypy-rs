@@ -4403,6 +4403,25 @@ class NativeWireFixupSuite(Suite):
         assert isinstance(actual, AnyType)
         assert actual.type_of_any == TypeOfAny.special_form
 
+    def test_replace_implicit_first_type_fixes_up(self) -> None:
+        from mypy.semanal import _set_native_semanal_active, replace_implicit_first_type
+
+        sig = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        _set_native_semanal_active(False)
+        expected = replace_implicit_first_type(sig, self.fx.o)
+        _set_native_semanal_active(True)
+        actual = replace_implicit_first_type(sig, self.fx.o)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, CallableType)
+        assert_equal(actual.arg_types, [self.fx.o, self.fx.b])
+
     def test_erase_typevars_fixes_up_typevars_in_instance(self) -> None:
         from mypy.erasetype import _set_native_erase_typevars_active, erase_typevars
 

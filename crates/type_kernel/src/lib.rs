@@ -298,6 +298,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_algebra::rust_make_any_non_unimported,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_algebra::rust_replace_implicit_first_type,
+        module
+    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     Ok(())

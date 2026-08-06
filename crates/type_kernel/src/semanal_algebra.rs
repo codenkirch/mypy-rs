@@ -142,6 +142,115 @@ fn make_any_non_unimported_inner(t: Type) -> Type {
 }
 
 // ---------------------------------------------------------------------------
+// replace_implicit_first_type
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.replace_implicit_first_type` — replace the first (implicit
+/// self/cls) argument type of a `FunctionLike` with `new`.
+///
+/// Mirrors semanal.py:8281-8291. A `CallableType` with no argument types is
+/// returned as-is; otherwise `arg_types[0]` is swapped for `new` and all
+/// other fields are preserved (the Python `copy_modified(arg_types=...)`).
+/// An `Overloaded` recurses into each item (each must be a `CallableType`).
+/// Returns `None` for any input that is not a `CallableType`/`Overloaded`,
+/// or when an `Overloaded` item is not a `CallableType`, so the caller
+/// falls back to the pure-Python implementation.
+#[pyfunction]
+pub(crate) fn rust_replace_implicit_first_type(
+    sig_bytes: &[u8],
+    new_bytes: &[u8],
+) -> PyResult<Option<Vec<u8>>> {
+    let sig = match decode_type(sig_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let new = match decode_type(new_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    match replace_implicit_first_type_inner(sig, &new) {
+        Some(result) => Ok(encode_type(&result)),
+        None => Ok(None),
+    }
+}
+
+fn replace_implicit_first_type_inner(sig: Type, new: &Type) -> Option<Type> {
+    match sig {
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => Some(if arg_types.is_empty() {
+            Type::CallableType {
+                fallback,
+                instance_type,
+                is_ellipsis_args,
+                implicit,
+                is_bound,
+                from_concatenate,
+                imprecise_arg_kinds,
+                unpack_kwargs,
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                name,
+                variables,
+                type_guard,
+                type_is,
+            }
+        } else {
+            let mut new_arg_types = Vec::with_capacity(arg_types.len());
+            new_arg_types.push(new.clone());
+            new_arg_types.extend(arg_types.into_iter().skip(1));
+            Type::CallableType {
+                fallback,
+                instance_type,
+                is_ellipsis_args,
+                implicit,
+                is_bound,
+                from_concatenate,
+                imprecise_arg_kinds,
+                unpack_kwargs,
+                arg_types: new_arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                name,
+                variables,
+                type_guard,
+                type_is,
+            }
+        }),
+        Type::Overloaded { items } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                let replaced = replace_implicit_first_type_inner(item, new)?;
+                if !matches!(replaced, Type::CallableType { .. }) {
+                    return None;
+                }
+                new_items.push(replaced);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Default identity traversal (mirrors TypeTranslator.visit_* defaults)
 // ---------------------------------------------------------------------------
 
@@ -554,5 +663,120 @@ mod tests {
         let t = Type::UninhabitedType { ambiguous: false };
         let result = transform_children(t, |x| x);
         assert!(matches!(result, Type::UninhabitedType { .. }));
+    }
+
+    fn make_callable(arg_types: Vec<Type>) -> Type {
+        Type::CallableType {
+            fallback: Box::new(make_instance(
+                "builtins.function",
+                vec![
+                    Type::AnyType {
+                        type_of_any: SPECIAL_FORM,
+                        source_any: None,
+                        missing_import_name: None,
+                    },
+                    Type::NoneType,
+                ],
+            )),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types,
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn test_replace_implicit_first_type_swaps_first_arg() {
+        let sig = make_callable(vec![make_any(EXPLICIT), make_instance("builtins.int", vec![])]);
+        let new = make_any(SPECIAL_FORM);
+        match replace_implicit_first_type_inner(sig, &new) {
+            Some(Type::CallableType { arg_types, .. }) => {
+                assert_eq!(arg_types.len(), 2);
+                match &arg_types[0] {
+                    Type::AnyType { type_of_any, .. } => assert_eq!(*type_of_any, SPECIAL_FORM),
+                    _ => panic!("expected AnyType first arg"),
+                }
+                match &arg_types[1] {
+                    Type::Instance { type_ref, .. } => {
+                        assert_eq!(type_ref, "builtins.int");
+                    }
+                    _ => panic!("expected Instance second arg"),
+                }
+            }
+            _ => panic!("expected CallableType"),
+        }
+    }
+
+    #[test]
+    fn test_replace_implicit_first_type_preserves_empty_args() {
+        let sig = make_callable(vec![]);
+        let new = make_any(SPECIAL_FORM);
+        let result = replace_implicit_first_type_inner(sig, &new).unwrap();
+        match &result {
+            Type::CallableType { arg_types, .. } if arg_types.is_empty() => {}
+            _ => panic!("expected empty-arg CallableType unchanged"),
+        }
+        // Compare serialized form to confirm arg_types stayed empty.
+        let expected = encode_bytes(&make_callable(vec![]));
+        assert_eq!(encode_bytes(&result), expected);
+    }
+
+    fn encode_bytes(t: &Type) -> Vec<u8> {
+        let mut wbuf = WriteBuffer::new();
+        write_type(&mut wbuf, t).unwrap();
+        wbuf.into_bytes()
+    }
+
+    #[test]
+    fn test_replace_implicit_first_type_recurses_overloaded() {
+        let sig = Type::Overloaded {
+            items: vec![
+                make_callable(vec![make_any(EXPLICIT)]),
+                make_callable(vec![make_any(EXPLICIT)]),
+            ],
+        };
+        let new = make_any(SPECIAL_FORM);
+        match replace_implicit_first_type_inner(sig, &new) {
+            Some(Type::Overloaded { items }) => {
+                assert_eq!(items.len(), 2);
+                for item in items {
+                    match item {
+                        Type::CallableType { arg_types, .. } => match &arg_types[0] {
+                            Type::AnyType { type_of_any, .. } => {
+                                assert_eq!(*type_of_any, SPECIAL_FORM);
+                            }
+                            _ => panic!("expected AnyType"),
+                        },
+                        _ => panic!("expected CallableType item"),
+                    }
+                }
+            }
+            _ => panic!("expected Overloaded"),
+        }
+    }
+
+    #[test]
+    fn test_replace_implicit_first_type_rejects_non_callable() {
+        assert!(replace_implicit_first_type_inner(make_any(EXPLICIT), &make_any(SPECIAL_FORM)).is_none());
+        assert!(replace_implicit_first_type_inner(Type::NoneType, &make_any(SPECIAL_FORM)).is_none());
+    }
+
+    #[test]
+    fn test_replace_implicit_first_type_rejects_bad_overload_item() {
+        let sig = Type::Overloaded {
+            items: vec![make_any(EXPLICIT)],
+        };
+        assert!(replace_implicit_first_type_inner(sig, &make_any(SPECIAL_FORM)).is_none());
     }
 }

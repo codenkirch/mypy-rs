@@ -370,15 +370,16 @@ _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 # Stage 15: native semanal_algebra seam (parity-only, default-off).
 
 # When `type_kernel` is importable and the gate is active, the pure
-# Type-transformation helpers `make_any_non_explicit` and
-# `make_any_non_unimported` route through Rust via the wire format.
-# Rust returns None for types it cannot handle (decode failure),
-# falling back to the pure-Python TrivialSyntheticTypeTranslator.
+# Type-transformation helpers `make_any_non_explicit`,
+# `make_any_non_unimported`, and `replace_implicit_first_type` route
+# through Rust via the wire format. Rust returns None for types it cannot
+# handle (decode failure), falling back to the pure-Python visitors.
 try:
     from librt.internal import ReadBuffer as _SemanalReadBuffer, WriteBuffer as _SemanalWriteBuffer
     from type_kernel import (
         rust_make_any_non_explicit as _rust_make_any_non_explicit,
         rust_make_any_non_unimported as _rust_make_any_non_unimported,
+        rust_replace_implicit_first_type as _rust_replace_implicit_first_type,
     )
 
     from mypy.types import read_type as _semanal_read_type
@@ -388,6 +389,7 @@ try:
 except ImportError:
     _rust_make_any_non_explicit = None  # type: ignore[assignment]
     _rust_make_any_non_unimported = None  # type: ignore[assignment]
+    _rust_replace_implicit_first_type = None  # type: ignore[assignment]
     _SemanalWriteBuffer = None  # type: ignore[assignment]
     _SemanalReadBuffer = None  # type: ignore[assignment]
     _semanal_read_type = None  # type: ignore[assignment]
@@ -8279,6 +8281,18 @@ class SemanticAnalyzer(
 
 
 def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
+    if _SEMANAL_HAS_KERNEL and _native_semanal_active:
+        try:
+            data = _serialize_semanal_type(sig)
+            new_data = _serialize_semanal_type(new)
+            result = _rust_replace_implicit_first_type(data, new_data)
+            if result is not None:
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(sig, CallableType):
         if len(sig.arg_types) == 0:
             return sig
