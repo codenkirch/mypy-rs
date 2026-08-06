@@ -476,6 +476,75 @@ class NativeSubtypeSuite(Suite):
         assert is_subtype(gsab, gb)
         assert not is_subtype(gsab, ga)
 
+    # Callable parameter-compat parity (Stage 3c/M8c). These mirror
+    # SubtypingSuite's callable tests; the Rust engine returns None for
+    # shapes it does not handle (Parameters, generics, unpack), so every
+    # assertion must match the pure-Python result and coverage is run
+    # with the resolver active in setUp.
+
+    # NativeSubtypeSuite extends Suite (not SubtypingSuite), so use
+    # is_subtype directly (Suite has no assert_strict_subtype).
+
+    def _strict_subtype(self, s: Type, t: Type) -> None:
+        assert is_subtype(s, t), f"{s} not subtype of {t}"
+        assert not is_subtype(t, s), f"{t} subtype of {s}"
+
+    def _unrelated(self, s: Type, t: Type) -> None:
+        assert not is_subtype(s, t), f"{s} subtype of {t}"
+        assert not is_subtype(t, s), f"{t} subtype of {s}"
+
+    def test_callable_basic_subtyping(self) -> None:
+        self._strict_subtype(
+            self.fx.callable(self.fx.o, self.fx.d), self.fx.callable(self.fx.a, self.fx.d)
+        )
+        self._strict_subtype(
+            self.fx.callable(self.fx.d, self.fx.b), self.fx.callable(self.fx.d, self.fx.a)
+        )
+        self._unrelated(
+            self.fx.callable(self.fx.a, self.fx.a, self.fx.a),
+            self.fx.callable(self.fx.a, self.fx.a),
+        )
+
+    def test_callable_default_subtyping(self) -> None:
+        self._strict_subtype(
+            self.fx.callable_default(1, self.fx.a, self.fx.d, self.fx.a),
+            self.fx.callable(self.fx.a, self.fx.d, self.fx.a),
+        )
+        self._strict_subtype(
+            self.fx.callable_default(1, self.fx.a, self.fx.d, self.fx.a),
+            self.fx.callable(self.fx.a, self.fx.a),
+        )
+        self._strict_subtype(
+            self.fx.callable_default(0, self.fx.a, self.fx.d, self.fx.a),
+            self.fx.callable_default(1, self.fx.a, self.fx.d, self.fx.a),
+        )
+        self._unrelated(
+            self.fx.callable_default(1, self.fx.a, self.fx.d, self.fx.a),
+            self.fx.callable(self.fx.d, self.fx.d, self.fx.a),
+        )
+
+    def test_callable_var_arg_subtyping(self) -> None:
+        self._strict_subtype(
+            self.fx.callable_var_arg(0, self.fx.a, self.fx.a),
+            self.fx.callable_var_arg(0, self.fx.b, self.fx.a),
+        )
+        self._strict_subtype(
+            self.fx.callable_var_arg(0, self.fx.a, self.fx.a),
+            self.fx.callable(self.fx.b, self.fx.a),
+        )
+        assert not is_subtype(
+            self.fx.callable_var_arg(0, self.fx.b, self.fx.d),
+            self.fx.callable(self.fx.a, self.fx.d),
+        )
+        assert is_subtype(
+            self.fx.callable_var_arg(0, self.fx.a, self.fx.d),
+            self.fx.callable_var_arg(0, self.fx.b, self.fx.b, self.fx.d),
+        )
+        assert not is_subtype(
+            self.fx.callable_var_arg(0, self.fx.b, self.fx.b, self.fx.d),
+            self.fx.callable_var_arg(0, self.fx.a, self.fx.d),
+        )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "Native type kernel not available")
 class NativeSubtypeGapSuite(Suite):

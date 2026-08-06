@@ -44,6 +44,7 @@ mod applytype;
 mod argmap;
 mod astwire;
 mod cache;
+mod callable_compat;
 mod checkcall;
 mod checker_stmts;
 mod checkexpr_functions;
@@ -98,6 +99,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        callable_compat::rust_callables_compatible,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
