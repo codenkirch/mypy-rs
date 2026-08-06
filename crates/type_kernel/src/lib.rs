@@ -244,6 +244,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checker_stmts::rust_stmt_outcome, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_with_exit_suppresses,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_try_handler_union,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(
