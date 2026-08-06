@@ -1,2 +1,6 @@
 # We vendor typeshed from https://github.com/python/typeshed
 mypy/typeshed/** linguist-vendored
+
+# We vendor mypyc from https://github.com/mypyc/mypyc (separate upstream project).
+# The whole subtree is upstream code: mypyc has its own repo + issue tracker.
+mypyc/** linguist-vendored
