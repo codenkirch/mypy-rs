@@ -409,6 +409,11 @@ class FindModuleCache:
         ``FindModuleCache.clear()`` flushes the resolver's derived caches on
         each fine-grained increment, and ``FileSystemCache.flush()`` flushes
         the shared FS caches, so both stay consistent within a transaction.
+
+        Bazel stays on the Python resolver: its synthetic init modules
+        (fake-init stats, see ``FileSystemCache._fake_init_py``) are
+        Python-owned and the native resolver reads through the real
+        ``FsCache``, which does not observe Bazel's virtual FS.
         """
         # The compiled `module_resolver` extension is only present on
         # interpreters where it was built; fall back to the Python resolver.

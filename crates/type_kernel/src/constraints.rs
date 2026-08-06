@@ -9,6 +9,8 @@ use crate::wire::{
     read_int, read_type, write_int, write_type, ReadBuffer, Type, WireError, WriteBuffer,
 };
 
+// Used only by the wire round-trip tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SUPERTYPE_OF: i64 = 1;
 
 /// A representation of a type constraint (T <: type or T :> type).
@@ -32,6 +34,7 @@ impl Constraint {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn read(buf: &mut ReadBuffer<'_>) -> Result<Self, WireError> {
         let origin_type_var = read_type(buf, None)?;
         let op = read_int(buf)?;

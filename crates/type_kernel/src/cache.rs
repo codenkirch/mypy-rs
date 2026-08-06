@@ -97,22 +97,6 @@ fn read_bytes_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Vec<u8>>, WireError> 
     Ok(items)
 }
 
-/// `read_str_opt_list`: `LIST_GEN` tag, bare size, N `read_str_opt`s.
-fn read_str_opt_list(buf: &mut ReadBuffer<'_>) -> Result<Vec<Option<String>>, WireError> {
-    let tag = read_tag(buf)?;
-    if tag != LIST_GEN {
-        return Err(WireError::invalid(format!(
-            "expected LIST_GEN, got tag {tag}"
-        )));
-    }
-    let size = read_int_bare(buf)?;
-    let mut items = Vec::with_capacity(size as usize);
-    for _ in 0..size {
-        items.push(read_str_opt(buf)?);
-    }
-    Ok(items)
-}
-
 /// `read_short_int`: the varint decoding inverse of `write_int_bare`. Mirrors
 /// librt_internal.c `_read_short_int` and wire.rs `read_short_int`.
 /// Delegates to the shared short-int varint reader in wire.rs (authoritative
