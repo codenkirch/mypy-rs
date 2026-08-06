@@ -284,7 +284,7 @@ fn visit_all<F: FnMut(&AstNode)>(node: &AstNode, f: &mut F) {
 mod tests {
     use super::*;
     use crate::astwire::{AstNode, ChildField, RETURN_STMT, YIELD_EXPR};
-    use crate::astwire::{ASSIGNMENT_STMT, BLOCK, INT_EXPR, MEMBER_EXPR, NAME_EXPR, STR_EXPR};
+    use crate::astwire::{BLOCK, INT_EXPR, MEMBER_EXPR, NAME_EXPR, STR_EXPR};
 
     fn make_int() -> AstNode {
         AstNode {
@@ -336,13 +336,6 @@ mod tests {
         AstNode {
             tag: BLOCK,
             children: vec![ChildField::List(stmts)],
-        }
-    }
-
-    fn make_assignment() -> AstNode {
-        AstNode {
-            tag: ASSIGNMENT_STMT,
-            children: vec![ChildField::None, ChildField::Node(make_int())],
         }
     }
 
