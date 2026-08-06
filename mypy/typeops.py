@@ -1242,6 +1242,13 @@ def is_literal_type_like(t: Type | None) -> bool:
     """Returns 'true' if the given type context is potentially either a LiteralType,
     a Union of LiteralType, or something similar.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active and t is not None:
+        try:
+            result = _type_kernel.rust_is_literal_type_like(_serialize_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     t = get_proper_type(t)
     if t is None:
         return False
