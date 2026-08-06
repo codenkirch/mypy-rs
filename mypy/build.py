@@ -1112,6 +1112,25 @@ class BuildManager:
         # Packages for which we know presence or absence of __getattr__().
         self.known_partial_packages: dict[str, bool] = {}
 
+    def _collect_aliases(self) -> list:
+        """Walk all loaded modules and collect every `TypeAlias` node.
+
+        Mirrors `_collect_type_infos` for the alias symbol table. The
+        native resolver build passes these so wire-round-trip fixup can
+        resolve recursive TypeAliasType nodes by fullname.
+        """
+        from mypy.nodes import TypeAlias
+
+        aliases: list[TypeAlias] = []
+        for module in self.modules.values():
+            if module is None:
+                continue
+            for sym in module.names.values():
+                node = sym.node
+                if isinstance(node, TypeAlias):
+                    aliases.append(node)
+        return aliases
+
     def _collect_type_infos(self) -> list:
         """Walk all loaded modules and collect every `TypeInfo` node.
 
@@ -1166,8 +1185,10 @@ class BuildManager:
         from mypy.join import _set_native_join_resolver
 
         type_infos = self._collect_type_infos()
-        resolver = _type_kernel.build_native_resolver(type_infos, [])
+        aliases = self._collect_aliases()
+        resolver = _type_kernel.build_native_resolver(type_infos, aliases)
         typeinfo_map = {info.fullname: info for info in type_infos}
+        alias_map = {a.fullname: a for a in aliases}
         # Stage 3c resolvers wired: the subtype/join kernels now defer
         # (return None) for all unsupported generic substitution edges,
         # so they cannot return wrong answers. See PR #72 for the
@@ -1179,6 +1200,13 @@ class BuildManager:
         # return a wrong answer. Wired to production.
         _set_native_mro_resolver(resolver, typeinfo_map)
         _set_native_join_typeinfo_map(typeinfo_map)
+        try:
+            from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+            set_wire_typeinfo_map(typeinfo_map)
+            set_wire_alias_map(alias_map)
+        except ImportError:
+            pass
         # Stage 3d: expand_type shares the join typeinfo_map so
         # wire-decoded type_ref strings resolve to live TypeInfo.
         # Resolver install left commented (parity-only): the port has

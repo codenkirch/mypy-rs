@@ -132,6 +132,8 @@ class _TypeRefFixer(TypeTranslator):
         super().__init__()
         self.typeinfo_map = typeinfo_map
         self.missing = False
+        # Guard against infinite recursion on self-referential aliases.
+        self._seen_aliases: set[int] = set()
 
     def visit_instance(self, t: Instance, /) -> Type:
         if t.type_ref is not None:
@@ -167,9 +169,32 @@ class _TypeRefFixer(TypeTranslator):
         return super().visit_type_type(t)
 
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        # TypeAliasType carries its own `type_ref` -> `alias` fixup,
-        # but the Rust encoder does not emit TypeAliasType today.
-        # Leave it untouched to avoid masking a missing alias.
+        # The wire encoder emits TypeAliasType with `args` + `type_ref`
+        # and a None alias (wire.rs). Recursive aliases need the live
+        # TypeAlias node AND its target fixed. Delegate to the shared
+        # wirefixup logic which holds the alias map.
+        from mypy.wirefixup import _wire_alias_map
+
+        if self.missing:
+            return t
+        args = [a.accept(self) for a in t.args]
+        if self.missing:
+            return t
+        if t.type_ref is not None and _wire_alias_map is not None:
+            alias = _wire_alias_map.get(t.type_ref)
+            if alias is None:
+                self.missing = True
+                return t
+            t.alias = alias
+        if t.alias is not None:
+            if id(t.alias) in self._seen_aliases:
+                return t
+            self._seen_aliases.add(id(t.alias))
+            target = t.alias.target.accept(self)
+            if self.missing:
+                return t
+            if target is not t.alias.target:
+                t.alias.target = target  # type: ignore[assignment]
         return t
 
 

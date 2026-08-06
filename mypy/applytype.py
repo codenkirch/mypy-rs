@@ -211,10 +211,23 @@ class _TypeRefFixer(mypy.type_visitor.TypeTranslator):
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
         if self.missing:
             return t
+        from mypy.wirefixup import fix_alias_recursive
+
         args = [a.accept(self) for a in t.args]
         if self.missing:
             return t
-        return t.copy_modified(args=args)
+        seen = getattr(self, "_seen_aliases", None)
+        if seen is None:
+            seen = set()
+            self._seen_aliases = seen
+        if t.alias is not None and id(t.alias) in seen:
+            return t
+        result = fix_alias_recursive(self, t)
+        if self.missing:
+            return t
+        if t.alias is not None:
+            seen.add(id(t.alias))
+        return result
 
 
 # Wire codec drops TypeVarId.meta_level. Collector snapshots meta_level

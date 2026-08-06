@@ -39,12 +39,20 @@ def _install_native_resolvers_patch() -> None:
         from mypy.subtypes import _set_native_subtype_resolver
 
         type_infos = self._collect_type_infos()
-        resolver = _type_kernel.build_native_resolver(type_infos, [])
+        aliases = self._collect_aliases() if hasattr(self, "_collect_aliases") else []
+        resolver = _type_kernel.build_native_resolver(type_infos, aliases)
         _set_native_subtype_resolver(resolver)
         _set_native_join_resolver(resolver)
         _set_native_join_typeinfo_map(
             {info.fullname: info for info in type_infos}
         )
+        try:
+            from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+            set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+            set_wire_alias_map({a.fullname: a for a in aliases})
+        except ImportError:
+            pass
 
         try:
             from mypy.constraints import _set_native_constraints_active

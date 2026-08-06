@@ -196,7 +196,29 @@ class _TypeRefFixer(mypy.type_visitor.TypeTranslator):
         return t.copy_modified(tuple_fallback=tuple_fallback)
 
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
-        return t
+        # The wire encoder emits TypeAliasType with `args` + `type_ref`
+        # and a None alias. Recursive aliases need the live TypeAlias
+        # node AND its target fixed; the base translator skips the
+        # target, so deferring here leaves poisoned inner Instances.
+        if self.missing:
+            return t
+        from mypy.wirefixup import fix_alias_recursive
+
+        args = [a.accept(self) for a in t.args]
+        if self.missing:
+            return t
+        seen = getattr(self, "_seen_aliases", None)
+        if seen is None:
+            seen = set()
+            self._seen_aliases = seen
+        if t.alias is not None and id(t.alias) in seen:
+            return t
+        result = fix_alias_recursive(self, t)
+        if self.missing:
+            return t
+        if t.alias is not None:
+            seen.add(id(t.alias))
+        return result
 
 
 def _fixup_decoded_type(typ: Type) -> Type | None:

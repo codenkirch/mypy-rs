@@ -123,7 +123,13 @@ def _serialize_typevar_ids(ids: Container[TypeVarId] | None) -> bytes:
 
 
 def _deserialize_type(data: bytes) -> Type:
-    return _read_type(_ReadBuffer(data))
+    raw = _read_type(_ReadBuffer(data))
+    # Repair FakeInfo on the decoded result (erase_typevars / replace_meta_vars
+    # wire seams). Falls back to the raw result when the wire map is unset.
+    from mypy.wirefixup import fixup_wire_type
+
+    fixed = fixup_wire_type(raw)
+    return raw if fixed is None else fixed
 
 
 def erase_type(typ: Type) -> ProperType:
@@ -141,7 +147,15 @@ def erase_type(typ: Type) -> ProperType:
     if _HAS_TYPE_KERNEL and _native_erase_active:
         result = _rust_erase_type(typ)
         if result is not None:
-            return result
+            # Repair FakeInfo leaked by the pyo3 read-back (shared cached
+            # Instances get their type_ref resolved in place).
+            from mypy.wirefixup import fixup_wire_type
+
+            fixed = fixup_wire_type(result)
+            if fixed is not None:
+                return fixed
+            # Couldn't fix (map unset or missing type_ref): return the
+            # raw result is unsafe (FakeInfo). Fall through to Python.
         # Rust returned None (unsupported case) — fall through to Python.
     typ = get_proper_type(typ)
     return typ.accept(EraseTypeVisitor())
@@ -349,7 +363,11 @@ def remove_instance_last_known_values(t: Type) -> Type:
     if _HAS_TYPE_KERNEL and _native_erase_active:
         result = _rust_remove_lkv(t)
         if result is not None:
-            return result
+            from mypy.wirefixup import fixup_wire_type
+
+            fixed = fixup_wire_type(result)
+            if fixed is not None:
+                return fixed
     return t.accept(LastKnownValueEraser())
 
 
