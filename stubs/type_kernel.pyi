@@ -101,6 +101,9 @@ __all__ = [
     "rust_is_typeddict_type_context",
     "rust_format_messages_default",
     "rust_infer_constraints",
+    "rust_select_trivial",
+    "rust_exclude_non_meta_vars",
+    "rust_is_similar_constraints",
     "rust_classify_call",
     "rust_normalize_callable",
     "rust_solve_one",
@@ -312,6 +315,9 @@ def rust_format_messages_default(
 def rust_infer_constraints(
     template_bytes: bytes, actual_bytes: bytes, direction: int
 ) -> list[bytes] | None: ...
+def rust_select_trivial(options_bytes: bytes) -> bytes | None: ...
+def rust_exclude_non_meta_vars(option_bytes: bytes) -> bytes | None: ...
+def rust_is_similar_constraints(x_bytes: bytes, y_bytes: bytes) -> bool | None: ...
 def rust_classify_call(callee_bytes: bytes) -> int | None: ...
 def rust_normalize_callable(callee_bytes: bytes) -> bytes | None: ...
 def rust_solve_one(

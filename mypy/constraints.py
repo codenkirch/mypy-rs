@@ -76,6 +76,81 @@ def _try_native_infer_constraints(
             raise NotImplementedError("target not wire-safe")
         constraints.append(Constraint(template, op, actual))
     return constraints
+
+
+def _write_constraint(buf: _WriteBuffer, constraint: Constraint) -> None:
+    """Serialize a single constraint: origin Type | op int | target Type.
+
+    The op carries the LITERAL_INT tag (mypy.cache.write_int), matching the
+    Rust reader in constraints_helpers.rs.
+    """
+    from mypy.cache import write_int
+
+    constraint.origin_type_var.write(buf)
+    write_int(buf, constraint.op)
+    constraint.target.write(buf)
+
+
+def _write_option(buf: _WriteBuffer, option: list[Constraint]) -> None:
+    """Serialize one option: count (bare int) + N× constraint."""
+    from mypy.cache import write_int_bare
+
+    write_int_bare(buf, len(option))
+    for constraint in option:
+        _write_constraint(buf, constraint)
+
+
+def _read_index_list(raw: bytes) -> list[int]:
+    """Read a bare-int index list: count + N× index."""
+    from mypy.cache import read_int_bare
+
+    data = _ReadBuffer(raw)
+    count = read_int_bare(data)
+    return [read_int_bare(data) for _ in range(count)]
+
+
+def _try_native_select_trivial(
+    options: Sequence[list[Constraint] | None],
+) -> list[list[Constraint]] | None:
+    """Route select_trivial through the Rust kernel, deferring on unsupported input."""
+    if not options:
+        return []
+    buf = _WriteBuffer()
+    from mypy.cache import write_int_bare
+
+    write_int_bare(buf, len(options))
+    for option in options:
+        if option is None:
+            raise NotImplementedError("None option not supported on the kernel")
+        _write_option(buf, option)
+    raw = _type_kernel.rust_select_trivial(buf.getvalue())
+    if raw is None:
+        raise NotImplementedError("kernel deferred select_trivial")
+    return [options[i] for i in _read_index_list(bytes(raw))]
+
+
+def _try_native_exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] | None:
+    """Route exclude_non_meta_vars through the Rust kernel, deferring on unsupported input."""
+    if not option:
+        return option
+    buf = _WriteBuffer()
+    _write_option(buf, option)
+    raw = _type_kernel.rust_exclude_non_meta_vars(buf.getvalue())
+    if raw is None:
+        raise NotImplementedError("kernel deferred exclude_non_meta_vars")
+    kept = [option[i] for i in _read_index_list(bytes(raw))]
+    return kept or None
+
+
+def _try_native_is_similar_constraints(x: list[Constraint], y: list[Constraint]) -> bool | None:
+    """Route is_similar_constraints through the Rust kernel, deferring on unsupported input."""
+    x_buf = _WriteBuffer()
+    _write_option(x_buf, x)
+    y_buf = _WriteBuffer()
+    _write_option(y_buf, y)
+    return _type_kernel.rust_is_similar_constraints(x_buf.getvalue(), y_buf.getvalue())
+
+
 from mypy.argmap import ArgTypeExpander
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type_by_instance
@@ -553,6 +628,13 @@ def infer_constraints_if_possible(
 
 def select_trivial(options: Sequence[list[Constraint] | None]) -> list[list[Constraint]]:
     """Select only those lists where each item is a constraint against Any."""
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_select_trivial(options)
+            if native_result is not None:
+                return native_result
+        except (NotImplementedError, ValueError):
+            pass
     res = []
     for option in options:
         if option is None:
@@ -674,6 +756,13 @@ def exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] |
     # If we had an empty list, keep it intact
     if not option:
         return option
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_exclude_non_meta_vars(option)
+            if native_result is not None:
+                return native_result
+        except (NotImplementedError, ValueError):
+            pass
     # However, if none of the options actually references meta vars, better remove
     # this constraint entirely.
     return [c for c in option if c.type_var.is_meta_var()] or None
@@ -708,6 +797,13 @@ def is_similar_constraints(x: list[Constraint], y: list[Constraint]) -> bool:
     ignore the target). Except for constraints where target is Any type, there
     we ignore direction as well.
     """
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_is_similar_constraints(x, y)
+            if native_result is not None:
+                return native_result
+        except (NotImplementedError, ValueError):
+            pass
     return _is_similar_constraints(x, y) and _is_similar_constraints(y, x)
 
 

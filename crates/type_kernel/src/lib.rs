@@ -49,6 +49,7 @@ mod checker_stmts;
 mod checkexpr_functions;
 mod checkstrformat;
 mod constraints;
+mod constraints_helpers;
 mod erase;
 mod erase_typevars;
 mod errors;
@@ -254,6 +255,18 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         constraints::rust_infer_constraints,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_helpers::rust_select_trivial,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_helpers::rust_exclude_non_meta_vars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_helpers::rust_is_similar_constraints,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
