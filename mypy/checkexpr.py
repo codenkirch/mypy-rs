@@ -231,6 +231,7 @@ try:
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
+        rust_is_async_def as _rust_is_async_def,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
@@ -248,6 +249,7 @@ except ImportError:
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
+    _rust_is_async_def = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
@@ -6911,6 +6913,14 @@ def is_async_def(t: Type) -> bool:
     # (We really need to see whether the original, undecorated
     # function was an `async def`, which is orthogonal to its
     # decorations.)
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_is_async_def(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     t = get_proper_type(t)
     if (
         isinstance(t, Instance)
