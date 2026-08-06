@@ -65,6 +65,7 @@ mod setops;
 mod solve;
 mod subtypes;
 mod traverser;
+mod typeanal_queries;
 mod typeinfo;
 mod typeops;
 mod visitor;
@@ -300,6 +301,22 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_algebra::rust_replace_implicit_first_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_has_explicit_any,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_has_any_from_unimported_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_collect_all_inner_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_make_optional_type,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

@@ -956,6 +956,11 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_active
 
         _set_native_semanal_active(self.options.native_type_kernel)
+        # Stage 17 typeanal query helpers. Wirefixup protection in place;
+        # parity-tracked on the same native_type_kernel opt-in gate.
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(self.options.native_type_kernel)
         # Stage 4c erase_typevars. Wirefixup resolves type_ref strings.
         # Truthiness flags on UnionType round-trip loss-free since the
         # wire fix (#201); parity verified 8198/0 with the gate on.

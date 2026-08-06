@@ -2551,10 +2551,81 @@ def check_for_explicit_any(
         msg.explicit_any(context)
 
 
+# Stage 17: native typeanal query seam (parity-only, default-off).
+# Kernel routes has_explicit_any / has_any_from_unimported_type /
+# collect_all_inner_types / make_optional_type; None falls back to Python.
+try:
+    from librt.internal import (
+        ReadBuffer as _TypeanalReadBuffer,
+        WriteBuffer as _TypeanalWriteBuffer,
+    )
+    from type_kernel import (
+        rust_collect_all_inner_types as _rust_collect_all_inner_types,
+        rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
+        rust_has_explicit_any as _rust_has_explicit_any,
+        rust_make_optional_type as _rust_make_optional_type,
+    )
+
+    from mypy.types import read_type as _typeanal_read_type
+    from mypy.wirefixup import check_no_fake_info, fixup_wire_type
+
+    _TYPEANAL_HAS_KERNEL = True
+except ImportError:
+    _rust_has_explicit_any = None  # type: ignore[assignment]
+    _rust_has_any_from_unimported_type = None  # type: ignore[assignment]
+    _rust_collect_all_inner_types = None  # type: ignore[assignment]
+    _rust_make_optional_type = None  # type: ignore[assignment]
+    _TypeanalWriteBuffer = None  # type: ignore[assignment]
+    _TypeanalReadBuffer = None  # type: ignore[assignment]
+    _typeanal_read_type = None  # type: ignore[assignment]
+    _TYPEANAL_HAS_KERNEL = False
+
+_native_typeanal_active: bool = False
+
+
+def _set_native_typeanal_active(active: bool) -> None:
+    global _native_typeanal_active
+    _native_typeanal_active = active
+
+
+def _serialize_typeanal_type(t: Type) -> bytes:
+    buf = _TypeanalWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _typeanal_decode(result: bytes) -> Type | None:
+    buf = _TypeanalReadBuffer(bytes(result))
+    decoded = _typeanal_read_type(buf)
+    # Clear instance_cache primitives after read_type so NOT_READY
+    # singletons cannot leak into later builds (mirrors applytype).
+    from mypy.types import instance_cache
+
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    fixed = fixup_wire_type(decoded)
+    if fixed is None:
+        return None
+    # Any residual fake TypeInfo crashes later serialization, so defer.
+    if not check_no_fake_info(fixed):
+        return None
+    return fixed
+
+
 def has_explicit_any(t: Type) -> bool:
     """
     Whether this type is or type it contains is an Any coming from explicit type annotation
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_has_explicit_any(_serialize_typeanal_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(HasExplicitAny())
 
 
@@ -2576,6 +2647,13 @@ def has_any_from_unimported_type(t: Type) -> bool:
     If type t is such Any type or has type arguments that contain such Any type
     this function will return true.
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_has_any_from_unimported_type(_serialize_typeanal_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(HasAnyFromUnimportedType())
 
 
@@ -2595,6 +2673,20 @@ def collect_all_inner_types(t: Type) -> list[Type]:
     """
     Return all types that `t` contains
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_collect_all_inner_types(_serialize_typeanal_type(t))
+            if result is not None:
+                decoded = []
+                for item in result:
+                    bt = _typeanal_decode(item)
+                    if bt is None:
+                        break
+                    decoded.append(bt)
+                else:
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     return t.accept(CollectAllInnerTypesQuery())
 
 
@@ -2615,7 +2707,16 @@ def make_optional_type(t: Type) -> Type:
     """
     if isinstance(t, ProperType) and isinstance(t, NoneType):
         return t
-    elif isinstance(t, ProperType) and isinstance(t, UnionType):
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_make_optional_type(_serialize_typeanal_type(t))
+            if result is not None:
+                decoded = _typeanal_decode(result)
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
+    if isinstance(t, ProperType) and isinstance(t, UnionType):
         # Eagerly expanding aliases is not safe during semantic analysis.
         items = [item for item in t.items if not isinstance(get_proper_type(item), NoneType)]
         return UnionType(items + [NoneType()], t.line, t.column)

@@ -66,6 +66,10 @@ __all__ = [
     "rust_find_unpack_in_list",
     "rust_split_with_prefix_and_suffix",
     "rust_flatten_nested_unions",
+    "rust_has_explicit_any",
+    "rust_has_any_from_unimported_type",
+    "rust_collect_all_inner_types",
+    "rust_make_optional_type",
     "rust_flatten_nested_tuples",
     "rust_copy_type",
     "rust_apply_generic_arguments",
@@ -240,6 +244,10 @@ def rust_split_with_prefix_and_suffix(
 def rust_flatten_nested_unions(
     type_bytes_list: list[bytes], handle_type_alias_type: bool, handle_recursive: bool
 ) -> list[bytes] | None: ...
+def rust_has_explicit_any(type_bytes: bytes) -> bool | None: ...
+def rust_has_any_from_unimported_type(type_bytes: bytes) -> bool | None: ...
+def rust_collect_all_inner_types(type_bytes: bytes) -> list[bytes] | None: ...
+def rust_make_optional_type(type_bytes: bytes) -> bytes | None: ...
 def rust_flatten_nested_tuples(
     type_bytes_list: list[bytes], handle_recursive: bool
 ) -> list[bytes] | None: ...
