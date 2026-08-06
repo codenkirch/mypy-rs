@@ -441,6 +441,83 @@ pub(crate) fn is_async_def_inner(typ: &Type) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// is_duplicate_mapping
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.is_duplicate_mapping` — whether multiple actual
+/// arguments map to the same formal in a non-star position, i.e. the call
+/// has duplicate values for that formal.
+///
+/// Mirrors `is_duplicate_mapping` (checkexpr.py:6947-6959). The exception
+/// cases where duplicates are allowed at runtime:
+///   * `f(..., *args, **kwargs)` with exactly two actuals (`*args` and
+///     `**kwargs`) mapping to the same formal.
+///   * Multiple `**kwargs` that all map to the same formal, provided they
+///     are not TypedDicts (a non-TypedDict `**kwargs` cannot be matched
+///     with certainty).
+///
+/// `actual_types` each carry a serialized type; we resolve each through
+/// `get_proper_or_none` so a `TypeAliasType` actual defers (None), since
+/// the wire format has no alias target.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_is_duplicate_mapping(
+    mapping: Vec<i64>,
+    actual_types: Vec<Vec<u8>>,
+    actual_kinds: Vec<i64>,
+) -> PyResult<Option<bool>> {
+    let mut types = Vec::with_capacity(mapping.len());
+    for &idx in &mapping {
+        match actual_types.get(idx as usize) {
+            Some(bytes) => match decode_type(bytes) {
+                Some(t) => types.push(t),
+                None => return Ok(None),
+            },
+            None => return Ok(None),
+        }
+    }
+    Ok(is_duplicate_mapping_inner(&mapping, &types, &actual_kinds))
+}
+
+fn is_duplicate_mapping_inner(
+    mapping: &[i64],
+    actual_types: &[Type],
+    actual_kinds: &[i64],
+) -> Option<bool> {
+    // `mapping` with one entry (or fewer) cannot be a duplicate.
+    if mapping.len() <= 1 {
+        return Some(false);
+    }
+    // `f(..., *args, **kwargs)`: the two actuals can both map to the same
+    // formal and no runtime duplicate occurs. Allow this exception.
+    if mapping.len() == 2 {
+        let first = *actual_kinds.get(mapping[0] as usize)?;
+        let second = *actual_kinds.get(mapping[1] as usize)?;
+        if first == ARG_STAR && second == ARG_STAR2 {
+            return Some(false);
+        }
+    }
+    // Exceptions where duplicates are allowed: every mapped actual is a
+    // `**kwargs` that is NOT a TypedDict (cannot be matched with certainty),
+    // so `all(mapped actual is a non-TypedDict **kwargs)` disables the
+    // duplicate check.
+    let mut all_non_typeddict_star2 = true;
+    for (i, &idx) in mapping.iter().enumerate() {
+        let kind = *actual_kinds.get(idx as usize)?;
+        if kind != ARG_STAR2 {
+            all_non_typeddict_star2 = false;
+            break;
+        }
+        let proper = get_proper_or_none(&actual_types[i])?;
+        if matches!(proper, Type::TypedDictType { .. }) {
+            all_non_typeddict_star2 = false;
+            break;
+        }
+    }
+    Some(!all_non_typeddict_star2)
+}
+
+// ---------------------------------------------------------------------------
 // is_typed_callable
 // ---------------------------------------------------------------------------
 
@@ -1284,5 +1361,118 @@ mod tests {
             value: LiteralValue::Int(42),
         };
         assert_eq!(is_string_literal_inner(&lit), Some(false));
+    }
+
+    // -- is_duplicate_mapping --
+
+    fn make_typeddict() -> Type {
+        Type::TypedDictType {
+            fallback: Box::new(make_instance("TD", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        }
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_single_false() {
+        let kinds = vec![ARG_POS];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0], &[make_instance("int", vec![])], &kinds),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_empty_false() {
+        assert_eq!(
+            is_duplicate_mapping_inner(&[], &[], &[]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_star_kwargs_exception_false() {
+        let kinds = vec![ARG_STAR, ARG_STAR2];
+        let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_two_star2() {
+        // Two **kwargs, both non-TypedDict: allowed (no duplicate).
+        let kinds = vec![ARG_STAR2, ARG_STAR2];
+        let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_star2_typeddict_true() {
+        // Two **kwargs, but one is a TypedDict: duplicate is real.
+        let kinds = vec![ARG_STAR2, ARG_STAR2];
+        let types = vec![make_instance("int", vec![]), make_typeddict()];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_two_pos_true() {
+        let kinds = vec![ARG_POS, ARG_POS];
+        let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_pos_does_not_touch_alias() {
+        // A non-`**kwargs` actual short-circuits the `all(...)`: the alias
+        // at index 1 is never resolved, matching Python's short-circuit.
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        let kinds = vec![ARG_POS, ARG_POS];
+        let types = vec![make_instance("int", vec![]), alias];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_alias_defers() {
+        // Both actuals are `**kwargs`, so `get_proper_type` runs on each;
+        // the wire format has no alias target, so the result defers.
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        let kinds = vec![ARG_STAR2, ARG_STAR2];
+        let types = vec![make_instance("int", vec![]), alias];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_duplicate_mapping_out_of_range_defers() {
+        let kinds = vec![ARG_POS];
+        let types = vec![make_instance("int", vec![])];
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 5], &types, &kinds),
+            None
+        );
     }
 }
