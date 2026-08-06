@@ -20,10 +20,25 @@ from typing import Optional
 
 from mypy.types import ProperType, Type
 
-__all__ = ["erase_type", "remove_instance_last_known_values"]
+__all__ = [
+    "erase_type",
+    "remove_instance_last_known_values",
+    "rust_is_unreachable_map",
+    "rust_stmt_outcome",
+    "rust_type_requires_usage",
+]
 
 
 def erase_type(typ: Type) -> Optional[ProperType]: ...
 
 
 def remove_instance_last_known_values(typ: Type) -> Optional[Type]: ...
+
+
+def rust_type_requires_usage(type_bytes: bytes) -> Optional[int]: ...
+
+
+def rust_is_unreachable_map(type_bytes_list: list[bytes]) -> Optional[bool]: ...
+
+
+def rust_stmt_outcome(node_bytes: bytes) -> Optional[str]: ...

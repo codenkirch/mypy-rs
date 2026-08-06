@@ -160,6 +160,17 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # M17 statement helpers (parity-only). type_requires_usage /
+        # is_unreachable_map via the type wire, rust_stmt_outcome via the
+        # statement wire (astwire).
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS"):
+            try:
+                from mypy.checker import _set_native_checker_stmts_active
+
+                _set_native_checker_stmts_active(True)
+            except ImportError:
+                pass
+
         # Stage 6c small pure modules batch (parity-only).
         # apply_generic_arguments needs the resolver + typeinfo_map
         # (shares the subtype/expand resolvers). has_no_typevars needs
