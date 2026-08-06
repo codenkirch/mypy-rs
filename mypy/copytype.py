@@ -71,7 +71,7 @@ def copy_type(t: ProperType) -> ProperType:
             t.write(buf)
             result = _rust_copy_type(buf.getvalue())
             if result is not None:
-                rbuf = _CopyReadBuffer(result)
+                rbuf = _CopyReadBuffer(bytes(result))
                 return _copy_read_type(rbuf)  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass

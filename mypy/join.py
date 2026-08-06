@@ -351,7 +351,7 @@ def trivial_join(s: Type, t: Type) -> Type:
                 state.strict_optional,
                 _native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             if result == 0:
@@ -426,7 +426,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 state.strict_optional,
                 _native_join_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
             disc, fullname, arg_discs, encoded = result

@@ -8342,7 +8342,7 @@ def make_any_non_explicit(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_explicit(data)
             if result is not None:
-                buf = _SemanalReadBuffer(result)
+                buf = _SemanalReadBuffer(bytes(result))
                 return _semanal_read_type(buf)
         except (AssertionError, NotImplementedError):
             pass
@@ -8366,7 +8366,7 @@ def make_any_non_unimported(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_unimported(data)
             if result is not None:
-                buf = _SemanalReadBuffer(result)
+                buf = _SemanalReadBuffer(bytes(result))
                 return _semanal_read_type(buf)
         except (AssertionError, NotImplementedError):
             pass

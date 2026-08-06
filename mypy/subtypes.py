@@ -447,9 +447,10 @@ def _is_subtype(
                 state.strict_optional,
                 _native_subtype_resolver,
             )
-        except NotImplementedError:
+        except (AssertionError, NotImplementedError):
             # Type tree contains an unserializable variant (e.g.
-            # TypeGuardedType nested in a Union). Defer to Python.
+            # TypeGuardedType nested in a Union) or an unfixed TypeInfo
+            # (TypeType.item not yet resolved). Defer to Python.
             result = None
         if result is not None:
             return result
