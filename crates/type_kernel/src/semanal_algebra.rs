@@ -698,7 +698,10 @@ mod tests {
 
     #[test]
     fn test_replace_implicit_first_type_swaps_first_arg() {
-        let sig = make_callable(vec![make_any(EXPLICIT), make_instance("builtins.int", vec![])]);
+        let sig = make_callable(vec![
+            make_any(EXPLICIT),
+            make_instance("builtins.int", vec![]),
+        ]);
         let new = make_any(SPECIAL_FORM);
         match replace_implicit_first_type_inner(sig, &new) {
             Some(Type::CallableType { arg_types, .. }) => {
@@ -768,8 +771,13 @@ mod tests {
 
     #[test]
     fn test_replace_implicit_first_type_rejects_non_callable() {
-        assert!(replace_implicit_first_type_inner(make_any(EXPLICIT), &make_any(SPECIAL_FORM)).is_none());
-        assert!(replace_implicit_first_type_inner(Type::NoneType, &make_any(SPECIAL_FORM)).is_none());
+        assert!(
+            replace_implicit_first_type_inner(make_any(EXPLICIT), &make_any(SPECIAL_FORM))
+                .is_none()
+        );
+        assert!(
+            replace_implicit_first_type_inner(Type::NoneType, &make_any(SPECIAL_FORM)).is_none()
+        );
     }
 
     #[test]

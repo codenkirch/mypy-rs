@@ -424,12 +424,7 @@ pub(crate) fn rust_is_async_def(type_bytes: &[u8]) -> PyResult<Option<bool>> {
 
 pub(crate) fn is_async_def_inner(typ: &Type) -> Option<bool> {
     let mut proper = get_proper_or_none(typ)?;
-    if let Type::Instance {
-        type_ref,
-        args,
-        ..
-    } = proper
-    {
+    if let Type::Instance { type_ref, args, .. } = proper {
         if type_ref == "typing.AwaitableGenerator" && args.len() >= 4 {
             proper = get_proper_or_none(&args[3])?;
         }
@@ -861,9 +856,7 @@ pub(crate) fn is_typeddict_type_context_inner(typ: &Type) -> Option<bool> {
 /// recursive TypeAlias defers (needs get_proper_type with alias target).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_allow_fast_container_literal(
-    type_bytes: &[u8],
-) -> PyResult<Option<bool>> {
+pub(crate) fn rust_allow_fast_container_literal(type_bytes: &[u8]) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
@@ -1037,9 +1030,7 @@ mod tests {
     #[test]
     fn test_has_ambiguous_uninhabited_component_true() {
         assert_eq!(
-            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType {
-                ambiguous: true
-            }),
+            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: true }),
             Some(true)
         );
     }
@@ -1047,9 +1038,7 @@ mod tests {
     #[test]
     fn test_has_ambiguous_uninhabited_component_false_flag() {
         assert_eq!(
-            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType {
-                ambiguous: false
-            }),
+            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: false }),
             Some(false)
         );
     }
@@ -1092,10 +1081,7 @@ mod tests {
     fn test_allow_fast_container_literal_tuple_all_items() {
         let tup = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
-            items: vec![
-                make_instance("int", vec![]),
-                make_instance("str", vec![]),
-            ],
+            items: vec![make_instance("int", vec![]), make_instance("str", vec![])],
             implicit: false,
         };
         assert_eq!(allow_fast_container_literal_inner(&tup), Some(true));
@@ -1386,10 +1372,7 @@ mod tests {
 
     #[test]
     fn test_is_duplicate_mapping_empty_false() {
-        assert_eq!(
-            is_duplicate_mapping_inner(&[], &[], &[]),
-            Some(false)
-        );
+        assert_eq!(is_duplicate_mapping_inner(&[], &[], &[]), Some(false));
     }
 
     #[test]
@@ -1460,19 +1443,13 @@ mod tests {
         };
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), alias];
-        assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
-            None
-        );
+        assert_eq!(is_duplicate_mapping_inner(&[0, 1], &types, &kinds), None);
     }
 
     #[test]
     fn test_is_duplicate_mapping_out_of_range_defers() {
         let kinds = vec![ARG_POS];
         let types = vec![make_instance("int", vec![])];
-        assert_eq!(
-            is_duplicate_mapping_inner(&[0, 5], &types, &kinds),
-            None
-        );
+        assert_eq!(is_duplicate_mapping_inner(&[0, 5], &types, &kinds), None);
     }
 }
