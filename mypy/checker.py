@@ -97,6 +97,7 @@ from mypy.erasetype import (
     shallow_erase_type_for_equality,
 )
 from mypy.errorcodes import TYPE_VAR, UNUSED_AWAITABLE, UNUSED_COROUTINE, ErrorCode
+from mypy.fixup import TypeFixer
 from mypy.errors import (
     ErrorInfo,
     Errors,
@@ -306,11 +307,9 @@ from mypy.typevars import fill_typevars, fill_typevars_with_any, has_no_typevars
 from mypy.util import is_dunder, is_sunder
 from mypy.visitor import NodeVisitor
 
-# Native type_kernel seam for standalone checker functions (Stage 9).
-# Gates: _native_checker_active enables scalar-returning functions,
-# _native_checker_types_active enables type-returning functions.
-# Rust returns None for TypeAliasType (no alias target on the wire);
-# Python falls back to get_proper_type + the pure-Python path.
+# Native type_kernel seam (Stage 9): _active enables scalar-returning,
+# _types_active type-returning. Rust returns None for TypeAliasType (no alias
+# target on the wire); Python falls back to get_proper_type + pure-Python.
 try:
     from librt.internal import ReadBuffer as _CheckerReadBuffer, WriteBuffer as _CheckerWriteBuffer
     from type_kernel import (
@@ -476,10 +475,8 @@ DeferredNodeType: _TypeAlias = FuncDef | OverloadedFuncDef | Decorator
 FineGrainedDeferredNodeType: _TypeAlias = FuncDef | MypyFile | OverloadedFuncDef
 
 
-# A node which is postponed to be processed during the next pass.
-# In normal mode one can defer functions and methods (also decorated and/or overloaded)
-# but not lambda expressions. Nested functions can't be deferred -- only top-level functions
-# and methods of classes not defined within a function can be deferred.
+# A node postponed to the next pass. Top-level functions and methods can be
+# deferred; lambdas and nested functions cannot.
 class DeferredNode(NamedTuple):
     node: DeferredNodeType
     # And its TypeInfo (for semantic analysis self type handling)
@@ -5763,7 +5760,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         typ = get_proper_type(typ)
         res = _try_native_try_handler_union(typ)
         if res is not None:
-            return [_deserialize_type_from_checker(b) for b in res]
+            # Native path returns deserialized types with TypeInfo refs
+            # stored as strings (NOT_READY). Resolve them against the module
+            # table before the caller dereferences, then drop cached types.
+            types = [_deserialize_type_from_checker(b) for b in res]
+            for t in types:
+                t.accept(TypeFixer(self.modules, allow_missing=True))
+            from mypy.types import instance_cache
+
+            for attr in ("int_type", "str_type", "bool_type", "object_type", "function_type"):
+                s = getattr(instance_cache, attr)
+                if s is not None and s.type_ref is not None:
+                    setattr(instance_cache, attr, None)
+            return types
         if isinstance(typ, TupleType):
             merged_type = make_simplified_union(typ.items)
             if isinstance(merged_type, UnionType):
