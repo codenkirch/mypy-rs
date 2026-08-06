@@ -1191,6 +1191,15 @@ def try_getting_str_literals_from_type(typ: Type) -> list[str] | None:
     For example, if we had the type 'Literal["foo", "bar"]' as input, this function
     would return a list of strings ["foo", "bar"].
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_try_getting_str_literals_from_type(
+                _serialize_type(typ)
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return try_getting_literals_from_type(typ, str, "builtins.str")
 
 
@@ -1202,6 +1211,15 @@ def try_getting_int_literals_from_type(typ: Type) -> list[int] | None:
     For example, if we had the type 'Literal[1, 2, 3]' as input, this function
     would return a list of ints [1, 2, 3].
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_try_getting_int_literals_from_type(
+                _serialize_type(typ)
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return try_getting_literals_from_type(typ, int, "builtins.int")
 
 
