@@ -31,8 +31,11 @@ use pyo3::prelude::*;
 
 // Varint width constants (librt_internal.c:14-19).
 const MIN_ONE_BYTE_INT: i64 = -10;
+const MAX_ONE_BYTE_INT: i64 = 117;
 const MIN_TWO_BYTES_INT: i64 = -100;
+const MAX_TWO_BYTES_INT: i64 = 16283;
 const MIN_FOUR_BYTES_INT: i64 = -10000;
+const MAX_FOUR_BYTES_INT: i64 = 536860911;
 
 // Varint bit flags (librt_internal.c:21-25).
 const TWO_BYTES_INT_BIT: u8 = 1;
@@ -1722,58 +1725,55 @@ pub(crate) fn write_bool(buf: &mut WriteBuffer, value: bool) {
 
 /// `write_int_bare`: the tagged-int encoding inverse of `read_int_bare`.
 ///
-/// Layout mirrors librt_internal.c `write_int_internal` / `_read_short_int`
+/// Layout mirrors librt_internal.c `write_int_internal` / `_write_short_int`
 /// (wire.rs:185-212). Three width tiers, chosen by value range:
 /// - 1-byte:  value in [-10, 117], payload = (value + 10) << 1 (low bit 0)
 /// - 2-byte: value in [-100, 16283], payload = (value + 100) << 2 | 0b01
 ///   (byte0 low 2 bits = 0b01, byte1 = high 8 bits)
-/// - 4-byte: value in [-10000, 536870911], payload = (value + 10000) << 3
+/// - 4-byte: value in [-10000, 536860911], payload = (value + 10000) << 3
 ///   | 0b011 (byte0 low 3 bits = 0b011, byte1 = bits 3..8, bytes 2-3 =
 ///   bits 8..21 little-endian)
 ///
-/// Larger values use the `LONG_INT_TRAILER` form. mypy's wire format only
-/// serializes i64 ints that fit the short-int range (TypeVarId.raw_id is
-/// tiny; Enum int values are small); we return `Err` for values outside
-/// i32 short-int range rather than silently truncate.
+/// Values outside the 4-byte short-int range use the `LONG_INT_TRAILER` form,
+/// matching `write_int_internal` (librt_internal.c:833-839). This covers all
+/// values mypy's wire format serializes (TypeVarId raw_ids and enum values
+/// fit the short-int range); the long-int path is implemented for
+/// completeness and never silently truncates.
 pub(crate) fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), WireError> {
-    if value >= MIN_ONE_BYTE_INT {
+    if (MIN_ONE_BYTE_INT..=MAX_ONE_BYTE_INT).contains(&value) {
         let payload = (value - MIN_ONE_BYTE_INT) << 1;
-        debug_assert!(payload <= 0x7F);
         buf.push(payload as u8);
-        return Ok(());
-    }
-    if value >= MIN_TWO_BYTES_INT {
+    } else if (MIN_TWO_BYTES_INT..=MAX_TWO_BYTES_INT).contains(&value) {
         let payload = (value - MIN_TWO_BYTES_INT) << 2 | (TWO_BYTES_INT_BIT as i64);
-        debug_assert!(payload <= 0x3FFF);
         buf.push((payload & 0xFF) as u8);
         buf.push(((payload >> 8) & 0xFF) as u8);
-        return Ok(());
-    }
-    if value >= MIN_FOUR_BYTES_INT {
+    } else if (MIN_FOUR_BYTES_INT..=MAX_FOUR_BYTES_INT).contains(&value) {
         let payload = (value - MIN_FOUR_BYTES_INT) << 3
             | (TWO_BYTES_INT_BIT as i64)
             | (FOUR_BYTES_INT_BIT as i64);
-        debug_assert!(payload <= 0x1FFFFFFF);
         buf.push((payload & 0xFF) as u8);
         buf.push(((payload >> 8) & 0xFF) as u8);
         buf.push(((payload >> 16) & 0xFF) as u8);
         buf.push(((payload >> 24) & 0xFF) as u8);
-        return Ok(());
+    } else {
+        // Long-int form (LONG_INT_TRAILER): sentinel, then a short-int
+        // size_and_sign header (size << 1 | sign), then LE magnitude bytes.
+        // Mirrors `_write_long_int` (librt_internal.c:764-827).
+        buf.push(LONG_INT_TRAILER);
+        let neg = value < 0;
+        let mut magnitude = (value as i128).unsigned_abs();
+        let mut bytes = Vec::new();
+        if magnitude == 0 {
+            bytes.push(0);
+        }
+        while magnitude > 0 {
+            bytes.push((magnitude & 0xFF) as u8);
+            magnitude >>= 8;
+        }
+        let size_and_sign = ((bytes.len() as i64) << 1) | if neg { 1 } else { 0 };
+        write_int_bare(buf, size_and_sign)?;
+        buf.extend(&bytes);
     }
-    // Long-int form (LONG_INT_TRAILER). Only reached for values < -10000,
-    // which the type-kernel set-ops never produce (no raw_id is that
-    // negative). Implemented for completeness; uses little-endian magnitude.
-    buf.push(LONG_INT_TRAILER);
-    let magnitude = (-(value)) as u128;
-    let mut bytes = Vec::new();
-    let mut m = magnitude;
-    while m != 0 {
-        bytes.push((m & 0xFF) as u8);
-        m >>= 8;
-    }
-    let size_and_sign = ((bytes.len() as i64) << 1) | 1;
-    write_int_bare(buf, size_and_sign)?;
-    buf.extend(&bytes);
     Ok(())
 }
 
@@ -2342,6 +2342,48 @@ mod tests {
         assert_eq!(round_trip_int(-101), -101);
         assert_eq!(round_trip_int(16284), 16284);
         assert_eq!(round_trip_int(536860911), 536860911);
+    }
+
+    /// Round-trip through the production writer `write_int_bare`, not the
+    /// reader-only oracle. Guards against the truncation bug where values
+    /// above a tier's ceiling silently took the smaller width (e.g.
+    /// `Literal[123]` corrupting to `Literal[-5]`), which the reader-only
+    /// tests above cannot detect because `encode_int_for_test` is correct.
+    fn write_round_trip_int(value: i64) -> i64 {
+        let mut buf = WriteBuffer::new();
+        write_int_bare(&mut buf, value).unwrap();
+        let bytes = buf.into_bytes();
+        let mut rb = ReadBuffer::new(&bytes);
+        read_int_bare(&mut rb).unwrap()
+    }
+
+    #[test]
+    fn write_int_bare_round_trips_all_tiers() {
+        // 1-byte tier borders.
+        assert_eq!(write_round_trip_int(-10), -10);
+        assert_eq!(write_round_trip_int(0), 0);
+        assert_eq!(write_round_trip_int(117), 117);
+        // 2-byte tier borders (values just past the 1-byte ceiling are the
+        // ones the old truncating writer corrupted).
+        assert_eq!(write_round_trip_int(118), 118);
+        assert_eq!(write_round_trip_int(123), 123);
+        assert_eq!(write_round_trip_int(456), 456);
+        assert_eq!(write_round_trip_int(16283), 16283);
+        // 4-byte tier borders.
+        assert_eq!(write_round_trip_int(16284), 16284);
+        assert_eq!(write_round_trip_int(536860911), 536860911);
+        // Long-int form just past the 4-byte ceiling.
+        assert_eq!(write_round_trip_int(536860912), 536860912);
+    }
+
+    #[test]
+    fn write_int_bare_negative_tiers() {
+        assert_eq!(write_round_trip_int(-100), -100);
+        assert_eq!(write_round_trip_int(-99), -99);
+        assert_eq!(write_round_trip_int(-11), -11);
+        assert_eq!(write_round_trip_int(-10000), -10000);
+        assert_eq!(write_round_trip_int(-9999), -9999);
+        assert_eq!(write_round_trip_int(-10001), -10001);
     }
 
     #[test]
