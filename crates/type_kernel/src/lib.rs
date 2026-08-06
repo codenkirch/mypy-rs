@@ -172,6 +172,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_has_ambiguous_uninhabited_component,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_allow_fast_container_literal,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_has_bytes_component,
         module
     )?)?;

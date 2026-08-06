@@ -224,7 +224,9 @@ try:
         WriteBuffer as _CheckExprWriteBuffer,
     )
     from type_kernel import (
+        rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_classify_call as _rust_classify_call,
+        rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
@@ -242,6 +244,8 @@ try:
 except ImportError:
     _rust_has_any_type = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
+    _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
+    _rust_allow_fast_container_literal = None  # type: ignore[assignment]
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
@@ -411,6 +415,14 @@ class TooManyUnions(Exception):
 
 
 def allow_fast_container_literal(t: Type) -> bool:
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_allow_fast_container_literal(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, TypeAliasType) and t.is_recursive:
         return False
     t = get_proper_type(t)
@@ -7005,6 +7017,14 @@ class HasUninhabitedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_ambiguous_uninhabited_component(t: Type | None) -> bool:
+    if t is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_has_ambiguous_uninhabited_component(type_bytes)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t is not None and t.accept(HasAmbiguousUninhabitedComponentsQuery())
 
 

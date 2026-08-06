@@ -233,6 +233,46 @@ pub(crate) fn has_uninhabited_component_inner(typ: &Type) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// has_ambiguous_uninhabited_component
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.has_ambiguous_uninhabited_component` — whether a type
+/// contains an UninhabitedType marked ambiguous.
+///
+/// Mirrors `HasAmbiguousUninhabitedComponentsQuery` (checkexpr.py:
+/// 7007-7018). `ambiguous` is the flag on the UninhabitedType wire
+/// variant; False matches the plain has_uninhabited_component case.
+/// Defer on TypeAliasType (no alias target on the wire).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_has_ambiguous_uninhabited_component(
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(has_ambiguous_uninhabited_component_inner(&typ))
+}
+
+pub(crate) fn has_ambiguous_uninhabited_component_inner(typ: &Type) -> Option<bool> {
+    if let Type::TypeAliasType { .. } = typ {
+        return None;
+    }
+    if let Type::UninhabitedType { ambiguous } = typ {
+        return Some(*ambiguous);
+    }
+    for child in all_children(typ) {
+        match has_ambiguous_uninhabited_component_inner(child) {
+            Some(true) => return Some(true),
+            None => return None,
+            Some(false) => {}
+        }
+    }
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
 // has_bytes_component
 // ---------------------------------------------------------------------------
 
@@ -692,6 +732,46 @@ pub(crate) fn is_typeddict_type_context_inner(typ: &Type) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// allow_fast_container_literal
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.allow_fast_container_literal` — whether a type is a
+/// fast-path container literal: an Instance, or a TupleType whose items
+/// all qualify.
+///
+/// Mirrors `allow_fast_container_literal` (checkexpr.py:413-419). A
+/// recursive TypeAlias defers (needs get_proper_type with alias target).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_allow_fast_container_literal(
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(allow_fast_container_literal_inner(&typ))
+}
+
+pub(crate) fn allow_fast_container_literal_inner(typ: &Type) -> Option<bool> {
+    let proper = get_proper_or_none(typ)?;
+    match proper {
+        Type::TupleType { items, .. } => {
+            for it in items {
+                match allow_fast_container_literal_inner(it) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            Some(true)
+        }
+        Type::Instance { .. } => Some(true),
+        _ => Some(false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // all_children: include CallableType children (for has_uninhabited)
 // ---------------------------------------------------------------------------
 
@@ -834,6 +914,92 @@ mod tests {
             has_uninhabited_component_inner(&make_instance("int", vec![])),
             Some(false)
         );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_true() {
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType {
+                ambiguous: true
+            }),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_false_flag() {
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType {
+                ambiguous: false
+            }),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_in_union() {
+        let u = make_union(vec![
+            make_instance("int", vec![]),
+            Type::UninhabitedType { ambiguous: true },
+        ]);
+        assert_eq!(has_ambiguous_uninhabited_component_inner(&u), Some(true));
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_clean_instance() {
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&make_instance("int", vec![])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        assert_eq!(has_ambiguous_uninhabited_component_inner(&alias), None);
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_instance() {
+        assert_eq!(
+            allow_fast_container_literal_inner(&make_instance("list", vec![])),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_tuple_all_items() {
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![
+                make_instance("int", vec![]),
+                make_instance("str", vec![]),
+            ],
+            implicit: false,
+        };
+        assert_eq!(allow_fast_container_literal_inner(&tup), Some(true));
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_tuple_with_non_instance() {
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![make_instance("int", vec![]), make_union(vec![])],
+            implicit: false,
+        };
+        assert_eq!(allow_fast_container_literal_inner(&tup), Some(false));
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        assert_eq!(allow_fast_container_literal_inner(&alias), None);
     }
 
     #[test]
