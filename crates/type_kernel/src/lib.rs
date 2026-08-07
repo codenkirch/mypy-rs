@@ -56,6 +56,7 @@ mod erase_typevars;
 mod errors;
 mod expand;
 mod expandtype;
+mod freshen;
 mod lkv;
 mod meet;
 mod messages;
@@ -127,6 +128,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(expandtype::rust_expand_type, module)?)?;
     module.add_function(wrap_pyfunction!(
         expandtype::rust_expand_type_by_instance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        freshen::rust_freshen_all_functions_type_vars,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

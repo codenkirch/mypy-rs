@@ -1648,12 +1648,12 @@ fn is_named_object(t: &Type) -> bool {
 }
 
 /// True if the typevar default is the special "no default" sentinel. mypy
-/// uses `AnyType(TypeOfAny.special_form)` as the no-default marker; Stage 3a
-/// treats any `AnyType` as having no user-visible default, matching the
-/// `var.has_default()` check in the non-verbose path (which consults the
-/// TypeVar's `default` field that defaults to that sentinel).
+/// uses `AnyType(TypeOfAny.from_omitted_generics)` (enum value 4) as the
+/// no-default marker; any other AnyType (e.g. special_form) is a real,
+/// user-visible default. Mirrors the `has_default()` check in
+/// `visit_callable_type`'s variables block.
 fn is_default_object(t: &Type) -> bool {
-    matches!(t, Type::AnyType { .. })
+    matches!(t, Type::AnyType { type_of_any: 4, .. })
 }
 
 // ---------------------------------------------------------------------------

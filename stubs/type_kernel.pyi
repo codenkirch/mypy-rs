@@ -233,6 +233,11 @@ def rust_expand_type_by_instance(
     instance_bytes: bytes,
     strict_optional: bool,
 ) -> bytes | None: ...
+def rust_freshen_all_functions_type_vars(
+    start_raw_id: int,
+    type_bytes: bytes,
+    strict_optional: bool,
+) -> tuple[int, bool, bytes] | None: ...
 def rust_make_simplified_union(
     items_bytes: bytes,
     line: int,
