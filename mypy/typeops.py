@@ -1690,6 +1690,11 @@ def can_have_shared_disjoint_base(instances: list[Instance]) -> bool:
 
     This means that a child class of these classes can exist at runtime.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            return _type_kernel.rust_can_have_shared_disjoint_base(instances)
+        except (AssertionError, NotImplementedError):
+            pass
     # Ignore None disjoint bases (which are `object`).
     disjoint_bases = [
         base for instance in instances if (base := _get_disjoint_base_of(instance)) is not None
