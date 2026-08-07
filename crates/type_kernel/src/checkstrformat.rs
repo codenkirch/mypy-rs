@@ -33,14 +33,21 @@ pub fn rust_is_numeric_format_type(conv_type: &str, is_new_style: bool) -> bool 
 }
 
 // ===== Printf-style (% interpolation) parsing =====
-//
-// Mirrors FORMAT_RE:
-//   %(\((?P<key>[^)]*)\))?(?P<flags>[#0\-+ ]*)?
-//   (?P<width>[1-9][0-9]*|\*)?(?:\.(?P<precision>\*|[0-9]+)?)?
-//   [hlL]?(?P<type>.)?
-//
-// All groups after % are optional and greedy. re.finditer matches every
-// '%' in the string, each match extending as far as the groups allow.
+// Mirrors FORMAT_RE. All groups after % are optional and greedy;
+// re.finditer matches every '%', extending as far as the groups allow.
+
+/// A parsed printf-style specifier returned to Python.
+///
+/// Fields: (whole_seq, start_pos, key, conv_type, flags, width, precision).
+type PrintfSpecTuple = (
+    String,
+    usize,
+    Option<String>,
+    String,
+    String,
+    String,
+    String,
+);
 
 /// Parse one printf specifier starting at `pos` (bytes[pos] == '%').
 /// Returns (whole_seq, start_pos, key, conv_type, flags, width, precision, end).
@@ -66,8 +73,8 @@ fn parse_one_printf_spec(
     let key = if idx < n && bytes[idx] == b'(' {
         let key_start = idx + 1;
         let mut key_end = None;
-        for i in key_start..n {
-            if bytes[i] == b')' {
+        for (i, &c) in bytes.iter().enumerate().take(n).skip(key_start) {
+            if c == b')' {
                 key_end = Some(i);
                 break;
             }
@@ -152,17 +159,7 @@ fn parse_one_printf_spec(
 ///
 /// `key` is `None` when no mapping key was present.
 #[pyfunction]
-pub fn rust_parse_conversion_specifiers(
-    format_str: &str,
-) -> Vec<(
-    String,
-    usize,
-    Option<String>,
-    String,
-    String,
-    String,
-    String,
-)> {
+pub fn rust_parse_conversion_specifiers(format_str: &str) -> Vec<PrintfSpecTuple> {
     let bytes = format_str.as_bytes();
     let n = bytes.len();
     let mut result = Vec::new();
@@ -243,9 +240,8 @@ pub fn rust_find_non_escaped_targets(format_value: &str) -> (i32, Vec<(String, u
 }
 
 // ===== str.format() specifier parsing =====
-//
-// Mirrors FORMAT_RE_NEW (built-in types) and FORMAT_RE_NEW_CUSTOM.
-// Both use fullmatch. If FORMAT_RE_NEW doesn't match, try CUSTOM.
+// Mirrors FORMAT_RE_NEW (built-in types) and FORMAT_RE_NEW_CUSTOM, both
+// fullmatch. If FORMAT_RE_NEW doesn't match, try CUSTOM.
 
 struct NewFormatSpec {
     key: Option<String>,
