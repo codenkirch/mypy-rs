@@ -108,8 +108,9 @@ with plugin hooks, and is called from `check_call` (Instance branch),
 `checkexpr`, and recursively. Must use the "Rust returns result +
 descriptor, Python applies mutations" pattern.
 
-**Dependencies:** M23 (expand_type resolver fix) should land first —
-`analyze_member_access` calls `expand_type` for generic member access.
+**Dependencies:** M23 (expand_type resolver fix) is RESOLVED (PR #220) —
+`analyze_member_access` calls `expand_type` for generic member access. M20
+can proceed.
 
 **Parity gates:** testcheck, testtypes, fine-grained.
 
@@ -160,12 +161,23 @@ interaction.
 
 ---
 
-## Issue #301: M23 — Fix `expand_type` resolver (316 known failures)
+## Issue #301: M23 — Fix `expand_type` resolver (316 known failures) — RESOLVED
+
+**Status:** RESOLVED via PR #220 (commit 14ccc0f901, merged Aug 4 2026).
+The resolver is uncommented in build.py:1261 and graduated to production.
 
 **Scope:** Fix the 316 parity failures in the `expand_type` resolver and
 uncomment `_set_native_expand_type_resolver(resolver)` in build.py.
 
-**Current Rust:** `expandtype.rs` (805 lines) exists. Resolver commented out.
+**What was fixed:** Three parity gaps in the Python shim
+(`_needs_python`/`_env_substitutes_unsafe` in expandtype.py):
+- Named callables substituted from the env lose their FuncDef/Decorator
+  definition node on a wire round-trip, corrupting error formatting.
+- Recursive TypeAliasType would loop during decode, hanging testcheck.
+- Walking every env value per expand call was O(env), blowing up RSS to
+  20GB+ on big-literal tests.
+
+**Current Rust:** `expandtype.rs` (805 lines) exists. Resolver active.
 
 **Rust work:** Fix failure categories in existing code. No new LOC expected,
 just bug fixes.
@@ -175,7 +187,8 @@ just bug fixes.
 
 **Risk:** Medium. Failures are in generic substitution edge cases.
 
-**Parity gates:** `NativeExpandTypeSuite`, testcheck, testtypes.
+**Parity gates:** testcheck (8151 passed/0 failed), testtypes (313/0),
+testinfer (106/0).
 
 **Why it matters:** Unblocks M20 (checkmember needs expand_type).
 
@@ -361,12 +374,12 @@ porting `nodes.py`/`types.py` (high risk) or the tooling modules
 Phase 1 (parallel, no deps):
   #296 M18 subtype active (flag flip)
   #297 M19 checkstrformat
-  #301 M23 expand_type fix
+  #301 M23 expand_type fix (DONE — PR #220)
   #302 M24 typeops fix
   #304 M26 traverser
   #305 M27 suggestions
 
-Phase 2 (after M23):
+Phase 2 (after M23 — M23 is done, can proceed):
   #298 M20 checkmember
   #299 M21 messages
   #300 M22 checkpattern

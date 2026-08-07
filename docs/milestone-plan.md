@@ -22,7 +22,7 @@
 - `erase_type`, `remove_instance_last_known_values`
 - `join` (active + resolver)
 - `mro` (active + resolver)
-- `expand_type` (active only; resolver commented out, 316 known failures)
+- `expand_type` (active + resolver, graduated to production via PR #220)
 - `typeops` (active only; resolver commented out)
 - `semanal` (active, visitor helpers)
 - `typeanal` (active, queries)
@@ -119,11 +119,16 @@
 **LOC impact:** ~800 Rust lines
 **Priority:** Low — pattern matching is not on the hot path for most codebases
 
-### M23: `expand_type` Resolver Fix
+### M23: `expand_type` Resolver Fix (RESOLVED)
 **Goal:** Fix the 316 known parity failures in the `expand_type` resolver and uncomment it in build.py.
-**Current state:** `expand_type` active flag is on (per-call gate works), but the resolver is commented out due to 316 failures.
+**Current state:** RESOLVED via PR #220 (commit 14ccc0f901). The resolver is
+uncommented in build.py:1261 and graduated to production. Three parity gaps
+(named-callable definition loss on env substitution, recursive TypeAliasType
+decode loops, O(env) per-call memory growth) were fixed with targeted
+`_needs_python`/`_env_substitutes_unsafe` deferrals. Full parity verified:
+testcheck 8151/0, testtypes 313/0, testinfer 106/0.
 **Risk:** Medium — the failures are in generic substitution edge cases.
-**Steps:**
+**Steps:** (completed)
 1. Run expand_type parity suite, categorize failures
 2. Fix each failure category
 3. Uncomment `_set_native_expand_type_resolver(resolver)` in build.py
