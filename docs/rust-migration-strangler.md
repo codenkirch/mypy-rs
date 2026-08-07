@@ -1869,9 +1869,8 @@ inference is the remaining Stage 4 work. Open design questions:
    classifier that returns early (low risk) vs. full arg-binding
    port (high risk, needs `freshen_function_type_vars`,
    `infer_type_vars`, `applytype`). Note: `applytype` resolver is
-   installed (Stage 6c) but `expand_type` is *commented out* with ~316
-   known failures, a warning that generic-substitution in Rust is not
-   yet parity-safe.
+   installed (Stage 6c) and `expand_type` is graduated to production
+   (PR #220), so generic-substitution in Rust is parity-safe.
 4. **Scope of the snapshot.** `PluginHookRegistry` currently holds one
    combined `HashSet<String>`. The 4 hooks are one set because
    `plugin_call_hook_known_absent` only needs to prove absence across
@@ -1902,10 +1901,10 @@ inference is the remaining Stage 4 work. Open design questions:
   overhead (the discarded fast-path) more than the snapshot lookup.
 - **High** on the future full port: `check_callable_call` touches
   type-var inference, `store_type`, and the plugin callbacks. The
-  `expand_type` parity gap (316 failures) warns that generic
-  substitution in Rust is not yet safe. The full port should follow
-  the same incremental staging as Stage 3 (a/b/c sub-stages,
-  parity-only first, then production wiring).
+  `expand_type` is graduated to production (PR #220, zero parity
+  failures), so generic substitution in Rust is safe. The full port
+  should follow the same incremental staging as Stage 3 (a/b/c
+  sub-stages, parity-only first, then production wiring).
 
 ## Milestone 17 (M17) Graduation Benchmark
 
