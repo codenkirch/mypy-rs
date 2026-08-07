@@ -390,8 +390,8 @@ except ImportError:
     _rust_make_any_non_explicit = None  # type: ignore[assignment]
     _rust_make_any_non_unimported = None  # type: ignore[assignment]
     _rust_replace_implicit_first_type = None  # type: ignore[assignment]
-    _SemanalWriteBuffer = None  # type: ignore[assignment]
-    _SemanalReadBuffer = None  # type: ignore[assignment]
+    _SemanalWriteBuffer = None  # type: ignore[assignment,misc]
+    _SemanalReadBuffer = None  # type: ignore[assignment,misc]
     _semanal_read_type = None  # type: ignore[assignment]
     _SEMANAL_HAS_KERNEL = False
 
@@ -8290,7 +8290,7 @@ def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
                 buf = _SemanalReadBuffer(bytes(result))
                 decoded = fixup_wire_type(_semanal_read_type(buf))
                 if decoded is not None:
-                    return decoded
+                    return cast(FunctionLike, decoded)
         except (AssertionError, NotImplementedError):
             pass
     if isinstance(sig, CallableType):

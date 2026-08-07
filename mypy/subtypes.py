@@ -87,7 +87,7 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from

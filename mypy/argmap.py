@@ -28,7 +28,7 @@ try:
 
     _HAS_LIBRT = True
 except ImportError:
-    _ArgMapWriteBuffer = None  # type: ignore[assignment]
+    _ArgMapWriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_LIBRT = False
 
 # Stage 4 type-kernel seam: when the `type_kernel` Rust extension is
@@ -329,6 +329,7 @@ class ArgTypeExpander:
                 decision, name, new_tuple_index, _ = result
                 if decision == _DECISION_TUPLE:
                     self.tuple_index = new_tuple_index
+                    assert isinstance(actual_type, TupleType)
                     item = actual_type.items[self.tuple_index - 1]
                     if isinstance(item, UnpackType) and not allow_unpack:
                         # An unpack item that doesn't have special handling,
@@ -346,6 +347,7 @@ class ArgTypeExpander:
                     return item
                 elif decision == _DECISION_KWARG:
                     assert name is not None
+                    assert isinstance(actual_type, TypedDictType)
                     if self.kwargs_used is None:
                         self.kwargs_used = set()
                     self.kwargs_used.add(name)

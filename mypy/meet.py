@@ -77,7 +77,7 @@ def trivial_meet(s: Type, t: Type) -> ProperType:
         and not isinstance(t, ErasedType)
     ):
         try:
-            result = join._type_kernel.rust_trivial_meet(
+            result = join._type_kernel.rust_trivial_meet(  # type: ignore[attr-defined]
                 join._serialize_type(s),
                 join._serialize_type(t),
                 False,  # ignore_type_params
@@ -165,7 +165,7 @@ def meet_types(s: Type, t: Type) -> ProperType:
         and not isinstance(t, ErasedType)
     ):
         try:
-            result = join._type_kernel.rust_meet_types(
+            result = join._type_kernel.rust_meet_types(  # type: ignore[attr-defined]
                 join._serialize_type(s),
                 join._serialize_type(t),
                 state.strict_optional,
@@ -189,10 +189,12 @@ def meet_types(s: Type, t: Type) -> ProperType:
                 # then resolve wire-only `type_ref` strings to live
                 # TypeInfo via join._fixup_decoded_type. If any type_ref
                 # is missing, defer to Python.
-                decoded = read_type(join._ReadBuffer(bytes(encoded)))
-                fixed = join._fixup_decoded_type(decoded)
+                decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
+                from mypy.wirefixup import fixup_wire_type
+
+                fixed = fixup_wire_type(decoded)
                 if fixed is not None:
-                    return fixed
+                    return fixed  # type: ignore[return-value]
                 # Fall through to Python.
             # disc == 2 (Object), 5 (Ancestor), 6 (SameTypeWithArgs)
             # are join-only results; meet_types never emits them. Fall
@@ -234,7 +236,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
         and not isinstance(narrowed, PartialType)
     ):
         try:
-            encoded = join._type_kernel.rust_narrow_declared_type(
+            encoded = join._type_kernel.rust_narrow_declared_type(  # type: ignore[attr-defined]
                 join._serialize_type(declared),
                 join._serialize_type(narrowed),
                 state.strict_optional,
@@ -243,7 +245,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
         except (AssertionError, NotImplementedError):
             encoded = None
         if encoded is not None:
-            decoded = read_type(join._ReadBuffer(bytes(encoded)))
+            decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
             from mypy.types import instance_cache
             from mypy.wirefixup import fixup_wire_type
 
@@ -508,7 +510,7 @@ def is_overlapping_types(
         and not isinstance(right, PartialType)
     ):
         try:
-            result = join._type_kernel.rust_is_overlapping_types(
+            result = join._type_kernel.rust_is_overlapping_types(  # type: ignore[attr-defined]
                 join._serialize_type(left),
                 join._serialize_type(right),
                 ignore_promotions,
@@ -519,7 +521,7 @@ def is_overlapping_types(
         except (AssertionError, NotImplementedError):
             result = None
         if result is not None:
-            return result
+            return result  # type: ignore[no-any-return]
 
     if isinstance(left, TypeGuardedType) or isinstance(right, TypeGuardedType):
         # A type guard forces the new type even if it doesn't overlap the old.

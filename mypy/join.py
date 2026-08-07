@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, overload
+from typing import Any, cast, overload
 
 import mypy.typeops
 from mypy.expandtype import expand_type
@@ -65,8 +65,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
@@ -361,7 +361,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
             elif disc == 1:
                 return t
             elif disc == 2:
-                return object_or_any_from_type(get_proper_type(t))
+                return object_or_any_from_type(t)
             elif disc == 3:
                 return UninhabitedType() if state.strict_optional else NoneType()
             elif disc == 4:
@@ -422,7 +422,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                                 else t_args[i]
                             )
                             new_args.append(
-                                AnyType(TypeOfAny.from_another_any, get_proper_type(src))
+                                AnyType(TypeOfAny.from_another_any, cast(AnyType, get_proper_type(src)))
                             )
                     return Instance(type_info, new_args)
         # Rust returned None (unsupported case) — fall through to Python.

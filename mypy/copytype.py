@@ -43,8 +43,8 @@ try:
     _COPY_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_copy_type = None  # type: ignore[assignment]
-    _CopyWriteBuffer = None  # type: ignore[assignment]
-    _CopyReadBuffer = None  # type: ignore[assignment]
+    _CopyWriteBuffer = None  # type: ignore[assignment,misc]
+    _CopyReadBuffer = None  # type: ignore[assignment,misc]
     _copy_read_type = None  # type: ignore[assignment]
     _COPY_HAS_TYPE_KERNEL = False
 

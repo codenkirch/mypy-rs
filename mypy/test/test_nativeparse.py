@@ -56,6 +56,7 @@ try:
     # upstream ast_serialize that imports but writes an incompatible format)
     # is caught here and the native suites are skipped instead of failing.
     _state = State(_options)
+    assert _node.raw_data is not None
     _data = ReadBuffer(_node.raw_data.defs)
     _n = read_int(_data)
     _node.defs = read_statements(_state, _data, _n)

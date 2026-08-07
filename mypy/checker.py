@@ -347,8 +347,8 @@ except ImportError:
     _rust_try_handler_union = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
     _CheckerStmtWriteBuffer = None  # type: ignore[misc, assignment]
-    _CheckerReadBuffer = None  # type: ignore[assignment]
-    _CheckerWriteBuffer = None  # type: ignore[assignment]
+    _CheckerReadBuffer = None  # type: ignore[assignment,misc]
+    _CheckerWriteBuffer = None  # type: ignore[assignment,misc]
     _checker_read_type = None  # type: ignore[assignment]
     _CHECKER_HAS_TYPE_KERNEL = False
 

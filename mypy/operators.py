@@ -135,18 +135,18 @@ try:
     from type_kernel import rust_operator_tables as _rust_operator_tables
 
     _rust_tables = _rust_operator_tables()
-    op_methods = _rust_tables["op_methods"]  # type: ignore[assignment]
-    op_methods_to_symbols = _rust_tables["op_methods_to_symbols"]  # type: ignore[assignment]
-    reverse_op_methods = _rust_tables["reverse_op_methods"]  # type: ignore[assignment]
-    unary_op_methods = _rust_tables["unary_op_methods"]  # type: ignore[assignment]
-    flip_ops = _rust_tables["flip_ops"]  # type: ignore[assignment]
-    neg_ops = _rust_tables["neg_ops"]  # type: ignore[assignment]
-    ops_with_inplace_method = _rust_tables["ops_with_inplace_method"]  # type: ignore[assignment]
-    inplace_operator_methods = _rust_tables["inplace_operator_methods"]  # type: ignore[assignment]
-    ops_falling_back_to_cmp = _rust_tables["ops_falling_back_to_cmp"]  # type: ignore[assignment]
-    reverse_op_method_names = _rust_tables["reverse_op_method_names"]  # type: ignore[assignment]
-    normal_from_reverse_op = _rust_tables["normal_from_reverse_op"]  # type: ignore[assignment]
-    op_methods_that_shortcut = _rust_tables["op_methods_that_shortcut"]  # type: ignore[assignment]
+    op_methods = _rust_tables["op_methods"]  # type: ignore[assignment,misc]
+    op_methods_to_symbols = _rust_tables["op_methods_to_symbols"]  # type: ignore[assignment,misc]
+    reverse_op_methods = _rust_tables["reverse_op_methods"]  # type: ignore[assignment,misc]
+    unary_op_methods = _rust_tables["unary_op_methods"]  # type: ignore[assignment,misc]
+    flip_ops = _rust_tables["flip_ops"]  # type: ignore[assignment,misc]
+    neg_ops = _rust_tables["neg_ops"]  # type: ignore[assignment,misc]
+    ops_with_inplace_method = _rust_tables["ops_with_inplace_method"]  # type: ignore[assignment,misc]
+    inplace_operator_methods = _rust_tables["inplace_operator_methods"]  # type: ignore[assignment,misc]
+    ops_falling_back_to_cmp = _rust_tables["ops_falling_back_to_cmp"]  # type: ignore[assignment,misc]
+    reverse_op_method_names = _rust_tables["reverse_op_method_names"]  # type: ignore[assignment,misc]
+    normal_from_reverse_op = _rust_tables["normal_from_reverse_op"]  # type: ignore[assignment,misc]
+    op_methods_that_shortcut = _rust_tables["op_methods_that_shortcut"]  # type: ignore[assignment,misc]
     del _rust_tables
 except ImportError:
     pass

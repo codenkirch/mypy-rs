@@ -24,6 +24,8 @@ identifies them.
 
 from __future__ import annotations
 
+from typing import Any
+
 from librt.internal import (
     write_int as write_int_bare,
 )
@@ -174,8 +176,8 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
     # Track visited nodes to break cycles (e.g. NameExpr.node → FuncDef
     # → body → NameExpr). Re-serialized nodes write LITERAL_NONE.
     visited: set[int] = set()
-    # Task stack: ("end",), ("none",), ("list", items), ("node", node)
-    stack: list = [("node", node)]
+    # Task stack: ("end", None), ("none", None), ("list", items), ("node", node)
+    stack: list[tuple[str, Any]] = [("node", node)]
     while stack:
         task = stack.pop()
         kind = task[0]
@@ -191,7 +193,7 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
                 if isinstance(item, nodes.Node):
                     stack.append(("node", item))
                 else:
-                    stack.append(("none",))
+                    stack.append(("none", None))
         elif kind == "node":
             n = task[1]
             cls = type(n)
@@ -208,7 +210,7 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             slots = _get_all_slots(cls)
 
             # Collect child fields (Node or list-of-Node).
-            child_fields: list = []
+            child_fields: list[Any] = []
             for slot in slots:
                 value = getattr(n, slot, None)
                 if value is None:
@@ -229,10 +231,10 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             write_int_bare(buf, len(child_fields))
             # Push END_TAG first (LIFO → processed last), then fields
             # in reverse order so they pop in forward order.
-            stack.append(("end",))
+            stack.append(("end", None))
             for field in reversed(child_fields):
                 if field is None:
-                    stack.append(("none",))
+                    stack.append(("none", None))
                 elif isinstance(field, nodes.Node):
                     stack.append(("node", field))
                 else:

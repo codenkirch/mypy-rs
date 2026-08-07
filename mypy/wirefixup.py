@@ -33,8 +33,10 @@ from mypy.types import (
     Type,
     TypeAliasType,
     TypeType,
+    TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
+    get_proper_type,
 )
 
 # type_visitor needs to be imported after types
@@ -108,17 +110,22 @@ class _FreshVarCanonicalizer(TypeTranslator):
             return t
         return self._canonical(t, self._key(t))
 
+    def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
+        return t
+
     def visit_callable_type(self, t: CallableType, /) -> Type:
         # Base translator leaves `variables`, `type_guard`, `type_is`
         # untranslated; traverse them so fresh vars inside are unified.
-        result = super().visit_callable_type(t)
+        result = get_proper_type(super().visit_callable_type(t))
         if not isinstance(result, CallableType):
             return result
         variables = [v.accept(self) for v in result.variables]
         type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
         type_is = t.type_is.accept(self) if t.type_is is not None else None
         return result.copy_modified(
-            variables=variables, type_guard=type_guard, type_is=type_is
+            variables=variables,  # type: ignore[arg-type]
+            type_guard=type_guard,
+            type_is=type_is,
         )
 
 
@@ -156,11 +163,11 @@ class _TypeRefFixer(TypeTranslator):
             t.type_ref = None
         if self.missing:
             return t
-        result = super().visit_instance(t)
+        result = get_proper_type(super().visit_instance(t))
         if isinstance(result, Instance) and result.extra_attrs is not None:
             attrs = {k: v.accept(self) for k, v in result.extra_attrs.attrs.items()}
             if self.missing:
-                return t
+                return t  # type: ignore[unreachable]
             extra = result.extra_attrs.copy()
             extra.attrs = attrs
             result.extra_attrs = extra
@@ -171,8 +178,8 @@ class _TypeRefFixer(TypeTranslator):
             return t
         fallback = t.fallback.accept(self)
         if self.missing:
-            return t
-        result = super().visit_callable_type(t)
+            return t  # type: ignore[unreachable]
+        result = get_proper_type(super().visit_callable_type(t))
         if not isinstance(result, CallableType):
             return result
         # translate_variables returns vars as-is (base translator
@@ -180,23 +187,23 @@ class _TypeRefFixer(TypeTranslator):
         # get TypeInfo fixed up.
         variables = [v.accept(self) for v in result.variables]
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         # Base translator also skips type_guard/type_is.
         type_guard = None
         if t.type_guard is not None:
             tg = t.type_guard.accept(self)
             if self.missing:
-                return t
+                return t  # type: ignore[unreachable]
             type_guard = tg
         type_is = None
         if t.type_is is not None:
             ti = t.type_is.accept(self)
             if self.missing:
-                return t
+                return t  # type: ignore[unreachable]
             type_is = ti
         return result.copy_modified(
-            fallback=fallback,
-            variables=variables,
+            fallback=fallback,  # type: ignore[arg-type]
+            variables=variables,  # type: ignore[arg-type]
             type_guard=type_guard,
             type_is=type_is,
         )
@@ -211,13 +218,13 @@ class _TypeRefFixer(TypeTranslator):
             return t
         upper_bound = t.upper_bound.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         values = [v.accept(self) for v in t.values]
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         default = t.default.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         return t.copy_modified(upper_bound=upper_bound, values=values, default=default)
 
     def visit_param_spec(self, t: ParamSpecType, /) -> Type:
@@ -225,10 +232,10 @@ class _TypeRefFixer(TypeTranslator):
             return t
         default = t.default.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         prefix = t.prefix.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         assert isinstance(prefix, Parameters)
         # copy_modified keeps upper_bound (it is determined by flavor).
         return t.copy_modified(default=default, prefix=prefix)
@@ -238,17 +245,17 @@ class _TypeRefFixer(TypeTranslator):
             return t
         tuple_fallback = t.tuple_fallback.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         upper_bound = t.upper_bound.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         default = t.default.accept(self)
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         result = t.copy_modified(upper_bound=upper_bound, default=default)
         # copy_modified keeps tuple_fallback; swap it on the fresh copy.
         assert isinstance(result, TypeVarTupleType)
-        result.tuple_fallback = tuple_fallback
+        result.tuple_fallback = tuple_fallback  # type: ignore[assignment]
         return result
 
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
@@ -256,7 +263,7 @@ class _TypeRefFixer(TypeTranslator):
             return t
         args = [a.accept(self) for a in t.args]
         if self.missing:
-            return t
+            return t  # type: ignore[unreachable]
         return t.copy_modified(args=args)
 
 

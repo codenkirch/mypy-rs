@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import Any, cast
 
 import mypy.subtypes
 from mypy.erasetype import erase_typevars
@@ -52,8 +52,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _write_int_bare = None  # type: ignore[assignment]
     _write_tag = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
@@ -98,10 +98,6 @@ def _contains_named_callable(types: Sequence[Type | None]) -> bool:
         elif isinstance(t, TupleType):
             stack.extend(t.items)
     return False
-
-
-class _TypeVarMetaCollector(mypy.type_visitor.TypeQuery[dict[tuple[int, str], int]]):
-    """Walk a live type tree, mapping (raw_id, namespace) -> meta_level."""
 
 
 def _set_native_applytype_resolver(resolver: Any) -> None:
@@ -193,7 +189,7 @@ def _merge_meta_map(dst: dict[tuple[int, str], int], src: dict[tuple[int, str], 
 _META_CONFLICT = -1
 
 
-class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list]):
+class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list[Any]]):
     """Restore meta_level onto a freshly decoded type tree (in place)."""
 
     def __init__(self, meta: dict[tuple[int, str], int]) -> None:
@@ -201,7 +197,7 @@ class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list]):
         self.meta = meta
         self.missing = False
 
-    def strategy(self, items: list[list]) -> list:
+    def strategy(self, items: list[list[Any]]) -> list[Any]:
         return []
 
     def _fix(self, t: TypeVarLikeType) -> None:
@@ -214,25 +210,25 @@ class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list]):
             return
         t.id.meta_level = meta
 
-    def visit_type_var(self, t: TypeVarType, /) -> list:
+    def visit_type_var(self, t: TypeVarType, /) -> list[Any]:
         self._fix(t)
         if self.missing:
             return []
         return super().visit_type_var(t)
 
-    def visit_param_spec(self, t: ParamSpecType, /) -> list:
+    def visit_param_spec(self, t: ParamSpecType, /) -> list[Any]:
         self._fix(t)
         if self.missing:
             return []
         return super().visit_param_spec(t)
 
-    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> list:
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> list[Any]:
         self._fix(t)
         if self.missing:
             return []
         return super().visit_type_var_tuple(t)
 
-    def visit_callable_type(self, t: CallableType, /) -> list:
+    def visit_callable_type(self, t: CallableType, /) -> list[Any]:
         # Base TypeQuery skips variables, type_guard and type_is.
         result = super().visit_callable_type(t)
         if self.missing:
@@ -376,8 +372,8 @@ def apply_generic_arguments(
                     # Wire round-trip loses line/column/definition.
                     # Restore them from the original callable so error
                     # locations and special-signature dispatch agree.
-                    if isinstance(decoded, CallableType):
-                        decoded = decoded.copy_modified(
+                    if isinstance(get_proper_type(decoded), CallableType):
+                        decoded = cast(CallableType, decoded).copy_modified(
                             line=callable.line,
                             column=callable.column,
                             definition=callable.definition,
@@ -390,14 +386,14 @@ def apply_generic_arguments(
 
                         fixed = fixup_wire_type(decoded)
                         if fixed is not None:
-                            assert isinstance(fixed, CallableType)
+                            assert isinstance(get_proper_type(fixed), CallableType)
                             # Any residual fake TypeInfo crashes later
                             # serialization, so defer instead.
                             if check_no_fake_info(fixed):
-                                return fixed
+                                return cast(CallableType, fixed)
                     else:
-                        assert isinstance(decoded, CallableType)
-                        return decoded
+                        assert isinstance(get_proper_type(decoded), CallableType)
+                        return cast(CallableType, decoded)
         except (NotImplementedError, AssertionError):
             # AssertionError: TypeInfo not yet fixed during semanal.
             # NotImplementedError: unserializable variant.

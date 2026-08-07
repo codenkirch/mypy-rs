@@ -392,7 +392,9 @@ def can_subclass_builtin(builtin_base: str) -> bool:
     # BaseException and dict are special cased.
     if _MYPYC_HAS_KERNEL:
         try:
-            return _rust_can_subclass_builtin(builtin_base)
+            result = _rust_can_subclass_builtin(builtin_base)
+            if result is not None:
+                return result
         except (AssertionError, NotImplementedError):
             pass
     return builtin_base in (

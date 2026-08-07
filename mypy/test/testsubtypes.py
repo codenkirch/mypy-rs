@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from unittest import skipUnless
 
-from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT
+from mypy.nodes import CONTRAVARIANT, COVARIANT, INVARIANT, TypeInfo
 from mypy.subtypes import is_subtype
 from mypy.test.helpers import Suite
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
@@ -351,7 +351,7 @@ class NativeSubtypeSuite(Suite):
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         # The fixture stores TypeInfo objects on its `*i` attributes.
         infos = []
         for name in dir(self.fx):
@@ -414,7 +414,9 @@ class NativeSubtypeSuite(Suite):
         from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
         from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
 
-        def make_class(name, *, bases, typevars):
+        def make_class(
+            name: str, *, bases: list[Instance], typevars: list[str]
+        ) -> TypeInfo:
             defn = ClassDef(name, Block([]), None, [])
             defn.fullname = name
             defn.type_vars = [
@@ -582,7 +584,7 @@ class NativeSubtypeGapSuite(Suite):
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         from mypy.nodes import TypeInfo
 
         infos: list[TypeInfo] = []
@@ -729,7 +731,7 @@ class NativeOverlapSuite(Suite):
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         from mypy.nodes import TypeInfo
 
         infos: list[TypeInfo] = []
@@ -847,7 +849,7 @@ class NativeNarrowDeclaredSuite(Suite):
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         from mypy.nodes import TypeInfo
 
         infos: list[TypeInfo] = []
@@ -875,7 +877,7 @@ class NativeNarrowDeclaredSuite(Suite):
         _set_native_join_active(True)
         _set_native_subtype_active(True)
 
-    def _assert_parity(self, declared, narrowed) -> None:
+    def _assert_parity(self, declared: Type, narrowed: Type) -> None:
         from mypy.state import state
 
         expected = None

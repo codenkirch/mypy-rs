@@ -56,8 +56,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag, set by the build manager from
@@ -294,14 +294,15 @@ def solve_constraints(
                 out = _native_solve_dependent_result(result, originals)
                 if out is not None:
                     solutions_out, _ = out
-                    res: list[Type | None] | None = []
+                    rust_res: list[Type | None] | None = []
                     for v in vars:
                         if v not in solutions_out:
-                            res = None
+                            rust_res = None
                             break
-                        res.append(solutions_out[v])
-                    if res is not None:
-                        return res, []
+                        assert rust_res is not None
+                        rust_res.append(solutions_out[v])
+                    if rust_res is not None:
+                        return rust_res, []
         solutions = {}
         free_vars = []
         for tv, cs in cmap.items():

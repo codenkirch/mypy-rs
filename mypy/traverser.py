@@ -126,7 +126,7 @@ except ImportError:
     _rust_has_yield_from_expression = None  # type: ignore[assignment]
     _rust_has_await_expression = None  # type: ignore[assignment]
     _ast_serialize_node = None  # type: ignore[assignment]
-    _AstWriteBuffer = None  # type: ignore[assignment]
+    _AstWriteBuffer = None  # type: ignore[assignment,misc]
     _TRAVERSER_HAS_KERNEL = False
 
 

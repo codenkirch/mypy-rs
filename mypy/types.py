@@ -4275,8 +4275,8 @@ except ImportError:
     _rust_flatten_nested_unions = None  # type: ignore[assignment]
     _rust_flatten_nested_tuples = None  # type: ignore[assignment]
     _rust_copy_type = None  # type: ignore[assignment]
-    _VisitorWriteBuffer = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
+    _VisitorWriteBuffer = None  # type: ignore[assignment,misc]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
     _visitor_read_type = None  # type: ignore[assignment]
     _VISITOR_HAS_TYPE_KERNEL = False
 
@@ -4325,7 +4325,7 @@ def _encode_literal_value(value: LiteralValue) -> tuple[str, str]:
         return ("float", repr(value))
     if isinstance(value, str):
         return ("str", value)
-    if isinstance(value, bytes):
+    if isinstance(value, bytes):  # type: ignore[unreachable]
         return ("bytes", value.decode("latin-1"))
     return ("", "")
 
@@ -4602,7 +4602,7 @@ def callable_with_ellipsis(any_type: AnyType, ret_type: Type, fallback: Instance
 def remove_dups(types: list[T]) -> list[T]:
     if _VISITOR_HAS_TYPE_KERNEL and _native_visitor_types_active and len(types) > 1:
         try:
-            type_bytes_list = _serialize_type_list_for_visitor(types)
+            type_bytes_list = _serialize_type_list_for_visitor(types)  # type: ignore[arg-type]
             result = _rust_remove_dups(type_bytes_list)
             return _deserialize_type_list_from_visitor(result)  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):

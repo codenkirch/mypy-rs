@@ -28,7 +28,7 @@ from mypy.build import BuildManager
 def _install_native_resolvers_patch() -> None:
     original = BuildManager._build_native_resolvers
 
-    def patched(self):
+    def patched(self: BuildManager) -> None:
         original(self)
         if not self.options.native_type_kernel:
             return
@@ -192,7 +192,7 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
-    BuildManager._build_native_resolvers = patched
+    BuildManager._build_native_resolvers = patched  # type: ignore[method-assign]
 
 
 if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_RESOLVERS") and os.environ.get(
