@@ -689,3 +689,120 @@ def _is_type_info(value: object) -> bool:
     from mypy.nodes import TypeInfo
 
     return isinstance(value, TypeInfo)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeOverlapSuite(Suite):
+    """Parity suite for the Rust `is_overlapping_types` (Stage 3d M9).
+
+    Reruns overlap cases with the native type-kernel seam active. The
+    Rust path (`crates/type_kernel/src/meet.rs`) decides literal and
+    nominal-instance cases itself and returns `None` (falling through to
+    the pure-Python `mypy.meet.is_overlapping_types`) for unions with
+    None, callables, tuples, TypeTypes and aliases. Because `None`
+    triggers the Python fallback, every assertion here must equal the
+    pure-Python answer; the cases Rust decides itself validate the Rust
+    branch directly.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.meet import is_overlapping_types
+
+        self.overlap = is_overlapping_types
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # The meet seam reads the join-owned resolver (shared with the
+        # subtype seam), and internally calls the native is_subtype.
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list:
+        from mypy.nodes import TypeInfo
+
+        infos: list[TypeInfo] = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if isinstance(value, TypeInfo):
+                infos.append(value)
+        return infos
+
+    def test_literal_literal(self) -> None:
+        # Rust decides literal-vs-literal: distinct literal values on the
+        # same fallback never overlap.
+        assert not self.overlap(self.fx.lit1, self.fx.lit2)
+        assert not self.overlap(self.fx.lit_str1, self.fx.lit_str2)
+        assert self.overlap(self.fx.lit1, self.fx.lit1)
+
+    def test_literal_instance(self) -> None:
+        # A literal overlaps its (literal-valued) instance and its proper
+        # type. Rust handles both lit/instance and lit/proper pairs.
+        assert self.overlap(self.fx.lit1, self.fx.lit1_inst)
+        assert self.overlap(self.fx.lit1, self.fx.a)
+        assert self.overlap(self.fx.a, self.fx.lit1)
+
+    def test_nominal_instance(self) -> None:
+        # Rust decides nominal overlap via is_subtype both directions.
+        assert self.overlap(self.fx.b, self.fx.a)  # B <: A
+        assert self.overlap(self.fx.a, self.fx.b)  # and reverse
+        assert not self.overlap(self.fx.b, self.fx.c)  # siblings
+        assert not self.overlap(self.fx.d, self.fx.a)
+
+    def test_generic_instance(self) -> None:
+        # Same tag, pairwise-compatible args: Rust's instances_overlap
+        # walks the args (G[A] vs G[B] overlaps since A/B both instanceof
+        # object; G[A] vs G[D] does not since D is unrelated to A).
+        assert self.overlap(self.fx.ga, self.fx.ga)
+        assert not self.overlap(self.fx.ga, self.fx.gd)
+        assert self.overlap(self.fx.ga, self.fx.go)
+
+    def test_none_union(self) -> None:
+        from mypy.types import UnionType
+
+        # None vs plain instance: Rust defers (Union-with-None needs the
+        # relevant_items simplification), Python says False.
+        assert not self.overlap(self.fx.nonet, self.fx.a)
+        # None vs Optional: True via the strict-optional union path.
+        assert self.overlap(self.fx.nonet, UnionType([self.fx.a, self.fx.nonet]))
+
+    def test_union(self) -> None:
+        from mypy.types import UnionType
+
+        assert self.overlap(UnionType([self.fx.a, self.fx.b]), UnionType([self.fx.b, self.fx.c]))
+        assert self.overlap(self.fx.a, UnionType([self.fx.a, self.fx.b]))
+        assert self.overlap(self.fx.a, UnionType([self.fx.b, self.fx.c]))
+
+    def test_callable(self) -> None:
+        # Rust defers callables; Python's callable overlap applies.
+        assert self.overlap(
+            self.fx.callable(self.fx.o, self.fx.d), self.fx.callable(self.fx.a, self.fx.d)
+        )
+
+    def test_tuple(self) -> None:
+        # Rust defers tuples; Python's tuple overlap applies.
+        assert self.overlap(self.fx.std_tuple, self.fx.std_tuple.copy_modified(args=[self.fx.a]))
+
+    def test_type_type(self) -> None:
+        # Rust defers TypeType (live metaclass lookups); Python decides.
+        assert self.overlap(self.fx.type_a, self.fx.type_b)
+        assert not self.overlap(self.fx.type_a, self.fx.type_d)
+
+    def test_overlap_for_overloads_kwarg(self) -> None:
+        # overlap_for_overloads is forwarded to Rust (Any branch).
+        assert not self.overlap(self.fx.anyt, self.fx.a, overlap_for_overloads=True)
+        assert self.overlap(self.fx.anyt, self.fx.o, overlap_for_overloads=True)

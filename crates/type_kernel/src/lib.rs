@@ -57,6 +57,7 @@ mod errors;
 mod expand;
 mod expandtype;
 mod lkv;
+mod meet;
 mod messages;
 mod mro;
 mod operators;
@@ -103,6 +104,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         callable_compat::rust_callables_compatible,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_is_overlapping_types, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;

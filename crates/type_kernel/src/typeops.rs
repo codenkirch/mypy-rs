@@ -435,7 +435,7 @@ pub(crate) fn rust_is_literal_type_like(t_bytes: &[u8]) -> Option<bool> {
 /// whose upper bound / values qualify.
 ///
 /// Mirrors typeops.py:1241-1257:
-/// ```
+/// ```text
 /// t = get_proper_type(t)
 /// if t is None: return False
 /// elif isinstance(t, LiteralType): return True
@@ -593,7 +593,7 @@ fn make_union(items: Vec<Type>) -> Type {
 /// expand a bool Instance into `Literal[True, False]` or an enum Instance
 /// into the union of its member literals, recursively down a Union.
 ///
-/// ```
+/// ```text
 /// typ = get_proper_type(typ)
 /// if isinstance(typ, UnionType):
 ///     items = [try_expanding_sum_type_to_union(item, target_fullname) for
@@ -621,9 +621,8 @@ fn try_expanding_sum_type_to_union_inner(
     resolver: &TypeResolver,
 ) -> Option<Type> {
     // get_proper_type: a TypeAliasType has no proper form in the wire format.
-    match typ {
-        Type::TypeAliasType { .. } => return None,
-        _ => {}
+    if let Type::TypeAliasType { .. } = typ {
+        return None;
     }
     match typ {
         Type::UnionType { items, .. } => {
@@ -693,7 +692,7 @@ fn try_expanding_sum_type_to_union_inner(
 /// a proper type, or `None` if it has no such fallback.
 ///
 /// Mirrors typeops.py:1525-1539:
-/// ```
+/// ```text
 /// t = get_proper_type(t)
 /// if isinstance(t, Instance): return t
 /// elif isinstance(t, LiteralType): return t.fallback
