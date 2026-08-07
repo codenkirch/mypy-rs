@@ -606,7 +606,6 @@ class NativeSubtypeGapSuite(Suite):
         # split_with_prefix_and_suffix path computes the answer. We
         # verify the result matches pure-Python by constructing a
         # TupleType right (the partial-fallback of a variadic class).
-        from mypy.types import AnyType, TypeOfAny, TypeVarTupleType, TypeVarId
 
         # Build a synthetic TypeInfo with has_type_var_tuple_type=True
         # by re-installing the resolver with a modified snapshot is
@@ -667,7 +666,7 @@ class NativeSubtypeGapSuite(Suite):
         # Regression guard: nested Instance args with TypeVars must
         # still be handled correctly. A[A] <: A[A] (invariant = true
         # via is_equivalent both ways).
-        from mypy.types import AnyType, TypeOfAny, TypeVarType, TypeVarId
+        from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
 
         tvar = TypeVarType(
             "T",
@@ -707,8 +706,8 @@ class NativeOverlapSuite(Suite):
 
     def setUp(self) -> None:
         from mypy.join import _set_native_join_active, _set_native_join_resolver
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
         from mypy.meet import is_overlapping_types
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
 
         self.overlap = is_overlapping_types
         self.fx = TypeFixture(INVARIANT)
@@ -806,3 +805,127 @@ class NativeOverlapSuite(Suite):
         # overlap_for_overloads is forwarded to Rust (Any branch).
         assert not self.overlap(self.fx.anyt, self.fx.a, overlap_for_overloads=True)
         assert self.overlap(self.fx.anyt, self.fx.o, overlap_for_overloads=True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeNarrowDeclaredSuite(Suite):
+    """Parity suite for the Rust `narrow_declared_type` (Stage 3d M9).
+
+    Reruns narrowing cases with the native type-kernel seam active. The
+    Rust path (`crates/type_kernel/src/meet.rs`) decides proper-type
+    equals/disjoint/union/instance/literal cases and returns `None`
+    (falling through to pure-Python `mypy.meet.narrow_declared_type`)
+    for TypeAliasType, recursive pairs, TypeType/metaclass/TypeForm,
+    TypedDict and CallableType normalizations. Because `None` triggers
+    the Python fallback, every assertion here equals the pure-Python
+    answer; the cases Rust decides itself validate the Rust branch.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.meet import narrow_declared_type
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.narrow = narrow_declared_type
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # The narrow seam reads the join-owned resolver (shared with the
+        # subtype seam); it internally calls the native is_subtype and
+        # meet paths, so activate all three.
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list:
+        from mypy.nodes import TypeInfo
+
+        infos: list[TypeInfo] = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if isinstance(value, TypeInfo):
+                infos.append(value)
+        return infos
+
+    def _python(self) -> None:
+        """Switch the seams to pure Python (control run)."""
+        from mypy.join import _set_native_join_active
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_join_active(False)
+        _set_native_subtype_active(False)
+
+    def _rust(self) -> None:
+        """Switch the seams back to the native kernel."""
+        from mypy.join import _set_native_join_active
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_join_active(True)
+        _set_native_subtype_active(True)
+
+    def _assert_parity(self, declared, narrowed) -> None:
+        from mypy.state import state
+
+        expected = None
+        # Pure-Python control first (seams off).
+        self._python()
+        with state.strict_optional_set(True):
+            expected = self.narrow(declared, narrowed)
+        # Rust path (seams on).
+        self._rust()
+        with state.strict_optional_set(True):
+            actual = self.narrow(declared, narrowed)
+        assert actual == expected, (
+            f"Rust ({actual}) != Python ({expected}) for narrow_declared_type"
+            f"({declared!r}, {narrowed!r})"
+        )
+
+    def test_subtype_identity(self) -> None:
+        # Narrowing A to B (B <: A) keeps A; narrowing A to A keeps A.
+        self._assert_parity(self.fx.a, self.fx.b)
+        self._assert_parity(self.fx.a, self.fx.a)
+
+    def test_disjoint(self) -> None:
+        # A and D are unrelated: strict-optional gives UninhabitedType.
+        self._assert_parity(self.fx.a, self.fx.d)
+
+    def test_any(self) -> None:
+        # Narrowing to Any keeps Any.
+        self._assert_parity(self.fx.a, self.fx.anyt)
+
+    def test_union(self) -> None:
+        # Declared Union[A, B] narrowed to B -> B.
+        from mypy.types import UnionType
+
+        self._assert_parity(UnionType([self.fx.a, self.fx.b]), self.fx.b)
+
+    def test_none_narrowed(self) -> None:
+        # Declared A narrowed to None (non-optional) -> UninhabitedType.
+        self._assert_parity(self.fx.a, self.fx.nonet)
+
+    def test_typevar(self) -> None:
+        # Declared TypeVar[T] with A upper bound, narrowed to A -> T(bound=A).
+        from mypy.types import AnyType, TypeOfAny, TypeVarId, TypeVarType
+
+        tvar = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1, namespace=self.fx.ai.fullname),
+            [],
+            self.fx.a,
+            AnyType(TypeOfAny.from_omitted_generics),
+            variance=INVARIANT,
+        )
+        self._assert_parity(tvar, self.fx.b)

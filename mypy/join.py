@@ -70,16 +70,12 @@ except ImportError:
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
-# `Options.native_type_kernel` at the start of each build. Reuses the
-# subtype resolver (trivial_join only needs is_subtype, which shares
-# the same NativeTypeResolver). When `_native_join_active` is True but
-# `_native_join_resolver` is None, the shim falls through to Python.
+# `Options.native_type_kernel` per build. Reuses the subtype resolver
+# (trivial_join only needs is_subtype). None resolver = fall through.
 _native_join_active: bool = False
 _native_join_resolver: Any = None
-# fullname -> TypeInfo map, set alongside the resolver. Used to
-# construct `Instance(typeinfo, [])` when the Rust visit_instance
-# nominal join returns discriminator 5 (Ancestor). Built from the
-# same TypeInfo list passed to `build_native_resolver`.
+# fullname -> TypeInfo map, for building `Instance(typeinfo, [])` when
+# the Rust nominal join returns discriminator 5 (Ancestor).
 _native_join_typeinfo_map: dict[str, Any] | None = None
 
 
@@ -377,8 +373,16 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # TypeInfo via the fullname -> TypeInfo map. If any
                 # type_ref is missing, defer to Python.
                 decoded = read_type(_ReadBuffer(bytes(encoded)))
+                from mypy.types import instance_cache
                 from mypy.wirefixup import fixup_wire_type
 
+                # Clear instance_cache primitives so NOT_READY
+                # singletons cannot leak (mirrors _typeanal_decode).
+                instance_cache.int_type = None
+                instance_cache.str_type = None
+                instance_cache.bool_type = None
+                instance_cache.object_type = None
+                instance_cache.function_type = None
                 fixed = fixup_wire_type(decoded)
                 if fixed is not None:
                     return fixed

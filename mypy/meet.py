@@ -67,10 +67,8 @@ from mypy.types import (
 def trivial_meet(s: Type, t: Type) -> ProperType:
     """Return one of types (expanded) if it is a subtype of other, otherwise bottom type."""
     # Stage 3c (M8d): try the Rust trivial_meet path. Rust returns a
-    # discriminator (0=SameS, 1=SameT, 2=Object, 3=Bottom) or None
-    # (unsupported, e.g. non-Instance left that makes is_subtype defer).
-    # Reuses the join path's resolver + active flag. Mirrors the
-    # erasetype.py:80-86 strangler-fig contract.
+    # discriminator (0=SameS, 1=SameT, 2=Object, 3=Bottom) or None.
+    # Reuses the join path's resolver + active flag. Seam per-call gate.
     if (
         join._HAS_TYPE_KERNEL
         and join._native_join_active
@@ -157,17 +155,8 @@ def meet_types(s: Type, t: Type) -> ProperType:
     s, t = join.normalize_callables(s, t)
 
     # Stage 3c (M8p): try the Rust meet_types pre-dispatch + leaf
-    # visitors. Rust handles the AnyType/NoneType/UninhabitedType/
-    # DeletedType leaf visitors and the args-less Instance-Instance
-    # nominal meet (same-type, subtype, supertype, unrelated). Returns
-    # (disc, fullname, arg_discs) where disc is 0=SameS, 1=SameT,
-    # 3=Bottom, 4=Any, or None (defer to Python). Mirrors the
-    # erasetype.py:80-86 strangler-fig contract. Placed after the
-    # is_proper_subtype pre-check, the AnyType-s / UnionType-s
-    # pre-dispatch, and normalize_callables, so Rust only handles the
-    # visitor leaf cases (the pre-dispatch is already done in Python;
-    # Rust repeats it for the cases where is_proper_subtype returned
-    # None on non-Instance inputs).
+    # visitors, placed after normalize_callables so Rust only handles
+    # leaf cases (pre-dispatch already done in Python).
     if (
         join._HAS_TYPE_KERNEL
         and join._native_join_active
@@ -230,6 +219,46 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
 
     if declared == narrowed:
         return original_declared
+
+    # Stage 3d (M9) type-kernel seam: native narrow_declared_type handles
+    # alias-free, non-recursive proper types; None on unsupported cases
+    # (aliases/recursion/TypeType/TypedDict/Callable) -> fall through.
+    if (
+        join._HAS_TYPE_KERNEL
+        and join._native_join_active
+        and join._native_join_resolver is not None
+        and not is_recursive_pair(declared, narrowed)
+        and not isinstance(declared, ErasedType)
+        and not isinstance(narrowed, ErasedType)
+        and not isinstance(declared, PartialType)
+        and not isinstance(narrowed, PartialType)
+    ):
+        try:
+            encoded = join._type_kernel.rust_narrow_declared_type(
+                join._serialize_type(declared),
+                join._serialize_type(narrowed),
+                state.strict_optional,
+                join._native_join_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            encoded = None
+        if encoded is not None:
+            decoded = read_type(join._ReadBuffer(bytes(encoded)))
+            from mypy.types import instance_cache
+            from mypy.wirefixup import fixup_wire_type
+
+            # Clear instance_cache primitives so NOT_READY singletons
+            # cannot leak (mirrors _typeanal_decode).
+            instance_cache.int_type = None
+            instance_cache.str_type = None
+            instance_cache.bool_type = None
+            instance_cache.object_type = None
+            instance_cache.function_type = None
+            fixed = fixup_wire_type(decoded)
+            if fixed is not None:
+                return fixed
+            # Fall through to Python.
+
     if isinstance(declared, UnionType):
         declared_items = declared.relevant_items()
         if isinstance(narrowed, UnionType):

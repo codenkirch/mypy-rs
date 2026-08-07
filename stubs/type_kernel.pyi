@@ -41,6 +41,7 @@ __all__ = [
     "rust_trivial_meet",
     "rust_join_types",
     "rust_meet_types",
+    "rust_narrow_declared_type",
     "rust_map_actuals_to_formals",
     "rust_map_formals_to_actuals",
     "rust_map_actuals_to_formals_with_types",
@@ -185,6 +186,9 @@ def rust_join_types(
 def rust_meet_types(
     left: bytes, right: bytes, strict_optional: bool, resolver: NativeTypeResolver
 ) -> tuple[int, str | None, list[int], bytes] | None: ...
+def rust_narrow_declared_type(
+    declared: bytes, narrowed: bytes, strict_optional: bool, resolver: NativeTypeResolver
+) -> bytes | None: ...
 def rust_map_actuals_to_formals(
     actual_kinds: list[int],
     actual_names: list[str | None],
