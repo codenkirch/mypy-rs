@@ -10,14 +10,19 @@ name: native-kernel-parity
 # parity job below has no continue-on-error: keep it green before merging.
 
 # env-var -> issue (conftest.py): base = Stage 3c subtype/join/mro/solve.
-# TYPEOPS -> #203 (M16, blocked on #201); ERASEVARS/COPYTYPE/VISITOR_TYPES/
-# CHECKEXPR_TYPES -> #201 (M14). expand_type graduated (#199): no gate.
+# TYPEOPS -> #203 (M16, graduated); CHECKER_STMTS -> #207 (M17 Phase 1).
+# ERASEVARS/COPYTYPE/VISITOR_TYPES/CHECKEXPR_TYPES -> #201 (M14).
+# expand_type graduated (#199): no gate. All jobs build the full
+# extension set (type_kernel + ast_serialize + module_resolver) so the
+# native parser/resolver paths are exercised in CI too.
 
 on:
   pull_request:
     branches: [main]
     paths:
       - crates/type_kernel/**
+      - crates/ast_serialize/**
+      - crates/module_resolver/**
       - mypy/subtypes.py
       - mypy/join.py
       - mypy/argmap.py
@@ -26,6 +31,8 @@ on:
       - mypy/applytype.py
       - mypy/mro.py
       - mypy/build.py
+      - mypy/checker.py
+      - mypy/semanal.py
       - mypy/test/conftest.py
       - mypy/checkexpr.py
       - mypy/solve.py
@@ -84,11 +91,29 @@ jobs:
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
+      - name: Build ast_serialize extension
+        run: |
+          cargo rustc -p mypy-ast-serialize --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libast_serialize.so "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}"
+
+      - name: Build module_resolver extension
+        run: |
+          cargo rustc -p mypy-module-resolver --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
+
       - name: Parity testcheck (resolvers installed)
         env:
           PYTHONPATH: ${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_PARSER: "1"
+          TEST_NATIVE_RESOLVER: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
 
@@ -101,10 +126,8 @@ jobs:
         run: uv run python -m pytest mypy/test/testinfer.py -q --timeout=30 --timeout-method=thread
 
   parity-typeops:
-    # Non-gating: typeops graduation (#203, M16) is blocked on the #201
-    # truthiness fix and the gate is unverified in CI. Flip to gating
-    # after #201 merges and CI confirms the typeops corpus passes.
-    continue-on-error: true
+    # Gating: typeops graduation (#203, M16) shipped; the truthiness fix
+    # (#201) landed and the typeops corpus passes. Keep green before merging.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,10 +169,26 @@ jobs:
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
+      - name: Build ast_serialize extension
+        run: |
+          cargo rustc -p mypy-ast-serialize --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libast_serialize.so "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}"
+
+      - name: Build module_resolver extension
+        run: |
+          cargo rustc -p mypy-module-resolver --features extension-module \
+            --lib --crate-type cdylib --release
+          EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+          cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
+
       - name: Parity testcheck (typeops resolvers installed)
         env:
           PYTHONPATH: ${{ env.SCRATCH }}
           TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_PARSER: "1"
+          TEST_NATIVE_RESOLVER: "1"
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
