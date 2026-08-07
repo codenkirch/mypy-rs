@@ -59,20 +59,77 @@ pub(crate) fn rust_expand_type(
     if env.is_empty() {
         return None;
     }
-    // Leaf types (Any, None, Never, etc.) carry no TypeVars to substitute.
-    // Python's visitor returns `t` (the original object), preserving
-    // identity for the checker's partial-type tracker. A wire round-trip
-    // yields a fresh object, so defer to Python for leaves.
-    if is_leaf_type(&typ) {
+    expand_with_env(&typ, &env, strict_optional)
+}
+
+/// Shared tail of the expand FFI entries: run the substitution and ship
+/// only concrete (typevar-free) results. Python's solver is identity
+/// based, so any leftover TypeVar after a wire round-trip defers.
+fn expand_with_env(
+    typ: &Type,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Vec<u8>> {
+    // Leaf types carry no TypeVars; Python returns the original object
+    // (identity), so defer rather than round-trip a fresh object.
+    if is_leaf_type(typ) {
         return None;
     }
-    let expanded = expand_type_inner(&typ, &env, strict_optional)?;
-    // Ship only concrete (typevar-free) results: any leftover TypeVar
-    // breaks Python's identity-based solver after a wire round-trip.
+    let expanded = expand_type_inner(typ, env, strict_optional)?;
     if result_has_typevar(&expanded) {
         return None;
     }
     encode_type(&expanded)
+}
+
+/// `#[pyfunction]` entry for `expand_type_by_instance`
+/// (mypy/expandtype.py:295-325). Serializable subset: plain class type
+/// var binding (no TypeVarTuple), every arg readable, args length equal
+/// to the class's `defn.type_vars`. Mirroring the Python zip-truncate, a
+/// length mismatch leaves extra typevars unbound, so this defers.
+///
+/// Mirrors the non-TVT branch:
+///   tvars = tuple(instance.type.defn.type_vars)
+///   variables = {binder.id: arg for binder, arg in zip(tvars, instance.args)}
+///   return expand_type(typ, variables)
+///
+/// The env keys use `(raw_id, 0, "")`: class typevars bind
+/// `TypeVarId(raw_id)` (types.py:554 defaults meta_level=0, namespace="").
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_expand_type_by_instance(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+    instance_bytes: &[u8],
+    strict_optional: bool,
+) -> Option<Vec<u8>> {
+    let typ = decode_type(type_bytes)?;
+    let instance = decode_type(instance_bytes)?;
+    let Type::Instance { type_ref, args, .. } = &instance else {
+        return None;
+    };
+    // Python fast path (expandtype.py:298-299) returns `typ` unchanged
+    // when the instance has no args and no TVT. A fresh object breaks
+    // identity, so defer rather than round-trip.
+    if args.is_empty() {
+        return None;
+    }
+    let snap = resolver.resolver().get(type_ref)?;
+    // TypeVarTuple branch (expandtype.py:302-316) stays in Python.
+    if snap.has_type_var_tuple_type {
+        return None;
+    }
+    let raw_ids = &snap.type_var_raw_ids;
+    // Python `zip` truncates to the shorter; any unbound tvar makes
+    // submission incomplete, so defer (the length mismatch is legal).
+    if raw_ids.len() != args.len() {
+        return None;
+    }
+    let mut env = HashMap::with_capacity(args.len());
+    for (raw_id, arg) in raw_ids.iter().zip(args) {
+        env.insert((*raw_id, 0, String::new()), arg.clone());
+    }
+    expand_with_env(&typ, &env, strict_optional)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.
@@ -210,12 +267,8 @@ pub(crate) fn expand_type_inner(
         }
 
         // UnionType: Python calls
-        // make_union(remove_trivial(flatten_nested_unions(expanded))),
-        // then get_proper_type, which can collapse single-item unions and
-        // deduplicate. Ported with no is_subtype (expandtype.py:779-802):
-        // remove_trivial only strips bottom/duplicate items, and flatten
-        // defers (returns None) on a TypeAliasType, so the whole union
-        // falls back to Python there.
+        // make_union(remove_trivial(flatten_nested_unions(expanded))) then
+        // get_proper_type, which collapses and deduplicates items.
         Type::UnionType { items, .. } => {
             let mut expanded = Vec::with_capacity(items.len());
             for item in items {
@@ -228,8 +281,7 @@ pub(crate) fn expand_type_inner(
 
         // TypeType: Python expands the item then calls
         // TypeType.make_normalized(item, is_type_form), which distributes
-        // Type[Union[A, B]] into Union[Type[A], Type[B]] unless
-        // is_type_form (expandtype.py:807-812, types.py:3677-3691).
+        // Type[Union[A, B]] into Union[Type[A], Type[B]].
         Type::TypeType { item, is_type_form } => {
             let new_item = expand_type_inner(item, env, strict_optional)?;
             Some(make_type_normalized(new_item, *is_type_form))
@@ -662,4 +714,92 @@ fn normalize_tuple_unpack_to_instance(arg: &Type) -> Option<Type> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    fn snap_with_tvar(fullname: &str, raw_id: i64) -> TypeInfoSnapshot {
+        TypeInfoSnapshot {
+            fullname: fullname.to_owned(),
+            name: fullname.to_owned(),
+            has_type_var_tuple_type: false,
+            type_var_raw_ids: vec![raw_id],
+            ..Default::default()
+        }
+    }
+
+    fn any() -> Type {
+        Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn tvar(raw_id: i64) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "__main__.T".to_string(),
+            raw_id,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(any()),
+            default: Box::new(any()),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn expand_by_instance_substitutes_tvar_in_args() {
+        // List[T] applied to List[int] expands the arg T -> int.
+        let typ = instance("builtins.list", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((0, 0, String::new()), any())]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { args, .. } => {
+                assert!(matches!(args.as_slice(), [Type::AnyType { .. }]));
+            }
+            _ => panic!("expected Instance"),
+        }
+    }
+
+    #[test]
+    fn expand_by_instance_unmatched_tvar_leaves_typevar() {
+        // List[T] applied with an env that lacks T stays a TypeVarType.
+        let typ = instance("builtins.list", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { args, .. } => {
+                assert!(matches!(args.as_slice(), [Type::TypeVarType { .. }]));
+            }
+            _ => panic!("expected Instance"),
+        }
+    }
+
+    #[test]
+    fn etbi_sentinel_raw_id_never_matches_typevar() {
+        // A -1 sentinel key never matches a real TypeVar (raw_id >= 0),
+        // so expand_by_instance with an unreadable typevar defers.
+        let snap = snap_with_tvar("foo.Box", -1);
+        assert_eq!(snap.type_var_raw_ids, vec![-1]);
+        let typ = instance("foo.Box", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        assert!(matches!(out, Type::Instance { ref args, .. } if matches!(
+            args.as_slice(), [Type::TypeVarType { .. }])));
+    }
 }

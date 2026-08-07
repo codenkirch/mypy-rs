@@ -126,6 +126,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(mro::rust_linearize_hierarchy, module)?)?;
     module.add_function(wrap_pyfunction!(expandtype::rust_expand_type, module)?)?;
     module.add_function(wrap_pyfunction!(
+        expandtype::rust_expand_type_by_instance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         typeops::rust_make_simplified_union,
         module
     )?)?;

@@ -298,6 +298,54 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
     if not instance.args and not instance.type.has_type_var_tuple_type:
         return typ
     else:
+        # Stage 3c type-kernel seam: try Rust expand_type_by_instance.
+        # Rust returns None for unsupported cases (TypeVarTuple, arg
+        # count mismatch, unmatched typevars); falls back to Python.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_expand_type_active
+            and _native_expand_type_resolver is not None
+            and not _needs_python(typ)
+            and not any(_needs_python(a) for a in instance.args)
+        ):
+            try:
+                result = _type_kernel.rust_expand_type_by_instance(
+                    _native_expand_type_resolver,
+                    _serialize_type(typ),
+                    _serialize_type(instance),
+                    state.strict_optional,
+                )
+                if result is not None:
+                    decoded = read_type(_ReadBuffer(bytes(result)))
+                    from mypy.wirefixup import fixup_wire_type
+
+                    fixed = fixup_wire_type(decoded)
+                    # The wire format does not carry line/column; decoded
+                    # types default to line -1. Preserve the input type's
+                    # location so derived contexts report errors at the
+                    # call site instead of a phantom line 0/-1.
+                    if fixed is not None and isinstance(fixed, ProperType):
+                        fixed.line = typ.line
+                        fixed.column = typ.column
+                        if isinstance(fixed, CallableType):
+                            fixed.fallback.line = fixed.line
+                    # Clear the process-global primitive decode singletons
+                    # after a read so NOT_READY Instances cannot leak into
+                    # later builds.
+                    from mypy.types import instance_cache
+
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    if fixed is not None:
+                        return fixed
+            except (NotImplementedError, AssertionError):
+                # AssertionError: TypeInfo not yet fixed during semanal.
+                # NotImplementedError: unserializable variant.
+                # Both defer to Python.
+                pass
         variables: dict[TypeVarId, Type] = {}
         if instance.type.has_type_var_tuple_type:
             assert instance.type.type_var_tuple_prefix is not None
