@@ -1012,6 +1012,16 @@ class BuildManager:
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
+        # M17 checker statement helpers (type_requires_usage,
+        # is_unreachable_map, etc.) and semanal visitor helpers
+        # (refers_to_fullname, is_trivial_body, etc.). Parity verified
+        # 8151/0; graduated to production.
+        from mypy.checker import _set_native_checker_stmts_active
+
+        _set_native_checker_stmts_active(self.options.native_type_kernel)
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        _set_native_semanal_visitor_active(self.options.native_type_kernel)
         # M4: gate the fixed-format cache meta read seam; raw bytes are
         # present only in build.py, so this is a module-level flag checked
         # by cache_load (the read() helpers stay pure-Python).
