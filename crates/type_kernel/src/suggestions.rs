@@ -43,18 +43,16 @@ fn find_longest_match(
     let mut bestj = blo;
     let mut bestsize: usize = 0;
 
-    // For each j in b, track the longest match ending at that position.
-    // j2len[j] = length of longest match ending at a=??, b=j.
-    // We iterate over a, updating the b positions.
-    // This mirrors CPython's implementation in difflib.py.
+    // For each j in b, track the longest match ending at that position:
+    // iterate over a, updating the b positions as CPython's difflib.py does.
 
     let b_len = bhi - blo;
     let mut j2len = vec![0usize; b_len + 1];
 
-    for i in alo..ahi {
+    for (i, &ai) in a.iter().enumerate().take(ahi).skip(alo) {
         let mut j2len_new = vec![0usize; b_len + 1];
         for j in blo..bhi {
-            if a[i] == b[j] {
+            if ai == b[j] {
                 let k = j2len[j - blo];
                 j2len_new[j + 1 - blo] = k + 1;
                 let size = k + 1;
@@ -199,19 +197,8 @@ mod tests {
         let r = sequence_matcher_ratio("helo", "hello");
         assert!((r - 8.0 / 9.0).abs() < 1e-9, "got {r}");
 
-        // append / apend: longest block "apend" (5), total=10 -> 10/10=1.0?
-        // No: a="append", b="apend". Longest match is "apend" (len 5).
-        // Remaining: a has "p" before "end", b has nothing left.
-        // Actually: a=append, b=apend. find_longest: "apend" is in both
-        // (a[1..6]="ppend"? no. Let me think again.
-        // a = a p p e n d, b = a p e n d
-        // longest common substring: "apend"? a has a,p,p,e,n,d; b has a,p,e,n,d
-        // "apend" appears in b. In a: a(0),p(1),...e(3),n(4),d(5) -> "apend"
-        // at a[0],b[0] length... a[0]=a=a[0], a[1]=p=b[1], a[2]=p!=e(2)
-        // So "ap" matches (len 2), then a[2]=p vs b[2]=e, no match.
-        // Then look right of a[2],b[2]: "pend" vs "end" -> "end" len 3.
-        // Then left of a[2],b[2]: "ap" vs "ap" -> "ap" len 2.
-        // Total M = 2+3 = 5. ratio = 2*5/11 = 10/11 = 0.909...
+        // append / apend: "ap" matches (len 2); right of that, "pend" vs "end"
+        // gives "end" (len 3); ratio = 2*5/11 = 10/11 = 0.909...
         let r2 = sequence_matcher_ratio("append", "apend");
         assert!((r2 - 10.0 / 11.0).abs() < 1e-9, "got {r2}");
     }
