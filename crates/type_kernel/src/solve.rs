@@ -332,6 +332,44 @@ pub(crate) fn rust_solve_one(
     )
 }
 
+/// `is_trivial_bound` (solve.py:651-655): is `tp` a trivial bound, i.e. the
+/// wide `builtins.object` top (or `builtins.tuple` when `allow_tuple` is
+/// set, recursing into the singleton type argument). Returns `None` either
+/// on decode failure or when an alias needs expansion, which the shim maps
+/// to the Python fallback.
+#[pyfunction]
+pub(crate) fn rust_is_trivial_bound(t_bytes: &[u8], allow_tuple: bool) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    is_trivial_bound_inner(&t, allow_tuple)
+}
+
+fn is_trivial_bound_inner(t: &Type, allow_tuple: bool) -> Option<bool> {
+    match t {
+        Type::TypeAliasType { .. } => None,
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+            if !allow_tuple {
+                return Some(false);
+            }
+            let arg = args.first()?;
+            is_trivial_bound_inner(arg, allow_tuple)
+        }
+        Type::Instance { type_ref, .. } => Some(type_ref == "builtins.object"),
+        _ => Some(false),
+    }
+}
+
+/// PyO3 connector for `find_linear` (solve.py:657-671): decode a wire
+/// `Constraint` (origin_type_var, op, target) and run the linearity check.
+/// Returns `(is_linear, tv_id)` where `tv_id` is `(raw_id, meta_level,
+/// namespace)` or `None`. On decode failure, `None` defers to Python.
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+pub(crate) fn rust_find_linear(c_bytes: &[u8]) -> Option<(bool, Option<(i64, i64, String)>)> {
+    let mut buf = ReadBuffer::new(c_bytes);
+    let c = crate::constraints::Constraint::read(&mut buf).ok()?;
+    Some(find_linear(&c))
+}
+
 // ---------------------------------------------------------------------------
 // solve_with_dependent (solve.py:234-292) Rust subset.
 // ---------------------------------------------------------------------------
@@ -1602,5 +1640,191 @@ mod tests {
             decode_type(&bytes).unwrap(),
             instance("builtins.object", vec![])
         );
+    }
+
+    // ------------------------------------------------------------------
+    // is_trivial_bound / find_linear connectors
+    // ------------------------------------------------------------------
+
+    fn tv_type(raw_id: i64, name: &str) -> Type {
+        Type::TypeVarType {
+            name: name.to_string(),
+            fullname: format!("mod.{}", name),
+            raw_id,
+            namespace: "fn".to_string(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 1,
+        }
+    }
+
+    /// Encode a constraint blob: origin_type_var, op, target.
+    fn encode_constraint(origin: Type, op: i64, target: Type) -> Vec<u8> {
+        let c = crate::constraints::Constraint {
+            origin_type_var: origin,
+            op,
+            target,
+        };
+        let mut cb = crate::wire::WriteBuffer::new();
+        c.write(&mut cb).unwrap();
+        cb.into_bytes()
+    }
+
+    #[test]
+    fn trivial_bound_object_yes_tuple_no() {
+        let obj = instance("builtins.object", vec![]);
+        assert_eq!(is_trivial_bound_inner(&obj, false), Some(true));
+        let tup = instance("builtins.tuple", vec![obj]);
+        // allow_tuple=False rejects the tuple; True recurses into its arg.
+        assert_eq!(is_trivial_bound_inner(&tup, false), Some(false));
+        assert_eq!(is_trivial_bound_inner(&tup, true), Some(true));
+    }
+
+    #[test]
+    fn trivial_bound_nontrivial_no() {
+        let int_t = instance("builtins.int", vec![]);
+        assert_eq!(is_trivial_bound_inner(&int_t, false), Some(false));
+        let str_t = instance("builtins.str", vec![]);
+        // tuple[str] with allow_tuple=True recurses and rejects str (not object).
+        let tup_str = instance("builtins.tuple", vec![str_t]);
+        assert_eq!(is_trivial_bound_inner(&tup_str, true), Some(false));
+    }
+
+    #[test]
+    fn trivial_bound_alias_defers() {
+        // Python expands aliases via get_proper_type before recursing; the
+        // wire cannot, so an alias must defer the whole check to Python.
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.IntAlias".to_string(),
+        };
+        assert_eq!(is_trivial_bound_inner(&alias, false), None);
+    }
+    #[test]
+    fn find_linear_typevar_like() {
+        let s = tv_type(7, "S");
+        let c = encode_constraint(s.clone(), 0, s.clone());
+        let (lin, id) = rust_find_linear(&c).unwrap();
+        assert!(lin);
+        assert_eq!(id, Some((7, 1, "fn".to_string())));
+    }
+
+    #[test]
+    fn find_linear_rejects_constant_target() {
+        let s = tv_type(7, "S");
+        let int_t = instance("builtins.int", vec![]);
+        let c = encode_constraint(s, 0, int_t);
+        let (lin, id) = rust_find_linear(&c).unwrap();
+        assert!(!lin);
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn find_linear_param_spec_needs_empty_prefix() {
+        // P with no prefix args is linear.
+        let p = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".into(),
+            fullname: "mod.P".into(),
+            raw_id: 9,
+            namespace: "fn".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+        };
+        let (lin, id) = {
+            let c = crate::constraints::Constraint {
+                origin_type_var: p.clone(),
+                op: 0,
+                target: p.clone(),
+            };
+            find_linear(&c)
+        };
+        assert!(lin);
+        assert_eq!(id, Some((9, 0, "fn".to_string())));
+
+        // A prefixed target (prefix args non-empty) is not linear.
+        let prefixed = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: vec![instance("builtins.int", vec![])],
+                arg_kinds: vec![1],
+                arg_names: vec![None],
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".into(),
+            fullname: "mod.P".into(),
+            raw_id: 9,
+            namespace: "fn".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+        };
+        let prefixed_c = crate::constraints::Constraint {
+            origin_type_var: p.clone(),
+            op: 0,
+            target: prefixed,
+        };
+        let (lin, id) = find_linear(&prefixed_c);
+        assert!(!lin);
+        assert_eq!(id, None);
+    }
+
+    #[test]
+    fn find_linear_type_var_tuple_unpack() {
+        // Ts captured as Tuple[*Ts] is linear.
+        let tvv = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
+            name: "Ts".into(),
+            fullname: "mod.Ts".into(),
+            raw_id: 11,
+            namespace: "fn".to_string(),
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            min_len: 0,
+        };
+        let target = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+            items: vec![Type::UnpackType {
+                typ: Box::new(tvv.clone()),
+            }],
+            implicit: true,
+        };
+        let c = crate::constraints::Constraint {
+            origin_type_var: tvv.clone(),
+            op: 0,
+            target: target.clone(),
+        };
+        let (lin, id) = find_linear(&c);
+        assert!(lin);
+        assert_eq!(id, Some((11, 0, "fn".to_string())));
+
+        // Tuple[*Ts, U] is non-linear.
+        let two_items = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+            items: vec![
+                Type::UnpackType {
+                    typ: Box::new(tvv.clone()),
+                },
+                instance("builtins.int", vec![]),
+            ],
+            implicit: true,
+        };
+        let c = crate::constraints::Constraint {
+            origin_type_var: tvv,
+            op: 0,
+            target: two_items,
+        };
+        let (lin, id) = find_linear(&c);
+        assert!(!lin);
+        assert_eq!(id, None);
     }
 }

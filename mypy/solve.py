@@ -107,6 +107,15 @@ def _serialize_constraint_list(constraints: Iterable[Constraint]) -> list[bytes]
     return blobs
 
 
+def _serialize_constraint(c: Constraint) -> bytes:
+    """Serialize a single `Constraint` to wire format for the Rust reader."""
+    from mypy.constraints import _write_constraint
+
+    buf = _WriteBuffer()
+    _write_constraint(buf, c)
+    return buf.getvalue()
+
+
 def _native_solve_dependent_result(
     result: tuple[Any, Any, Any], originals: dict[TypeVarId, TypeVarLikeType]
 ) -> tuple[Solutions, list[TypeVarLikeType]] | None:
@@ -648,7 +657,23 @@ def choose_free(
     return None
 
 
+def _serialize_type_payload(tp: Type) -> bytes:
+    """Serialize a single `Type` to wire format for the Rust reader."""
+    buf = _WriteBuffer()
+    tp.write(buf)
+    return buf.getvalue()
+
+
 def is_trivial_bound(tp: ProperType, allow_tuple: bool = False) -> bool:
+    if _HAS_TYPE_KERNEL and _native_solve_active:
+        try:
+            result = _type_kernel.rust_is_trivial_bound(
+                _serialize_type_payload(tp), allow_tuple
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(tp, Instance) and tp.type.fullname == "builtins.tuple":
         return allow_tuple and is_trivial_bound(get_proper_type(tp.args[0]))
     return isinstance(tp, Instance) and tp.type.fullname == "builtins.object"
@@ -656,6 +681,32 @@ def is_trivial_bound(tp: ProperType, allow_tuple: bool = False) -> bool:
 
 def find_linear(c: Constraint) -> tuple[bool, TypeVarId | None]:
     """Find out if this constraint represent a linear relationship, return target id if yes."""
+    if _HAS_TYPE_KERNEL and _native_solve_active:
+        try:
+            result = _type_kernel.rust_find_linear(_serialize_constraint(c))
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            is_linear, _ = result
+            if is_linear:
+                # Rust says linear. The wire drops meta_level for ParamSpec /
+                # TypeVarTuple targets (it lives only on TypeVarType), so rebuild
+                # the id from live objects to match the Python membership check.
+                if isinstance(c.origin_type_var, TypeVarType):
+                    if isinstance(c.target, TypeVarType):
+                        return True, c.target.id
+                if isinstance(c.origin_type_var, ParamSpecType):
+                    if isinstance(c.target, ParamSpecType) and not c.target.prefix.arg_types:
+                        return True, c.target.id
+                if isinstance(c.origin_type_var, TypeVarTupleType):
+                    target = get_proper_type(c.target)
+                    if isinstance(target, TupleType) and len(target.items) == 1:
+                        item = target.items[0]
+                        if isinstance(item, UnpackType) and isinstance(item.type, TypeVarTupleType):
+                            return True, item.type.id
+            # Rust's negative answer does not expand `TypeAliasType` targets
+            # (Python's `get_proper_type` does), so a `False` here is not
+            # authoritative: fall through to the Python body verbatim.
     if isinstance(c.origin_type_var, TypeVarType):
         if isinstance(c.target, TypeVarType):
             return True, c.target.id
