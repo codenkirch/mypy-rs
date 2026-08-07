@@ -621,9 +621,8 @@ fn try_expanding_sum_type_to_union_inner(
     resolver: &TypeResolver,
 ) -> Option<Type> {
     // get_proper_type: a TypeAliasType has no proper form in the wire format.
-    match typ {
-        Type::TypeAliasType { .. } => return None,
-        _ => {}
+    if let Type::TypeAliasType { .. } = typ {
+        return None;
     }
     match typ {
         Type::UnionType { items, .. } => {

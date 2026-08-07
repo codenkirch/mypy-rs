@@ -27,7 +27,7 @@
 
 use pyo3::prelude::*;
 
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WireError, WriteBuffer};
+use crate::wire::{read_type, ReadBuffer, Type, WireError, WriteBuffer};
 
 /// `select_trivial` (constraints.py:554-562): keep only options whose
 /// every constraint is against `Any`, returning the selected option
@@ -118,6 +118,10 @@ fn read_constraint(buf: &mut ReadBuffer<'_>) -> Option<ConstraintParts> {
     Some(ConstraintParts { origin, op, target })
 }
 
+#[cfg(test)]
+use crate::wire::write_type;
+
+#[cfg(test)]
 fn write_constraint(buf: &mut WriteBuffer, constraint: &ConstraintParts) -> Result<(), WireError> {
     write_type(buf, &constraint.origin)?;
     crate::wire::write_int(buf, constraint.op)?;

@@ -461,6 +461,37 @@ def is_overlapping_types(
     positives), for example: None only overlaps with explicitly optional types, Any
     doesn't overlap with anything except object, we don't ignore positional argument names.
     """
+    # Stage 3d (M9) type-kernel seam: the native overlap check handles
+    # alias-free, non-recursive cases; the active flag + resolver are owned
+    # by `mypy.join` (shared with the subtype/meet seams) and read at call
+    # time. Rust returns None for any case it cannot decide (TypeAliasType
+    # expansion, live-TypeInfo needs, unported callable/parameter paths),
+    # and we fall through to the pure-Python implementation below.
+    if (
+        join._HAS_TYPE_KERNEL
+        and join._native_join_active
+        and join._native_join_resolver is not None
+        and seen_types is None
+        and not isinstance(left, TypeGuardedType)
+        and not isinstance(right, TypeGuardedType)
+        and not is_recursive_pair(left, right)
+        and not isinstance(left, PartialType)
+        and not isinstance(right, PartialType)
+    ):
+        try:
+            result = join._type_kernel.rust_is_overlapping_types(
+                join._serialize_type(left),
+                join._serialize_type(right),
+                ignore_promotions,
+                overlap_for_overloads,
+                state.strict_optional,
+                join._native_join_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
+
     if isinstance(left, TypeGuardedType) or isinstance(right, TypeGuardedType):
         # A type guard forces the new type even if it doesn't overlap the old.
         return True
