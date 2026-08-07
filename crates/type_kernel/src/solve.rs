@@ -341,6 +341,19 @@ pub(crate) fn rust_solve_one(
 /// same triple, so the two are interchangeable).
 type TvId = (i64, i64, String);
 
+/// Bound sets and reachability graph produced by `transitive_closure`.
+type BoundSets = (
+    HashSet<(TvId, TvId)>,
+    HashMap<TvId, Vec<Type>>,
+    HashMap<TvId, Vec<Type>>,
+);
+
+/// `solve_with_dependent_native` outcome: `Some` = both blobs, `None` = empty solutions.
+type NativeDependentOut = Option<(Option<Vec<u8>>, Option<Vec<u8>>)>;
+
+/// PyO3-facing `(num_solved, sol_blob, free_blob)`; `None` defers to Python.
+type SolveDependentOut = Option<(i64, Option<Vec<u8>>, Option<Vec<u8>>)>;
+
 /// `to_raw_id(x)` — resolve a `Type`'s TypeVar id (raw_id, meta_level,
 /// namespace). ParamSpec and TypeVarTuple are stored with `meta_level 0`.
 fn tv_id(t: &Type) -> Option<TvId> {
@@ -437,11 +450,11 @@ fn collect_type_var_ids(typ: &Type, out: &mut Vec<TvId>) {
             }
         }
         Type::TypeType { item, .. } => collect_type_var_ids(item, out),
-        Type::AnyType { source_any, .. } => {
-            if let Some(s) = source_any {
-                collect_type_var_ids(s, out);
-            }
-        }
+        Type::AnyType {
+            source_any: Some(s),
+            ..
+        } => collect_type_var_ids(s, out),
+        Type::AnyType { .. } => {}
         Type::TypeAliasType { args, .. } => {
             for a in args {
                 collect_type_var_ids(a, out);
@@ -538,14 +551,7 @@ fn transitive_closure(
     tvars: &[TvId],
     constraints: &[Constraint],
     resolver: &crate::typeinfo::TypeResolver,
-) -> Result<
-    (
-        HashSet<(TvId, TvId)>,
-        HashMap<TvId, Vec<Type>>,
-        HashMap<TvId, Vec<Type>>,
-    ),
-    (),
-> {
+) -> Result<BoundSets, ()> {
     let tvars_set: HashSet<TvId> = tvars.iter().cloned().collect();
     let mut uppers: HashMap<TvId, Vec<Type>> = HashMap::new();
     let mut lowers: HashMap<TvId, Vec<Type>> = HashMap::new();
@@ -608,7 +614,7 @@ fn transitive_closure(
             let cv = tv_id(&c.origin_type_var).ok_or(())?;
             if uppers
                 .get(&cv)
-                .map_or(false, |bounds| bounds.contains(&c.target))
+                .is_some_and(|bounds| bounds.contains(&c.target))
             {
                 continue;
             }
@@ -626,7 +632,7 @@ fn transitive_closure(
             let cv = tv_id(&c.origin_type_var).ok_or(())?;
             if lowers
                 .get(&cv)
-                .map_or(false, |bounds| bounds.contains(&c.target))
+                .is_some_and(|bounds| bounds.contains(&c.target))
             {
                 continue;
             }
@@ -986,8 +992,8 @@ fn solve_iteratively_native(
         s_batch.sort_by_key(|(raw, _, _)| *raw);
         let mut solvable: Option<usize> = None;
         for (i, tv) in s_batch.iter().enumerate() {
-            let has = lowers.get(tv).map_or(false, |b| !b.is_empty())
-                || uppers.get(tv).map_or(false, |b| !b.is_empty());
+            let has = lowers.get(tv).is_some_and(|b| !b.is_empty())
+                || uppers.get(tv).is_some_and(|b| !b.is_empty());
             if has {
                 solvable = Some(i);
                 break;
@@ -1058,7 +1064,7 @@ fn solve_with_dependent_native(
     infer_unions: bool,
     strict_optional: bool,
     resolver: &crate::typeinfo::TypeResolver,
-) -> Result<Option<(Option<Vec<u8>>, Option<Vec<u8>>)>, ()> {
+) -> Result<NativeDependentOut, ()> {
     let tvars: Vec<TvId> = vars
         .iter()
         .map(|t| tv_id(t).ok_or(()))
@@ -1083,8 +1089,8 @@ fn solve_with_dependent_native(
     if let Some(first) = raw_batches.first() {
         for scc in first {
             let all_empty = scc.iter().all(|tv| {
-                lowers.get(tv).map_or(true, |b| b.is_empty())
-                    && uppers.get(tv).map_or(true, |b| b.is_empty())
+                lowers.get(tv).is_none_or(|b| b.is_empty())
+                    && uppers.get(tv).is_none_or(|b| b.is_empty())
             });
             if all_empty {
                 match choose_free_single(scc) {
@@ -1187,7 +1193,7 @@ pub(crate) fn rust_solve_dependent(
     infer_unions: bool,
     strict_optional: bool,
     resolver: &NativeTypeResolver,
-) -> Option<(i64, Option<Vec<u8>>, Option<Vec<u8>>)> {
+) -> SolveDependentOut {
     let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
     for b in &vars {
         var_types.push(decode_type(b)?);
