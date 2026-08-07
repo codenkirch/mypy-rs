@@ -5072,3 +5072,109 @@ class NativeTraverserSuite(Suite):
         py_names, py_members = all_name_and_member_expressions(tree)
         assert rust_names == len(py_names)
         assert rust_members == len(py_members)
+
+
+class NativeSuggestionsSuite(Suite):
+    """Parity suite for M27: did-you-mean suggestion ranking and formatting.
+
+    Verifies `best_matches` and `pretty_seq` produce identical results
+    between the pure-Python difflib path and the Rust Ratcliff-Obershelp
+    path when the `native_type_kernel` gate is on.
+    """
+
+    def setUp(self) -> None:
+        from mypy.messages import _set_native_suggestions_active
+
+        self._setter = _set_native_suggestions_active
+
+    def _check_best_matches(
+        self, current: str, options: list[str], n: int
+    ) -> None:
+        from mypy.messages import best_matches
+
+        self._setter(False)
+        py_result = best_matches(current, options, n)
+        self._setter(True)
+        rs_result = best_matches(current, options, n)
+        assert_equal(
+            rs_result,
+            py_result,
+            f"best_matches({current!r}, {options!r}, {n})",
+        )
+
+    def _check_pretty_seq(self, args: list[str], conjunction: str) -> None:
+        from mypy.messages import pretty_seq
+
+        self._setter(False)
+        py_result = pretty_seq(args, conjunction)
+        self._setter(True)
+        rs_result = pretty_seq(args, conjunction)
+        assert_equal(
+            rs_result,
+            py_result,
+            f"pretty_seq({args!r}, {conjunction!r})",
+        )
+
+    def test_best_matches_identical(self) -> None:
+        self._check_best_matches("foo", ["foo", "bar", "baz"], 3)
+
+    def test_best_matches_fuzzy(self) -> None:
+        self._check_best_matches(
+            "helo", ["hello", "help", "hero", "hola", "foo"], 3
+        )
+
+    def test_best_matches_empty_current(self) -> None:
+        self._check_best_matches("", ["a", "b"], 3)
+
+    def test_best_matches_no_matches(self) -> None:
+        self._check_best_matches("xyz", ["foo", "bar", "baz"], 3)
+
+    def test_best_matches_many_options(self) -> None:
+        options = [f"test{i}" for i in range(60)]
+        options[30] = "test"
+        self._check_best_matches("test", options, 3)
+
+    def test_best_matches_tie_breaking(self) -> None:
+        self._check_best_matches(
+            "abc",
+            ["abd", "abe", "abf", "abg"],
+            2,
+        )
+
+    def test_best_matches_partial_match(self) -> None:
+        self._check_best_matches(
+            "append",
+            ["apend", "append", "prepend", "foo"],
+            3,
+        )
+
+    def test_best_matches_case_sensitive(self) -> None:
+        self._check_best_matches(
+            "Sequence", ["sequence", "Sequence", "SEQUENCE"], 3
+        )
+
+    def test_best_matches_n_larger_than_results(self) -> None:
+        self._check_best_matches("foo", ["foo", "foobar"], 10)
+
+    def test_pretty_seq_single(self) -> None:
+        self._check_pretty_seq(["a"], "or")
+
+    def test_pretty_seq_pair(self) -> None:
+        self._check_pretty_seq(["a", "b"], "or")
+
+    def test_pretty_seq_triple(self) -> None:
+        self._check_pretty_seq(["a", "b", "c"], "or")
+
+    def test_pretty_seq_quad(self) -> None:
+        self._check_pretty_seq(["a", "b", "c", "d"], "and")
+
+    def test_pretty_seq_empty(self) -> None:
+        self._setter(False)
+        from mypy.messages import pretty_seq
+
+        # Python crashes on empty, so only test Rust returns ""
+        self._setter(True)
+        assert_equal(pretty_seq([], "or"), "")
+
+    def test_pretty_seq_and_conjunction(self) -> None:
+        self._check_pretty_seq(["x", "y", "z"], "and")

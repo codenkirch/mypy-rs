@@ -70,6 +70,7 @@ mod semanal_visitor;
 mod setops;
 mod solve;
 mod subtypes;
+mod suggestions;
 mod traverser;
 mod typeanal_queries;
 mod typeinfo;
@@ -480,5 +481,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
+    module.add_function(wrap_pyfunction!(suggestions::rust_best_matches, module)?)?;
+    module.add_function(wrap_pyfunction!(suggestions::rust_pretty_seq, module)?)?;
     Ok(())
 }
