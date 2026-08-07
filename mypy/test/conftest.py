@@ -192,6 +192,18 @@ def _install_native_resolvers_patch() -> None:
             except ImportError:
                 pass
 
+        # Stage 16 (#209): semanal visitor helpers (parity-only).
+        # Activates the PyO3-on-live-objects gate for refers_to_fullname,
+        # is_trivial_body, find_duplicate, is_valid_replacement,
+        # is_same_symbol, names_modified_in_lvalue, etc.
+        if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_SEMANAL_VISITOR"):
+            try:
+                from mypy.semanal import _set_native_semanal_visitor_active
+
+                _set_native_semanal_visitor_active(True)
+            except ImportError:
+                pass
+
     BuildManager._build_native_resolvers = patched  # type: ignore[method-assign]
 
 

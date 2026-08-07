@@ -65,6 +65,7 @@ mod operators;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
+mod semanal_visitor;
 mod setops;
 mod solve;
 mod subtypes;
@@ -384,6 +385,46 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_algebra::rust_replace_implicit_first_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_refers_to_fullname,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_refers_to_class_or_function,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_trivial_body,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_find_duplicate,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_valid_replacement,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_same_symbol,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_names_modified_in_lvalue,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_names_modified_by_assignment,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_remove_imported_names_from_symtable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_apply_semantic_analyzer_patches,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
