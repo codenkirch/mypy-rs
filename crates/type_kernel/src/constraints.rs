@@ -100,8 +100,10 @@ pub(crate) fn rust_infer_constraints(
 fn infer_constraints_inner(template: &Type, actual: &Type, direction: i64) -> Option<Constraint> {
     // Unions must be normalized before emitting, which Rust cannot do — defer
     // so Python's `_infer_constraints` runs make_simplified_union first.
-    if matches!(template, Type::UnionType { .. } | Type::TypeAliasType { .. })
-        || matches!(actual, Type::UnionType { .. } | Type::TypeAliasType { .. })
+    if matches!(
+        template,
+        Type::UnionType { .. } | Type::TypeAliasType { .. }
+    ) || matches!(actual, Type::UnionType { .. } | Type::TypeAliasType { .. })
     {
         return None;
     }
@@ -175,8 +177,10 @@ fn infer_constraints_full_inner(
     // (`T <: bool | int | float` instead of `T <: int | float`) and change
     // solver results. The old union defer below this point ran too late,
     // because the TypeVar branch above returns first.
-    if matches!(template, Type::UnionType { .. } | Type::TypeAliasType { .. })
-        || matches!(actual, Type::UnionType { .. } | Type::TypeAliasType { .. })
+    if matches!(
+        template,
+        Type::UnionType { .. } | Type::TypeAliasType { .. }
+    ) || matches!(actual, Type::UnionType { .. } | Type::TypeAliasType { .. })
     {
         return None;
     }
@@ -282,25 +286,44 @@ fn visit_instance_native(
             if template_snap.has_type_var_tuple_type || a_snap.has_type_var_tuple_type {
                 return None;
             }
-            let mapped = map_instance_to_supertype(get_type_ref(template)?, template_args, type_ref, resolver)?;
+            let mapped = map_instance_to_supertype(
+                get_type_ref(template)?,
+                template_args,
+                type_ref,
+                resolver,
+            )?;
             let mut res = Vec::new();
-            for (tvar, mapped_arg, inst_arg) in zip3(tvars_of(a_snap), &mapped, args)
-            {
+            for (tvar, mapped_arg, inst_arg) in zip3(tvars_of(a_snap), &mapped, args) {
                 match tvar.2 {
                     // TypeVarType (kind 0): variance-aware.
                     0 => {
                         if tvar.1 != CONTRAVARIANT {
-                            res.extend(push_inner(mapped_arg.clone(), inst_arg.clone(), direction, resolver)?);
+                            res.extend(push_inner(
+                                mapped_arg.clone(),
+                                inst_arg.clone(),
+                                direction,
+                                resolver,
+                            )?);
                         }
                         if tvar.1 != COVARIANT {
-                            res.extend(push_inner(mapped_arg.clone(), inst_arg.clone(), neg_op(direction), resolver)?);
+                            res.extend(push_inner(
+                                mapped_arg.clone(),
+                                inst_arg.clone(),
+                                neg_op(direction),
+                                resolver,
+                            )?);
                         }
                     }
                     // ParamSpecType (kind 1): defer (needs Parameters slicing).
                     1 => return None,
                     // TypeVarTupleType (kind 2): covariant-ish single direction.
                     2 => {
-                        res.extend(push_inner(mapped_arg.clone(), inst_arg.clone(), direction, resolver)?);
+                        res.extend(push_inner(
+                            mapped_arg.clone(),
+                            inst_arg.clone(),
+                            direction,
+                            resolver,
+                        )?);
                     }
                     _ => {}
                 }
@@ -315,21 +338,42 @@ fn visit_instance_native(
             let template_ref = get_type_ref(template)?;
             let mapped = map_instance_to_supertype(type_ref, args, template_ref, resolver)?;
             let mut res = Vec::new();
-            for (tvar, template_arg, mapped_arg) in zip3(tvars_of(template_snap), template_args, &mapped)
+            for (tvar, template_arg, mapped_arg) in
+                zip3(tvars_of(template_snap), template_args, &mapped)
             {
                 match tvar.2 {
                     0 => {
                         if tvar.1 != CONTRAVARIANT {
-                            res.extend(push_inner(template_arg.clone(), mapped_arg.clone(), direction, resolver)?);
+                            res.extend(push_inner(
+                                template_arg.clone(),
+                                mapped_arg.clone(),
+                                direction,
+                                resolver,
+                            )?);
                         }
                         if tvar.1 != COVARIANT {
-                            res.extend(push_inner(template_arg.clone(), mapped_arg.clone(), neg_op(direction), resolver)?);
+                            res.extend(push_inner(
+                                template_arg.clone(),
+                                mapped_arg.clone(),
+                                neg_op(direction),
+                                resolver,
+                            )?);
                         }
                     }
                     1 => return None,
                     2 => {
-                        res.extend(push_inner(template_arg.clone(), mapped_arg.clone(), SUBTYPE_OF, resolver)?);
-                        res.extend(push_inner(template_arg.clone(), mapped_arg.clone(), SUPERTYPE_OF, resolver)?);
+                        res.extend(push_inner(
+                            template_arg.clone(),
+                            mapped_arg.clone(),
+                            SUBTYPE_OF,
+                            resolver,
+                        )?);
+                        res.extend(push_inner(
+                            template_arg.clone(),
+                            mapped_arg.clone(),
+                            SUPERTYPE_OF,
+                            resolver,
+                        )?);
                     }
                     _ => {}
                 }
@@ -374,9 +418,7 @@ fn visit_instance_tail_native(
                 let constrained = match item {
                     Type::UnpackType { typ } => match typ.as_ref() {
                         Type::TypeVarTupleType { .. } => None,
-                        Type::Instance { args, .. }
-                            if get_type_ref(typ)? == "builtins.tuple" =>
-                        {
+                        Type::Instance { args, .. } if get_type_ref(typ)? == "builtins.tuple" => {
                             args.first().cloned()
                         }
                         _ => return None,
@@ -463,18 +505,19 @@ fn visit_tuple_native(
     // tuples, constrain only the fallbacks and return immediately, skipping
     // the per-item constraints.
     if a_items.len() == t_items.len() {
-        if let (Type::TupleType { partial_fallback: t_fb, .. }, Type::TupleType { partial_fallback: a_fb, .. }) =
-            (template, actual)
+        if let (
+            Type::TupleType {
+                partial_fallback: t_fb,
+                ..
+            },
+            Type::TupleType {
+                partial_fallback: a_fb,
+                ..
+            },
+        ) = (template, actual)
         {
             let is_named = match (t_fb.as_ref(), a_fb.as_ref()) {
-                (
-                    Type::Instance {
-                        type_ref: t_tr, ..
-                    },
-                    Type::Instance {
-                        type_ref: a_tr, ..
-                    },
-                ) => {
+                (Type::Instance { type_ref: t_tr, .. }, Type::Instance { type_ref: a_tr, .. }) => {
                     let t_snap = resolver.get(t_tr)?;
                     let a_snap = resolver.get(a_tr)?;
                     t_snap.is_named_tuple && a_snap.is_named_tuple
@@ -500,8 +543,16 @@ fn visit_tuple_native(
         }
     }
     // Always append the fallback-vs-fallback constraint.
-    if let (Type::TupleType { partial_fallback: t_fb, .. }, Type::TupleType { partial_fallback: a_fb, .. }) =
-        (template, actual)
+    if let (
+        Type::TupleType {
+            partial_fallback: t_fb,
+            ..
+        },
+        Type::TupleType {
+            partial_fallback: a_fb,
+            ..
+        },
+    ) = (template, actual)
     {
         res.extend(push_inner(
             t_fb.as_ref().clone(),
@@ -560,9 +611,12 @@ fn visit_type_type_native(
     };
     match actual {
         Type::CallableType { .. } | Type::Overloaded { .. } => None,
-        Type::TypeType { item, .. } => {
-            push_inner(template_item.clone(), item.as_ref().clone(), direction, resolver)
-        }
+        Type::TypeType { item, .. } => push_inner(
+            template_item.clone(),
+            item.as_ref().clone(),
+            direction,
+            resolver,
+        ),
         Type::AnyType { .. } => {
             push_inner(template_item.clone(), actual.clone(), direction, resolver)
         }
