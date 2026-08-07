@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from typing import Any
-from unittest import TestCase, skipUnless
+from unittest import TestCase, skipIf, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
 
@@ -4850,6 +4851,7 @@ class NativeTraverserSuite(Suite):
         tree = self._parse("x = 42\n")
         assert has_str_expression(tree) is False
 
+    @skipIf(sys.version_info < (3, 14), "t-strings need Python 3.14+")
     def test_has_str_expression_in_template(self) -> None:
         # t-strings need Python 3.14+
         from mypy.errors import Errors
