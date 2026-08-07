@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
+use crate::setops::{flatten_nested_unions, union_make_union};
 use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{
     read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
@@ -50,6 +51,7 @@ pub(crate) fn rust_expand_type(
     resolver: &NativeTypeResolver,
     type_bytes: &[u8],
     env_bytes: &[u8],
+    strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
     let typ = decode_type(type_bytes)?;
@@ -64,7 +66,7 @@ pub(crate) fn rust_expand_type(
     if is_leaf_type(&typ) {
         return None;
     }
-    let expanded = expand_type(&typ, &env)?;
+    let expanded = expand_type_inner(&typ, &env, strict_optional)?;
     // Ship only concrete (typevar-free) results: any leftover TypeVar
     // breaks Python's identity-based solver after a wire round-trip.
     if result_has_typevar(&expanded) {
@@ -111,7 +113,11 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// Substitute TypeVar references in `typ` using `env`, mirroring
 /// `ExpandTypeVisitor`. Returns `None` for deferred cases (ParamSpec,
 /// TypeAliasType, Overloaded, etc.) so the caller falls through to Python.
-pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Type> {
+pub(crate) fn expand_type_inner(
+    typ: &Type,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Type> {
     match typ {
         // Leaf types that carry no TypeVars: returned as-is.
         // (expandtype.py:189-211)
@@ -130,7 +136,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             if args.is_empty() {
                 return Some(typ.clone());
             }
-            let new_args = expand_type_tuple_with_unpack(args, env)?;
+            let new_args = expand_type_tuple_with_unpack(args, env, strict_optional)?;
             // Tuple[*Tuple[X, ...], ...] -> Tuple[X, ...].
             // When single arg is UnpackType wrapping builtins.tuple,
             // unwrap to that Instance's args.
@@ -162,7 +168,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             // (expandtype.py:243-244), since Self`0 <: C[T, S] may reference
             // other TypeVars in the bound.
             let upper_bound = if *raw_id == 0 {
-                Box::new(expand_type(upper_bound, env)?)
+                Box::new(expand_type_inner(upper_bound, env, strict_optional)?)
             } else {
                 upper_bound.clone()
             };
@@ -203,15 +209,31 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             }
         }
 
-        // UnionType: Python calls make_union(remove_trivial(flatten_nested_unions(expanded)))
-        // then get_proper_type, which can collapse single-item unions, deduplicate, and
-        // resolve aliases. Rust cannot replicate this without porting the full
-        // simplification pipeline, so defer to Python to avoid wrong results.
-        Type::UnionType { .. } => None,
+        // UnionType: Python calls
+        // make_union(remove_trivial(flatten_nested_unions(expanded))),
+        // then get_proper_type, which can collapse single-item unions and
+        // deduplicate. Ported with no is_subtype (expandtype.py:779-802):
+        // remove_trivial only strips bottom/duplicate items, and flatten
+        // defers (returns None) on a TypeAliasType, so the whole union
+        // falls back to Python there.
+        Type::UnionType { items, .. } => {
+            let mut expanded = Vec::with_capacity(items.len());
+            for item in items {
+                expanded.push(expand_type_inner(item, env, strict_optional)?);
+            }
+            let flat = flatten_nested_unions(&expanded)?;
+            let simplified = union_make_union(remove_trivial(&flat, strict_optional));
+            Some(simplified)
+        }
 
-        // TypeType: Python calls TypeType.make_normalized(item), which unwraps
-        // nested TypeType and distributes over unions. Defer to Python.
-        Type::TypeType { .. } => None,
+        // TypeType: Python expands the item then calls
+        // TypeType.make_normalized(item, is_type_form), which distributes
+        // Type[Union[A, B]] into Union[Type[A], Type[B]] unless
+        // is_type_form (expandtype.py:807-812, types.py:3677-3691).
+        Type::TypeType { item, is_type_form } => {
+            let new_item = expand_type_inner(item, env, strict_optional)?;
+            Some(make_type_normalized(new_item, *is_type_form))
+        }
 
         // LiteralType: Python's visit_literal_type returns t as-is
         // (expandtype.py:751-753). Do not expand the fallback.
@@ -223,7 +245,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             implicit,
         } => {
             // (expandtype.py:720-740)
-            let new_items = expand_type_list_with_unpack(items, env)?;
+            let new_items = expand_type_list_with_unpack(items, env, strict_optional)?;
             // Normalize Tuple[*Tuple[X, ...]] -> Tuple[X, ...].
             if new_items.len() == 1 {
                 if let Type::UnpackType { typ: inner } = &new_items[0] {
@@ -243,14 +265,14 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
                                 return Some(unpacked.clone());
                             }
                             // Named tuple: return expanded fallback.
-                            return expand_type(partial_fallback, env);
+                            return expand_type_inner(partial_fallback, env, strict_optional);
                         }
                         // unpacked is not builtins.tuple: return fallback.
-                        return expand_type(partial_fallback, env);
+                        return expand_type_inner(partial_fallback, env, strict_optional);
                     }
                 }
             }
-            let new_fallback = expand_type(partial_fallback, env)?;
+            let new_fallback = expand_type_inner(partial_fallback, env, strict_optional)?;
             Some(Type::TupleType {
                 partial_fallback: Box::new(new_fallback),
                 items: new_items,
@@ -266,10 +288,10 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             is_closed,
         } => {
             // (expandtype.py:556-563)
-            let new_fallback = expand_type(fallback, env)?;
+            let new_fallback = expand_type_inner(fallback, env, strict_optional)?;
             let mut new_items = Vec::with_capacity(items.len());
             for (name, typ) in items {
-                new_items.push((name.clone(), expand_type(typ, env)?));
+                new_items.push((name.clone(), expand_type_inner(typ, env, strict_optional)?));
             }
             Some(Type::TypedDictType {
                 fallback: Box::new(new_fallback),
@@ -324,20 +346,20 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             // type_guard, type_is, instance_type. Does NOT expand fallback or
             // variables (declared type vars are definitions).
             let new_instance_type = match instance_type {
-                Some(it) => Some(Box::new(expand_type(it, env)?)),
+                Some(it) => Some(Box::new(expand_type_inner(it, env, strict_optional)?)),
                 None => None,
             };
             let mut new_arg_types = Vec::with_capacity(arg_types.len());
             for at in arg_types {
-                new_arg_types.push(expand_type(at, env)?);
+                new_arg_types.push(expand_type_inner(at, env, strict_optional)?);
             }
-            let new_ret_type = Box::new(expand_type(ret_type, env)?);
+            let new_ret_type = Box::new(expand_type_inner(ret_type, env, strict_optional)?);
             let new_type_guard = match type_guard {
-                Some(tg) => Some(Box::new(expand_type(tg, env)?)),
+                Some(tg) => Some(Box::new(expand_type_inner(tg, env, strict_optional)?)),
                 None => None,
             };
             let new_type_is = match type_is {
-                Some(ti) => Some(Box::new(expand_type(ti, env)?)),
+                Some(ti) => Some(Box::new(expand_type_inner(ti, env, strict_optional)?)),
                 None => None,
             };
             Some(Type::CallableType {
@@ -364,7 +386,7 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
             // (expandtype.py:370-380). visit_unpack_type carries a variadic
             // tuple over. We expand the inner type. The expand_unpack
             // list-expansion path is handled at the tuple/instance level.
-            let new_typ = expand_type(typ, env)?;
+            let new_typ = expand_type_inner(typ, env, strict_optional)?;
             Some(Type::UnpackType {
                 typ: Box::new(new_typ),
             })
@@ -385,7 +407,11 @@ pub(crate) fn expand_type(typ: &Type, env: &HashMap<EnvKey, Type>) -> Option<Typ
 /// tuple of arg types, splicing in the items of any UnpackType wrapping
 /// a TypeVarTupleType via `expand_unpack`. Non-Unpack args are expanded
 /// normally.
-fn expand_type_tuple_with_unpack(typs: &[Type], env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
+fn expand_type_tuple_with_unpack(
+    typs: &[Type],
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Vec<Type>> {
     let mut items = Vec::with_capacity(typs.len());
     for item in typs {
         if let Type::UnpackType { typ: inner } = item {
@@ -396,15 +422,75 @@ fn expand_type_tuple_with_unpack(typs: &[Type], env: &HashMap<EnvKey, Type>) -> 
                 continue;
             }
         }
-        items.push(expand_type(item, env)?);
+        items.push(expand_type_inner(item, env, strict_optional)?);
     }
     Some(items)
 }
 
 /// `expand_type_list_with_unpack` (expandtype.py:513-521). Same as
 /// `expand_type_tuple_with_unpack` but over a Vec.
-fn expand_type_list_with_unpack(typs: &[Type], env: &HashMap<EnvKey, Type>) -> Option<Vec<Type>> {
-    expand_type_tuple_with_unpack(typs, env)
+fn expand_type_list_with_unpack(
+    typs: &[Type],
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Vec<Type>> {
+    expand_type_tuple_with_unpack(typs, env, strict_optional)
+}
+
+/// `TypeType.make_normalized` (types.py:3677-3691): distributes
+/// `Type[Union[A, B]]` into `Union[Type[A], Type[B]]` unless
+/// `is_type_form`. The item comes from a wire round-trip so it is already
+/// proper (`get_proper_type` is a no-op). The resulting union may be a
+/// single TypeType (collapsed by `make_union`).
+fn make_type_normalized(item: Type, is_type_form: bool) -> Type {
+    if !is_type_form {
+        if let Type::UnionType { items, .. } = &item {
+            let mut tt_items = Vec::with_capacity(items.len());
+            for u in items {
+                tt_items.push(make_type_normalized(u.clone(), false));
+            }
+            return union_make_union(tt_items);
+        }
+    }
+    Type::TypeType {
+        item: Box::new(item),
+        is_type_form,
+    }
+}
+
+/// `remove_trivial` (expandtype.py:845-872). Makes trivial simplifications
+/// on a list of types without `is_subtype`: drop bottom types (honoring
+/// `strict_optional` for NoneType), short-circuit to a lone
+/// `builtins.object`, and drop strict duplicates (push-first-wins).
+/// The input comes from the wire format so every type is already proper.
+fn remove_trivial(types: &[Type], strict_optional: bool) -> Vec<Type> {
+    let mut removed_none = false;
+    let mut new_types: Vec<Type> = Vec::new();
+    for t in types {
+        match t {
+            Type::UninhabitedType { .. } => continue,
+            Type::NoneType if !strict_optional => {
+                removed_none = true;
+                continue;
+            }
+            _ => {}
+        }
+        if let Type::Instance { type_ref, .. } = t {
+            if type_ref == "builtins.object" {
+                return vec![t.clone()];
+            }
+        }
+        if !new_types.contains(t) {
+            new_types.push(t.clone());
+        }
+    }
+    if !new_types.is_empty() {
+        return new_types;
+    }
+    if removed_none {
+        return vec![Type::NoneType];
+    }
+    vec![Type::UninhabitedType { ambiguous: false }]
 }
 
 /// `expand_unpack` (expandtype.py:382-400). Expands an UnpackType whose

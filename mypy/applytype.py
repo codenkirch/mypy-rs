@@ -7,6 +7,7 @@ import mypy.subtypes
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type
 from mypy.nodes import Context, TypeInfo
+from mypy.state import state
 from mypy.type_visitor import TypeTranslator
 from mypy.typeops import get_all_type_vars
 from mypy.types import (
@@ -359,6 +360,7 @@ def apply_generic_arguments(
                     _serialize_type(callable),
                     _serialize_optional_type_list(orig_types),
                     skip_unsatisfied,
+                    state.strict_optional,
                 )
                 if result is not None:
                     decoded = read_type(_ReadBuffer(bytes(result)))

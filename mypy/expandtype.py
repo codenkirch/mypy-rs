@@ -239,7 +239,10 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     ):
         try:
             result = _type_kernel.rust_expand_type(
-                _native_expand_type_resolver, _serialize_type(typ), _serialize_env(env)
+                _native_expand_type_resolver,
+                _serialize_type(typ),
+                _serialize_env(env),
+                state.strict_optional,
             )
             if result is not None:
                 decoded = read_type(_ReadBuffer(bytes(result)))
