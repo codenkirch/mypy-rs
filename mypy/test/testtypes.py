@@ -5796,3 +5796,236 @@ class NativeCheckPatternSuite(Suite):
             resolver,
         )
         assert result is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckMemberSuite(Suite):
+    """Parity tests for the M20 checkmember Rust port.
+
+    Verifies that `rust_bind_self_fast` agrees with the Python
+    `bind_self_fast` for CallableType and Overloaded, including the
+    deferral semantics (None return) for *args/**kwargs and non-callable
+    types.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.checkmember import _set_native_checkmember_active
+        from librt.internal import WriteBuffer as _WB
+
+        self._tk = _tk
+        self._WB = _WB
+        self._set_active = _set_native_checkmember_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.std_tuplei,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = self._WB()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _make_callable(self, arg_kinds: list, ret: Type | None = None) -> CallableType:
+        from mypy.nodes import ARG_POS
+
+        return CallableType(
+            arg_types=[self.fx.o],
+            arg_kinds=arg_kinds,
+            arg_names=["self"],
+            ret_type=ret or self.fx.o,
+            fallback=self.fx.function,
+            is_bound=False,
+        )
+
+    def test_bind_self_fast_plain_callable(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        method = self._make_callable([ARG_POS])
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.is_bound is True
+        assert len(result.arg_types) == 0
+        assert len(result.arg_kinds) == 0
+        assert len(result.arg_names) == 0
+
+    def test_bind_self_fast_preserves_ret_type(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        method = self._make_callable([ARG_POS], ret=self.fx.a)
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.ret_type is self.fx.a
+
+    def test_bind_self_fast_preserves_variables(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        method = CallableType(
+            arg_types=[self.fx.o],
+            arg_kinds=[ARG_POS],
+            arg_names=["self"],
+            ret_type=self.fx.t,
+            fallback=self.fx.function,
+            variables=[self.fx.t],
+            is_bound=False,
+        )
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert len(result.variables) == 1
+
+    def test_bind_self_fast_overloaded(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        item1 = self._make_callable([ARG_POS])
+        item2 = self._make_callable([ARG_POS])
+        overloaded = Overloaded([item1, item2])
+        result = bind_self_fast(overloaded)
+        assert isinstance(result, Overloaded)
+        assert len(result.items) == 2
+        for item in result.items:
+            assert item.is_bound is True
+
+    def test_bind_self_fast_defers_star_args(self) -> None:
+        from mypy.nodes import ARG_STAR
+        from mypy.checkmember import bind_self_fast
+
+        method = self._make_callable([ARG_STAR])
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.is_bound is False
+        assert len(result.arg_types) == 1
+
+    def test_bind_self_fast_defers_star2(self) -> None:
+        from mypy.nodes import ARG_STAR2
+        from mypy.checkmember import bind_self_fast
+
+        method = self._make_callable([ARG_STAR2])
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.is_bound is False
+        assert len(result.arg_types) == 1
+
+    def test_bind_self_fast_rust_direct(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        method = self._make_callable([ARG_POS])
+        rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
+        assert rust_bytes is not None
+
+    def test_bind_self_fast_rust_returns_none_for_star(self) -> None:
+        from mypy.nodes import ARG_STAR
+
+        method = self._make_callable([ARG_STAR])
+        rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
+        assert rust_bytes is None
+
+    def test_bind_self_fast_rust_returns_none_for_non_callable(self) -> None:
+        rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(self.fx.a))
+        assert rust_bytes is None
+
+    def test_classify_member_access_instance(self) -> None:
+        # Instance -> MA_INSTANCE (0).
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(self.fx.a)
+        )
+        assert code == 0
+
+    def test_classify_member_access_none(self) -> None:
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(NoneType())
+        )
+        assert code == 8
+
+    def test_classify_member_access_union(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b])
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(u)
+        )
+        assert code == 2
+
+    def test_classify_member_access_type_type(self) -> None:
+        tt = TypeType(self.fx.a)
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(tt)
+        )
+        assert code == 4
+
+    def test_classify_member_access_deleted(self) -> None:
+        from mypy.types import DeletedType
+
+        dt = DeletedType("x")
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(dt)
+        )
+        assert code == 10
+
+    def test_classify_member_access_uninhabited(self) -> None:
+        ui = UninhabitedType()
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(ui)
+        )
+        assert code == 11
+
+    def test_bind_self_fast_preserves_name(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        method = CallableType(
+            arg_types=[self.fx.o],
+            arg_kinds=[ARG_POS],
+            arg_names=["self"],
+            ret_type=self.fx.o,
+            fallback=self.fx.function,
+            name="my_method",
+            is_bound=False,
+        )
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.name == "my_method"
+
+    def test_bind_self_fast_round_trip_multiple_args(self) -> None:
+        from mypy.nodes import ARG_POS
+        from mypy.checkmember import bind_self_fast
+
+        method = CallableType(
+            arg_types=[self.fx.o, self.fx.a, self.fx.b],
+            arg_kinds=[ARG_POS, ARG_POS, ARG_POS],
+            arg_names=["self", "x", "y"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+            is_bound=False,
+        )
+        result = bind_self_fast(method)
+        assert isinstance(result, CallableType)
+        assert result.is_bound is True
+        assert len(result.arg_types) == 2
+        assert result.arg_names == ["x", "y"]
+

@@ -79,6 +79,56 @@ from mypy.types import (
     instance_cache,
 )
 
+# M20: type-kernel seam for checkmember. When the `type_kernel` Rust
+# extension is importable and `Options.native_type_kernel` is set,
+# `bind_self_fast` and `_analyze_member_access` dispatch route through
+# Rust. The Rust path returns `None` for any type it does not handle, in
+# which case we fall back to the pure-Python implementation. This is the
+# strangler-fig per-call gate — no behavior change unless the option is
+# explicitly enabled.
+try:
+    from librt.internal import (
+        ReadBuffer as _CheckMemberReadBuffer,
+        WriteBuffer as _CheckMemberWriteBuffer,
+    )
+    from type_kernel import (
+        rust_bind_self_fast as _rust_bind_self_fast,
+    )
+
+    from mypy.types import read_type as _checkmember_read_type
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_bind_self_fast = None  # type: ignore[assignment]
+    _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
+    _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
+    _checkmember_read_type = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_checkmember_active: bool = False
+
+
+def _set_native_checkmember_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_checkmember_active
+    _native_checkmember_active = active
+
+
+def _serialize_type_for_checkmember(t: Type) -> bytes:
+    buf = _CheckMemberWriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
+
+def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
+    """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
+
+    Returns None when a type_ref is unresolvable so callers defer to Python.
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    return fixup_wire_type(_checkmember_read_type(_CheckMemberReadBuffer(data)))
+
 
 class MemberContext:
     """Information and objects needed to type check attribute access.
@@ -1507,6 +1557,12 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
     This is a faster version of mypy.typeops.bind_self() that can be used for methods
     with trivial self/cls annotations.
     """
+    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+        result = _rust_bind_self_fast(_serialize_type_for_checkmember(method))
+        if result is not None:
+            decoded = _deserialize_type_for_checkmember(bytes(result))
+            if decoded is not None:
+                return cast(F, decoded)
     if isinstance(method, Overloaded):
         items = [bind_self_fast(c, original_type) for c in method.items]
         return cast(F, Overloaded(items))

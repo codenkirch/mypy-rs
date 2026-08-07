@@ -49,6 +49,7 @@ mod checkcall;
 mod checker_stmts;
 mod checker_visitor;
 mod checkexpr_functions;
+mod checkmember;
 mod checkpattern;
 mod checkstrformat;
 mod constraints;
@@ -525,6 +526,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_make_optional_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checkmember::rust_bind_self_fast, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_classify_member_access,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

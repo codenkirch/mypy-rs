@@ -1018,6 +1018,12 @@ class BuildManager:
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
+        # M20: gate checkmember bind_self_fast (trivial-self method binding).
+        # Rust strips the first arg and sets is_bound; Python falls back for
+        # *args/**kwargs and non-callable types.
+        from mypy.checkmember import _set_native_checkmember_active
+
+        _set_native_checkmember_active(self.options.native_type_kernel)
         # M17 checker statement helpers (type_requires_usage,
         # is_unreachable_map, etc.) and semanal visitor helpers
         # (refers_to_fullname, is_trivial_body, etc.). Parity verified
