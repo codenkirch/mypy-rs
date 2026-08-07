@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-# Stage 4b type-kernel seam: when type_kernel is importable and the
-from typing import TYPE_CHECKING, Final, TypeGuard, cast
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING, Any, Final, TypeGuard, cast
 
 import mypy.subtypes
 import mypy.typeops
@@ -18,8 +18,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag, set by the build manager from
@@ -38,7 +38,7 @@ def _set_native_constraints_active(active: bool) -> None:
     _native_constraints_active = active
 
 
-def _set_native_constraints_resolver(resolver) -> None:
+def _set_native_constraints_resolver(resolver: Any) -> None:
     """Install/clear the NativeTypeResolver snapshot used by the Rust
     constraint-builder port. Pass `None` to clear (stale snapshot hazard:
     a resolver from a previous build would resolve Instance refs against
@@ -87,7 +87,7 @@ def _try_native_infer_constraints(
         # `actual` object when Rust agrees with it, else defer.
         if target != actual:
             raise NotImplementedError("target not wire-safe")
-        constraints.append(Constraint(template, op, actual))
+        constraints.append(Constraint(template, op, actual))  # type: ignore[arg-type]
     return constraints
 
 
@@ -149,7 +149,7 @@ def _write_constraint(buf: _WriteBuffer, constraint: Constraint) -> None:
 
 def _write_option(buf: _WriteBuffer, option: list[Constraint]) -> None:
     """Serialize one option: count (bare int) + N× constraint."""
-    from mypy.cache import write_int_bare
+    from mypy.cache import write_int_bare  # type: ignore[attr-defined]
 
     write_int_bare(buf, len(option))
     for constraint in option:
@@ -158,7 +158,7 @@ def _write_option(buf: _WriteBuffer, option: list[Constraint]) -> None:
 
 def _read_index_list(raw: bytes) -> list[int]:
     """Read a bare-int index list: count + N× index."""
-    from mypy.cache import read_int_bare
+    from mypy.cache import read_int_bare  # type: ignore[attr-defined]
 
     data = _ReadBuffer(raw)
     count = read_int_bare(data)
@@ -172,7 +172,7 @@ def _try_native_select_trivial(
     if not options:
         return []
     buf = _WriteBuffer()
-    from mypy.cache import write_int_bare
+    from mypy.cache import write_int_bare  # type: ignore[attr-defined]
 
     write_int_bare(buf, len(options))
     for option in options:
@@ -182,7 +182,8 @@ def _try_native_select_trivial(
     raw = _type_kernel.rust_select_trivial(buf.getvalue())
     if raw is None:
         raise NotImplementedError("kernel deferred select_trivial")
-    return [options[i] for i in _read_index_list(bytes(raw))]
+    result = [options[i] for i in _read_index_list(bytes(raw))]
+    return result  # type: ignore[return-value]
 
 
 def _try_native_exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] | None:

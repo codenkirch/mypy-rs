@@ -42,6 +42,7 @@ from mypy.types import (
     TypeVarType,
     UnionType,
     UnpackType,
+    get_proper_type,
 )
 
 # Stage 4 parity: flip the argmap gate from the env var so the unit tests
@@ -311,7 +312,7 @@ class ClassifyCallParitySuite(Suite):
     def test_callable_with_vars(self) -> None:
         fixture = TypeFixture()
         callable_t = fixture.callable(fixture.a)
-        callable_t.variables = [fixture.t]
+        callable_t.variables = (fixture.t,)
         self.assert_classify(callable_t, CALL_WITH_VARS)
 
     def test_overloaded(self) -> None:
@@ -363,7 +364,7 @@ class ClassifyCallParitySuite(Suite):
         saved_active = _native_checkexpr_active
         try:
             _set_native_checkexpr_active(True)
-            kind = _try_native_classify_call(callee)
+            kind = _try_native_classify_call(get_proper_type(callee))
             assert_equal(kind, expected)
         finally:
             _set_native_checkexpr_active(saved_active)
@@ -394,7 +395,7 @@ class CheckCallDispatchParitySuite(Suite):
         saved_active = _native_checkexpr_active
         try:
             _set_native_checkexpr_active(True)
-            native_kind = _try_native_classify_call(callee)
+            native_kind = _try_native_classify_call(get_proper_type(callee))
             py_kind = ExpressionChecker._dispatch_kind(None, callee)  # type: ignore[arg-type]
             if native_kind is not None and native_kind != CALL_OTHER:
                 assert_equal(native_kind, py_kind)

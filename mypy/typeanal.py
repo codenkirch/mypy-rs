@@ -2575,8 +2575,8 @@ except ImportError:
     _rust_has_any_from_unimported_type = None  # type: ignore[assignment]
     _rust_collect_all_inner_types = None  # type: ignore[assignment]
     _rust_make_optional_type = None  # type: ignore[assignment]
-    _TypeanalWriteBuffer = None  # type: ignore[assignment]
-    _TypeanalReadBuffer = None  # type: ignore[assignment]
+    _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
+    _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
     _TYPEANAL_HAS_KERNEL = False
 

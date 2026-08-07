@@ -131,6 +131,12 @@ __all__ = [
     "rust_find_linear",
     "rust_separate_union_literals",
     "rust_get_type_vars",
+    "rust_solve_constraints",
+    "rust_solve_dependent",
+    "rust_replace_implicit_first_type",
+    "rust_callables_compatible",
+    "rust_can_subclass_builtin",
+    "rust_is_overlapping_types",
 ]
 
 class NativeTypeResolver:
@@ -387,3 +393,41 @@ def rust_separate_union_literals(
     type_bytes: bytes,
 ) -> tuple[list[bytes], list[bytes]] | None: ...
 def rust_get_type_vars(type_bytes: bytes, include_all: bool) -> list[bytes] | None: ...
+def rust_solve_constraints(
+    vars_bytes: list[bytes],
+    dependent_vars_bytes: list[bytes],
+    constraints_bytes: list[bytes],
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+    skip_unsatisfied: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[int, bytes | None, bytes | None] | None: ...
+def rust_solve_dependent(
+    vars_bytes: list[bytes],
+    constraints_bytes: list[bytes],
+    infer_unions: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[int, bytes | None, bytes | None] | None: ...
+def rust_replace_implicit_first_type(
+    sig_bytes: bytes, new_type_bytes: bytes
+) -> bytes | None: ...
+def rust_callables_compatible(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    proper_subtype: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
+def rust_can_subclass_builtin(builtin_base: str) -> bool | None: ...
+def rust_is_overlapping_types(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    ignore_promotions: bool,
+    overlap_for_overloads: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...

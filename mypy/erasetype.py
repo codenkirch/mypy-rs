@@ -70,8 +70,8 @@ except ImportError:
     _rust_remove_lkv = None  # type: ignore[assignment]
     _rust_erase_typevars = None  # type: ignore[assignment]
     _rust_replace_meta_vars = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _write_int_bare = None  # type: ignore[assignment]
     _write_str_tagged = None  # type: ignore[assignment]
     _read_type = None  # type: ignore[assignment]
@@ -117,7 +117,7 @@ def _serialize_typevar_ids(ids: Container[TypeVarId] | None) -> bytes:
     """
     if ids is None:
         return b""
-    items = list(ids)
+    items = list(ids)  # type: ignore[call-overload]
     buf = _WriteBuffer()
     _write_int_bare(buf, len(items))
     for tv_id in items:

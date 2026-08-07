@@ -139,8 +139,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _write_int_bare = None  # type: ignore[assignment]
     _write_str_tagged = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False

@@ -120,6 +120,7 @@ from mypy.nodes import (
     MypyFile,
     OverloadedFuncDef,
     SymbolTable,
+    TypeInfo,
 )
 from mypy.options import OPTIONS_AFFECTING_CACHE_NO_PLATFORM
 from mypy.partially_defined import PossiblyUndefinedVariableVisitor
@@ -1152,7 +1153,7 @@ class BuildManager:
         # Packages for which we know presence or absence of __getattr__().
         self.known_partial_packages: dict[str, bool] = {}
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         """Walk all loaded modules and collect every `TypeInfo` node.
 
         The parity suites use a fixture-walk; production walks the same
@@ -1166,7 +1167,7 @@ class BuildManager:
         infos: list[TypeInfo] = []
         for module in self.modules.values():
             if module is None:
-                continue
+                continue  # type: ignore[unreachable]
             for sym in module.names.values():
                 node = sym.node
                 if isinstance(node, TypeInfo):
@@ -1203,11 +1204,11 @@ class BuildManager:
             # unless parity CI required the native path
             # (MYPY_NATIVE_TYPE_KERNEL_REQUIRED=1).
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
-                raise CompileError(
+                raise CompileError([
                     "native_type_kernel is enabled but the type_kernel "
                     "extension failed to import (required by "
                     "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
-                ) from None
+                ]) from None
             return
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
@@ -1284,11 +1285,11 @@ class BuildManager:
             import type_kernel as _type_kernel
         except ImportError:
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
-                raise CompileError(
+                raise CompileError([
                     "native_type_kernel is enabled but the type_kernel "
                     "extension failed to import (required by "
                     "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
-                ) from None
+                ]) from None
             return
         from mypy.checkexpr import _set_native_plugin_hook_registry
         from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES

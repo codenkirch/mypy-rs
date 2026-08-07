@@ -85,8 +85,8 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _ReadBuffer = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -686,8 +686,8 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
             result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if isinstance(decoded, Instance):
-                    return decoded
+                if isinstance(get_proper_type(decoded), Instance):
+                    return decoded  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     if isinstance(t, Instance) and t.last_known_value is not None:
@@ -925,7 +925,7 @@ def _get_type_method_ret_type(t: ProperType, *, name: str) -> Type | None:
     return None
 
 
-def _interpret_truthiness_result(disc: tuple, t: ProperType) -> ProperType | None:
+def _interpret_truthiness_result(disc: tuple[int, object], t: ProperType) -> ProperType | None:
     """Map a Rust truthiness discriminator to a live Python `ProperType`.
 
     Returns `None` if the discriminator can't be interpreted (the caller
@@ -955,17 +955,17 @@ def _interpret_truthiness_result(disc: tuple, t: ProperType) -> ProperType | Non
         new_t.can_be_false = new_t.can_be_false_default()
         return new_t
     elif tag == 6:
-        fallback = _deserialize_type(bytes(disc[1]))
-        if isinstance(fallback, Instance):
-            return LiteralType("", fallback=fallback)
+        fallback = _deserialize_type(bytes(disc[1]))  # type: ignore[call-overload]
+        if isinstance(get_proper_type(fallback), Instance):
+            return LiteralType("", fallback=fallback)  # type: ignore[arg-type]
         return None
     elif tag == 7:
-        fallback = _deserialize_type(bytes(disc[1]))
-        if isinstance(fallback, Instance):
-            return LiteralType(0, fallback=fallback)
+        fallback = _deserialize_type(bytes(disc[1]))  # type: ignore[call-overload]
+        if isinstance(get_proper_type(fallback), Instance):
+            return LiteralType(0, fallback=fallback)  # type: ignore[arg-type]
         return None
     elif tag == 8:
-        item_discs = disc[1]
+        item_discs: list[tuple[int, object]] = disc[1]  # type: ignore[assignment]
         new_items: list[Type] = []
         for i, item_disc in enumerate(item_discs):
             if not isinstance(t, UnionType):
@@ -1250,11 +1250,10 @@ def try_getting_literals_from_type(
                 _serialize_type(typ)
             )
             if result is not None:
-                return result
+                return result  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     typ = get_proper_type(typ)
-
     if isinstance(typ, Instance) and typ.last_known_value is not None:
         possible_literals: list[Type] = [typ.last_known_value]
     elif isinstance(typ, UnionType):
@@ -1479,7 +1478,7 @@ def _rust_type_vars(tp: Type) -> list[TypeVarLikeType] | None:
                 decoded = _deserialize_type(bytes(blob))
                 if decoded is None:
                     return None
-                out.append(decoded)
+                out.append(decoded)  # type: ignore[arg-type]
             return out
     return None
 
@@ -1582,9 +1581,9 @@ def _rust_separate_union_literals(
         literal_items: list[LiteralType] = []
         for blob in literal_blobs:
             decoded = _deserialize_type(bytes(blob))
-            if not isinstance(decoded, LiteralType):
+            if not isinstance(get_proper_type(decoded), LiteralType):
                 return None
-            literal_items.append(decoded)
+            literal_items.append(decoded)  # type: ignore[arg-type]
         union_items: list[Type] = []
         for blob in union_blobs:
             if (decoded := _deserialize_type(bytes(blob))) is None:
@@ -1623,8 +1622,8 @@ def try_getting_instance_fallback(typ: Type) -> Instance | None:
                 # deferred (TypeAliasType, unresolved type_ref, or no
                 # fallback): fall back to the Python walk below.
                 decoded = _deserialize_type(bytes(result))
-                if isinstance(decoded, Instance):
-                    return decoded
+                if isinstance(get_proper_type(decoded), Instance):
+                    return decoded  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     typ = get_proper_type(typ)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from typing import Any
 from unittest import TestCase, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
@@ -32,6 +33,7 @@ from mypy.nodes import (
     CallExpr,
     Expression,
     NameExpr,
+    TypeInfo,
 )
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
@@ -1526,7 +1528,7 @@ try:
     _HAS_TYPE_KERNEL_WIRE = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
-    _WriteBuffer = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
     _HAS_TYPE_KERNEL_WIRE = False
 
 _NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_WIRE
@@ -1734,7 +1736,7 @@ class NativeTypeWireSuite(Suite):
             buf = _WB()
             t.write(buf)
             rt = read_type(_RB(buf.getvalue()))
-            assert rt.id == t.id, f"{rt.id} != {t.id} after round-trip"
+            assert rt.id == t.id, f"{rt.id} != {t.id} after round-trip"  # type: ignore[attr-defined]
 
     def test_union(self) -> None:
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b]))
@@ -1829,7 +1831,7 @@ class NativeFreshenSuite(Suite):
         assert next_raw_id == 1000000
         # pyo3 0.20 converts Vec<u8> to a Python list, not bytes; the shim
         # wraps it via bytes() when decoding. Empty payload = no change.
-        assert serialized == []
+        assert len(serialized) == 0
 
     def test_nested_generic_in_ret(self) -> None:
         inner = CallableType(
@@ -1906,7 +1908,7 @@ class FreshVarCanonicalizerSuite(Suite):
             variables=[self.fresh1, self.fresh2],
         )
         fixed = canonicalize_fresh_vars(c)
-        assert isinstance(fixed, CallableType)
+        assert isinstance(fixed, CallableType)  # type: ignore[misc]
         # Same raw id must map to the same object, not equal-but-distinct.
         assert fixed.arg_types[0] is fixed.arg_types[1]
         assert fixed.arg_types[0] is fixed.variables[0]
@@ -1924,7 +1926,7 @@ class FreshVarCanonicalizerSuite(Suite):
             variables=[self.fresh1, self.fresh2],
         )
         fixed = canonicalize_fresh_vars(c)
-        assert isinstance(fixed, CallableType)
+        assert isinstance(fixed, CallableType)  # type: ignore[misc]
         assert fixed.arg_types[0] is fixed.ret_type
         assert fixed.arg_types[0] is not fixed.arg_types[1]
 
@@ -1940,7 +1942,7 @@ class FreshVarCanonicalizerSuite(Suite):
             variables=[self.declared],
         )
         fixed = canonicalize_fresh_vars(c)
-        assert isinstance(fixed, CallableType)
+        assert isinstance(fixed, CallableType)  # type: ignore[misc]
         # meta_level=0 vars are ordinary declared vars; leave each as-is.
         assert fixed.arg_types[0] is self.declared
         assert fixed.ret_type is self.declared
@@ -2257,7 +2259,7 @@ class NativeJoinMeetSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2363,7 +2365,7 @@ class NativeJoinTypesSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2486,7 +2488,7 @@ class NativeJoinInstanceSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2588,7 +2590,7 @@ class NativeJoinInstanceWithArgsSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2674,7 +2676,7 @@ class NativeJoinCovariantArgsSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2781,7 +2783,7 @@ class NativeJoinUnionSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -2902,7 +2904,7 @@ class NativeJoinCallableSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3075,7 +3077,7 @@ class NativeJoinOverloadedSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3235,7 +3237,7 @@ class NativeJoinTypeTypeSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3334,7 +3336,7 @@ class NativeJoinLiteralSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3456,7 +3458,7 @@ class NativeJoinTypeVarSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3606,7 +3608,7 @@ class NativeJoinTypedDictSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3739,7 +3741,7 @@ class NativeJoinTupleSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -3861,7 +3863,7 @@ class NativeMeetSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -4040,7 +4042,7 @@ class NativeMeetUnboundSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -4129,7 +4131,7 @@ class NativeMeetTypeVarTupleSuite(Suite):
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
 
-    def _collect_type_infos(self) -> list:
+    def _collect_type_infos(self) -> list[TypeInfo]:
         infos = []
         for name in dir(self.fx):
             if not name.endswith("i"):
@@ -4551,7 +4553,7 @@ class NativeWireFixupSuite(Suite):
         typeinfo_map = {info.fullname: info for info in typeinfos}
         # Installs the shared wirefixup map as well.
         _set_native_applytype_typeinfo_map(typeinfo_map)
-        self._py: list[tuple] = [
+        self._py: list[tuple[str, Any]] = [
             ("typeops", _set_native_typeops_active),
             ("semanal", _set_native_semanal_active),
             ("erase", _set_native_erase_typevars_active),
@@ -4567,7 +4569,7 @@ class NativeWireFixupSuite(Suite):
             setter(False)
         _set_native_applytype_typeinfo_map(None)
 
-    def _assert_no_fake_info(self, t) -> None:
+    def _assert_no_fake_info(self, t: Type) -> None:
         from mypy.wirefixup import check_no_fake_info
 
         assert check_no_fake_info(t), "wire decode leaked a FakeInfo-bearing Type"
@@ -4602,7 +4604,7 @@ class NativeWireFixupSuite(Suite):
         actual = make_any_non_explicit(AnyType(TypeOfAny.explicit))
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
-        assert isinstance(actual, AnyType)
+        assert isinstance(actual, AnyType)  # type: ignore[misc]
         assert actual.type_of_any == TypeOfAny.special_form
 
     def test_replace_implicit_first_type_fixes_up(self) -> None:
@@ -4634,7 +4636,7 @@ class NativeWireFixupSuite(Suite):
         actual = erase_typevars(generic)
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
-        assert isinstance(actual, Instance)
+        assert isinstance(actual, Instance)  # type: ignore[misc]
 
     def test_copy_type_fixes_up_instance(self) -> None:
         from mypy.copytype import _set_native_copy_active, copy_type
@@ -4750,7 +4752,7 @@ class NativeWireFixupSuite(Suite):
         actual = make_optional_type(self.fx.b)
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
-        assert isinstance(actual, UnionType)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
         assert_equal(
             actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}"
         )
@@ -4766,7 +4768,7 @@ class NativeWireFixupSuite(Suite):
         actual = make_optional_type(union_none)
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
-        assert isinstance(actual, UnionType)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
         assert NoneType() in actual.items
         # Optional[B|C] == B|C|None, and None is absorbed.
         assert_equal(
