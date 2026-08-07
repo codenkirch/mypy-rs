@@ -1025,6 +1025,13 @@ class BuildManager:
         from mypy.checker import _set_native_checker_stmts_active
 
         _set_native_checker_stmts_active(self.options.native_type_kernel)
+        # M22: gate checkpattern standalone helpers (is_uninhabited,
+        # get_match_arg_names, get_type_range, should_self_match,
+        # can_match_sequence). Uses the subtype resolver installed in
+        # _build_native_resolvers for should_self_match / can_match_sequence.
+        from mypy.checkpattern import _set_native_checkpattern_active
+
+        _set_native_checkpattern_active(self.options.native_type_kernel)
         from mypy.semanal import _set_native_semanal_visitor_active
 
         _set_native_semanal_visitor_active(self.options.native_type_kernel)
