@@ -1870,6 +1870,82 @@ class NativeFreshenSuite(Suite):
         self.assert_fresh_par(c)
 
 
+class FreshVarCanonicalizerSuite(Suite):
+    """Regression tests for fresh meta-var identity repair (wirefixup).
+
+    Python's in-memory freshen returns the *same* fresh TypeVar object for
+    every occurrence of a given id; downstream inference compares
+    metavariables by object identity. The wire round-trip splits each
+    occurrence into a distinct object sharing an id, so
+    ``canonicalize_fresh_vars`` must re-unify them. These tests are pure
+    Python and run without the native extension.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        any_type = AnyType(TypeOfAny.special_form)
+        self.fresh1 = TypeVarType(
+            "T", "T", TypeVarId(1, meta_level=1), [], self.fx.o, any_type
+        )
+        self.fresh2 = TypeVarType(
+            "S", "S", TypeVarId(2, meta_level=1), [], self.fx.o, any_type
+        )
+        self.declared = TypeVarType(
+            "D", "D", TypeVarId(3), [], self.fx.o, any_type  # meta_level=0
+        )
+
+    def test_same_occurrences_share_one_object(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.fresh1, self.fresh1],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fresh2,
+            self.fx.function,
+            variables=[self.fresh1, self.fresh2],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        # Same raw id must map to the same object, not equal-but-distinct.
+        assert fixed.arg_types[0] is fixed.arg_types[1]
+        assert fixed.arg_types[0] is fixed.variables[0]
+        assert fixed.ret_type is fixed.variables[1]
+
+    def test_distinct_ids_stay_distinct(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.fresh1, self.fresh2],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fresh1,
+            self.fx.function,
+            variables=[self.fresh1, self.fresh2],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        assert fixed.arg_types[0] is fixed.ret_type
+        assert fixed.arg_types[0] is not fixed.arg_types[1]
+
+    def test_declared_vars_untouched(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.declared],
+            [ARG_POS],
+            [None],
+            self.declared,
+            self.fx.function,
+            variables=[self.declared],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        # meta_level=0 vars are ordinary declared vars; leave each as-is.
+        assert fixed.arg_types[0] is self.declared
+        assert fixed.ret_type is self.declared
+
+
 # Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader, with a TypeInfo resolver
 # built from the live Python TypeInfo graph, produces the same `str(t)` as

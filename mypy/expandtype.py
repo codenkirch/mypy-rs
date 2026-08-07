@@ -460,6 +460,11 @@ def freshen_all_functions_type_vars(t: T) -> T:
                         instance_cache.object_type = None
                         instance_cache.function_type = None
                         if fixed is not None:
+                            from mypy.wirefixup import canonicalize_fresh_vars
+
+                            # Wire round-trip loses fresh meta-var identity;
+                            # re-unify occurrences before returning.
+                            fixed = canonicalize_fresh_vars(fixed)
                             return cast(T, fixed)
             except (NotImplementedError, AssertionError):
                 pass
