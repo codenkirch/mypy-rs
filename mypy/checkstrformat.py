@@ -125,14 +125,43 @@ DUMMY_FIELD_NAME: Final = "__dummy_name__"
 NUMERIC_TYPES_OLD: Final = {"d", "i", "o", "u", "x", "X", "e", "E", "f", "F", "g", "G"}
 NUMERIC_TYPES_NEW: Final = {"b", "d", "o", "e", "E", "f", "F", "g", "G", "n", "x", "X", "%"}
 
+# Stage 6b type-kernel seam: when the `type_kernel` Rust extension is
+# importable and `Options.native_type_kernel` is set, the pure parsing
+# functions (`parse_conversion_specifiers`, `find_non_escaped_targets`,
+# `parse_format_value`) route through Rust. Rust returns parsed specifier
+# data as tuples; Python constructs `ConversionSpecifier` objects from
+# them. Error codes are returned as integers so Python can call `msg.fail()`
+# with the appropriate message (Rust has no access to the message builder).
+# This is the strangler-fig per-call gate, same pattern as erasetype.
+try:
+    import type_kernel as _type_kernel
+
+    _rust_is_numeric_format_type = _type_kernel.rust_is_numeric_format_type
+    _rust_parse_conversion_specifiers = _type_kernel.rust_parse_conversion_specifiers
+    _rust_find_non_escaped_targets = _type_kernel.rust_find_non_escaped_targets
+    _rust_parse_format_value = _type_kernel.rust_parse_format_value
+    _HAS_TYPE_KERNEL_STRFORMAT = True
+except (ImportError, AttributeError):
+    _rust_is_numeric_format_type = None  # type: ignore[assignment]
+    _rust_parse_conversion_specifiers = None  # type: ignore[assignment]
+    _rust_find_non_escaped_targets = None  # type: ignore[assignment]
+    _rust_parse_format_value = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL_STRFORMAT = False
+
+# Module-level flag read by the gates below. Set by the build manager from
+# `Options.native_type_kernel` at the start of each build.
+_native_strformat_active: bool = False
+
+
+def _set_native_strformat_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_strformat_active
+    _native_strformat_active = active
+
 
 def is_numeric_format_type(conv_type: str, is_new_style: bool) -> bool:
-    try:
-        import type_kernel as _type_kernel
-
-        return _type_kernel.rust_is_numeric_format_type(conv_type, is_new_style)
-    except (ImportError, AttributeError):
-        pass
+    if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+        return _rust_is_numeric_format_type(conv_type, is_new_style)
     if is_new_style:
         return conv_type in NUMERIC_TYPES_NEW
     return conv_type in NUMERIC_TYPES_OLD
@@ -176,9 +205,45 @@ class ConversionSpecifier:
     def has_star(self) -> bool:
         return self.width == "*" or self.precision == "*"
 
+    @classmethod
+    def from_fields(
+        cls,
+        whole_seq: str,
+        start_pos: int,
+        key: str | None,
+        conv_type: str,
+        flags: str,
+        width: str,
+        precision: str,
+        format_spec: str | None = None,
+        non_standard_format_spec: bool = False,
+        conversion: str | None = None,
+        field: str | None = None,
+    ) -> ConversionSpecifier:
+        """Construct from raw field values (used by the Rust parsing path)."""
+        obj = cls.__new__(cls)
+        obj.whole_seq = whole_seq
+        obj.start_pos = start_pos
+        obj.key = key
+        obj.conv_type = conv_type
+        obj.flags = flags
+        obj.width = width
+        obj.precision = precision
+        obj.format_spec = format_spec
+        obj.non_standard_format_spec = non_standard_format_spec
+        obj.conversion = conversion
+        obj.field = field
+        return obj
+
 
 def parse_conversion_specifiers(format_str: str) -> list[ConversionSpecifier]:
     """Parse c-printf-style format string into list of conversion specifiers."""
+    if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+        raw = _rust_parse_conversion_specifiers(format_str)
+        return [
+            ConversionSpecifier.from_fields(whole, sp, key, ct, fl, w, pr)
+            for (whole, sp, key, ct, fl, w, pr) in raw
+        ]
     specifiers: list[ConversionSpecifier] = []
     for m in re.finditer(FORMAT_RE, format_str):
         specifiers.append(ConversionSpecifier(m, start_pos=m.start()))
@@ -193,6 +258,52 @@ def parse_format_value(
     The specifiers may be nested (two levels maximum), in this case they are ordered as
     '{0:{1}}, {2:{3}{4}}'. Return None in case of an error.
     """
+    if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+        err_code, raw_specs = _rust_parse_format_value(format_value)
+        if err_code == 1:
+            msg.fail(
+                "Invalid conversion specifier in format string: unexpected }",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        elif err_code == 2:
+            msg.fail(
+                "Invalid conversion specifier in format string: unmatched {",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        elif err_code == 3:
+            msg.fail(
+                "Invalid conversion specifier in format string",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        elif err_code == 4:
+            msg.fail(
+                "Conversion value must not contain { or }",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        elif err_code == 5:
+            msg.fail(
+                "Formatting nesting must be at most two levels deep",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        return [
+            ConversionSpecifier.from_fields(
+                whole, sp, key, ct, fl, w, pr, fs, nss, conv, field
+            )
+            for (
+                whole, sp, key, ct, fl, w, pr, fs, nss, conv, field
+            ) in raw_specs
+        ]
+
     top_targets = find_non_escaped_targets(format_value, ctx, msg)
     if top_targets is None:
         return None
@@ -253,6 +364,23 @@ def find_non_escaped_targets(
 
     Return None in case of an error.
     """
+    if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+        err_code, targets = _rust_find_non_escaped_targets(format_value)
+        if err_code == 1:
+            msg.fail(
+                "Invalid conversion specifier in format string: unexpected }",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        elif err_code == 2:
+            msg.fail(
+                "Invalid conversion specifier in format string: unmatched {",
+                ctx,
+                code=codes.STRING_FORMATTING,
+            )
+            return None
+        return targets
     result = []
     next_spec = ""
     pos = 0

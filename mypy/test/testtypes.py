@@ -17,6 +17,9 @@ _set_native_erase_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 from mypy.mro import _set_native_mro_active
 
 _set_native_mro_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+from mypy.checkstrformat import _set_native_strformat_active
+
+_set_native_strformat_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
@@ -5178,3 +5181,187 @@ class NativeSuggestionsSuite(Suite):
 
     def test_pretty_seq_and_conjunction(self) -> None:
         self._check_pretty_seq(["x", "y", "z"], "and")
+
+
+# Stage 6b parity suite: compares Python vs Rust format-string parsing.
+# Gated by TEST_NATIVE_TYPE_KERNEL=1 plus the type_kernel extension.
+try:
+    import type_kernel as _strformat_type_kernel  # noqa: F401
+
+    _HAS_TYPE_KERNEL_STRFORMAT_TEST = True
+except ImportError:
+    _HAS_TYPE_KERNEL_STRFORMAT_TEST = False
+
+_NATIVE_STRFORMAT_ENABLED = (
+    bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+    and _HAS_TYPE_KERNEL_STRFORMAT_TEST
+)
+
+
+@skipUnless(
+    _NATIVE_STRFORMAT_ENABLED,
+    "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext",
+)
+class NativeStrFormatSuite(Suite):
+    """Parity tests for Rust format-string parsing (Stage 6b).
+
+    Each test toggles `_native_strformat_active` and compares the Rust
+    output against the Python output for `parse_conversion_specifiers`,
+    `find_non_escaped_targets`, and `parse_format_value`.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkstrformat import (
+            ConversionSpecifier,
+            _set_native_strformat_active,
+            find_non_escaped_targets,
+            parse_conversion_specifiers,
+            parse_format_value,
+        )
+        from mypy.errors import Errors
+        from mypy.options import Options
+
+        from mypy.messages import MessageBuilder
+
+        self._set_active = _set_native_strformat_active
+        self._parse_conv = parse_conversion_specifiers
+        self._parse_fmt = parse_format_value
+        self._find_targets = find_non_escaped_targets
+        self._errors = Errors(Options())
+        self._msg = MessageBuilder(self._errors, None)  # type: ignore[arg-type]
+
+    def _spec_tuples(self, specs: list[ConversionSpecifier]) -> list[tuple]:
+        """Convert ConversionSpecifier list to comparable tuples."""
+        return [
+            (
+                s.whole_seq,
+                s.start_pos,
+                s.key,
+                s.conv_type,
+                s.flags,
+                s.width,
+                s.precision,
+                s.format_spec,
+                s.non_standard_format_spec,
+                s.conversion,
+                s.field,
+            )
+            for s in specs
+        ]
+
+    # --- parse_conversion_specifiers ---
+
+    def test_parse_conv_simple(self) -> None:
+        for s in ["%s", "%d", "%f", "%x", "%%", "%r"]:
+            self._set_active(False)
+            py = self._spec_tuples(self._parse_conv(s))
+            self._set_active(True)
+            rs = self._spec_tuples(self._parse_conv(s))
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    def test_parse_conv_multiple(self) -> None:
+        for s in ["%d %s", "%s %d %f", "hello %s world %d", "%d%%", "100%% done"]:
+            self._set_active(False)
+            py = self._spec_tuples(self._parse_conv(s))
+            self._set_active(True)
+            rs = self._spec_tuples(self._parse_conv(s))
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    def test_parse_conv_with_key(self) -> None:
+        for s in ["%(name)s", "%(key)d %(other)s", "%(x)f"]:
+            self._set_active(False)
+            py = self._spec_tuples(self._parse_conv(s))
+            self._set_active(True)
+            rs = self._spec_tuples(self._parse_conv(s))
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    def test_parse_conv_flags_width_precision(self) -> None:
+        cases = [
+            "%05d", "%-10s", "%+d", "%#x", "%*d", "%.*f",
+            "%10.2f", "%-+5.3e", "% #0*d", "%8.0f",
+            "%5d", "%.3s", "%5.3f",
+        ]
+        for s in cases:
+            self._set_active(False)
+            py = self._spec_tuples(self._parse_conv(s))
+            self._set_active(True)
+            rs = self._spec_tuples(self._parse_conv(s))
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    def test_parse_conv_no_specifiers(self) -> None:
+        for s in ["hello", "", "no percent", "100 percent no sign"]:
+            self._set_active(False)
+            py = self._spec_tuples(self._parse_conv(s))
+            self._set_active(True)
+            rs = self._spec_tuples(self._parse_conv(s))
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    # --- find_non_escaped_targets ---
+
+    def test_find_targets_basic(self) -> None:
+        from mypy.nodes import Context
+
+        ctx = Context()
+        cases = [
+            "{}", "{name}", "{0}", "{0:d}", "{name!r}", "{{escaped}}",
+            "no targets", "", "{a} {b}", "{0}{1}{2}",
+            "{:.2f}", "{:>10}", "{:s}", "{!s}",
+        ]
+        for s in cases:
+            self._set_active(False)
+            py = self._find_targets(s, ctx, self._msg)
+            self._set_active(True)
+            rs = self._find_targets(s, ctx, self._msg)
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    def test_find_targets_errors(self) -> None:
+        from mypy.nodes import Context
+
+        ctx = Context()
+        # Clear errors between runs
+        for s in ["}", "{", "{}}", "{{}"]:
+            self._errors.reset()
+            self._set_active(False)
+            py = self._find_targets(s, ctx, self._msg)
+            self._errors.reset()
+            self._set_active(True)
+            rs = self._find_targets(s, ctx, self._msg)
+            assert_equal(rs, py, f"mismatch for {s!r}")
+
+    # --- parse_format_value ---
+
+    def test_parse_format_value_basic(self) -> None:
+        from mypy.nodes import Context
+
+        ctx = Context()
+        cases = [
+            "{}", "{0}", "{name}", "{:s}", "{:d}", "{:.2f}",
+            "{:>10}", "{!r}", "{!s}", "{0:d} {1:s}",
+            "{{literal}}", "no specs", "",
+            "{name!r:>{width}}",
+        ]
+        for s in cases:
+            self._errors.reset()
+            self._set_active(False)
+            py = self._parse_fmt(s, ctx, self._msg)
+            self._errors.reset()
+            self._set_active(True)
+            rs = self._parse_fmt(s, ctx, self._msg)
+            assert_equal(
+                self._spec_tuples(rs) if rs else None,
+                self._spec_tuples(py) if py else None,
+                f"mismatch for {s!r}",
+            )
+
+    def test_parse_format_value_errors(self) -> None:
+        from mypy.nodes import Context
+
+        ctx = Context()
+        for s in ["}", "{", "{a}{", "{a}}"]:
+            self._errors.reset()
+            self._set_active(False)
+            py = self._parse_fmt(s, ctx, self._msg)
+            self._errors.reset()
+            self._set_active(True)
+            rs = self._parse_fmt(s, ctx, self._msg)
+            assert_equal(rs, py, f"mismatch for {s!r}")
