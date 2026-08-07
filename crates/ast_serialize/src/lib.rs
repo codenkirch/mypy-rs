@@ -95,6 +95,7 @@ const TYPE_ALIAS_STMT: u8 = 225;
 const IMPORT_METADATA: u8 = 226;
 const IMPORTFROM_METADATA: u8 = 227;
 const IMPORTALL_METADATA: u8 = 228;
+const TSTRING_EXPR: u8 = 229;
 
 const UNBOUND_TYPE: u8 = 104;
 const UNPACK_TYPE: u8 = 105;
@@ -247,6 +248,7 @@ struct Serializer<'a> {
     class_depth: usize,
     parse_errors: Vec<NativeParseError>,
     forced_type_loc: Option<SourceLocation>,
+    uses_template_strings: bool,
     callable_arg_list_depth: usize,
 }
 
@@ -275,6 +277,7 @@ impl<'a> Serializer<'a> {
             parse_errors: Vec::new(),
             forced_type_loc: None,
             callable_arg_list_depth: 0,
+            uses_template_strings: false,
         }
     }
 
@@ -434,7 +437,7 @@ fn parse(
     let is_partial_package = is_partial_stub_package(fnam, &module.body);
     let python_version = python_version.unwrap_or((3, 10));
     let python_version = (i64::from(python_version.0), i64::from(python_version.1));
-    let (ast_bytes, imports, native_errors) = serialize_suite(
+    let (ast_bytes, imports, native_errors, uses_template_strings) = serialize_suite(
         &module.body,
         &source,
         python_version,
@@ -448,7 +451,7 @@ fn parse(
     let import_bytes = serialize_import_metadata(&imports);
     let data = pyo3::types::PyDict::new(py);
     data.set_item("is_partial_package", is_partial_package)?;
-    data.set_item("uses_template_strings", false)?;
+    data.set_item("uses_template_strings", uses_template_strings)?;
     data.set_item("mypy_ignores", type_ignores.clone())?;
     data.set_item("source_hash", source_hash(&source))?;
     data.set_item("mypy_comments", collect_mypy_comments(&source))?;
@@ -614,7 +617,7 @@ fn serialize_suite(
     always_false: Vec<String>,
     skip_function_bodies: bool,
     type_comments: HashMap<i64, String>,
-) -> PyResult<(Vec<u8>, Vec<ImportMetadata>, Vec<NativeParseError>)> {
+) -> PyResult<(Vec<u8>, Vec<ImportMetadata>, Vec<NativeParseError>, bool)> {
     let mut serializer = Serializer::new(
         source,
         python_version,
@@ -639,9 +642,10 @@ fn serialize_suite(
             rest_unreachable = top_level_assert_always_fails(&serializer, statement);
         }
     }
+    let uses_template_strings = serializer.uses_template_strings;
     let imports = serializer.imports.imports.clone();
     let errors = serializer.parse_errors.clone();
-    Ok((serializer.into_bytes(), imports, errors))
+    Ok((serializer.into_bytes(), imports, errors, uses_template_strings))
 }
 
 fn serialize_import_metadata(imports: &[ImportMetadata]) -> Vec<u8> {
@@ -1077,6 +1081,7 @@ fn serialize_expr(serializer: &mut Serializer<'_>, expression: &ast::Expr) -> Py
             Ok(())
         }
         ast::Expr::FString(f_string) => serialize_f_string_expr(serializer, f_string),
+        ast::Expr::TString(t_string) => serialize_t_string_expr(serializer, t_string),
         ast::Expr::If(if_expr) => {
             let loc = serializer.loc(expression);
             serializer.writer.tag(CONDITIONAL_EXPR);
@@ -1351,6 +1356,75 @@ fn serialize_f_string_expr(
             ast::FStringPart::FString(part) => {
                 serializer.writer.bool(true);
                 serialize_f_string_items(serializer, &part.elements)?;
+            }
+        }
+    }
+    serializer.writer.loc(&loc);
+    serializer.writer.tag(END_TAG);
+    Ok(())
+}
+
+/// Serialize a PEP 701 template string (`ExprTString`).
+///
+/// Wire format (read by `nativeparse.py:read_expression` TSTRING_EXPR):
+/// ```text
+/// TSTRING_EXPR; int nparts;
+/// for each part:
+///   bool is_interpolation
+///   if interpolation:
+///     expr; str (source); bool has_conv; [str conv]; bool has_format_spec;
+///     [fstring_items]
+///   else:
+///     str; loc
+/// loc; END_TAG
+/// ```
+/// Matches `fastparse.visit_TemplateStr`, which uses the same item shape as
+/// f-strings plus the raw interpolation source string (dropped by the
+/// checker, used only for debugging).
+fn serialize_t_string_expr(
+    serializer: &mut Serializer<'_>,
+    t_string: &ast::ExprTString,
+) -> PyResult<()> {
+    serializer.uses_template_strings = true;
+    let loc = serializer.loc(t_string);
+    serializer.writer.tag(TSTRING_EXPR);
+    // Wire format flattens all TString parts' elements into one list.
+    let nparts: usize = t_string
+        .value
+        .as_slice()
+        .iter()
+        .map(|t| t.elements.iter().count())
+        .sum();
+    serializer.writer.int(nparts as i64);
+    for tstring in t_string.value.as_slice() {
+        for element in tstring.elements.iter() {
+            match element {
+                ast::InterpolatedStringElement::Interpolation(interpolation) => {
+                    serializer.writer.bool(true);
+                    serialize_expr(serializer, &interpolation.expression)?;
+                    // Raw interpolation source text (CPython's Interpolation.str).
+                    let source = &serializer.source[interpolation.range.start().to_usize()
+                        ..interpolation.range.end().to_usize()];
+                    serializer.writer.string(source);
+
+                    let conversion = interpolation.conversion.to_char();
+                    serializer.writer.bool(conversion.is_some());
+                    if let Some(conversion) = conversion {
+                        serializer.writer.string(&format!("!{conversion}"));
+                    }
+
+                    serializer.writer.bool(interpolation.format_spec.is_some());
+                    if let Some(format_spec) = &interpolation.format_spec {
+                        serialize_f_string_items(serializer, &format_spec.elements)?;
+                        let loc = serializer.loc(&**format_spec);
+                        serializer.writer.loc(&loc);
+                    }
+                }
+                ast::InterpolatedStringElement::Literal(literal) => {
+                    serializer.writer.bool(false);
+                    serializer.writer.string(&literal.value);
+                    serializer.writer.loc(&serializer.loc(literal));
+                }
             }
         }
     }
@@ -3626,7 +3700,7 @@ mod tests {
     #[test]
     fn serializes_trivial_call_like_existing_binary_contract() {
         let suite = parse_module("print('hello')").unwrap().into_suite();
-        let (bytes, imports, errors) = serialize_suite(
+        let (bytes, imports, errors, _) = serialize_suite(
             &suite,
             "print('hello')",
             (3, 10),
