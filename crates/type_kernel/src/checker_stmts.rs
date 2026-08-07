@@ -216,8 +216,8 @@ fn with_exit_suppresses_inner(typ: &Type, strict_optional: bool) -> bool {
 /// folds the collected types through `make_simplified_union` at the end
 /// (checker.py:5705), so parity holds. A value that is neither a tuple nor a
 /// union is returned as a single-item list. `None` means the input could not
-/// be decoded (parity-only usage serializes live types, so this signals
-/// defer).
+/// be decoded, or an output type cannot cross the binary seam (see
+/// `encode_type_owned`), in which case the caller defers to the Python path.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn rust_try_handler_union<'py>(
@@ -232,7 +232,10 @@ pub(crate) fn rust_try_handler_union<'py>(
     let types = try_handler_union_inner(&typ, strict_optional);
     let out = PyList::empty(py);
     for t in &types {
-        out.append(PyBytes::new(py, &encode_type_owned(t)))?;
+        match encode_type_owned(t) {
+            Some(bytes) => out.append(PyBytes::new(py, &bytes))?,
+            None => return Ok(None),
+        }
     }
     Ok(Some(out))
 }
@@ -285,10 +288,21 @@ fn expand_union_items(typ: &Type, strict_optional: bool) -> Vec<Type> {
     }
 }
 
-fn encode_type_owned(t: &Type) -> Vec<u8> {
+/// Encode `t` to the type wire format, or `None` to defer to Python.
+///
+/// `TypeAliasType` is deferred because the wire format stores only the
+/// `type_ref` string, not the live `TypeAlias` node. The Python `read`
+/// (types.py:462-466) sets `alias=None`, producing a poisoned type that
+/// crashes when the checker dereferences `alias.target`. The crate-wide
+/// contract (visitor.rs `has_recursive_types_inner`, typeops.rs) is to
+/// defer such types to the pure-Python path.
+fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
+    if matches!(t, Type::TypeAliasType { .. }) {
+        return None;
+    }
     let mut buf = WriteBuffer::new();
-    write_type(&mut buf, t).expect("write type");
-    buf.into_bytes()
+    write_type(&mut buf, t).ok()?;
+    Some(buf.into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -617,5 +631,50 @@ mod tests {
             blob = Some(read_type(&mut buf, None).unwrap());
         });
         assert_eq!(blob.unwrap(), t);
+    }
+
+    #[test]
+    fn handler_union_alias_leaf_passed_through() {
+        // `try_handler_union_inner` mirrors checker.py's `_ => [typ]` fallback:
+        // a TypeAliasType leaf is passed through unchanged. The pyfunction
+        // layer then defers (see `encode_type_owned`) rather than crossing the
+        // seam, because the wire format drops the live TypeAlias node and the
+        // Python side would deserialize a poisoned alias=None type.
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![instance("builtins.ValueError")],
+        };
+        assert_eq!(try_handler_union_inner(&alias, true), vec![alias.clone()]);
+        // encode_type_owned defers TypeAliasType to avoid alias=None poisoning.
+        assert!(encode_type_owned(&alias).is_none());
+    }
+
+    #[test]
+    fn handler_union_union_item_alias_passed_through() {
+        // Alias nested inside a union item is likewise passed through by the
+        // inner flatten; `encode_type_owned` defers on it at the pyfunction
+        // layer, so the whole call falls back to Python.
+        let t = Type::UnionType {
+            items: vec![
+                instance("builtins.ValueError"),
+                Type::TypeAliasType {
+                    type_ref: "mod.Alias".to_string(),
+                    args: Vec::new(),
+                },
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(
+            try_handler_union_inner(&t, true),
+            vec![
+                instance("builtins.ValueError"),
+                Type::TypeAliasType {
+                    type_ref: "mod.Alias".to_string(),
+                    args: Vec::new(),
+                },
+            ]
+        );
     }
 }
