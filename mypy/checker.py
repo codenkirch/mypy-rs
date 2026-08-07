@@ -325,6 +325,14 @@ try:
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_with_exit_suppresses as _rust_with_exit_suppresses,
         rust_try_handler_union as _rust_try_handler_union,
+        rust_is_true_literal as _rust_is_true_literal,
+        rust_is_false_literal as _rust_is_false_literal,
+        rust_is_literal_none as _rust_is_literal_none,
+        rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
+        rust_is_static as _rust_is_static,
+        rust_is_property as _rust_is_property,
+        rust_is_settable_property as _rust_is_settable_property,
+        rust_is_custom_settable_property as _rust_is_custom_settable_property,
     )
 
     from mypy.astwire import serialize_node as _checker_serialize_node
@@ -345,6 +353,14 @@ except ImportError:
     _rust_stmt_outcome = None  # type: ignore[assignment]
     _rust_with_exit_suppresses = None  # type: ignore[assignment]
     _rust_try_handler_union = None  # type: ignore[assignment]
+    _rust_is_true_literal = None  # type: ignore[assignment]
+    _rust_is_false_literal = None  # type: ignore[assignment]
+    _rust_is_literal_none = None  # type: ignore[assignment]
+    _rust_is_literal_not_implemented = None  # type: ignore[assignment]
+    _rust_is_static = None  # type: ignore[assignment]
+    _rust_is_property = None  # type: ignore[assignment]
+    _rust_is_settable_property = None  # type: ignore[assignment]
+    _rust_is_custom_settable_property = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
     _CheckerStmtWriteBuffer = None  # type: ignore[misc, assignment]
     _CheckerReadBuffer = None  # type: ignore[assignment,misc]
@@ -9001,20 +9017,40 @@ def gen_unique_name(base: str, table: SymbolTable) -> str:
 
 def is_true_literal(n: Expression) -> bool:
     """Returns true if this expression is the 'True' literal/keyword."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_true_literal(n)
+        except (AssertionError, NotImplementedError):
+            pass
     return refers_to_fullname(n, "builtins.True") or isinstance(n, IntExpr) and n.value != 0
 
 
 def is_false_literal(n: Expression) -> bool:
     """Returns true if this expression is the 'False' literal/keyword."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_false_literal(n)
+        except (AssertionError, NotImplementedError):
+            pass
     return refers_to_fullname(n, "builtins.False") or isinstance(n, IntExpr) and n.value == 0
 
 
 def is_literal_none(n: Expression) -> bool:
     """Returns true if this expression is the 'None' literal/keyword."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_literal_none(n)
+        except (AssertionError, NotImplementedError):
+            pass
     return isinstance(n, NameExpr) and n.fullname == "builtins.None"
 
 
 def is_literal_not_implemented(n: Expression | None) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_literal_not_implemented(n)
+        except (AssertionError, NotImplementedError):
+            pass
     return isinstance(n, NameExpr) and n.fullname == "builtins.NotImplemented"
 
 
@@ -9856,6 +9892,11 @@ def is_untyped_decorator(typ: Type | None) -> bool:
 
 
 def is_static(func: FuncBase | Decorator) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_static(func)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(func, Decorator):
         return is_static(func.func)
     elif isinstance(func, FuncBase):
@@ -9864,6 +9905,11 @@ def is_static(func: FuncBase | Decorator) -> bool:
 
 
 def is_property(defn: SymbolNode) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_property(defn)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(defn, FuncDef):
         return defn.is_property
     if isinstance(defn, Decorator):
@@ -9875,6 +9921,11 @@ def is_property(defn: SymbolNode) -> bool:
 
 
 def is_settable_property(defn: SymbolNode | None) -> TypeGuard[OverloadedFuncDef]:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_settable_property(defn)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(defn, OverloadedFuncDef):
         if defn.items and isinstance(defn.items[0], Decorator):
             return defn.items[0].func.is_property
@@ -9887,6 +9938,11 @@ def is_custom_settable_property(defn: SymbolNode | None) -> bool:
     By non-trivial here we mean that it is known (i.e. definition was already type
     checked), it is not Any, and it is different from the property getter type.
     """
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_custom_settable_property(defn)
+        except (AssertionError, NotImplementedError):
+            pass
     if defn is None:
         return False
     if not is_settable_property(defn):

@@ -47,6 +47,7 @@ mod cache;
 mod callable_compat;
 mod checkcall;
 mod checker_stmts;
+mod checker_visitor;
 mod checkexpr_functions;
 mod checkstrformat;
 mod constraints;
@@ -331,6 +332,36 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checker_stmts::rust_try_handler_union,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_true_literal,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_false_literal,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_literal_none,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_literal_not_implemented,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checker_visitor::rust_is_static, module)?)?;
+    module.add_function(wrap_pyfunction!(checker_visitor::rust_is_property, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_settable_property,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_custom_settable_property,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_can_have_shared_disjoint_base,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
