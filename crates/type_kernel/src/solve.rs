@@ -332,8 +332,6 @@ pub(crate) fn rust_solve_one(
     )
 }
 
-
-
 // ---------------------------------------------------------------------------
 // solve_with_dependent (solve.py:234-292) Rust subset.
 // ---------------------------------------------------------------------------
@@ -354,14 +352,10 @@ fn tv_id(t: &Type) -> Option<TvId> {
             ..
         } => Some((*raw_id, *meta_level, namespace.clone())),
         Type::ParamSpecType {
-            raw_id,
-            namespace,
-            ..
+            raw_id, namespace, ..
         } => Some((*raw_id, 0, namespace.clone())),
         Type::TypeVarTupleType {
-            raw_id,
-            namespace,
-            ..
+            raw_id, namespace, ..
         } => Some((*raw_id, 0, namespace.clone())),
         _ => None,
     }
@@ -428,7 +422,9 @@ fn collect_type_var_ids(typ: &Type, out: &mut Vec<TvId>) {
             }
             collect_type_var_ids(partial_fallback, out);
         }
-        Type::TypedDictType { items, fallback, .. } => {
+        Type::TypedDictType {
+            items, fallback, ..
+        } => {
             for (_, t) in items {
                 collect_type_var_ids(t, out);
             }
@@ -511,7 +507,10 @@ fn add_secondary_constraints(
         return Ok(());
     }
     let sub = crate::constraints::infer_constraints_full_inner(
-        lower, upper, crate::constraints::SUBTYPE_OF, resolver,
+        lower,
+        upper,
+        crate::constraints::SUBTYPE_OF,
+        resolver,
     )
     .ok_or(())?;
     for c in sub {
@@ -520,7 +519,10 @@ fn add_secondary_constraints(
         }
     }
     let sup = crate::constraints::infer_constraints_full_inner(
-        upper, lower, crate::constraints::SUPERTYPE_OF, resolver,
+        upper,
+        lower,
+        crate::constraints::SUPERTYPE_OF,
+        resolver,
     )
     .ok_or(())?;
     for c in sup {
@@ -536,11 +538,19 @@ fn transitive_closure(
     tvars: &[TvId],
     constraints: &[Constraint],
     resolver: &crate::typeinfo::TypeResolver,
-) -> Result<(HashSet<(TvId, TvId)>, HashMap<TvId, Vec<Type>>, HashMap<TvId, Vec<Type>>), ()> {
+) -> Result<
+    (
+        HashSet<(TvId, TvId)>,
+        HashMap<TvId, Vec<Type>>,
+        HashMap<TvId, Vec<Type>>,
+    ),
+    (),
+> {
     let tvars_set: HashSet<TvId> = tvars.iter().cloned().collect();
     let mut uppers: HashMap<TvId, Vec<Type>> = HashMap::new();
     let mut lowers: HashMap<TvId, Vec<Type>> = HashMap::new();
-    let mut graph: HashSet<(TvId, TvId)> = tvars.iter().cloned().map(|tv| (tv.clone(), tv)).collect();
+    let mut graph: HashSet<(TvId, TvId)> =
+        tvars.iter().cloned().map(|tv| (tv.clone(), tv)).collect();
 
     let mut remaining: Vec<Constraint> = constraints.to_vec();
     while let Some(c) = remaining.pop() {
@@ -659,7 +669,9 @@ fn compute_dependencies(
             if other == tv {
                 continue;
             }
-            if graph.contains(&(tv.clone(), other.clone())) || graph.contains(&(other.clone(), tv.clone())) {
+            if graph.contains(&(tv.clone(), other.clone()))
+                || graph.contains(&(other.clone(), tv.clone()))
+            {
                 deps.insert(other.clone());
             }
         }
@@ -752,7 +764,15 @@ fn strongly_connected_components(
     let vlist: Vec<TvId> = vertices.into_iter().collect();
     for v in vlist {
         if !index.contains_key(&v) {
-            dfs(&v, &mut index, &mut boundaries, &mut stack, &mut identified, edges, &mut result);
+            dfs(
+                &v,
+                &mut index,
+                &mut boundaries,
+                &mut stack,
+                &mut identified,
+                edges,
+                &mut result,
+            );
         }
     }
     result
@@ -924,8 +944,14 @@ fn solve_one_for_dependent(
         return Err(());
     }
 
-    let out = solve_one_inner(lowers, &filtered_uppers, infer_unions, strict_optional, resolver)
-        .ok_or(())?;
+    let out = solve_one_inner(
+        lowers,
+        &filtered_uppers,
+        infer_unions,
+        strict_optional,
+        resolver,
+    )
+    .ok_or(())?;
     match out {
         (0, Some(bytes)) | (1, Some(bytes)) => {
             let typ = decode_type(&bytes).ok_or(())?;
@@ -1038,8 +1064,7 @@ fn solve_with_dependent_native(
         .map(|t| tv_id(t).ok_or(()))
         .collect::<Result<_, _>>()?;
 
-    let (mut graph, mut lowers, mut uppers) =
-        transitive_closure(&tvars, constraints, resolver)?;
+    let (mut graph, mut lowers, mut uppers) = transitive_closure(&tvars, constraints, resolver)?;
 
     let dmap = compute_dependencies(&tvars, &graph, &lowers, &uppers);
 
@@ -1057,12 +1082,10 @@ fn solve_with_dependent_native(
     let mut free_solutions: HashMap<TvId, Type> = HashMap::new();
     if let Some(first) = raw_batches.first() {
         for scc in first {
-            let all_empty = scc
-                .iter()
-                .all(|tv| {
-                    lowers.get(tv).map_or(true, |b| b.is_empty())
-                        && uppers.get(tv).map_or(true, |b| b.is_empty())
-                });
+            let all_empty = scc.iter().all(|tv| {
+                lowers.get(tv).map_or(true, |b| b.is_empty())
+                    && uppers.get(tv).map_or(true, |b| b.is_empty())
+            });
             if all_empty {
                 match choose_free_single(scc) {
                     Some(id) => {
@@ -1083,10 +1106,16 @@ fn solve_with_dependent_native(
     // Update lowers/uppers with free vars (solve.py:271-277).
     for (l, u) in graph.clone() {
         if free_vars.contains(&l) {
-            lowers.entry(u.clone()).or_default().push(free_solutions.get(&l).unwrap().clone());
+            lowers
+                .entry(u.clone())
+                .or_default()
+                .push(free_solutions.get(&l).unwrap().clone());
         }
         if free_vars.contains(&u) {
-            uppers.entry(l.clone()).or_default().push(free_solutions.get(&u).unwrap().clone());
+            uppers
+                .entry(l.clone())
+                .or_default()
+                .push(free_solutions.get(&u).unwrap().clone());
         }
     }
 
@@ -1095,7 +1124,13 @@ fn solve_with_dependent_native(
     for level in &raw_batches {
         let flat: Vec<TvId> = level.iter().flat_map(|s| s.iter().cloned()).collect();
         let res = solve_iteratively_native(
-            &flat, &mut graph, &mut lowers, &mut uppers, infer_unions, strict_optional, resolver,
+            &flat,
+            &mut graph,
+            &mut lowers,
+            &mut uppers,
+            infer_unions,
+            strict_optional,
+            resolver,
         )?;
         solutions.extend(res);
     }
