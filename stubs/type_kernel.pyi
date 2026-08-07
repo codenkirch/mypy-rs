@@ -103,6 +103,7 @@ __all__ = [
     "rust_is_typeddict_type_context",
     "rust_format_messages_default",
     "rust_infer_constraints",
+    "rust_infer_constraints_full",
     "rust_select_trivial",
     "rust_exclude_non_meta_vars",
     "rust_is_similar_constraints",
@@ -334,6 +335,14 @@ def rust_format_messages_default(
 ) -> list[str]: ...
 def rust_infer_constraints(
     template_bytes: bytes, actual_bytes: bytes, direction: int
+) -> list[bytes] | None: ...
+def rust_infer_constraints_full(
+    resolver: NativeTypeResolver,
+    template_bytes: bytes,
+    actual_bytes: bytes,
+    direction: int,
+    skip_neg_op: bool,
+    erase_types: bool,
 ) -> list[bytes] | None: ...
 def rust_select_trivial(options_bytes: bytes) -> bytes | None: ...
 def rust_exclude_non_meta_vars(option_bytes: bytes) -> bytes | None: ...

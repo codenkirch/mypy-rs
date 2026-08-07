@@ -922,6 +922,9 @@ class BuildManager:
         from mypy.solve import _set_native_solve_resolver
 
         _set_native_solve_resolver(None)
+        from mypy.constraints import _set_native_constraints_resolver
+
+        _set_native_constraints_resolver(None)
         # Stage 4 (M8ba): gate the pure-positional/named branch of
         # `map_actuals_to_formals`. The Rust path returns None for any call
         # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
@@ -1224,6 +1227,9 @@ class BuildManager:
         from mypy.solve import _set_native_solve_resolver
 
         _set_native_solve_resolver(resolver)
+        from mypy.constraints import _set_native_constraints_resolver
+
+        _set_native_constraints_resolver(resolver)
         # Stage 5: the MRO kernel only declines (None) for cycles,
         # missing bases, and the obj_type callback edge, so it cannot
         # return a wrong answer. Wired to production.
@@ -5131,6 +5137,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.solve import _set_native_solve_resolver
 
         _set_native_solve_resolver(None)
+        from mypy.constraints import _set_native_constraints_resolver
+
+        _set_native_constraints_resolver(None)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 

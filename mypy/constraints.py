@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+# Stage 4b type-kernel seam: when type_kernel is importable and the
 from typing import TYPE_CHECKING, Final, TypeGuard, cast
 
 import mypy.subtypes
@@ -26,12 +26,25 @@ except ImportError:
 # `Options.native_type_kernel` at the start of each build. When active
 # but no Rust result, the shim falls through to Python.
 _native_constraints_active: bool = False
+# NativeTypeResolver snapshot, installed by the build manager after
+# semantic analysis (per SCC). Needed by the full constraint-builder
+# port to resolve Instance refs / type-var variance.
+_native_constraints_resolver = None
 
 
 def _set_native_constraints_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_constraints_active
     _native_constraints_active = active
+
+
+def _set_native_constraints_resolver(resolver) -> None:
+    """Install/clear the NativeTypeResolver snapshot used by the Rust
+    constraint-builder port. Pass `None` to clear (stale snapshot hazard:
+    a resolver from a previous build would resolve Instance refs against
+    a dead TypeInfo graph)."""
+    global _native_constraints_resolver
+    _native_constraints_resolver = resolver
 
 
 def _try_native_infer_constraints(
@@ -75,6 +88,49 @@ def _try_native_infer_constraints(
         if target != actual:
             raise NotImplementedError("target not wire-safe")
         constraints.append(Constraint(template, op, actual))
+    return constraints
+
+
+def _try_native_constraint_builder(
+    template: Type, actual: Type, direction: int, skip_neg_op: bool, erase_types: bool
+) -> list[Constraint] | None:
+    """Route the full ConstraintBuilderVisitor port through Rust.
+
+    Requires a NativeTypeResolver snapshot (installed by the build manager
+    per SCC). Any unsupported type shape makes Rust return None, which we
+    turn into an exception so the caller falls back to Python.
+    """
+    if _native_constraints_resolver is None:
+        return None
+    template_buf = _WriteBuffer()
+    template.write(template_buf)
+    actual_buf = _WriteBuffer()
+    actual.write(actual_buf)
+    raw = _type_kernel.rust_infer_constraints_full(
+        _native_constraints_resolver,
+        template_buf.getvalue(),
+        actual_buf.getvalue(),
+        direction,
+        skip_neg_op,
+        erase_types,
+    )
+    if raw is None:
+        raise NotImplementedError("constraint-builder path not supported")
+    from mypy.cache import read_int
+    from mypy.types import read_type
+    from mypy.wirefixup import fixup_wire_type
+
+    constraints: list[Constraint] = []
+    for blob in raw:
+        data = _ReadBuffer(bytes(blob))
+        origin = fixup_wire_type(read_type(data))
+        if not isinstance(origin, (TypeVarType, TypeVarTupleType)):
+            raise NotImplementedError("origin not a type variable")
+        op = read_int(data)
+        target = fixup_wire_type(read_type(data))
+        if target is None:
+            raise NotImplementedError("target unresolvable on wire")
+        constraints.append(Constraint(origin, op, target))
     return constraints
 
 
@@ -578,6 +634,15 @@ def _infer_constraints(
         return []
 
     # Remaining cases are handled by ConstraintBuilderVisitor.
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            res = _try_native_constraint_builder(
+                template, actual, direction, skip_neg_op, erase_types
+            )
+            if res is not None:
+                return res
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     return template.accept(ConstraintBuilderVisitor(actual, direction, skip_neg_op, erase_types))
 
 
