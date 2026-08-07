@@ -1226,6 +1226,243 @@ pub(crate) fn rust_solve_dependent(
     }
 }
 
+/// `upper_bound_of`: extract the `upper_bound` field of a TypeVar-like
+/// wire type (all three variants carry one).
+fn upper_bound_of(t: &Type) -> Option<Type> {
+    match t {
+        Type::TypeVarType { upper_bound, .. }
+        | Type::ParamSpecType { upper_bound, .. }
+        | Type::TypeVarTupleType { upper_bound, .. } => Some((**upper_bound).clone()),
+        _ => None,
+    }
+}
+
+/// `is_callable_protocol` (solve.py:832-836): an `Instance` whose type
+/// info is a protocol exposing `__call__`.
+fn is_callable_protocol(t: &Type, resolver: &crate::typeinfo::TypeResolver) -> bool {
+    if let Type::Instance { type_ref, .. } = t {
+        resolver
+            .get(type_ref)
+            .is_some_and(|s| s.is_protocol && s.protocol_members.iter().any(|m| m == "__call__"))
+    } else {
+        false
+    }
+}
+
+/// Non-polymorphic `solve_constraints` (solve.py:263-296) in Rust: cmap
+/// grouping, per-var `solve_one`, extra-var leak check, ordered `res`
+/// assembly with strict/Any defaults, and `pre_validate_solutions`.
+/// Returns `(sol_blob, free_blob)`; free is always empty. `Err(())`
+/// defers the whole call to Python.
+#[allow(clippy::too_many_arguments)]
+fn solve_constraints_native(
+    vars: &[Type],
+    original_vars: &[Type],
+    constraints: &[Constraint],
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+    skip_unsatisfied: bool,
+    resolver: &crate::typeinfo::TypeResolver,
+) -> Result<(Vec<u8>, Vec<u8>), ()> {
+    let original_ids: HashSet<TvId> = original_vars
+        .iter()
+        .map(|t| tv_id(t).ok_or(()))
+        .collect::<Result<_, _>>()?;
+    let all_ids: HashSet<TvId> = vars
+        .iter()
+        .map(|t| tv_id(t).ok_or(()))
+        .collect::<Result<_, _>>()?;
+    let extra_ids: HashSet<TvId> = all_ids.difference(&original_ids).cloned().collect();
+
+    // cmap (solve.py:249-251): constraints grouped by origin var id; only
+    // ids in the solving set participate.
+    let mut cmap: HashMap<TvId, Vec<Constraint>> = HashMap::new();
+    for c in constraints {
+        if let Some(k) = tv_id(&c.origin_type_var) {
+            if all_ids.contains(&k) {
+                cmap.entry(k).or_default().push(c.clone());
+            }
+        }
+    }
+
+    // Per-var solve (solve.py:265-275). Each solve is independent, so
+    // cmap iteration order does not affect the result.
+    let mut solutions: Vec<(TvId, Option<Type>)> = Vec::new();
+    for (tv, cs) in &cmap {
+        if cs.is_empty() {
+            continue;
+        }
+        let lowers: Vec<Type> = cs
+            .iter()
+            .filter(|c| c.op == crate::constraints::SUPERTYPE_OF)
+            .map(|c| c.target.clone())
+            .collect();
+        let uppers: Vec<Type> = cs
+            .iter()
+            .filter(|c| c.op == crate::constraints::SUBTYPE_OF)
+            .map(|c| c.target.clone())
+            .collect();
+        // Filter ambiguous UninhabitedType uppers (solve.py:462-467).
+        let filtered_uppers: Vec<Type> = uppers
+            .iter()
+            .filter(|u| !matches!(u, Type::UninhabitedType { ambiguous: true }))
+            .cloned()
+            .collect();
+
+        let candidate: Option<Type> = if lowers.is_empty() && filtered_uppers.is_empty() {
+            // No usable bounds: ambiguous Never (solve.py:470-474).
+            Some(Type::UninhabitedType { ambiguous: true })
+        } else {
+            let out = solve_one_inner(
+                &lowers,
+                &filtered_uppers,
+                infer_unions,
+                strict_optional,
+                resolver,
+            )
+            .ok_or(())?;
+            match out {
+                (0, Some(bytes)) | (1, Some(bytes)) => {
+                    let typ = decode_type(&bytes).ok_or(())?;
+                    if wire_unsafe_solution(&typ) {
+                        return Err(());
+                    }
+                    Some(typ)
+                }
+                // kind=1 no-blob: no solution (Python returns None).
+                (1, None) => None,
+                // kind=2: ambiguous Never.
+                _ => Some(Type::UninhabitedType { ambiguous: true }),
+            }
+        };
+
+        // Do not leak extra-var ids into non-polymorphic solutions
+        // (solve.py:272-275); leak-skips record nothing.
+        if let Some(c) = &candidate {
+            if !get_vars(c, &extra_ids).is_empty() {
+                continue;
+            }
+        }
+        solutions.push((tv.clone(), candidate));
+    }
+
+    // Ordered `res` assembly over `vars` only (solve.py:277-289).
+    let mut ordered: Vec<(TvId, Option<Type>)> = Vec::with_capacity(original_vars.len());
+    for t in original_vars {
+        let tv = tv_id(t).ok_or(())?;
+        match solutions.iter().find(|(k, _)| *k == tv) {
+            Some((_, sol)) => ordered.push((tv.clone(), sol.clone())),
+            None => {
+                // Unconstrained or leak-skipped: strict Never / lax Any.
+                // `TypeOfAny.special_form` = 6.
+                let cand = if strict {
+                    Type::UninhabitedType { ambiguous: true }
+                } else {
+                    Type::AnyType {
+                        type_of_any: 6,
+                        source_any: None,
+                        missing_import_name: None,
+                    }
+                };
+                ordered.push((tv.clone(), Some(cand)));
+            }
+        }
+    }
+
+    // pre_validate_solutions (solve.py:291-295, 799-829): replace a
+    // solution that violates its var's upper bound with the bound itself
+    // when the bound satisfies every constraint.
+    if !skip_unsatisfied {
+        let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+        let mut validated: Vec<(TvId, Option<Type>)> = Vec::with_capacity(ordered.len());
+        for (t, s) in original_vars.iter().zip(ordered.iter()) {
+            let tv = tv_id(t).ok_or(())?;
+            let ub = upper_bound_of(t).ok_or(())?;
+            if is_callable_protocol(&ub, resolver) {
+                validated.push((tv, s.1.clone()));
+                continue;
+            }
+            if let Some(sol) = &s.1 {
+                if !subtypes::is_subtype(sol, &ub, &ctx, resolver).ok_or(())? {
+                    let mut bound_satisfies_all = true;
+                    for c in constraints {
+                        if c.op == crate::constraints::SUBTYPE_OF
+                            && !subtypes::is_subtype(&ub, &c.target, &ctx, resolver).ok_or(())?
+                        {
+                            bound_satisfies_all = false;
+                            break;
+                        }
+                        if c.op == crate::constraints::SUPERTYPE_OF
+                            && !subtypes::is_subtype(&c.target, &ub, &ctx, resolver).ok_or(())?
+                        {
+                            bound_satisfies_all = false;
+                            break;
+                        }
+                    }
+                    if bound_satisfies_all {
+                        validated.push((tv, Some(ub)));
+                        continue;
+                    }
+                }
+            }
+            validated.push((tv, s.1.clone()));
+        }
+        ordered = validated;
+    }
+
+    let sol_blob = encode_solutions_blob(&ordered)?;
+    let free_blob = encode_free_vars_blob(&[])?;
+    Ok((sol_blob, free_blob))
+}
+
+/// `#[pyfunction]` entry for the non-polymorphic `solve_constraints`.
+///
+/// `vars` are serialized originals for `vars + extra_vars`; `original_vars`
+/// for `vars` only (the ordered positions returned in `res`); `constraints`
+/// serialized `Constraint` blobs. Returns `None` to defer the whole call
+/// to Python; otherwise `(num_solved, sol_blob, free_blob)`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_solve_constraints(
+    vars: Vec<Vec<u8>>,
+    original_vars: Vec<Vec<u8>>,
+    constraints: Vec<Vec<u8>>,
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+    skip_unsatisfied: bool,
+    resolver: &NativeTypeResolver,
+) -> SolveDependentOut {
+    let mut var_types: Vec<Type> = Vec::with_capacity(vars.len());
+    for b in &vars {
+        var_types.push(decode_type(b)?);
+    }
+    let mut orig_types: Vec<Type> = Vec::with_capacity(original_vars.len());
+    for b in &original_vars {
+        orig_types.push(decode_type(b)?);
+    }
+    let mut con_list: Vec<Constraint> = Vec::with_capacity(constraints.len());
+    for b in &constraints {
+        let mut buf = ReadBuffer::new(b);
+        con_list.push(crate::constraints::Constraint::read(&mut buf).ok()?);
+    }
+    let out = match solve_constraints_native(
+        &var_types,
+        &orig_types,
+        &con_list,
+        strict,
+        infer_unions,
+        strict_optional,
+        skip_unsatisfied,
+        resolver.resolver(),
+    ) {
+        Ok(o) => o,
+        Err(()) => return None,
+    };
+    Some((0, Some(out.0), Some(out.1)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
