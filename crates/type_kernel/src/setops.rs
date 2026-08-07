@@ -358,6 +358,39 @@ pub(crate) fn meet_types(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    // meet.py:129-141: same-type Instance pair with extra_attrs on either
+    // side returns the attrs-bearing side (so hasattr-synthesized attrs
+    // survive narrowing), before the is_proper_subtype pre-check.
+    if let (
+        Type::Instance {
+            type_ref: s_ref,
+            args: s_args,
+            last_known_value: s_lkv,
+            extra_attrs: s_ea,
+        },
+        Type::Instance {
+            type_ref: t_ref,
+            args: t_args,
+            last_known_value: t_lkv,
+            extra_attrs: t_ea,
+        },
+    ) = (s, t)
+    {
+        if s_ref == t_ref
+            && s_args == t_args
+            && s_lkv == t_lkv
+            && (s_ea.is_some() || t_ea.is_some())
+        {
+            return Some(match (s_ea, t_ea) {
+                (Some(a), Some(b)) if a.attrs.len() > b.attrs.len() => SetOpResult::SameS,
+                (Some(_), Some(_)) => SetOpResult::SameT,
+                (Some(_), None) => SetOpResult::SameS,
+                (None, Some(_)) => SetOpResult::SameT,
+                (None, None) => unreachable!(), // guarded above
+            });
+        }
+    }
+
     // meet.py:137-141: is_proper_subtype pre-check (ignore_promotions).
     // Only fires for Instance-Instance (Rust is_subtype returns None
     // for non-Instance, so ErasedType never reaches the check).
@@ -541,15 +574,9 @@ fn visit_meet(
             Some(SetOpResult::Bottom)
         }
 
-        // visit_literal_type (meet.py:1236-1242). Case 1 (s is
-        // LiteralType, s==t) -> return t (SameT). Case 2 (s is
-        // Instance, is_subtype(t.fallback, s)) -> return t (SameT).
-        // Else -> default(self.s) -> Bottom.
-        //
-        // LiteralType.__eq__ (types.py:3361-3363) compares value AND
-        // fallback. The Type enum derives PartialEq, so s == t is
-        // structural equality over the LiteralType variant (fallback +
-        // value). This matches Python's s == t exactly.
+        // visit_literal_type (meet.py:1236-1242): s==t -> SameT;
+        // is_subtype(t.fallback, s) -> SameT; else Bottom. Type enum
+        // derives PartialEq, matching LiteralType.__eq__ (types.py:3361).
         Type::LiteralType { .. } => {
             if let Type::LiteralType { .. } = s {
                 if s == t {
@@ -559,10 +586,8 @@ fn visit_meet(
                 return Some(SetOpResult::Bottom);
             }
             if let Type::Instance { .. } = s {
-                // Case 2: is_subtype(t.fallback, s). t.fallback is
-                // the LiteralType's fallback Instance. Extract it and
-                // check. is_subtype returns None for unsupported
-                // (non-Instance) -> defer conservatively.
+                // Case 2: is_subtype(t.fallback, s); t.fallback is the
+                // LiteralType's fallback Instance. None -> defer.
                 if let Type::LiteralType { fallback, .. } = t {
                     // Match on the result once: True -> SameT,
                     // False -> Bottom (default), None -> defer.
@@ -577,11 +602,9 @@ fn visit_meet(
             Some(SetOpResult::Bottom)
         }
 
-        // visit_type_type (meet.py:1248-1261), case 2 only. Case 1
-        // (both TypeType) recurses + make_normalized -> defer. Case 3
-        // (CallableType) recurses -> defer. Case 2 (s is
-        // Instance(builtins.type)) -> return t (SameT). Else ->
-        // default -> Bottom.
+        // visit_type_type (meet.py:1248-1261), case 2 only: case 1/3
+        // (TypeType/CallableType) recurse or normalize -> defer; case 2
+        // (s is Instance(builtins.type)) -> SameT; else Bottom.
         Type::TypeType { .. } => {
             if let Type::Instance { type_ref, .. } = s {
                 if type_ref == "builtins.type" {
@@ -648,6 +671,9 @@ fn visit_instance_meet(
     if t_ref == s_ref {
         if s_args.is_empty() && t_args.is_empty() {
             // Equal args-less Instances -> meet is the type itself.
+            // (The extra_attrs same-type guard lives at the top of
+            // meet_types, meet.py:129-141, so any attrs-bearing pair
+            // returns there before reaching this visitor.)
             return Some(SetOpResult::SameS);
         }
         // Same type with args: needs arg combination -> defer.
@@ -1634,6 +1660,12 @@ fn remove_redundant_union_items(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
+    // Dedup like Python's `_remove_redundant_union_items` with
+    // `is_proper_subtype(ignore_promotions=True)` (typeops.py:878-880):
+    // any-right is not a supertype; promotions must not drop `Literal[5]`.
+    let mut dedup_ctx = ctx.clone();
+    dedup_ctx.ignore_promotions = true;
+    dedup_ctx.proper_subtype = true;
     let mut current = items;
     for _direction in 0..2 {
         let mut new_items: Vec<Type> = Vec::with_capacity(current.len());
@@ -1662,7 +1694,7 @@ fn remove_redundant_union_items(
                         continue;
                     }
                 }
-                if is_subtype(&ti, tj, ctx, resolver)? {
+                if is_subtype(&ti, tj, &dedup_ctx, resolver)? {
                     duplicate_index = Some(j);
                     break;
                 }

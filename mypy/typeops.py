@@ -74,11 +74,8 @@ from mypy.typetraverser import TypeTraverserVisitor
 from mypy.typevars import fill_typevars
 
 # Stage 3e type-kernel seam: when the `type_kernel` Rust extension is
-# importable and `Options.native_type_kernel` is set, `make_simplified_union`,
-# `simple_literal_type`, `is_simple_literal`, `true_only`, `false_only`, and
-# `true_or_false` route through Rust. Rust returns `None` for any case it
-# does not handle, in which case we fall back to the pure-Python path. This
-# is the strangler-fig per-call gate, parity-only and default-off.
+# importable and `Options.native_type_kernel` is set, union / literal
+# helpers route through Rust, falling back to Python on `None`.
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
@@ -152,9 +149,17 @@ def _deserialize_type(data: bytes) -> Type | None:
     Returns None if any type_ref cannot be resolved to a live TypeInfo
     (so the caller defers to Python).
     """
+    from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
 
     decoded = _read_type(_ReadBuffer(data))
+    # Clear instance_cache primitives after read_type so NOT_READY
+    # singletons cannot leak into later builds (mirrors _typeanal_decode).
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
     return fixup_wire_type(decoded)
 
 

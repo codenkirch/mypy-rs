@@ -12,11 +12,11 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use crate::setops::union_make_union;
+use crate::setops::{make_simplified_union, meet_types, union_make_union};
 use crate::subtypes::{is_subtype, map_instance_to_supertype, SubtypeContext};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::visitor::find_unpack_in_list_inner;
-use crate::wire::{self, LiteralValue, ReadBuffer, Type};
+use crate::visitor::{find_unpack_in_list_inner, has_type_vars_inner};
+use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 /// `mypy.meet.is_overlapping_types` recursion guard. Python guards
 /// recursion with `seen_types`; Rust cannot carry that across the wire, so
@@ -207,9 +207,8 @@ fn overlap(
     }
 
     // 1. illegal types: Unbound/Deleted in Python are an overlap (True).
-    // ErasedType is not on the wire; PartialType corrupts serialization so
-    // the shim asserts before we are reached. Shorthand with `||` = Rust's
-    // operator (Python's `and`), correct boolean logic.
+    // ErasedType is not on the wire; PartialType corrupts the wire so the
+    // shim asserts first. `||` is Rust's operator for Python's `and`.
     if matches!(left, Type::UnboundType { .. } | Type::DeletedType { .. })
         || matches!(right, Type::UnboundType { .. } | Type::DeletedType { .. })
     {
@@ -956,4 +955,301 @@ pub(crate) fn rust_is_overlapping_types(
         resolver.resolver(),
         0,
     )
+}
+
+/// `mypy.types.UnionType.relevant_items` including NoneType under strict
+/// optional (narrow_declared_type keeps `None` items when strict_optional
+/// is on; meet.rs's `relevant_items` always strips them).
+fn relevant_items_with_none(items: &[Type], strict_optional: bool) -> Option<Vec<Type>> {
+    if strict_optional {
+        for item in items {
+            get_proper(item)?;
+        }
+        Some(items.to_vec())
+    } else {
+        relevant_items(items)
+    }
+}
+
+/// `mypy.meet.narrow_declared_type` (meet.py:216-348), Rust subset.
+///
+/// The Python shim resolves the `declared == narrowed` top-level equality
+/// (object identity for most types, not structural) before calling us, on
+/// the proper forms. It also guarantees neither side is `TypeAliasType`
+/// (unexpanded, `get_proper` returns None -> deferred). This worker mirrors
+/// the meet.py body after that equality check. Returns `None` (defer to
+/// Python) for any case that needs a live `TypeInfo` outside our snapshot
+/// (aliases, TypeForm-normalization special cases) or that we simply did
+/// not port; the Python shim re-runs the pure-Python visitor unchanged.
+///
+/// Cross-branch recursion mirrors Python's mutual recursion through
+/// `narrow_declared_type` -> `is_overlapping_types`/`is_subtype`/`meet_types`
+/// (Rust overlap/meet/is_subtype), and the per-item recursion for unions.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn narrow_rec(
+    declared: &Type,
+    narrowed: &Type,
+    strict_optional: bool,
+    res: &TypeResolver,
+) -> Option<Type> {
+    let declared_p = get_proper(declared)?;
+    let narrowed_p = get_proper(narrowed)?;
+
+    // meet.py:224: declared == narrowed (identity-equality branch handled
+    // in the Python shim; any in-branch equality here resolves via the
+    // proceed-paths below, which match the Python fallthrough).
+
+    // meet.py:225-244: declared UnionType -> cross-product of the
+    // overlapping/subtype items, simplified.
+    if let Type::UnionType { items, .. } = declared_p {
+        let declared_items = relevant_items_with_none(items, strict_optional)?;
+        let narrowed_items = match narrowed_p {
+            Type::UnionType { items, .. } => relevant_items_with_none(items, strict_optional)?,
+            _ => vec![narrowed_p.clone()],
+        };
+        let mut results = Vec::new();
+        for d in &declared_items {
+            for n in &narrowed_items {
+                if overlap(d, n, strict_optional, true, false, res, 0)?
+                    || is_subtype(
+                        n,
+                        d,
+                        &SubtypeContext::new(false, false, false, false, false, strict_optional),
+                        res,
+                    )?
+                {
+                    results.push(narrow_rec(d, n, strict_optional, res)?);
+                }
+            }
+        }
+        return make_simplified_union(
+            &results,
+            &SubtypeContext::new(false, false, false, false, false, strict_optional),
+            res,
+            true,
+        );
+    }
+
+    // meet.py:246-256: enum/union overlap shortcut.
+    if is_enum_overlapping_union(declared_p, narrowed_p, res)? {
+        let Type::UnionType { items, .. } = narrowed_p else {
+            return None;
+        };
+        let relevant = relevant_items_with_none(items, strict_optional)?;
+        let mut results = Vec::new();
+        for x in &relevant {
+            results.push(narrow_rec(declared, x, strict_optional, res)?);
+        }
+        return make_simplified_union(
+            &results,
+            &SubtypeContext::new(false, false, false, false, false, strict_optional),
+            res,
+            true,
+        );
+    }
+
+    // meet.py:257-263: declared TypeVarType, no type vars in original
+    // narrowed, narrowed subtype of declared's upper bound.
+    if let Type::TypeVarType { upper_bound, .. } = declared_p {
+        if !has_type_vars_inner(narrowed)
+            && is_subtype(
+                narrowed,
+                upper_bound,
+                &SubtypeContext::new(false, false, false, false, false, strict_optional),
+                res,
+            )?
+        {
+            let new_ub = narrow_rec(upper_bound, narrowed, strict_optional, res)?;
+            let mut t = declared_p.clone();
+            if let Type::TypeVarType { upper_bound, .. } = &mut t {
+                **upper_bound = new_ub;
+            }
+            return Some(t);
+        }
+    }
+
+    // meet.py:264-270: narrowed TypeVarType, mirror image.
+    if let Type::TypeVarType { upper_bound, .. } = narrowed_p {
+        if !has_type_vars_inner(declared)
+            && is_subtype(
+                declared,
+                upper_bound,
+                &SubtypeContext::new(false, false, false, false, false, strict_optional),
+                res,
+            )?
+        {
+            let new_ub = narrow_rec(declared, upper_bound, strict_optional, res)?;
+            let mut t = narrowed_p.clone();
+            if let Type::TypeVarType { upper_bound, .. } = &mut t {
+                **upper_bound = new_ub;
+            }
+            return Some(t);
+        }
+    }
+
+    // meet.py:271-276: disjoint -> UninhabitedType (strict) / NoneType.
+    if !overlap(
+        declared_p,
+        narrowed_p,
+        strict_optional,
+        false,
+        false,
+        res,
+        0,
+    )? {
+        return if strict_optional {
+            Some(Type::UninhabitedType { ambiguous: false })
+        } else {
+            Some(Type::NoneType)
+        };
+    }
+
+    // meet.py:277-280: narrowed UnionType -> per-item.
+    if let Type::UnionType { items, .. } = narrowed_p {
+        let relevant = relevant_items_with_none(items, strict_optional)?;
+        let mut results = Vec::new();
+        for x in &relevant {
+            results.push(narrow_rec(declared, x, strict_optional, res)?);
+        }
+        return make_simplified_union(
+            &results,
+            &SubtypeContext::new(false, false, false, false, false, strict_optional),
+            res,
+            true,
+        );
+    }
+
+    // meet.py:281-282: narrowed AnyType -> original_narrowed.
+    if matches!(narrowed_p, Type::AnyType { .. }) {
+        return Some(narrowed.clone());
+    }
+
+    // meet.py:283-284: narrowed TypeVarType, upper_bound subtype of
+    // declared -> narrowed.
+    if let Type::TypeVarType { upper_bound, .. } = narrowed_p {
+        if is_subtype(
+            upper_bound,
+            declared_p,
+            &SubtypeContext::new(false, false, false, false, false, strict_optional),
+            res,
+        )? {
+            return Some(narrowed.clone());
+        }
+    }
+
+    // meet.py:287-295: TypeType both sides -> Python's
+    // TypeType.make_normalized (union-splitting); 296-306 declared +
+    // narrowed metaclass -> TypeForm conversion; defer both.
+    if matches!(declared_p, Type::TypeType { .. }) {
+        return None;
+    }
+
+    // meet.py:307-317: declared Instance.
+    if let Type::Instance {
+        type_ref: d_ref, ..
+    } = declared_p
+    {
+        let d_snap = res.get(d_ref)?;
+        // meet.py:308-310: declared type has an alt_promote (native int)
+        // -> cannot narrow -> unchanged.
+        if d_snap.alt_promote_fullname.is_some() {
+            return Some(declared.clone());
+        }
+        // meet.py:311-314: `narrowed` is an Instance whose alt_promote
+        // points back at the declared type (`int` -> `i64`) -> unchanged.
+        if let Type::Instance {
+            type_ref: n_ref, ..
+        } = narrowed_p
+        {
+            let n_snap = res.get(n_ref)?;
+            if n_snap.alt_promote_fullname.as_deref() == Some(d_ref) {
+                return Some(declared.clone());
+            }
+        }
+        // meet.py:315-316: fall to meet_types(original, original).
+        let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+        let r = meet_types(declared, narrowed, &ctx, res)?;
+        return materialize_meet_result(r, declared, narrowed, res);
+    }
+
+    // meet.py:318-320: declared (TupleType, TypeType, LiteralType) -> meet.
+    if matches!(declared_p, Type::TupleType { .. })
+        || matches!(declared_p, Type::LiteralType { .. })
+    {
+        let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+        let r = meet_types(declared, narrowed, &ctx, res)?;
+        return materialize_meet_result(r, declared, narrowed, res);
+    }
+
+    // meet.py:322-329: declared TypedDictType + narrowed `builtins.dict`
+    // with all-Any args -> original_declared. Rust defers (TypedDictType
+    // needs live TypeInfo); fall through.
+
+    // meet.py:322-329: declared TypedDictType + narrowed `builtins.dict`
+    // with all-Any args -> original_declared. TypedDictType carries callsite
+    // extra attrs we can't reproduce; defer to Python.
+    if matches!(declared_p, Type::TypedDictType { .. }) {
+        return None;
+    }
+
+    // meet.py:331-334: both CallableType + type vars in declared ret_type
+    // -> copy_modified(ret_type=narrow(...)). Rust is_subtype returns None
+    // for CallableType pairs; defer to Python rather than mis-narrowing.
+    if matches!(declared_p, Type::CallableType { .. }) {
+        return None;
+    }
+
+    // meet.py:335-337: default -> original_narrowed.
+    Some(narrowed.clone())
+}
+
+/// Materialize a `SetOpResult` from `meet_types` for `narrow_declared_type`.
+/// `meet_types` emits SameS/SameT/Bottom/Any only. Any-typed result picks
+/// `TypeOfAny.special_form` (3), matching meet.py's `meet_types` fallback
+/// (`AnyType(TypeOfAny.special_form)`).
+fn materialize_meet_result(
+    r: crate::setops::SetOpResult,
+    declared: &Type,
+    narrowed: &Type,
+    _res: &TypeResolver,
+) -> Option<Type> {
+    use crate::setops::SetOpResult;
+    match r {
+        SetOpResult::SameS => Some(declared.clone()),
+        SetOpResult::SameT => Some(narrowed.clone()),
+        SetOpResult::Bottom => Some(Type::UninhabitedType { ambiguous: false }),
+        SetOpResult::Any => Some(Type::AnyType {
+            type_of_any: 3, // TypeOfAny.special_form
+            source_any: None,
+            missing_import_name: None,
+        }),
+        _ => None, // meet never emits Object/Ancestor/SameTypeWithArgs/Encoded.
+    }
+}
+
+/// `#[pyfunction]` entry for `mypy.meet.narrow_declared_type`.
+///
+/// The Python shim guarantees: no `TypeGuardedType`, no recursive pair,
+/// and it resolves the top-level `declared == narrowed` identity branch
+/// before us. We re-check alias-deferral internally. Returns serialized
+/// result bytes, or `None` (defer to Python).
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_narrow_declared_type(
+    declared_bytes: &[u8],
+    narrowed_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let declared = decode_type(declared_bytes)?;
+    let narrowed = decode_type(narrowed_bytes)?;
+    if matches!(declared, Type::TypeAliasType { .. })
+        || matches!(narrowed, Type::TypeAliasType { .. })
+    {
+        return None;
+    }
+    let result = narrow_rec(&declared, &narrowed, strict_optional, resolver.resolver())?;
+    let mut wbuf = WriteBuffer::new();
+    crate::wire::write_type(&mut wbuf, &result).ok()?;
+    Some(wbuf.into_bytes())
 }
