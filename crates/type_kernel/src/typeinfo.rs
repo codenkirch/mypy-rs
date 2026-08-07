@@ -97,6 +97,13 @@ pub(crate) struct TypeInfoSnapshot {
     /// `is_subtype(new_type, upper_bound)` in the covariant branch
     /// (subtypes.py:612-619). Empty blob for ParamSpec/TypeVarTuple.
     pub type_var_upper_bounds: Vec<Vec<u8>>,
+    /// `TypeVarId.raw_id` per `defn.type_vars` entry, parallel to
+    /// `type_vars_with_variance`. expandtype.rs uses it to build the env
+    /// of `expand_type_by_instance` (class type vars bind
+    /// `TypeVarId(raw_id, meta_level=0)`). -1 sentinel when the attribute
+    /// is unreadable; a -1 key never matches a real raw_id (>= 0), so the
+    /// result keeps a TypeVar and defers to Python.
+    pub type_var_raw_ids: Vec<i64>,
 }
 
 #[allow(dead_code)]
@@ -341,6 +348,35 @@ fn read_opt_usize_attr(obj: &PyAny, attr: &str) -> Option<usize> {
         return None;
     }
     v.extract::<usize>().ok()
+}
+
+/// Read `TypeVarId.raw_id` per `defn.type_vars` entry, parallel to
+/// `read_type_vars_with_variance`. Used by `expand_type_by_instance` to
+/// key the substitution env: class type vars bind `(raw_id, 0, "")`.
+/// Duplicate walk is build-time-only cost. `-1` sentinel when unreadable.
+fn read_type_var_raw_ids(obj: &PyAny) -> Vec<i64> {
+    let defn = match obj.getattr("defn") {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let tvars = match defn.getattr("type_vars") {
+        Ok(t) => match t.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Vec::new(),
+        },
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(tvars.len());
+    for item in tvars.iter() {
+        let raw_id = item
+            .getattr("id")
+            .ok()
+            .and_then(|i| i.getattr("raw_id").ok())
+            .and_then(|r| r.extract::<i64>().ok())
+            .unwrap_or(-1);
+        out.push(raw_id);
+    }
+    out
 }
 
 /// Build a resolver (Python `dict[str, dict]`) from an iterable of live
@@ -850,6 +886,9 @@ pub(crate) fn build_native_resolver(
             .into_iter()
             .map(|(_, _, _, ub)| ub)
             .collect();
+        // Read after `type_vars_with_variance_full` is consumed above.
+        // Duplicate `defn.type_vars` walk is confined to resolver build.
+        let type_var_raw_ids = read_type_var_raw_ids(item);
 
         let snap = TypeInfoSnapshot {
             fullname,
@@ -875,6 +914,7 @@ pub(crate) fn build_native_resolver(
             type_var_tuple_suffix,
             type_vars_with_variance,
             type_var_upper_bounds,
+            type_var_raw_ids,
         };
         resolver.insert(snap.fullname.clone(), snap);
     }

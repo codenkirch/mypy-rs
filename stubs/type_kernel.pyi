@@ -48,6 +48,7 @@ __all__ = [
     "rust_expand_actual_type",
     "rust_linearize_hierarchy",
     "rust_expand_type",
+    "rust_expand_type_by_instance",
     "rust_make_simplified_union",
     "rust_simple_literal_type",
     "rust_is_simple_literal",
@@ -224,6 +225,12 @@ def rust_expand_type(
     resolver: NativeTypeResolver,
     type_bytes: bytes,
     env_bytes: bytes,
+    strict_optional: bool,
+) -> bytes | None: ...
+def rust_expand_type_by_instance(
+    resolver: NativeTypeResolver,
+    type_bytes: bytes,
+    instance_bytes: bytes,
     strict_optional: bool,
 ) -> bytes | None: ...
 def rust_make_simplified_union(
