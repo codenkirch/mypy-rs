@@ -1751,6 +1751,201 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(ov)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFreshenSuite(Suite):
+    """Parity tests for the Rust `freshen_all_functions_type_vars` port.
+
+    Each test serializes a `Type` via `Type.write(WriteBuffer)` and asserts
+    the Rust result (a) advances `TypeVarId.next_raw_id`, (b) produces
+    meta-level-1 `raw_id > 1000000` variables, and (c) renders identically to
+    the pure-Python `freshen_all_functions_type_vars` oracle. The oracle is
+    forced to pure Python by disabling the native gate; the Rust side is
+    invoked directly through the extension, so no TypeInfo resolver is
+    needed.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._old_active = mypy.expandtype._native_expand_type_active
+        mypy.expandtype._set_native_expand_type_active(False)
+
+    def tearDown(self) -> None:
+        mypy.expandtype._set_native_expand_type_active(self._old_active)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def assert_fresh_par(self, t: Type) -> None:
+        from mypy.expandtype import freshen_all_functions_type_vars
+        from mypy.types import read_type as _read_type
+
+        expected = freshen_all_functions_type_vars(t)
+        call = _type_kernel.rust_freshen_all_functions_type_vars(
+            1000000, self._bytes_of(t), state.strict_optional
+        )
+        assert call is not None, f"rust freshen None for {t!r}"
+        next_raw_id, changed, serialized = call
+        assert changed, f"rust freshen reported no change for {t!r}"
+        assert next_raw_id > 1000000
+        assert_equal(
+            _type_kernel.read_type_to_str(bytes(serialized)),
+            str(expected),
+            f"freshen {t!r}",
+        )
+        # The real freshen signal: fresh meta-level-1 variables with a
+        # bumped raw_id (str() prints only the name, which is unchanged).
+        from librt.internal import ReadBuffer as _RB
+
+        rt = _read_type(_RB(bytes(serialized)))
+        assert isinstance(rt, ProperType) and isinstance(rt, CallableType), str(rt)
+        for v in rt.variables:
+            assert v.id.meta_level == 1, f"var {v!r} not meta_level 1"
+            # TypeVarId.new() uses next_raw_id then increments (types.py:561),
+            # so the first fresh var gets exactly start_raw_id.
+            assert v.id.raw_id >= 1000000, f"var {v!r} raw_id not fresh"
+
+    def test_generic_simple(self) -> None:
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
+        )
+        self.assert_fresh_par(c)
+
+    def test_generic_instance_arg(self) -> None:
+        c = CallableType(
+            [self.fx.gt], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
+        )
+        self.assert_fresh_par(c)
+
+    def test_non_generic_changed_false(self) -> None:
+        c = CallableType([self.fx.b], [ARG_POS], [None], self.fx.b, self.fx.function)
+        call = _type_kernel.rust_freshen_all_functions_type_vars(
+            1000000, self._bytes_of(c), state.strict_optional
+        )
+        assert call is not None
+        next_raw_id, changed, serialized = call
+        assert not changed
+        assert next_raw_id == 1000000
+        # pyo3 0.20 converts Vec<u8> to a Python list, not bytes; the shim
+        # wraps it via bytes() when decoding. Empty payload = no change.
+        assert serialized == []
+
+    def test_nested_generic_in_ret(self) -> None:
+        inner = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        outer = CallableType([inner], [ARG_POS], [None], self.fx.b, self.fx.function)
+        self.assert_fresh_par(outer)
+
+    def test_generic_with_upper_bound(self) -> None:
+        u = TypeVarType(
+            "U", "U", TypeVarId(10), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], u, self.fx.function, variables=[u]
+        )
+        self.assert_fresh_par(c)
+
+    def test_generic_with_default_expansion(self) -> None:
+        t2 = TypeVarType(
+            "T2", "T2", TypeVarId(11), [], self.fx.o, self.fx.gt
+        )
+        c = CallableType(
+            [self.fx.t],
+            [ARG_POS],
+            [None],
+            t2,
+            self.fx.function,
+            variables=[self.fx.t, t2],
+        )
+        self.assert_fresh_par(c)
+
+    def test_union_and_type_type_ret(self) -> None:
+        inner = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        ret_union = UnionType.make_union([inner, self.fx.type_type])
+        c = CallableType([self.fx.gt], [ARG_POS], [None], ret_union, self.fx.function)
+        self.assert_fresh_par(c)
+
+
+class FreshVarCanonicalizerSuite(Suite):
+    """Regression tests for fresh meta-var identity repair (wirefixup).
+
+    Python's in-memory freshen returns the *same* fresh TypeVar object for
+    every occurrence of a given id; downstream inference compares
+    metavariables by object identity. The wire round-trip splits each
+    occurrence into a distinct object sharing an id, so
+    ``canonicalize_fresh_vars`` must re-unify them. These tests are pure
+    Python and run without the native extension.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        any_type = AnyType(TypeOfAny.special_form)
+        self.fresh1 = TypeVarType(
+            "T", "T", TypeVarId(1, meta_level=1), [], self.fx.o, any_type
+        )
+        self.fresh2 = TypeVarType(
+            "S", "S", TypeVarId(2, meta_level=1), [], self.fx.o, any_type
+        )
+        self.declared = TypeVarType(
+            "D", "D", TypeVarId(3), [], self.fx.o, any_type  # meta_level=0
+        )
+
+    def test_same_occurrences_share_one_object(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.fresh1, self.fresh1],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fresh2,
+            self.fx.function,
+            variables=[self.fresh1, self.fresh2],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        # Same raw id must map to the same object, not equal-but-distinct.
+        assert fixed.arg_types[0] is fixed.arg_types[1]
+        assert fixed.arg_types[0] is fixed.variables[0]
+        assert fixed.ret_type is fixed.variables[1]
+
+    def test_distinct_ids_stay_distinct(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.fresh1, self.fresh2],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fresh1,
+            self.fx.function,
+            variables=[self.fresh1, self.fresh2],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        assert fixed.arg_types[0] is fixed.ret_type
+        assert fixed.arg_types[0] is not fixed.arg_types[1]
+
+    def test_declared_vars_untouched(self) -> None:
+        from mypy.wirefixup import canonicalize_fresh_vars
+
+        c = CallableType(
+            [self.declared],
+            [ARG_POS],
+            [None],
+            self.declared,
+            self.fx.function,
+            variables=[self.declared],
+        )
+        fixed = canonicalize_fresh_vars(c)
+        assert isinstance(fixed, CallableType)
+        # meta_level=0 vars are ordinary declared vars; leave each as-is.
+        assert fixed.arg_types[0] is self.declared
+        assert fixed.ret_type is self.declared
+
+
 # Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader, with a TypeInfo resolver
 # built from the live Python TypeInfo graph, produces the same `str(t)` as

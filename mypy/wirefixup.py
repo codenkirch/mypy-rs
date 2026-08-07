@@ -63,6 +63,70 @@ def fixup_wire_type(typ: Type) -> Type | None:
     return None if fixer.missing else result
 
 
+class _FreshVarCanonicalizer(TypeTranslator):
+    """Re-unify fresh (meta-level > 0) type variable occurrences by id.
+
+    Python's in-memory fresh paths (e.g. ``expand_type`` with a tvmap built
+    by ``freshen_function_type_vars``) return the *same* fresh TypeVar
+    object for every occurrence of a given id, so downstream inference that
+    compares metavariables by object identity sees them as one variable.
+    A wire round-trip loses that: each occurrence materializes a distinct
+    object carrying the same id, splitting metavariables and breaking
+    inference. This pass makes all occurrences of a given fresh id share a
+    single object, restoring Python-observable identity.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._var_by_id: dict[tuple[int, int, str], TypeVarLikeType] = {}
+
+    def _canonical(
+        self, t: TypeVarLikeType, key: tuple[int, int, str]
+    ) -> TypeVarLikeType:
+        existing = self._var_by_id.get(key)
+        if existing is None:
+            self._var_by_id[key] = t
+            return t
+        return existing
+
+    @staticmethod
+    def _key(t: TypeVarLikeType) -> tuple[int, int, str]:
+        return (t.id.raw_id, t.id.meta_level, t.id.namespace)
+
+    def visit_type_var(self, t: TypeVarType, /) -> Type:
+        if not t.id.is_meta_var():
+            return t
+        return self._canonical(t, self._key(t))
+
+    def visit_param_spec(self, t: ParamSpecType, /) -> Type:
+        if not t.id.is_meta_var():
+            return t
+        return self._canonical(t, self._key(t))
+
+    def visit_type_var_tuple(self, t: TypeVarTupleType, /) -> Type:
+        if not t.id.is_meta_var():
+            return t
+        return self._canonical(t, self._key(t))
+
+    def visit_callable_type(self, t: CallableType, /) -> Type:
+        # Base translator leaves `variables`, `type_guard`, `type_is`
+        # untranslated; traverse them so fresh vars inside are unified.
+        result = super().visit_callable_type(t)
+        if not isinstance(result, CallableType):
+            return result
+        variables = [v.accept(self) for v in result.variables]
+        type_guard = t.type_guard.accept(self) if t.type_guard is not None else None
+        type_is = t.type_is.accept(self) if t.type_is is not None else None
+        return result.copy_modified(
+            variables=variables, type_guard=type_guard, type_is=type_is
+        )
+
+
+def canonicalize_fresh_vars(typ: Type) -> Type:
+    """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
+    return typ.accept(_FreshVarCanonicalizer())
+
+
 class _TypeRefFixer(TypeTranslator):
     """Resolve wire-decoded Instance.type_ref to live TypeInfo.
 

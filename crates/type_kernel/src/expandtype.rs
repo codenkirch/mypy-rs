@@ -32,7 +32,7 @@ use crate::wire::{
 /// Key for the env: `(raw_id, meta_level, namespace)`. Mirrors
 /// `TypeVarId.__eq__` (types.py:574-576), which compares `raw_id`,
 /// `meta_level`, and `namespace`.
-type EnvKey = (i64, i64, String);
+pub(crate) type EnvKey = (i64, i64, String);
 
 /// `#[pyfunction]` entry for `expand_type`. The Python-side shim
 /// (mypy/expandtype.py) calls this with the serialized `typ` blob, the
@@ -494,7 +494,7 @@ fn expand_type_list_with_unpack(
 /// `is_type_form`. The item comes from a wire round-trip so it is already
 /// proper (`get_proper_type` is a no-op). The resulting union may be a
 /// single TypeType (collapsed by `make_union`).
-fn make_type_normalized(item: Type, is_type_form: bool) -> Type {
+pub(crate) fn make_type_normalized(item: Type, is_type_form: bool) -> Type {
     if !is_type_form {
         if let Type::UnionType { items, .. } = &item {
             let mut tt_items = Vec::with_capacity(items.len());

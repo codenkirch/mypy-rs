@@ -419,6 +419,55 @@ def freshen_all_functions_type_vars(t: T) -> T:
     if not t.accept(has_generic_callable):
         return t  # Fast path to avoid expensive freshening
     else:
+        # Stage 3c type-kernel seam: try the Rust freshen path first. Rust
+        # returns None for unsupported cases (Overloaded, ParamSpec vars,
+        # TypeAliasType), then we fall through to the pure-Python visitor.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_expand_type_active
+            and _native_expand_type_resolver is not None
+            and not _needs_python(t)
+        ):
+            try:
+                call = _type_kernel.rust_freshen_all_functions_type_vars(
+                    TypeVarId.next_raw_id,
+                    _serialize_type(t),
+                    state.strict_optional,
+                )
+                if call is not None:
+                    next_raw_id, changed, serialized = call
+                    if changed:
+                        TypeVarId.next_raw_id = next_raw_id
+                        decoded = read_type(_ReadBuffer(bytes(serialized)))
+                        from mypy.wirefixup import fixup_wire_type
+
+                        fixed = fixup_wire_type(decoded)
+                        # The wire format has no line/column; decoded types
+                        # default to -1. Preserve the input type's location so
+                        # derived contexts report errors at the call site.
+                        if fixed is not None and isinstance(fixed, ProperType):
+                            fixed.line = t.line
+                            fixed.column = t.column
+                            if isinstance(fixed, CallableType):
+                                fixed.fallback.line = fixed.line
+                        # Clear the process-global primitive decode
+                        # singletons after a read (see expand_type).
+                        from mypy.types import instance_cache
+
+                        instance_cache.int_type = None
+                        instance_cache.str_type = None
+                        instance_cache.bool_type = None
+                        instance_cache.object_type = None
+                        instance_cache.function_type = None
+                        if fixed is not None:
+                            from mypy.wirefixup import canonicalize_fresh_vars
+
+                            # Wire round-trip loses fresh meta-var identity;
+                            # re-unify occurrences before returning.
+                            fixed = canonicalize_fresh_vars(fixed)
+                            return cast(T, fixed)
+            except (NotImplementedError, AssertionError):
+                pass
         result = t.accept(FreshenCallableVisitor())
         assert isinstance(result, type(t))
         return result
