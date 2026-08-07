@@ -1259,11 +1259,11 @@ class BuildManager:
         _set_native_expand_type_active(True)
         _set_native_expand_type_typeinfo_map(typeinfo_map)
         _set_native_expand_type_resolver(resolver)
-        # Stage 3e typeops helpers (parity-only). Resolver install left
-        # commented (parity-only): install via conftest.py with
-        # MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS=1.
-        # from mypy.typeops import _set_native_typeops_resolver
-        # _set_native_typeops_resolver(resolver)
+        # Stage 3e typeops helpers. Resolver install now active in
+        # production: typeops.rs is at full parity (testtypes + testcheck).
+        from mypy.typeops import _set_native_typeops_resolver
+
+        _set_native_typeops_resolver(resolver)
         # Stage 6c: applytype shares the subtype/expand resolvers.
         from mypy.applytype import (
             _set_native_applytype_resolver,
