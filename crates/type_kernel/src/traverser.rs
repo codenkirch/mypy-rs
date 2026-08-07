@@ -268,6 +268,41 @@ fn collect_name_member(node: &AstNode, names: &mut i64, members: &mut i64) {
 }
 
 // ---------------------------------------------------------------------------
+// all_yield_from_expressions (FuncCollectorBase + AssignmentStmt tracking)
+// ---------------------------------------------------------------------------
+
+/// `mypy.traverser.all_yield_from_expressions` — collect (YieldFromExpr,
+/// in_assignment) pairs. Returns the count of yield-from expressions.
+#[pyfunction]
+pub(crate) fn rust_count_yield_from_expressions(node_bytes: &[u8]) -> PyResult<i64> {
+    let node = match decode_node(node_bytes) {
+        Some(n) => n,
+        None => return Ok(0),
+    };
+    let mut count = 0i64;
+    collect_yield_from(&node, false, false, &mut count);
+    Ok(count)
+}
+
+fn collect_yield_from(node: &AstNode, inside_func: bool, in_assignment: bool, count: &mut i64) {
+    if is_yield_from_expr(node.tag) {
+        *count += 1;
+    }
+    if inside_func && is_func_def(node.tag) {
+        return;
+    }
+    let new_in_assignment = in_assignment || is_assignment_stmt(node.tag);
+    for child in node.child_nodes() {
+        collect_yield_from(
+            child,
+            inside_func || is_func_def(node.tag),
+            new_in_assignment,
+            count,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Traversal helper: visit all nodes (for future extenders)
 // ---------------------------------------------------------------------------
 
@@ -283,8 +318,10 @@ fn visit_all<F: FnMut(&AstNode)>(node: &AstNode, f: &mut F) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::astwire::{AstNode, ChildField, RETURN_STMT, YIELD_EXPR};
-    use crate::astwire::{BLOCK, INT_EXPR, MEMBER_EXPR, NAME_EXPR, STR_EXPR};
+    use crate::astwire::{
+        AstNode, ChildField, ASSIGNMENT_STMT, BLOCK, FUNC_DEF, INT_EXPR, MEMBER_EXPR, NAME_EXPR,
+        RETURN_STMT, STR_EXPR, YIELD_EXPR, YIELD_FROM_EXPR,
+    };
 
     fn make_int() -> AstNode {
         AstNode {
@@ -318,6 +355,13 @@ mod tests {
         }
     }
 
+    fn make_yield_from() -> AstNode {
+        AstNode {
+            tag: YIELD_FROM_EXPR,
+            children: vec![ChildField::Node(make_int())],
+        }
+    }
+
     fn make_name() -> AstNode {
         AstNode {
             tag: NAME_EXPR,
@@ -336,6 +380,20 @@ mod tests {
         AstNode {
             tag: BLOCK,
             children: vec![ChildField::List(stmts)],
+        }
+    }
+
+    fn make_func_def(body: AstNode) -> AstNode {
+        AstNode {
+            tag: FUNC_DEF,
+            children: vec![ChildField::Node(body)],
+        }
+    }
+
+    fn make_assignment(rvalue: AstNode) -> AstNode {
+        AstNode {
+            tag: ASSIGNMENT_STMT,
+            children: vec![ChildField::Node(rvalue)],
         }
     }
 
@@ -389,6 +447,29 @@ mod tests {
     }
 
     #[test]
+    fn test_has_yield_from_expression() {
+        let block = make_block(vec![make_yield_from()]);
+        assert!(yield_from_seek(&block, false));
+    }
+
+    #[test]
+    fn test_has_yield_from_expression_none() {
+        let block = make_block(vec![make_int()]);
+        assert!(!yield_from_seek(&block, false));
+    }
+
+    #[test]
+    fn test_has_await_expression() {
+        use crate::astwire::AWAIT_EXPR;
+        let node = AstNode {
+            tag: AWAIT_EXPR,
+            children: vec![ChildField::Node(make_int())],
+        };
+        let block = make_block(vec![node]);
+        assert!(has_await_inner(&block));
+    }
+
+    #[test]
     fn test_count_returns() {
         let block = make_block(vec![
             make_return(Some(make_int())),
@@ -401,11 +482,46 @@ mod tests {
     }
 
     #[test]
+    fn test_count_returns_skips_nested_func() {
+        let inner_func = make_func_def(make_block(vec![make_return(Some(make_int()))]));
+        let block = make_func_def(make_block(vec![make_return(Some(make_int())), inner_func]));
+        let mut count = 0i64;
+        collect_returns(&block, false, &mut count);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_count_yields() {
         let block = make_block(vec![make_yield(), make_int(), make_yield()]);
         let mut count = 0i64;
         collect_yields(&block, false, false, &mut count);
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_yields_skips_nested_func() {
+        let inner_func = make_func_def(make_block(vec![make_yield()]));
+        let block = make_func_def(make_block(vec![make_yield(), inner_func]));
+        let mut count = 0i64;
+        collect_yields(&block, false, false, &mut count);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_count_yield_from() {
+        let block = make_block(vec![make_yield_from(), make_int(), make_yield_from()]);
+        let mut count = 0i64;
+        collect_yield_from(&block, false, false, &mut count);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn test_count_yield_from_skips_nested_func() {
+        let inner_func = make_func_def(make_block(vec![make_yield_from()]));
+        let block = make_func_def(make_block(vec![make_yield_from(), inner_func]));
+        let mut count = 0i64;
+        collect_yield_from(&block, false, false, &mut count);
+        assert_eq!(count, 1);
     }
 
     #[test]
@@ -416,5 +532,24 @@ mod tests {
         collect_name_member(&block, &mut names, &mut members);
         assert_eq!(names, 2);
         assert_eq!(members, 1);
+    }
+
+    #[test]
+    fn test_collect_yields_tracks_assignment() {
+        // yield inside an assignment should be counted with in_assignment=true
+        let assignment = make_assignment(make_yield());
+        let block = make_block(vec![assignment]);
+        let mut count = 0i64;
+        collect_yields(&block, false, false, &mut count);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_collect_yield_from_tracks_assignment() {
+        let assignment = make_assignment(make_yield_from());
+        let block = make_block(vec![assignment]);
+        let mut count = 0i64;
+        collect_yield_from(&block, false, false, &mut count);
+        assert_eq!(count, 1);
     }
 }

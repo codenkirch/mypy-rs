@@ -32,6 +32,8 @@ from mypy.nodes import (
     ArgKind,
     CallExpr,
     Expression,
+    FuncDef,
+    MypyFile,
     NameExpr,
     TypeInfo,
 )
@@ -39,6 +41,17 @@ from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
+from mypy.traverser import (
+    all_name_and_member_expressions,
+    all_return_statements,
+    all_yield_expressions,
+    all_yield_from_expressions,
+    has_await_expression,
+    has_return_statement,
+    has_str_expression,
+    has_yield_expression,
+    has_yield_from_expression,
+)
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.typeanal import (
     collect_all_inner_types,
@@ -4774,3 +4787,286 @@ class NativeWireFixupSuite(Suite):
         assert_equal(
             actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}"
         )
+
+
+class NativeTraverserSuite(Suite):
+    """Parity suite for the native AST traverser (Stage 14, #304).
+
+    Builds AST from source, then verifies that the Rust traverser seekers
+    and counters produce the same results as the pure-Python collectors.
+    Exercises node types that were previously invisible to the wire format
+    (CastExpr, AssertTypeExpr, RevealExpr, SuperExpr, TypeApplication,
+    TemplateStrExpr).
+    """
+
+    def _parse(self, source: str) -> MypyFile:
+        from mypy.errors import Errors
+        from mypy.fastparse import parse
+        from mypy.options import Options
+
+        options = Options()
+        options.python_version = (3, 12)
+        errors = Errors(options)
+        tree = parse(source, fnam="<test>", module="<test>", errors=errors, options=options)
+        return tree
+
+    def _find_func(self, tree: MypyFile, name: str) -> FuncDef:
+        for stmt in tree.defs:
+            if isinstance(stmt, FuncDef) and stmt.name == name:
+                return stmt
+        raise AssertionError(f"function {name} not found")
+
+    def test_has_return_statement_trivial_return(self) -> None:
+        tree = self._parse("def f() -> int:\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is True
+
+    def test_has_return_statement_bare_return(self) -> None:
+        tree = self._parse("def f() -> None:\n    return\n")
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is False
+
+    def test_has_return_statement_none(self) -> None:
+        tree = self._parse("def f() -> None:\n    x = 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is False
+
+    def test_has_return_statement_nested_in_cast(self) -> None:
+        # cast() wraps the return expr in a CastExpr — previously
+        # invisible to the Rust seeker.
+        tree = self._parse(
+            "from typing import cast\n"
+            "def f() -> int:\n"
+            "    return cast(int, 42)\n"
+        )
+        fdef = self._find_func(tree, "f")
+        assert has_return_statement(fdef) is True
+
+    def test_has_str_expression_simple(self) -> None:
+        tree = self._parse("x = 'hello'\n")
+        assert has_str_expression(tree) is True
+
+    def test_has_str_expression_false(self) -> None:
+        tree = self._parse("x = 42\n")
+        assert has_str_expression(tree) is False
+
+    def test_has_str_expression_in_template(self) -> None:
+        # t-strings need Python 3.14+
+        from mypy.errors import Errors
+        from mypy.fastparse import parse
+        from mypy.options import Options
+
+        o = Options()
+        o.python_version = (3, 14)
+        e = Errors(o)
+        tree = parse("x = t'hello'", fnam="<t>", module="<t>", errors=e, options=o)
+        assert has_str_expression(tree) is True
+
+    def test_has_yield_expression(self) -> None:
+        tree = self._parse("def f():\n    yield 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_expression(fdef) is True
+
+    def test_has_yield_expression_false(self) -> None:
+        tree = self._parse("def f():\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_expression(fdef) is False
+
+    def test_has_yield_expression_nested_func_skipped(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    def g():\n"
+            "        yield 1\n"
+            "    return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        assert has_yield_expression(fdef) is False
+
+    def test_has_yield_from_expression(self) -> None:
+        tree = self._parse("def f():\n    yield from range(10)\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_from_expression(fdef) is True
+
+    def test_has_yield_from_expression_false(self) -> None:
+        tree = self._parse("def f():\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_from_expression(fdef) is False
+
+    def test_has_await_expression(self) -> None:
+        tree = self._parse("async def f():\n    await g()\n")
+        fdef = self._find_func(tree, "f")
+        assert has_await_expression(fdef) is True
+
+    def test_has_await_expression_false(self) -> None:
+        tree = self._parse("async def f():\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_await_expression(fdef) is False
+
+    def test_all_return_statements_count(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    return 2\n"
+            "    return\n"
+        )
+        fdef = self._find_func(tree, "f")
+        returns = all_return_statements(fdef)
+        assert len(returns) == 3
+
+    def test_all_return_statements_skips_nested(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    def g():\n"
+            "        return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        returns = all_return_statements(fdef)
+        assert len(returns) == 1
+
+    def test_all_return_statements_empty(self) -> None:
+        tree = self._parse("def f():\n    x = 1\n")
+        fdef = self._find_func(tree, "f")
+        returns = all_return_statements(fdef)
+        assert len(returns) == 0
+
+    def test_all_yield_expressions_count(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_expressions(fdef)
+        assert len(yields) == 2
+
+    def test_all_yield_expressions_in_assignment(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    x = yield 1\n"
+        )
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_expressions(fdef)
+        assert len(yields) == 1
+        assert yields[0][1] is True  # in_assignment
+
+    def test_all_yield_expressions_not_in_assignment(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    yield 1\n"
+        )
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_expressions(fdef)
+        assert len(yields) == 1
+        assert yields[0][1] is False
+
+    def test_all_yield_from_expressions_count(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    yield from range(10)\n"
+            "    yield from g()\n"
+        )
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_from_expressions(fdef)
+        assert len(yields) == 2
+
+    def test_all_yield_from_expressions_in_assignment(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    x = yield from g()\n"
+        )
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_from_expressions(fdef)
+        assert len(yields) == 1
+        assert yields[0][1] is True
+
+    def test_all_yield_from_expressions_empty(self) -> None:
+        tree = self._parse("def f():\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        yields = all_yield_from_expressions(fdef)
+        assert len(yields) == 0
+
+    def test_all_name_and_member_expressions(self) -> None:
+        tree = self._parse("x = a.b + c.d + e\n")
+        names, members = all_name_and_member_expressions(tree)
+        # x, a, c, e are names; a.b, c.d are members
+        assert len(names) == 4
+        assert len(members) == 2
+
+    def test_all_name_and_member_expressions_empty(self) -> None:
+        tree = self._parse("42\n")
+        names, members = all_name_and_member_expressions(tree)
+        assert len(names) == 0
+        assert len(members) == 0
+
+    def test_rust_count_matches_python_returns(self) -> None:
+        from type_kernel import rust_count_return_statements
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    return 2\n"
+            "    def g():\n"
+            "        return 3\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        rust_count = rust_count_return_statements(buf.getvalue())
+        py_returns = all_return_statements(fdef)
+        assert rust_count == len(py_returns)
+
+    def test_rust_count_matches_python_yields(self) -> None:
+        from type_kernel import rust_count_yield_expressions
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    yield 1\n"
+            "    x = yield 2\n"
+            "    def g():\n"
+            "        yield 3\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        rust_count = rust_count_yield_expressions(buf.getvalue())
+        py_yields = all_yield_expressions(fdef)
+        assert rust_count == len(py_yields)
+
+    def test_rust_count_matches_python_yield_from(self) -> None:
+        from type_kernel import rust_count_yield_from_expressions
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    yield from a()\n"
+            "    x = yield from b()\n"
+            "    def g():\n"
+            "        yield from c()\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        rust_count = rust_count_yield_from_expressions(buf.getvalue())
+        py_yields = all_yield_from_expressions(fdef)
+        assert rust_count == len(py_yields)
+
+    def test_rust_count_matches_python_name_member(self) -> None:
+        from type_kernel import rust_count_name_and_member_expressions
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse("x = a.b.c + d.e + f\n")
+        buf = WriteBuffer()
+        serialize_node(tree, buf)
+        rust_names, rust_members = rust_count_name_and_member_expressions(
+            buf.getvalue()
+        )
+        py_names, py_members = all_name_and_member_expressions(tree)
+        assert rust_names == len(py_names)
+        assert rust_members == len(py_members)

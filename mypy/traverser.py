@@ -103,8 +103,9 @@ from mypy.visitor import NodeVisitor
 # Stage 14: native traverser shims (parity-only).
 
 # Routes has_return_statement, has_str_expression, has_yield_expression,
-# has_yield_from_expression, has_await_expression through the AST wire-format
-# (mypy/astwire.py) into the Rust type_kernel extension.
+# has_yield_from_expression, has_await_expression through the AST
+# wire-format (mypy/astwire.py) into the Rust type_kernel extension.
+# Also imports count functions for all_* collectors (parity validation).
 
 # Rust traverses the serialized tree; falls back to pure-Python on error.
 try:
@@ -115,6 +116,18 @@ try:
         rust_has_yield_from_expression as _rust_has_yield_from_expression,
     )
     from type_kernel import rust_has_await_expression as _rust_has_await_expression
+    from type_kernel import (
+        rust_count_return_statements as _rust_count_return_statements,
+    )
+    from type_kernel import (
+        rust_count_yield_expressions as _rust_count_yield_expressions,
+    )
+    from type_kernel import (
+        rust_count_yield_from_expressions as _rust_count_yield_from_expressions,
+    )
+    from type_kernel import (
+        rust_count_name_and_member_expressions as _rust_count_name_and_member_exprs,
+    )
     from mypy.astwire import serialize_node as _ast_serialize_node
     from mypy.cache import WriteBuffer as _AstWriteBuffer
 
@@ -125,6 +138,10 @@ except ImportError:
     _rust_has_yield_expression = None  # type: ignore[assignment]
     _rust_has_yield_from_expression = None  # type: ignore[assignment]
     _rust_has_await_expression = None  # type: ignore[assignment]
+    _rust_count_return_statements = None  # type: ignore[assignment]
+    _rust_count_yield_expressions = None  # type: ignore[assignment]
+    _rust_count_yield_from_expressions = None  # type: ignore[assignment]
+    _rust_count_name_and_member_exprs = None  # type: ignore[assignment]
     _ast_serialize_node = None  # type: ignore[assignment]
     _AstWriteBuffer = None  # type: ignore[assignment,misc]
     _TRAVERSER_HAS_KERNEL = False
@@ -1020,7 +1037,18 @@ class NameAndMemberCollector(TraverserVisitor):
         super().visit_member_expr(o)
 
 
-def all_name_and_member_expressions(node: Expression) -> tuple[list[NameExpr], list[MemberExpr]]:
+def all_name_and_member_expressions(
+    node: Expression,
+) -> tuple[list[NameExpr], list[MemberExpr]]:
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            rust_names, rust_members = _rust_count_name_and_member_exprs(
+                _serialize_ast_node(node)
+            )
+            if rust_names == 0 and rust_members == 0:
+                return ([], [])
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
     v = NameAndMemberCollector()
     node.accept(v)
     return (v.name_exprs, v.member_exprs)
@@ -1126,6 +1154,12 @@ class ReturnCollector(FuncCollectorBase):
 
 
 def all_return_statements(node: Node) -> list[ReturnStmt]:
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            if _rust_count_return_statements(_serialize_ast_node(node)) == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
     v = ReturnCollector()
     node.accept(v)
     return v.return_statements
@@ -1147,6 +1181,12 @@ class YieldCollector(FuncCollectorBase):
 
 
 def all_yield_expressions(node: Node) -> list[tuple[YieldExpr, bool]]:
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            if _rust_count_yield_expressions(_serialize_ast_node(node)) == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
     v = YieldCollector()
     node.accept(v)
     return v.yield_expressions
@@ -1165,3 +1205,15 @@ class YieldFromCollector(FuncCollectorBase):
 
     def visit_yield_from_expr(self, expr: YieldFromExpr) -> None:
         self.yield_from_expressions.append((expr, self.in_assignment))
+
+
+def all_yield_from_expressions(node: Node) -> list[tuple[YieldFromExpr, bool]]:
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            if _rust_count_yield_from_expressions(_serialize_ast_node(node)) == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = YieldFromCollector()
+    node.accept(v)
+    return v.yield_from_expressions
