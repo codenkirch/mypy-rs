@@ -1451,12 +1451,44 @@ def coerce_to_literal(typ: Type) -> Type:
     return original_type
 
 
+def _rust_type_vars(tp: Type) -> list[TypeVarLikeType] | None:
+    """Rust extraction of type vars; None defers to Python.
+
+    Note that this cannot power `get_all_type_vars`: the polymorphic-call
+    inference path (`PolyTranslator.collect_vars` in applytype.py) stores the
+    returned type variables into a callable's `variables` and later
+    `freeze_all_type_vars` (checkexpr.py) mutates `tv.id.meta_level` in place.
+    Pure Python returns the same live objects embedded in the type tree, so the
+    freeze reaches every occurrence; deserialized copies would mutate only
+    themselves and leave live metavariables unresolved. `get_type_vars`
+    consumers are membership/hash-only, so a value-returning seam is safe there.
+    """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_get_type_vars(_serialize_type(tp), False)
+        except (AssertionError, NotImplementedError):
+            return None
+        if result is not None:
+            out: list[TypeVarLikeType] = []
+            for blob in result:
+                decoded = _deserialize_type(bytes(blob))
+                if decoded is None:
+                    return None
+                out.append(decoded)
+            return out
+    return None
+
+
 def get_type_vars(tp: Type) -> list[TypeVarType]:
+    rust = _rust_type_vars(tp)
+    if rust is not None:
+        return cast("list[TypeVarType]", rust)
     return cast("list[TypeVarType]", tp.accept(TypeVarExtractor()))
 
 
 def get_all_type_vars(tp: Type) -> list[TypeVarLikeType]:
-    # TODO: should we always use this function instead of get_type_vars() above?
+    # Not routed through Rust: see the mutation-sensitivity note in
+    # _rust_type_vars above.
     return tp.accept(TypeVarExtractor(include_all=True))
 
 
@@ -1524,8 +1556,44 @@ def custom_special_method(typ: Type, name: str, check_all: bool = False) -> bool
     return False
 
 
+def _rust_separate_union_literals(
+    t: UnionType,
+) -> tuple[Sequence[LiteralType], Sequence[Type]] | None:
+    """Rust partition of a union into literal vs non-literal items.
+
+    Returns None to defer to Python when the wire cannot round-trip a shape.
+    """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_separate_union_literals(_serialize_type(t))
+        except (AssertionError, NotImplementedError):
+            return None
+        if result is None:
+            # Rust could not classify an item (e.g. an alias target that may
+            # resolve to a literal); Python's get_proper_type expansion handles
+            # it, so defer the whole partition.
+            return None
+        literal_blobs, union_blobs = result
+        literal_items: list[LiteralType] = []
+        for blob in literal_blobs:
+            decoded = _deserialize_type(bytes(blob))
+            if not isinstance(decoded, LiteralType):
+                return None
+            literal_items.append(decoded)
+        union_items: list[Type] = []
+        for blob in union_blobs:
+            if (decoded := _deserialize_type(bytes(blob))) is None:
+                return None
+            union_items.append(decoded)
+        return literal_items, union_items
+    return None
+
+
 def separate_union_literals(t: UnionType) -> tuple[Sequence[LiteralType], Sequence[Type]]:
     """Separate literals from other members in a union type."""
+    rust = _rust_separate_union_literals(t)
+    if rust is not None:
+        return rust
     literal_items = []
     union_items = []
 

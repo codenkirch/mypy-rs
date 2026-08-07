@@ -830,6 +830,146 @@ pub(crate) fn rust_true_or_false(t_bytes: &[u8]) -> Option<TruthinessOut> {
 }
 
 // ---------------------------------------------------------------------------
+// separate_union_literals / get_type_vars
+// ---------------------------------------------------------------------------
+
+/// `separate_union_literals` (typeops.py:1522-1534): split the items of a
+/// union into a list of literal items and a list of non-literal items.
+///
+/// The Python version calls `get_proper_type` on each item before checking
+/// `isinstance(proper, LiteralType)`, so any `TypeAliasType` reaches Python's
+/// proper-type machinery. To keep the alias target expansion on the Python
+/// side, the Rust entry defers (returns `None`) when any item is not directly
+/// a `LiteralType` wire variant it cannot classify. Because
+/// `fixup_wire_type` runs on the decoded items in the shim, literal items
+/// come back as live `LiteralType` objects.
+#[allow(clippy::type_complexity)]
+#[pyfunction]
+pub(crate) fn rust_separate_union_literals(t_bytes: &[u8]) -> Option<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
+    let t = decode_type(t_bytes)?;
+    let Type::UnionType { items, .. } = t else {
+        // Not a union on the wire: Python would iterate `t.items` and fail,
+        // so this is a defensive defer.
+        return None;
+    };
+    let mut literal_items: Vec<Vec<u8>> = Vec::new();
+    let mut union_items: Vec<Vec<u8>> = Vec::new();
+    for item in items {
+        match item {
+            // Python classifies with `get_proper_type(item)`, which expands
+            // aliases; a `TypeAliasType` may resolve to a `LiteralType`, so
+            // we cannot bucket it without the resolver. Defer the whole call.
+            Type::TypeAliasType { .. } => return None,
+            Type::LiteralType { .. } => literal_items.push(encode_type(&item)?),
+            _ => union_items.push(encode_type(&item)?),
+        }
+    }
+    Some((literal_items, union_items))
+}
+
+/// `get_type_vars` (typeops.py:1449-1450) and `get_all_type_vars`
+/// (typeops.py:1453-1455): collect the type variables (or type-var-like
+/// parameters and type-var-tuples when `include_all`) appearing in `tp`,
+/// mirroring `TypeVarExtractor` (typeops.py:1458-1476).
+///
+/// `TypeVarExtractor` inherits `TypeQuery`, whose default traversal walks
+/// instance args, callable arg/ret/instance types, tuple partial fallback +
+/// items, typed-dict item values, type_obj item, overload items, union
+/// items, unpacked type, parameter arg types, and placeholder args.
+/// `TypeAliasType` targets would require alias expansion (the `TypeQuery`
+/// default eagerly expands via `get_proper_type`), so any alias defers the
+/// whole call to Python. Non-type-var leaves contribute nothing.
+///
+/// Returns a list of wire-encoded `Type` blobs, or `None` to defer (decode
+/// failure, or a shape the Rust traversal does not handle).
+#[pyfunction]
+pub(crate) fn rust_get_type_vars(t_bytes: &[u8], include_all: bool) -> Option<Vec<Vec<u8>>> {
+    let t = decode_type(t_bytes)?;
+    let mut out: Vec<Type> = Vec::new();
+    collect_type_vars(&t, include_all, &mut out)?;
+    let mut blobs = Vec::with_capacity(out.len());
+    for tv in out {
+        blobs.push(encode_type(&tv)?);
+    }
+    Some(blobs)
+}
+
+/// Return `None` when any shape needs alias expansion or is not handled,
+/// deferring the entire extraction to the Python `TypeVarExtractor`.
+fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+    match t {
+        Type::TypeVarType { .. } => {
+            out.push(t.clone());
+            Some(())
+        }
+        Type::ParamSpecType { .. } => {
+            if include_all {
+                out.push(t.clone());
+            }
+            Some(())
+        }
+        Type::TypeVarTupleType { .. } => {
+            if include_all {
+                out.push(t.clone());
+            }
+            Some(())
+        }
+        Type::TypeAliasType { .. } => None,
+        Type::Instance { args, .. } => collect_list(args, include_all, out),
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            collect_list(arg_types, include_all, out)?;
+            collect(ret_type, include_all, out)?;
+            if let Some(it) = instance_type {
+                if it.as_ref() != (ret_type.as_ref()) {
+                    collect(it, include_all, out)?;
+                }
+            }
+            Some(())
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            collect(partial_fallback, include_all, out)?;
+            collect_list(items, include_all, out)?;
+            Some(())
+        }
+        Type::TypedDictType { items, .. } => {
+            for (_, v) in items {
+                collect(v, include_all, out)?;
+            }
+            Some(())
+        }
+        Type::TypeType { item, .. } => collect(item, include_all, out),
+        Type::Overloaded { items } => collect_list(items, include_all, out),
+        Type::UnionType { items, .. } => collect_list(items, include_all, out),
+        Type::UnpackType { typ } => collect(typ, include_all, out),
+        Type::Parameters(p) => collect_list(&p.arg_types, include_all, out),
+        Type::UnboundType { args, .. } => collect_list(args, include_all, out),
+        // Leaf types: any, none, uninhabited, deleted, erased, literal,
+        // ellipsis, raw expression, partial, has no children.
+        _ => Some(()),
+    }
+}
+
+fn collect(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+    collect_type_vars(t, include_all, out)
+}
+
+fn collect_list(ts: &[Type], include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+    for t in ts {
+        collect_type_vars(t, include_all, out)?;
+    }
+    Some(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1688,5 +1828,186 @@ mod tests {
             try_expanding_sum_type_to_union_inner(&alias, None, true, &TypeResolver::new()),
             None
         );
+    }
+
+    // ------------------------------------------------------------------
+    // separate_union_literals
+    // ------------------------------------------------------------------
+
+    fn tv_type(raw_id: i64, name: &str) -> Type {
+        Type::TypeVarType {
+            name: name.to_string(),
+            fullname: format!("mod.{name}"),
+            raw_id,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn encode(t: &Type) -> Vec<u8> {
+        super::encode_type(t).unwrap()
+    }
+
+    #[test]
+    fn separate_union_literals_partitions_items() {
+        let lit = lit_str("x");
+        let inst = plain_instance("builtins.int");
+        let union = union_of(vec![lit.clone(), inst.clone()]);
+        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lits.len(), 1);
+        assert_eq!(super::decode_type(&lits[0]).unwrap(), lit);
+        assert_eq!(nonlits.len(), 1);
+        assert_eq!(super::decode_type(&nonlits[0]).unwrap(), inst);
+    }
+
+    #[test]
+    fn separate_union_literals_all_literals() {
+        let a = lit_str("a");
+        let b = lit_str("b");
+        let union = union_of(vec![a.clone(), b.clone()]);
+        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lits.len(), 2);
+        assert_eq!(nonlits.len(), 0);
+        assert_eq!(super::decode_type(&lits[0]).unwrap(), a);
+        assert_eq!(super::decode_type(&lits[1]).unwrap(), b);
+    }
+
+    #[test]
+    fn separate_union_literals_no_literals() {
+        let s = plain_instance("builtins.str");
+        let i = plain_instance("builtins.int");
+        let union = union_of(vec![s, i]);
+        let (lits, nonlits) = rust_separate_union_literals(&encode(&union)).unwrap();
+        assert_eq!(lits.len(), 0);
+        assert_eq!(nonlits.len(), 2);
+    }
+
+    #[test]
+    fn separate_union_literals_non_union_defers() {
+        let i = plain_instance("builtins.int");
+        assert!(rust_separate_union_literals(&encode(&i)).is_none());
+    }
+
+    #[test]
+    fn separate_union_literals_alias_defers() {
+        // TypeAliasType has no wire write arm, so a union whose item is an
+        // alias cannot cross the binary seam and the call defers to Python.
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert!(super::encode_type(&alias).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // get_type_vars / get_all_type_vars
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_type_vars_finds_nested_typevar() {
+        let t = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tv_type(1, "T")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let blobs = rust_get_type_vars(&encode(&t), false).unwrap();
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(super::decode_type(&blobs[0]).unwrap(), tv_type(1, "T"));
+    }
+
+    #[test]
+    fn get_type_vars_traverses_callable() {
+        // CallableType augments arg_types + ret_type with instance_type when
+        // it differs from ret_type. All three carriers are encodable, so a
+        // nested TypeVar is reachable through the binary seam.
+        let ret = tv_type(2, "R");
+        let inst = tv_type(3, "I");
+        let t = Type::CallableType {
+            fallback: Box::new(plain_instance("builtins.function")),
+            instance_type: Some(Box::new(inst.clone())),
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![tv_type(1, "T")],
+            arg_kinds: vec![1],
+            arg_names: vec![Some("x".to_string())],
+            ret_type: Box::new(ret.clone()),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let blobs = rust_get_type_vars(&encode(&t), false).unwrap();
+        assert_eq!(blobs.len(), 3);
+        assert_eq!(super::decode_type(&blobs[0]).unwrap(), tv_type(1, "T"));
+        assert_eq!(super::decode_type(&blobs[1]).unwrap(), ret);
+        assert_eq!(super::decode_type(&blobs[2]).unwrap(), inst);
+    }
+
+    #[test]
+    fn get_type_vars_include_all_param_spec_unencodable() {
+        // ParamSpecType has no wire write arm, so it cannot cross the binary
+        // seam at any depth; the whole call defers to Python.
+        let ps = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 2,
+            namespace: "".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+        };
+        assert!(super::encode_type(&ps).is_none());
+    }
+
+    #[test]
+    fn get_type_vars_union_collects_type_vars() {
+        let t1 = tv_type(1, "T");
+        let t2 = tv_type(3, "U");
+        let union = union_of(vec![t1.clone(), t2.clone()]);
+        let blobs = rust_get_type_vars(&encode(&union), false).unwrap();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(super::decode_type(&blobs[0]).unwrap(), t1);
+        assert_eq!(super::decode_type(&blobs[1]).unwrap(), t2);
+    }
+
+    #[test]
+    fn get_type_vars_alias_defers() {
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert!(super::encode_type(&alias).is_none());
     }
 }

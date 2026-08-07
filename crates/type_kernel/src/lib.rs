@@ -167,6 +167,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeops::rust_try_expanding_sum_type_to_union,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_separate_union_literals,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_get_type_vars, module)?)?;
     module.add_function(wrap_pyfunction!(operators::rust_operator_tables, module)?)?;
     module.add_function(wrap_pyfunction!(
         erase_typevars::rust_erase_typevars,
@@ -328,6 +333,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_is_trivial_bound, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_find_linear, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_dependent, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_constraints, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;

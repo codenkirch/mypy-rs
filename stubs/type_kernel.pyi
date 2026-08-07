@@ -127,6 +127,10 @@ __all__ = [
     "rust_type_requires_usage",
     "rust_with_exit_suppresses",
     "rust_try_handler_union",
+    "rust_is_trivial_bound",
+    "rust_find_linear",
+    "rust_separate_union_literals",
+    "rust_get_type_vars",
 ]
 
 class NativeTypeResolver:
@@ -375,3 +379,11 @@ def rust_with_exit_suppresses(type_bytes: bytes, strict_optional: bool) -> bool:
 def rust_try_handler_union(
     type_bytes: bytes, strict_optional: bool
 ) -> list[bytes] | None: ...
+def rust_is_trivial_bound(type_bytes: bytes, allow_tuple: bool) -> bool | None: ...
+def rust_find_linear(
+    constraint_bytes: bytes,
+) -> tuple[bool, tuple[int, int, str] | None] | None: ...
+def rust_separate_union_literals(
+    type_bytes: bytes,
+) -> tuple[list[bytes], list[bytes]] | None: ...
+def rust_get_type_vars(type_bytes: bytes, include_all: bool) -> list[bytes] | None: ...
