@@ -108,11 +108,25 @@ fn infer_constraints_inner(template: &Type, actual: &Type, direction: i64) -> Op
         return None;
     }
     match template {
-        Type::TypeVarType { .. } => Some(Constraint {
-            origin_type_var: template.clone(),
-            op: direction,
-            target: actual.clone(),
-        }),
+        Type::TypeVarType { .. } => {
+            // The CallableType wire format carries only 6 flags
+            // (wire.rs:539) and drops `from_type_type`; any CallableType
+            // target reconstructed on the Python side decodes with
+            // `from_type_type = False`. That would spuriously trigger
+            // abstract-class instantiation errors (checkexpr's
+            // `cannot_instantiate_abstract_class` is gated on
+            // `from_type_type`). Defer so Python's `_infer_constraints`
+            // emits the constraint against the original object.
+            // Mirrors the documented setops.rs join limitation.
+            if matches!(actual, Type::CallableType { .. } | Type::Overloaded { .. }) {
+                return None;
+            }
+            Some(Constraint {
+                origin_type_var: template.clone(),
+                op: direction,
+                target: actual.clone(),
+            })
+        }
         _ => None,
     }
 }
@@ -186,6 +200,12 @@ fn infer_constraints_full_inner(
     }
     // Template is a TypeVar -> single constraint (direction + target).
     if let Type::TypeVarType { .. } = template {
+        // Same `from_type_type` wire loss as `infer_constraints_inner`:
+        // CallableType/Overloaded targets round-trip flagless, which would
+        // spuriously flip abstract-class checks. Defer to Python's visitor.
+        if matches!(actual, Type::CallableType { .. } | Type::Overloaded { .. }) {
+            return None;
+        }
         return Some(vec![Constraint {
             origin_type_var: template.clone(),
             op: direction,
