@@ -1356,13 +1356,18 @@ def try_expanding_sum_type_to_union(typ: Type, target_fullname: str | None) -> T
 
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
-            result = _type_kernel.rust_try_expanding_sum_type_to_union(
-                _serialize_type(typ), target_fullname, state.strict_optional, _native_typeops_resolver
-            )
-            if result is not None:
-                decoded = _deserialize_type(bytes(result))
-                if decoded is not None:
-                    return decoded
+            # Wire serialization drops can_be_true/can_be_false. The
+            # expanded result feeds true_only/false_only/make_simplified_union
+            # which rely on these flags for narrowing. Defer to Python
+            # when the input carries mutated truthiness.
+            if not _has_mutated_truthiness(typ):
+                result = _type_kernel.rust_try_expanding_sum_type_to_union(
+                    _serialize_type(typ), target_fullname, state.strict_optional, _native_typeops_resolver
+                )
+                if result is not None:
+                    decoded = _deserialize_type(bytes(result))
+                    if decoded is not None:
+                        return decoded
         except (AssertionError, NotImplementedError):
             pass
 

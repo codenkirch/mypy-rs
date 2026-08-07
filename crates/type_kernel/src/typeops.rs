@@ -612,8 +612,12 @@ fn make_union(items: Vec<Type>) -> Type {
 ///
 /// A `TypeAliasType` cannot be resolved here (no target in the wire form), so
 /// it returns `None` and the Python shim defers — matching `get_proper_type`.
-/// Same deferral when a Union branch needs recursive alias flattening or an
-/// enum snapshot is missing from the resolver.
+/// Same deferral when a Union branch needs recursive alias flattening.
+///
+/// Enum expansion is deferred to Python: the snapshot's `enum_members` is
+/// captured at resolver-build time, when nonmember members (e.g.
+/// `z = nonmember(3)`) may not yet have their `Var.type` resolved, causing
+/// stale entries. Python reads `enum_members` live at type-check time.
 fn try_expanding_sum_type_to_union_inner(
     typ: &Type,
     target_fullname: Option<&str>,
@@ -667,22 +671,18 @@ fn try_expanding_sum_type_to_union_inner(
                 };
                 return Some(make_union(vec![lit(true), lit(false)]));
             }
+            // Non-bool, non-enum instances pass through unchanged.
+            // Enum expansion is deferred to Python: the snapshot's
+            // enum_members is captured at resolver-build time, when
+            // nonmember members (e.g. `z = nonmember(3)`) may not yet
+            // have their Var.type resolved, causing stale entries.
+            // Python reads enum_members live at type-check time, which
+            // correctly excludes nonmembers.
             let snap = resolver.get(type_ref)?;
-            if !snap.is_enum {
-                return Some(typ.clone());
+            if snap.is_enum {
+                return None;
             }
-            let items: Vec<Type> = snap
-                .enum_members
-                .iter()
-                .map(|name| Type::LiteralType {
-                    fallback: Box::new(typ.clone()),
-                    value: LiteralValue::Str(name.clone()),
-                })
-                .collect();
-            if items.is_empty() {
-                return Some(typ.clone());
-            }
-            Some(make_union(items))
+            Some(typ.clone())
         }
         _ => Some(typ.clone()),
     }
@@ -1650,13 +1650,6 @@ mod tests {
     // try_expanding_sum_type_to_union
     // ------------------------------------------------------------------
 
-    fn lit_enum(color: &Type, member: &str) -> Type {
-        Type::LiteralType {
-            fallback: Box::new(color.clone()),
-            value: LiteralValue::Str(member.to_string()),
-        }
-    }
-
     fn resolver_with_enum(members: Vec<String>) -> TypeResolver {
         let mut r = TypeResolver::new();
         // builtins.int must resolve (as a non-enum) for non-target Instance
@@ -1673,41 +1666,17 @@ mod tests {
     }
 
     #[test]
-    fn expand_sum_enum_expands_to_member_literals() {
+    fn expand_sum_enum_defers_to_python() {
+        // Enum expansion is deferred to Python because the snapshot's
+        // enum_members can be stale at resolver-build time.
         let color = plain_instance("tests.Color");
         let r = resolver_with_enum(vec![
             "RED".to_string(),
             "GREEN".to_string(),
             "BLUE".to_string(),
         ]);
-        let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
-        match &result {
-            Type::UnionType {
-                items,
-                uses_pep604_syntax,
-                ..
-            } => {
-                assert!(!uses_pep604_syntax);
-                assert_eq!(items.len(), 3);
-                assert_eq!(items[0], lit_enum(&color, "RED"));
-                assert_eq!(items[1], lit_enum(&color, "GREEN"));
-                assert_eq!(items[2], lit_enum(&color, "BLUE"));
-            }
-            _ => panic!("expected Union"),
-        }
-        // truthiness: enum member literals inherit fallback Instance truthiness
-        // (both True in Python, canonical Type defaults), so the member union
-        // can_be_true and can_be_false are both true.
-        assert!(crate::setops::union_item_can_be_true(&result));
-        assert!(crate::setops::union_item_can_be_false(&result));
-    }
-
-    #[test]
-    fn expand_sum_enum_with_no_members_returns_instance() {
-        let color = plain_instance("tests.Color");
-        let r = resolver_with_enum(vec![]);
-        let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r).unwrap();
-        assert_eq!(result, color);
+        let result = try_expanding_sum_type_to_union_inner(&color, None, true, &r);
+        assert!(result.is_none());
     }
 
     #[test]
@@ -1756,7 +1725,9 @@ mod tests {
     }
 
     #[test]
-    fn expand_sum_union_expands_enum_but_not_int() {
+    fn expand_sum_union_defers_when_enum_present() {
+        // Union containing an enum defers (enum branch returns None,
+        // which propagates through the ? in the union loop).
         let color = plain_instance("tests.Color");
         let i = plain_instance("builtins.int");
         let r = resolver_with_enum(vec!["RED".to_string(), "GREEN".to_string()]);
@@ -1766,32 +1737,32 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r).unwrap();
-        match result {
-            Type::UnionType { items, .. } => {
-                assert_eq!(items.len(), 3);
-                assert_eq!(items[0], lit_enum(&color, "RED"));
-                assert_eq!(items[1], lit_enum(&color, "GREEN"));
-                assert_eq!(items[2], i);
-            }
-            _ => panic!("expected Union"),
-        }
+        let result = try_expanding_sum_type_to_union_inner(&t, None, true, &r);
+        assert!(result.is_none());
     }
 
     #[test]
     fn expand_sum_union_drops_none_without_strict_optional() {
-        let color = plain_instance("tests.Color");
-        let r = resolver_with_enum(vec!["RED".to_string()]);
+        // No enum in this union, so bool branch fires for builtins.bool
+        // and non-enum instances pass through. NoneType dropped by
+        // strict_optional=false filter.
+        let b = plain_instance("builtins.bool");
+        let r = resolver_with_enum(vec![]);
         let t = Type::UnionType {
-            items: vec![Type::NoneType, color.clone()],
+            items: vec![Type::NoneType, b.clone()],
             uses_pep604_syntax: true,
             can_be_true: true,
             can_be_false: true,
         };
         let result = try_expanding_sum_type_to_union_inner(&t, None, false, &r).unwrap();
-        // NoneType dropped (strict_optional off), enum expands to a single
-        // literal, make_union of one item returns the literal itself.
-        assert_eq!(result, lit_enum(&color, "RED"));
+        // NoneType dropped (strict_optional off), bool expands to
+        // Literal[True] | Literal[False].
+        match result {
+            Type::UnionType { items, .. } => {
+                assert_eq!(items.len(), 2);
+            }
+            _ => panic!("expected Union"),
+        }
     }
 
     #[test]
