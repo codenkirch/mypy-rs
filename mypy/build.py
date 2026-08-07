@@ -979,6 +979,12 @@ class BuildManager:
         from mypy.errors import _set_native_errors_active
 
         _set_native_errors_active(self.options.native_type_kernel)
+        # Stage 6b: gate the pure str-format parsing functions (printf-style
+        # and str.format()). Parity verified against checkstrformat test
+        # cases in testcheck.
+        from mypy.checkstrformat import _set_native_strformat_active
+
+        _set_native_strformat_active(self.options.native_type_kernel)
         # Stage 11: gate the solve_one constraint solver. No resolver
         # needed; join/meet/subtype use the already-installed global
         # resolvers when constructing candidate types.
