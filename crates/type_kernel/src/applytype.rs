@@ -71,10 +71,17 @@ pub(crate) fn rust_apply_generic_arguments(
     callable_bytes: &[u8],
     orig_types_bytes: &[u8],
     skip_unsatisfied: bool,
+    strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let callable = decode_type(callable_bytes)?;
     let orig_types = decode_optional_type_list(orig_types_bytes)?;
-    let result = apply_generic_arguments_inner(&callable, &orig_types, skip_unsatisfied, resolver)?;
+    let result = apply_generic_arguments_inner(
+        &callable,
+        &orig_types,
+        skip_unsatisfied,
+        strict_optional,
+        resolver,
+    )?;
     encode_type(&result)
 }
 
@@ -83,6 +90,7 @@ fn apply_generic_arguments_inner(
     callable: &Type,
     orig_types: &[Option<Type>],
     skip_unsatisfied: bool,
+    strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> Option<Type> {
     let callable = if let Type::CallableType { .. } = callable {
@@ -166,23 +174,36 @@ fn apply_generic_arguments_inner(
     // applytype.py:143-149: UnpackType var_arg special-casing. If the
     // var_arg's type is an UnpackType, expand the whole callable.
     if has_unpack_var_arg(arg_types, arg_kinds) {
-        let expanded = crate::expandtype::expand_type(callable, &id_to_type)?;
+        let expanded =
+            crate::expandtype::expand_type_inner(callable, &id_to_type, strict_optional)?;
         return Some(expanded);
     }
 
     // applytype.py:150-153: expand arg_types individually.
     let mut new_arg_types = Vec::with_capacity(arg_types.len());
     for at in arg_types {
-        new_arg_types.push(crate::expandtype::expand_type(at, &id_to_type)?);
+        new_arg_types.push(crate::expandtype::expand_type_inner(
+            at,
+            &id_to_type,
+            strict_optional,
+        )?);
     }
 
     // applytype.py:155-163: expand type_guard and type_is.
     let new_type_guard = match type_guard {
-        Some(tg) => Some(Box::new(crate::expandtype::expand_type(tg, &id_to_type)?)),
+        Some(tg) => Some(Box::new(crate::expandtype::expand_type_inner(
+            tg,
+            &id_to_type,
+            strict_optional,
+        )?)),
         None => None,
     };
     let new_type_is = match type_is {
-        Some(ti) => Some(Box::new(crate::expandtype::expand_type(ti, &id_to_type)?)),
+        Some(ti) => Some(Box::new(crate::expandtype::expand_type_inner(
+            ti,
+            &id_to_type,
+            strict_optional,
+        )?)),
         None => None,
     };
 
@@ -198,15 +219,23 @@ fn apply_generic_arguments_inner(
             continue;
         }
         // Expand the TypeVar default. applytype.py:178.
-        let expanded_tv = crate::expandtype::expand_type(tv, &id_to_type)?;
+        let expanded_tv = crate::expandtype::expand_type_inner(tv, &id_to_type, strict_optional)?;
         remaining_tvars.push(expanded_tv);
     }
 
     let new_instance_type = match instance_type {
-        Some(it) => Some(Box::new(crate::expandtype::expand_type(it, &id_to_type)?)),
+        Some(it) => Some(Box::new(crate::expandtype::expand_type_inner(
+            it,
+            &id_to_type,
+            strict_optional,
+        )?)),
         None => None,
     };
-    let new_ret_type = Box::new(crate::expandtype::expand_type(ret_type, &id_to_type)?);
+    let new_ret_type = Box::new(crate::expandtype::expand_type_inner(
+        ret_type,
+        &id_to_type,
+        strict_optional,
+    )?);
 
     Some(Type::CallableType {
         fallback: fallback.clone(),

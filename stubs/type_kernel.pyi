@@ -221,7 +221,10 @@ def rust_linearize_hierarchy(
     resolver: NativeTypeResolver, info_fullname: str
 ) -> list[str] | None: ...
 def rust_expand_type(
-    resolver: NativeTypeResolver, type_bytes: bytes, env_bytes: bytes
+    resolver: NativeTypeResolver,
+    type_bytes: bytes,
+    env_bytes: bytes,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_make_simplified_union(
     items_bytes: bytes,
@@ -285,6 +288,7 @@ def rust_apply_generic_arguments(
     callable_bytes: bytes,
     orig_types_bytes: bytes,
     skip_unsatisfied: bool,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_has_no_typevars(type_bytes: bytes) -> bool | None: ...
 def rust_has_any_type(type_bytes: bytes, ignore_in_type_obj: bool) -> bool | None: ...
