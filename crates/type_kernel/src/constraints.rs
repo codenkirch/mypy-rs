@@ -19,7 +19,7 @@ use crate::wire::{
 // Used only by the wire round-trip tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SUPERTYPE_OF: i64 = 1;
-const SUBTYPE_OF: i64 = 0;
+pub(crate) const SUBTYPE_OF: i64 = 0;
 const ANY_SUGGESTION: i64 = 9;
 const TUPLE_LIKE_INSTANCE_NAMES: [&str; 5] = [
     "builtins.tuple",
@@ -30,7 +30,7 @@ const TUPLE_LIKE_INSTANCE_NAMES: [&str; 5] = [
 ];
 
 /// Mirrors `mypy.utils.neg_op` (constraints.py:1617).
-fn neg_op(op: i64) -> i64 {
+pub(crate) fn neg_op(op: i64) -> i64 {
     if op == SUBTYPE_OF {
         SUPERTYPE_OF
     } else {
@@ -177,7 +177,7 @@ pub(crate) fn rust_infer_constraints_full(
 /// 2. TypeVar template -> single constraint.
 /// 3. Any-suggestion empty result, actual-TypeVar rebinding.
 /// 4. Per-shape visitor dispatch.
-fn infer_constraints_full_inner(
+pub(crate) fn infer_constraints_full_inner(
     template: &Type,
     actual: &Type,
     direction: i64,

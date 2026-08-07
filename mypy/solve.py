@@ -95,6 +95,72 @@ def _serialize_type_list(types: Iterable[Type]) -> list[bytes]:
     return blobs
 
 
+def _serialize_constraint_list(constraints: Iterable[Constraint]) -> list[bytes]:
+    """Serialize a `Constraint` iterable to wire-format blobs for the Rust reader."""
+    from mypy.constraints import _write_constraint
+
+    blobs: list[bytes] = []
+    for c in constraints:
+        buf = _WriteBuffer()
+        _write_constraint(buf, c)
+        blobs.append(buf.getvalue())
+    return blobs
+
+
+def _native_solve_dependent_result(
+    result: tuple[Any, Any, Any], originals: dict[TypeVarId, TypeVarLikeType]
+) -> tuple[Solutions, list[TypeVarLikeType]] | None:
+    """Decode a Rust `rust_solve_dependent` result into (solutions, free_vars).
+
+    `result` is `(num_solved, sol_blob, free_blob)`. A nonzero status or any
+    wire-cycle problem returns None, which makes the caller fall back to
+    pure Python.
+    """
+    from mypy.cache import read_int, read_str
+
+    status, sol_blob, free_blob = result
+    if status != 0 or sol_blob is None or free_blob is None:
+        return None
+
+    solutions: Solutions = {}
+    data = _ReadBuffer(bytes(sol_blob))
+    count = read_int(data)
+    for _ in range(count):
+        raw = read_int(data)
+        meta = read_int(data)
+        ns = read_str(data)
+        has_sol = read_int(data)
+        tv = TypeVarId(raw, meta, namespace=ns)
+        if has_sol == 1:
+            from mypy.wirefixup import fixup_wire_type
+
+            decoded = fixup_wire_type(read_type(data))
+            if decoded is None:
+                return None
+            solutions[tv] = decoded
+        elif has_sol == 0:
+            solutions[tv] = None
+        else:
+            return None
+
+    free_vars: list[TypeVarLikeType] = []
+    data = _ReadBuffer(bytes(free_blob))
+    count = read_int(data)
+    for _ in range(count):
+        raw = read_int(data)
+        meta = read_int(data)
+        ns = read_str(data)
+        flag = read_int(data)
+        if flag != 0:
+            return None
+        tv = TypeVarId(raw, meta, namespace=ns)
+        orig = originals.get(tv)
+        if orig is None:
+            return None
+        free_vars.append(orig)
+    return solutions, free_vars
+
+
 _WIRE_SAFE_UNSAFE_TYPES: tuple[type[Type], ...] = (
     TupleType,
     CallableType,
@@ -246,6 +312,29 @@ def solve_with_dependent(
       * Variables in leaf SCCs that don't have constant bounds are free (choose one per SCC)
       * Solve constraints iteratively starting from leaves, updating bounds after each step.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_solve_active
+        and _native_solve_resolver is not None
+        and constraints
+        and type_state.infer_unions
+        and state.strict_optional
+    ):
+        try:
+            result = _type_kernel.rust_solve_dependent(
+                _serialize_type_list([originals[tv] for tv in vars]),
+                _serialize_constraint_list(constraints),
+                type_state.infer_unions,
+                state.strict_optional,
+                _native_solve_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            out = _native_solve_dependent_result(result, originals)
+            if out is not None:
+                return out
+
     graph, lowers, uppers = transitive_closure(vars, constraints)
 
     dmap = compute_dependencies(vars, graph, lowers, uppers)
