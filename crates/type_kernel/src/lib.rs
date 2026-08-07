@@ -403,6 +403,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        traverser::rust_count_yield_from_expressions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         traverser::rust_count_name_and_member_expressions,
         module
     )?)?;

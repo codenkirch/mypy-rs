@@ -44,6 +44,22 @@ from mypy.cache import (
 _NODE_TAGS: dict[type, int] = {}
 
 
+# Wire-format-only tags for expression types that have no Final[Tag]
+# in nodes.py. Range 150-159 is unused by the cache format (reserved:
+# 50-79 symbols, 80-149 types). These are local to the astwire
+# format and never written to/read from the mypy metadata cache.
+ASTWIRE_CAST_EXPR: int = 150
+ASTWIRE_ASSERT_TYPE_EXPR: int = 151
+ASTWIRE_REVEAL_EXPR: int = 152
+ASTWIRE_SUPER_EXPR: int = 153
+ASTWIRE_TYPE_APPLICATION: int = 154
+ASTWIRE_TYPE_ALIAS_EXPR: int = 155
+ASTWIRE_NAMEDTUPLE_EXPR: int = 156
+ASTWIRE_TYPEDDICT_EXPR: int = 157
+ASTWIRE_ENUM_CALL_EXPR: int = 158
+ASTWIRE_PROMOTE_EXPR: int = 159
+
+
 def _register_node_tags() -> None:
     """Populate ``_NODE_TAGS`` from mypy.nodes tag constants."""
     tag_map = {
@@ -114,6 +130,19 @@ def _register_node_tags() -> None:
         nodes.IMPORT_ALL: nodes.ImportAll,
         nodes.MATCH_STMT: nodes.MatchStmt,
         nodes.TYPE_ALIAS_STMT: nodes.TypeAliasStmt,
+        nodes.TSTRING_EXPR: nodes.TemplateStrExpr,
+        # Expression types without their own Final[Tag] — assigned
+        # wire-format-only tags so the Rust traverser can see into them.
+        ASTWIRE_CAST_EXPR: nodes.CastExpr,
+        ASTWIRE_ASSERT_TYPE_EXPR: nodes.AssertTypeExpr,
+        ASTWIRE_REVEAL_EXPR: nodes.RevealExpr,
+        ASTWIRE_SUPER_EXPR: nodes.SuperExpr,
+        ASTWIRE_TYPE_APPLICATION: nodes.TypeApplication,
+        ASTWIRE_TYPE_ALIAS_EXPR: nodes.TypeAliasExpr,
+        ASTWIRE_NAMEDTUPLE_EXPR: nodes.NamedTupleExpr,
+        ASTWIRE_TYPEDDICT_EXPR: nodes.TypedDictExpr,
+        ASTWIRE_ENUM_CALL_EXPR: nodes.EnumCallExpr,
+        ASTWIRE_PROMOTE_EXPR: nodes.PromoteExpr,
     }
     # Patterns.
     from mypy import patterns as p

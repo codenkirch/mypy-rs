@@ -94,6 +94,20 @@ pub(crate) const MAPPING_PATTERN: u8 = 223;
 pub(crate) const CLASS_PATTERN: u8 = 224;
 pub(crate) const TYPE_ALIAS_STMT: u8 = 225;
 
+// Wire-format-only tags for expression types that have no Final[Tag]
+// in nodes.py. Range 150-159 is unused by the cache format.
+pub(crate) const ASTWIRE_CAST_EXPR: u8 = 150;
+pub(crate) const ASTWIRE_ASSERT_TYPE_EXPR: u8 = 151;
+pub(crate) const ASTWIRE_REVEAL_EXPR: u8 = 152;
+pub(crate) const ASTWIRE_SUPER_EXPR: u8 = 153;
+pub(crate) const ASTWIRE_TYPE_APPLICATION: u8 = 154;
+pub(crate) const ASTWIRE_TYPE_ALIAS_EXPR: u8 = 155;
+pub(crate) const ASTWIRE_NAMEDTUPLE_EXPR: u8 = 156;
+pub(crate) const ASTWIRE_TYPEDDICT_EXPR: u8 = 157;
+pub(crate) const ASTWIRE_ENUM_CALL_EXPR: u8 = 158;
+pub(crate) const ASTWIRE_PROMOTE_EXPR: u8 = 159;
+pub(crate) const TSTRING_EXPR: u8 = 229;
+
 // ---------------------------------------------------------------------------
 // Node tree representation
 // ---------------------------------------------------------------------------
@@ -257,10 +271,12 @@ pub(crate) fn is_member_expr(tag: u8) -> bool {
     tag == MEMBER_EXPR
 }
 
-/// Check if a node is a FuncDef (the FUNC_DEF tag, used by both FuncDef
-/// and the FUNC_DEF_STMT alias).
+/// Check if a node is a FuncDef (FUNC_DEF or FUNC_DEF_STMT alias).
+/// OverloadedFuncDef is NOT included — FuncCollectorBase only treats
+/// FuncDef as a function boundary, traversing OverloadedFuncDef's
+/// items normally (each item is a FuncDef that sets the boundary).
 pub(crate) fn is_func_def(tag: u8) -> bool {
-    tag == FUNC_DEF || tag == FUNC_DEF_STMT || tag == OVERLOADED_FUNC_DEF
+    tag == FUNC_DEF || tag == FUNC_DEF_STMT
 }
 
 /// Check if a node is an AssignmentStmt.
