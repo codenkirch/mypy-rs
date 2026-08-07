@@ -62,7 +62,32 @@ def fixup_wire_type(typ: Type) -> Type | None:
         return None
     fixer = _TypeRefFixer(_wire_typeinfo_map)
     result = typ.accept(fixer)
+    # Also fixup shared instance_cache singletons that read_type may have
+    # populated with NOT_READY instances. Without this, a failed fixup
+    # (returning None) leaves NOT_READY singletons in the cache that leak
+    # into later calls.
+    fixup_instance_cache()
     return None if fixer.missing else result
+
+
+def fixup_instance_cache() -> None:
+    """Fix up shared instance_cache singletons if they carry type_refs.
+
+    read_type populates instance_cache with NOT_READY Instances when it
+    encounters INSTANCE_OBJECT/INSTANCE_STR/etc. tags. These must be
+    resolved to live TypeInfo before they leak into the type graph.
+    """
+    if _wire_typeinfo_map is None:
+        return
+    from mypy.types import instance_cache
+
+    for attr in ("str_type", "function_type", "int_type", "bool_type", "object_type"):
+        inst = getattr(instance_cache, attr)
+        if inst is not None and inst.type_ref is not None:
+            info = _wire_typeinfo_map.get(inst.type_ref)
+            if info is not None and not isinstance(info, FakeInfo):
+                inst.type = info
+                inst.type_ref = None
 
 
 class _FreshVarCanonicalizer(TypeTranslator):
