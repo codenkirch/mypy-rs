@@ -3374,6 +3374,30 @@ def find_defining_module(modules: dict[str, MypyFile], typ: CallableType) -> Myp
 # For hard-coding suggested missing member alternatives.
 COMMON_MISTAKES: Final[dict[str, Sequence[str]]] = {"add": ("append", "extend")}
 
+# Stage 18 (M27): when the `type_kernel` Rust extension is importable and
+# `Options.native_type_kernel` is set, `best_matches` and `pretty_seq` route
+# through Rust. The Rust path ports the Ratcliff-Obershelp similarity ratio
+# (difflib.SequenceMatcher.ratio) and the ranking/filtering logic in pure
+# Rust. Falls back to the pure-Python path if the extension is unavailable
+# or the gate is off.
+try:
+    from type_kernel import rust_best_matches as _rust_best_matches
+    from type_kernel import rust_pretty_seq as _rust_pretty_seq
+
+    _HAS_SUGGESTIONS_KERNEL = True
+except ImportError:
+    _rust_best_matches = None  # type: ignore[assignment]
+    _rust_pretty_seq = None  # type: ignore[assignment]
+    _HAS_SUGGESTIONS_KERNEL = False
+
+_native_suggestions_active: bool = False
+
+
+def _set_native_suggestions_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust suggestion path."""
+    global _native_suggestions_active
+    _native_suggestions_active = active
+
 
 def _real_quick_ratio(a: str, b: str) -> float:
     # this is an upper bound on difflib.SequenceMatcher.ratio
@@ -3384,6 +3408,8 @@ def _real_quick_ratio(a: str, b: str) -> float:
 
 
 def best_matches(current: str, options: Collection[str], n: int) -> list[str]:
+    if _HAS_SUGGESTIONS_KERNEL and _native_suggestions_active:
+        return _rust_best_matches(current, list(options), n)
     if not current:
         return []
     # narrow down options cheaply
@@ -3397,6 +3423,8 @@ def best_matches(current: str, options: Collection[str], n: int) -> list[str]:
 
 
 def pretty_seq(args: Sequence[str], conjunction: str) -> str:
+    if _HAS_SUGGESTIONS_KERNEL and _native_suggestions_active:
+        return _rust_pretty_seq(list(args), conjunction)
     quoted = ['"' + a + '"' for a in args]
     if len(quoted) == 1:
         return quoted[0]

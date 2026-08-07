@@ -1041,6 +1041,12 @@ class BuildManager:
 
         _set_native_applytype_active(self.options.native_type_kernel)
         _set_native_typevars_active(self.options.native_type_kernel)
+        # Stage 18 (M27): gate did-you-mean suggestion ranking and
+        # formatting. Pure computation (no AST, no plugins), so no
+        # resolver needed. Ports Ratcliff-Obershelp fuzzy matching.
+        from mypy.messages import _set_native_suggestions_active
+
+        _set_native_suggestions_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
