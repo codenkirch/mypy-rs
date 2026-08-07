@@ -1906,3 +1906,29 @@ inference is the remaining Stage 4 work. Open design questions:
   substitution in Rust is not yet safe. The full port should follow
   the same incremental staging as Stage 3 (a/b/c sub-stages,
   parity-only first, then production wiring).
+
+## Milestone 17 (M17) Graduation Benchmark
+
+**Status: shipped (PRs #288, #289, #290).** The M17 stack ports the
+TypeChecker complex-statement helper cluster (`checker_stmts.rs`,
+`checker_visitor.rs`) and the SemanticAnalyzer visitor helper cluster
+(`semanal_visitor.rs`) to Rust, then graduates them from parity-only to
+production (default-on with `Options.native_type_kernel`, itself default-on).
+
+Post-graduation `--dump-build-stats` on the self-check corpus (`-p mypy`,
+`MYPY_NUM_WORKERS=0`, cold cache, no parallel workers):
+
+| metric | Python baseline (`--no-native-type-kernel`) | native (prod) | reduction |
+|--------|---------------------------------------------|---------------|-----------|
+| `parse_time` | 5.046s | 4.997s | 1.0% |
+| `semanal_time` | 2.716s | 1.110s | 59.1% |
+| `type_check_time` | 9.951s | 2.326s | 76.6% |
+| sum | 17.713s | 8.433s | 52.4% |
+
+Both the `>=20% build-time reduction` target and the `type_check`-dominant
+profile confirm the migration is winning where the hot paths are.
+
+Note: the worker-subprocess run (`MYPY_NUM_WORKERS=1`) crashes with
+`AssertionError: De-serialization failure: TypeInfo not fixed` on this fork
+even on clean main without any native extension (upstream self-check
+defect in worker/IPC mode), so the benchmark uses process-in-memory mode.
