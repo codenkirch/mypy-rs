@@ -403,6 +403,46 @@ def _set_native_semanal_active(active: bool) -> None:
     _native_semanal_active = active
 
 
+# Stage 16 (#209): native semanal_visitor seam (parity-only, default-off).
+# When the gate is active, the pure helper functions route through Rust
+# via PyO3 on live Python objects. Rust returns false/None for anything it
+# cannot handle, falling back to the pure-Python implementation.
+try:
+    from type_kernel import (
+        rust_refers_to_fullname as _rust_refers_to_fullname,
+        rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
+        rust_is_trivial_body as _rust_is_trivial_body,
+        rust_find_duplicate as _rust_find_duplicate,
+        rust_is_valid_replacement as _rust_is_valid_replacement,
+        rust_is_same_symbol as _rust_is_same_symbol,
+        rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
+        rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
+        rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
+        rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
+    )
+
+    _SEMANAL_VISITOR_HAS_KERNEL = True
+except ImportError:
+    _rust_refers_to_fullname = None  # type: ignore[assignment]
+    _rust_refers_to_class_or_function = None  # type: ignore[assignment]
+    _rust_is_trivial_body = None  # type: ignore[assignment]
+    _rust_find_duplicate = None  # type: ignore[assignment]
+    _rust_is_valid_replacement = None  # type: ignore[assignment]
+    _rust_is_same_symbol = None  # type: ignore[assignment]
+    _rust_names_modified_in_lvalue = None  # type: ignore[assignment]
+    _rust_names_modified_by_assignment = None  # type: ignore[assignment]
+    _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
+    _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
+    _SEMANAL_VISITOR_HAS_KERNEL = False
+
+_native_semanal_visitor_active: bool = False
+
+
+def _set_native_semanal_visitor_active(active: bool) -> None:
+    global _native_semanal_visitor_active
+    _native_semanal_visitor_active = active
+
+
 def _serialize_semanal_type(t: Type) -> bytes:
     buf = _SemanalWriteBuffer()
     t.write(buf)
@@ -8307,6 +8347,11 @@ def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
 
 def refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bool:
     """Is node a name or member expression with the given full name?"""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_refers_to_fullname(node, fullnames)
+        except (AssertionError, NotImplementedError):
+            pass
     if not isinstance(fullnames, tuple):
         fullnames = (fullnames,)
 
@@ -8321,6 +8366,11 @@ def refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bo
 
 def refers_to_class_or_function(node: Expression) -> bool:
     """Does semantically analyzed node refer to a class?"""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_refers_to_class_or_function(node)
+        except (AssertionError, NotImplementedError):
+            pass
     return isinstance(node, RefExpr) and isinstance(
         node.node, (TypeInfo, FuncDef, OverloadedFuncDef)
     )
@@ -8331,6 +8381,13 @@ def find_duplicate(list: list[T]) -> T | None:
 
     Otherwise, return None.
     """
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            result = _rust_find_duplicate(list)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     for i in range(1, len(list)):
         if list[i] in list[:i]:
             return list[i]
@@ -8339,6 +8396,12 @@ def find_duplicate(list: list[T]) -> T | None:
 
 def remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None:
     """Remove all imported names from the symbol table of a module."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            _rust_remove_imported_names_from_symtable(names, module)
+            return
+        except (AssertionError, NotImplementedError):
+            pass
     removed: list[str] = []
     for name, node in names.items():
         if node.node is None:
@@ -8428,6 +8491,12 @@ def apply_semantic_analyzer_patches(patches: list[tuple[int, Callable[[], None]]
 
     This should happen after semantic analyzer pass 3.
     """
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            _rust_apply_semantic_analyzer_patches(patches)
+            return
+        except (AssertionError, NotImplementedError):
+            pass
     patches_by_priority = sorted(patches, key=lambda x: x[0])
     for priority, patch_func in patches_by_priority:
         patch_func()
@@ -8435,6 +8504,13 @@ def apply_semantic_analyzer_patches(patches: list[tuple[int, Callable[[], None]]
 
 def names_modified_by_assignment(s: AssignmentStmt) -> list[NameExpr]:
     """Return all unqualified (short) names assigned to in an assignment statement."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            rust_result = _rust_names_modified_by_assignment(s)
+            if rust_result is not None:
+                return rust_result
+        except (AssertionError, NotImplementedError):
+            pass
     result: list[NameExpr] = []
     for lvalue in s.lvalues:
         result += names_modified_in_lvalue(lvalue)
@@ -8443,6 +8519,13 @@ def names_modified_by_assignment(s: AssignmentStmt) -> list[NameExpr]:
 
 def names_modified_in_lvalue(lvalue: Lvalue) -> list[NameExpr]:
     """Return all NameExpr assignment targets in an Lvalue."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            rust_result = _rust_names_modified_in_lvalue(lvalue)
+            if rust_result is not None:
+                return rust_result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(lvalue, NameExpr):
         return [lvalue]
     elif isinstance(lvalue, StarExpr):
@@ -8479,6 +8562,11 @@ def is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool:
     2. Placeholder that isn't known to become type replaced with a
        placeholder that can become a type
     """
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_is_valid_replacement(old, new)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(old.node, PlaceholderNode):
         if isinstance(new.node, PlaceholderNode):
             return not old.node.becomes_typeinfo and new.node.becomes_typeinfo
@@ -8488,6 +8576,11 @@ def is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool:
 
 
 def is_same_symbol(a: SymbolNode | None, b: SymbolNode | None) -> bool:
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_is_same_symbol(a, b)
+        except (AssertionError, NotImplementedError):
+            pass
     return (
         a == b
         or (isinstance(a, PlaceholderNode) and isinstance(b, PlaceholderNode))
@@ -8514,6 +8607,11 @@ def is_trivial_body(block: Block) -> bool:
     Note: If you update this, you may also need to update
     mypy.fastparse.is_possible_trivial_body!
     """
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_is_trivial_body(block)
+        except (AssertionError, NotImplementedError):
+            pass
     body = block.body
     if not body:
         # Functions have empty bodies only if the body is stripped or the function is

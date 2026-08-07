@@ -21,8 +21,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from mypy.nodes import TypeAlias, TypeInfo
+from mypy.nodes import (
+    AssignmentStmt,
+    Block,
+    Expression,
+    Lvalue,
+    NameExpr,
+    SymbolNode,
+    SymbolTable,
+    SymbolTableNode,
+    TypeAlias,
+    TypeInfo,
+)
 from mypy.types import ProperType, Type
+from collections.abc import Callable
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 __all__ = [
     "NativeTypeResolver",
@@ -137,6 +152,16 @@ __all__ = [
     "rust_callables_compatible",
     "rust_can_subclass_builtin",
     "rust_is_overlapping_types",
+    "rust_refers_to_fullname",
+    "rust_refers_to_class_or_function",
+    "rust_is_trivial_body",
+    "rust_find_duplicate",
+    "rust_is_valid_replacement",
+    "rust_is_same_symbol",
+    "rust_names_modified_in_lvalue",
+    "rust_names_modified_by_assignment",
+    "rust_remove_imported_names_from_symtable",
+    "rust_apply_semantic_analyzer_patches",
 ]
 
 class NativeTypeResolver:
@@ -431,3 +456,13 @@ def rust_is_overlapping_types(
     strict_optional: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
+def rust_refers_to_fullname(node: Expression, fullnames: str | tuple[str, ...]) -> bool: ...
+def rust_refers_to_class_or_function(node: Expression) -> bool: ...
+def rust_is_trivial_body(block: Block) -> bool: ...
+def rust_find_duplicate(list: list[T]) -> T | None: ...
+def rust_is_valid_replacement(old: SymbolTableNode, new: SymbolTableNode) -> bool: ...
+def rust_is_same_symbol(a: SymbolNode | None, b: SymbolNode | None) -> bool: ...
+def rust_names_modified_in_lvalue(lvalue: Lvalue) -> list[NameExpr]: ...
+def rust_names_modified_by_assignment(s: AssignmentStmt) -> list[NameExpr]: ...
+def rust_remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None: ...
+def rust_apply_semantic_analyzer_patches(patches: list[tuple[int, Callable[[], None]]]) -> None: ...
