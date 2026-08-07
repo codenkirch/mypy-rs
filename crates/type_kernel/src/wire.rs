@@ -1221,6 +1221,7 @@ fn python_str_body(f: &mut fmt::Formatter<'_>, s: &str, quote: char) -> fmt::Res
             '\n' => f.write_str("\\n")?,
             '\r' => f.write_str("\\r")?,
             '\t' => f.write_str("\\t")?,
+            c if c.is_control() => write!(f, "\\x{:02x}", c as u32)?,
             _ => write!(f, "{c}")?,
         }
     }
