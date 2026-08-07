@@ -290,6 +290,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        constraints::rust_infer_constraints_full,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         constraints_helpers::rust_select_trivial,
         module
     )?)?;
