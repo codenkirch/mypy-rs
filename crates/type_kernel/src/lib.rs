@@ -329,6 +329,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_dependent, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_solve_constraints, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,

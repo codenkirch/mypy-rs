@@ -259,6 +259,40 @@ def solve_constraints(
             solutions = {}
             free_vars = []
     else:
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_solve_active
+            and _native_solve_resolver is not None
+            and constraints
+            and type_state.infer_unions
+            and state.strict_optional
+            and _bounds_wire_safe([c.target for c in constraints])
+        ):
+            try:
+                result = _type_kernel.rust_solve_constraints(
+                    _serialize_type_list([originals[tv] for tv in vars + extra_vars]),
+                    _serialize_type_list([originals[tv] for tv in vars]),
+                    _serialize_constraint_list(constraints),
+                    strict,
+                    type_state.infer_unions,
+                    state.strict_optional,
+                    skip_unsatisfied,
+                    _native_solve_resolver,
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                out = _native_solve_dependent_result(result, originals)
+                if out is not None:
+                    solutions_out, _ = out
+                    res: list[Type | None] | None = []
+                    for v in vars:
+                        if v not in solutions_out:
+                            res = None
+                            break
+                        res.append(solutions_out[v])
+                    if res is not None:
+                        return res, []
         solutions = {}
         free_vars = []
         for tv, cs in cmap.items():
