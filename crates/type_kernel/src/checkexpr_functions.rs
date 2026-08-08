@@ -494,9 +494,8 @@ fn is_duplicate_mapping_inner(
         }
     }
     // Exceptions where duplicates are allowed: every mapped actual is a
-    // `**kwargs` that is NOT a TypedDict (cannot be matched with certainty),
-    // so `all(mapped actual is a non-TypedDict **kwargs)` disables the
-    // duplicate check.
+    // non-TypedDict `**kwargs` (cannot be matched with certainty), so
+    // `all(mapped actual is a non-TypedDict **kwargs)` disables the check.
     let mut all_non_typeddict_star2 = true;
     for (i, &idx) in mapping.iter().enumerate() {
         let kind = *actual_kinds.get(idx as usize)?;
@@ -961,11 +960,7 @@ fn all_children(typ: &Type) -> Vec<&Type> {
 /// Instance / TypedDictType / LiteralType / TupleType. Anything else
 /// (including a CallableType or TypeType nested in a type wrapper that
 /// Python doesn't reach) defers.
-fn method_fullname_inner(
-    typ: &Type,
-    method_name: &str,
-    resolver: &TypeResolver,
-) -> Option<String> {
+fn method_fullname_inner(typ: &Type, method_name: &str, resolver: &TypeResolver) -> Option<String> {
     let proper = get_proper_or_none(typ)?; // TypeAliasType defers
     let unwrapped: &Type = match proper {
         Type::CallableType {
@@ -999,15 +994,13 @@ fn method_fullname_inner(
         } => {
             // `tuple_fallback()`: named tuples return the partial fallback
             // directly; plain tuples rebuild from the fallback's type info.
-            // Either way `.type.fullname` is the partial fallback's
-            // fullname. Only the variadic-unpack path raises
-            // NotImplementedError, so defer when unpacking is present.
+            // Only the variadic-unpack path raises, so defer when it exists.
             let Type::Instance { type_ref, .. } = partial_fallback.as_ref() else {
                 return None;
             };
-            if type_ref == "builtins.tuple" && items.iter().any(
-                |it| matches!(it, Type::UnpackType { .. }),
-            ) {
+            if type_ref == "builtins.tuple"
+                && items.iter().any(|it| matches!(it, Type::UnpackType { .. }))
+            {
                 return None;
             }
             Some(format!("{type_ref}.{method_name}"))
@@ -1058,7 +1051,11 @@ pub(crate) fn rust_method_fullname(
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(method_fullname_inner(&typ, method_name, resolver.resolver()))
+    Ok(method_fullname_inner(
+        &typ,
+        method_name,
+        resolver.resolver(),
+    ))
 }
 
 #[cfg(test)]
@@ -1708,7 +1705,10 @@ mod tests {
 
     #[test]
     fn test_method_fullname_tuple_plain() {
-        let t = make_tuple(make_instance("builtins.tuple", vec![]), vec![make_instance("int", vec![])]);
+        let t = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![make_instance("int", vec![])],
+        );
         assert_eq!(
             method_fullname_inner(&t, "foo", &empty_resolver()),
             Some("builtins.tuple.foo".to_string())
@@ -1772,7 +1772,10 @@ mod tests {
             args: vec![],
             type_ref: "mod.A".to_string(),
         };
-        assert_eq!(method_fullname_inner(&alias, "foo", &empty_resolver()), None);
+        assert_eq!(
+            method_fullname_inner(&alias, "foo", &empty_resolver()),
+            None
+        );
     }
 
     #[test]
