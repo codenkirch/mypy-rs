@@ -17,6 +17,7 @@
 //! to it (the shim is added in this same milestone).
 
 use pyo3::prelude::*;
+use std::collections::HashSet;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{self, ReadBuffer, Type};
@@ -257,8 +258,15 @@ pub(crate) fn is_subtype(
     // for the common case (left=Instance, right=TypeVarType). The
     // protocol/TypeType branches are not reachable here (right is
     // TypeVarType, not those).
-    if let (Type::TypedDictType { .. }, Type::TypedDictType { .. }) = (left, right) {
-        return Some(left == right);
+    // visit_typeddict_type (subtypes.py:1039-1096): structural TypedDict
+    // subtyping. Previously used `left == right` (nominal equality including
+    // fallback), which rejected two structurally identical TypedDicts with
+    // different fallback type_refs (e.g. ast_serialize.ParseError vs
+    // mypy.nodes.ParseError). Python's structural check ignores fallbacks
+    // (subtypes.py:1093) and compares items, required_keys, readonly_keys,
+    // and is_closed.
+    if let Type::TypedDictType { .. } = left {
+        return visit_typeddict_subtype(left, right, ctx, resolver);
     }
     if let Type::Instance { .. } = left {
         if let Type::TypeVarType { .. } = right {
@@ -276,6 +284,164 @@ pub(crate) fn is_subtype(
     visit_instance_nominal(
         left_ref, left_args, right, right_ref, right_args, ctx, resolver,
     )
+}
+
+/// `visit_typeddict_type` (subtypes.py:1039-1096), Rust port.
+///
+/// Returns `Some(bool)` when Rust decided; `None` when a recursive
+/// `is_subtype` hit an unsupported variant (caller defers to Python).
+///
+/// Two cases:
+/// - right is Instance: `is_subtype(left.fallback, right)`.
+/// - right is TypedDictType: structural check over items, required_keys,
+///   readonly_keys, and is_closed. Fallbacks don't matter
+///   (subtypes.py:1093).
+fn visit_typeddict_subtype(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let (left_fallback, left_items, left_required, left_readonly, left_closed) = match left {
+        Type::TypedDictType {
+            fallback,
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+        } => (
+            fallback.as_ref(),
+            items.as_slice(),
+            required_keys,
+            readonly_keys,
+            *is_closed,
+        ),
+        _ => return None,
+    };
+    // right is Instance: is_subtype(left.fallback, right)
+    // (subtypes.py:1041-1042).
+    if let Type::Instance { .. } = right {
+        return is_subtype(left_fallback, right, ctx, resolver);
+    }
+    let (right_items, right_required, right_readonly, right_closed) = match right {
+        Type::TypedDictType {
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+            ..
+        } => (items.as_slice(), required_keys, readonly_keys, *is_closed),
+        _ => return None,
+    };
+    // A closed type must remain closed (subtypes.py:1048-1049).
+    if right_closed && !left_closed {
+        return Some(false);
+    }
+    // Collect all unique key names from both dicts (zipall,
+    // types.py:3232-3239).
+    let mut all_keys: Vec<&str> = Vec::new();
+    for (name, _) in left_items {
+        if !all_keys.contains(&name.as_str()) {
+            all_keys.push(name.as_str());
+        }
+    }
+    for (name, _) in right_items {
+        if !all_keys.contains(&name.as_str()) {
+            all_keys.push(name.as_str());
+        }
+    }
+    // Key-based checks (subtypes.py:1051-1062).
+    for name in &all_keys {
+        let (_, l_required, l_readonly) =
+            td_item(left_items, left_required, left_readonly, left_closed, name);
+        let (_, r_required, r_readonly) = td_item(
+            right_items,
+            right_required,
+            right_readonly,
+            right_closed,
+            name,
+        );
+        // Required keys must remain required.
+        if r_required && !l_required {
+            return Some(false);
+        }
+        // Mutable keys must remain mutable.
+        if !r_readonly && l_readonly {
+            return Some(false);
+        }
+        // Mutable optional keys must also remain optional.
+        if !r_readonly && !r_required && l_required {
+            return Some(false);
+        }
+    }
+    // Value type checks (subtypes.py:1064-1092).
+    for name in &all_keys {
+        let (l_typ, _, _l_readonly) =
+            td_item(left_items, left_required, left_readonly, left_closed, name);
+        let (r_typ, _, r_readonly) = td_item(
+            right_items,
+            right_required,
+            right_readonly,
+            right_closed,
+            name,
+        );
+        let check = if !r_readonly {
+            // Mutable items: invariant (is_equivalent / is_same_type).
+            // Both typ must be Some (guaranteed by key-based checks
+            // for mutable items).
+            match (l_typ.as_ref(), r_typ.as_ref()) {
+                (Some(lt), Some(rt)) => {
+                    let fwd = is_subtype(lt, rt, ctx, resolver)?;
+                    let bwd = is_subtype(rt, lt, ctx, resolver)?;
+                    Some(fwd && bwd)
+                }
+                _ => return None,
+            }
+        } else {
+            // Read-only items: covariant.
+            match (l_typ.as_ref(), r_typ.as_ref()) {
+                (_, None) => Some(true),
+                (None, Some(_)) => Some(false),
+                (Some(lt), Some(rt)) => is_subtype(lt, rt, ctx, resolver),
+            }
+        };
+        match check {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    // (NOTE: Fallbacks don't matter. — subtypes.py:1093)
+    Some(true)
+}
+
+/// Look up a key in a TypedDictType, mirroring `TypedDictType.item`
+/// (types.py:3218-3230). Returns `(typ, required, readonly)`.
+///
+/// For a missing key in a closed dict: `(Some(UninhabitedType), false, false)`.
+/// For a missing key in an open dict: `(None, false, true)`.
+fn td_item(
+    items: &[(String, Type)],
+    required_keys: &HashSet<String>,
+    readonly_keys: &HashSet<String>,
+    is_closed: bool,
+    name: &str,
+) -> (Option<Type>, bool, bool) {
+    if let Some((_, typ)) = items.iter().find(|(n, _)| n == name) {
+        (
+            Some(typ.clone()),
+            required_keys.contains(name),
+            readonly_keys.contains(name),
+        )
+    } else if is_closed {
+        (
+            Some(Type::UninhabitedType { ambiguous: false }),
+            false,
+            false,
+        )
+    } else {
+        (None, false, true)
+    }
 }
 
 /// The `visit_instance` `isinstance(right, Instance)` branch
@@ -1159,6 +1325,215 @@ mod tests {
         assert_eq!(
             is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_structural_subtype_different_fallbacks() {
+        // M18 parity: two TypedDicts with identical items but different
+        // fallback type_refs (e.g. ast_serialize.ParseError vs
+        // mypy.nodes.ParseError) must be compatible. Python ignores
+        // fallbacks (subtypes.py:1093); the old Rust `left == right`
+        // check rejected this.
+        let mk_typeddict = |type_ref: &str| Type::TypedDictType {
+            fallback: Box::new(instance(type_ref, vec![])),
+            items: vec![("code".to_string(), instance("builtins.int", vec![]))],
+            required_keys: ["code".to_string()].into_iter().collect(),
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let t1 = mk_typeddict("ast_serialize.ParseError");
+        let t2 = mk_typeddict("mypy.nodes.ParseError");
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_structural_subtype_same_items_different_fallback() {
+        // Both directions should be True (symmetric structural match).
+        let mk_typeddict = |type_ref: &str| Type::TypedDictType {
+            fallback: Box::new(instance(type_ref, vec![])),
+            items: vec![
+                ("msg".to_string(), instance("builtins.str", vec![])),
+                ("code".to_string(), instance("builtins.int", vec![])),
+            ],
+            required_keys: ["msg".to_string(), "code".to_string()]
+                .into_iter()
+                .collect(),
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let t1 = mk_typeddict("mypy.ast_serialize.ParseError");
+        let t2 = mk_typeddict("mypy.nodes.ParseError");
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
+            Some(true)
+        );
+        assert_eq!(
+            is_subtype(&t2, &t1, &ctx_strict_optional(true), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_required_key_must_remain_required() {
+        // left has "x" as optional, right has "x" as required -> not a
+        // subtype (subtypes.py:1053-1055).
+        let mk = |required: bool| Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![("x".to_string(), instance("builtins.int", vec![]))],
+            required_keys: if required {
+                ["x".to_string()].into_iter().collect()
+            } else {
+                HashSet::new()
+            },
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&mk(false), &mk(true), &ctx_strict_optional(true), &r),
+            Some(false)
+        );
+        // required -> optional is OK (widening).
+        assert_eq!(
+            is_subtype(&mk(true), &mk(false), &ctx_strict_optional(true), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_closed_must_remain_closed() {
+        // right is closed, left is not -> not a subtype
+        // (subtypes.py:1048-1049).
+        let mk = |is_closed: bool| Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![("x".to_string(), instance("builtins.int", vec![]))],
+            required_keys: ["x".to_string()].into_iter().collect(),
+            readonly_keys: HashSet::new(),
+            is_closed,
+        };
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&mk(false), &mk(true), &ctx_strict_optional(true), &r),
+            Some(false)
+        );
+        // closed -> closed is OK.
+        assert_eq!(
+            is_subtype(&mk(true), &mk(true), &ctx_strict_optional(true), &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_readonly_item_covariant() {
+        // Read-only items are covariant: int <: object -> TD(ro x: int)
+        // <: TD(ro x: object).
+        let mk = |item_type: &str| {
+            let readonly_keys: HashSet<String> = ["x".to_string()].into_iter().collect();
+            Type::TypedDictType {
+                fallback: Box::new(instance("builtins.dict", vec![])),
+                items: vec![("x".to_string(), instance(item_type, vec![]))],
+                required_keys: ["x".to_string()].into_iter().collect(),
+                readonly_keys,
+                is_closed: false,
+            }
+        };
+        let r = make_resolver(vec![
+            snap("builtins.int", "int"),
+            snap("builtins.object", "object"),
+        ]);
+        assert_eq!(
+            is_subtype(
+                &mk("builtins.int"),
+                &mk("builtins.object"),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_mutable_item_invariant() {
+        // Mutable (non-readonly) items are invariant: int is not
+        // equivalent to object -> not a subtype.
+        let mk = |item_type: &str| Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![("x".to_string(), instance(item_type, vec![]))],
+            required_keys: ["x".to_string()].into_iter().collect(),
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let r = make_resolver(vec![
+            snap("builtins.int", "int"),
+            snap("builtins.object", "object"),
+        ]);
+        assert_eq!(
+            is_subtype(
+                &mk("builtins.int"),
+                &mk("builtins.object"),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(false)
+        );
+        // int <: int is trivially equivalent.
+        assert_eq!(
+            is_subtype(
+                &mk("builtins.int"),
+                &mk("builtins.int"),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_subtype_instance_fallback() {
+        // right is Instance: is_subtype(left.fallback, right).
+        let td = Type::TypedDictType {
+            fallback: Box::new(instance("mypy.nodes.ParseError", vec![])),
+            items: vec![],
+            required_keys: HashSet::new(),
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let mut base = snap("mypy.nodes.ParseError", "ParseError");
+        base.has_base.insert("builtins.object".to_string());
+        base.mro.push("builtins.object".to_string());
+        let r = make_resolver(vec![base, snap("builtins.object", "object")]);
+        assert_eq!(
+            is_subtype(
+                &td,
+                &instance("builtins.object", vec![]),
+                &ctx_strict_optional(true),
+                &r
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_typeddict_not_subtype_unrelated_type() {
+        // TypedDict vs non-Instance/non-TypedDict right -> False
+        // (subtypes.py:1095-1096).
+        let td = Type::TypedDictType {
+            fallback: Box::new(instance("builtins.dict", vec![])),
+            items: vec![],
+            required_keys: HashSet::new(),
+            readonly_keys: HashSet::new(),
+            is_closed: false,
+        };
+        let r = make_resolver(vec![]);
+        assert_eq!(
+            is_subtype(&td, &Type::NoneType, &ctx_strict_optional(true), &r),
+            Some(false)
         );
     }
 }
