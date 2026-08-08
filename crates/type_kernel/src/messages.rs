@@ -9,6 +9,8 @@
 //! - `pretty_seq`, `capitalize`, `format_string_list`, `format_item_name_list`
 //! - `wrong_type_arg_count`, `callable_name`, `for_function`
 //! - `extract_type`, `strip_quotes`, `variance_string`
+//! - `append_invariance_notes`, `append_numbers_notes`, `append_union_note`
+//! - `pretty_callable` (definition-free form)
 //! - `rust_format_key_list` (pre-existing)
 //!
 //! The Rust path walks the wire-format `Type` enum (from `wire.rs`) and
@@ -26,10 +28,21 @@ use std::collections::HashSet;
 
 use pyo3::prelude::*;
 
-use crate::typeinfo::NativeTypeResolver;
+use crate::subtypes::{is_subtype, SubtypeContext};
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::visitor::flatten_nested_unions_inner;
 use crate::wire::{self, LiteralValue, ReadBuffer, Type};
 
 const MAX_UNION_ITEMS: usize = 10;
+
+/// `mypy/messages.py:UNSUPPORTED_NUMBERS_TYPES` (the "numeric tower").
+const UNSUPPORTED_NUMBERS_TYPES: &[&str] = &[
+    "numbers.Number",
+    "numbers.Complex",
+    "numbers.Real",
+    "numbers.Rational",
+    "numbers.Integral",
+];
 
 /// Types from `typing` that are always formatted with their full module
 /// prefix in `find_type_overlaps` (mypy/messages.py:110-123).
@@ -1467,6 +1480,385 @@ fn collect_named_types_for_overlap(
 }
 
 // ---------------------------------------------------------------------------
+// Variance/numbers/union notes (messages.py:3520-3583)
+// ---------------------------------------------------------------------------
+
+/// `is_same_type` with `ignore_promotions=True` (subtypes.py:302):
+/// mutual `is_proper_subtype` in both directions; the fast path is
+/// subsumed by mutual subtyping.
+fn is_same(left: &Type, right: &Type, resolver: &TypeResolver) -> Option<bool> {
+    let ctx = SubtypeContext::new(false, false, false, true, true, true);
+    let lr = is_subtype(left, right, &ctx, resolver)?;
+    let rl = is_subtype(right, left, &ctx, resolver)?;
+    Some(lr && rl)
+}
+
+/// Append variance notes for `list`/`dict` invariance (messages.py:3520).
+/// The arg type is only read for the subtype checks (Python reads it too).
+/// Returns `None` for any type the Rust path does not handle.
+fn append_invariance_notes_inner(
+    arg: &Type,
+    expected: &Type,
+    resolver: &TypeResolver,
+) -> Option<Vec<String>> {
+    let Type::Instance {
+        type_ref: arg_ref,
+        args: arg_args,
+        ..
+    } = arg
+    else {
+        return None;
+    };
+    let Type::Instance {
+        type_ref: exp_ref,
+        args: exp_args,
+        ..
+    } = expected
+    else {
+        return None;
+    };
+    if arg_args.is_empty() || exp_args.is_empty() {
+        return None;
+    }
+
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    let (invariant_type, covariant_suggestion) = if arg_ref == "builtins.list"
+        && exp_ref == "builtins.list"
+        && is_subtype(&arg_args[0], &exp_args[0], &ctx, resolver)?
+    {
+        (
+            "list",
+            "Consider using \"Sequence\" instead, which is covariant",
+        )
+    } else if arg_ref == "builtins.dict"
+        && exp_ref == "builtins.dict"
+        && is_same(&arg_args[0], &exp_args[0], resolver)?
+        && is_subtype(&arg_args[1], &exp_args[1], &ctx, resolver)?
+    {
+        (
+            "dict",
+            "Consider using \"Mapping\" instead, which is covariant in the value type",
+        )
+    } else {
+        return Some(Vec::new());
+    };
+
+    Some(vec![
+        format!(
+            "\"{invariant_type}\" is invariant -- see \
+             https://mypy.readthedocs.io/en/stable/common_issues.html#variance"
+        ),
+        covariant_suggestion.to_string(),
+    ])
+}
+
+/// Append notes for unsupported types from `numbers` (messages.py:3569).
+/// The Python arg_type parameter is unused; only expected_type matters.
+fn append_numbers_notes_inner(expected: &Type) -> Option<Vec<String>> {
+    let Type::Instance { type_ref, .. } = expected else {
+        return None;
+    };
+    if !UNSUPPORTED_NUMBERS_TYPES.contains(&type_ref.as_str()) {
+        return Some(Vec::new());
+    }
+    Some(vec![
+        "Types from \"numbers\" are not supported for static type checking".to_string(),
+        "See https://peps.python.org/pep-0484/#the-numeric-tower".to_string(),
+        "Consider using a protocol instead, such as typing.SupportsFloat".to_string(),
+    ])
+}
+
+/// Append a note naming union items not in the second union (messages.py:3552).
+fn append_union_note_inner(
+    py: Python<'_>,
+    arg: &Type,
+    expected: &Type,
+    resolver: &NativeTypeResolver,
+    use_star_unpack: bool,
+) -> Option<Vec<String>> {
+    let Type::UnionType { items, .. } = arg else {
+        return None;
+    };
+    let items = flatten_nested_unions_inner(items, true, true)?;
+    if items.len() < MAX_UNION_ITEMS {
+        return Some(Vec::new());
+    }
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    let mut non_matching: Vec<&Type> = Vec::new();
+    for item in &items {
+        let ok = is_subtype(item, expected, &ctx, resolver.resolver())?;
+        if !ok {
+            non_matching.push(item);
+        }
+    }
+    if non_matching.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut parts = Vec::with_capacity(non_matching.len());
+    for t in &non_matching {
+        let fullnames = find_type_overlaps(t, resolver);
+        let bare = format_type_inner(py, t, 0, false, &fullnames, resolver, true, use_star_unpack)?;
+        parts.push(quote_type_string(&bare));
+    }
+    let plural = if non_matching.len() == 1 { "" } else { "s" };
+    Some(vec![format!(
+        "Item{plural} in the first union not in the second: {}",
+        parts.join(", ")
+    )])
+}
+
+// ---------------------------------------------------------------------------
+// pretty_callable (messages.py:3111)
+// ---------------------------------------------------------------------------
+
+fn arg_kind_is_named(kind: i64) -> bool {
+    matches!(kind, 3 | 5)
+}
+
+fn arg_kind_is_optional(kind: i64) -> bool {
+    matches!(kind, 1 | 5)
+}
+
+fn arg_kind_is_positional(kind: i64) -> bool {
+    matches!(kind, 0 | 1)
+}
+
+/// Render a callable without a FuncDef definition (messages.py:3111).
+/// Wire format has no definition; name is the first token of `tp.name`,
+/// no leading `self`/`cls`. Defers on non-TypeVarType variables.
+fn pretty_callable_inner(
+    py: Python<'_>,
+    tp: &Type,
+    resolver: &NativeTypeResolver,
+    reveal_verbose_types: bool,
+    use_star_unpack: bool,
+) -> Option<String> {
+    let Type::CallableType {
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        name,
+        variables,
+        type_guard,
+        type_is,
+        unpack_kwargs,
+        ..
+    } = tp
+    else {
+        return None;
+    };
+
+    let mut s = String::new();
+    let mut asterisk = false;
+    let mut slash = false;
+    for i in 0..arg_types.len() {
+        if !s.is_empty() {
+            s.push_str(", ");
+        }
+        let kind = *arg_kinds.get(i)?;
+        if arg_kind_is_named(kind) && !asterisk {
+            s.push_str("*, ");
+            asterisk = true;
+        }
+        if kind == 2 {
+            s.push('*');
+            asterisk = true;
+        }
+        if kind == 4 {
+            s.push_str("**");
+        }
+        let mut name = arg_names.get(i).and_then(|n| n.as_deref());
+        if name.is_none() && !reveal_verbose_types {
+            if kind == 2 && matches!(arg_types[i], Type::UnpackType { .. }) {
+                name = Some("args");
+            } else if kind == 4 && *unpack_kwargs {
+                name = Some("kwargs");
+            }
+        }
+        let mut type_str = format_type_inner(
+            py,
+            &arg_types[i],
+            0,
+            false,
+            &HashSet::new(),
+            resolver,
+            true,
+            use_star_unpack,
+        )?;
+        if kind == 4 && *unpack_kwargs {
+            if reveal_verbose_types {
+                type_str = format!("Unpack[{type_str}]");
+            } else {
+                type_str = format!("**{type_str}");
+            }
+        }
+        if let Some(n) = name {
+            s.push_str(n);
+            s.push_str(": ");
+        }
+        s.push_str(&type_str);
+        if arg_kind_is_optional(kind) {
+            s.push_str(" = ...");
+        }
+        if !slash
+            && arg_kind_is_positional(kind)
+            && name.is_none()
+            && (i == arg_types.len() - 1
+                || arg_names.get(i + 1).and_then(|n| n.as_deref()).is_some()
+                || !arg_kind_is_positional(*arg_kinds.get(i + 1)?))
+        {
+            s.push_str(", /");
+            slash = true;
+        }
+    }
+
+    // No definition on the wire: `get_func_def(tp) is None`, so the function
+    // name is the first whitespace token of `tp.name`, never a `self`/`cls`.
+    let func_name = name.as_deref().and_then(|n| n.split_whitespace().next());
+    if let Some(fname) = func_name {
+        s = format!("{fname}({s})");
+    } else {
+        s = format!("({s})");
+    }
+
+    s.push_str(" -> ");
+    if let Some(tg) = type_guard {
+        let bare = format_type_inner(
+            py,
+            tg.as_ref(),
+            0,
+            false,
+            &HashSet::new(),
+            resolver,
+            true,
+            use_star_unpack,
+        )?;
+        s.push_str(&format!("TypeGuard[{bare}]"));
+    } else if let Some(ti) = type_is {
+        let bare = format_type_inner(
+            py,
+            ti.as_ref(),
+            0,
+            false,
+            &HashSet::new(),
+            resolver,
+            true,
+            use_star_unpack,
+        )?;
+        s.push_str(&format!("TypeIs[{bare}]"));
+    } else {
+        let bare = format_type_inner(
+            py,
+            ret_type.as_ref(),
+            0,
+            false,
+            &HashSet::new(),
+            resolver,
+            true,
+            use_star_unpack,
+        )?;
+        s.push_str(&bare);
+    }
+
+    if !variables.is_empty() {
+        let mut tvars = Vec::with_capacity(variables.len());
+        for tvar in variables {
+            let Type::TypeVarType {
+                name,
+                values,
+                upper_bound,
+                ..
+            } = tvar
+            else {
+                // Python prints `repr(tvar)` for non-TypeVarType variables,
+                // which the wire format cannot reconstruct.
+                return None;
+            };
+            let is_object_upper = matches!(
+                upper_bound.as_ref(),
+                Type::Instance { type_ref, .. } if type_ref == "builtins.object"
+            );
+            if !is_object_upper {
+                let bare = format_type_inner(
+                    py,
+                    upper_bound.as_ref(),
+                    0,
+                    false,
+                    &HashSet::new(),
+                    resolver,
+                    true,
+                    use_star_unpack,
+                )?;
+                tvars.push(format!("{name}: {bare}"));
+            } else if !values.is_empty() {
+                let mut vals = Vec::with_capacity(values.len());
+                for v in values {
+                    let bare = format_type_inner(
+                        py,
+                        v,
+                        0,
+                        false,
+                        &HashSet::new(),
+                        resolver,
+                        true,
+                        use_star_unpack,
+                    )?;
+                    vals.push(bare);
+                }
+                tvars.push(format!("{name}: ({})", vals.join(", ")));
+            } else {
+                tvars.push(name.to_string());
+            }
+        }
+        s = format!("[{}] {s}", tvars.join(", "));
+    }
+    Some(format!("def {s}"))
+}
+
+#[pyfunction]
+pub fn rust_append_invariance_notes(
+    arg_bytes: &[u8],
+    expected_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<String>> {
+    let arg = wire::read_type(&mut ReadBuffer::new(arg_bytes), None).ok()?;
+    let expected = wire::read_type(&mut ReadBuffer::new(expected_bytes), None).ok()?;
+    append_invariance_notes_inner(&arg, &expected, resolver.resolver())
+}
+
+#[pyfunction]
+pub fn rust_append_numbers_notes(expected_bytes: &[u8]) -> Option<Vec<String>> {
+    let expected = wire::read_type(&mut ReadBuffer::new(expected_bytes), None).ok()?;
+    append_numbers_notes_inner(&expected)
+}
+
+#[pyfunction]
+pub fn rust_append_union_note(
+    py: Python<'_>,
+    arg_bytes: &[u8],
+    expected_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+    use_star_unpack: bool,
+) -> Option<Vec<String>> {
+    let arg = wire::read_type(&mut ReadBuffer::new(arg_bytes), None).ok()?;
+    let expected = wire::read_type(&mut ReadBuffer::new(expected_bytes), None).ok()?;
+    append_union_note_inner(py, &arg, &expected, resolver, use_star_unpack)
+}
+
+#[pyfunction]
+pub fn rust_pretty_callable(
+    py: Python<'_>,
+    callable_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+    reveal_verbose_types: bool,
+    use_star_unpack: bool,
+) -> Option<String> {
+    let tp = wire::read_type(&mut ReadBuffer::new(callable_bytes), None).ok()?;
+    pretty_callable_inner(py, &tp, resolver, reveal_verbose_types, use_star_unpack)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1619,5 +2011,135 @@ mod tests {
         assert_eq!(arg_constructor_name(3), "NamedArg");
         assert_eq!(arg_constructor_name(4), "KwArg");
         assert_eq!(arg_constructor_name(5), "DefaultNamedArg");
+    }
+
+    fn make_resolver(snaps: Vec<crate::typeinfo::TypeInfoSnapshot>) -> TypeResolver {
+        let mut r = TypeResolver::new();
+        for s in snaps {
+            r.insert(s.fullname.clone(), s);
+        }
+        r
+    }
+
+    fn snap(fullname: &str, name: &str) -> crate::typeinfo::TypeInfoSnapshot {
+        let mut s = crate::typeinfo::TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        s.has_base.insert(fullname.to_string());
+        s
+    }
+
+    fn instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_append_invariance_notes_positive() {
+        // list[A] <: list[A] (A has no args, so has_base A→A suffices).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("builtins.object", "object")]);
+        let arg = instance("builtins.list", vec![instance("a.A", vec![])]);
+        let expected = instance("builtins.list", vec![instance("a.A", vec![])]);
+        let notes = append_invariance_notes_inner(&arg, &expected, &r).unwrap();
+        assert_eq!(
+            notes,
+            vec![
+                "\"list\" is invariant -- see \
+                 https://mypy.readthedocs.io/en/stable/common_issues.html#variance"
+                    .to_string(),
+                "Consider using \"Sequence\" instead, which is covariant".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_append_invariance_notes_negative() {
+        // A and B are unrelated, so list[A] <: list[B] is Some(false)
+        // (invariance note fires only on a subtype, so no notes).
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("a.B", "B"),
+            snap("builtins.object", "object"),
+        ]);
+        let arg = instance("builtins.list", vec![instance("a.A", vec![])]);
+        let expected = instance("builtins.list", vec![instance("a.B", vec![])]);
+        assert_eq!(
+            append_invariance_notes_inner(&arg, &expected, &r),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn test_append_invariance_notes_dict_positive() {
+        // dict[str, str] <: dict[str, str].
+        let r = make_resolver(vec![
+            snap("builtins.str", "str"),
+            snap("builtins.object", "object"),
+        ]);
+        let arg = instance(
+            "builtins.dict",
+            vec![
+                instance("builtins.str", vec![]),
+                instance("builtins.str", vec![]),
+            ],
+        );
+        assert_eq!(
+            append_invariance_notes_inner(&arg, &arg, &r),
+            Some(vec![
+                "\"dict\" is invariant -- see \
+                 https://mypy.readthedocs.io/en/stable/common_issues.html#variance"
+                    .to_string(),
+                "Consider using \"Mapping\" instead, which is covariant in the value type"
+                    .to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_append_invariance_notes_non_instance_defers() {
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.list", vec![instance("a.A", vec![])]);
+        assert_eq!(
+            append_invariance_notes_inner(
+                &arg,
+                &Type::AnyType {
+                    type_of_any: 0,
+                    source_any: None,
+                    missing_import_name: None
+                },
+                &r
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_append_numbers_notes_matches() {
+        // Numbers types are members of UNSUPPORTED_NUMBERS_TYPES.
+        assert_eq!(
+            append_numbers_notes_inner(&instance("numbers.Complex", vec![])),
+            Some(vec![
+                "Types from \"numbers\" are not supported for static type checking".to_string(),
+                "See https://peps.python.org/pep-0484/#the-numeric-tower".to_string(),
+                "Consider using a protocol instead, such as typing.SupportsFloat".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn test_append_numbers_notes_non_matching() {
+        assert_eq!(
+            append_numbers_notes_inner(&instance("builtins.str", vec![])),
+            Some(vec![])
+        );
+        // Non-Instance expected type defers to Python.
+        assert_eq!(append_numbers_notes_inner(&Type::NoneType), None);
     }
 }

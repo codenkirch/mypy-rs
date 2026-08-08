@@ -438,6 +438,24 @@ def rust_format_type_distinctly(
     bare: bool,
     use_star_unpack: bool,
 ) -> list[str] | None: ...
+def rust_append_invariance_notes(
+    arg_bytes: bytes,
+    expected_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> list[str] | None: ...
+def rust_append_numbers_notes(expected_bytes: bytes) -> list[str] | None: ...
+def rust_append_union_note(
+    arg_bytes: bytes,
+    expected_bytes: bytes,
+    resolver: NativeTypeResolver,
+    use_star_unpack: bool,
+) -> list[str] | None: ...
+def rust_pretty_callable(
+    callable_bytes: bytes,
+    resolver: NativeTypeResolver,
+    reveal_verbose_types: bool,
+    use_star_unpack: bool,
+) -> str | None: ...
 def rust_best_matches(current: str, options: list[str], n: int) -> list[str]: ...
 def rust_is_numeric_format_type(conv_type: str, is_new_style: bool) -> bool: ...
 def rust_parse_conversion_specifiers(
