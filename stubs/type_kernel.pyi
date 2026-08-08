@@ -411,6 +411,13 @@ def rust_meta_has_operator(
 def rust_defined_in_superclass(
     resolver: NativeTypeResolver, fullname: str, name: str
 ) -> bool | None: ...
+def rust_analyze_instance_member_access(
+    resolver: NativeTypeResolver,
+    instance: bytes,
+    signature: bytes,
+    method_fullname: str,
+    strict_optional: bool,
+) -> bytes | None: ...
 def rust_solve_one(
     lowers: list[bytes],
     uppers: list[bytes],

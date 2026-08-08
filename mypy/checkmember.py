@@ -92,6 +92,7 @@ try:
         WriteBuffer as _CheckMemberWriteBuffer,
     )
     from type_kernel import (
+        rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
         rust_instance_fallback as _rust_instance_fallback,
         rust_has_operator as _rust_has_operator,
@@ -108,6 +109,7 @@ except ImportError:
     _rust_has_operator = None  # type: ignore[assignment]
     _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
+    _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
     _checkmember_read_type = None  # type: ignore[assignment]
@@ -439,6 +441,56 @@ def analyze_instance_member_access(
             signature = method.type
         if not mx.preserve_type_var_ids:
             signature = freshen_all_functions_type_vars(signature)
+        # M20 native seam: for a static, non-overloaded method the whole
+        # map -> expand -> freeze tail is replaceable by one Rust call.
+        # Rust defers (None) for overloads, bound signatures, non-Instance
+        # types, unresolvable derivation paths, and any expand result that
+        # still carries type variables. Freshening already happened above,
+        # and a fully successful Rust expand is already frozen, so
+        # freeze_all_type_vars is a no-op on that path.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_checkmember_active
+            and _native_checkmember_resolver is not None
+            and method.is_static
+            and isinstance(method, FuncDef)
+            and not mx.is_super
+            and not mx.is_lvalue
+        ):
+            try:
+                result = _rust_analyze_instance_member_access(
+                    _native_checkmember_resolver,
+                    _serialize_type_for_checkmember(typ),
+                    _serialize_type_for_checkmember(signature),
+                    method.info.fullname,
+                    state.state.strict_optional,
+                )
+                if result is not None:
+                    decoded = _deserialize_type_for_checkmember(bytes(result))
+                    # The wire format does not carry line/column; decoded
+                    # types default to line -1. Preserve the input type's
+                    # location so derived contexts report errors at the
+                    # call site instead of a phantom line 0/-1.
+                    if decoded is not None and isinstance(decoded, ProperType):
+                        decoded.line = typ.line
+                        decoded.column = typ.column
+                        if isinstance(decoded, CallableType):
+                            decoded.fallback.line = decoded.line
+                    # Clear the process-global primitive decode singletons
+                    # after a read so NOT_READY Instances cannot leak into
+                    # later builds.
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    if decoded is not None:
+                        return decoded
+            except (AssertionError, NotImplementedError):
+                # AssertionError: TypeInfo not yet fixed during semanal.
+                # NotImplementedError: unserializable variant.
+                # Both defer to Python.
+                pass
         if not method.is_static:
             if isinstance(method, (FuncDef, OverloadedFuncDef)) and method.is_trivial_self:
                 signature = bind_self_fast(signature, mx.self_type)

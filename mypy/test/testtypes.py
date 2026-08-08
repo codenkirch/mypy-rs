@@ -6520,4 +6520,160 @@ class NativeCheckMemberSuite(Suite):
             self._set_resolver(self.resolver)
             del self.fx.ai.names["x"]
 
+    def _member_access_expected(
+        self, instance: Instance, method: TypeInfo, signature: CallableType
+    ) -> Type:
+        # Python baseline for the M20 seam tail:
+        # map_instance_to_supertype -> expand_type_by_instance -> freeze
+        # (checkmember.py:502-504). Runs with the native checkmember gate
+        # off so it always exercises the pure-Python expand path.
+        from mypy.expandtype import expand_type_by_instance
+        from mypy.maptype import map_instance_to_supertype
+
+        self._set_active(False)
+        try:
+            mapped = map_instance_to_supertype(instance, method)
+            expanded = expand_type_by_instance(signature, mapped)
+            from mypy.typeops import freeze_all_type_vars
+
+            freeze_all_type_vars(expanded)
+            return expanded
+        finally:
+            self._set_active(True)
+
+    def _rust_member_access(
+        self, instance: Type, signature: Type, method_fullname: str
+    ) -> bytes | None:
+        result = self._tk.rust_analyze_instance_member_access(
+            self.resolver,
+            self._bytes_of(instance),
+            self._bytes_of(signature),
+            method_fullname,
+            False,
+        )
+        return bytes(result) if result is not None else None
+
+    def _assert_parity_callable(self, decoded: Type, expected: Type) -> None:
+        # Structural parity for the M20 seam: decoded comes back from the wire
+        # with a process-global builtins.function TypeInfo (see
+        # instance_cache.function_type in mypy/typeops.py), which is not the
+        # TypeFixture() TypeInfo under test. Comparing the whole CallableType
+        # by __eq__ would then fail on fallback identity alone, so compare
+        # every field except fallback and verify fallback by name only.
+        assert isinstance(decoded, CallableType) and isinstance(expected, CallableType)
+        assert decoded.name == expected.name
+        assert decoded.is_ellipsis_args == expected.is_ellipsis_args
+        assert decoded.type_guard == expected.type_guard
+        assert decoded.type_is == expected.type_is
+        assert decoded.arg_types == expected.arg_types
+        assert decoded.arg_names == expected.arg_names
+        assert decoded.arg_kinds == expected.arg_kinds
+        assert decoded.ret_type == expected.ret_type
+        assert str(decoded.fallback.type) == str(expected.fallback.type)
+
+    def test_instance_member_access_parity_plain(self) -> None:
+        # Non-generic static method: member type is just the ret type.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        expected = self._member_access_expected(self.fx.ga, self.fx.gi, sig)
+        rust_bytes = self._rust_member_access(self.fx.ga, sig, "G")
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(rust_bytes)
+        assert isinstance(decoded, ProperType)
+        self._assert_parity_callable(decoded, expected)
+        assert decoded.ret_type == self.fx.a
+
+    def test_instance_member_access_parity_expands(self) -> None:
+        # Generic: G[A].foo() -> G[A] substitutes T`1 -> A in the ret type.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.gt,
+            fallback=self.fx.function,
+        )
+        expected = self._member_access_expected(self.fx.ga, self.fx.gi, sig)
+        rust_bytes = self._rust_member_access(self.fx.ga, sig, "G")
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(rust_bytes)
+        assert isinstance(decoded, ProperType)
+        self._assert_parity_callable(decoded, expected)
+        assert decoded.ret_type == self.fx.ga
+
+    def test_instance_member_access_parity_sibling_class_maps(self) -> None:
+        # G2[A].foo() where foo is defined on G2 maps the args onto G2[A]
+        # even though the instance type is generic.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        instance = Instance(self.fx.g2i, [self.fx.a])
+        expected = self._member_access_expected(instance, self.fx.g2i, sig)
+        rust_bytes = self._rust_member_access(instance, sig, "G2")
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(rust_bytes)
+        assert isinstance(decoded, ProperType)
+        self._assert_parity_callable(decoded, expected)
+        assert decoded.ret_type == self.fx.a
+
+    def test_instance_member_access_rust_none_for_overloaded(self) -> None:
+        item = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        assert self._rust_member_access(self.fx.ga, Overloaded([item]), "G") is None
+
+    def test_instance_member_access_rust_none_for_non_instance(self) -> None:
+        # A non-Instance left operand is not handled: defer.
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        result = self._tk.rust_analyze_instance_member_access(
+            self.resolver,
+            self._bytes_of(self.fx.o),
+            self._bytes_of(sig),
+            "G",
+            False,
+        )
+        assert result is None
+
+    def test_instance_member_access_rust_none_for_unknown_class(self) -> None:
+        # A method fullname with no resolver floor entry defers.
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        result = self._tk.rust_analyze_instance_member_access(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "NoSuchClass",
+            False,
+        )
+        assert result is None
+
 

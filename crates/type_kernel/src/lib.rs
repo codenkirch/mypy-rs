@@ -574,6 +574,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkmember::rust_defined_in_superclass,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_instance_member_access,
+        module
+    )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     module.add_function(wrap_pyfunction!(suggestions::rust_best_matches, module)?)?;

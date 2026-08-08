@@ -523,6 +523,75 @@ pub(crate) fn rust_defined_in_superclass(
 }
 
 // ---------------------------------------------------------------------------
+// analyze_instance_member_access (method path)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_instance_member_access` (checkmember.py:388-453),
+/// the method branch (checkmember.py:415-453), Rust subset.
+///
+/// Ports the map-then-expand tail of the method path for a **static**,
+/// non-overloaded method: `map_instance_to_supertype` +
+/// `expand_type_by_instance` + `freeze_all_type_vars`. The Python caller
+/// freshens the signature before dispatching, so method-level type vars are
+/// freshened (raw_ids that are not class vars); Rust's
+/// `expand_type_with_env` defers any result that still contains a TypeVar,
+/// so methods generic over their own type vars fall through to Python.
+///
+/// The caller gates on `method.is_static`, which guarantees the signature is
+/// not bound (non-static methods go through `bind_self`/`check_self_arg` on
+/// the Python side); a bound callable is not representable here because
+/// expand defers `is_bound`. Returns `None` (Python falls through) for:
+///   * a non-Instance `typ`
+///   * an Overloaded signature (the static overloaded path maps in Python)
+///   * a missing resolver snapshot / unresolvable derivation path
+///   * a mapped instance with empty args or a TVT class (expand defers)
+///   * a bound callable or a ParamSpec/Unpack signature (expand defers)
+///   * an expanded result that still carries a TypeVar
+/// Python's `freeze_all_type_vars` is unported: the signature is already
+/// frozen by this seam (expand produces only bound class vars), so nothing
+/// remains to freeze when the Rust path fully succeeds.
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_analyze_instance_member_access(
+    resolver: &NativeTypeResolver,
+    instance_bytes: &[u8],
+    signature_bytes: &[u8],
+    method_fullname: &str,
+    strict_optional: bool,
+) -> Option<Vec<u8>> {
+    let instance = decode_type(instance_bytes)?;
+    let signature = decode_type(signature_bytes)?;
+    let (left_ref, left_args) = match &instance {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return None,
+    };
+    if !matches!(signature, Type::CallableType { .. }) {
+        return None; // Overloaded defers to Python
+    }
+    // checkmember.py:450 `typ = map_instance_to_supertype(typ, method.info)`.
+    let mapped_args = crate::subtypes::map_instance_to_supertype(
+        left_ref,
+        left_args,
+        method_fullname,
+        resolver.resolver(),
+    )?;
+    let mapped_instance = Type::Instance {
+        type_ref: method_fullname.to_string(),
+        args: mapped_args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    // checkmember.py:451 `expand_type_by_instance(signature, typ)`.
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &signature,
+        &mapped_instance,
+        resolver.resolver(),
+        strict_optional,
+    )?;
+    encode_type(&expanded)
+}
+
+// ---------------------------------------------------------------------------
 // classify_member_access
 // ---------------------------------------------------------------------------
 
