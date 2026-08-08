@@ -2080,6 +2080,119 @@ class NativeTypeWireResolverSuite(Suite):
         self.assert_wire_par(UnionType.make_union([self.fx.a, self.fx.b, self.fx.nonet]))
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMethodFullnameSuite(Suite):
+    """Parity tests for M25: checkexpr `method_fullname` ported to Rust.
+
+    Each test serializes a `mypy.types.Type` and asks both
+    `type_kernel.rust_method_fullname(resolver, bytes, name)` and the
+    pure-Python `ExpressionChecker.method_fullname` for the qualified
+    method name, asserting they agree. The Rust side defers (None) to
+    Python for any case the kernel cannot decide, so the assertion is:
+    Rust result if non-None, else the Python result, equals the Python
+    result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        # The containing-type cases (TypedDict, Literal) resolve "foo"
+        # through the fallback's names table, so inject it before the
+        # resolver snapshots member_info.
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        self._injected = Var("foo")
+        self.fx.ai.names["foo"] = SymbolTableNode(MDEF, self._injected)
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.gsi,
+            self.fx.gs2i,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        del self.fx.ai.names["foo"]
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def assert_fullname_par(self, t: Type, method_name: str) -> None:
+        # Python reference via the pure-Python path (gate off).
+        from mypy.checkexpr import ExpressionChecker
+
+        self._set_active(False)
+        py = ExpressionChecker.method_fullname(None, t, method_name)
+        rusted = _type_kernel.rust_method_fullname(
+            self.resolver, self._bytes_of(t), method_name
+        )
+        assert (rusted if rusted is not None else py) == py, (
+            f"method_fullname({t!r}, {method_name!r}) rust={{}} py={{}}".format(rusted, py)
+        )
+
+    def test_instance(self) -> None:
+        self.assert_fullname_par(self.fx.a, "foo")
+        self.assert_fullname_par(self.fx.b, "foo")
+
+    def test_plain_tuple(self) -> None:
+        plain = TupleType([self.fx.a], self.fx.std_tuple)
+        self.assert_fullname_par(plain, "foo")
+
+    def test_type_type(self) -> None:
+        self.assert_fullname_par(self.fx.type_a, "foo")
+        self.assert_fullname_par(self.fx.type_any, "foo")
+
+    def test_callable_type_obj(self) -> None:
+        # A class-object callable: fallback is builtins.type (metaclass), so
+        # both sides unwrap to the constructed instance.
+        c = CallableType(
+            [], [], [], self.fx.a, Instance(self.fx.type_typei, [])
+        )
+        self.assert_fullname_par(c, "foo")
+
+    def test_typeddict(self) -> None:
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), Instance(self.fx.ai, []))
+        self.assert_fullname_par(td, "foo")
+
+    def test_literal(self) -> None:
+        lit = LiteralType(1, Instance(self.fx.ai, []))
+        self.assert_fullname_par(lit, "foo")
+
+    def test_instance_missing_method(self) -> None:
+        # Instance branch appends unconditionally (no names lookup).
+        self.assert_fullname_par(self.fx.a, "missing")
+
+    def test_unknown_type_defers(self) -> None:
+        # NoneType is not Instance/TypedDict/Literal/Tuple: both defer to
+        # None. The Rust side returns None and Python re-runs.
+        self.assert_fullname_par(self.fx.nonet, "foo")
+        self.assert_fullname_par(self.fx.anyt, "foo")
+
+
 class ShallowOverloadMatchingSuite(Suite):
     def setUp(self) -> None:
         self.fx = TypeFixture()

@@ -236,6 +236,7 @@ try:
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
+        rust_method_fullname as _rust_method_fullname,
         rust_normalize_callable as _rust_normalize_callable,
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
         rust_real_union as _rust_real_union,
@@ -257,6 +258,7 @@ except ImportError:
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
+    _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -268,6 +270,17 @@ except ImportError:
     _CHECKEXPR_HAS_TYPE_KERNEL = False
 
 _native_checkexpr_active: bool = False
+
+# M25: NativeTypeResolver shared with the checkexpr kernel for
+# `method_fullname`. Installed/cleared per build by BuildManager.
+_native_checkexpr_resolver: Any = None
+
+
+def _set_native_checkexpr_resolver(resolver: Any) -> None:
+    """Install/clear the NativeTypeResolver shared with the checkexpr kernel."""
+    global _native_checkexpr_resolver
+    _native_checkexpr_resolver = resolver
+
 
 # Stage 4 plugin-hook snapshot: a Rust `PluginHookRegistry` holding
 # DefaultPlugin's call-hook fullnames. See `plugin_call_hook_known_absent`.
@@ -863,6 +876,25 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         it is invoked on. Return `None` if the name of `object_type` cannot be determined.
         """
         object_type = get_proper_type(object_type)
+
+        # M25: resolve the qualified name against the shared type-info
+        # snapshot in Rust. Defers (None) and falls back to Python for
+        # any case the kernel cannot decide.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+        ):
+            try:
+                result = _rust_method_fullname(
+                    _native_checkexpr_resolver,
+                    _serialize_type_for_checkexpr(object_type),
+                    method_name,
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
 
         if isinstance(object_type, CallableType) and object_type.is_type_obj():
             # For class method calls, object_type is a callable representing the class object.

@@ -293,6 +293,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_method_fullname,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         errors::rust_format_messages_default,
         module
     )?)?;
