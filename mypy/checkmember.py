@@ -1562,6 +1562,12 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
         if result is not None:
             decoded = _deserialize_type_for_checkmember(bytes(result))
             if decoded is not None:
+                if isinstance(method, CallableType) and isinstance(decoded, CallableType):
+                    decoded.definition = method.definition
+                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):
+                    for orig, dec in zip(method.items, decoded.items):
+                        if isinstance(orig, CallableType) and isinstance(dec, CallableType):
+                            dec.definition = orig.definition
                 return cast(F, decoded)
     if isinstance(method, Overloaded):
         items = [bind_self_fast(c, original_type) for c in method.items]
