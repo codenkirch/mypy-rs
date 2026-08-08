@@ -68,6 +68,7 @@ mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
 mod semanal_visitor;
+mod serverdeps;
 mod setops;
 mod solve;
 mod subtypes;
@@ -536,5 +537,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     module.add_function(wrap_pyfunction!(suggestions::rust_best_matches, module)?)?;
     module.add_function(wrap_pyfunction!(suggestions::rust_pretty_seq, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_get_type_triggers,
+        module
+    )?)?;
     Ok(())
 }

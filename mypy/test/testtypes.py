@@ -5957,3 +5957,143 @@ class NativeCheckCallSuite(Suite):
         target2 = self._callable([self.fx.a, self.fx.a, self.fx.t])
         assert self._rust_overlap([arg], [target1, target2]) is False
 
+
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeServerDepsSuite(Suite):
+    """Parity tests for the Rust `get_type_triggers` port (M28).
+
+    Each test calls `get_type_triggers` with the Rust gate on and off and
+    asserts the trigger lists match. The Rust path walks live Python `Type`
+    objects via PyO3 and returns `None` for unsupported cases; when it
+    returns `None`, the Python `TypeTriggersVisitor` runs instead, so parity
+    holds by construction. These tests verify the Rust path actually handles
+    the case (does not defer) and produces the same trigger list.
+    """
+
+    def setUp(self) -> None:
+        from mypy.server.deps import _set_native_server_deps_active
+        from mypy.server.trigger import make_trigger, make_wildcard_trigger
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_server_deps_active
+        self.make_trigger = make_trigger
+        self.make_wildcard_trigger = make_wildcard_trigger
+
+    def _triggers(self, typ: Type, use_logical: bool = False) -> list[str]:
+        from mypy.server.deps import get_type_triggers
+
+        self._set_active(False)
+        py = get_type_triggers(typ, use_logical)
+        self._set_active(True)
+        rs = get_type_triggers(typ, use_logical)
+        assert_equal(
+            rs,
+            py,
+            f"Rust/Python mismatch for {typ!r} (logical={use_logical})",
+        )
+        return rs
+
+    def test_instance_simple(self) -> None:
+        triggers = self._triggers(self.fx.a)
+        assert_equal(triggers, [self.make_trigger("A")])
+
+    def test_instance_generic(self) -> None:
+        triggers = self._triggers(self.fx.ga)
+        assert_equal(triggers, [self.make_trigger("G"), self.make_trigger("A")])
+
+    def test_none_type(self) -> None:
+        triggers = self._triggers(self.fx.nonet)
+        assert_equal(triggers, [])
+
+    def test_any_type(self) -> None:
+        triggers = self._triggers(self.fx.anyt)
+        assert_equal(triggers, [])
+
+    def test_any_with_missing_import(self) -> None:
+        any_t = AnyType(
+            TypeOfAny.from_unimported_type, missing_import_name="missing_mod"
+        )
+        triggers = self._triggers(any_t)
+        assert_equal(triggers, [self.make_trigger("missing_mod")])
+
+    def test_uninhabited_type(self) -> None:
+        triggers = self._triggers(self.fx.uninhabited)
+        assert_equal(triggers, [])
+
+    def test_literal_type(self) -> None:
+        triggers = self._triggers(self.fx.lit1)
+        assert_equal(triggers, [self.make_trigger("A")])
+
+    def test_tuple_type(self) -> None:
+        t = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        triggers = self._triggers(t)
+        assert_equal(
+            triggers,
+            [
+                self.make_trigger("A"),
+                self.make_trigger("B"),
+                self.make_trigger("builtins.tuple"),
+            ],
+        )
+
+    def test_union_type(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b])
+        triggers = self._triggers(u)
+        assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
+
+    def test_type_var(self) -> None:
+        triggers = self._triggers(self.fx.t)
+        # The fixture TypeVar has fullname "T" set, plus upper_bound (object).
+        assert_equal(
+            triggers,
+            [self.make_trigger("T"), self.make_trigger("builtins.object")],
+        )
+
+    def test_type_type_no_logical(self) -> None:
+        triggers = self._triggers(self.fx.type_a, use_logical=False)
+        # Without logical deps, TypeType appends __init__ and __new__ triggers
+        # AFTER the item triggers (matching Python's ordering).
+        assert_equal(
+            triggers,
+            [
+                self.make_trigger("A"),
+                self.make_trigger("A.__init__"),
+                self.make_trigger("A.__new__"),
+            ],
+        )
+
+    def test_type_type_logical(self) -> None:
+        triggers = self._triggers(self.fx.type_a, use_logical=True)
+        # With logical deps, no __init__/__new__ appended.
+        assert_equal(triggers, [self.make_trigger("A")])
+
+    def test_instance_with_last_known_value(self) -> None:
+        triggers = self._triggers(self.fx.lit1_inst)
+        assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("A")])
+
+    def test_callable_type(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        triggers = self._triggers(c)
+        # Fallback (builtins.function) is processed separately by Python.
+        assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
+
+    def test_overloaded(self) -> None:
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        c2 = CallableType(
+            [self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        ov = Overloaded([c1, c2])
+        triggers = self._triggers(ov)
+        assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
+
+
