@@ -83,6 +83,28 @@ from __future__ import annotations
 
 from collections import defaultdict
 
+# M28 type-kernel seam: when `type_kernel` is importable and
+# `Options.native_type_kernel` is set, `get_type_triggers` routes through Rust,
+# falling back to Python `TypeTriggersVisitor` for unsupported types.
+try:
+    from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_get_type_triggers = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag read by the gate below; set by the build manager from
+# `Options.native_type_kernel` at build start (avoids an options lookup per call).
+_native_server_deps_active: bool = False
+
+
+def _set_native_server_deps_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_server_deps_active
+    _native_server_deps_active = active
+
+
 from mypy.nodes import (
     GDEF,
     LDEF,
@@ -952,6 +974,11 @@ def get_type_triggers(
     typ: Type, use_logical_deps: bool, seen_aliases: set[TypeAliasType] | None = None
 ) -> list[str]:
     """Return all triggers that correspond to a type becoming stale."""
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        result = _rust_get_type_triggers(typ, use_logical_deps)
+        if result is not None:
+            return result
+        # Rust returned None (unsupported case) — fall through to Python.
     return typ.accept(TypeTriggersVisitor(use_logical_deps, seen_aliases))
 
 
