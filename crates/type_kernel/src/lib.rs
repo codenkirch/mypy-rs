@@ -319,6 +319,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkcall::rust_normalize_callable,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(checkcall::rust_real_union, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkcall::rust_possible_none_type_var_overlap,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_stmts::rust_type_requires_usage,
         module

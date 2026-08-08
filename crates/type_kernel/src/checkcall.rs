@@ -274,6 +274,142 @@ impl CallableBase {
     }
 }
 
+/// `mypy.checkexpr.ExpressionChecker.real_union` (checkexpr.py:3488):
+/// a "real" union has more than one relevant item. When `strict_optional`
+/// is False, NoneType items are stripped from the union before counting
+/// (mirrors `UnionType.relevant_items`). Returns None on wire/decode
+/// failure or TypeAliasType (unresolved alias target).
+#[pyfunction]
+pub(crate) fn rust_real_union(type_bytes: &[u8], strict_optional: bool) -> Option<bool> {
+    let mut buf = ReadBuffer::new(type_bytes);
+    let typ = read_type(&mut buf, None).ok()?;
+    real_union(&typ, strict_optional)
+}
+
+fn real_union(typ: &Type, strict_optional: bool) -> Option<bool> {
+    let proper = get_proper_or_none(typ)?;
+    match proper {
+        Type::UnionType { items, .. } => {
+            let count = if strict_optional {
+                items.len()
+            } else {
+                items
+                    .iter()
+                    .filter(|t| !matches!(t, Type::NoneType))
+                    .count()
+            };
+            Some(count > 1)
+        }
+        _ => Some(false),
+    }
+}
+
+/// `mypy.checkexpr.ExpressionChecker.possible_none_type_var_overlap`
+/// (checkexpr.py:3348): heuristic to decide whether union math should be
+/// forced. Returns True when an argument is a union containing NoneType
+/// AND some plausible overload target has a NoneType formal while another
+/// has a TypeVarType formal at the same position. Returns None on any
+/// wire/decode failure or TypeAliasType in the inputs.
+///
+/// Inputs are serialized arg_types and plausible_targets (CallableType
+/// list). The Python caller passes already-proper types.
+#[pyfunction]
+pub(crate) fn rust_possible_none_type_var_overlap(
+    arg_type_bytes: Vec<Vec<u8>>,
+    target_bytes: Vec<Vec<u8>>,
+) -> Option<bool> {
+    let mut arg_types: Vec<Type> = Vec::with_capacity(arg_type_bytes.len());
+    for bytes in &arg_type_bytes {
+        let mut buf = ReadBuffer::new(bytes);
+        arg_types.push(read_type(&mut buf, None).ok()?);
+    }
+    let mut targets: Vec<Type> = Vec::with_capacity(target_bytes.len());
+    for bytes in &target_bytes {
+        let mut buf = ReadBuffer::new(bytes);
+        targets.push(read_type(&mut buf, None).ok()?);
+    }
+    possible_none_type_var_overlap(&arg_types, &targets)
+}
+
+fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Option<bool> {
+    if targets.is_empty() || arg_types.is_empty() {
+        return Some(false);
+    }
+    // Step 1: check if any arg_type is a union containing NoneType.
+    let mut has_optional_arg = false;
+    for arg_type in arg_types {
+        let proper = get_proper_or_none(arg_type)?;
+        if let Type::UnionType { items, .. } = proper {
+            for item in items {
+                let item_proper = get_proper_or_none(item)?;
+                if matches!(item_proper, Type::NoneType) {
+                    has_optional_arg = true;
+                    break;
+                }
+            }
+        }
+        if has_optional_arg {
+            break;
+        }
+    }
+    if !has_optional_arg {
+        return Some(false);
+    }
+    // Step 2: find min prefix length across all target arg_types.
+    let mut min_prefix = usize::MAX;
+    for target in targets {
+        let proper = get_proper_or_none(target)?;
+        let Type::CallableType {
+            arg_types: t_arg_types,
+            ..
+        } = proper
+        else {
+            return None;
+        };
+        if t_arg_types.len() < min_prefix {
+            min_prefix = t_arg_types.len();
+        }
+    }
+    if min_prefix == 0 {
+        return Some(false);
+    }
+    // Step 3: for each position, check if some target has NoneType and
+    // another has TypeVarType at that position.
+    for i in 0..min_prefix {
+        let mut has_none = false;
+        let mut has_typevar = false;
+        for target in targets {
+            let proper = get_proper_or_none(target)?;
+            let Type::CallableType {
+                arg_types: t_arg_types,
+                ..
+            } = proper
+            else {
+                return None;
+            };
+            let formal = get_proper_or_none(&t_arg_types[i])?;
+            match formal {
+                Type::NoneType => has_none = true,
+                Type::TypeVarType { .. } => has_typevar = true,
+                _ => {}
+            }
+        }
+        if has_none && has_typevar {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// `get_proper_type` for the wire format. Expands TypeAliasType by
+/// returning None (defer) since the wire format has no alias target.
+fn get_proper_or_none(typ: &Type) -> Option<&Type> {
+    match typ {
+        Type::TypeAliasType { .. } => None,
+        _ => Some(typ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,6 +655,159 @@ mod tests {
                     Some("args".into())
                 )]
             ))
+        );
+    }
+
+    fn none_type() -> Type {
+        Type::NoneType
+    }
+
+    fn union_of(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    fn callable_with_args(arg_types: Vec<Type>) -> Type {
+        let arg_kinds = vec![ARG_POS; arg_types.len()];
+        let arg_names = vec![None; arg_types.len()];
+        Type::CallableType {
+            fallback: Box::new(instance()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(any_type()),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn encode(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, t).unwrap();
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn real_union_non_union_returns_false() {
+        let t = any_type();
+        assert_eq!(rust_real_union(&encode(&t), true), Some(false));
+    }
+
+    #[test]
+    fn real_union_single_item_returns_false() {
+        let t = union_of(vec![any_type()]);
+        assert_eq!(rust_real_union(&encode(&t), true), Some(false));
+    }
+
+    #[test]
+    fn real_union_multi_item_returns_true() {
+        let t = union_of(vec![any_type(), instance()]);
+        assert_eq!(rust_real_union(&encode(&t), true), Some(true));
+    }
+
+    #[test]
+    fn real_union_strips_none_when_not_strict() {
+        // Union[int, None] with strict_optional=False: relevant = [int], count=1 -> false
+        let t = union_of(vec![instance(), none_type()]);
+        assert_eq!(rust_real_union(&encode(&t), false), Some(false));
+    }
+
+    #[test]
+    fn real_union_keeps_none_when_strict() {
+        // Union[int, None] with strict_optional=True: relevant = [int, None], count=2 -> true
+        let t = union_of(vec![instance(), none_type()]);
+        assert_eq!(rust_real_union(&encode(&t), true), Some(true));
+    }
+
+    #[test]
+    fn none_overlap_empty_args_returns_false() {
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![], vec![encode(&callable(0))]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_no_targets_returns_false() {
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![encode(&any_type())], vec![]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_no_union_arg_returns_false() {
+        let arg = encode(&any_type());
+        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_union_without_none_returns_false() {
+        let arg = encode(&union_of(vec![any_type(), instance()]));
+        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_union_with_none_no_typevar_returns_false() {
+        let arg = encode(&union_of(vec![instance(), none_type()]));
+        let target = encode(&callable_with_args(vec![none_type(), any_type()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_union_with_none_and_typevar_returns_true() {
+        let arg = encode(&union_of(vec![instance(), none_type()]));
+        let target1 = encode(&callable_with_args(vec![none_type()]));
+        let target2 = encode(&callable_with_args(vec![type_var()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target1, target2]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_overlap_single_target_none_and_typevar_different_pos_returns_false() {
+        // NoneType at pos 0, TypeVar at pos 1: neither position has both.
+        let arg = encode(&union_of(vec![instance(), none_type()]));
+        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_typevar_in_different_position_returns_false() {
+        let arg = encode(&union_of(vec![instance(), none_type()]));
+        let target1 = encode(&callable_with_args(vec![none_type(), any_type()]));
+        let target2 = encode(&callable_with_args(vec![any_type(), type_var()]));
+        assert_eq!(
+            rust_possible_none_type_var_overlap(vec![arg], vec![target1, target2]),
+            Some(false)
         );
     }
 }

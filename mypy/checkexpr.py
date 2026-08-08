@@ -237,6 +237,8 @@ try:
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
         rust_normalize_callable as _rust_normalize_callable,
+        rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
+        rust_real_union as _rust_real_union,
         rust_try_getting_literal as _rust_try_getting_literal,
     )
 
@@ -258,6 +260,8 @@ except ImportError:
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
+    _rust_real_union = None  # type: ignore[assignment]
+    _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -3362,6 +3366,21 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         if not plausible_targets or not arg_types:
             return False
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                arg_type_bytes = [
+                    _serialize_type_for_checkexpr(t) for t in arg_types
+                ]
+                target_bytes = [
+                    _serialize_type_for_checkexpr(c) for c in plausible_targets
+                ]
+                result = _rust_possible_none_type_var_overlap(
+                    arg_type_bytes, target_bytes
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         has_optional_arg = False
         for arg_type in get_proper_types(arg_types):
             if not isinstance(arg_type, UnionType):
@@ -3486,6 +3505,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return result
 
     def real_union(self, typ: Type) -> bool:
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                type_bytes = _serialize_type_for_checkexpr(typ)
+                result = _rust_real_union(type_bytes, state.strict_optional)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         typ = get_proper_type(typ)
         return isinstance(typ, UnionType) and len(typ.relevant_items()) > 1
 

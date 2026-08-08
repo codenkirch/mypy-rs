@@ -5796,3 +5796,164 @@ class NativeCheckPatternSuite(Suite):
             resolver,
         )
         assert result is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckCallSuite(Suite):
+    """Parity suite for M25: check_call decision helpers ported to Rust.
+
+    Tests `rust_real_union` and `rust_possible_none_type_var_overlap`
+    against the pure-Python implementations in `mypy.checkexpr`. Each
+    test toggles the native gate off/on and compares.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.state import state as _state
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+        self._state = _state
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _serialize(self, t: Type) -> bytes:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _serialize_type_for_checkexpr(t)
+
+    def _rust_real_union(self, t: Type, strict_optional: bool) -> bool | None:
+        import type_kernel as tk
+
+        return tk.rust_real_union(self._serialize(t), strict_optional)
+
+    def _rust_overlap(
+        self, arg_types: list[Type], targets: list[Type]
+    ) -> bool | None:
+        import type_kernel as tk
+
+        return tk.rust_possible_none_type_var_overlap(
+            [self._serialize(t) for t in arg_types],
+            [self._serialize(t) for t in targets],
+        )
+
+    def _py_real_union(self, t: Type, strict_optional: bool) -> bool:
+        old = self._state.strict_optional
+        self._state.strict_optional = strict_optional
+        try:
+            p = get_proper_type(t)
+            return isinstance(p, UnionType) and len(p.relevant_items()) > 1
+        finally:
+            self._state.strict_optional = old
+
+    # --- real_union ---
+
+    def test_real_union_non_union(self) -> None:
+        for t in [self.fx.a, self.fx.anyt, self.fx.nonet, self.fx.t]:
+            assert self._rust_real_union(t, True) == self._py_real_union(t, True)
+
+    def test_real_union_single_item_union(self) -> None:
+        t = UnionType.make_union([self.fx.a])
+        assert self._rust_real_union(t, True) == self._py_real_union(t, True)
+
+    def test_real_union_multi_item_union(self) -> None:
+        t = UnionType.make_union([self.fx.a, self.fx.b])
+        assert self._rust_real_union(t, True) == self._py_real_union(t, True)
+
+    def test_real_union_strict_optional_keeps_none(self) -> None:
+        t = UnionType.make_union([self.fx.a, NoneType()])
+        assert self._rust_real_union(t, True) == self._py_real_union(t, True)
+        assert self._rust_real_union(t, True) is True
+
+    def test_real_union_non_strict_strips_none(self) -> None:
+        t = UnionType.make_union([self.fx.a, NoneType()])
+        assert self._rust_real_union(t, False) == self._py_real_union(t, False)
+        assert self._rust_real_union(t, False) is False
+
+    def test_real_union_non_strict_multi_without_none(self) -> None:
+        t = UnionType.make_union([self.fx.a, self.fx.b])
+        assert self._rust_real_union(t, False) == self._py_real_union(t, False)
+        assert self._rust_real_union(t, False) is True
+
+    def test_real_union_non_strict_strips_all_none(self) -> None:
+        t = UnionType.make_union([NoneType(), NoneType()])
+        assert self._rust_real_union(t, False) == self._py_real_union(t, False)
+
+    def test_real_union_nested_union(self) -> None:
+        inner = UnionType.make_union([self.fx.a, NoneType()])
+        outer = UnionType.make_union([inner, self.fx.b])
+        assert self._rust_real_union(outer, True) == self._py_real_union(outer, True)
+
+    # --- possible_none_type_var_overlap ---
+
+    def _callable(self, arg_types: list[Type], variables: list[Type] | None = None) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            self.fx.anyt,
+            self.fx.function,
+            variables=variables or [],
+        )
+
+    def test_overlap_empty_args(self) -> None:
+        targets = [self._callable([self.fx.a])]
+        assert self._rust_overlap([], targets) is False
+
+    def test_overlap_empty_targets(self) -> None:
+        assert self._rust_overlap([self.fx.a], []) is False
+
+    def test_overlap_no_union_arg(self) -> None:
+        targets = [self._callable([NoneType(), self.fx.t])]
+        assert self._rust_overlap([self.fx.a], targets) is False
+
+    def test_overlap_union_without_none(self) -> None:
+        arg = UnionType.make_union([self.fx.a, self.fx.b])
+        targets = [self._callable([NoneType(), self.fx.t])]
+        assert self._rust_overlap([arg], targets) is False
+
+    def test_overlap_union_with_none_no_typevar(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        targets = [self._callable([NoneType(), self.fx.a])]
+        assert self._rust_overlap([arg], targets) is False
+
+    def test_overlap_union_with_none_and_typevar_same_pos(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target1 = self._callable([NoneType()])
+        target2 = self._callable([self.fx.t])
+        assert self._rust_overlap([arg], [target1, target2]) is True
+
+    def test_overlap_single_target_none_and_typevar_different_pos(self) -> None:
+        # NoneType at pos 0, TypeVar at pos 1: neither position has both.
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target = self._callable([NoneType(), self.fx.t])
+        assert self._rust_overlap([arg], [target]) is False
+
+    def test_overlap_typevar_different_position(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target1 = self._callable([NoneType(), self.fx.a])
+        target2 = self._callable([self.fx.a, self.fx.t])
+        assert self._rust_overlap([arg], [target1, target2]) is False
+
+    def test_overlap_multiple_positions_only_first_matches(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target1 = self._callable([NoneType(), self.fx.a, self.fx.a])
+        target2 = self._callable([self.fx.t, self.fx.a, self.fx.a])
+        assert self._rust_overlap([arg], [target1, target2]) is True
+
+    def test_overlap_none_in_second_position(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target1 = self._callable([self.fx.a, NoneType()])
+        target2 = self._callable([self.fx.a, self.fx.t])
+        assert self._rust_overlap([arg], [target1, target2]) is True
+
+    def test_overlap_min_prefix_limits_search(self) -> None:
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        # target1 has 1 arg (NoneType), target2 has 3 (a, a, t).
+        # min_prefix = 1, position 0: none vs a -> no match.
+        target1 = self._callable([NoneType()])
+        target2 = self._callable([self.fx.a, self.fx.a, self.fx.t])
+        assert self._rust_overlap([arg], [target1, target2]) is False
+
