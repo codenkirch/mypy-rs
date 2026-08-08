@@ -3117,6 +3117,23 @@ def pretty_callable(tp: CallableType, options: Options, skip_self: bool = False)
     when bound on an instance/class, rather than how it would appear in the
     defining statement.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_messages_active
+        and _native_messages_resolver is not None
+        and get_func_def(tp) is None
+    ):
+        try:
+            result = _type_kernel.rust_pretty_callable(
+                _serialize_type_for_messages(tp),
+                _native_messages_resolver,
+                options.reveal_verbose_types,
+                options.use_star_unpack(),
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     s = ""
     asterisk = False
     slash = False
@@ -3521,6 +3538,17 @@ def append_invariance_notes(
     notes: list[str], arg_type: Instance, expected_type: Instance
 ) -> list[str]:
     """Explain that the type is invariant and give notes for how to solve the issue."""
+    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
+        try:
+            result = _type_kernel.rust_append_invariance_notes(
+                _serialize_type_for_messages(arg_type),
+                _serialize_type_for_messages(expected_type),
+                _native_messages_resolver,
+            )
+            if result is not None:
+                return notes + result
+        except (AssertionError, NotImplementedError):
+            pass
     invariant_type = ""
     covariant_suggestion = ""
     if (
@@ -3553,6 +3581,18 @@ def append_union_note(
     notes: list[str], arg_type: UnionType, expected_type: UnionType, options: Options
 ) -> list[str]:
     """Point to specific union item(s) that may cause failure in subtype check."""
+    if _HAS_TYPE_KERNEL and _native_messages_active and _native_messages_resolver is not None:
+        try:
+            result = _type_kernel.rust_append_union_note(
+                _serialize_type_for_messages(arg_type),
+                _serialize_type_for_messages(expected_type),
+                _native_messages_resolver,
+                options.use_star_unpack(),
+            )
+            if result is not None:
+                return notes + result
+        except (AssertionError, NotImplementedError):
+            pass
     non_matching = []
     items = flatten_nested_unions(arg_type.items)
     if len(items) < MAX_UNION_ITEMS:
@@ -3570,6 +3610,15 @@ def append_numbers_notes(
     notes: list[str], arg_type: Instance, expected_type: Instance
 ) -> list[str]:
     """Explain if an unsupported type from "numbers" is used in a subtype check."""
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        try:
+            result = _type_kernel.rust_append_numbers_notes(
+                _serialize_type_for_messages(expected_type)
+            )
+            if result is not None:
+                return notes + result
+        except (AssertionError, NotImplementedError):
+            pass
     if expected_type.type.fullname in UNSUPPORTED_NUMBERS_TYPES:
         notes.append('Types from "numbers" are not supported for static type checking')
         notes.append("See https://peps.python.org/pep-0484/#the-numeric-tower")

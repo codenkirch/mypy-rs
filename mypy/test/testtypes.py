@@ -5598,6 +5598,67 @@ class NativeMessagesSuite(Suite):
 
         t = DeletedType("var")
         self.assert_format_par(t)
+
+    def test_append_invariance_notes_par(self) -> None:
+        from mypy.messages import append_invariance_notes
+
+        for arg_t, exp_t in [
+            (self.fx.lsta, self.fx.lsta),  # List[A] vs List[A]: list note fires
+            (self.fx.lsta, self.fx.lstb),  # A not subtype of B: no note appended
+        ]:
+            expected = append_invariance_notes([], arg_t, exp_t)
+            actual = _type_kernel.rust_append_invariance_notes(
+                self._bytes_of(arg_t), self._bytes_of(exp_t), self.resolver
+            )
+            self.assertIsNotNone(actual, f"rust invariance notes deferred for {arg_t} vs {exp_t}")
+            assert_equal(actual, expected, f"invariance notes mismatch {arg_t} vs {exp_t}")
+
+    def test_append_numbers_notes_par(self) -> None:
+        from mypy.messages import append_numbers_notes
+
+        num_t = Instance(self.fx.make_type_info("numbers.Complex"), [])
+        for exp_t in [num_t, self.fx.str_type]:
+            expected = append_numbers_notes([], self.fx.a, exp_t)
+            actual = _type_kernel.rust_append_numbers_notes(self._bytes_of(exp_t))
+            self.assertIsNotNone(actual, f"rust numbers notes deferred for {exp_t}")
+            assert_equal(actual, expected, f"numbers notes mismatch for {exp_t}")
+
+    def test_append_union_note_par(self) -> None:
+        from mypy.messages import append_union_note
+
+        # 11 items clears MAX_UNION_ITEMS so the non-matching tail can fire.
+        items = [self.fx.a, self.fx.b, self.fx.c, self.fx.d, self.fx.e, self.fx.f,
+                 self.fx.e2, self.fx.e3, self.fx.o, self.fx.str_type, self.fx.bool_type]
+        arg_u = UnionType.make_union(items)
+        exp_u = UnionType.make_union([self.fx.a, self.fx.b])
+        expected = append_union_note([], arg_u, exp_u, self.options)
+        actual = _type_kernel.rust_append_union_note(
+            self._bytes_of(arg_u),
+            self._bytes_of(exp_u),
+            self.resolver,
+            self.options.use_star_unpack(),
+        )
+        if actual is not None:
+            assert_equal(actual, expected, "union note mismatch")
+
+    def test_pretty_callable_par(self) -> None:
+        from mypy.messages import pretty_callable
+
+        # Definition-free callable, the exact scope of the Rust gate.
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+            name="f",
+        )
+        expected = pretty_callable(c, self.options)
+        actual = _type_kernel.rust_pretty_callable(
+            self._bytes_of(c), self.resolver, False, self.options.use_star_unpack()
+        )
+        self.assertIsNotNone(actual, "rust pretty_callable deferred on a plain callable")
+        assert_equal(actual, expected, "pretty_callable mismatch")
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckPatternSuite(Suite):
     """Parity tests for the M22 checkpattern Rust helpers.

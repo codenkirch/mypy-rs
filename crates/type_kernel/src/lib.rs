@@ -401,6 +401,16 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        messages::rust_append_invariance_notes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_append_numbers_notes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_append_union_note, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_pretty_callable, module)?)?;
+    module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
         module
     )?)?;
