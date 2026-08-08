@@ -16,7 +16,9 @@ module and re-applies the patch before any test runs.
 
 from __future__ import annotations
 
+import importlib
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -254,3 +256,91 @@ def pytest_sessionstart(session: Any) -> None:
             "-- -C link-arg=-undefined -C link-arg=dynamic_lookup\n"
             f"  cp target/release/libtype_kernel.dylib {installed}"
         )
+
+
+# Cross-suite isolation for the module-level native-gate globals (issue #322).
+# Each entry is a (dotted module path, attribute) pair; the modules are already
+# imported by test time, so the lazy import in the fixture is a cheap no-op.
+_NATIVE_GATE_GLOBALS: list[tuple[str, str]] = [
+    ("mypy.applytype", "_native_applytype_active"),
+    ("mypy.applytype", "_native_applytype_resolver"),
+    ("mypy.applytype", "_native_applytype_typeinfo_map"),
+    ("mypy.argmap", "_native_argmap_active"),
+    ("mypy.cache", "_native_cache_active"),
+    ("mypy.checker", "_native_checker_active"),
+    ("mypy.checker", "_native_checker_types_active"),
+    ("mypy.checker", "_native_checker_stmts_active"),
+    ("mypy.checkexpr", "_native_checkexpr_active"),
+    ("mypy.checkexpr", "_native_checkexpr_active"),
+    ("mypy.checkexpr", "_native_plugin_hook_registry"),
+    ("mypy.checkexpr", "_native_plugin_hook_has_user_plugins"),
+    ("mypy.checkmember", "_native_checkmember_active"),
+    ("mypy.checkmember", "_native_checkmember_resolver"),
+    ("mypy.checkpattern", "_native_checkpattern_active"),
+    ("mypy.checkstrformat", "_native_strformat_active"),
+    ("mypy.constraints", "_native_constraints_active"),
+    ("mypy.constraints", "_native_constraints_resolver"),
+    ("mypy.copytype", "_native_copy_active"),
+    ("mypy.erasetype", "_native_erase_active"),
+    ("mypy.erasetype", "_native_erase_typevars_active"),
+    ("mypy.errors", "_native_errors_active"),
+    ("mypy.expandtype", "_native_expand_type_active"),
+    ("mypy.expandtype", "_native_expand_type_resolver"),
+    ("mypy.expandtype", "_native_expand_type_typeinfo_map"),
+    ("mypy.join", "_native_join_active"),
+    ("mypy.join", "_native_join_resolver"),
+    ("mypy.join", "_native_join_typeinfo_map"),
+    ("mypy.messages", "_native_messages_active"),
+    ("mypy.messages", "_native_messages_resolver"),
+    ("mypy.messages", "_native_suggestions_active"),
+    ("mypy.mro", "_native_mro_active"),
+    ("mypy.mro", "_native_mro_resolver"),
+    ("mypy.mro", "_native_mro_typeinfo_map"),
+    ("mypy.semanal", "_native_semanal_active"),
+    ("mypy.semanal", "_native_semanal_visitor_active"),
+    ("mypy.server.deps", "_native_server_deps_active"),
+    ("mypy.solve", "_native_solve_active"),
+    ("mypy.solve", "_native_solve_resolver"),
+    ("mypy.subtypes", "_native_subtype_active"),
+    ("mypy.subtypes", "_native_subtype_resolver"),
+    ("mypy.typeanal", "_native_typeanal_active"),
+    ("mypy.typeops", "_native_typeops_active"),
+    ("mypy.typeops", "_native_typeops_resolver"),
+    ("mypy.types", "_native_visitor_active"),
+    ("mypy.types", "_native_visitor_types_active"),
+    ("mypy.typevars", "_native_typevars_active"),
+    # Side channel fed by `join._set_native_join_typeinfo_map`; kept in sync
+    # with the join globals so the wire-ref fixer never sees a stale map.
+    ("mypy.wirefixup", "_wire_typeinfo_map"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _isolate_native_gates() -> Iterator[None]:
+    """Restore every module-level native-gate global after each test.
+
+    `BuildManager.__init__` (mypy/build.py) sets every `_set_native_*_active`
+    gate to `options.native_type_kernel` and installs the per-build
+    `NativeTypeResolver` snapshot into the subtype/join/solve/constraints/
+    mro/expand/applytype/typeops/messages/checkmember shims. None of that
+    state is rolled back when the build ends. During a combined xdist run a
+    worker may therefore run a pure-Python testtypes suite (TypeOps/Join/
+    Meet) right after a testcheck build; the pure suite then hits the Rust
+    kernels with a foreign resolver built from the testcheck TypeInfo graph,
+    producing mismatched join/subtype/expand results (~15 failures).
+
+    This fixture snapshots every module-level native-gate global at setup and
+    restores the snapshot at teardown, so no residue from an earlier test can
+    leak into a later one on the same worker. It never forces a value, so
+    import-time activations (e.g. testinfer's argmap gate) and the per-suite
+    installs done by the Native* testtypes suites are preserved exactly.
+    Running a single file is unaffected: the snapshot and restore are both
+    no-ops relative to an already-clean worker.
+    """
+    saved = []
+    for module_name, attr in _NATIVE_GATE_GLOBALS:
+        module = importlib.import_module(module_name)
+        saved.append((module, attr, getattr(module, attr, None)))
+    yield
+    for module, attr, value in saved:
+        setattr(module, attr, value)
