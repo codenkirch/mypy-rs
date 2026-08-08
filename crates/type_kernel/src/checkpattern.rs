@@ -15,20 +15,67 @@
 //! * `rust_should_self_match` — mirrors `PatternChecker.should_self_match`.
 //! * `rust_can_match_sequence` — mirrors `PatternChecker.can_match_sequence`.
 //!
+//! * `rust_contract_starred_pattern_types` — mirrors
+//!   `PatternChecker.contract_starred_pattern_types`, re-shaping a list of
+//!   types around a starred capture so a sequence pattern can be matched
+//!   against a fixed-length type list.
+//! * `rust_expand_starred_pattern_types` — mirrors
+//!   `PatternChecker.expand_starred_pattern_types`, the inverse operation
+//!   that restores the star item before a match.
+//! * `rust_construct_sequence_child` — mirrors
+//!   `PatternChecker.construct_sequence_child`, producing the inner sequence
+//!   type used to recurse into a sequence pattern's items.
+//!
 //! Each function takes wire-format bytes (serialized `Type` objects) and a
 //! `NativeTypeResolver` for subtyping checks. Returns `None` to defer to
-//! Python when the wire form cannot be fully decoded or a subtyping check
-//! is undecided (the strangler-fig per-call gate).
+//! Python when the wire form cannot be fully decoded, a subtyping check
+//! is undecided, or the type shape differs from the mechanical subset this
+//! module implements (the strangler-fig per-call gate).
 
 use pyo3::prelude::*;
 
+use crate::setops::make_simplified_union;
 use crate::subtypes::{is_subtype, SubtypeContext};
-use crate::typeinfo::NativeTypeResolver;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::visitor::{find_unpack_in_list_inner, split_with_prefix_and_suffix_inner};
 use crate::wire::{self, LiteralValue, ReadBuffer, Type};
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     wire::read_type(&mut buf, None).ok()
+}
+
+/// Encode a `Type` via `write_type`. Returns `None` if the variant is not
+/// writable (the caller defers to Python).
+fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+    let mut wbuf = crate::wire::WriteBuffer::new();
+    crate::wire::write_type(&mut wbuf, typ).ok()?;
+    Some(wbuf.into_bytes())
+}
+
+/// Encode a list of types, dropping any that cannot be serialized.
+fn encode_type_list(types: &[Type]) -> Vec<Vec<u8>> {
+    types.iter().filter_map(encode_type).collect()
+}
+
+/// Decode a list of type blobs, returning `None` on any read failure.
+fn decode_type_list(blobs: &[Vec<u8>]) -> Option<Vec<Type>> {
+    let mut out = Vec::with_capacity(blobs.len());
+    for b in blobs {
+        out.push(decode_type(b)?);
+    }
+    Some(out)
+}
+
+/// `get_proper_type` on the wire: a `ProperType` that may sit behind
+/// nothing at all. A `TypeAliasType` cannot be expanded (Python resolves
+/// it from live `TypeInfo`), so it defers. This mirrors the private
+/// `get_proper` helper used by `setops` and isolates the alias rejection.
+fn proper_wire(t: &Type) -> Option<&Type> {
+    match t {
+        Type::TypeAliasType { .. } => None,
+        other => Some(other),
+    }
 }
 
 /// `checkpattern.is_uninhabited(typ)` — whether `get_proper_type(typ)` is an
@@ -307,6 +354,310 @@ fn can_match_sequence_inner(
     }
 }
 
+/// `PatternChecker.contract_starred_pattern_types(types, star_pos,
+/// num_patterns)` — contract a list of types in a sequence pattern around a
+/// starred capture position.
+///
+/// Mirrors checkpattern.py:434-481. Two regimes:
+/// 1. A variadic `UnpackType` is present (unaligned tuple): re-shape the
+///    list around the unpack so the requested pattern length fits.
+/// 2. A fixed-length list with `star_pos` (starred capture, no unpack):
+///    collapse the `star_length` middle items into a simplified union.
+///
+/// The unpack branch requires the type-level `find_unpack_in_list`,
+/// `split_with_prefix_and_suffix`, and `make_simplified_union` (whose
+/// subtyping steps need the resolver). Returns `None` (defer to Python)
+/// when any type cannot be decoded, the unpack is not `Instance[builtins.
+/// tuple]`, or a union cannot be simplified.
+#[pyfunction]
+#[pyo3(signature = (types_bytes, star_pos, num_patterns, resolver))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_contract_starred_pattern_types(
+    types_bytes: Vec<Vec<u8>>,
+    star_pos: Option<i64>,
+    num_patterns: i64,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<Vec<u8>>> {
+    let star_pos = match star_pos {
+        Some(p) if p < 0 => return None,
+        Some(p) => Some(p as usize),
+        None => None,
+    };
+    let num_patterns: usize = match num_patterns.try_into() {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    let types = decode_type_list(&types_bytes)?;
+    let unpack_index = find_unpack_in_list_inner(&types);
+    if unpack_index >= 0 {
+        contract_with_unpack(
+            types,
+            unpack_index as usize,
+            star_pos,
+            num_patterns,
+            Some(resolver.resolver()),
+        )
+    } else {
+        contract_no_unpack(types, star_pos, num_patterns, Some(resolver.resolver()))
+    }
+}
+
+/// Unpack branch: re-shape a variadic list around the requested pattern
+/// length. `star_pos == None` broadens the unpack item to cover `missing`
+/// pattern slots; `star_pos == Some` normalizes via prefix/suffix split and
+/// collapses the middle into a single union.
+///
+/// The resolver is only used by the `Some(star_pos)` branch (to simplify the
+/// middle union); it is `Option` so the pure logic is unit-testable offline.
+fn contract_with_unpack(
+    types: Vec<Type>,
+    unpack_index: usize,
+    star_pos: Option<usize>,
+    num_patterns: usize,
+    resolver: Option<&TypeResolver>,
+) -> Option<Vec<Vec<u8>>> {
+    let Type::UnpackType { typ: unpack_typ } = &types[unpack_index] else {
+        return None;
+    };
+    // Normalization in the caller guarantees Instance[builtins.tuple].
+    let unpacked = proper_wire(unpack_typ)?;
+    let Type::Instance {
+        type_ref,
+        args: unpacked_args,
+        ..
+    } = unpacked
+    else {
+        return None;
+    };
+    if type_ref != "builtins.tuple" {
+        return None;
+    }
+    match star_pos {
+        None => {
+            // missing = num_patterns - len(types) + 1.
+            let missing = num_patterns
+                .checked_sub(types.len())
+                .and_then(|d| d.checked_add(1))?;
+            let mut new_types = Vec::with_capacity(types.len() + missing);
+            new_types.extend(types[..unpack_index].iter().cloned());
+            if let Some(t) = unpacked_args.first() {
+                new_types.extend(std::iter::repeat_n(t.clone(), missing));
+            }
+            new_types.extend(types[unpack_index + 1..].iter().cloned());
+            Some(encode_type_list(&new_types))
+        }
+        Some(pos) => {
+            // The Python split only reads `args[0]` of any UnpackType-wrapped
+            // builtins.tuple, so passing `&types` directly is equivalent.
+            let suffix = num_patterns.checked_sub(pos)?;
+            let (prefix, middle, suffix_types) =
+                split_with_prefix_and_suffix_inner(&types, pos, suffix);
+            let unpack_item = unpacked_args.first().cloned()?;
+            let new_middle: Vec<Type> = middle
+                .iter()
+                .map(|m| {
+                    if matches!(m, Type::UnpackType { .. }) {
+                        unpack_item.clone()
+                    } else {
+                        m.clone()
+                    }
+                })
+                .collect();
+            let res = resolver?;
+            let ctx = SubtypeContext::new(false, false, false, true, true, true);
+            let merged = make_simplified_union(&new_middle, &ctx, res, true)?;
+            let mut out = Vec::with_capacity(prefix.len() + 1 + suffix_types.len());
+            out.extend(prefix);
+            out.push(merged);
+            out.extend(suffix_types);
+            Some(encode_type_list(&out))
+        }
+    }
+}
+
+/// Fixed-length branch: with `star_pos` collapse the `star_length` middle
+/// items into a single simplified union; with `star_pos == None` return the
+/// list unchanged.
+fn contract_no_unpack(
+    types: Vec<Type>,
+    star_pos: Option<usize>,
+    num_patterns: usize,
+    resolver: Option<&TypeResolver>,
+) -> Option<Vec<Vec<u8>>> {
+    let Some(pos) = star_pos else {
+        return Some(encode_type_list(&types));
+    };
+    // star_length = len(types) - num_patterns.
+    let star_length = types.len().checked_sub(num_patterns)?;
+    let slice_end = pos.checked_add(star_length)?;
+    if slice_end < pos || slice_end > types.len() {
+        return None;
+    }
+    let res = resolver?;
+    let ctx = SubtypeContext::new(false, false, false, true, true, true);
+    let merged = make_simplified_union(&types[pos..slice_end], &ctx, res, true)?;
+    let mut new_types = Vec::with_capacity(pos + 1 + (types.len() - slice_end));
+    new_types.extend(types[..pos].iter().cloned());
+    new_types.push(merged);
+    new_types.extend(types[slice_end..].iter().cloned());
+    Some(encode_type_list(&new_types))
+}
+
+/// `PatternChecker.expand_starred_pattern_types(types, star_pos,
+/// num_types, original_unpack)` — undo the contraction done by
+/// `contract_starred_pattern_types`.
+///
+/// Mirrors checkpattern.py:483-509. With `star_pos == None` the list is
+/// returned unchanged. With `original_unpack`, the star item is re-wrapped
+/// in `UnpackType[builtins.tuple[t]]` (only when the type is not
+/// uninhabited, matching `is_uninhabited`); otherwise the star item is
+/// duplicated `star_length = num_types - len(types) + 1` times.
+///
+/// Returns `None` (defer to Python) when the list cannot be decoded, the
+/// star position is out of range, or the star item is an unresolvable
+/// `TypeAliasType` (the caller's `is_uninhabited` resolves it live). No
+/// resolver is needed: the function only re-shapes a list.
+#[pyfunction]
+#[pyo3(signature = (types_bytes, star_pos, num_types, original_unpack))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_expand_starred_pattern_types(
+    types_bytes: Vec<Vec<u8>>,
+    star_pos: Option<i64>,
+    num_types: i64,
+    original_unpack: bool,
+) -> Option<Vec<Vec<u8>>> {
+    let Some(pos) = star_pos else {
+        // star_pos is None: types returned unchanged, no decode needed.
+        return Some(types_bytes);
+    };
+    if pos < 0 {
+        return None;
+    }
+    let pos = pos as usize;
+    let types = decode_type_list(&types_bytes)?;
+    // Never extend/rewrap an alias: the caller's is_uninhabited resolves it
+    // live, and an unresolved alias has no known item to place at the star.
+    if types
+        .iter()
+        .any(|t| matches!(t, Type::TypeAliasType { .. }))
+    {
+        return None;
+    }
+    if pos >= types.len() {
+        // The star item must exist before we can expand it.
+        return None;
+    }
+    if original_unpack {
+        let mut res = Vec::with_capacity(types.len());
+        for (i, t) in types.into_iter().enumerate() {
+            if i != pos || matches!(t, Type::UninhabitedType { .. }) {
+                res.push(t);
+            } else {
+                res.push(Type::UnpackType {
+                    typ: Box::new(Type::Instance {
+                        type_ref: "builtins.tuple".to_string(),
+                        args: vec![t],
+                        last_known_value: None,
+                        extra_attrs: None,
+                    }),
+                });
+            }
+        }
+        Some(encode_type_list(&res))
+    } else {
+        // star_length = num_types - len(types) + 1.
+        let star_length = match num_types
+            .checked_sub(types.len() as i64)
+            .and_then(|d| d.checked_add(1))
+        {
+            Some(d) if d > 0 => d as usize,
+            _ => return None,
+        };
+        let mut new_types = Vec::with_capacity(pos + star_length + (types.len() - pos - 1));
+        new_types.extend(types[..pos].iter().cloned());
+        new_types.extend(std::iter::repeat_n(types[pos].clone(), star_length));
+        new_types.extend(types[pos + 1..].iter().cloned());
+        Some(encode_type_list(&new_types))
+    }
+}
+
+/// `PatternChecker.construct_sequence_child(outer_type, inner_type)` — if
+/// `outer_type` is a subtype of `typing.Sequence`, produce a new instance of
+/// it whose type argument is `inner_type`; otherwise produce
+/// `Sequence[inner_type]`.
+///
+/// Mirrors checkpattern.py:877-911 for the non-recursive subset (a `TupleType`
+/// or `Instance` after `get_proper_type`, or a direct `AnyType`).
+/// `TypeVarType`/`UnionType` inputs recurse into children that need
+/// `copy_modified`/`can_match_sequence` and are deferred to Python (the shim
+/// returns `None` for them before serializing).
+///
+/// The `empty_type` (`fill_typevars(proper_type.type)`) and the sequence
+/// instance (`named_generic_type("typing.Sequence", [inner_type])`) are
+/// computed on the Python side (they reference live `TypeInfo`), then passed
+/// in for expansion. Returns `None` (defer to Python) when any input cannot
+/// be decoded, the type is a recursive case, a subtype check is undecided,
+/// or the by-instance expansion cannot bind every class typevar.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_construct_sequence_child(
+    outer_bytes: &[u8],
+    empty_type_bytes: &[u8],
+    sequence_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let outer = decode_type(outer_bytes)?;
+    let empty_type = decode_type(empty_type_bytes)?;
+    let sequence = decode_type(sequence_bytes)?;
+    construct_sequence_child_inner(&outer, &empty_type, &sequence, Some(resolver.resolver()))
+}
+
+/// Inner logic: `AnyType` passes through, `TypeVarType`/`UnionType` defer
+/// (recursive children live in Python), and the Instance branch checks
+/// `is_subtype(outer, Sequence[Any])` to decide between returning the
+/// expanded proper type or the passed-in `Sequence[inner]`.
+fn construct_sequence_child_inner(
+    outer: &Type,
+    empty_type: &Type,
+    sequence: &Type,
+    resolver: Option<&TypeResolver>,
+) -> Option<Vec<u8>> {
+    let proper = proper_wire(outer)?;
+    if matches!(proper, Type::AnyType { .. }) {
+        return encode_type(outer);
+    }
+    // Recursive children (_copy_modified / _can_match_sequence_filtered):
+    // handled by the Python recursion because they need live TypeInfo and
+    // Rust does not model those transformations.
+    if !matches!(proper, Type::Instance { .. }) {
+        return None;
+    }
+    let res = resolver?;
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    // Python compares against a bare Sequence (type var filled with
+    // TypeOfAny.special_form Any); the parametrized `sequence` would wrongly
+    // reject e.g. List[int] <: Sequence[bool] over inner_type=bool.
+    let sequence_any = Type::Instance {
+        type_ref: "typing.Sequence".to_string(),
+        args: vec![Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        }],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let can_seq = is_subtype(outer, &sequence_any, &ctx, res)?;
+    if !can_seq {
+        return encode_type(sequence);
+    }
+    // Single by-instance expansion; equals Python's two-step split
+    // (expand_type_by_instance(empty, sequence) then (partial, proper)),
+    // which leaves a TypeVar the second call would reject for this subset.
+    let final_t = crate::expandtype::expand_type_by_instance_core(empty_type, outer, res, true)?;
+    encode_type(&final_t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +740,218 @@ mod tests {
         crate::wire::write_type(&mut buf, &t).unwrap();
         let bytes = buf.into_bytes();
         assert_eq!(rust_get_type_range(&bytes), Some(false));
+    }
+
+    fn instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn unpack(item: Type) -> Type {
+        Type::UnpackType {
+            typ: Box::new(instance("builtins.tuple", vec![item])),
+        }
+    }
+
+    fn blobs(types: &[Type]) -> Vec<Vec<u8>> {
+        types
+            .iter()
+            .map(|t| {
+                let mut b = crate::wire::WriteBuffer::new();
+                crate::wire::write_type(&mut b, t).unwrap();
+                b.into_bytes()
+            })
+            .collect()
+    }
+
+    fn decode_one(blob: &[u8]) -> Type {
+        let mut buf = crate::wire::ReadBuffer::new(blob);
+        crate::wire::read_type(&mut buf, None).unwrap()
+    }
+
+    #[test]
+    fn test_expand_star_pos_none_returns_unchanged() {
+        let types = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+        ];
+        let input = blobs(&types);
+        let res = rust_expand_starred_pattern_types(input.clone(), None, 0, false);
+        assert!(res.is_some());
+        // star_pos == None returns the input bytes verbatim, no decode.
+        assert_eq!(res, Some(input));
+    }
+
+    #[test]
+    fn test_expand_original_unpack_rewraps_star_item() {
+        // original_unpack rewraps the star item as UnpackType[tuple[t]]
+        // (checkpattern.py:527-533).
+        let types = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+            instance("builtins.bool", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, true).unwrap();
+        assert_eq!(res.len(), 3);
+        let star = decode_one(&res[1]);
+        assert_eq!(
+            star,
+            Type::UnpackType {
+                typ: Box::new(instance(
+                    "builtins.tuple",
+                    vec![instance("builtins.str", vec![])]
+                )),
+            }
+        );
+        // Non-star items pass through untouched.
+        assert_eq!(decode_one(&res[0]), types[0]);
+        assert_eq!(decode_one(&res[2]), types[2]);
+    }
+
+    #[test]
+    fn test_expand_original_unpack_keeps_uninhabited_star_item() {
+        // An uninhabited star item is not re-wrapped (is_uninhabited guard
+        // in checkpattern.py:529).
+        let types = vec![
+            instance("builtins.int", vec![]),
+            Type::UninhabitedType { ambiguous: false },
+            instance("builtins.bool", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, true).unwrap();
+        assert_eq!(decode_one(&res[1]), types[1]);
+    }
+
+    #[test]
+    fn test_expand_no_unpack_duplicates_star_item() {
+        // star_length = num_types - len(types) + 1 (checkpattern.py:535-537).
+        let types = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, false).unwrap();
+        assert_eq!(res.len(), 3);
+        let expected = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+            instance("builtins.str", vec![]),
+        ];
+        let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_contract_with_unpack_no_star_broadens() {
+        // unpack split with star_pos=None: missing = num_patterns -
+        // len(types) + 1; the unpack item is duplicated to fill the slot
+        // (checkpattern.py:484-489).
+        let types = vec![
+            instance("builtins.int", vec![]),
+            unpack(instance("builtins.bool", vec![])),
+            instance("builtins.str", vec![]),
+        ];
+        let res = contract_with_unpack(types, 1, None, 4, None).unwrap();
+        let expected = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.bool", vec![]),
+            instance("builtins.bool", vec![]),
+            instance("builtins.str", vec![]),
+        ];
+        let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_contract_no_unpack_no_star_returns_unchanged() {
+        let types = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+            instance("builtins.bool", vec![]),
+        ];
+        let res = contract_no_unpack(types.clone(), None, 4, None).unwrap();
+        let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
+        assert_eq!(got, types);
+    }
+
+    #[test]
+    fn test_contract_star_branches_need_resolver() {
+        // The union-simplification star branches require a resolver; without
+        // one they defer (return None) rather than guess.
+        let with_unpack = vec![
+            instance("builtins.int", vec![]),
+            unpack(instance("builtins.bool", vec![])),
+            instance("builtins.str", vec![]),
+        ];
+        assert_eq!(contract_with_unpack(with_unpack, 1, Some(1), 4, None), None);
+        let no_unpack = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.str", vec![]),
+            instance("builtins.bool", vec![]),
+            instance("builtins.bytes", vec![]),
+        ];
+        assert_eq!(contract_no_unpack(no_unpack, Some(1), 2, None), None);
+    }
+
+    #[test]
+    fn test_construct_sequence_child_any_passthrough() {
+        // AnyType outer passes through unchanged (checkpattern.py:923-924).
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let empty = instance(
+            "builtins.list",
+            vec![Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            }],
+        );
+        let seq = instance("typing.Sequence", vec![instance("builtins.str", vec![])]);
+        let res = construct_sequence_child_inner(&any, &empty, &seq, None).unwrap();
+        assert_eq!(decode_one(&res), any);
+    }
+
+    #[test]
+    fn test_construct_sequence_child_defers_non_instance() {
+        // TypeVarType / UnionType / TypeAliasType outer defer to Python.
+        let empty = instance(
+            "builtins.list",
+            vec![Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            }],
+        );
+        let seq = instance("typing.Sequence", vec![instance("builtins.str", vec![])]);
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "m".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            construct_sequence_child_inner(&tvar, &empty, &seq, None),
+            None
+        );
+        // Instance outer needs a resolver for the is_subtype check.
+        let outer = instance("builtins.list", vec![instance("builtins.int", vec![])]);
+        assert_eq!(
+            construct_sequence_child_inner(&outer, &empty, &seq, None),
+            None
+        );
     }
 }

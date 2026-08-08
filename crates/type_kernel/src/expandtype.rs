@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use pyo3::prelude::*;
 
 use crate::setops::{flatten_nested_unions, union_make_union};
-use crate::typeinfo::NativeTypeResolver;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{
     read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
 };
@@ -70,6 +70,18 @@ fn expand_with_env(
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
+    let expanded = expand_type_with_env(typ, env, strict_optional)?;
+    encode_type(&expanded)
+}
+
+/// Inner expansion returning the raw `Type`: leaves that carry no TypeVars
+/// defer (Python returns the original object by identity), and any leftover
+/// TypeVar after substitution defers for the same reason.
+pub(crate) fn expand_type_with_env(
+    typ: &Type,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+) -> Option<Type> {
     // Leaf types carry no TypeVars; Python returns the original object
     // (identity), so defer rather than round-trip a fresh object.
     if is_leaf_type(typ) {
@@ -79,7 +91,7 @@ fn expand_with_env(
     if result_has_typevar(&expanded) {
         return None;
     }
-    encode_type(&expanded)
+    Some(expanded)
 }
 
 /// `#[pyfunction]` entry for `expand_type_by_instance`
@@ -105,7 +117,32 @@ pub(crate) fn rust_expand_type_by_instance(
 ) -> Option<Vec<u8>> {
     let typ = decode_type(type_bytes)?;
     let instance = decode_type(instance_bytes)?;
-    let Type::Instance { type_ref, args, .. } = &instance else {
+    let expanded =
+        expand_type_by_instance_core(&typ, &instance, resolver.resolver(), strict_optional)?;
+    encode_type(&expanded)
+}
+
+/// Core `expand_type_by_instance` (mypy/expandtype.py:295-325): bind the
+/// class typevars of `instance` in `typ`, then substitute them into `typ`.
+/// Serializable subset: plain class type var binding (no TypeVarTuple),
+/// every arg readable, args length equal to the class's `defn.type_vars`.
+/// Mirroring the Python zip-truncate, a length mismatch leaves extra
+/// typevars unbound, so this defers.
+///
+/// Mirrors the non-TVT branch:
+///   tvars = tuple(instance.type.defn.type_vars)
+///   variables = {binder.id: arg for binder, arg in zip(tvars, instance.args)}
+///   return expand_type(typ, variables)
+///
+/// The env keys use `(raw_id, 0, "")`: class typevars bind
+/// `TypeVarId(raw_id)` (types.py:554 defaults meta_level=0, namespace="").
+pub(crate) fn expand_type_by_instance_core(
+    typ: &Type,
+    instance: &Type,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+) -> Option<Type> {
+    let Type::Instance { type_ref, args, .. } = instance else {
         return None;
     };
     // Python fast path (expandtype.py:298-299) returns `typ` unchanged
@@ -114,7 +151,7 @@ pub(crate) fn rust_expand_type_by_instance(
     if args.is_empty() {
         return None;
     }
-    let snap = resolver.resolver().get(type_ref)?;
+    let snap = resolver.get(type_ref)?;
     // TypeVarTuple branch (expandtype.py:302-316) stays in Python.
     if snap.has_type_var_tuple_type {
         return None;
@@ -129,7 +166,7 @@ pub(crate) fn rust_expand_type_by_instance(
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, String::new()), arg.clone());
     }
-    expand_with_env(&typ, &env, strict_optional)
+    expand_type_with_env(typ, &env, strict_optional)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.

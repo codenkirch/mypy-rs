@@ -464,6 +464,24 @@ def rust_can_match_sequence(
     sequence_type_bytes: bytes,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
+def rust_contract_starred_pattern_types(
+    types_bytes: list[bytes],
+    star_pos: int | None,
+    num_patterns: int,
+    resolver: NativeTypeResolver,
+) -> list[bytes] | None: ...
+def rust_expand_starred_pattern_types(
+    types_bytes: list[bytes],
+    star_pos: int | None,
+    num_types: int,
+    original_unpack: bool,
+) -> list[bytes] | None: ...
+def rust_construct_sequence_child(
+    outer_bytes: bytes,
+    empty_type_bytes: bytes,
+    sequence_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> bytes | None: ...
 def rust_has_return_statement(node_bytes: bytes) -> bool: ...
 def rust_has_str_expression(node_bytes: bytes) -> bool: ...
 def rust_has_yield_expression(node_bytes: bytes) -> bool: ...

@@ -419,6 +419,18 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkpattern::rust_contract_starred_pattern_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkpattern::rust_expand_starred_pattern_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkpattern::rust_construct_sequence_child,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkstrformat::rust_parse_conversion_specifiers,
         module
     )?)?;
