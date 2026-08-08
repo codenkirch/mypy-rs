@@ -49,6 +49,7 @@ mod checkcall;
 mod checker_stmts;
 mod checker_visitor;
 mod checkexpr_functions;
+mod checkpattern;
 mod checkstrformat;
 mod constraints;
 mod constraints_helpers;
@@ -394,6 +395,20 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checkpattern::rust_is_uninhabited, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkpattern::rust_get_match_arg_names,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checkpattern::rust_get_type_range, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkpattern::rust_should_self_match,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkpattern::rust_can_match_sequence,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

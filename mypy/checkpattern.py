@@ -59,6 +59,36 @@ from mypy.types import (
 from mypy.typevars import fill_typevars, fill_typevars_with_any
 from mypy.visitor import PatternVisitor
 
+# M22 type-kernel seam: when the `type_kernel` Rust extension is importable
+# and `Options.native_type_kernel` is set, standalone helpers from this
+# module route through Rust. Rust returns None for any case it does not
+# handle, so Python falls back to the pure-Python path (strangler-fig
+# per-call gate).
+try:
+    import type_kernel as _type_kernel
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _WriteBuffer = None  # type: ignore[assignment,misc]
+    _HAS_TYPE_KERNEL = False
+
+# Module-level flag, set by the build manager from Options.native_type_kernel.
+_native_checkpattern_active: bool = False
+
+
+def _set_native_checkpattern_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_checkpattern_active
+    _native_checkpattern_active = active
+
+
+def _serialize_type(t: Type) -> bytes:
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
 self_match_type_names: Final = [
     "builtins.bool",
     "builtins.bytearray",
@@ -759,10 +789,28 @@ class PatternChecker(PatternVisitor[PatternType]):
             typ = typ.partial_fallback
         if isinstance(typ, AnyType):
             return False
-        if isinstance(typ, Instance) and typ.type.get("__match_args__") is not None:
+        has_match_args = isinstance(typ, Instance) and typ.type.get("__match_args__") is not None
+        if has_match_args:
             # Named tuples and other subtypes of builtins that define __match_args__
             # should not self match.
             return False
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active and self.self_match_types:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    union = UnionType.make_union(self.self_match_types)
+                    result = _type_kernel.rust_should_self_match(
+                        _serialize_type(typ),
+                        has_match_args,
+                        _serialize_type(union),
+                        resolver,
+                    )
+                    if result is not None:
+                        return result
+                except (AssertionError, NotImplementedError):
+                    pass
         for other in self.self_match_types:
             if is_subtype(typ, other):
                 return True
@@ -773,6 +821,24 @@ class PatternChecker(PatternVisitor[PatternType]):
             return True
         if isinstance(typ, UnionType):
             return any(self.can_match_sequence(get_proper_type(item)) for item in typ.items)
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active and self.non_sequence_match_types:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                sequence = self.chk.named_type("typing.Sequence")
+                try:
+                    non_seq_union = UnionType.make_union(self.non_sequence_match_types)
+                    result = _type_kernel.rust_can_match_sequence(
+                        _serialize_type(typ),
+                        _serialize_type(non_seq_union),
+                        _serialize_type(sequence),
+                        resolver,
+                    )
+                    if result is not None:
+                        return result
+                except (AssertionError, NotImplementedError):
+                    pass
         for other in self.non_sequence_match_types:
             # We have to ignore promotions, as memoryview should match, but bytes,
             # which it can be promoted to, shouldn't
@@ -849,6 +915,13 @@ class PatternChecker(PatternVisitor[PatternType]):
 
 
 def get_match_arg_names(typ: TupleType) -> list[str | None]:
+    if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+        try:
+            result = _type_kernel.rust_get_match_arg_names(_serialize_type(typ))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     args: list[str | None] = []
     for item in typ.items:
         values = try_getting_str_literals_from_type(item)
@@ -872,6 +945,16 @@ def get_var(expr: Expression) -> Var:
 
 def get_type_range(typ: Type) -> TypeRange:
     typ = get_proper_type(typ)
+    if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+        try:
+            result = _type_kernel.rust_get_type_range(_serialize_type(typ))
+            if result is True:
+                # Rust says: the bool LKV should be unwrapped for the TypeRange.
+                return TypeRange(typ.last_known_value, is_upper_bound=False)
+            if result is False:
+                return TypeRange(typ, is_upper_bound=False)
+        except (AssertionError, NotImplementedError):
+            pass
     if (
         isinstance(typ, Instance)
         and typ.last_known_value
@@ -882,4 +965,11 @@ def get_type_range(typ: Type) -> TypeRange:
 
 
 def is_uninhabited(typ: Type) -> bool:
+    if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+        try:
+            result = _type_kernel.rust_is_uninhabited(_serialize_type(typ))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return isinstance(get_proper_type(typ), UninhabitedType)

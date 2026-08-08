@@ -5598,3 +5598,201 @@ class NativeMessagesSuite(Suite):
 
         t = DeletedType("var")
         self.assert_format_par(t)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckPatternSuite(Suite):
+    """Parity tests for the M22 checkpattern Rust helpers.
+
+    Each test serializes a Type via Type.write(WriteBuffer) and asserts
+    that the Rust helper agrees with the Python implementation. The suite
+    mirrors the standalone functions in mypy/checkpattern.py:
+
+    * rust_is_uninhabited vs isinstance(get_proper_type(t), UninhabitedType)
+    * rust_get_match_arg_names vs the Python get_match_arg_names
+    * rust_get_type_range vs the Python get_type_range bool-LKV unwrap logic
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._buf = _WriteBuffer()
+
+    def _bytes_of(self, t: Type) -> bytes:
+        self._buf = _WriteBuffer()
+        t.write(self._buf)
+        return self._buf.getvalue()
+
+    def test_is_uninhabited_true(self) -> None:
+        t = UninhabitedType()
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is True
+
+    def test_is_uninhabited_false(self) -> None:
+        t = self.fx.a
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+
+    def test_is_uninhabited_none_type(self) -> None:
+        t = NoneType()
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+
+    def test_is_uninhabited_union_with_uninhabited(self) -> None:
+        # Union containing UninhabitedType: get_proper_type keeps it in the
+        # union, but is_uninhabited checks the whole type, not items.
+        t = UnionType.make_union([self.fx.a, UninhabitedType()])
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+
+    def test_get_match_arg_names_all_str(self) -> None:
+        # TupleType with str-literal items -> list of str values.
+        t = TupleType([self.fx.lit_str1, self.fx.lit_str2], self.fx.std_tuple)
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        assert result == ["x", "y"]
+
+    def test_get_match_arg_names_mixed(self) -> None:
+        # TupleType with a non-str-literal item -> None in that position.
+        t = TupleType([self.fx.lit_str1, self.fx.a], self.fx.std_tuple)
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        assert result == ["x", None]
+
+    def test_get_match_arg_names_no_literals(self) -> None:
+        t = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        assert result == [None, None]
+
+    def test_get_match_arg_names_empty(self) -> None:
+        t = TupleType([], self.fx.std_tuple)
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        assert result == []
+
+    def test_get_type_range_bool_lkv(self) -> None:
+        # Instance with a bool last_known_value should return True (unwrap).
+        t = Instance(self.fx.bool_type_info, [], last_known_value=self.fx.lit_true)
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is True
+
+    def test_get_type_range_bool_lkv_false(self) -> None:
+        t = Instance(self.fx.bool_type_info, [], last_known_value=self.fx.lit_false)
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is True
+
+    def test_get_type_range_int_lkv(self) -> None:
+        # Instance with an int last_known_value should return False (no unwrap).
+        t = self.fx.lit1_inst
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is False
+
+    def test_get_type_range_no_lkv(self) -> None:
+        t = self.fx.a
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is False
+
+    def test_get_type_range_none_type(self) -> None:
+        t = NoneType()
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is False
+
+    def test_get_type_range_str_lkv(self) -> None:
+        # Instance with a str last_known_value should return False (not bool).
+        t = self.fx.lit_str1_inst
+        assert _type_kernel.rust_get_type_range(self._bytes_of(t)) is False
+
+    def test_should_self_match_int(self) -> None:
+        # int is in self_match_type_names, so should_self_match(int) = True.
+        from type_kernel import build_native_resolver
+
+        int_info = self.fx.make_type_info("builtins.int")
+        resolver = build_native_resolver([int_info, self.fx.oi], [])
+        int_type = Instance(int_info, [])
+        self_match_union = UnionType.make_union([int_type])
+        result = _type_kernel.rust_should_self_match(
+            self._bytes_of(int_type),
+            False,  # has_match_args
+            self._bytes_of(self_match_union),
+            resolver,
+        )
+        assert result is True
+
+    def test_should_self_match_custom_class(self) -> None:
+        # A custom class not in self_match_type_names -> False.
+        from type_kernel import build_native_resolver
+
+        resolver = build_native_resolver([self.fx.ai, self.fx.oi], [])
+        int_info = self.fx.make_type_info("builtins.int")
+        int_type = Instance(int_info, [])
+        self_match_union = UnionType.make_union([int_type])
+        result = _type_kernel.rust_should_self_match(
+            self._bytes_of(self.fx.a),
+            False,
+            self._bytes_of(self_match_union),
+            resolver,
+        )
+        assert result is False
+
+    def test_should_self_match_any(self) -> None:
+        # AnyType -> always False.
+        from type_kernel import build_native_resolver
+
+        int_info = self.fx.make_type_info("builtins.int")
+        resolver = build_native_resolver([int_info, self.fx.oi], [])
+        int_type = Instance(int_info, [])
+        self_match_union = UnionType.make_union([int_type])
+        any_t = AnyType(TypeOfAny.special_form)
+        result = _type_kernel.rust_should_self_match(
+            self._bytes_of(any_t),
+            False,
+            self._bytes_of(self_match_union),
+            resolver,
+        )
+        assert result is False
+
+    def test_can_match_sequence_object(self) -> None:
+        # object is more general than Sequence: is_subtype(Sequence, object)
+        # is True, so can_match_sequence(object) = True.
+        from type_kernel import build_native_resolver
+
+        seq_info = self.fx.make_type_info("typing.Sequence", mro=[self.fx.oi])
+        str_info = self.fx.make_type_info("builtins.str")
+        resolver = build_native_resolver(
+            [seq_info, str_info, self.fx.oi], []
+        )
+        non_seq_union = UnionType.make_union([Instance(str_info, [])])
+        seq_type = Instance(seq_info, [self.fx.a])
+        # object: is_subtype(str, object) is False (non_seq check passes),
+        # then is_subtype(object, Sequence) is False, but
+        # is_subtype(Sequence, object) is True -> can_match = True.
+        result = _type_kernel.rust_can_match_sequence(
+            self._bytes_of(self.fx.o),
+            self._bytes_of(non_seq_union),
+            self._bytes_of(seq_type),
+            resolver,
+        )
+        # Rust may defer (None) on generic subtype checks; when it does,
+        # the Python fallback handles it. Assert True when it decides.
+        assert result is None or result is True
+
+    def test_can_match_sequence_str(self) -> None:
+        # str is in non_sequence_match_types -> False.
+        from type_kernel import build_native_resolver
+
+        str_info = self.fx.make_type_info("builtins.str")
+        seq_info = self.fx.make_type_info("typing.Sequence", mro=[self.fx.oi])
+        resolver = build_native_resolver([str_info, seq_info, self.fx.oi], [])
+        str_type = Instance(str_info, [])
+        non_seq_union = UnionType.make_union([str_type])
+        seq_type = Instance(seq_info, [self.fx.a])
+        result = _type_kernel.rust_can_match_sequence(
+            self._bytes_of(str_type),
+            self._bytes_of(non_seq_union),
+            self._bytes_of(seq_type),
+            resolver,
+        )
+        assert result is False
+
+    def test_can_match_sequence_any(self) -> None:
+        # AnyType -> always True.
+        from type_kernel import build_native_resolver
+
+        str_info = self.fx.make_type_info("builtins.str")
+        seq_info = self.fx.make_type_info("typing.Sequence", mro=[self.fx.oi])
+        resolver = build_native_resolver([str_info, seq_info, self.fx.oi], [])
+        any_t = AnyType(TypeOfAny.special_form)
+        non_seq_union = UnionType.make_union([Instance(str_info, [])])
+        seq_type = Instance(seq_info, [self.fx.a])
+        result = _type_kernel.rust_can_match_sequence(
+            self._bytes_of(any_t),
+            self._bytes_of(non_seq_union),
+            self._bytes_of(seq_type),
+            resolver,
+        )
+        assert result is True
