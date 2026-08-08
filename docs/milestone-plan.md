@@ -183,7 +183,7 @@ M25 (check_call full)    ─── last, depends on M20+M23
 
 ## Sustaining 20%+ Rust
 
-Current: 1.716M Rust bytes / 7.636M total = 22.5%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
+Current: 1.716M Rust bytes / 7.612M total = 22.5%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
 
 | Milestone | New Rust LOC | Rust bytes added | Est. new % |
 |-----------|--------------|-------------------|------------|
@@ -198,7 +198,7 @@ Current: 1.716M Rust bytes / 7.636M total = 22.5%. Each milestone adds Rust LOC 
 1.907M Rust bytes (24.8%), but the issues that closed as umbrellas landed as
 self-contained helper subsets, not full module ports (strangler-fig — Python
 stays as the fallback behind each gate). Actual increment from the 20.4% start
-was ~217K bytes (~5.9K LOC), landing at 22.5% (1,716,197 / 7,636,211), not
+was ~217K bytes (~5.9K LOC), landing at 22.5% (1,716,197 / 7,612,001), not
 24.8%. This is still well past the 20% target.
 
 The 20% target is sustainable even without new milestones — the existing 41K Rust LOC is enough. New milestones extend it toward 24%.
