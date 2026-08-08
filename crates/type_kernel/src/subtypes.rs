@@ -331,7 +331,8 @@ fn visit_typeddict_subtype(
             is_closed,
             ..
         } => (items.as_slice(), required_keys, readonly_keys, *is_closed),
-        _ => return None,
+        // Any other right is not a subtype (subtypes.py:1095-1096).
+        _ => return Some(false),
     };
     // A closed type must remain closed (subtypes.py:1048-1049).
     if right_closed && !left_closed {
@@ -1344,7 +1345,9 @@ mod tests {
         };
         let t1 = mk_typeddict("ast_serialize.ParseError");
         let t2 = mk_typeddict("mypy.nodes.ParseError");
-        let r = make_resolver(vec![]);
+        // builtins.int snap needed for the invariant value-type check
+        // on the shared "code" item.
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
         assert_eq!(
             is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
             Some(true)
@@ -1368,7 +1371,10 @@ mod tests {
         };
         let t1 = mk_typeddict("mypy.ast_serialize.ParseError");
         let t2 = mk_typeddict("mypy.nodes.ParseError");
-        let r = make_resolver(vec![]);
+        let r = make_resolver(vec![
+            snap("builtins.str", "str"),
+            snap("builtins.int", "int"),
+        ]);
         assert_eq!(
             is_subtype(&t1, &t2, &ctx_strict_optional(true), &r),
             Some(true)
@@ -1399,10 +1405,12 @@ mod tests {
             is_subtype(&mk(false), &mk(true), &ctx_strict_optional(true), &r),
             Some(false)
         );
-        // required -> optional is OK (widening).
+        // required -> optional is NOT OK: right is mutable+optional, so
+        // delete-ability must be preserved (subtypes.py:1058-1059);
+        // left still requires the key.
         assert_eq!(
             is_subtype(&mk(true), &mk(false), &ctx_strict_optional(true), &r),
-            Some(true)
+            Some(false)
         );
     }
 
@@ -1417,7 +1425,7 @@ mod tests {
             readonly_keys: HashSet::new(),
             is_closed,
         };
-        let r = make_resolver(vec![]);
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
         assert_eq!(
             is_subtype(&mk(false), &mk(true), &ctx_strict_optional(true), &r),
             Some(false)
