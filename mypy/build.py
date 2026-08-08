@@ -1066,6 +1066,13 @@ class BuildManager:
         from mypy.messages import _set_native_suggestions_active
 
         _set_native_suggestions_active(self.options.native_type_kernel)
+        # M28: gate fine-grained dependency trigger computation. Ports
+        # get_type_triggers / TypeTriggersVisitor to Rust. The DependencyVisitor
+        # AST traversal stays in Python; only the hot per-type trigger
+        # collection is ported (the strangler-fig per-call gate).
+        from mypy.server.deps import _set_native_server_deps_active
+
+        _set_native_server_deps_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
