@@ -1028,6 +1028,12 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_visitor_active
 
         _set_native_semanal_visitor_active(self.options.native_type_kernel)
+        # M21: gate message formatting helpers (format_type, format_type_bare,
+        # format_type_distinctly, quote_type_string, etc.). Resolver installed
+        # in _build_native_resolvers.
+        from mypy.messages import _set_native_messages_active
+
+        _set_native_messages_active(self.options.native_type_kernel)
         # M4: gate the fixed-format cache meta read seam; raw bytes are
         # present only in build.py, so this is a module-level flag checked
         # by cache_load (the read() helpers stay pure-Python).
@@ -1284,6 +1290,10 @@ class BuildManager:
 
         _set_native_applytype_resolver(resolver)
         _set_native_applytype_typeinfo_map(typeinfo_map)
+        # M21: messages formatter shares the same resolver as typeops.
+        from mypy.messages import _set_native_messages_resolver
+
+        _set_native_messages_resolver(resolver)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.

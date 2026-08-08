@@ -371,6 +371,27 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(solve::rust_solve_dependent, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_constraints, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_quote_type_string, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_capitalize, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_pretty_seq, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_format_string_list, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_format_item_name_list,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_wrong_type_arg_count,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_strip_quotes, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_extract_type, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_variance_string, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_format_type, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_format_type_bare, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_format_type_distinctly,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
         module

@@ -107,6 +107,35 @@ from mypy.types import (
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.util import plural_s, unmangle
 
+try:
+    import type_kernel as _type_kernel
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _type_kernel = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_messages_active: bool = False
+_native_messages_resolver: Any = None
+
+
+def _set_native_messages_active(active: bool) -> None:
+    global _native_messages_active
+    _native_messages_active = active
+
+
+def _set_native_messages_resolver(resolver: Any) -> None:
+    global _native_messages_resolver
+    _native_messages_resolver = resolver
+
+
+def _serialize_type_for_messages(t: Type) -> bytes:
+    from librt.internal import WriteBuffer as _WriteBuffer
+
+    buf = _WriteBuffer()
+    t.write(buf)
+    return buf.getvalue()
+
 TYPES_FOR_UNIMPORTED_HINTS: Final = {
     "typing.Any",
     "typing.Callable",
@@ -2605,6 +2634,8 @@ class MessageBuilder:
 
 def quote_type_string(type_string: str) -> str:
     """Quotes a type representation for use in messages."""
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_quote_type_string(type_string)
     if (
         type_string in ["Module", "overloaded function", "<deleted>"]
         or type_string.startswith("Module ")
@@ -2981,6 +3012,23 @@ def format_type_bare(
     instead.  (The caller may want to use quote_type_string after
     processing has happened, to maintain consistent quoting in messages.)
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_messages_active
+        and _native_messages_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_format_type_bare(
+                _serialize_type_for_messages(typ),
+                _native_messages_resolver,
+                verbosity,
+                module_names,
+                options.use_star_unpack(),
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return format_type_inner(typ, verbosity, options, find_type_overlaps(typ), module_names)
 
 
@@ -2996,6 +3044,23 @@ def format_type_distinctly(*types: Type, options: Options, bare: bool = False) -
     be quoted; callers who need to do post-processing of the strings before
     quoting them (such as prepending * or **) should use this.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_messages_active
+        and _native_messages_resolver is not None
+    ):
+        try:
+            type_bytes_list = [_serialize_type_for_messages(t) for t in types]
+            result = _type_kernel.rust_format_type_distinctly(
+                type_bytes_list,
+                _native_messages_resolver,
+                bare,
+                options.use_star_unpack(),
+            )
+            if result is not None:
+                return tuple(result)
+        except (AssertionError, NotImplementedError):
+            pass
     overlapping = find_type_overlaps(*types)
 
     def format_single(arg: Type) -> str:
@@ -3172,6 +3237,8 @@ def get_first_arg(tp: CallableType) -> str | None:
 
 
 def variance_string(variance: int) -> str:
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_variance_string(variance)
     if variance == COVARIANT:
         return "covariant"
     elif variance == CONTRAVARIANT:
@@ -3284,6 +3351,8 @@ def get_bad_protocol_flags(
 
 def capitalize(s: str) -> str:
     """Capitalize the first character of a string."""
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_capitalize(s)
     if s == "":
         return ""
     else:
@@ -3295,12 +3364,16 @@ def extract_type(name: str) -> str:
     the type portion in quotes (e.g. "y"). Otherwise, return the string
     unmodified.
     """
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_extract_type(name)
     name = re.sub('^"[a-zA-Z0-9_]+" of ', "", name)
     return name
 
 
 def strip_quotes(s: str) -> str:
     """Strip a double quote at the beginning and end of the string, if any."""
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_strip_quotes(s)
     s = re.sub('^"', "", s)
     s = re.sub('"$', "", s)
     return s
@@ -3308,6 +3381,10 @@ def strip_quotes(s: str) -> str:
 
 def format_string_list(lst: list[str]) -> str:
     assert lst
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        result = _type_kernel.rust_format_string_list(lst)
+        if result is not None:
+            return result
     if len(lst) == 1:
         return lst[0]
     elif len(lst) <= 5:
@@ -3322,6 +3399,8 @@ def format_string_list(lst: list[str]) -> str:
 
 def format_item_name_list(s: Iterable[str]) -> str:
     lst = list(s)
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_format_item_name_list(lst)
     if len(lst) <= 5:
         return "(" + ", ".join([f'"{name}"' for name in lst]) + ")"
     else:
@@ -3343,6 +3422,8 @@ def for_function(callee: CallableType) -> str:
 
 
 def wrong_type_arg_count(low: int, high: int, act: str, name: str) -> str:
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_wrong_type_arg_count(low, high, act, name)
     if low == high:
         s = f"{low} type arguments"
         if low == 0:
@@ -3425,6 +3506,8 @@ def best_matches(current: str, options: Collection[str], n: int) -> list[str]:
 def pretty_seq(args: Sequence[str], conjunction: str) -> str:
     if _HAS_SUGGESTIONS_KERNEL and _native_suggestions_active:
         return _rust_pretty_seq(list(args), conjunction)
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        return _type_kernel.rust_pretty_seq(list(args), conjunction)
     quoted = ['"' + a + '"' for a in args]
     if len(quoted) == 1:
         return quoted[0]
@@ -3528,12 +3611,8 @@ def make_inferred_type_note(
 
 
 def format_key_list(keys: list[str], *, short: bool = False) -> str:
-    try:
-        import type_kernel as _type_kernel
-
+    if _HAS_TYPE_KERNEL and _native_messages_active:
         return _type_kernel.rust_format_key_list(keys, short)
-    except (ImportError, AttributeError):
-        pass
     formatted_keys = [f'"{key}"' for key in keys]
     td = "" if short else "TypedDict "
     if len(keys) == 0:

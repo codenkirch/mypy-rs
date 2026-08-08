@@ -5077,6 +5077,7 @@ class NativeTraverserSuite(Suite):
         assert rust_members == len(py_members)
 
 
+
 class NativeSuggestionsSuite(Suite):
     """Parity suite for M27: did-you-mean suggestion ranking and formatting.
 
@@ -5365,3 +5366,235 @@ class NativeStrFormatSuite(Suite):
             self._set_active(True)
             rs = self._parse_fmt(s, ctx, self._msg)
             assert_equal(rs, py, f"mismatch for {s!r}")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMessagesSuite(Suite):
+    """Parity tests for the Rust message formatting (M21).
+
+    Each test builds a NativeTypeResolver from the live Python TypeInfo
+    graph, serializes a `Type` via `Type.write(WriteBuffer)`, and asserts
+    that `rust_format_type_bare(bytes, resolver, ...)` matches the
+    pure-Python `format_type_bare(typ, options, ...)`. The corpus targets
+    the hot type-formatter output that appears in error messages.
+    """
+
+    def setUp(self) -> None:
+        from mypy.options import Options
+        from mypy.test.typefixture import TypeFixture as _TypeFixture
+
+        self.fx = _TypeFixture()
+        self.options = Options()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.gsi,
+            self.fx.gs2i,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def assert_format_par(self, t: Type, verbosity: int = 0) -> None:
+        from mypy.messages import format_type_bare
+
+        expected = format_type_bare(t, self.options, verbosity=verbosity)
+        actual = _type_kernel.rust_format_type_bare(
+            self._bytes_of(t), self.resolver, verbosity, False, True
+        )
+        self.assertIsNotNone(actual, f"rust format_type_bare({t!r}) returned None")
+        assert_equal(actual, expected, f"format_type_bare({t!r}) = {{}} ({{}} expected)")
+
+    def assert_format_quoted_par(self, t: Type) -> None:
+        from mypy.messages import format_type
+
+        expected = format_type(t, self.options)
+        actual = _type_kernel.rust_format_type(self._bytes_of(t), self.resolver, 0, False, True)
+        self.assertIsNotNone(actual, f"rust format_type({t!r}) returned None")
+        assert_equal(actual, expected, f"format_type({t!r}) = {{}} ({{}} expected)")
+
+    def test_pure_helpers(self) -> None:
+        # Pure string helpers, no resolver needed.
+        assert_equal(_type_kernel.rust_quote_type_string("int"), '"int"')
+        assert_equal(_type_kernel.rust_quote_type_string("Module"), "Module")
+        assert_equal(_type_kernel.rust_capitalize("hello"), "Hello")
+        assert_equal(_type_kernel.rust_capitalize(""), "")
+        assert_equal(
+            _type_kernel.rust_pretty_seq(["a", "b"], "or"),
+            '"a" or "b"',
+        )
+        assert_equal(
+            _type_kernel.rust_format_string_list(["a", "b", "c"]),
+            "a, b and c",
+        )
+        assert_equal(
+            _type_kernel.rust_format_item_name_list(["a", "b"]),
+            '("a", "b")',
+        )
+        assert_equal(
+            _type_kernel.rust_wrong_type_arg_count(1, 1, "0", "List"),
+            '"List" expects 1 type argument, but none given',
+        )
+        assert_equal(_type_kernel.rust_strip_quotes('"x"'), "x")
+        assert_equal(_type_kernel.rust_extract_type('"__getitem__" of list'), "list")
+        assert_equal(_type_kernel.rust_variance_string(1), "covariant")
+        assert_equal(_type_kernel.rust_variance_string(2), "contravariant")
+        assert_equal(_type_kernel.rust_variance_string(0), "invariant")
+
+    def test_any(self) -> None:
+        from mypy.messages import format_type_bare
+
+        t = AnyType(TypeOfAny.special_form)
+        self.assert_format_par(t)
+        self.assert_format_quoted_par(t)
+
+    def test_none(self) -> None:
+        self.assert_format_par(NoneType())
+        self.assert_format_quoted_par(NoneType())
+
+    def test_uninhabited(self) -> None:
+        self.assert_format_par(UninhabitedType())
+
+    def test_instance_singletons(self) -> None:
+        self.assert_format_par(self.fx.str_type)
+        self.assert_format_par(self.fx.function)
+        self.assert_format_par(self.fx.bool_type)
+        self.assert_format_par(self.fx.o)
+        self.assert_format_par(self.fx.a)
+        self.assert_format_par(self.fx.b)
+        self.assert_format_par(self.fx.o)
+
+    def test_instance_generic(self) -> None:
+        self.assert_format_par(self.fx.ga)
+        self.assert_format_par(self.fx.gb)
+        self.assert_format_par(self.fx.gt)
+        self.assert_format_par(self.fx.lsta)
+        self.assert_format_par(self.fx.lstb)
+
+    def test_instance_tuple(self) -> None:
+        self.assert_format_par(self.fx.std_tuple)
+
+    def test_literal_int(self) -> None:
+        self.assert_format_par(self.fx.lit1)
+        self.assert_format_par(self.fx.lit2)
+        self.assert_format_par(self.fx.lit4)
+
+    def test_literal_str(self) -> None:
+        self.assert_format_par(self.fx.lit_str1)
+        self.assert_format_par(self.fx.lit_str2)
+        self.assert_format_par(self.fx.lit_str3)
+
+    def test_literal_bool(self) -> None:
+        self.assert_format_par(self.fx.lit_false)
+        self.assert_format_par(self.fx.lit_true)
+
+    def test_type_type(self) -> None:
+        self.assert_format_par(self.fx.type_a)
+        self.assert_format_par(self.fx.type_b)
+        self.assert_format_par(self.fx.type_any)
+
+    def test_union_none(self) -> None:
+        # Optional[T]: should format as `T | None`.
+        u = UnionType.make_union([self.fx.a, NoneType()])
+        self.assert_format_par(u)
+        self.assert_format_quoted_par(u)
+
+    def test_union_multi(self) -> None:
+        u = UnionType.make_union([self.fx.a, self.fx.b, self.fx.o])
+        self.assert_format_par(u)
+
+    def test_union_literals(self) -> None:
+        # Coalesced Literal[1, 2] | None.
+        u = UnionType.make_union([self.fx.lit1, self.fx.lit2, NoneType()])
+        self.assert_format_par(u)
+
+    def test_callable_simple(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+        )
+        self.assert_format_par(c)
+
+    def test_callable_named(self) -> None:
+        # Named-arg callables use pretty_callable, which needs FuncDef
+        # data not present in the wire format, so the Rust path defers
+        # (returns None) and Python formats instead.
+        c = CallableType(
+            [self.fx.a],
+            [ARG_NAMED],
+            ["x"],
+            self.fx.o,
+            self.fx.function,
+        )
+        actual = _type_kernel.rust_format_type_bare(
+            self._bytes_of(c), self.resolver, 0, False, True
+        )
+        self.assertIsNone(actual, "named-arg callable should defer to Python")
+
+    def test_ellipsis_callable(self) -> None:
+        c = CallableType(
+            [],
+            [],
+            [],
+            self.fx.o,
+            self.fx.function,
+            is_ellipsis_args=True,
+        )
+        self.assert_format_par(c)
+
+    def test_tuple_type(self) -> None:
+        t = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        self.assert_format_par(t)
+
+    def test_type_var(self) -> None:
+        self.assert_format_par(self.fx.t)
+        self.assert_format_par(self.fx.tf)
+
+    def test_unpack(self) -> None:
+        u = UnpackType(self.fx.a)
+        self.assert_format_par(u)
+
+    def test_typeddict_anonymous(self) -> None:
+        from mypy.types import TypedDictType
+
+        # Create a TypeInfo for typing._TypedDict so the anonymity check
+        # treats the fallback as anonymous.
+        fb_ti = self.fx.make_type_info("typing._TypedDict")
+        fb = Instance(fb_ti, [])
+        t = TypedDictType(
+            {"x": self.fx.a, "y": self.fx.b},
+            {"x"},
+            set(),
+            fb,
+        )
+        self.assert_format_par(t)
+
+    def test_deleted_type(self) -> None:
+        from mypy.types import DeletedType
+
+        t = DeletedType("var")
+        self.assert_format_par(t)
