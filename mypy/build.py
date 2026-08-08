@@ -1327,6 +1327,36 @@ class BuildManager:
         _set_native_checkexpr_resolver(resolver)
         _set_native_checkmember_resolver(resolver)
 
+    def _clear_native_resolvers(self) -> None:
+        """Clear all native resolver globals so the kernel defers to Python.
+
+        Called before daemon semantic analysis on fine-grained recheck so that
+        the stale per-build resolver snapshot is purged.  Mirrors the inline
+        clear block at ``process_stale_scc`` (lines 5193-5216).
+        """
+        if not self.options.native_type_kernel:
+            return
+        from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
+        from mypy.mro import _set_native_mro_resolver
+        from mypy.subtypes import _set_native_subtype_resolver
+
+        _set_native_subtype_resolver(None)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+        _set_native_mro_resolver(None, None)
+        from mypy.solve import _set_native_solve_resolver
+
+        _set_native_solve_resolver(None)
+        from mypy.constraints import _set_native_constraints_resolver
+
+        _set_native_constraints_resolver(None)
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        _set_native_checkexpr_resolver(None)
+        from mypy.checkmember import _set_native_checkmember_resolver
+
+        _set_native_checkmember_resolver(None)
+
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
 
