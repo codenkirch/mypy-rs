@@ -12,6 +12,7 @@
 use pyo3::prelude::*;
 
 use crate::operators::is_operator_method_name;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -493,9 +494,8 @@ fn is_duplicate_mapping_inner(
         }
     }
     // Exceptions where duplicates are allowed: every mapped actual is a
-    // `**kwargs` that is NOT a TypedDict (cannot be matched with certainty),
-    // so `all(mapped actual is a non-TypedDict **kwargs)` disables the
-    // duplicate check.
+    // non-TypedDict `**kwargs` (cannot be matched with certainty), so
+    // `all(mapped actual is a non-TypedDict **kwargs)` disables the check.
     let mut all_non_typeddict_star2 = true;
     for (i, &idx) in mapping.iter().enumerate() {
         let kind = *actual_kinds.get(idx as usize)?;
@@ -943,6 +943,119 @@ fn all_children(typ: &Type) -> Vec<&Type> {
         out.extend(p.arg_types.iter());
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// method_fullname
+// ---------------------------------------------------------------------------
+
+/// Mirror of `mypy.checkexpr.ExpressionChecker.method_fullname`
+/// (checkexpr.py:861-899). Resolves `method_name` to a fully qualified
+/// name (`type_name.method_name`) for the type the method is invoked on.
+/// Returns None (defer) when the name cannot be determined.
+///
+/// Mirrors the Python isinstance chain one level deep: the outer type is
+/// `get_proper_type`-expanded (TypeAliasType defers) and unwrapped once
+/// for CallableType type objects and TypeType, then the flat chain checks
+/// Instance / TypedDictType / LiteralType / TupleType. Anything else
+/// (including a CallableType or TypeType nested in a type wrapper that
+/// Python doesn't reach) defers.
+fn method_fullname_inner(typ: &Type, method_name: &str, resolver: &TypeResolver) -> Option<String> {
+    let proper = get_proper_or_none(typ)?; // TypeAliasType defers
+    let unwrapped: &Type = match proper {
+        Type::CallableType {
+            fallback,
+            ret_type,
+            instance_type,
+            from_concatenate,
+            ..
+        } if is_type_obj(fallback, *from_concatenate) => {
+            // `CallableType.is_type_obj` also rejects a callable whose
+            // proper return type is UninhabitedType; deferring is safe.
+            if matches!(ret_type.as_ref(), Type::UninhabitedType { .. }) {
+                return None;
+            }
+            // `get_instance_type()`: the explicit instance type, else the
+            // proper return type.
+            match instance_type {
+                Some(t) => t.as_ref(),
+                None => ret_type.as_ref(),
+            }
+        }
+        Type::TypeType { item, .. } => item.as_ref(),
+        other => other,
+    };
+    match unwrapped {
+        Type::Instance { type_ref, .. } => Some(format!("{type_ref}.{method_name}")),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            // `tuple_fallback()`: named tuples return the partial fallback
+            // directly; plain tuples rebuild from the fallback's type info.
+            // Only the variadic-unpack path raises, so defer when it exists.
+            let Type::Instance { type_ref, .. } = partial_fallback.as_ref() else {
+                return None;
+            };
+            if type_ref == "builtins.tuple"
+                && items.iter().any(|it| matches!(it, Type::UnpackType { .. }))
+            {
+                return None;
+            }
+            Some(format!("{type_ref}.{method_name}"))
+        }
+        Type::TypedDictType { fallback, .. } | Type::LiteralType { fallback, .. } => {
+            containing_type_info(resolver, fallback, method_name)
+        }
+        _ => None,
+    }
+}
+
+/// `TypeInfo.get_containing_type_info` (nodes.py:3953) for the wire
+/// format: walk the fallback's MRO and return the first class whose
+/// `names` table defines `method_name`, as a fully qualified method name.
+/// A missing snapshot for the fallback or any MRO base defers (None) so
+/// the Python side re-runs the real TypeInfo graph.
+fn containing_type_info(
+    resolver: &TypeResolver,
+    fallback: &Type,
+    method_name: &str,
+) -> Option<String> {
+    let Type::Instance { type_ref, .. } = fallback else {
+        return None;
+    };
+    let start = resolver.get(type_ref)?;
+    for base in &start.mro {
+        let snap = resolver.get(base)?;
+        if snap.member_info.contains_key(method_name) {
+            return Some(format!("{}.{}", snap.fullname, method_name));
+        }
+    }
+    None
+}
+
+/// `mypy.checkexpr.ExpressionChecker.method_fullname` (M25). The caller
+/// serializes the (already proper) object type and the method name; the
+/// kernel resolves the qualified name against the shared type-info
+/// snapshot. Deferral (None) is the strangler-fig escape hatch: the
+/// Python side recomputes via the real TypeInfo graph.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_method_fullname(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+    method_name: &str,
+) -> PyResult<Option<String>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(method_fullname_inner(
+        &typ,
+        method_name,
+        resolver.resolver(),
+    ))
 }
 
 #[cfg(test)]
@@ -1451,5 +1564,236 @@ mod tests {
         let kinds = vec![ARG_POS];
         let types = vec![make_instance("int", vec![])];
         assert_eq!(is_duplicate_mapping_inner(&[0, 5], &types, &kinds), None);
+    }
+
+    // -- method_fullname --
+
+    fn make_type_obj(instance: Type) -> Type {
+        // A class object callable: fallback is `builtins.type` (metaclass),
+        // ret_type is the constructed instance.
+        Type::CallableType {
+            fallback: Box::new(make_instance("builtins.type", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(instance),
+            name: Some("A".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn make_typet(item: Type) -> Type {
+        Type::TypeType {
+            item: Box::new(item),
+            is_type_form: false,
+        }
+    }
+
+    fn make_tuple(partial_fallback: Type, items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(partial_fallback),
+            items,
+            implicit: false,
+        }
+    }
+
+    fn empty_resolver() -> TypeResolver {
+        TypeResolver::new()
+    }
+
+    fn containing_resolver() -> TypeResolver {
+        // A -> (B defines "foo"), C -> B; "foo" sits on B.
+        let mut r = TypeResolver::new();
+        let mut b = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.B".to_string(),
+            name: "B".to_string(),
+            ..Default::default()
+        };
+        b.mro.push("mod.B".to_string());
+        b.member_info.insert("foo".to_string(), (false, true));
+        r.insert("mod.B".to_string(), b);
+        let mut c = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.C".to_string(),
+            name: "C".to_string(),
+            ..Default::default()
+        };
+        c.mro.push("mod.C".to_string());
+        c.mro.push("mod.B".to_string());
+        r.insert("mod.C".to_string(), c);
+        r
+    }
+
+    #[test]
+    fn test_method_fullname_instance() {
+        let t = make_instance("mod.A", vec![]);
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("mod.A.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_type_obj_unwraps_instance() {
+        let t = make_type_obj(make_instance("mod.A", vec![]));
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("mod.A.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_type_obj_with_explicit_instance_type() {
+        // instance_type takes precedence over ret_type.
+        let mut t = make_type_obj(make_instance("mod.Ret", vec![]));
+        let Type::CallableType { instance_type, .. } = &mut t else {
+            unreachable!();
+        };
+        *instance_type = Some(Box::new(make_instance("mod.Inst", vec![])));
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("mod.Inst.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_type_obj_uninhabited_ret_defers() {
+        let t = make_type_obj(Type::UninhabitedType { ambiguous: false });
+        assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_method_fullname_callable_non_type_obj_defers() {
+        // Plain callable (fallback is function, not a metaclass): defers.
+        let t = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(make_instance("builtins.int", vec![])),
+            name: Some("f".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_method_fullname_type_type_unwraps_item() {
+        let t = make_typet(make_instance("mod.A", vec![]));
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("mod.A.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_tuple_plain() {
+        let t = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![make_instance("int", vec![])],
+        );
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("builtins.tuple.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_tuple_named() {
+        // Named tuples return partial_fallback directly (non-tuple info).
+        let t = make_tuple(make_instance("collections.NamedTuple", vec![]), vec![]);
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &empty_resolver()),
+            Some("collections.NamedTuple.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_tuple_with_unpack_defers() {
+        // tuple_fallback raises NotImplementedError for unpacked items.
+        let t = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![Type::UnpackType {
+                typ: Box::new(make_instance("builtins.tuple", vec![])),
+            }],
+        );
+        assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_method_fullname_typeddict_containing() {
+        let r = containing_resolver();
+        let t = Type::TypedDictType {
+            fallback: Box::new(make_instance("mod.C", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &r),
+            Some("mod.B.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_literal_fallback_containing() {
+        let r = containing_resolver();
+        let t = Type::LiteralType {
+            fallback: Box::new(make_instance("mod.C", vec![])),
+            value: LiteralValue::Int(1),
+        };
+        assert_eq!(
+            method_fullname_inner(&t, "foo", &r),
+            Some("mod.B.foo".to_string())
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        assert_eq!(
+            method_fullname_inner(&alias, "foo", &empty_resolver()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_method_fullname_missing_containing_defers() {
+        // Fallback info not in the resolver: defer to Python.
+        let t = Type::TypedDictType {
+            fallback: Box::new(make_instance("mod.Nope", vec![])),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        };
+        assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_method_fullname_union_defers() {
+        let t = make_union(vec![make_instance("mod.A", vec![])]);
+        assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
     }
 }

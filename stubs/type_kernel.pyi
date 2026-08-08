@@ -116,6 +116,7 @@ __all__ = [
     "rust_is_string_literal",
     "rust_is_untyped_decorator",
     "rust_is_typeddict_type_context",
+    "rust_method_fullname",
     "rust_format_messages_default",
     "rust_infer_constraints",
     "rust_infer_constraints_full",
@@ -371,6 +372,9 @@ def rust_try_getting_literal(type_bytes: bytes) -> bytes | None: ...
 def rust_is_string_literal(type_bytes: bytes) -> bool | None: ...
 def rust_is_untyped_decorator(type_bytes: bytes) -> bool | None: ...
 def rust_is_typeddict_type_context(type_bytes: bytes) -> bool | None: ...
+def rust_method_fullname(
+    resolver: NativeTypeResolver, type_bytes: bytes, method_name: str
+) -> str | None: ...
 def rust_format_messages_default(
     error_tuples: list[tuple[str | None, int, int, int, int, str, str, str | None]],
     show_column_numbers: bool,

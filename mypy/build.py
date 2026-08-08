@@ -1012,9 +1012,10 @@ class BuildManager:
             _set_native_checker_active,
             _set_native_checker_types_active,
         )
-        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
+        _set_native_checkexpr_resolver(None)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
         # M20: gate checkmember bind_self_fast (trivial-self binding),
@@ -1320,8 +1321,10 @@ class BuildManager:
         # M20: checkmember operator helpers (has_operator, meta_has_operator,
         # defined_in_superclass) resolve member metadata through the same
         # snapshot as everything else.
+        from mypy.checkexpr import _set_native_checkexpr_resolver
         from mypy.checkmember import _set_native_checkmember_resolver
 
+        _set_native_checkexpr_resolver(resolver)
         _set_native_checkmember_resolver(resolver)
 
     def _build_plugin_hook_registry(self) -> None:
@@ -5202,6 +5205,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.constraints import _set_native_constraints_resolver
 
         _set_native_constraints_resolver(None)
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        _set_native_checkexpr_resolver(None)
         from mypy.checkmember import _set_native_checkmember_resolver
 
         _set_native_checkmember_resolver(None)
