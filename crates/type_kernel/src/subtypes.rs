@@ -84,6 +84,12 @@ pub(crate) fn is_subtype(
     // doesn't produce in this recursive path). The Python shim handles
     // this at the top-level entry, but recursive calls from
     // check_type_parameter bypass the shim, so we must mirror it here.
+    if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
+        // Python expands both operands with get_proper_type before every
+        // comparison (subtypes.py:346-347); recursive check_type_parameter
+        // and callable-compat paths bypass that, so defer unexpanded aliases.
+        return None;
+    }
     if !ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
         return Some(true);
     }
@@ -334,6 +340,10 @@ fn visit_typeddict_subtype(
         // Any other right is not a subtype (subtypes.py:1095-1096).
         _ => return Some(false),
     };
+    // Equal types are always subtypes (subtypes.py:1044-1045 fast path).
+    if left == right {
+        return Some(true);
+    }
     // A closed type must remain closed (subtypes.py:1048-1049).
     if right_closed && !left_closed {
         return Some(false);
