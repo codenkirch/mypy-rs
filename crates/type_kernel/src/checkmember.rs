@@ -26,7 +26,9 @@
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{read_type, ReadBuffer, Type};
+#[cfg(test)]
+use crate::wire::{write_type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -35,9 +37,11 @@ use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 /// `ArgKind.ARG_POS` = 0.
 #[cfg(test)]
 const ARG_POS: i64 = 0;
-/// `ArgKind.ARG_STAR` = 2.
+/// `ArgKind.ARG_STAR` = 2. Only used by the bind_self_fast unit tests.
+#[cfg(test)]
 const ARG_STAR: i64 = 2;
-/// `ArgKind.ARG_STAR2` = 4.
+/// `ArgKind.ARG_STAR2` = 4. Only used by the bind_self_fast unit tests.
+#[cfg(test)]
 const ARG_STAR2: i64 = 4;
 
 /// Dispatch codes for `classify_member_access`. Mirror the `isinstance`
@@ -65,6 +69,7 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
     read_type(&mut buf, None).ok()
 }
 
+#[cfg(test)]
 fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     let mut wbuf = WriteBuffer::new();
     write_type(&mut wbuf, typ).ok()?;
@@ -130,17 +135,17 @@ fn is_type_obj(fallback: &Type, ret_type: &Type, resolver: &TypeResolver) -> boo
 /// type variables (that's `bind_self` in typeops.py).
 #[pyfunction]
 pub(crate) fn rust_bind_self_fast(method_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
-    let typ = match decode_type(method_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    let result = bind_self_fast_inner(&typ)?;
-    match result {
-        Some(r) => Ok(encode_type(&r)),
-        None => Ok(None),
-    }
+    // Deferred: the wire-format round-trip drops the `definition` back-reference
+    // (FuncDef) and other Python-side attributes that CallableType carries.
+    // These are used by error-message formatting, overload ordering, and the
+    // override-comparison path. Returning None lets Python's bind_self_fast
+    // (which uses copy_modified, preserving all attributes) handle the call.
+    // The classify_member_access function below is still active.
+    let _ = method_bytes;
+    Ok(None)
 }
 
+#[cfg(test)]
 fn bind_self_fast_inner(typ: &Type) -> PyResult<Option<Type>> {
     match typ {
         Type::Overloaded { items } => {
