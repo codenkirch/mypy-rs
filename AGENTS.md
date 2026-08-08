@@ -233,8 +233,9 @@ self-check (0 errors). Three parity fixes were applied:
 ### Type kernel build order
 
 The type kernel (`Options.native_type_kernel`, default off — opt-in) is
-backed by the `type_kernel` Rust extension. It implements two PyO3
-functions that walk live Python `Type` objects:
+backed by the `type_kernel` Rust extension. It implements Rust ports of
+the kernel's hot-path functions that walk live Python `Type` objects,
+including:
 
 - `erase_type` (Stage 1) — mirrors `mypy.erasetype.EraseTypeVisitor`.
 - `remove_instance_last_known_values` (Stage 2) — mirrors
@@ -244,6 +245,12 @@ functions that walk live Python `Type` objects:
   `str(t)`. Not wired into any production path; used by
   `NativeTypeWireSuite` to prove the Rust `Type` enum + reader
   reconstructs the same type. Foundation for Stage 3c (`is_subtype`).
+- `get_type_triggers` (M28) — mirrors
+  `mypy.server.deps.TypeTriggersVisitor` in `crates/type_kernel/src/
+  serverdeps.rs`; the `DependencyVisitor` AST walk stays in Python.
+  Gated via `_set_native_server_deps_active` (wired from
+  `mypy/server/deps.py` by `mypy/build.py`) and covered by
+  `NativeServerDepsSuite` in `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

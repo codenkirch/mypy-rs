@@ -93,9 +93,11 @@ message builder, and named_type.
 **Current state:** PARTIAL — `checkmember.rs` is 927 lines (PR #325). The
 `bind_self_fast` decision gate is live (pure helper, no checker state) and four
 operator helpers (`has_operator`, `meta_has_operator`, `instance_fallback`,
-`defined_in_superclass`) are ported behind the resolver. `analyze_member_access`
-itself is NOT ported — it is the highest-value remaining port and the
-second-hottest dispatch in the type checker.
+`defined_in_superclass`) are ported behind the resolver. The method-path fast
+path (`analyze_instance_member_access`, `MethodFullname` lookup) is ported
+behind the resolver via PR #332. The general `analyze_member_access` /
+`analyze_typevar_member_access` port remains open — it is the highest-value
+remaining port and the second-hottest dispatch in the type checker.
 **Risk:** High — `analyze_member_access` is called from `check_call` (Instance branch), `checkexpr`, and `checkmember` itself. It mutates the AST (`store_type`) and interacts with the plugin (`get_method_hook`).
 **Steps:**
 1. Port `analyze_member_access` as a Rust resolver (returns the result type + side-effect descriptor, Python applies mutations)
@@ -154,7 +156,8 @@ testcheck 8151/0, testtypes 313/0, testinfer 106/0.
 
 ### M25: Stage 4 Full Port — `check_call` / `check_callable_call`
 **Goal:** Full port of `check_call` arg-binding and type-var inference.
-**Current state:** Plugin-hook snapshot shipped (PR #291). `checkcall.rs` has classifier logic (524 lines). Full port not started.
+**Current state:** Plugin-hook snapshot shipped (PR #291). `checkcall.rs` has classifier logic (524 lines). The `method_fullname` helper is ported behind the resolver via PR #333. Full `check_call` port not started.
+**Numbering note:** Issue #330 carries the "M25 method_fullname" title, distinct from the original M25 `check_call` plan below.
 **Risk:** High — see "Stage 4 Design Spike" in `docs/rust-migration-strangler.md` (7 open questions).
 **Steps:**
 1. Resolve open question 1 (defer-mutation boundary)
@@ -183,7 +186,7 @@ M25 (check_call full)    ─── last, depends on M20+M23
 
 ## Sustaining 20%+ Rust
 
-Current: 1.716M Rust bytes / 7.612M total = 22.5%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
+Current: 1.731M Rust bytes / 7.647M total = 22.64%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
 
 | Milestone | New Rust LOC | Rust bytes added | Est. new % |
 |-----------|--------------|-------------------|------------|
@@ -198,7 +201,8 @@ Current: 1.716M Rust bytes / 7.612M total = 22.5%. Each milestone adds Rust LOC 
 1.907M Rust bytes (24.8%), but the issues that closed as umbrellas landed as
 self-contained helper subsets, not full module ports (strangler-fig — Python
 stays as the fallback behind each gate). Actual increment from the 20.4% start
-was ~217K bytes (~5.9K LOC), landing at 22.5% (1,716,197 / 7,612,001), not
+was ~217K bytes (~5.9K LOC) for the original milestones, plus the M20/M25 method
+path ports (PR #332, PR #333), landing at 22.64% (1,731,579 / 7,647,253), not
 24.8%. This is still well past the 20% target.
 
 The 20% target is sustainable even without new milestones — the existing 41K Rust LOC is enough. New milestones extend it toward 24%.

@@ -312,9 +312,13 @@ Computes fine-grained dependency records for incremental mode.
 
 **Python target:** `mypy/server/deps.py`
 
-**Current Rust:** None.
+**Current Rust:** `get_type_triggers` landed (PR #318): ports
+`TypeTriggersVisitor` as `rust_get_type_triggers` in
+`crates/type_kernel/src/serverdeps.rs`, falling back to the Python
+visitor. The `DependencyVisitor` AST walk stays in Python (too coupled
+to the live object graph to port).
 
-**Rust work:** Port `DependencyVisitor`, `get_dependencies`,
+**Rust work (remaining):** Port `DependencyVisitor`, `get_dependencies`,
 `get_fine_grained_deps`. The dependency-records extraction
 (`BuildManager.all_imported_modules_in_file`) is already ported via
 module_resolver; this is the broader visitor.
@@ -342,7 +346,7 @@ module_resolver; this is the broader visitor.
 | #303 | M25 check_call full | 2,500 | 92,500 | High | M20 | open |
 | #304 | M26 traverser | 800 | 29,600 | Low | None | open |
 | #305 | M27 suggestions | 900 | 33,300 | Low | None | open |
-| #306 | M28 server/deps | 1,000 | 37,000 | Medium | None | open |
+| #306 | M28 server/deps | 455 landed | ~15K landed | Medium | None | DONE (PR #318) |
 | **Total (projected)** | | **11,000** | **407,000** | | | |
 
 ## Percentage Estimate After All Milestones
