@@ -59,11 +59,9 @@ from mypy.types import (
 from mypy.typevars import fill_typevars, fill_typevars_with_any
 from mypy.visitor import PatternVisitor
 
-# M22 type-kernel seam: when the `type_kernel` Rust extension is importable
-# and `Options.native_type_kernel` is set, standalone helpers from this
-# module route through Rust. Rust returns None for any case it does not
-# handle, so Python falls back to the pure-Python path (strangler-fig
-# per-call gate).
+# M22 type-kernel seam: with `type_kernel` importable and
+# `Options.native_type_kernel` set, standalone helpers route through Rust;
+# Rust returns None for unhandled cases so Python falls back (strangler-fig).
 try:
     import type_kernel as _type_kernel
     from librt.internal import WriteBuffer as _WriteBuffer
@@ -89,6 +87,18 @@ def _serialize_type(t: Type) -> bytes:
     t.write(buf)
     return buf.getvalue()
 
+
+def _deserialize_type_list(result: list[bytes] | list[list[int]]) -> list[Type] | None:
+    from mypy.typeops import _deserialize_type
+
+    out: list[Type] = []
+    for b in result:
+        t = _deserialize_type(b)
+        if t is None:
+            return None
+        out.append(t)
+    return out
+
 self_match_type_names: Final = [
     "builtins.bool",
     "builtins.bytearray",
@@ -106,9 +116,9 @@ self_match_type_names: Final = [
 non_sequence_match_type_names: Final = ["builtins.str", "builtins.bytes", "builtins.bytearray"]
 
 
-# For every Pattern a PatternType can be calculated. This requires recursively calculating
+# For every Pattern a PatternType can be calculated, by recursively calculating
 # the PatternTypes of the sub-patterns first.
-# Using the data in the PatternType the match subject and captured names can be narrowed/inferred.
+# Using the PatternType data the match subject and captures can be narrowed.
 class PatternType(NamedTuple):
     type: Type  # The type the match subject can be narrowed to
     rest_type: Type  # The remaining type if the pattern didn't match
@@ -134,7 +144,7 @@ class PatternChecker(PatternVisitor[PatternType]):
     subject_type: Type
     # Type of the subject to check the (sub)pattern against
     type_context: list[Type]
-    # Types that match against self instead of their __match_args__ if used as a class pattern
+    # Types matching self instead of __match_args__ when used as a class pattern
     # Filled in from self_match_type_names
     self_match_types: list[Type]
     # Types that are sequences, but don't match sequence patterns. Filled in from
@@ -443,6 +453,24 @@ class PatternChecker(PatternVisitor[PatternType]):
 
         If star_pos in None the types are returned unchanged.
         """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    result = _type_kernel.rust_contract_starred_pattern_types(
+                        [_serialize_type(t) for t in types],
+                        star_pos,
+                        num_patterns,
+                        resolver,
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_list([bytes(b) for b in result])
+                        if decoded is not None:
+                            return decoded
+                except (AssertionError, NotImplementedError):
+                    pass
         unpack_index = find_unpack_in_list(types)
         if unpack_index is not None:
             # Variadic tuples require "re-shaping" to match the requested pattern.
@@ -488,6 +516,20 @@ class PatternChecker(PatternVisitor[PatternType]):
         For example if the sequence pattern is [a, *b, c] and types [bool, int, str] are extended
         to length 4 the result is [bool, int, int, str].
         """
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            try:
+                result = _type_kernel.rust_expand_starred_pattern_types(
+                    [_serialize_type(t) for t in types],
+                    star_pos,
+                    num_types,
+                    original_unpack,
+                )
+                if result is not None:
+                    decoded = _deserialize_type_list([bytes(b) for b in result])
+                    if decoded is not None:
+                        return decoded
+            except (AssertionError, NotImplementedError):
+                pass
         if star_pos is None:
             return types
         if original_unpack:
@@ -862,8 +904,8 @@ class PatternChecker(PatternVisitor[PatternType]):
     def update_type_map(
         self, original_type_map: dict[Expression, Type], extra_type_map: dict[Expression, Type]
     ) -> None:
-        # Calculating this would not be needed if TypeMap directly used literal hashes instead of
-        # expressions, as suggested in the TODO above it's definition
+        # Unneeded if TypeMap used literal hashes instead of expressions, as
+        # noted in the TODO above its definition
         already_captured = {literal_hash(expr) for expr in original_type_map}
         for expr, typ in extra_type_map.items():
             if literal_hash(expr) in already_captured:
@@ -887,6 +929,26 @@ class PatternChecker(PatternVisitor[PatternType]):
         or class T(Sequence[Tuple[T, T]]), there is no way any of those can map to Sequence[str].
         """
         proper_type = get_proper_type(outer_type)
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active and isinstance(proper_type, Instance):
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                sequence = self.chk.named_generic_type("typing.Sequence", [inner_type])
+                empty_type = fill_typevars(proper_type.type)
+                try:
+                    result = _type_kernel.rust_construct_sequence_child(
+                        _serialize_type(outer_type),
+                        _serialize_type(empty_type),
+                        _serialize_type(sequence),
+                        resolver,
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_list([bytes(result)])
+                        if decoded is not None:
+                            return decoded[0]
+                except (AssertionError, NotImplementedError):
+                    pass
         if isinstance(proper_type, TypeVarType):
             new_bound = self.construct_sequence_child(proper_type.upper_bound, inner_type)
             return proper_type.copy_modified(upper_bound=new_bound)
