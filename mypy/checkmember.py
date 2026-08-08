@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from mypy import message_registry, state
 from mypy.checker_shared import TypeCheckerSharedApi
@@ -93,6 +93,10 @@ try:
     )
     from type_kernel import (
         rust_bind_self_fast as _rust_bind_self_fast,
+        rust_instance_fallback as _rust_instance_fallback,
+        rust_has_operator as _rust_has_operator,
+        rust_meta_has_operator as _rust_meta_has_operator,
+        rust_defined_in_superclass as _rust_defined_in_superclass,
     )
 
     from mypy.types import read_type as _checkmember_read_type
@@ -100,6 +104,10 @@ try:
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_bind_self_fast = None  # type: ignore[assignment]
+    _rust_instance_fallback = None  # type: ignore[assignment]
+    _rust_has_operator = None  # type: ignore[assignment]
+    _rust_meta_has_operator = None  # type: ignore[assignment]
+    _rust_defined_in_superclass = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
     _checkmember_read_type = None  # type: ignore[assignment]
@@ -112,6 +120,15 @@ def _set_native_checkmember_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_checkmember_active
     _native_checkmember_active = active
+
+
+_native_checkmember_resolver: Any = None
+
+
+def _set_native_checkmember_resolver(resolver: Any) -> None:
+    """Install/clear the NativeTypeResolver shared with the checkmember kernel."""
+    global _native_checkmember_resolver
+    _native_checkmember_resolver = resolver
 
 
 def _serialize_type_for_checkmember(t: Type) -> bytes:
@@ -1563,12 +1580,25 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
             decoded = _deserialize_type_for_checkmember(bytes(result))
             if decoded is not None:
                 if isinstance(method, CallableType) and isinstance(decoded, CallableType):
-                    decoded.definition = method.definition
+                    if not method.arg_types or method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
+                        return method
+                    return cast(
+                        F,
+                        method.copy_modified(
+                            arg_types=method.arg_types[1:],
+                            arg_kinds=method.arg_kinds[1:],
+                            arg_names=method.arg_names[1:],
+                            is_bound=True,
+                        ),
+                    )
                 elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):
-                    for orig, dec in zip(method.items, decoded.items):
-                        if isinstance(orig, CallableType) and isinstance(dec, CallableType):
-                            dec.definition = orig.definition
-                return cast(F, decoded)
+                    if not method.items:
+                        return method
+                    items: list[F] = []
+                    for c in method.items:
+                        bound = bind_self_fast(c, original_type)
+                        items.append(bound)
+                    return cast(F, Overloaded(items))
     if isinstance(method, Overloaded):
         items = [bind_self_fast(c, original_type) for c in method.items]
         return cast(F, Overloaded(items))
@@ -1601,6 +1631,22 @@ def has_operator(typ: Type, op_method: str) -> bool:
     # e.g. for __OP__ vs __rOP__.
     typ = get_proper_type(typ)
 
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+        try:
+            # The Rust path expands TypeVarLikeType internally (values_or_bound)
+            # and defers (None) for any case it cannot decide, e.g. a
+            # TypeVarType with a non-empty value restriction.
+            result = _rust_has_operator(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(typ),
+                op_method,
+                state.state.strict_optional,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
+
     if isinstance(typ, TypeVarLikeType):
         typ = typ.values_or_bound()
     if isinstance(typ, AnyType):
@@ -1623,6 +1669,18 @@ def has_operator(typ: Type, op_method: str) -> bool:
 
 
 def instance_fallback(typ: ProperType) -> Instance:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+        try:
+            result = _rust_instance_fallback(_serialize_type_for_checkmember(typ))
+            if result is not None:
+                decoded = _deserialize_type_for_checkmember(bytes(result))
+                # Rust mirrors Python: Literal/TypedDict return their fallback
+                # (always an Instance); a TupleType whose partial fallback is
+                # not an Instance already deferred. Only trust an Instance.
+                if decoded is not None and isinstance(decoded, Instance):
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(typ, Instance):
         return typ
     if isinstance(typ, TupleType):
@@ -1637,6 +1695,17 @@ def instance_fallback(typ: ProperType) -> Instance:
 
 def meta_has_operator(item: Type, op_method: str) -> bool:
     item = get_proper_type(item)
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+        try:
+            result = _rust_meta_has_operator(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(item),
+                op_method,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(item, AnyType):
         return True
     item = instance_fallback(item)
@@ -1649,6 +1718,15 @@ def meta_has_operator(item: Type, op_method: str) -> bool:
 
 def defined_in_superclass(info: TypeInfo, name: str) -> bool:
     """Check if a variable has an explicit value at class level in any of superclasses."""
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+        try:
+            result = _rust_defined_in_superclass(
+                _native_checkmember_resolver, info.fullname, name
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     for base in info.mro[1:]:
         if (node := base.names.get(name)) is not None:
             if not node.implicit and isinstance(node.node, Var) and node.node.has_explicit_value:

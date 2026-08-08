@@ -104,6 +104,12 @@ pub(crate) struct TypeInfoSnapshot {
     /// is unreadable; a -1 key never matches a real raw_id (>= 0), so the
     /// result keeps a TypeVar and defers to Python.
     pub type_var_raw_ids: Vec<i64>,
+    /// `TypeInfo.names` read as `name -> (implicit, has_explicit_value)`.
+    /// `implicit` is `SymbolTableNode.implicit`; `has_explicit_value` is
+    /// `Var.has_explicit_value` when the node is a Var (false for non-Var
+    /// nodes and unreadable attributes). Feeds the M20 checkmember kernel
+    /// (`has_operator`, `meta_has_operator`, `defined_in_superclass`).
+    pub member_info: HashMap<String, (bool, bool)>,
 }
 
 #[allow(dead_code)]
@@ -375,6 +381,43 @@ fn read_type_var_raw_ids(obj: &PyAny) -> Vec<i64> {
             .and_then(|r| r.extract::<i64>().ok())
             .unwrap_or(-1);
         out.push(raw_id);
+    }
+    out
+}
+
+/// Read `TypeInfo.names` (a `SymbolTable`, a dict subclass) as
+/// `name -> (implicit, has_explicit_value)`. `implicit` is
+/// `SymbolTableNode.implicit`; `has_explicit_value` is
+/// `Var.has_explicit_value` when the node is a Var (false for non-Var
+/// nodes and unreadable attributes). Returns an empty map on any read
+/// failure so a partially-constructed TypeInfo does not fail the resolver
+/// build. Feeds the M20 checkmember kernel (`has_operator`,
+/// `meta_has_operator`, `defined_in_superclass`).
+fn read_member_info(obj: &PyAny) -> HashMap<String, (bool, bool)> {
+    let names = match obj.getattr("names") {
+        Ok(n) => match n.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return HashMap::new(),
+        },
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for (key, value) in names.iter() {
+        let name = match key.extract::<String>() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let implicit = value
+            .getattr("implicit")
+            .and_then(|v| v.extract::<bool>())
+            .unwrap_or(false);
+        let has_explicit = value
+            .getattr("node")
+            .ok()
+            .and_then(|n| n.getattr("has_explicit_value").ok())
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
+        out.insert(name, (implicit, has_explicit));
     }
     out
 }
@@ -889,6 +932,7 @@ pub(crate) fn build_native_resolver(
         // Read after `type_vars_with_variance_full` is consumed above.
         // Duplicate `defn.type_vars` walk is confined to resolver build.
         let type_var_raw_ids = read_type_var_raw_ids(item);
+        let member_info = read_member_info(item);
 
         let snap = TypeInfoSnapshot {
             fullname,
@@ -915,6 +959,7 @@ pub(crate) fn build_native_resolver(
             type_vars_with_variance,
             type_var_upper_bounds,
             type_var_raw_ids,
+            member_info,
         };
         resolver.insert(snap.fullname.clone(), snap);
     }

@@ -10,25 +10,35 @@
 //!   * `bind_self_fast` — strips the first positional argument from a
 //!     CallableType or Overloaded and sets `is_bound=True`. Pure type
 //!     manipulation, no checker state. Called on every trivial-self method
-//!     access (hot path).
+//!     access (hot path). Star-args, empty-args and non-callable types are
+//!     handled exactly like Python: the first two return the method
+//!     unchanged, only non-callable types defer.
 //!   * `classify_member_access` — classifies the `_analyze_member_access`
 //!     dispatch branch from a wire-format type. Returns an int code so
 //!     Python can skip the isinstance chain. Defers on TypeAliasType
 //!     (needs alias expansion via `get_proper_type`).
+//!   * `instance_fallback` — the Instance fallback for a proper type.
+//!   * `has_operator` / `meta_has_operator` — operator-presence checks that
+//!     walk the resolver's mro + member metadata instead of consulting live
+//!     checker state.
+//!   * `defined_in_superclass` — whether a variable has an explicit value at
+//!     class level in any superclass.
 //!
 //! Deferred (return None):
 //!   * `TypeAliasType` — the wire format carries no resolved alias target,
 //!     so `get_proper_type` cannot expand it.
-//!   * CallableType whose first arg is `*args`/`**kwargs` — `bind_self_fast`
-//!     returns the method unchanged in Python; we defer so Python handles it.
 //!   * Overloaded with zero items — degenerate; defer to Python.
+//!   * `has_operator` on a TypeVarType with a non-empty value restriction,
+//!     or on ParamSpec/TypeVarTuple — `values_or_bound()` needs union
+//!     construction or the objects bound; defer.
+//!   * Any member or metaclass lookup that hits a snapshot missing from the
+//!     resolver — we cannot distinguish "absent" from "unknown", so we
+//!     return None rather than risk a wrong boolean.
 
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, ReadBuffer, Type};
-#[cfg(test)]
-use crate::wire::{write_type, WriteBuffer};
+use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -37,11 +47,9 @@ use crate::wire::{write_type, WriteBuffer};
 /// `ArgKind.ARG_POS` = 0.
 #[cfg(test)]
 const ARG_POS: i64 = 0;
-/// `ArgKind.ARG_STAR` = 2. Only used by the bind_self_fast unit tests.
-#[cfg(test)]
+/// `ArgKind.ARG_STAR` = 2.
 const ARG_STAR: i64 = 2;
-/// `ArgKind.ARG_STAR2` = 4. Only used by the bind_self_fast unit tests.
-#[cfg(test)]
+/// `ArgKind.ARG_STAR2` = 4.
 const ARG_STAR2: i64 = 4;
 
 /// Dispatch codes for `classify_member_access`. Mirror the `isinstance`
@@ -69,7 +77,6 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
     read_type(&mut buf, None).ok()
 }
 
-#[cfg(test)]
 fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     let mut wbuf = WriteBuffer::new();
     write_type(&mut wbuf, typ).ok()?;
@@ -126,47 +133,44 @@ fn is_type_obj(fallback: &Type, ret_type: &Type, resolver: &TypeResolver) -> boo
 /// `None`) when Rust cannot handle the case so the Python caller falls
 /// through. Deferred cases:
 ///   * Non-callable types (Instance, AnyType, etc.)
-///   * CallableType with no arg_types
-///   * CallableType whose first arg_kind is ARG_STAR or ARG_STAR2
 ///   * Overloaded with zero items
+///
+/// A CallableType with no args, or whose first arg is `*args`/`**kwargs`, is
+/// returned unchanged (mirroring Python), not deferred.
 ///
 /// The `original_type` parameter from Python is unused here: `bind_self_fast`
 /// only strips the first arg and sets `is_bound`; it does NOT substitute
 /// type variables (that's `bind_self` in typeops.py).
 #[pyfunction]
 pub(crate) fn rust_bind_self_fast(method_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
-    // Deferred: the wire-format round-trip drops the `definition` back-reference
-    // (FuncDef) and other Python-side attributes that CallableType carries.
-    // These are used by error-message formatting, overload ordering, and the
-    // override-comparison path. Returning None lets Python's bind_self_fast
-    // (which uses copy_modified, preserving all attributes) handle the call.
-    // The classify_member_access function below is still active.
-    let _ = method_bytes;
-    Ok(None)
+    let typ = match decode_type(method_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    match bind_self_fast_inner(&typ) {
+        Some(bound) => Ok(encode_type(&bound)),
+        None => Ok(None),
+    }
 }
 
-#[cfg(test)]
-fn bind_self_fast_inner(typ: &Type) -> PyResult<Option<Type>> {
+fn bind_self_fast_inner(typ: &Type) -> Option<Type> {
     match typ {
         Type::Overloaded { items } => {
             if items.is_empty() {
-                return Ok(None);
+                return None;
             }
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
-                match bind_self_fast_inner(item)? {
-                    Some(bound) => new_items.push(bound),
-                    None => return Ok(None),
-                }
+                new_items.push(bind_self_fast_inner(item)?);
             }
-            Ok(Some(Type::Overloaded { items: new_items }))
+            Some(Type::Overloaded { items: new_items })
         }
         Type::CallableType {
             fallback,
             instance_type,
             is_ellipsis_args,
             implicit,
-            is_bound,
+            is_bound: _,
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
@@ -179,39 +183,343 @@ fn bind_self_fast_inner(typ: &Type) -> PyResult<Option<Type>> {
             type_guard,
             type_is,
         } => {
-            if arg_types.is_empty() || arg_kinds.is_empty() {
-                // Invalid method — Python returns it unchanged.
-                return Ok(None);
+            if arg_types.is_empty() {
+                // Nothing to strip — Python returns the method unchanged.
+                return Some(typ.clone());
             }
-            let first_kind = arg_kinds[0];
-            if first_kind == ARG_STAR || first_kind == ARG_STAR2 {
-                // *args / **kwargs — Python returns unchanged. Defer.
-                return Ok(None);
+            // Python indexes arg_kinds[0]; guard a length mismatch so a
+            // pathological CallableType returns unchanged instead of panicking.
+            match arg_kinds.first() {
+                Some(&kind) if kind == ARG_STAR || kind == ARG_STAR2 => {
+                    // *args / **kwargs — Python returns the method unchanged.
+                    Some(typ.clone())
+                }
+                Some(_) => Some(Type::CallableType {
+                    fallback: fallback.clone(),
+                    instance_type: instance_type.clone(),
+                    is_ellipsis_args: *is_ellipsis_args,
+                    implicit: *implicit,
+                    is_bound: true,
+                    from_concatenate: *from_concatenate,
+                    imprecise_arg_kinds: *imprecise_arg_kinds,
+                    unpack_kwargs: *unpack_kwargs,
+                    arg_types: arg_types[1..].to_vec(),
+                    arg_kinds: arg_kinds[1..].to_vec(),
+                    arg_names: arg_names[1..].to_vec(),
+                    ret_type: ret_type.clone(),
+                    name: name.clone(),
+                    variables: variables.clone(),
+                    type_guard: type_guard.clone(),
+                    type_is: type_is.clone(),
+                }),
+                None => Some(typ.clone()),
             }
-            let new_callable = Type::CallableType {
-                fallback: fallback.clone(),
-                instance_type: instance_type.clone(),
-                is_ellipsis_args: *is_ellipsis_args,
-                implicit: *implicit,
-                is_bound: true,
-                from_concatenate: *from_concatenate,
-                imprecise_arg_kinds: *imprecise_arg_kinds,
-                unpack_kwargs: *unpack_kwargs,
-                arg_types: arg_types[1..].to_vec(),
-                arg_kinds: arg_kinds[1..].to_vec(),
-                arg_names: arg_names[1..].to_vec(),
-                ret_type: ret_type.clone(),
-                name: name.clone(),
-                variables: variables.clone(),
-                type_guard: type_guard.clone(),
-                type_is: type_is.clone(),
-            };
-            // Suppress unused warning for the original is_bound.
-            let _ = is_bound;
-            Ok(Some(new_callable))
         }
-        _ => Ok(None),
+        _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// instance_fallback
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.instance_fallback` — the Instance fallback of a proper
+/// type: Instance→self, TupleType→tuple_fallback, Literal/TypedDict→fallback,
+/// anything else→`builtins.object`.
+///
+/// Mirrors `instance_fallback` (checkmember.py:1625-1635). Returns `None` for
+/// a TupleType whose partial fallback is not an Instance (variadic edge), so
+/// the caller falls through to Python. Returns the (possibly non-Instance)
+/// fallback for LiteralType/TypedDictType exactly like Python; the Python
+/// shim re-checks `isinstance(decoded, Instance)` before trusting it.
+#[pyfunction]
+pub(crate) fn rust_instance_fallback(type_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let fb = match instance_fallback_inner(&typ) {
+        Some(fb) => fb,
+        None => return Ok(None),
+    };
+    Ok(encode_type(&fb))
+}
+
+fn instance_fallback_inner(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::Instance { .. } => Some(typ.clone()),
+        Type::TupleType {
+            partial_fallback, ..
+        } => {
+            // tuple_fallback: return the partial fallback when it is an
+            // Instance, else defer (variadic edge). For builtins.tuple the
+            // Instance is rebuilt from the items with the same type_ref.
+            match &**partial_fallback {
+                Type::Instance { .. } => Some((**partial_fallback).clone()),
+                _ => None,
+            }
+        }
+        Type::LiteralType { fallback, .. } | Type::TypedDictType { fallback, .. } => {
+            Some((**fallback).clone())
+        }
+        _ => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// has_operator / meta_has_operator
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.has_operator` — whether a proper type has the given
+/// operator method, mirroring checkmember.py:1590-1622.
+///
+/// Resolver-based: member presence is read from the resolver snapshots (the
+/// Rust `Type` wire format carries no `TypeInfo.mro`/`names`/metaclass), so
+/// this returns `None` whenever the relevant snapshots are missing from the
+/// resolver, letting Python fall through. `strict_optional` mirrors
+/// `state.strict_optional` for `relevant_items()` filtering of `NoneType`
+/// union items.
+#[pyfunction]
+pub(crate) fn rust_has_operator(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+    op_method: &str,
+    strict_optional: bool,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(has_operator_inner(
+        &typ,
+        op_method,
+        strict_optional,
+        resolver.resolver(),
+    ))
+}
+
+fn has_operator_inner(
+    typ: &Type,
+    op_method: &str,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    match typ {
+        Type::TypeAliasType { .. } => None, // needs get_proper_type alias expansion
+        Type::AnyType { .. } => Some(true),
+        Type::UnionType { items, .. } => {
+            let mut acc = true;
+            for item in items {
+                let is_none = matches!(item, Type::NoneType);
+                if !strict_optional && is_none {
+                    continue; // relevant_items(): skip NoneType when not strict
+                }
+                let b = has_operator_inner(item, op_method, strict_optional, resolver)?;
+                if !b {
+                    acc = false;
+                }
+            }
+            Some(acc)
+        }
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            ..
+        } => {
+            if !values.is_empty() {
+                None // values_or_bound() would need union construction
+            } else {
+                // values_or_bound(): a TypeVarType with no value restriction
+                // resolves to its upper bound.
+                has_operator_inner(upper_bound, op_method, strict_optional, resolver)
+            }
+        }
+        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => None,
+        Type::CallableType {
+            fallback, ret_type, ..
+        } => {
+            if is_type_obj(fallback, ret_type, resolver) {
+                // FunctionLike.is_type_obj() -> fallback.type.has_readable_member
+                match &**fallback {
+                    Type::Instance { type_ref, .. } => {
+                        has_readable_member_by_ref(resolver, type_ref, op_method)
+                    }
+                    _ => None,
+                }
+            } else {
+                // Not a type object — falls through to the generic path below.
+                match instance_fallback_inner(typ) {
+                    Some(Type::Instance { type_ref, .. }) => {
+                        has_readable_member_by_ref(resolver, &type_ref, op_method)
+                    }
+                    _ => None,
+                }
+            }
+        }
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                return None; // degenerate — defer to Python
+            }
+            // FunctionLike.is_type_obj() checks the first overload item.
+            if let Some(Type::CallableType {
+                fallback, ret_type, ..
+            }) = items.first()
+            {
+                if is_type_obj(fallback, ret_type, resolver) {
+                    match &**fallback {
+                        Type::Instance { type_ref, .. } => {
+                            has_readable_member_by_ref(resolver, type_ref, op_method)
+                        }
+                        _ => None,
+                    }
+                } else {
+                    match instance_fallback_inner(typ) {
+                        Some(Type::Instance { type_ref, .. }) => {
+                            has_readable_member_by_ref(resolver, &type_ref, op_method)
+                        }
+                        _ => None,
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        Type::TypeType { item, .. } => {
+            // Python: item = typ.item; if TypeVarType -> values_or_bound();
+            // if Union -> all(meta_has_operator per relevant item); else
+            // meta_has_operator(item).
+            match &**item {
+                Type::TypeVarType {
+                    values,
+                    upper_bound,
+                    ..
+                } => {
+                    if values.is_empty() {
+                        meta_has_operator_inner(upper_bound, op_method, resolver)
+                    } else {
+                        None
+                    }
+                }
+                Type::UnionType { items, .. } => {
+                    let mut acc = true;
+                    for x in items {
+                        let is_none = matches!(x, Type::NoneType);
+                        if !strict_optional && is_none {
+                            continue;
+                        }
+                        let b = meta_has_operator_inner(x, op_method, resolver)?;
+                        if !b {
+                            acc = false;
+                        }
+                    }
+                    Some(acc)
+                }
+                _ => meta_has_operator_inner(item, op_method, resolver),
+            }
+        }
+        // Generic path: instance_fallback(typ).type.has_readable_member(op).
+        _ => match instance_fallback_inner(typ) {
+            Some(Type::Instance { type_ref, .. }) => {
+                has_readable_member_by_ref(resolver, &type_ref, op_method)
+            }
+            _ => None,
+        },
+    }
+}
+
+/// `mypy.checkmember.meta_has_operator` — operator presence on a type's
+/// metaclass, mirroring checkmember.py:1638-1647.
+#[pyfunction]
+pub(crate) fn rust_meta_has_operator(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+    op_method: &str,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(meta_has_operator_inner(
+        &typ,
+        op_method,
+        resolver.resolver(),
+    ))
+}
+
+fn meta_has_operator_inner(item: &Type, op_method: &str, resolver: &TypeResolver) -> Option<bool> {
+    match item {
+        Type::TypeAliasType { .. } => None,
+        Type::AnyType { .. } => Some(true),
+        _ => {
+            let fb = instance_fallback_inner(item)?;
+            let type_ref = match &fb {
+                Type::Instance { type_ref, .. } => type_ref.as_str(),
+                _ => return None,
+            };
+            // meta = item.type.metaclass_type or Instance(builtins.type)
+            let snap = resolver.get(type_ref)?;
+            let meta_ref = snap
+                .metaclass_fullname
+                .as_deref()
+                .unwrap_or("builtins.type");
+            has_readable_member_by_ref(resolver, meta_ref, op_method)
+        }
+    }
+}
+
+/// `TypeInfo.has_readable_member` for a resolver-resolved class ref.
+///
+/// Mirrors `TypeInfo.get` (mypy/nodes.py): walks `self.mro`, returning the
+/// first class whose own `names` dict contains the name (existence-only;
+/// implicit or explicit). Defer (None) when any class in the mro is missing
+/// from the resolver — we cannot distinguish "absent" from "unknown".
+fn has_readable_member_by_ref(resolver: &TypeResolver, type_ref: &str, name: &str) -> Option<bool> {
+    let snap = resolver.get(type_ref)?;
+    for base in &snap.mro {
+        let b = resolver.get(base)?;
+        if b.member_info.contains_key(name) {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
+// defined_in_superclass
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.defined_in_superclass` — whether `name` is defined as an
+/// explicitly-valued variable in any superclass of `fullname`, mirroring
+/// checkmember.py:1650-1655. Defer (None) when the class or any superclass
+/// snapshot is missing from the resolver.
+#[pyfunction]
+pub(crate) fn rust_defined_in_superclass(
+    resolver: &NativeTypeResolver,
+    fullname: &str,
+    name: &str,
+) -> PyResult<Option<bool>> {
+    let r = resolver.resolver();
+    let snap = match r.get(fullname) {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+    for base in snap.mro.iter().skip(1) {
+        let b = match r.get(base) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        if let Some((implicit, var_explicit)) = b.member_info.get(name) {
+            if !*implicit && *var_explicit {
+                return Ok(Some(true));
+            }
+        }
+    }
+    Ok(Some(false))
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +659,7 @@ mod tests {
     #[test]
     fn test_bind_self_fast_strips_first_arg() {
         let method = make_callable(vec![ARG_POS], false);
-        let result = bind_self_fast_inner(&method).unwrap().unwrap();
+        let result = bind_self_fast_inner(&method).expect("expected bound callable");
         match result {
             Type::CallableType {
                 arg_types,
@@ -374,7 +682,7 @@ mod tests {
         let item1 = make_callable(vec![ARG_POS], false);
         let item2 = make_callable(vec![ARG_POS], false);
         let overloaded = make_overloaded(vec![item1, item2]);
-        let result = bind_self_fast_inner(&overloaded).unwrap().unwrap();
+        let result = bind_self_fast_inner(&overloaded).expect("expected bound overloaded");
         match result {
             Type::Overloaded { items } => {
                 assert_eq!(items.len(), 2);
@@ -397,21 +705,41 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_self_fast_defers_star_args() {
+    fn test_bind_self_fast_keeps_star_args() {
         let method = make_callable(vec![ARG_STAR], false);
-        let result = bind_self_fast_inner(&method).unwrap();
-        assert!(result.is_none());
+        let result = bind_self_fast_inner(&method).expect("star-arg method returned unchanged");
+        match result {
+            Type::CallableType {
+                arg_types,
+                is_bound,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 1);
+                assert!(!is_bound);
+            }
+            _ => panic!("expected CallableType"),
+        }
     }
 
     #[test]
-    fn test_bind_self_fast_defers_star2() {
+    fn test_bind_self_fast_keeps_star2() {
         let method = make_callable(vec![ARG_STAR2], false);
-        let result = bind_self_fast_inner(&method).unwrap();
-        assert!(result.is_none());
+        let result = bind_self_fast_inner(&method).expect("star2-arg method returned unchanged");
+        match result {
+            Type::CallableType {
+                arg_types,
+                is_bound,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 1);
+                assert!(!is_bound);
+            }
+            _ => panic!("expected CallableType"),
+        }
     }
 
     #[test]
-    fn test_bind_self_fast_defers_empty_args() {
+    fn test_bind_self_fast_keeps_empty_args() {
         let method = Type::CallableType {
             fallback: Box::new(make_instance("builtins.function")),
             instance_type: None,
@@ -430,22 +758,23 @@ mod tests {
             type_guard: None,
             type_is: None,
         };
-        let result = bind_self_fast_inner(&method).unwrap();
-        assert!(result.is_none());
+        let result = bind_self_fast_inner(&method).expect("empty-arg method returned unchanged");
+        match result {
+            Type::CallableType { is_bound, .. } => assert!(!is_bound),
+            _ => panic!("expected CallableType"),
+        }
     }
 
     #[test]
     fn test_bind_self_fast_defers_non_callable() {
         let inst = make_instance("builtins.int");
-        let result = bind_self_fast_inner(&inst).unwrap();
-        assert!(result.is_none());
+        assert!(bind_self_fast_inner(&inst).is_none());
     }
 
     #[test]
     fn test_bind_self_fast_defers_empty_overloaded() {
         let overloaded = make_overloaded(vec![]);
-        let result = bind_self_fast_inner(&overloaded).unwrap();
-        assert!(result.is_none());
+        assert!(bind_self_fast_inner(&overloaded).is_none());
     }
 
     #[test]
@@ -453,7 +782,7 @@ mod tests {
         let method = make_callable(vec![ARG_POS], false);
         let encoded = encode_type(&method).unwrap();
         let decoded = decode_type(&encoded).unwrap();
-        let result = bind_self_fast_inner(&decoded).unwrap().unwrap();
+        let result = bind_self_fast_inner(&decoded).expect("expected bound callable");
         match result {
             Type::CallableType { is_bound, .. } => assert!(is_bound),
             _ => panic!("expected CallableType"),
