@@ -125,6 +125,24 @@ jobs:
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testinfer.py -q --timeout=30 --timeout-method=thread
 
+      # Reversed-order combined run (#336): testcheck before testtypes in a
+      # single xdist invocation shares workers across both suites, so a
+      # leak of module-level native-gate globals from a testcheck build into
+      # a later pure-Python testtypes suite reproduces as ~17-25 failures.
+      # The runtest-hook isolation in mypy/test/conftest.py restores the
+      # snapshot per test; this step keeps the contamination gated.
+      - name: Parity reversed-order isolation (testcheck+testtypes, #336)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+          TEST_NATIVE_PARSER: "1"
+          TEST_NATIVE_RESOLVER: "1"
+          MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
+          MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
+          MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
+        run: uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread
+
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix
     # (#201) landed and the typeops corpus passes. Keep green before merging.
