@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import importlib
 import os
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -271,7 +270,7 @@ _NATIVE_GATE_GLOBALS: list[tuple[str, str]] = [
     ("mypy.checker", "_native_checker_types_active"),
     ("mypy.checker", "_native_checker_stmts_active"),
     ("mypy.checkexpr", "_native_checkexpr_active"),
-    ("mypy.checkexpr", "_native_checkexpr_active"),
+    ("mypy.checkexpr", "_native_checkexpr_resolver"),
     ("mypy.checkexpr", "_native_plugin_hook_registry"),
     ("mypy.checkexpr", "_native_plugin_hook_has_user_plugins"),
     ("mypy.checkmember", "_native_checkmember_active"),
@@ -315,32 +314,46 @@ _NATIVE_GATE_GLOBALS: list[tuple[str, str]] = [
 ]
 
 
-@pytest.fixture(autouse=True)
-def _isolate_native_gates() -> Iterator[None]:
-    """Restore every module-level native-gate global after each test.
+# Cross-suite isolation for the module-level native-gate globals (issue #336).
+# Hooks, not an autouse fixture: DataDrivenTestCase items bypass fixture
+# resolution via custom `runtest()`. Hooks fire for every item type.
+_saved_native_gates: list[tuple[Any, str, object]] = []
+
+
+def pytest_runtest_setup(item: Any) -> None:
+    """Snapshot every module-level native-gate global before each test.
 
     `BuildManager.__init__` (mypy/build.py) sets every `_set_native_*_active`
-    gate to `options.native_type_kernel` and installs the per-build
+    gate to options.native_type_kernel and installs the per-build
     `NativeTypeResolver` snapshot into the subtype/join/solve/constraints/
     mro/expand/applytype/typeops/messages/checkmember shims. None of that
-    state is rolled back when the build ends. During a combined xdist run a
-    worker may therefore run a pure-Python testtypes suite (TypeOps/Join/
-    Meet) right after a testcheck build; the pure suite then hits the Rust
-    kernels with a foreign resolver built from the testcheck TypeInfo graph,
-    producing mismatched join/subtype/expand results (~15 failures).
+    state is rolled back when the build ends. During a combined run a worker
+    may therefore run a pure-Python testtypes suite (TypeOps/Join/Meet) right
+    after a testcheck build; the pure suite then hits the Rust kernels with a
+    foreign resolver built from the testcheck TypeInfo graph, producing
+    mismatched join/subtype/expand results (~17 failures).
 
-    This fixture snapshots every module-level native-gate global at setup and
-    restores the snapshot at teardown, so no residue from an earlier test can
-    leak into a later one on the same worker. It never forces a value, so
-    import-time activations (e.g. testinfer's argmap gate) and the per-suite
-    installs done by the Native* testtypes suites are preserved exactly.
-    Running a single file is unaffected: the snapshot and restore are both
-    no-ops relative to an already-clean worker.
+    The snapshot captures whatever the gate state is at setup time, so
+    import-time activations are preserved by the restore. It never forces a
+    value. Per-suite installs done by the Native* testtypes suites in their
+    own setUp are wiped by the teardown restore, then re-installed by the
+    next test's setUp. Running a single file is unaffected.
     """
-    saved = []
+    _saved_native_gates.clear()
     for module_name, attr in _NATIVE_GATE_GLOBALS:
         module = importlib.import_module(module_name)
-        saved.append((module, attr, getattr(module, attr, None)))
-    yield
-    for module, attr, value in saved:
+        _saved_native_gates.append((module, attr, getattr(module, attr, None)))
+
+
+def pytest_runtest_teardown(item: Any, nextitem: Any) -> None:
+    """Restore the snapshot from `pytest_runtest_setup` after each test.
+
+    `BuildManager` leaks gate/resolver state across builds with no rollback,
+    and the Native* testtypes suites install their own resolver in setUp.
+    Restoring the pre-test snapshot here keeps residue from one test from
+    leaking into a later one on the same worker, while never fabricating
+    state. Restore errors would silently mask a leak, so let them fail.
+    """
+    for module, attr, value in _saved_native_gates:
         setattr(module, attr, value)
+    _saved_native_gates.clear()
