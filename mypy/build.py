@@ -1017,12 +1017,16 @@ class BuildManager:
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
-        # M20: gate checkmember bind_self_fast (trivial-self method binding).
-        # Rust strips the first arg and sets is_bound; Python falls back for
-        # *args/**kwargs and non-callable types.
-        from mypy.checkmember import _set_native_checkmember_active
+        # M20: gate checkmember bind_self_fast (trivial-self binding),
+        # instance_fallback, and the resolver-snapshot operator helpers.
+        # Rust strips the first arg; *args/**kwargs and non-callable defer.
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
 
         _set_native_checkmember_active(self.options.native_type_kernel)
+        _set_native_checkmember_resolver(None)
         # M17 checker statement helpers (type_requires_usage,
         # is_unreachable_map, etc.) and semanal visitor helpers
         # (refers_to_fullname, is_trivial_body, etc.). Parity verified
@@ -1313,6 +1317,12 @@ class BuildManager:
         from mypy.messages import _set_native_messages_resolver
 
         _set_native_messages_resolver(resolver)
+        # M20: checkmember operator helpers (has_operator, meta_has_operator,
+        # defined_in_superclass) resolve member metadata through the same
+        # snapshot as everything else.
+        from mypy.checkmember import _set_native_checkmember_resolver
+
+        _set_native_checkmember_resolver(resolver)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
@@ -5192,6 +5202,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.constraints import _set_native_constraints_resolver
 
         _set_native_constraints_resolver(None)
+        from mypy.checkmember import _set_native_checkmember_resolver
+
+        _set_native_checkmember_resolver(None)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 

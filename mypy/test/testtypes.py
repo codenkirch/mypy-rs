@@ -6103,20 +6103,26 @@ class NativeCheckMemberSuite(Suite):
 
     Verifies that `rust_bind_self_fast` agrees with the Python
     `bind_self_fast` for CallableType and Overloaded, including the
-    deferral semantics (None return) for *args/**kwargs and non-callable
-    types.
+    keep-unchanged semantics for *args/**kwargs and empty-arg callables,
+    and the deferral (None return) for non-callable types. Also verifies
+    `rust_instance_fallback`, `rust_has_operator`, `rust_meta_has_operator`,
+    and `rust_defined_in_superclass` against the Python originals.
     """
 
     def setUp(self) -> None:
         import type_kernel as _tk
 
-        from mypy.checkmember import _set_native_checkmember_active
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
         from librt.internal import WriteBuffer as _WB
 
         self._tk = _tk
         self._WB = _WB
         self._set_active = _set_native_checkmember_active
-        self._set_active(True)
+        self._set_resolver = _set_native_checkmember_resolver
         self.fx = TypeFixture()
         type_infos = [
             self.fx.oi,
@@ -6140,8 +6146,15 @@ class NativeCheckMemberSuite(Suite):
             self.fx.functioni,
         ]
         self.resolver = _tk.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
 
     def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        self._set_resolver(None)
         self._set_active(False)
 
     def _bytes_of(self, t: Type) -> bytes:
@@ -6180,7 +6193,7 @@ class NativeCheckMemberSuite(Suite):
         method = self._make_callable([ARG_POS], ret=self.fx.a)
         result = bind_self_fast(method)
         assert isinstance(result, CallableType)
-        assert result.ret_type is self.fx.a
+        assert result.ret_type == self.fx.a
 
     def test_bind_self_fast_preserves_variables(self) -> None:
         from mypy.nodes import ARG_POS
@@ -6232,21 +6245,31 @@ class NativeCheckMemberSuite(Suite):
         assert result.is_bound is False
         assert len(result.arg_types) == 1
 
-    def test_bind_self_fast_rust_deferred(self) -> None:
-        # bind_self_fast is deferred (returns None) because the wire-format
-        # round-trip drops Python-side attributes. Python handles it.
+    def test_bind_self_fast_rust_round_trip_plain_callable(self) -> None:
+        # New semantics: plain callable comes back bound through the wire.
+        from mypy.checkmember import _deserialize_type_for_checkmember
         from mypy.nodes import ARG_POS
 
         method = self._make_callable([ARG_POS])
         rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
-        assert rust_bytes is None
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is True
+        assert len(decoded.arg_types) == 0
 
-    def test_bind_self_fast_rust_returns_none_for_star(self) -> None:
+    def test_bind_self_fast_rust_keeps_star_unchanged(self) -> None:
+        # *args / **kwargs return the method unchanged (matches Python).
+        from mypy.checkmember import _deserialize_type_for_checkmember
         from mypy.nodes import ARG_STAR
 
         method = self._make_callable([ARG_STAR])
         rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
-        assert rust_bytes is None
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is False
+        assert len(decoded.arg_types) == 1
 
     def test_bind_self_fast_rust_returns_none_for_non_callable(self) -> None:
         rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(self.fx.a))
@@ -6329,5 +6352,111 @@ class NativeCheckMemberSuite(Suite):
         assert result.is_bound is True
         assert len(result.arg_types) == 2
         assert result.arg_names == ["x", "y"]
+
+    def test_has_operator_parity_present(self) -> None:
+        from mypy.checkmember import has_operator
+
+        self._set_active(False)
+        try:
+            expected = has_operator(self.fx.a, "__bool__")
+        finally:
+            self._set_active(True)
+        actual = has_operator(self.fx.a, "__bool__")
+        assert actual is True
+        assert actual == expected
+
+    def test_has_operator_parity_missing(self) -> None:
+        from mypy.checkmember import has_operator
+
+        self._set_active(False)
+        try:
+            expected = has_operator(self.fx.a, "__add__")
+        finally:
+            self._set_active(True)
+        actual = has_operator(self.fx.a, "__add__")
+        assert actual is False
+        assert actual == expected
+
+    def test_has_operator_rust_answers_meta_any(self) -> None:
+        from mypy.checkmember import has_operator
+        from mypy.types import AnyType, TypeOfAny
+
+        # AnyType: Python says True; Rust mirrors it without needing a
+        # superclass lookup, so this resolves with no resolver floor.
+        assert has_operator(AnyType(TypeOfAny.special_form), "__eq__") is True
+
+    def test_meta_has_operator_rust_answers(self) -> None:
+        from mypy.checkmember import meta_has_operator
+
+        # No fixture has a metaclass, so Python's std-lib "type" fallback
+        # would crash in this test env. Rust returns Some(false) via the
+        # default-metaclass path, so False proves Rust answered.
+        assert meta_has_operator(self.fx.a, "__call__") is False
+
+    def test_instance_fallback_parity(self) -> None:
+        from mypy.checkmember import instance_fallback
+
+        for t in (self.fx.a, self.fx.lit1):
+            self._set_active(False)
+            try:
+                expected = instance_fallback(t)
+            finally:
+                self._set_active(True)
+            actual = instance_fallback(t)
+            assert isinstance(actual, Instance)
+            assert actual == expected
+
+    def test_instance_fallback_rust_tuple_parity(self) -> None:
+        from mypy.checkmember import instance_fallback
+        from mypy.types import TupleType
+
+        cases = [
+            # builtins tuple: Python rebuilds the args (join union) while Rust
+            # returns the partial fallback unchanged, so only the class must
+            # match.
+            (TupleType([self.fx.a, self.fx.b], self.fx.std_tuple), self.fx.std_tuplei),
+            # non-builtins fallback: both return the partial fallback unchanged.
+            (TupleType([self.fx.a], Instance(self.fx.ai, [])), self.fx.ai),
+        ]
+        for t, expected_info in cases:
+            self._set_active(False)
+            try:
+                expected = instance_fallback(t)
+            finally:
+                self._set_active(True)
+            actual = instance_fallback(t)
+            assert isinstance(actual, Instance)
+            assert isinstance(expected, Instance)
+            assert actual.type is expected_info
+            assert expected.type is expected_info
+
+    def test_defined_in_superclass_parity(self) -> None:
+        # member_info is captured eagerly when the resolver is built, so a
+        # fresh resolver is needed after mutating ai.names.
+        from mypy.checkmember import defined_in_superclass
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        v = Var("x")
+        v.type = self.fx.a
+        v.has_explicit_value = True
+        self.fx.ai.names["x"] = SymbolTableNode(MDEF, v)
+        try:
+            local = self._tk.build_native_resolver(
+                [self.fx.bi, self.fx.ai, self.fx.oi], []
+            )
+            self._set_resolver(local)
+            self._set_active(False)
+            try:
+                expected = defined_in_superclass(self.fx.bi, "x")
+                expected_missing = defined_in_superclass(self.fx.bi, "zzz")
+            finally:
+                self._set_active(True)
+            assert defined_in_superclass(self.fx.bi, "x") is True
+            assert defined_in_superclass(self.fx.bi, "x") == expected
+            assert defined_in_superclass(self.fx.bi, "zzz") is False
+            assert expected_missing is False
+        finally:
+            self._set_resolver(self.resolver)
+            del self.fx.ai.names["x"]
 
 
