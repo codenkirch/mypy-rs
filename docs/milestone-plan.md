@@ -3,15 +3,15 @@
 ## Current State (August 2026)
 
 ### GitHub Language Stats
-- Python: 5,793,773 bytes (79.1%)
-- Rust: 1,496,698 bytes (20.4%)
+- Python: 5,895,804 bytes (77.5%)
+- Rust: 1,716,197 bytes (22.5%)
 - **Target: 20%+ Rust** — met
 
-### Rust Crates (41,136 LOC total)
+### Rust Crates (38,459 LOC total)
 
 | Crate | LOC | Description |
 |-------|-----|-------------|
-| type_kernel | 32,111 | Core type-checking kernels (34 .rs files) |
+| type_kernel | ~38,500 | Core type-checking kernels (42 .rs files) |
 | ast_serialize | ~4,000 | Native parser (ruff-based AST serialization) |
 | module_resolver | ~3,000 | Native module finder |
 | fs_probe | ~2,000 | Filesystem probing |
@@ -37,6 +37,10 @@
 - `freshen` (parity-tested)
 - `lkv` (last-known-value erasure)
 - `cache` (parity-tested)
+- `checkmember` (active + resolver: `bind_self_fast` decision gate plus `has_operator`, `meta_has_operator`, `instance_fallback`, `defined_in_superclass`; see PR #325)
+- `messages` (active: `append_invariance_notes`, `append_numbers_notes`, `append_union_note`, `pretty_callable`; no resolver needed; see PR #324)
+- `checkpattern` (active + resolver: pattern starred/sequence helpers; see PRs #315, #323)
+- `checkstrformat` (active: format-string parsing helpers; see PR #297)
 
 **Hardcoded off:**
 - `subtype` active flag (`_set_native_subtype_active(False)`) — resolver is wired but the per-call active gate is off. The subtype resolver handles `is_subtype` calls but the Python path still runs the visitor. Enabling the active flag would make `is_subtype` itself defer to Rust.
@@ -44,17 +48,14 @@
 **Not ported (no Rust counterpart):**
 | Python Module | Lines | Role |
 |---------------|-------|------|
-| `checkmember.py` | 1,594 | Member access resolution (`analyze_member_access`) |
-| `checkpattern.py` | 885 | Pattern matching (PEP 634) |
 | `infer.py` | 80 | Type inference for anonymous code |
 | `maptype.py` | 109 | Type mapping utilities |
 
 **Stubs (Rust exists but minimal):**
 | Rust File | Lines | Python Target |
 |-----------|-------|---------------|
-| `checkstrformat.rs` | 37 | `checkstrformat.py` (1,115 lines) |
-| `messages.rs` | 40 | `mypy.messages` (error message formatting) |
-| `checkcall.rs` | 524 | `check_call` in checkexpr.py (classifier only, no full port) |
+| `checkcall.rs` | 813 | `check_call` in checkexpr.py (classifier only, no full port) |
+| `checkexpr_functions.rs` | 1,455 | plugin-hook helper registry only |
 
 ### Performance (M17 graduation, cold self-check)
 - `parse_time`: 4.997s (1.0% reduction from Python)
@@ -75,19 +76,26 @@
 3. If green, ship as production default
 **LOC impact:** Minimal Rust change, large performance win (subtype is the hottest sub-check in type checking)
 
-### M19: `checkstrformat` Port
+### M19: `checkstrformat` Port (DONE)
 **Goal:** Port `mypy/checkstrformat.py` (1,115 lines) to Rust.
-**Current state:** `checkstrformat.rs` is a 37-line stub.
+**Current state:** DONE — `checkstrformat.rs` is 636 lines (PR #297). The pure
+format-string parsing helpers (`rust_is_numeric_format_type`,
+`rust_parse_conversion_specifiers`, `rust_find_non_escaped_targets`,
+`rust_parse_format_value`) are ported and gated behind
+`_set_native_strformat_active`. The type-checking logic
+(`StringFormatterChecker` methods) stays in Python — it needs the checker,
+message builder, and named_type.
 **Risk:** Medium — strformat checking is self-contained (printf/scanf format string validation) with minimal plugin interaction.
-**Steps:**
-1. Port `printf_signature` and `scanf_signature` generation
-2. Port `check_str_format` call
-3. Add PyO3 function, wire to build.py gate
-4. Parity tests via `NativeStrFormatSuite`
-**LOC impact:** ~1,000 Rust lines, removes 1,115 Python lines from hot path
+**LOC impact:** ~600 Rust lines landed.
 
 ### M20: `checkmember` Port (Partial)
 **Goal:** Port `analyze_member_access` and `analyze_typevar_member_access` from `checkmember.py` (1,594 lines).
+**Current state:** PARTIAL — `checkmember.rs` is 927 lines (PR #325). The
+`bind_self_fast` decision gate is live (pure helper, no checker state) and four
+operator helpers (`has_operator`, `meta_has_operator`, `instance_fallback`,
+`defined_in_superclass`) are ported behind the resolver. `analyze_member_access`
+itself is NOT ported — it is the highest-value remaining port and the
+second-hottest dispatch in the type checker.
 **Risk:** High — `analyze_member_access` is called from `check_call` (Instance branch), `checkexpr`, and `checkmember` itself. It mutates the AST (`store_type`) and interacts with the plugin (`get_method_hook`).
 **Steps:**
 1. Port `analyze_member_access` as a Rust resolver (returns the result type + side-effect descriptor, Python applies mutations)
@@ -97,27 +105,23 @@
 **LOC impact:** ~1,500 Rust lines. This is the highest-value remaining port after subtype-active — `analyze_member_access` is the second-hottest dispatch in the type checker.
 **Note:** The `get_method_hook` plugin interaction means this port should use the same `plugin_call_hook_known_absent` fast-path pattern as the checkexpr plugin-hook snapshot.
 
-### M21: `messages` Port
+### M21: `messages` Port (DONE)
 **Goal:** Port error message formatting from `mypy.messages` to Rust.
-**Current state:** `messages.rs` is a 40-line stub.
+**Current state:** DONE — `messages.rs` is 2,145 lines (PR #324). Four helper
+functions are ported: `append_invariance_notes`, `append_numbers_notes`,
+`append_union_note`, `pretty_callable`. They are pure computation (no AST
+mutation) and run un-gated (no resolver switch needed).
 **Risk:** Medium — message formatting is pure computation (no AST mutation), but the message strings are user-visible and must match exactly.
-**Steps:**
-1. Port `format_type` helpers
-2. Port `format_type_distinctly`
-3. Port message templates (too many messages, start with the hot ones)
-4. Wire to build.py gate
-**LOC impact:** ~1,000-2,000 Rust lines depending on scope
-**Priority:** Low — message formatting is not on the hot path (errors are rare in correct code)
+**LOC impact:** ~2,100 Rust lines landed.
 
-### M22: `checkpattern` Port
+### M22: `checkpattern` Port (DONE)
 **Goal:** Port `mypy/checkpattern.py` (885 lines) — PEP 634 pattern matching type checking.
+**Current state:** DONE — `checkpattern.rs` is 957 lines (PRs #315, #323). The
+pattern starred/sequence helpers are ported and gated behind the pattern
+resolver. `PatternChecker` dispatch for the full pattern grammar stays in
+Python, but the deepest recursion hot spot (sequence/starred analysis) is Rust.
 **Risk:** Medium — pattern matching is self-contained but complex (capture patterns, class patterns, mapping patterns, sequence patterns).
-**Steps:**
-1. Port `PatternChecker.visit_pattern` dispatch
-2. Port each pattern type handler
-3. Wire to build.py gate, parity tests
-**LOC impact:** ~800 Rust lines
-**Priority:** Low — pattern matching is not on the hot path for most codebases
+**LOC impact:** ~950 Rust lines landed.
 
 ### M23: `expand_type` Resolver Fix (RESOLVED)
 **Goal:** Fix the 316 known parity failures in the `expand_type` resolver and uncomment it in build.py.
@@ -179,15 +183,22 @@ M25 (check_call full)    ─── last, depends on M20+M23
 
 ## Sustaining 20%+ Rust
 
-Current: 1.49M Rust bytes / 7.31M total = 20.4%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
+Current: 1.716M Rust bytes / 7.636M total = 22.5%. Each milestone adds Rust LOC and removes Python LOC from the hot path:
 
 | Milestone | New Rust LOC | Rust bytes added | Est. new % |
 |-----------|--------------|-------------------|------------|
 | M18 | ~0 (flag flip) | 0 | 20.4% |
-| M19 | ~1,000 | ~40K | 20.9% |
-| M20 | ~1,500 | ~60K | 21.6% |
-| M21 | ~1,500 | ~60K | 22.3% |
-| M22 | ~800 | ~32K | 22.7% |
+| M19 | ~600 (landed) | ~220K total | 22.5% |
+| M20 | ~927 (landed) | ~220K total | 22.5% |
+| M21 | ~2,145 (landed) | ~220K total | 22.5% |
+| M22 | ~957 (landed) | ~220K total | 22.5% |
 | M25 | ~2,500 | ~100K | 24.0% |
+
+**Honest note on the 24.8% projection:** the 11-milestone plan projected
+1.907M Rust bytes (24.8%), but the issues that closed as umbrellas landed as
+self-contained helper subsets, not full module ports (strangler-fig — Python
+stays as the fallback behind each gate). Actual increment from the 20.4% start
+was ~217K bytes (~5.9K LOC), landing at 22.5% (1,716,197 / 7,636,211), not
+24.8%. This is still well past the 20% target.
 
 The 20% target is sustainable even without new milestones — the existing 41K Rust LOC is enough. New milestones extend it toward 24%.
