@@ -650,6 +650,10 @@ def update_module_isolated(
 
     state = graph[module]
 
+    # Clear stale native resolvers so daemon semanal doesn't read a
+    # stale pre-build resolver snapshot (Fixes #335).
+    manager._clear_native_resolvers()
+
     # Process the changed file.
     state.parse_file()
     assert state.tree is not None, "file must be at least parsed"
@@ -660,6 +664,10 @@ def update_module_isolated(
         # There was a blocking error, so module AST is incomplete. Restore old modules.
         restore([module])
         return BlockedUpdate(module, path, remaining_modules, err.messages)
+
+    # Rebuild the native resolver snapshot so type-checking uses a
+    # fresh TypeInfo graph (Fixes #335).
+    manager._build_native_resolvers()
 
     # Merge old and new ASTs.
     new_modules_dict: dict[str, MypyFile | None] = {module: state.tree}
@@ -1013,7 +1021,13 @@ def reprocess_nodes(
     for deferred in nodes:
         processed_targets.append(deferred.node.fullname)
         strip_target(deferred.node)
+    # Clear stale native resolvers so daemon semanal doesn't read a
+    # stale pre-build resolver snapshot (Fixes #335).
+    manager._clear_native_resolvers()
     semantic_analysis_for_targets(graph[module_id], nodes, graph)
+    # Rebuild the native resolver snapshot so type-checking uses a
+    # fresh TypeInfo graph (Fixes #335).
+    manager._build_native_resolvers()
     # Merge symbol tables to preserve identities of AST nodes. The file node will remain
     # the same, but other nodes may have been recreated with different identities, such as
     # NamedTuples defined using assignment statements.
