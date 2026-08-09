@@ -1873,17 +1873,16 @@ mod tests {
 
     #[test]
     fn separate_union_literals_alias_defers() {
-        // A non-literal, non-writable type (Parameters) in a union item defers.
-        // (Parameters has no write arm — write_type rejects it.)
-        let params = Parameters {
-            arg_types: vec![],
-            arg_kinds: vec![],
-            arg_names: vec![],
-            variables: vec![],
-            imprecise_arg_kinds: false,
+        // A TypeAliasType in a union item defers the whole call: Python
+        // classifies via get_proper_type (expands aliases), which Rust cannot
+        // bucket without the resolver.
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.Alias".to_string(),
         };
-        let t = Type::Parameters(params);
-        assert!(super::encode_type(&t).is_none());
+        let i = plain_instance("builtins.int");
+        let union = union_of(vec![alias, i]);
+        assert!(rust_separate_union_literals(&encode(&union)).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1989,59 +1988,13 @@ mod tests {
 
     #[test]
     fn get_type_vars_alias_defers() {
-        // ParamSpecType has no write arm, so a type var wrapped in it
-        // cannot cross the binary seam and the call defers to Python.
-        let prefix = Parameters {
-            arg_types: vec![],
-            arg_kinds: vec![],
-            arg_names: vec![],
-            variables: vec![],
-            imprecise_arg_kinds: false,
+        // A TypeAliasType anywhere in the shape defers: Python expands
+        // aliases eagerly (TypeQuery default traversal), Rust cannot without
+        // the resolver, so the whole extraction falls back to Python.
+        let alias = Type::TypeAliasType {
+            args: vec![tv_type(1, "T")],
+            type_ref: "mod.Alias".to_string(),
         };
-        let pv = Type::ParamSpecType {
-            prefix: Box::new(prefix),
-            name: "P".to_string(),
-            fullname: "mod.P".to_string(),
-            raw_id: -1,
-            namespace: "mod".to_string(),
-            flavor: 0,
-            upper_bound: Box::new(Type::AnyType {
-                type_of_any: 0,
-                source_any: None,
-                missing_import_name: None,
-            }),
-            default: Box::new(Type::AnyType {
-                type_of_any: 0,
-                source_any: None,
-                missing_import_name: None,
-            }),
-        };
-        let t = Type::TypeVarType {
-            name: "T".to_string(),
-            fullname: "mod.T".to_string(),
-            raw_id: 1,
-            namespace: String::new(),
-            values: vec![pv],
-            upper_bound: Box::new(Type::Instance {
-                type_ref: "builtins.object".to_string(),
-                args: vec![],
-                last_known_value: None,
-                extra_attrs: None,
-            }),
-            default: Box::new(Type::AnyType {
-                type_of_any: 0,
-                source_any: None,
-                missing_import_name: None,
-            }),
-            variance: 0,
-            meta_level: 0,
-        };
-        let union = Type::UnionType {
-            items: vec![t],
-            uses_pep604_syntax: false,
-            can_be_true: true,
-            can_be_false: true,
-        };
-        assert!(super::encode_type(&union).is_none());
+        assert!(rust_get_type_vars(&encode(&alias), false).is_none());
     }
 }

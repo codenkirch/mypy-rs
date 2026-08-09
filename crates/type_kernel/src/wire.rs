@@ -2802,8 +2802,10 @@ mod tests {
     }
 
     #[test]
-    fn write_type_rejects_unsupported_variant() {
-        // ParamSpecType is not in the implemented write set; must error
+    fn write_type_round_trips_param_spec_type() {
+        // ParamSpecType has a write arm (added with the typeanal/constraint
+        // wire support), so it writes and reads back cleanly. If a future
+        // variant is added without a write arm, `write_type` must error
         // rather than emit bytes Type.read() would reject.
         let prefix = Parameters {
             arg_types: vec![],
@@ -2831,9 +2833,10 @@ mod tests {
             }),
         };
         let mut buf = WriteBuffer::new();
-        assert!(matches!(
-            write_type(&mut buf, &t),
-            Err(WireError::Invalid(_))
-        ));
+        write_type(&mut buf, &t).expect("ParamSpecType must be writable");
+        let bytes = buf.into_bytes();
+        let mut rbuf = ReadBuffer::new(&bytes);
+        let back = read_type(&mut rbuf, None).expect("ParamSpecType must round-trip");
+        assert!(matches!(back, Type::ParamSpecType { .. }));
     }
 }
