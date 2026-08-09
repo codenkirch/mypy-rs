@@ -977,7 +977,7 @@ fn collect_list(ts: &[Type], include_all: bool, out: &mut Vec<Type>) -> Option<(
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
-    use crate::wire::{LiteralValue, Type};
+    use crate::wire::{LiteralValue, Parameters, Type};
 
     #[test]
     fn simple_literal_type_extracts_fallback() {
@@ -1873,13 +1873,17 @@ mod tests {
 
     #[test]
     fn separate_union_literals_alias_defers() {
-        // TypeAliasType has no wire write arm, so a union whose item is an
-        // alias cannot cross the binary seam and the call defers to Python.
-        let alias = Type::TypeAliasType {
-            type_ref: "mod.Alias".to_string(),
-            args: vec![],
+        // A non-literal, non-writable type (Parameters) in a union item defers.
+        // (Parameters has no write arm — write_type rejects it.)
+        let params = Parameters {
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            variables: vec![],
+            imprecise_arg_kinds: false,
         };
-        assert!(super::encode_type(&alias).is_none());
+        let t = Type::Parameters(params);
+        assert!(super::encode_type(&t).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1985,10 +1989,59 @@ mod tests {
 
     #[test]
     fn get_type_vars_alias_defers() {
-        let alias = Type::TypeAliasType {
-            type_ref: "mod.Alias".to_string(),
-            args: vec![],
+        // ParamSpecType has no write arm, so a type var wrapped in it
+        // cannot cross the binary seam and the call defers to Python.
+        let prefix = Parameters {
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            variables: vec![],
+            imprecise_arg_kinds: false,
         };
-        assert!(super::encode_type(&alias).is_none());
+        let pv = Type::ParamSpecType {
+            prefix: Box::new(prefix),
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: -1,
+            namespace: "mod".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+        };
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: vec![pv],
+            upper_bound: Box::new(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let union = Type::UnionType {
+            items: vec![t],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert!(super::encode_type(&union).is_none());
     }
 }

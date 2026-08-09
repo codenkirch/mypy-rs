@@ -2247,15 +2247,37 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
-        _ => Err(WireError::invalid(format!(
-            "write_type: variant {:?} not implemented (only AnyType/NoneType/UninhabitedType/Instance/TypeType/CallableType/UnionType/LiteralType/TypeVarType/TupleType/TypedDictType/DeletedType/UnpackType)",
-            t.variant_name()
-        ))),
+
+        Type::TypeAliasType { args, type_ref } => {
+            write_tag(buf, TYPE_ALIAS_TYPE);
+            write_type_list(buf, args)?;
+            write_str(buf, type_ref)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+
+        Type::Parameters(p) => write_parameters(buf, p),
+
+        Type::UnboundType {
+            name,
+            args,
+            original_str_expr,
+            original_str_fallback,
+        } => {
+            write_tag(buf, UNBOUND_TYPE);
+            write_str(buf, name)?;
+            write_type_list(buf, args)?;
+            write_str_opt(buf, original_str_expr.as_deref())?;
+            write_str_opt(buf, original_str_fallback.as_deref())?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
     }
 }
 
 impl Type {
     /// Stable variant name for error messages (mirrors the Python class name).
+    #[expect(dead_code)]
     fn variant_name(&self) -> &'static str {
         match self {
             Type::Instance { .. } => "Instance",
@@ -2781,11 +2803,32 @@ mod tests {
 
     #[test]
     fn write_type_rejects_unsupported_variant() {
-        // TypeAliasType is not in the implemented set; must error rather
-        // than emit bytes Type.read() would reject.
-        let t = Type::TypeAliasType {
-            args: Vec::new(),
-            type_ref: "mod.A".to_string(),
+        // ParamSpecType is not in the implemented write set; must error
+        // rather than emit bytes Type.read() would reject.
+        let prefix = Parameters {
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            variables: vec![],
+            imprecise_arg_kinds: false,
+        };
+        let t = Type::ParamSpecType {
+            prefix: Box::new(prefix),
+            name: "P".to_string(),
+            fullname: "P".to_string(),
+            raw_id: -1,
+            namespace: String::new(),
+            flavor: 0,
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
         };
         let mut buf = WriteBuffer::new();
         assert!(matches!(
