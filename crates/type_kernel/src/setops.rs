@@ -772,6 +772,9 @@ fn meet_callable_like(
             Type::CallableType {
                 arg_types: t_arg_types,
                 arg_kinds: t_arg_kinds,
+                arg_names: t_arg_names,
+                variables: t_variables,
+                imprecise_arg_kinds: t_imprecise_arg_kinds,
                 ret_type: t_ret,
                 fallback: t_fallback,
                 instance_type: t_inst,
@@ -789,6 +792,10 @@ fn meet_callable_like(
             if is_similar_callables(t_arg_types, t_arg_kinds, s_arg_types, s_arg_kinds) {
                 meet_similar_callables_impl(
                     t_arg_types,
+                    t_arg_kinds,
+                    t_arg_names,
+                    t_variables,
+                    *t_imprecise_arg_kinds,
                     t_ret.as_ref(),
                     t_fallback.as_ref(),
                     t_inst,
@@ -819,6 +826,10 @@ fn meet_callable_like(
 #[allow(clippy::too_many_arguments)]
 fn meet_similar_callables_impl(
     t_arg_types: &[Type],
+    t_arg_kinds: &[i64],
+    t_arg_names: &[Option<String>],
+    t_variables: &[Type],
+    t_imprecise_arg_kinds: bool,
     t_ret: &Type,
     t_fallback: &Type,
     t_inst: &Option<Box<Type>>,
@@ -838,12 +849,15 @@ fn meet_similar_callables_impl(
             sa,
         )?);
     }
-    let new_ret = setop_result_to_type(meet_types(t_ret, s_ret, ctx, resolver), s_ret, t_ret)?;
+    // meet.py:1414 ret_type=meet_types(t_ret, s_ret); map with the same
+    // argument order (SameS -> first). The old (s_ret, t_ret) order
+    // mapped an is_subtype win onto the wrong operand.
+    let new_ret = setop_result_to_type(meet_types(t_ret, s_ret, ctx, resolver), t_ret, s_ret)?;
     let new_instance_type = match (t_inst, s_inst) {
         (Some(ti), Some(si)) => Some(Box::new(setop_result_to_type(
             meet_types(ti, si, ctx, resolver),
-            si,
             ti,
+            si,
         )?)),
         _ => None,
     };
@@ -852,18 +866,20 @@ fn meet_similar_callables_impl(
     let new_callable = Type::CallableType {
         fallback: Box::new(new_fallback),
         instance_type: new_instance_type,
+        // Python's meet_similar_callables preserves t's flags,
+        // arg_kinds, arg_names, and variables (copy_modified).
         is_ellipsis_args: false,
         implicit: false,
         is_bound: false,
         from_concatenate: false,
-        imprecise_arg_kinds: false,
+        imprecise_arg_kinds: t_imprecise_arg_kinds,
         unpack_kwargs: false,
         arg_types: new_arg_types,
-        arg_kinds: vec![0; t_arg_types.len()],
-        arg_names: Vec::new(),
+        arg_kinds: t_arg_kinds.to_vec(),
+        arg_names: t_arg_names.to_vec(),
         ret_type: Box::new(new_ret),
         name: None,
-        variables: Vec::new(),
+        variables: t_variables.to_vec(),
         type_guard: None,
         type_is: None,
     };
@@ -5515,6 +5531,46 @@ mod tests {
             meet_types(&s, &t, &ctx(true), &r),
             Some(SetOpResult::Encoded(_))
         ));
+    }
+
+    #[test]
+    fn meet_similar_callables_uses_t_operand_for_ret_order() {
+        // Regression: meet of def(A)->A and def(B)->B (B<:A) is
+        // def(A)->B (args joined, ret met); the operand order passed
+        // to setop_result_to_type was reversed.
+        let r = make_resolver(vec![
+            snap("builtins.function", "function"),
+            snap_with_bases("a.A", "A", &["builtins.object"]),
+            snap_with_bases("a.B", "B", &["a.A"]),
+        ]);
+        let a = instance("a.A", vec![]);
+        let b = instance("a.B", vec![]);
+        let s = callable("builtins.function", vec![a.clone()], a.clone());
+        let t = callable("builtins.function", vec![b.clone()], b.clone());
+        let result = meet_types(&s, &t, &ctx(true), &r)
+            .expect("both non-generic similar callables should resolve");
+        let SetOpResult::Encoded(bytes) = result else {
+            panic!("expected Encoded result");
+        };
+        let joined = decode_type(&bytes).expect("encoded callable should decode");
+        let Type::CallableType {
+            arg_types,
+            ret_type,
+            ..
+        } = joined
+        else {
+            panic!("expected decoded CallableType");
+        };
+        assert_eq!(
+            arg_types,
+            vec![a],
+            "argument types are joined (contravariant): (A) stays A"
+        );
+        assert_eq!(
+            *ret_type,
+            b,
+            "return types are met (covariant): meet(A, B) = B"
+        );
     }
 
     #[test]
