@@ -430,6 +430,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_append_union_note, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_pretty_callable, module)?)?;
+    // Issue #358: dmypy server pure helper — count_stats from mypy/util.py
+    module.add_function(wrap_pyfunction!(messages::rust_count_stats, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
         module

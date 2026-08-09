@@ -22,6 +22,15 @@ try:
 except ImportError:
     orjson = None
 
+# Issue #358: dmypy server pure helper — count_stats native path.
+try:
+    from type_kernel import rust_count_stats as _rust_count_stats
+
+    _HAS_RUST_COUNT_STATS = True
+except ImportError:
+    _rust_count_stats = None  # type: ignore[assignment]
+    _HAS_RUST_COUNT_STATS = False
+
 try:
     import _curses  # noqa: F401
     import curses
@@ -501,6 +510,11 @@ def check_python_version(program: str) -> None:
 
 def count_stats(messages: list[str]) -> tuple[int, int, int]:
     """Count total number of errors, notes and error_files in message list."""
+    # Issue #358: try the Rust-native path when available.
+    if _HAS_RUST_COUNT_STATS:
+        result = _rust_count_stats(messages)
+        if result is not None:
+            return (int(result[0]), int(result[1]), int(result[2]))
     errors = [e for e in messages if ": error:" in e]
     error_files = {e.split(":")[0] for e in errors}
     notes = [e for e in messages if ": note:" in e]
