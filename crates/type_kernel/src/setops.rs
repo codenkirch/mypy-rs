@@ -5567,8 +5567,7 @@ mod tests {
             "argument types are joined (contravariant): (A) stays A"
         );
         assert_eq!(
-            *ret_type,
-            b,
+            *ret_type, b,
             "return types are met (covariant): meet(A, B) = B"
         );
     }
