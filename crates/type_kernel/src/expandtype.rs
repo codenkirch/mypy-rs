@@ -59,6 +59,12 @@ pub(crate) fn rust_expand_type(
     if env.is_empty() {
         return None;
     }
+    // Wire-decoded TypeAliasType carries alias=None, which the Python graph
+    // asserts against on access (types.py:362/397). Defer alias-bearing
+    // inputs to Python, preserving object identity.
+    if result_contains_typealias(&typ) {
+        return None;
+    }
     expand_with_env(&typ, &env, strict_optional)
 }
 
@@ -89,6 +95,13 @@ pub(crate) fn expand_type_with_env(
     }
     let expanded = expand_type_inner(typ, env, strict_optional)?;
     if result_has_typevar(&expanded) {
+        return None;
+    }
+    // A surviving TypeAliasType decodes from the wire with alias=None, and
+    // Python's TypeAliasType.is_recursive asserts alias is not None
+    // (types.py:397), so an unfixed alias crashes the caller. Defer any
+    // expansion whose result still contains a TypeAliasType node.
+    if result_contains_typealias(&expanded) {
         return None;
     }
     Some(expanded)
@@ -145,15 +158,21 @@ pub(crate) fn expand_type_by_instance_core(
     let Type::Instance { type_ref, args, .. } = instance else {
         return None;
     };
-    // Python fast path (expandtype.py:298-299) returns `typ` unchanged
-    // when the instance has no args and no TVT.
-    if args.is_empty() {
-        return Some(typ.clone());
+    // Wire-decoded TypeAliasType carries alias=None, which the Python
+    // graph asserts against (is_recursive/_expand_once, types.py:362/397).
+    // Preserve identity by deferring any alias-bearing input to Python.
+    if result_contains_typealias(typ) {
+        return None;
     }
     let snap = resolver.get(type_ref)?;
     // TypeVarTuple branch (expandtype.py:302-316) stays in Python.
     if snap.has_type_var_tuple_type {
         return None;
+    }
+    // Python fast path (expandtype.py:298-299) returns `typ` unchanged
+    // when the instance has no args and no TVT.
+    if args.is_empty() {
+        return Some(typ.clone());
     }
     let raw_ids = &snap.type_var_raw_ids;
     // Python `zip` truncates to the shorter; any unbound tvar makes
@@ -726,6 +745,63 @@ fn result_has_typevar(typ: &Type) -> bool {
             }
             Type::Instance { args, .. } => stack.extend(args.iter()),
             Type::TypeAliasType { args, .. } => stack.extend(args.iter()),
+            Type::CallableType {
+                arg_types,
+                ret_type,
+                fallback,
+                instance_type,
+                variables,
+                ..
+            } => {
+                stack.extend(arg_types.iter());
+                stack.push(ret_type);
+                stack.push(fallback);
+                if let Some(it) = instance_type {
+                    stack.push(it);
+                }
+                stack.extend(variables.iter());
+            }
+            Type::TupleType {
+                items,
+                partial_fallback,
+                ..
+            } => {
+                stack.extend(items.iter());
+                stack.push(partial_fallback);
+            }
+            Type::TypedDictType {
+                items, fallback, ..
+            } => {
+                stack.extend(items.iter().map(|(_, t)| t));
+                stack.push(fallback);
+            }
+            Type::UnionType { items, .. } => stack.extend(items.iter()),
+            Type::Overloaded { items, .. } => stack.extend(items.iter()),
+            Type::Parameters(params) => {
+                stack.extend(params.arg_types.iter());
+                stack.extend(params.variables.iter());
+            }
+            Type::TypeType { item, .. } => stack.push(item),
+            Type::UnpackType { typ } => stack.push(typ),
+            Type::LiteralType { fallback, .. } => stack.push(fallback),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if `typ` contains any TypeAliasType node. Wire round-trips decode
+/// TypeAliasType with alias=None, which Python asserts against on access
+/// (`TypeAliasType.is_recursive`, types.py:397), so such results must defer
+/// to the Python visitor which preserves the original alias object.
+fn result_contains_typealias(typ: &Type) -> bool {
+    let mut stack = vec![typ];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Type::TypeAliasType { .. } => {
+                return true;
+            }
+            Type::Instance { args, .. } => stack.extend(args.iter()),
             Type::CallableType {
                 arg_types,
                 ret_type,

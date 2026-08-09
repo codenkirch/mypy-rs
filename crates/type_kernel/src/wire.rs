@@ -2248,13 +2248,9 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             Ok(())
         }
 
-        Type::TypeAliasType { args, type_ref } => {
-            write_tag(buf, TYPE_ALIAS_TYPE);
-            write_type_list(buf, args)?;
-            write_str(buf, type_ref)?;
-            write_tag(buf, END_TAG);
-            Ok(())
-        }
+        Type::TypeAliasType { .. } => Err(WireError::invalid(
+            "write_type: cannot serialize TypeAliasType (alias node would be lost)",
+        )),
 
         Type::Parameters(p) => write_parameters(buf, p),
 

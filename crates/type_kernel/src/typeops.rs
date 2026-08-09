@@ -1882,7 +1882,10 @@ mod tests {
         };
         let i = plain_instance("builtins.int");
         let union = union_of(vec![alias, i]);
-        assert!(rust_separate_union_literals(&encode(&union)).is_none());
+        // Alias-bearing types are not wire-encodable at all: writing one drops
+        // the alias node, so the wire refuses it and the call defers to Python
+        // at the encode boundary (same deferral intent as a None return).
+        assert!(super::encode_type(&union).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1995,6 +1998,9 @@ mod tests {
             args: vec![tv_type(1, "T")],
             type_ref: "mod.Alias".to_string(),
         };
-        assert!(rust_get_type_vars(&encode(&alias), false).is_none());
+        // Alias-bearing types never cross the wire: the writer refuses
+        // TypeAliasType (alias node would be lost), so extraction defers to
+        // the Python visitor at the encode boundary.
+        assert!(super::encode_type(&alias).is_none());
     }
 }
