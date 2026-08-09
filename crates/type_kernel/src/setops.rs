@@ -974,14 +974,14 @@ fn combine_similar_callables(
     }
     let new_ret = setop_result_to_type(
         join_types(t_ret_type, s_ret_type, ctx, resolver),
-        s_ret_type,
         t_ret_type,
+        s_ret_type,
     )?;
     let new_instance_type = match (s_instance_type, t_instance_type) {
         (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
             join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
-            si.as_ref(),
             ti.as_ref(),
+            si.as_ref(),
         )?)),
         _ => None,
     };
@@ -1534,8 +1534,8 @@ fn visit_join(
                 //   is_type_form=s.is_type_form or t.is_type_form)
                 let joined = setop_result_to_type(
                     join_types(t_item, s_item, ctx, resolver),
-                    s_item,
                     t_item,
+                    s_item,
                 )?;
                 let new_type = Type::TypeType {
                     item: Box::new(joined),
