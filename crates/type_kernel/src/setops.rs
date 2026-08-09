@@ -391,20 +391,25 @@ pub(crate) fn meet_types(
         }
     }
 
-    // meet.py:137-141: is_proper_subtype pre-check (ignore_promotions).
-    // Only fires for Instance-Instance (Rust is_subtype returns None
-    // for non-Instance, so ErasedType never reaches the check).
-    let proper_ctx = {
-        let mut c = ctx.clone();
-        c.proper_subtype = true;
-        c.ignore_promotions = true;
-        c
-    };
-    if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
-        return Some(SetOpResult::SameS);
-    }
-    if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
-        return Some(SetOpResult::SameT);
+    // meet.py:139-141: is_proper_subtype pre-check (ignore_promotions),
+    // skipped when either side is an UnboundType (meet.py:138) so an
+    // UnboundType is never eliminated by the sub-type pre-check; the
+    // visit_unbound_type visitor below decides the result instead.
+    let has_unbound =
+        matches!(s, Type::UnboundType { .. }) || matches!(t, Type::UnboundType { .. });
+    if !has_unbound {
+        let proper_ctx = {
+            let mut c = ctx.clone();
+            c.proper_subtype = true;
+            c.ignore_promotions = true;
+            c
+        };
+        if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
+            return Some(SetOpResult::SameS);
+        }
+        if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
+            return Some(SetOpResult::SameT);
+        }
     }
 
     // meet.py:143-144 (isinstance(s, ErasedType) -> return s) is
