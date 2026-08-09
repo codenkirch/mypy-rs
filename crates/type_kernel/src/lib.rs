@@ -573,6 +573,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_make_optional_type,
         module
     )?)?;
+    // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
+    // (Instance, Callable, TypeVar, Tuple, etc.). Returns None for types
+    // needing semantic context, matching Python's deferral semantics.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_type_analyze,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(checkmember::rust_bind_self_fast, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkmember::rust_classify_member_access,

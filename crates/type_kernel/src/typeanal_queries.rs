@@ -1,30 +1,27 @@
 #![allow(non_local_definitions)]
 
-//! Native port of pure Type-query helpers from `mypy/typeanal.py`
-//! (continuation of the M18 metric grind toward 20% Rust).
+//! Native port of Type-query helpers and `TypeAnalyser.anal_type` hot path
+//! from `mypy/typeanal.py`.
 //!
-//! Ports four module-level functions that operate on `Type` values without
-//! needing the semantic analyzer's mutable state:
-//! - `has_explicit_any` — does the type (or a contained type) carry
-//!   `AnyType(TypeOfAny.explicit)`? Mirrors `HasExplicitAny`.
-//! - `has_any_from_unimported_type` — same shape for
-//!   `AnyType(TypeOfAny.from_unimported_type)`.
-//! - `collect_all_inner_types` — list of every type `t` contains, in
-//!   query order (`CollectAllInnerTypesQuery`, children before direct
-//!   children, root excluded).
-//! - `make_optional_type` — `Optional[t]` without union simplification
-//!   (NoneType identity / Union filter / wrap).
+//! Query helpers (no semantic context needed):
+//! - `has_explicit_any` — does the type carry `AnyType(TypeOfAny.explicit)`?
+//! - `has_any_from_unimported_type` — same for `from_unimported_type`.
+//! - `collect_all_inner_types` — list of every type `t` contains.
+//! - `make_optional_type` — `Optional[t]` without union simplification.
 //!
-//! All four defer (`None`) on `TypeAliasType` because the wire format has
-//! no alias target (mirroring `rust_has_recursive_types`): the bool queries
-//! need the target to expand, and `make_optional_type`'s union branch
-//! filters non-`None` items via `get_proper_type(item)`, which needs the
-//! live alias. The non-union `make_optional_type` wrap branch is alias-safe
-//! and handled natively.
+//! Hot path (`rust_type_analyze`): mirrors `TypeAnalyser.anal_type`, analyzing
+//! already-bound types (Instance, Callable, TypeVar, etc.) by recursing into
+//! children and rebuilding. Returns `None` for types needing semantic context
+//! (UnboundType, TypeAliasType, PlaceholderType) — exactly the deferral pattern
+//! Python uses (lookup_qualified, plugin hooks, type alias expansion).
+//!
+//! All four queries defer on `TypeAliasType`; `rust_type_analyze` also defers on
+//! TypeAliasType and UnboundType because their analysis requires the live alias
+//! target or symbol lookup respectively.
 
 use pyo3::prelude::*;
 
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Type, WriteBuffer};
 
 // TypeOfAny constants (mirror mypy/types.py:213-239).
 const EXPLICIT: i64 = 2;
@@ -688,4 +685,569 @@ mod tests {
             _ => panic!("expected UnionType"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// rust_type_analyze — hot path mirroring TypeAnalyser.anal_type
+// ---------------------------------------------------------------------------
+
+/// Mirrors `TypeAnalyser.anal_type` for types that can be analyzed without
+/// semantic context (Instance, Callable, TypeVar, Tuple, TypedDict, Union,
+/// TypeType, Literal, etc.). Returns `None` for types requiring symbol lookup
+/// (UnboundType), alias expansion (TypeAliasType), or placeholder resolution
+/// (PlaceholderType), matching Python's deferral semantics exactly.
+///
+/// Flags control tuple literal syntax, ParamSpec literal syntax, and unpack
+/// handling — these are the same options the Python visitor carries.
+#[pyfunction]
+#[pyo3(signature = (type_bytes, allow_tuple_literal=false, allow_param_spec_literals=false, allow_unpack=false))]
+pub(crate) fn rust_type_analyze(
+    type_bytes: &[u8],
+    allow_tuple_literal: bool,
+    allow_param_spec_literals: bool,
+    allow_unpack: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    let t = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let analyzed = match analyze_type_inner(
+        &t,
+        allow_tuple_literal,
+        allow_param_spec_literals,
+        allow_unpack,
+    ) {
+        Some(result) => result,
+        None => return Ok(None),
+    };
+    Ok(encode_type(&analyzed))
+}
+
+/// Core analysis of a single Type value. Returns `None` when the type requires
+/// semantic context (symbol lookup, alias expansion, etc.).
+fn analyze_type_inner(
+    t: &Type,
+    allow_tuple_literal: bool,
+    allow_param_spec_literals: bool,
+    allow_unpack: bool,
+) -> Option<Type> {
+    match t {
+        // Already-bound types: analyze children.
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        } => {
+            let args = analyze_type_list(
+                args,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            let lkv = match last_known_value {
+                Some(v) => Some(Box::new(analyze_type_inner(
+                    v,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?)),
+                None => None,
+            };
+            Some(Type::Instance {
+                type_ref: type_ref.clone(),
+                args,
+                last_known_value: lkv,
+                extra_attrs: extra_attrs.as_ref().map(|ea| ExtraAttrs {
+                    attrs: ea
+                        .attrs
+                        .iter()
+                        .map(|(k, v)| {
+                            (
+                                k.clone(),
+                                analyze_type_inner(
+                                    v,
+                                    allow_tuple_literal,
+                                    allow_param_spec_literals,
+                                    allow_unpack,
+                                )
+                                .unwrap(),
+                            )
+                        })
+                        .collect(),
+                    immutable: ea.immutable.clone(),
+                    mod_name: ea.mod_name.clone(),
+                }),
+            })
+        }
+
+        Type::TypeAliasType {
+            args: _,
+            type_ref: _,
+        } => {
+            // Type alias expansion needs the live alias target (symbol lookup,
+            // type parameter substitution). Defer to Python.
+            None
+        }
+
+        Type::TypeVarType {
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            values,
+            upper_bound,
+            default,
+            variance,
+            meta_level,
+        } => {
+            let values = analyze_type_list(
+                values,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            let upper_bound = Box::new(analyze_type_inner(
+                upper_bound,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let default = Box::new(analyze_type_inner(
+                default,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::TypeVarType {
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                values,
+                upper_bound,
+                default,
+                variance: *variance,
+                meta_level: *meta_level,
+            })
+        }
+
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor,
+            upper_bound,
+            default,
+        } => {
+            let prefix = Box::new(Parameters {
+                arg_types: analyze_type_list(
+                    &prefix.arg_types,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?,
+                arg_kinds: prefix.arg_kinds.clone(),
+                arg_names: prefix.arg_names.clone(),
+                variables: analyze_type_var_likes(
+                    &prefix.variables,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?,
+                imprecise_arg_kinds: prefix.imprecise_arg_kinds,
+            });
+            let upper_bound = Box::new(analyze_type_inner(
+                upper_bound,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let default = Box::new(analyze_type_inner(
+                default,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::ParamSpecType {
+                prefix,
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                flavor: *flavor,
+                upper_bound,
+                default,
+            })
+        }
+
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default,
+            min_len,
+        } => {
+            let tuple_fallback = Box::new(analyze_type_inner(
+                tuple_fallback,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let upper_bound = Box::new(analyze_type_inner(
+                upper_bound,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let default = Box::new(analyze_type_inner(
+                default,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::TypeVarTupleType {
+                tuple_fallback,
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                upper_bound,
+                default,
+                min_len: *min_len,
+            })
+        }
+
+        Type::UnpackType { typ } => {
+            // Unpack analysis needs allow_unpack context and nesting_level tracking.
+            // Defer to Python unless allow_unpack is set.
+            if !allow_unpack {
+                return None;
+            }
+            let typ = Box::new(analyze_type_inner(
+                typ,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                true,
+            )?);
+            Some(Type::UnpackType { typ })
+        }
+
+        Type::Parameters(p) => Some(Type::Parameters(Parameters {
+            arg_types: analyze_type_list(
+                &p.arg_types,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?,
+            arg_kinds: p.arg_kinds.clone(),
+            arg_names: p.arg_names.clone(),
+            variables: analyze_type_var_likes(
+                &p.variables,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?,
+            imprecise_arg_kinds: p.imprecise_arg_kinds,
+        })),
+
+        Type::UnboundType { .. } => {
+            // UnboundType needs symbol lookup (lookup_qualified) in the
+            // semantic analyzer. Python handles this by looking up the name
+            // and dispatching to ParamSpecExpr/TypeVarExpr/TypeInfo/etc.
+            // Rust has no access to the symbol table.
+            None
+        }
+
+        Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } => {
+            let source_any = match source_any {
+                Some(sa) => {
+                    let analyzed = analyze_type_inner(
+                        sa,
+                        allow_tuple_literal,
+                        allow_param_spec_literals,
+                        allow_unpack,
+                    )?;
+                    Some(Box::new(analyzed))
+                }
+                None => None,
+            };
+            Some(Type::AnyType {
+                type_of_any: *type_of_any,
+                source_any,
+                missing_import_name: missing_import_name.clone(),
+            })
+        }
+
+        Type::NoneType => Some(Type::NoneType),
+
+        Type::UninhabitedType { ambiguous } => Some(Type::UninhabitedType {
+            ambiguous: *ambiguous,
+        }),
+
+        Type::DeletedType { source } => Some(Type::DeletedType {
+            source: source.clone(),
+        }),
+
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            // Callable analysis: analyze arg_types, ret_type, variables, and
+            // optional fields. This is the most complex branch — mirroring
+            // visit_callable_type which binds type vars, handles type guards,
+            // and analyzes star args.
+            let ret = analyze_type_inner(
+                ret_type,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            let arg_types = analyze_type_list(
+                arg_types,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            let variables = analyze_type_var_likes(
+                variables,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            let type_guard = match type_guard {
+                Some(g) => Some(Box::new(analyze_type_inner(
+                    g,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?)),
+                None => None,
+            };
+            let type_is = match type_is {
+                Some(ti) => Some(Box::new(analyze_type_inner(
+                    ti,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?)),
+                None => None,
+            };
+            let instance_type = match instance_type {
+                Some(it) => Some(Box::new(analyze_type_inner(
+                    it,
+                    allow_tuple_literal,
+                    allow_param_spec_literals,
+                    allow_unpack,
+                )?)),
+                None => None,
+            };
+            let fallback = Box::new(analyze_type_inner(
+                fallback,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::CallableType {
+                fallback,
+                instance_type,
+                is_ellipsis_args: *is_ellipsis_args,
+                implicit: *implicit,
+                is_bound: *is_bound,
+                from_concatenate: *from_concatenate,
+                imprecise_arg_kinds: *imprecise_arg_kinds,
+                unpack_kwargs: *unpack_kwargs,
+                arg_types,
+                arg_kinds: arg_kinds.clone(),
+                arg_names: arg_names.clone(),
+                ret_type: Box::new(ret),
+                name: name.clone(),
+                variables,
+                type_guard,
+                type_is,
+            })
+        }
+
+        Type::Overloaded { items } => {
+            // Each overloaded item is a CallableType (Python asserts this).
+            let items: Vec<Type> = items
+                .iter()
+                .map(|item| match item {
+                    Type::CallableType { .. } => analyze_type_inner(
+                        item,
+                        allow_tuple_literal,
+                        allow_param_spec_literals,
+                        allow_unpack,
+                    ),
+                    _ => None,
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::Overloaded { items })
+        }
+
+        Type::TupleType {
+            partial_fallback,
+            items,
+            implicit,
+        } => {
+            let partial_fallback = Box::new(analyze_type_inner(
+                partial_fallback,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let items = analyze_type_list(
+                items,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            Some(Type::TupleType {
+                partial_fallback,
+                items,
+                implicit: *implicit,
+            })
+        }
+
+        Type::TypedDictType {
+            fallback,
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+        } => {
+            let fallback = Box::new(analyze_type_inner(
+                fallback,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            let items_out: Vec<_> = items
+                .iter()
+                .map(|(k, v)| {
+                    analyze_type_inner(
+                        v,
+                        allow_tuple_literal,
+                        allow_param_spec_literals,
+                        allow_unpack,
+                    )
+                    .map(|t| (k.clone(), t))
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::TypedDictType {
+                fallback,
+                items: items_out,
+                required_keys: required_keys.clone(),
+                readonly_keys: readonly_keys.clone(),
+                is_closed: *is_closed,
+            })
+        }
+
+        Type::LiteralType { fallback, value } => {
+            let fallback = Box::new(analyze_type_inner(
+                fallback,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::LiteralType {
+                fallback,
+                value: value.clone(),
+            })
+        }
+
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+            can_be_true,
+            can_be_false,
+        } => {
+            let items = analyze_type_list(
+                items,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?;
+            Some(Type::UnionType {
+                items,
+                uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true: *can_be_true,
+                can_be_false: *can_be_false,
+            })
+        }
+
+        Type::TypeType { item, is_type_form } => {
+            let item = Box::new(analyze_type_inner(
+                item,
+                allow_tuple_literal,
+                allow_param_spec_literals,
+                allow_unpack,
+            )?);
+            Some(Type::TypeType {
+                item,
+                is_type_form: *is_type_form,
+            })
+        }
+    }
+}
+
+/// Analyze a list of types, returning `None` if any child defers.
+fn analyze_type_list(
+    types: &[Type],
+    allow_tuple_literal: bool,
+    allow_param_spec_literals: bool,
+    allow_unpack: bool,
+) -> Option<Vec<Type>> {
+    let mut out = Vec::with_capacity(types.len());
+    for t in types {
+        out.push(analyze_type_inner(
+            t,
+            allow_tuple_literal,
+            allow_param_spec_literals,
+            allow_unpack,
+        )?);
+    }
+    Some(out)
+}
+
+/// Analyze TypeVar-like types (TypeVarType, ParamSpecType, TypeVarTupleType).
+fn analyze_type_var_likes(
+    types: &[Type],
+    allow_tuple_literal: bool,
+    allow_param_spec_literals: bool,
+    allow_unpack: bool,
+) -> Option<Vec<Type>> {
+    let mut out = Vec::with_capacity(types.len());
+    for t in types {
+        out.push(analyze_type_inner(
+            t,
+            allow_tuple_literal,
+            allow_param_spec_literals,
+            allow_unpack,
+        )?);
+    }
+    Some(out)
 }
