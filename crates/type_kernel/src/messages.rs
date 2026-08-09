@@ -1862,6 +1862,30 @@ pub fn rust_pretty_callable(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ── dmypy server helper (Issue #358) ──────────────────────────────────────────
+
+/// `mypy/util.py:count_stats` — count errors, notes and error_files in a message list.
+///
+/// Pure computation over a `list[str]`. Called from `dmypy_server.py` during
+/// `initialize_fine_grained` and `increment_output` to compute the daemon status
+/// code from the formatted message list. Returns `(n_errors, n_notes, n_error_files)`.
+///
+/// Issue #358: port of dmypy server pure helpers behind the `native_type_kernel`
+/// gate. All server orchestration (check, recheck, run, status commands) stays
+/// in Python; only the separable pure helpers are ported.
+#[pyfunction]
+pub fn rust_count_stats(messages: Vec<String>) -> (i64, i64, i64) {
+    let errors: i64 = messages.iter().filter(|e| e.contains(": error:")).count() as i64;
+    let notes: i64 = messages.iter().filter(|e| e.contains(": note:")).count() as i64;
+    let error_files: i64 = messages
+        .iter()
+        .filter(|e| e.contains(": error:"))
+        .map(|e| e.split(':').next().unwrap_or("").to_string())
+        .collect::<HashSet<String>>()
+        .len() as i64;
+    (errors, notes, error_files)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
