@@ -1253,3 +1253,243 @@ pub(crate) fn rust_narrow_declared_type(
     crate::wire::write_type(&mut wbuf, &result).ok()?;
     Some(wbuf.into_bytes())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    // ------------------------------------------------------------------
+    // helpers
+    // ------------------------------------------------------------------
+
+    fn make_resolver() -> TypeResolver {
+        let mut r = TypeResolver::new();
+        for name in ["builtins.int", "builtins.str", "builtins.object"] {
+            let mut s = TypeInfoSnapshot {
+                fullname: name.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(name.to_string());
+            s.has_base.insert(name.to_string());
+            r.insert(name.to_string(), s);
+        }
+        r
+    }
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn uninhabited() -> Type {
+        Type::UninhabitedType { ambiguous: false }
+    }
+
+    fn type_alias() -> Type {
+        Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.A".to_string(),
+        }
+    }
+
+    fn guarded(guard: &Type, typ: &Type) -> Type {
+        Type::Instance {
+            type_ref: "mypy.types.TypeGuardedType".to_string(),
+            args: vec![guard.clone(), typ.clone()],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn identity_returns_original_narrowed() {
+        // meet.py:224: declared == narrowed -> declared (via shim identity).
+        // The wrapper degrades to `Some(narrowed)` for a non-alias no-op.
+        let r = make_resolver();
+        let a = instance("a.A");
+        let out = narrow_rec(&a, &a, true, &r);
+        assert_eq!(out, Some(a));
+    }
+
+    #[test]
+    fn disjoint_int_str_uninhabited_strict() {
+        // meet.py:271-276: disjoint strict-optional -> UninhabitedType.
+        let r = make_resolver();
+        let out = narrow_rec(&instance("builtins.int"), &instance("builtins.str"), true, &r);
+        assert_eq!(out, Some(uninhabited()));
+    }
+
+    #[test]
+    fn disjoint_int_str_none_non_strict() {
+        // meet.py:271-276: disjoint non-strict-optional -> NoneType.
+        let r = make_resolver();
+        let out = narrow_rec(&instance("builtins.int"), &instance("builtins.str"), false, &r);
+        assert_eq!(out, Some(Type::NoneType));
+    }
+
+    #[test]
+    fn union_narrowed_maps_per_item() {
+        // meet.py:277-280: narrowed UnionType -> per-item results, simplified.
+        // Union[int, str] narrowed by int -> Union[int, Uninhabited] which
+        // simplifies to int (empty/uninhabited members are dropped).
+        let r = make_resolver();
+        let n = Type::UnionType {
+            items: vec![instance("builtins.int"), instance("builtins.str")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let out = narrow_rec(&n, &instance("builtins.int"), true, &r).unwrap();
+        assert!(matches!(out, Type::Instance { ref type_ref, .. } if type_ref == "builtins.int"));
+    }
+
+    #[test]
+    fn narrowed_any_returns_original_narrowed() {
+        // meet.py:281-282: narrowed AnyType -> original_narrowed.
+        let r = make_resolver();
+        let d = instance("builtins.int");
+        let out = narrow_rec(&d, &any_type(), true, &r).unwrap();
+        assert!(matches!(out, Type::AnyType { .. }));
+    }
+
+    #[test]
+    fn instance_instance_meet_same_branch() {
+        // meet.py:315-316: Instance + Instance -> meet_types; SameS -> declared.
+        let r = make_resolver();
+        let d = instance("builtins.int");
+        let out = narrow_rec(&d, &d, true, &r);
+        assert_eq!(out, Some(d));
+    }
+
+    #[test]
+    fn tuple_declared_defers_empty_resolver() {
+        // meet.rs:320-325: declared TupleType hits meet_types, which needs
+        // live tuple/TypeInfo lookups that an empty snapshot cannot back.
+        // Real parity for TupleType narrowing therefore defers to Python.
+        let r = make_resolver();
+        let t = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![instance("builtins.int")],
+            implicit: false,
+        };
+        let out = narrow_rec(&t, &instance("builtins.int"), true, &r);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn type_var_declared_narrows_upper_bound() {
+        // meet.py:257-263: declared TypeVarType with narrowed a subtype of
+        // the upper bound -> copy_modified(upper_bound=narrow(...)).
+        let r = make_resolver();
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            id: 1,
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Type::NoneType,
+            variance: crate::wire::Variance::Invariant,
+        };
+        let out = narrow_rec(&tv, &instance("builtins.int"), true, &r).unwrap();
+        match out {
+            Type::TypeVarType { upper_bound, .. } => {
+                match *upper_bound {
+                    Type::Instance { ref type_ref, .. } => {
+                        assert_eq!(type_ref, "builtins.int");
+                    }
+                    other => panic!("expected narrowed upper_bound, got {other:?}"),
+                }
+            }
+            other => panic!("expected TypeVarType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrapper_delegates_type_guarded_to_python() {
+        // TypeGuardedType handling needs live comparison of the guard type;
+        // wrapper defers instead of mis-narrowing.
+        let r = make_resolver();
+        let d = instance("builtins.int");
+        let g = guarded(&instance("builtins.bool"), &instance("builtins.str"));
+        let out = narrow_rec(&d, &g, true, &r);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn rust_narrow_declared_type_serializes_result() {
+        // The production seam: bytes in -> bytes out for an alias-free,
+        // non-recursive proper pair.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let resolver = NativeTypeResolver::from_resolver_for_test(make_resolver());
+            let d = instance("builtins.int");
+            let n = instance("builtins.str");
+            let declared = encode_for_test(&d);
+            let narrowed = encode_for_test(&n);
+            let out = rust_narrow_declared_type(
+                &declared,
+                &narrowed,
+                true,
+                &mut *resolver.borrow_mut(),
+            );
+            let bytes = out.expect("disjoint pair should serialize");
+            let mut buf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut buf, None).expect("decode");
+            assert_eq!(decoded, uninhabited());
+        });
+    }
+
+    #[test]
+    fn rust_narrow_declared_type_defers_alias() {
+        // meet.rs:1243-1248: TypeAliasType on either side -> None (the Python
+        // shim expands aliases itself; we must not cross a poisoned type).
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let resolver = NativeTypeResolver::from_resolver_for_test(make_resolver());
+            let declared = encode_for_test(&type_alias());
+            let narrowed = encode_for_test(&instance("builtins.int"));
+            let out = rust_narrow_declared_type(
+                &declared,
+                &narrowed,
+                true,
+                &mut *resolver.borrow_mut(),
+            );
+            assert!(out.is_none());
+        });
+    }
+
+    #[test]
+    fn rust_narrow_declared_type_defers_garbage_bytes() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let resolver = NativeTypeResolver::from_resolver_for_test(make_resolver());
+            let out = rust_narrow_declared_type(b"\xff\xff", b"\xff\xff", true, &mut *resolver.borrow_mut());
+            assert!(out.is_none());
+        });
+    }
+
+    // `NativeTypeResolver` wraps a `Py<PyRefCell<TypeResolver>>`; test
+    // helpers need a raw `TypeResolver` to read via `resolver()`.
+    // `from_resolver_for_test` is a #[cfg(test)]-gated constructor used by
+    // other type_kernel suites (see typeinfo.rs).
+
+    fn encode_for_test(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, t).expect("write type");
+        buf.into_bytes()
+    }
+}
