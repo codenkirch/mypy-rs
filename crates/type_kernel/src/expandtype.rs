@@ -59,6 +59,12 @@ pub(crate) fn rust_expand_type(
     if env.is_empty() {
         return None;
     }
+    // Wire-decoded TypeAliasType carries alias=None, which the Python graph
+    // asserts against on access (types.py:362/397). Defer alias-bearing
+    // inputs to Python, preserving object identity.
+    if result_contains_typealias(&typ) {
+        return None;
+    }
     expand_with_env(&typ, &env, strict_optional)
 }
 
@@ -83,12 +89,19 @@ pub(crate) fn expand_type_with_env(
     strict_optional: bool,
 ) -> Option<Type> {
     // Leaf types carry no TypeVars; Python returns the original object
-    // (identity), so defer rather than round-trip a fresh object.
+    // (identity). We return a cloned copy — structurally identical, wire-safe.
     if is_leaf_type(typ) {
-        return None;
+        return Some(typ.clone());
     }
     let expanded = expand_type_inner(typ, env, strict_optional)?;
     if result_has_typevar(&expanded) {
+        return None;
+    }
+    // A surviving TypeAliasType decodes from the wire with alias=None, and
+    // Python's TypeAliasType.is_recursive asserts alias is not None
+    // (types.py:397), so an unfixed alias crashes the caller. Defer any
+    // expansion whose result still contains a TypeAliasType node.
+    if result_contains_typealias(&expanded) {
         return None;
     }
     Some(expanded)
@@ -145,16 +158,21 @@ pub(crate) fn expand_type_by_instance_core(
     let Type::Instance { type_ref, args, .. } = instance else {
         return None;
     };
-    // Python fast path (expandtype.py:298-299) returns `typ` unchanged
-    // when the instance has no args and no TVT. A fresh object breaks
-    // identity, so defer rather than round-trip.
-    if args.is_empty() {
+    // Wire-decoded TypeAliasType carries alias=None, which the Python
+    // graph asserts against (is_recursive/_expand_once, types.py:362/397).
+    // Preserve identity by deferring any alias-bearing input to Python.
+    if result_contains_typealias(typ) {
         return None;
     }
     let snap = resolver.get(type_ref)?;
     // TypeVarTuple branch (expandtype.py:302-316) stays in Python.
     if snap.has_type_var_tuple_type {
         return None;
+    }
+    // Python fast path (expandtype.py:298-299) returns `typ` unchanged
+    // when the instance has no args and no TVT.
+    if args.is_empty() {
+        return Some(typ.clone());
     }
     let raw_ids = &snap.type_var_raw_ids;
     // Python `zip` truncates to the shorter; any unbound tvar makes
@@ -481,14 +499,48 @@ pub(crate) fn expand_type_inner(
             })
         }
 
-        // Deferred variants: TypeAliasType (unfixed), Overloaded,
-        // ParamSpecType, TypeVarTupleType, Parameters. These need graph
-        // resolution or prefix merging not available at this stage.
-        Type::TypeAliasType { .. }
-        | Type::Overloaded { .. }
-        | Type::ParamSpecType { .. }
-        | Type::TypeVarTupleType { .. }
-        | Type::Parameters(_) => None,
+        // TypeAliasType: Python's visit_type_alias_type expands the
+        // arguments (expandtype.py:911-918). Target cannot contain typevars
+        // (not bound by the alias itself), so we just expand the args.
+        Type::TypeAliasType { args, type_ref } => {
+            if args.is_empty() {
+                return Some(typ.clone());
+            }
+            let new_args = expand_type_list_with_unpack(args, env, strict_optional)?;
+            Some(Type::TypeAliasType {
+                args: new_args,
+                type_ref: type_ref.clone(),
+            })
+        }
+
+        // Overloaded: Python's visit_overloaded expands each item
+        // (expandtype.py:811-818). Each item is a CallableType.
+        Type::Overloaded { items } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                new_items.push(expand_type_inner(item, env, strict_optional)?);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+
+        // Parameters: Python's visit_parameters expands arg_types
+        // (expandtype.py:709-710).
+        Type::Parameters(params) => {
+            let new_arg_types =
+                expand_type_list_with_unpack(&params.arg_types, env, strict_optional)?;
+            Some(Type::Parameters(crate::wire::Parameters {
+                arg_types: new_arg_types,
+                arg_kinds: params.arg_kinds.clone(),
+                arg_names: params.arg_names.clone(),
+                variables: params.variables.clone(),
+                imprecise_arg_kinds: params.imprecise_arg_kinds,
+            }))
+        }
+
+        // Deferred variants: ParamSpecType (prefix merging too complex for
+        // this stage) and TypeVarTupleType (Python raises NotImplementedError
+        // for non-trivial replacements).
+        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => None,
     }
 }
 
@@ -693,6 +745,63 @@ fn result_has_typevar(typ: &Type) -> bool {
             }
             Type::Instance { args, .. } => stack.extend(args.iter()),
             Type::TypeAliasType { args, .. } => stack.extend(args.iter()),
+            Type::CallableType {
+                arg_types,
+                ret_type,
+                fallback,
+                instance_type,
+                variables,
+                ..
+            } => {
+                stack.extend(arg_types.iter());
+                stack.push(ret_type);
+                stack.push(fallback);
+                if let Some(it) = instance_type {
+                    stack.push(it);
+                }
+                stack.extend(variables.iter());
+            }
+            Type::TupleType {
+                items,
+                partial_fallback,
+                ..
+            } => {
+                stack.extend(items.iter());
+                stack.push(partial_fallback);
+            }
+            Type::TypedDictType {
+                items, fallback, ..
+            } => {
+                stack.extend(items.iter().map(|(_, t)| t));
+                stack.push(fallback);
+            }
+            Type::UnionType { items, .. } => stack.extend(items.iter()),
+            Type::Overloaded { items, .. } => stack.extend(items.iter()),
+            Type::Parameters(params) => {
+                stack.extend(params.arg_types.iter());
+                stack.extend(params.variables.iter());
+            }
+            Type::TypeType { item, .. } => stack.push(item),
+            Type::UnpackType { typ } => stack.push(typ),
+            Type::LiteralType { fallback, .. } => stack.push(fallback),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// True if `typ` contains any TypeAliasType node. Wire round-trips decode
+/// TypeAliasType with alias=None, which Python asserts against on access
+/// (`TypeAliasType.is_recursive`, types.py:397), so such results must defer
+/// to the Python visitor which preserves the original alias object.
+fn result_contains_typealias(typ: &Type) -> bool {
+    let mut stack = vec![typ];
+    while let Some(cur) = stack.pop() {
+        match cur {
+            Type::TypeAliasType { .. } => {
+                return true;
+            }
+            Type::Instance { args, .. } => stack.extend(args.iter()),
             Type::CallableType {
                 arg_types,
                 ret_type,
