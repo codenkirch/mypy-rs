@@ -708,10 +708,7 @@ pub(crate) fn rust_analyze_member_access(
     Ok(analyze_member_access_inner(&typ, resolver.resolver()).and_then(|typ| encode_type(&typ)))
 }
 
-fn analyze_member_access_inner<'a>(
-    typ: &'a Type,
-    resolver: &'a TypeResolver,
-) -> Option<Type> {
+fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) -> Option<Type> {
     match typ {
         // --- Instance ---
         Type::Instance { .. } => {
@@ -810,9 +807,7 @@ fn analyze_member_access_inner<'a>(
         }
         // --- CallableType ---
         Type::CallableType {
-            fallback,
-            ret_type,
-            ..
+            fallback, ret_type, ..
         } => {
             // Python: analyze_type_callable_member_access when is_type_obj(),
             // else recurse on fallback. Type objects need class-level
