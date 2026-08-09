@@ -87,10 +87,18 @@ from collections import defaultdict
 # `Options.native_type_kernel` is set, `get_type_triggers` routes through Rust,
 # falling back to Python `TypeTriggersVisitor` for unsupported types.
 try:
+    from type_kernel import (
+        rust_compute_target_modules as _rust_compute_target_modules,
+    )
+    from type_kernel import (
+        rust_compute_wildcard_triggers as _rust_compute_wildcard_triggers,
+    )
     from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
+    _rust_compute_target_modules = None  # type: ignore[assignment]
+    _rust_compute_wildcard_triggers = None  # type: ignore[assignment]
     _rust_get_type_triggers = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
@@ -103,6 +111,72 @@ def _set_native_server_deps_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_server_deps_active
     _native_server_deps_active = active
+
+
+# ====================================================================
+# M354: Pure server trigger/target computation — Python shims
+# ====================================================================
+#
+# These functions wrap the Rust pure computations. They check the native
+# gate and the `_HAS_TYPE_KERNEL` flag, then call into Rust. On any
+# failure or unhandled case, they fall back to the Python reference
+# implementations.
+
+
+def rust_compute_wildcard_triggers_pure(
+    changed_names: list[str],
+    package_nesting_level: int,
+) -> list[str] | None:
+    """Compute wildcard triggers from changed symbol names.
+
+    Mirrors the pure core of `calculate_active_triggers` wildcard expansion:
+    given changed name prefixes and nesting levels, compute wildcard triggers.
+
+    Returns None if the Rust path did not handle the input (empty list),
+    in which case the Python caller falls back to the Python implementation.
+    """
+    if not _HAS_TYPE_KERNEL or not _native_server_deps_active:
+        return None
+    try:
+        result = _rust_compute_wildcard_triggers(changed_names, package_nesting_level)
+        if result is None:
+            return None
+        return result
+    except Exception:
+        return None
+
+
+def rust_compute_target_modules_pure(
+    triggered: set[str],
+    deps: dict[str, set[str]],
+    up_to_date_modules: set[str],
+    module_ids: set[str],
+) -> list[str]:
+    """Compute which modules need reprocessing given fired triggers.
+
+    Mirrors the pure BFS core of `find_targets_recursive`: given the set of
+    fired trigger strings and the dependency map, return the list of module
+    IDs that need reprocessing.
+
+    This is a pure computation — no live AST objects are touched. The Python
+    caller handles `ensure_deps_loaded` and `lookup_target` which need
+    stateful objects.
+    """
+    if not _HAS_TYPE_KERNEL or not _native_server_deps_active:
+        return []
+    try:
+        # Convert deps dict to list of tuples for Rust FFI
+        deps_list: list[tuple[str, list[str]]] = [
+            (trigger, sorted(targets)) for trigger, targets in deps.items()
+        ]
+        module_ids_list: list[str] = sorted(module_ids)
+        up_to_date_list: list[str] = sorted(up_to_date_modules)
+        triggered_list: list[str] = sorted(triggered)
+        return _rust_compute_target_modules(
+            triggered_list, deps_list, up_to_date_list, module_ids_list
+        )
+    except Exception:
+        return []
 
 
 from mypy.nodes import (

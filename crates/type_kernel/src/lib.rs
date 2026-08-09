@@ -616,6 +616,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         serverdeps::rust_get_type_triggers,
         module
     )?)?;
+    // M354: pure server trigger/target computation
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_compute_wildcard_triggers,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_compute_target_modules,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
     module.add_function(wrap_pyfunction!(
         stubgen::rust_stubgen_render_type_args,
