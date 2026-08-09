@@ -662,6 +662,12 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         self._literal_true: Instance | None = None
         self._literal_false: Instance | None = None
 
+    def _try_native_plugin_hook(
+        self, callable_name: str, hook_method_name: str
+    ) -> Any:
+        """Delegate to module-level _try_native_plugin_hook."""
+        return _try_native_plugin_hook(callable_name, hook_method_name)
+
     def reset(self) -> None:
         self.expr_cache.clear()
 
