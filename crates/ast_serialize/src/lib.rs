@@ -645,7 +645,12 @@ fn serialize_suite(
     let uses_template_strings = serializer.uses_template_strings;
     let imports = serializer.imports.imports.clone();
     let errors = serializer.parse_errors.clone();
-    Ok((serializer.into_bytes(), imports, errors, uses_template_strings))
+    Ok((
+        serializer.into_bytes(),
+        imports,
+        errors,
+        uses_template_strings,
+    ))
 }
 
 fn serialize_import_metadata(imports: &[ImportMetadata]) -> Vec<u8> {
