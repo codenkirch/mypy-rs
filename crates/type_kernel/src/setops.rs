@@ -2942,14 +2942,14 @@ mod tests {
     }
 
     #[test]
-    fn trivial_meet_returns_none_when_subtype_defers() {
-        // Non-Instance left -> is_subtype returns None for both
-        // directions -> trivial_meet defers (returns None).
+    fn trivial_meet_defers_on_tuple_left() {
+        // TupleType left -> is_subtype defers for both directions ->
+        // trivial_meet defers (returns None).
         let r = make_resolver(vec![]);
-        let left = Type::AnyType {
-            type_of_any: 0,
-            source_any: None,
-            missing_import_name: None,
+        let left = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+            items: vec![],
+            implicit: true,
         };
         let right = instance("a.A", vec![]);
         assert_eq!(trivial_meet(&left, &right, &ctx(true), &r), None);

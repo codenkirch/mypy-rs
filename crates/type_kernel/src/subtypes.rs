@@ -1368,17 +1368,17 @@ mod tests {
     }
 
     #[test]
-    fn non_instance_returns_none() {
-        // UnionType right, AnyType left: not the nominal path.
-        let r = make_resolver(vec![]);
-        let left = any_type();
-        let right = Type::UnionType {
+    fn tuple_left_returns_none() {
+        // TupleType left: the visitor port is not at parity yet, so
+        // is_subtype defers to Python (matches the TupleType guard).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let tuple = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
             items: vec![instance("a.A", vec![])],
-            uses_pep604_syntax: true,
-            can_be_true: true,
-            can_be_false: true,
+            implicit: true,
         };
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        let right = instance("a.A", vec![]);
+        assert_eq!(is_subtype(&tuple, &right, &ctx_nominal(), &r), None);
     }
 
     #[test]
