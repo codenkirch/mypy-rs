@@ -305,6 +305,9 @@ def _set_native_checkexpr_resolver(resolver: Any) -> None:
 # Installed per build by BuildManager (None when user plugins present).
 _native_plugin_hook_registry: Any = None
 _native_plugin_hook_has_user_plugins: bool = False
+# Parallel list of Python Plugin objects (the ChainedPlugin._plugins list).
+# Used by rust_resolve_plugin_hook for the chained dispatch.
+_native_plugin_hook_plugins: Any = None
 
 
 def _set_native_checkexpr_active(active: bool) -> None:
@@ -313,17 +316,21 @@ def _set_native_checkexpr_active(active: bool) -> None:
     _native_checkexpr_active = active
 
 
-def _set_native_plugin_hook_registry(registry: Any, has_user_plugins: bool) -> None:
+def _set_native_plugin_hook_registry(
+    registry: Any, has_user_plugins: bool, plugins: Any | None = None
+) -> None:
     """Install the Stage 4 plugin-hook snapshot.
 
     Pass (None, False) to clear. When `has_user_plugins` is True the
     registry is ignored and all lookups defer to Python, since user
     plugins may match arbitrary fullnames that the registry does not
-    capture.
+    capture.  The optional `plugins` list is the ChainedPlugin._plugins
+    snapshot used by the Rust resolver.
     """
-    global _native_plugin_hook_registry, _native_plugin_hook_has_user_plugins
+    global _native_plugin_hook_registry, _native_plugin_hook_has_user_plugins, _native_plugin_hook_plugins
     _native_plugin_hook_registry = registry
     _native_plugin_hook_has_user_plugins = has_user_plugins
+    _native_plugin_hook_plugins = plugins
 
 
 def _set_native_plugin_hook_has_user_plugins(has_user_plugins: bool) -> None:
@@ -367,6 +374,64 @@ def plugin_call_hook_known_absent(callable_name: str | None) -> bool:
     ):
         return True
     return False
+
+
+# --- Stage 4: native plugin hook resolver ---
+
+# Lazily loaded Rust resolve function.
+_rust_resolve_plugin_hook: Any = None
+
+
+def _get_rust_resolve() -> Any:
+    """Return the Rust rust_resolve_plugin_hook function (lazy import)."""
+    global _rust_resolve_plugin_hook
+    if _rust_resolve_plugin_hook is None:
+        try:
+            import type_kernel as _tk
+            _rust_resolve_plugin_hook = _tk.rust_resolve_plugin_hook
+        except ImportError:
+            _rust_resolve_plugin_hook = False  # Sentinel: type_kernel not available
+    return _rust_resolve_plugin_hook
+
+
+def _try_native_plugin_hook(
+    callable_name: str,
+    hook_method_name: str,
+) -> Any:
+    """Try to resolve a plugin hook via the Rust resolver.
+
+    When the native kernel is active and builtin-only plugins are present,
+    delegates the lookup to Rust which checks the HashSet registry and
+    iterates the plugin list.  Returns the found hook or ``None`` so the
+    Python caller falls back to the full ``ChainedPlugin`` chain.
+
+    * ``callable_name`` — full name of the callable being checked.
+    * ``hook_method_name`` — name of the hook method to call (e.g.
+      ``"get_method_hook"``, ``"get_function_hook"``).
+    """
+    resolve = _get_rust_resolve()
+    if not resolve:
+        return None  # type_kernel not available or not yet imported
+
+    # If user plugins are present, defer to Python entirely.
+    if _native_plugin_hook_has_user_plugins or _native_plugin_hook_registry is None:
+        return None
+
+    plugins = _native_plugin_hook_plugins
+    if plugins is None or len(plugins) == 0:
+        return None
+
+    try:
+        result = resolve(
+            _native_plugin_hook_registry,
+            callable_name,
+            plugins,
+            hook_method_name,
+        )
+        return result  # PyObject or None
+    except Exception:
+        # On any FFI error, fall back to Python.
+        return None
 
 
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
@@ -1685,7 +1750,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # otherwise (user plugins, registry absent, or a real match).
             if not plugin_call_hook_known_absent(callable_name):
                 if object_type is not None:
-                    method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
+                    method_sig_hook = self._try_native_plugin_hook(
+                        callable_name, "get_method_signature_hook"
+                    )
+                    if method_sig_hook is None:
+                        method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
                     if method_sig_hook:
                         return self.apply_method_signature_hook(
                             callee,
@@ -1697,7 +1766,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             method_sig_hook,
                         )
                 else:
-                    function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
+                    function_sig_hook = self._try_native_plugin_hook(
+                        callable_name, "get_function_signature_hook"
+                    )
+                    if function_sig_hook is None:
+                        function_sig_hook = self.plugin.get_function_signature_hook(
+                            callable_name
+                        )
                     if function_sig_hook:
                         return self.apply_function_signature_hook(
                             callee, args, arg_kinds, context, arg_names, function_sig_hook
@@ -2291,8 +2366,22 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             callable_name
             and not plugin_call_hook_known_absent(callable_name)
             and (
-                (object_type is None and self.plugin.get_function_hook(callable_name))
-                or (object_type is not None and self.plugin.get_method_hook(callable_name))
+                (
+                    object_type is None
+                    and (
+                        self._try_native_plugin_hook(
+                            callable_name, "get_function_hook"
+                        )
+                        or self.plugin.get_function_hook(callable_name)
+                    )
+                )
+                or (
+                    object_type is not None
+                    and (
+                        self._try_native_plugin_hook(callable_name, "get_method_hook")
+                        or self.plugin.get_method_hook(callable_name)
+                    )
+                )
             )
         ):
             new_ret_type = self.apply_function_plugin(

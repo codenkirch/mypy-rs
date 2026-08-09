@@ -609,6 +609,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;
+    module.add_function(wrap_pyfunction!(
+        plugin_hooks::rust_resolve_plugin_hook,
+        module
+    )?)?;
     module.add_class::<typeinfo::NativeTypeResolver>()?;
     module.add_function(wrap_pyfunction!(suggestions::rust_best_matches, module)?)?;
     module.add_function(wrap_pyfunction!(suggestions::rust_pretty_seq, module)?)?;
