@@ -1432,8 +1432,8 @@ fn visit_join(
                                 _ => unreachable!(),
                             };
                             if let SetOpResult::Encoded(bytes) = combine_similar_callables(
-                                s,
-                                t,
+                                s_callable,
+                                t_callable,
                                 s_arg_types,
                                 t_arg_types,
                                 s_ret,
@@ -3676,7 +3676,8 @@ mod tests {
         // Both s and t are UnionType. The pre-dispatch swap only fires
         // when exactly one side is a union (join.py:311-312). When both
         // are unions, visit_union_type calls make_simplified_union
-        // which needs to merge/flatten -> defer (no Type encoder).
+        // which merges/flatten -> now returns Encoded union of
+        // [a.A, a.B] (no longer defers, the union encoder is available).
         let a = snap("a.A", "A");
         let b = snap("a.B", "B");
         let o = snap("builtins.object", "object");
@@ -3693,7 +3694,23 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            };
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]
@@ -4317,11 +4334,12 @@ mod tests {
 
     #[test]
     fn join_overloaded_with_overloaded_defers() {
-        // Both s and t are callable-like (Overloaded). The pre-dispatch
-        // defers because visit_overloaded's both-FunctionLike case
-        // (join.py:612-627) needs is_similar_callables +
-        // combine_similar_callables, which produce new CallableType /
-        // Overloaded. No Type encoder -> defer.
+        // Both s and t are callable-like (Overloaded). The both-FunctionLike
+        // case (join.py:612-627) uses is_similar_callables +
+        // combine_similar_callables which produces a new Overloaded via
+        // wire encoder. No longer defers — now returns Encoded(Overloaded).
+        // Fixed: combine_similar_callables was called with outer Overloaded
+        // types instead of inner CallableType items, causing a panic.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -4334,7 +4352,13 @@ mod tests {
         };
         let s = overloaded(vec![c()]);
         let t = overloaded(vec![c()]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert!(
+            matches!(
+                join_types(&s, &t, &ctx(true), &r),
+                Some(SetOpResult::Encoded(_))
+            ),
+            "overloaded-join should return Encoded, not defer"
+        );
     }
 
     #[test]
