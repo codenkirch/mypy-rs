@@ -54,6 +54,7 @@ mod checkpattern;
 mod checkstrformat;
 mod constraints;
 mod constraints_helpers;
+mod dataclasses;
 mod erase;
 mod erase_typevars;
 mod errors;
@@ -612,6 +613,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(suggestions::rust_pretty_seq, module)?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_get_type_triggers,
+        module
+    )?)?;
+    // Stage 30: dataclasses plugin transform seam. Currently returns None
+    // (defer to Python) because the transform operates on live AST nodes
+    // (ClassDef, TypeInfo, SymbolTableNode) rather than Type objects.
+    module.add_function(wrap_pyfunction!(
+        dataclasses::rust_dataclass_transform,
         module
     )?)?;
     Ok(())

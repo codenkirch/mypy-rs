@@ -77,6 +77,31 @@ from mypy.typevars import fill_typevars
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
+# Native type-kernel seam: when `Options.native_type_kernel` is set, the
+# dataclass class-maker callback is routed through the Rust `type_kernel`
+# extension first. The Rust path returns `None` for inputs it does not
+# fully handle, so the Python caller falls back to the pure-Python
+# `DataclassTransformer`. This is the strangler-fig per-call gate — no
+# behavior change unless the kernel is explicitly enabled.
+try:
+    from type_kernel import (
+        rust_dataclass_transform as _rust_dataclass_transform,
+    )
+
+    _HAS_NATIVE_DATACLASS = True
+except ImportError:
+    _rust_dataclass_transform = None  # type: ignore[assignment]
+    _HAS_NATIVE_DATACLASS = False
+
+_native_dataclasses_active: bool = False
+
+
+def _set_native_dataclasses_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust dataclass path."""
+    global _native_dataclasses_active
+    _native_dataclasses_active = active
+
+
 # The set of decorators that generate dataclasses.
 dataclass_makers: Final = {"dataclass", "dataclasses.dataclass"}
 # Default field specifiers for dataclasses
@@ -964,6 +989,16 @@ def dataclass_class_maker_callback(ctx: ClassDefContext) -> bool:
     if any(i.is_named_tuple for i in ctx.cls.info.mro):
         ctx.api.fail("A NamedTuple cannot be a dataclass", ctx=ctx.cls.info)
         return True
+    # Native gate: call the Rust kernel seam first; it returns None for
+    # all inputs today, so this always falls through to Python — but the
+    # seam is in place for future parity-porting.
+    if _HAS_NATIVE_DATACLASS and _native_dataclasses_active:
+        try:
+            result = _rust_dataclass_transform(ctx.cls, "", ctx.api)
+            if result is not None:
+                return True
+        except Exception:
+            pass
     transformer = DataclassTransformer(
         ctx.cls, ctx.reason, _get_transform_spec(ctx.reason), ctx.api
     )
