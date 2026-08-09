@@ -19,7 +19,8 @@ Stage 2: ``remove_instance_last_known_values`` mirrors
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from mypy.nodes import (
     AssignmentStmt,
@@ -34,8 +35,6 @@ from mypy.nodes import (
     TypeInfo,
 )
 from mypy.types import ProperType, Type
-from collections.abc import Callable
-from typing import Any, TypeVar
 
 T = TypeVar("T")
 
@@ -173,6 +172,7 @@ __all__ = [
     "rust_apply_semantic_analyzer_patches",
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
+    "rust_dataclass_transform",
 ]
 
 class NativeTypeResolver:
@@ -607,3 +607,4 @@ def rust_remove_imported_names_from_symtable(names: SymbolTable, module: str) ->
 def rust_apply_semantic_analyzer_patches(patches: list[tuple[int, Callable[[], None]]]) -> None: ...
 def rust_stubgen_render(expr: Expression) -> str | None: ...
 def rust_stubgen_render_type_args(items: list[Expression]) -> str | None: ...
+def rust_dataclass_transform(cls: Any, reason: str, api: Any) -> None: ...
