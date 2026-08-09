@@ -72,6 +72,7 @@ mod semanal_visitor;
 mod serverdeps;
 mod setops;
 mod solve;
+mod stubgen;
 mod subtypes;
 mod suggestions;
 mod traverser;
@@ -612,6 +613,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(suggestions::rust_pretty_seq, module)?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_get_type_triggers,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_stubgen_render_type_args,
         module
     )?)?;
     Ok(())

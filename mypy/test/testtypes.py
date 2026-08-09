@@ -34,12 +34,27 @@ from mypy.nodes import (
     COVARIANT,
     INVARIANT,
     ArgKind,
+    BytesExpr,
     CallExpr,
+    DictExpr,
+    EllipsisExpr,
     Expression,
     FuncDef,
+    IndexExpr,
+    IntExpr,
+    ListExpr,
+    MemberExpr,
     MypyFile,
     NameExpr,
+    OpExpr,
+    SetExpr,
+    SliceExpr,
+    StarExpr,
+    StrExpr,
+    TemplateStrExpr,
+    TupleExpr,
     TypeInfo,
+    UnaryExpr,
 )
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
@@ -7016,6 +7031,7 @@ class NativeCheckexprSuite(Suite):
         decoded = read_type(buf)
         self.assertIsInstance(decoded, UnionType)
         self.assertEqual(len(decoded.items), 2)
+
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
@@ -7296,3 +7312,198 @@ class NativeTypeAnalSuite(Suite):
         self.assertIsInstance(result.arg_types[0], Instance)
 
 
+class NativeStubgenRenderSuite(Suite):
+    """Parity tests for the stubgen AliasPrinter render port (native).
+
+    Each test builds an AST expression node, renders it via the Python
+    `AliasPrinter` (`mypy.stubgen`) and via `type_kernel.rust_stubgen_render`,
+    and asserts exact equality. The corpus mirrors the scratch harness in
+    `misc/stubgen_kernel_check.py`. Nodes the Rust path does not handle
+    return `None` and defer to Python (strangler-fig per-call gate), so only
+    the handled node kinds are exercised here.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+
+    # --- node constructors (mirror stubgen_kernel_check.py helpers) ---
+    def _n(self, name: str) -> "NameExpr":
+        return NameExpr(name)
+
+    def _m(self, expr: "Expression", attr: str) -> "MemberExpr":
+        return MemberExpr(expr, attr)
+
+    def _idx(self, base: "Expression", index: "Expression") -> "IndexExpr":
+        return IndexExpr(base, index)
+
+    def _unary(self, op: str, operand: "Expression") -> "UnaryExpr":
+        return UnaryExpr(op, operand)
+
+    def _tup(self, *items: "Expression") -> "TupleExpr":
+        return TupleExpr(list(items))
+
+    def _s(self, v: str) -> "StrExpr":
+        return StrExpr(v)
+
+    def _i(self, v: int) -> "IntExpr":
+        return IntExpr(v)
+
+    def _b(self, v: bytes) -> "BytesExpr":
+        return BytesExpr(v)
+
+    def _lst(self, *items: "Expression") -> "ListExpr":
+        return ListExpr(list(items))
+
+    def _st(self, *items: "Expression") -> "SetExpr":
+        return SetExpr(list(items))
+
+    def _d(self, *kvs: tuple["StrExpr", "Expression"]) -> "DictExpr":
+        return DictExpr(list(kvs))
+
+    def _call(
+        self,
+        callee: "Expression",
+        args: list["Expression"],
+        arg_names: list[str | None] | None = None,
+        arg_kinds: list[ArgKind] | None = None,
+    ) -> "CallExpr":
+        node = CallExpr(callee, args)
+        if arg_names is not None:
+            node.arg_names = arg_names
+        if arg_kinds is not None:
+            node.arg_kinds = arg_kinds
+        return node
+
+    def _op(self, op: str, left: "Expression", right: "Expression") -> "OpExpr":
+        return OpExpr(op, left, right)
+
+    def _slc(self, begin: "Expression | None", end: "Expression | None") -> "SliceExpr":
+        return SliceExpr(begin, end, None)
+
+    def _star(self, expr: "Expression") -> "StarExpr":
+        return StarExpr(expr)
+
+    def _ell(self) -> "EllipsisExpr":
+        return EllipsisExpr()
+
+    def _tmpl(self, s: str) -> "TemplateStrExpr":
+        return TemplateStrExpr([StrExpr(s)])
+
+    def _assert_render(self, expr: "Expression") -> None:
+        from mypy.stubgen import ASTStubGenerator, AliasPrinter
+
+        gen = ASTStubGenerator()
+        printer = AliasPrinter(gen)
+        expected = expr.accept(printer)
+        actual = self._tk.rust_stubgen_render(expr)
+        assert actual is not None, f"Rust returned None for {expr!r}"
+        assert_equal(
+            actual,
+            expected,
+            f"stubgen render mismatch: Python={expected!r} Rust={actual!r}",
+        )
+
+    # --- NameExpr ---
+    def test_name_int(self) -> None:
+        self._assert_render(self._n("int"))
+
+    def test_name_any(self) -> None:
+        self._assert_render(self._n("Any"))
+
+    def test_name_foo(self) -> None:
+        self._assert_render(self._n("Foo"))
+
+    # --- MemberExpr ---
+    def test_member_foo_bar(self) -> None:
+        self._assert_render(self._m(self._n("Foo"), "bar"))
+
+    def test_member_nested(self) -> None:
+        self._assert_render(self._m(self._m(self._n("pkg"), "sub"), "class"))
+
+    # --- IndexExpr (generics) ---
+    def test_index_list_int(self) -> None:
+        self._assert_render(self._idx(self._n("list"), self._n("int")))
+
+    def test_index_optional_str(self) -> None:
+        self._assert_render(self._idx(self._n("Optional"), self._n("str")))
+
+    def test_index_list_tuple(self) -> None:
+        self._assert_render(self._idx(self._n("list"), self._idx(self._n("tuple"), self._tup(self._n("str"), self._n("int")))))
+
+    def test_index_callable(self) -> None:
+        self._assert_render(
+            self._idx(self._n("Callable"), self._tup(self._lst(self._n("int"), self._n("str")), self._n("bool")))
+        )
+
+    # --- UnaryExpr ---
+    def test_unary_neg(self) -> None:
+        self._assert_render(self._unary("-", self._i(5)))
+
+    def test_unary_not(self) -> None:
+        self._assert_render(self._unary("not", self._n("True")))
+
+    # --- TupleExpr ---
+    def test_tuple_two(self) -> None:
+        self._assert_render(self._tup(self._n("int"), self._n("str")))
+
+    def test_tuple_one(self) -> None:
+        self._assert_render(self._tup(self._n("int")))
+
+    def test_tuple_empty(self) -> None:
+        self._assert_render(self._tup())
+
+    # --- StrExpr ---
+    def test_str_literal(self) -> None:
+        self._assert_render(self._s("hello"))
+
+    def test_str_forward_ref(self) -> None:
+        self._assert_render(self._s("Foo"))
+
+    def test_str_with_quote(self) -> None:
+        self._assert_render(self._s("it's"))
+
+    def test_str_backslash(self) -> None:
+        self._assert_render(self._s("a\\b"))
+
+    # --- IntExpr / BytesExpr ---
+    def test_int_pos(self) -> None:
+        self._assert_render(self._i(42))
+
+    def test_int_neg(self) -> None:
+        self._assert_render(self._i(-1))
+
+    def test_bytes_literal(self) -> None:
+        self._assert_render(self._b(b"test"))
+
+    # --- ListExpr / SetExpr / DictExpr ---
+    def test_list_expr(self) -> None:
+        self._assert_render(self._lst(self._n("int"), self._n("str")))
+
+    def test_set_expr(self) -> None:
+        self._assert_render(self._st(self._n("int"), self._n("str")))
+
+    def test_dict_expr(self) -> None:
+        self._assert_render(self._d((self._s("key"), self._n("value"))))
+
+    # --- OpExpr ---
+    def test_op_add(self) -> None:
+        self._assert_render(self._op("+", self._n("int"), self._n("int")))
+
+    # --- SliceExpr ---
+    def test_slice_basic(self) -> None:
+        self._assert_render(self._slc(self._n("int"), self._n("int")))
+
+    def test_slice_no_start(self) -> None:
+        self._assert_render(self._slc(None, self._n("int")))
+
+    # --- StarExpr / EllipsisExpr / TemplateStrExpr ---
+    def test_star_expr(self) -> None:
+        self._assert_render(self._star(self._n("int")))
+
+    def test_ellipsis(self) -> None:
+        self._assert_render(self._ell())
+
+    def test_template_str(self) -> None:
+        self._assert_render(self._tmpl("test"))
