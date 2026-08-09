@@ -331,18 +331,16 @@ class DataclassAttribute:
         elif of == "replace":
             arg_kind = ARG_NAMED if self.is_init_var and not self.has_default else ARG_NAMED_OPT
         elif of == "__post_init__":
-            # We always use `ARG_POS` without a default value, because it is practical.
-            # Consider this case:
-            #
-            # @dataclass
-            # class My:
-            #     y: dataclasses.InitVar[str] = 'a'
-            #     def __post_init__(self, y: str) -> None: ...
-            #
-            # We would be *required* to specify `y: str = ...` if default is added here.
-            # But, most people won't care about adding default values to `__post_init__`,
-            # because it is not designed to be called directly, and duplicating default values
-            # for the sake of type-checking is unpleasant.
+            # We always use `ARG_POS` without a default value. Without a default,
+            # callers are not required to provide the argument explicitly, the
+            # `__post_init__` protocol resolves it from the field default at runtime.
+
+            # Example: `y: dataclasses.InitVar[str] = 'a'` means `__post_init__`
+            # receives `y` from the field default, so a parameter default would
+            # over-constrain direct calls.
+
+            # `__post_init__` is not designed to be called directly, and
+            # duplicating default values for the sake of type-checking is unpleasant.
             arg_kind = ARG_POS
         return Argument(
             variable=self.to_var(current_info),
@@ -353,10 +351,9 @@ class DataclassAttribute:
 
     def expand_type(self, current_info: TypeInfo) -> Type | None:
         if self.type is not None and self.info.self_type is not None:
-            # In general, it is not safe to call `expand_type()` during semantic analysis,
-            # however this plugin is called very late, so all types should be fully ready.
-            # Also, it is tricky to avoid eager expansion of Self types here (e.g. because
-            # we serialize attributes).
+            # In general, it is not safe to call `expand_type()` during semantic
+            # analysis, however this plugin is called very late, so all types
+            # should be fully ready. Avoid eager expansion of Self types here.
             with state.strict_optional_set(self._api.options.strict_optional):
                 return expand_type(
                     self.type, {self.info.self_type.id: fill_typevars(current_info)}
@@ -486,10 +483,9 @@ class DataclassTransformer:
             "match_args": self._get_bool_arg("match_args", True),
         }
 
-        # If there are no attributes, it may be that the semantic analyzer has not
-        # processed them yet. In order to work around this, we can simply skip generating
-        # __init__ if there are no attributes, because if the user truly did not define any,
-        # then the object default __init__ with an empty signature will be present anyway.
+        # If there are no attributes, the semantic analyzer may not have processed
+        # them yet. Skip generating __init__ when there are no attributes: the
+        # object default __init__ with an empty signature will be present anyway.
         self._add_init(attributes, decorator_arguments)
 
         if (
@@ -646,10 +642,9 @@ class DataclassTransformer:
         existing_slots = info.names.get("__slots__")
         slots_defined_by_plugin = existing_slots is not None and existing_slots.plugin_generated
         if existing_slots is not None and not slots_defined_by_plugin:
-            # This means we have a slots conflict.
-            # Class explicitly specifies a different `__slots__` field.
-            # And `@dataclass(slots=True)` is used.
-            # In runtime this raises a type error.
+            # This means we have a slots conflict: the class explicitly specifies a
+            # different `__slots__` field and `@dataclass(slots=True)` is used. In
+            # runtime this raises a type error.
             self._api.fail(
                 '"{}" both defines "__slots__" and is used with "slots=True"'.format(
                     self._cls.name
@@ -727,15 +722,13 @@ class DataclassTransformer:
         """
         cls = self._cls
 
-        # First, collect attributes belonging to any class in the MRO, ignoring duplicates.
-        #
-        # We iterate through the MRO in reverse because attrs defined in the parent must appear
-        # earlier in the attributes list than attrs defined in the child. See:
-        # https://docs.python.org/3/library/dataclasses.html#inheritance
-        #
-        # However, we also want attributes defined in the subtype to override ones defined
-        # in the parent. We can implement this via a dict without disrupting the attr order
-        # because dicts preserve insertion order in Python 3.7+.
+        # First, collect attributes belonging to any class in the MRO, ignoring
+        # duplicates. Iterate the MRO in reverse so parent attrs appear before
+        # child attrs. See https://docs.python.org/3/library/dataclasses.html#inheritance
+
+        # However, we also want attributes defined in the subtype to override ones
+        # defined in the parent. We can implement this via a dict without disrupting
+        # the attr order because dicts preserve insertion order in Python 3.7+.
         found_attrs: dict[str, DataclassAttribute] = {}
         for info in reversed(cls.info.mro[1:-1]):
             if "dataclass_tag" in info.metadata and "dataclass" not in info.metadata:
@@ -844,11 +837,9 @@ class DataclassTransformer:
                 has_default = True
 
             if not has_default and self._spec is _TRANSFORM_SPEC_FOR_DATACLASSES:
-                # Make all non-default dataclass attributes implicit because they are de-facto
-                # set on self in the generated __init__(), not in the class body. On the other
-                # hand, we don't know how custom dataclass transforms initialize attributes,
-                # so we don't treat them as implicit. This is required to support descriptors
-                # (https://github.com/python/mypy/issues/14868).
+                # Non-default dataclass attributes are set on self in generated __init__()
+                # rather than the class body, so mark them implicit. Custom dataclass
+                # transforms initialize differently, so theirs stay non-implicit (mypy#14868).
                 sym.implicit = True
 
             is_kw_only = kw_only
@@ -871,11 +862,9 @@ class DataclassTransformer:
                     node.final_set_in_init = True
 
             if sym.type is None and node.is_final and node.is_inferred:
-                # This is a special case, assignment like x: Final = 42 is classified
-                # annotated above, but mypy strips the `Final` turning it into x = 42.
-                # We do not support inferred types in dataclasses, so we can try inferring
-                # type for simple literals, and otherwise require an explicit type
-                # argument for Final[...].
+                                # Special case: assignment like x: Final = 42 is classified as annotated
+                # above, but mypy strips `Final` turning it into x = 42. We only infer
+                # simple literals in dataclasses, otherwise require an explicit type.
                 typ = self._api.analyze_simple_literal_type(stmt.rvalue, is_final=True)
                 if typ:
                     node.type = typ
@@ -955,10 +944,9 @@ class DataclassTransformer:
         """
         info = self._cls.info
         for attr in attributes:
-            # Classes that directly specify a dataclass_transform metaclass must be neither frozen
-            # non non-frozen per PEP681. Though it is surprising, this means that attributes from
-            # such a class must be writable even if the rest of the class hierarchy is frozen. This
-            # matches the behavior of Pyright (the reference implementation).
+            # Classes that directly specify a dataclass_transform metaclass must be
+            # neither frozen nor non-frozen per PEP681, so their attributes must be
+            # writable even when the rest of the hierarchy is frozen (matches Pyright).
             if attr.is_neither_frozen_nor_nonfrozen:
                 continue
 
@@ -1008,12 +996,13 @@ class DataclassTransformer:
     def _add_dataclass_fields_magic_attribute(self) -> None:
         attr_name = "__dataclass_fields__"
         any_type = AnyType(TypeOfAny.explicit)
-        # For `dataclasses`, use the type `dict[str, Field[Any]]` for accuracy. For dataclass
-        # transforms, it's inaccurate to use `Field` since a given transform may use a completely
-        # different type (or none); fall back to `Any` there.
-        #
-        # In either case, we're aiming to match the Typeshed stub for `is_dataclass`, which expects
-        # the instance to have a `__dataclass_fields__` attribute of type `dict[str, Field[Any]]`.
+        # For `dataclasses`, use the type `dict[str, Field[Any]]` for accuracy. For
+        # dataclass transforms, it's inaccurate to use `Field` since a given transform
+        # may use a completely different type (or none); fall back to `Any` there.
+
+        # In either case, we're aiming to match the Typeshed stub for `is_dataclass`,
+        # which expects the instance to have a `__dataclass_fields__` attribute of
+        # type `dict[str, Field[Any]]`.
         if self._spec is _TRANSFORM_SPEC_FOR_DATACLASSES:
             field_type = self._api.named_type_or_none("dataclasses.Field", [any_type]) or any_type
         else:
@@ -1049,10 +1038,9 @@ class DataclassTransformer:
                         # TODO: we can infer what's inside `**` and try to collect it.
                         message = 'Unpacking **kwargs in "field()" is not supported'
                     elif self._spec is not _TRANSFORM_SPEC_FOR_DATACLASSES:
-                        # dataclasses.field can only be used with keyword args, but this
-                        # restriction is only enforced for the *standardized* arguments to
-                        # dataclass_transform field specifiers. If this is not a
-                        # dataclasses.dataclass class, we can just skip positional args safely.
+                        # dataclasses.field requires keyword args, but only for the
+                        # *standardized* arguments to dataclass_transform field specifiers.
+                        # If not a dataclasses.dataclass class, safely skip positional args.
                         continue
                     else:
                         message = '"field()" does not accept positional arguments'
@@ -1114,10 +1102,9 @@ class DataclassTransformer:
             return default
         t = get_proper_type(sym.type)
 
-        # Perform a simple-minded inference from the signature of __set__, if present.
-        # We can't use mypy.checkmember here, since this plugin runs before type checking.
-        # We only support some basic scanerios here, which is hopefully sufficient for
-        # the vast majority of use cases.
+        # Perform simple-minded inference from the signature of __set__. We can't use
+        # mypy.checkmember here since this plugin runs before type checking. We support
+        # some basic scenarios here, which is sufficient for most use cases.
         if not isinstance(t, Instance):
             return default
         setter = t.type.get("__set__")
@@ -1279,7 +1266,8 @@ def replace_function_sig_callback(ctx: FunctionSigContext) -> CallableType:
     of the first positional argument.
     """
     if len(ctx.args) != 2:
-        # Ideally the name and context should be callee's, but we don't have it in FunctionSigContext.
+        # Ideally the name and context should be the callee's, but we don't have
+        # it in FunctionSigContext.
         ctx.api.fail(f'"{ctx.default_signature.name}" has unexpected type annotation', ctx.context)
         return ctx.default_signature
 
