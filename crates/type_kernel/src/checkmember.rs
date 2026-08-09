@@ -725,16 +725,17 @@ fn analyze_member_access_inner<'a>(
         }
         // --- AnyType ---
         Type::AnyType {
-            type_of_any,
-            source_any,
-            missing_import_name,
+            type_of_any: _,
+            source_any: _,
+            missing_import_name: _,
         } => {
             // Python: AnyType(TypeOfAny.from_another_any, source_any=typ)
-            // from_another_any = 7 per types.py
+            // from_another_any = 7 per types.py; always set regardless of
+            // the input's type_of_any (Python hardcodes it, does not copy).
             Some(Type::AnyType {
                 type_of_any: 7, // TypeOfAny.from_another_any
                 source_any: Some(Box::new(typ.clone())),
-                missing_import_name: missing_import_name.clone(),
+                missing_import_name: None,
             })
         }
         // --- UnionType ---
@@ -825,10 +826,14 @@ fn analyze_member_access_inner<'a>(
             ret_type,
             ..
         } => {
-            // Python: _analyze_member_access(name, typ.fallback, mx)
-            // when not is_type_obj(), else analyze_type_callable_member_access.
-            // Rust path: always recurse on fallback (pure).
-            analyze_member_access_inner(fallback, resolver)
+            // Python: analyze_type_callable_member_access when is_type_obj(),
+            // else recurse on fallback. Type objects need class-level
+            // lookup (mx, override_info), so defer when is_type_obj.
+            if is_type_obj(fallback, ret_type, resolver) {
+                None
+            } else {
+                analyze_member_access_inner(fallback, resolver)
+            }
         }
         // --- Overloaded ---
         Type::Overloaded { items } => {
