@@ -426,7 +426,7 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn rust_solve_generic_call(
-    py: Python<'_>,
+    _py: Python<'_>,
     resolver: &crate::typeinfo::NativeTypeResolver,
     callee_bytes: &[u8],
     arg_types_bytes: Vec<Vec<u8>>,
@@ -444,7 +444,7 @@ pub fn rust_solve_generic_call(
 
     // Step 1: Normalize (with_unpacked_kwargs + with_normalized_var_args).
     let normalized = normalize_callable(&callee).ok()?;
-    let (formal_arg_types, formal_arg_kinds, formal_arg_names, variables) = match &normalized {
+    let (formal_arg_types, _formal_arg_kinds, _formal_arg_names, variables) = match &normalized {
         Type::CallableType {
             arg_types,
             arg_kinds,
@@ -456,10 +456,12 @@ pub fn rust_solve_generic_call(
     };
 
     // Defer on ParamSpec/TypeVarTuple variables — expand_type defers.
-    if variables
-        .iter()
-        .any(|v| matches!(v, Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }))
-    {
+    if variables.iter().any(|v| {
+        matches!(
+            v,
+            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
+        )
+    }) {
         return None;
     }
 
@@ -481,10 +483,7 @@ pub fn rust_solve_generic_call(
 
         // Handle UnpackType formals (*args: *Tuple[...], etc.)
         if let Type::UnpackType { typ: unpack_inner } = formal_type {
-            if let Type::TypeVarTupleType {
-                tuple_fallback, ..
-            } = unpack_inner.as_ref()
-            {
+            if let Type::TypeVarTupleType { tuple_fallback, .. } = unpack_inner.as_ref() {
                 // Collect expanded actual types for TupleType constraint.
                 let mut expanded: Vec<Type> = Vec::with_capacity(actual_indices.len());
                 for &ai in actual_indices {
@@ -529,18 +528,13 @@ pub fn rust_solve_generic_call(
                 continue;
             }
             let formal_proper = get_proper_or_none(formal_type)?;
-            if let Some(constraints) =
-                crate::constraints::infer_constraints_full_inner(
-                    formal_proper,
-                    actual_proper,
-                    crate::constraints::SUBTYPE_OF,
-                    resolver.resolver(),
-                )
-            {
-                all_constraints.extend(constraints);
-            } else {
-                return None; // Defer on unsupported constraint shape.
-            }
+            let constraints = crate::constraints::infer_constraints_full_inner(
+                formal_proper,
+                actual_proper,
+                crate::constraints::SUBTYPE_OF,
+                resolver.resolver(),
+            )?;
+            all_constraints.extend(constraints);
         }
     }
 
@@ -549,12 +543,13 @@ pub fn rust_solve_generic_call(
     }
 
     // Step 3: Solve constraints for the callable's type vars.
-    let tvar_types: Vec<Type> = variables.iter().cloned().collect();
+    let tvar_types: Vec<Type> = variables.to_vec();
     let constraint_blobs: Vec<Vec<u8>> = all_constraints
         .iter()
         .map(|c| {
             let mut b = crate::wire::WriteBuffer::new();
-            c.write(&mut b).ok()
+            c.write(&mut b).ok()?;
+            Some(b.into_bytes())
         })
         .collect::<Option<Vec<_>>>()?;
 
@@ -562,7 +557,8 @@ pub fn rust_solve_generic_call(
         .iter()
         .map(|t| {
             let mut b = crate::wire::WriteBuffer::new();
-            crate::wire::write_type(&mut b, t).ok()
+            crate::wire::write_type(&mut b, t).ok()?;
+            Some(b.into_bytes())
         })
         .collect::<Option<_>>()?;
 
@@ -612,8 +608,12 @@ pub fn rust_solve_generic_call(
     )
 }
 
+/// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
+/// substituted type (None when the solver left it unsolved).
+type SolveEntry = ((i64, i64, String), Option<Type>);
+
 /// Decode `(raw, meta, ns, has_sol, type?)...` from a solve solutions blob.
-fn decode_solve_solutions(blob: &[u8]) -> Option<Vec<((i64, i64, String), Option<Type>)>> {
+fn decode_solve_solutions(blob: &[u8]) -> Option<Vec<SolveEntry>> {
     let mut buf = crate::wire::ReadBuffer::new(blob);
     let count = crate::wire::read_int(&mut buf).ok()?;
     let mut result = Vec::with_capacity(count as usize);

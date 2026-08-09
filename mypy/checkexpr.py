@@ -285,6 +285,7 @@ def _set_native_checkcall_active(active: bool) -> None:
     global _native_checkcall_active
     _native_checkcall_active = active
 
+
 # M25: NativeTypeResolver shared with the checkexpr kernel for
 # `method_fullname`. Installed/cleared per build by BuildManager.
 _native_checkexpr_resolver: Any = None
@@ -309,9 +310,7 @@ def _set_native_checkexpr_active(active: bool) -> None:
     _native_checkexpr_active = active
 
 
-def _set_native_plugin_hook_registry(
-    registry: Any, has_user_plugins: bool
-) -> None:
+def _set_native_plugin_hook_registry(registry: Any, has_user_plugins: bool) -> None:
     """Install the Stage 4 plugin-hook snapshot.
 
     Pass (None, False) to clear. When `has_user_plugins` is True the
@@ -377,6 +376,7 @@ def _deserialize_type_from_checkexpr(b: bytes) -> Type:
     buf = _CheckExprReadBuffer(b)
     return _checkexpr_read_type(buf)
 
+
 # Stage 4 dispatch kinds mirroring `checkcall.rs`. Values must match
 # the Rust `CALL_*` constants exactly: the parity suite asserts equality.
 CALL_PLAIN = 0  # CallableType without variables
@@ -426,6 +426,7 @@ def _try_native_normalize_callable(callee: ProperType) -> bool | None:
         return bytes(rust_bytes) == buf.getvalue()
     except (AssertionError, NotImplementedError, ValueError):
         return None
+
 
 # Type of callback user for checking individual function arguments. See
 # check_args() below for details.
@@ -1649,7 +1650,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     method_sig_hook = self.plugin.get_method_signature_hook(callable_name)
                     if method_sig_hook:
                         return self.apply_method_signature_hook(
-                            callee, args, arg_kinds, context, arg_names, object_type, method_sig_hook
+                            callee,
+                            args,
+                            arg_kinds,
+                            context,
+                            arg_names,
+                            object_type,
+                            method_sig_hook,
                         )
                 else:
                     function_sig_hook = self.plugin.get_function_signature_hook(callable_name)
@@ -2070,46 +2077,80 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     callee = callee.copy_modified(arg_types=[new_arg_type])
 
         if callee.is_generic():
-            # Stage 9: try native generic-call solving.
-            # Skip when caller already has ParamSpec/TypeVarTuple (needs refresh).
-            _native_checkcall_has_special = any(
+            # Stage 9: try native generic-call solving. Native path runs only
+            # when the kernel is active and the callee has no ParamSpec /
+            # TypeVarTuple variables (those always go through Python).
+            need_refresh = any(
                 isinstance(v, (ParamSpecType, TypeVarTupleType)) for v in callee.variables
             )
+            native_solved = False
+            # Native solve does not replicate Python's recursive-alias handling
+            # in constraint generation (constraints.py:514, 633): recursive
+            # templates are solved by special-casing. Defer those to Python.
+            has_rec_ctx = has_recursive_types(callee)
             if (
                 _CHECKEXPR_HAS_TYPE_KERNEL
                 and _native_checkcall_active
                 and _native_checkexpr_resolver is not None
-                and not _native_checkcall_has_special
+                and not need_refresh
+                and not has_rec_ctx
             ):
                 # Collect arg types and formal-to-actual mapping for Rust.
+                # Accept each arg with its formal type as context (mirroring
+                # infer_arg_types_in_context) so lambdas keep parameter/return
+                # narrowing; bare accept() degrades them to Any.
                 try:
-                    arg_types_bytes = [
-                        _serialize_type_for_checkexpr(get_proper_type(self.accept(a)))
-                        for a in args
-                    ]
-                    resolved_bytes = _rust_solve_generic_call(
-                        _native_checkexpr_resolver,
-                        _serialize_type_for_checkexpr(callee),
-                        arg_types_bytes,
-                        formal_to_actual,
-                        self.chk.in_checked_function(),
-                        type_state.infer_unions,
+                    # arg_context[ai] = callee.arg_types[fi] for non-star actuals.
+                    arg_context: list[Any | None] = [None] * len(args)
+                    for fi, actual_inds in enumerate(formal_to_actual):
+                        for ai in actual_inds:
+                            if arg_kinds[ai].is_star():
+                                continue
+                            if fi < len(callee.arg_types):
+                                arg_context[ai] = callee.arg_types[fi]
+                    # A lambda arg whose context depends on a callee type
+                    # variable needs Python's two-pass lambda inference:
+                    # args are accepted before the solve, so its body would
+                    # otherwise be checked against the bare variable. Defer.
+                    lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
+                    callee_var_ids = {v.id for v in callee.variables}
+                    lam_typevar_ctx = any(
+                        arg_context[i] is not None
+                        and any(tv.id in callee_var_ids for tv in get_type_vars(arg_context[i]))
+                        for i in lam_idx
                     )
-                    if resolved_bytes is not None:
-                        resolved_callee = _deserialize_type_from_checkexpr(bytes(resolved_bytes))
-                        if isinstance(resolved_callee, CallableType):
-                            callee = resolved_callee
-                            # After native solve, skip Python's infer pass.
-                            _native_checkcall_has_special = True
+                    if not lam_typevar_ctx:
+                        arg_types_bytes = [
+                            _serialize_type_for_checkexpr(
+                                get_proper_type(
+                                    self.accept(a, ctx) if ctx is not None else self.accept(a)
+                                )
+                            )
+                            for a, ctx in zip(args, arg_context)
+                        ]
+                        resolved_bytes = _rust_solve_generic_call(
+                            _native_checkexpr_resolver,
+                            _serialize_type_for_checkexpr(callee),
+                            arg_types_bytes,
+                            formal_to_actual,
+                            self.chk.in_checked_function(),
+                            type_state.infer_unions,
+                        )
+                        if resolved_bytes is not None:
+                            resolved_callee = _deserialize_type_from_checkexpr(
+                                bytes(resolved_bytes)
+                            )
+                            if isinstance(resolved_callee, CallableType):
+                                callee = resolved_callee
+                                # Native solve succeeded; skip Python's infer pass.
+                                native_solved = True
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python
 
-            need_refresh = _native_checkcall_has_special
-            if not need_refresh:
+            if not native_solved:
                 callee = self.infer_function_type_arguments(
-                    callee, args, arg_kinds, arg_names, formal_to_actual, False, context
+                    callee, args, arg_kinds, arg_names, formal_to_actual, need_refresh, context
                 )
-            )
             if need_refresh:
                 # Argument kinds etc. may have changed due to
                 # ParamSpec or TypeVarTuple variables being replaced with an arbitrary
@@ -2208,9 +2249,13 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Store the inferred callable type.
             self.chk.store_type(callable_node, callee)
 
-        if callable_name and not plugin_call_hook_known_absent(callable_name) and (
-            (object_type is None and self.plugin.get_function_hook(callable_name))
-            or (object_type is not None and self.plugin.get_method_hook(callable_name))
+        if (
+            callable_name
+            and not plugin_call_hook_known_absent(callable_name)
+            and (
+                (object_type is None and self.plugin.get_function_hook(callable_name))
+                or (object_type is not None and self.plugin.get_method_hook(callable_name))
+            )
         ):
             new_ret_type = self.apply_function_plugin(
                 callee,
@@ -3462,15 +3507,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             return False
         if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
             try:
-                arg_type_bytes = [
-                    _serialize_type_for_checkexpr(t) for t in arg_types
-                ]
-                target_bytes = [
-                    _serialize_type_for_checkexpr(c) for c in plausible_targets
-                ]
-                result = _rust_possible_none_type_var_overlap(
-                    arg_type_bytes, target_bytes
-                )
+                arg_type_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
+                target_bytes = [_serialize_type_for_checkexpr(c) for c in plausible_targets]
+                result = _rust_possible_none_type_var_overlap(arg_type_bytes, target_bytes)
                 if result is not None:
                     return result
             except (AssertionError, NotImplementedError, ValueError):
@@ -7072,9 +7111,7 @@ def is_duplicate_mapping(
 ) -> bool:
     if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
         try:
-            type_bytes = [
-                _serialize_type_for_checkexpr(actual_types[m]) for m in mapping
-            ]
+            type_bytes = [_serialize_type_for_checkexpr(actual_types[m]) for m in mapping]
             result = _rust_is_duplicate_mapping(
                 mapping, type_bytes, [int(k.value) for k in actual_kinds]
             )
