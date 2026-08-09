@@ -1092,6 +1092,13 @@ class BuildManager:
         from mypy.server.deps import _set_native_server_deps_active
 
         _set_native_server_deps_active(self.options.native_type_kernel)
+        # Stage 30: gate the dataclasses plugin transform seam. The Rust
+        # path (`rust_dataclass_transform`) returns None for all inputs,
+        # so this is parity-only — Python always falls back to the
+        # `DataclassTransformer` port.
+        from mypy.plugins.dataclasses import _set_native_dataclasses_active
+
+        _set_native_dataclasses_active(self.options.native_type_kernel)
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.

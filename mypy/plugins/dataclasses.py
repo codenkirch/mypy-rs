@@ -77,6 +77,199 @@ from mypy.typevars import fill_typevars
 if TYPE_CHECKING:
     from mypy.checker import TypeChecker
 
+# Native type-kernel seam: when `Options.native_type_kernel` is set, the
+# dataclass class-maker callback is routed through Rust `type_kernel` first.
+# On `None` from Rust, Python falls back to `DataclassTransformer`.
+try:
+    from type_kernel import (
+        rust_dataclass_transform as _rust_dataclass_transform,
+    )
+
+    _HAS_NATIVE_DATACLASS = True
+except ImportError:
+    _rust_dataclass_transform = None  # type: ignore[assignment]
+    _HAS_NATIVE_DATACLASS = False
+
+_native_dataclasses_active: bool = False
+
+
+def _set_native_dataclasses_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust dataclass path."""
+    global _native_dataclasses_active
+    _native_dataclasses_active = active
+
+
+# Native dataclass __init__ wire format (mirrors the Rust side in
+# crates/type_kernel/src/dataclasses.rs).
+_DATACLASS_FIELD_TAG: Final = 210
+_DATACLASS_INIT_SIG_TAG: Final = 211
+_NONE_TYPE_TAG: Final = 108
+_END_TAG: Final = 255
+
+
+def _write_short_int(buf: list[int], value: int) -> None:
+    """Encode an int in the mypy wire short-int varint.
+
+    Mirrors ''_write_short_int'' in librt_internal.c and
+    ''write_int_bare'' in crates/type_kernel/src/wire.rs.
+    """
+    if -10 <= value <= 117:
+        buf.append((value + 10) << 1)
+    elif -100 <= value <= 16283:
+        payload = ((value + 100) << 2) | 1
+        buf.append(payload & 0xFF)
+        buf.append((payload >> 8) & 0xFF)
+    elif -10000 <= value <= 536860911:
+        payload = ((value + 10000) << 3) | 0b011
+        buf.append(payload & 0xFF)
+        buf.append((payload >> 8) & 0xFF)
+        buf.append((payload >> 16) & 0xFF)
+        buf.append((payload >> 24) & 0xFF)
+    else:
+        raise ValueError(f"short-int out of range: {value}")
+
+
+def _read_short_int(buf: bytes, pos: int) -> tuple[int, int]:
+    """Decode a mypy wire short-int varint, returning (value, new_pos)."""
+    first = buf[pos]
+    if first & 1 == 0:
+        return (first >> 1) - 10, pos + 1
+    if first & 2 == 0:
+        second = buf[pos + 1]
+        return (second << 6) + (first >> 2) - 100, pos + 2
+    second = buf[pos + 1]
+    two_more = int.from_bytes(buf[pos + 2 : pos + 4], "little")
+    return (two_more << 13) + (second << 5) + (first >> 3) - 10000, pos + 4
+
+
+def _serialize_dataclass_fields_for_rust(attributes: list[DataclassAttribute]) -> bytes:
+    """Serialize the in-''__init__'' attributes for the Rust seam."""
+    buf: list[int] = []
+    _write_short_int(buf, len(attributes))
+    for attr in attributes:
+        buf.append(_DATACLASS_FIELD_TAG)
+        name = attr.name.encode()
+        _write_short_int(buf, len(name))
+        buf.extend(name)
+        alias = (attr.alias or "").encode()
+        _write_short_int(buf, len(alias))
+        buf.extend(alias)
+        buf.append(1 if attr.has_default else 0)
+        buf.append(1 if attr.kw_only else 0)
+        buf.append(1 if attr.is_in_init else 0)
+        buf.append(1 if attr.is_init_var else 0)
+    return bytes(buf)
+
+
+def _parse_native_init_signature(rust_result: bytes) -> tuple[list[str], list[int]]:
+    """Parse the Rust seam's wire-encoded __init__ signature.
+
+    Returns (names, kinds) in field order. Raises ValueError on malformed
+    bytes.
+    """
+    if not rust_result or rust_result[0] != _DATACLASS_INIT_SIG_TAG:
+        raise ValueError("bad dataclass init signature header")
+    pos = 1
+    init_len, pos = _read_short_int(rust_result, pos)
+    if init_len < 0 or pos + init_len != len(rust_result):
+        raise ValueError("bad dataclass init signature length")
+    body = rust_result[pos : pos + init_len]
+    if not body or body[0] != _DATACLASS_INIT_SIG_TAG:
+        raise ValueError("bad dataclass init signature body tag")
+    bpos = 1
+    n_args, bpos = _read_short_int(body, bpos)
+    if not (0 <= n_args <= 1000):
+        raise ValueError("bad dataclass init signature arg count")
+    names: list[str] = []
+    kinds: list[int] = []
+    for _ in range(n_args):
+        name_len, bpos = _read_short_int(body, bpos)
+        if name_len < 0 or bpos + name_len > len(body):
+            raise ValueError("bad dataclass init arg name")
+        names.append(body[bpos : bpos + name_len].decode())
+        bpos += name_len
+        kind, bpos = _read_short_int(body, bpos)
+        if kind not in (0, 1, 3, 5):
+            raise ValueError("bad dataclass init arg kind")
+        kinds.append(kind)
+    if bpos >= len(body):
+        raise ValueError("truncated dataclass init signature")
+    bpos += 1  # returns_flag
+    if bpos + 2 > len(body) or body[bpos] != _NONE_TYPE_TAG or body[bpos + 1] != _END_TAG:
+        raise ValueError("bad dataclass init signature trailer")
+    return names, kinds
+
+
+def _apply_native_dataclass_transform(
+    transformer: DataclassTransformer,
+    rust_result: bytes,
+    attributes: list[DataclassAttribute],
+) -> None:
+    """Validate the Rust result against Python's own computation, then apply.
+
+    Raises ValueError on mismatch, so a Rust bug cannot silently change
+    semantics; the caller falls back to the Python path.
+    """
+    info = transformer._cls.info
+    rust_names, rust_kinds = _parse_native_init_signature(rust_result)
+    expected_names = [attr.alias or attr.name for attr in attributes]
+    expected_kinds = [
+        5 if attr.kw_only and attr.has_default else 3 if attr.kw_only else 1 if attr.has_default else 0
+        for attr in attributes
+    ]
+    if rust_names != expected_names or rust_kinds != expected_kinds:
+        raise ValueError("native dataclass init signature mismatch")
+    args = [attr.to_argument(info, of="__init__") for attr in attributes]
+    if info.fallback_to_any:
+        for arg in args:
+            if arg.kind == ARG_POS:
+                arg.kind = ARG_OPT
+        existing_args_names = {arg.variable.name for arg in args}
+        gen_args_name = "generated_args"
+        while gen_args_name in existing_args_names:
+            gen_args_name += "_"
+        gen_kwargs_name = "generated_kwargs"
+        while gen_kwargs_name in existing_args_names:
+            gen_kwargs_name += "_"
+        args = [
+            Argument(Var(gen_args_name), AnyType(TypeOfAny.explicit), None, ARG_STAR),
+            *args,
+            Argument(Var(gen_kwargs_name), AnyType(TypeOfAny.explicit), None, ARG_STAR2),
+        ]
+    add_method_to_class(
+        transformer._api, transformer._cls, "__init__", args=args, return_type=NoneType()
+    )
+
+
+def _try_native_dataclass_transform(
+    transformer: DataclassTransformer, attributes: list[DataclassAttribute]
+) -> bool:
+    """Run the __init__ computation through the Rust seam when enabled.
+
+    Returns True if Rust computed and Python applied the signature. Any
+    failure (unsupported input, disabled gate, mismatch) falls back to the
+    Python path and returns False.
+    """
+    if not _HAS_NATIVE_DATACLASS or not _native_dataclasses_active:
+        return False
+    try:
+        filtered = [a for a in attributes if a.is_in_init and not transformer._is_kw_only_type(a.type)]
+        rust_result = _rust_dataclass_transform(
+            _serialize_dataclass_fields_for_rust(filtered),
+            transformer._cls.fullname,
+            True,  # decorator_init
+            True,  # decorator_eq
+            False,  # decorator_order
+            False,  # decorator_frozen
+        )
+        if rust_result is None:
+            return False
+        _apply_native_dataclass_transform(transformer, rust_result, filtered)
+        return True
+    except Exception:
+        return False
+
+
 # The set of decorators that generate dataclasses.
 dataclass_makers: Final = {"dataclass", "dataclasses.dataclass"}
 # Default field specifiers for dataclasses
@@ -217,8 +410,8 @@ class DataclassTransformer:
     def __init__(
         self,
         cls: ClassDef,
-        # Statement must also be accepted since class definition itself may be passed as the reason
-        # for subclass/metaclass-based uses of `typing.dataclass_transform`
+        # Statement must also be accepted since class definition itself may
+        # be passed as the reason for subclass/metaclass uses of dataclass_transform
         reason: Expression | Statement,
         spec: DataclassTransformSpec,
         api: SemanticAnalyzerPluginInterface,
@@ -227,6 +420,49 @@ class DataclassTransformer:
         self._reason = reason
         self._spec = spec
         self._api = api
+
+    def _add_init(
+        self, attributes: list[DataclassAttribute], decorator_arguments: dict[str, bool]
+    ) -> None:
+        """Generate ``__init__`` for the dataclass.
+
+        Runs through the native type-kernel seam first when enabled; the
+        Rust side computes the argument names and kinds, Python applies the
+        AST mutation. Falls back to the pure-Python path (the original
+        behavior) on any mismatch or unsupported input.
+        """
+        info = self._cls.info
+        if not (
+            decorator_arguments["init"]
+            and ("__init__" not in info.names or info.names["__init__"].plugin_generated)
+            and attributes
+        ):
+            return
+        if _try_native_dataclass_transform(self, attributes):
+            return
+        args = [
+            attr.to_argument(info, of="__init__")
+            for attr in attributes
+            if attr.is_in_init and not self._is_kw_only_type(attr.type)
+        ]
+        if info.fallback_to_any:
+            # Make positional args optional since we don't know their order.
+            for arg in args:
+                if arg.kind == ARG_POS:
+                    arg.kind = ARG_OPT
+            existing_args_names = {arg.variable.name for arg in args}
+            gen_args_name = "generated_args"
+            while gen_args_name in existing_args_names:
+                gen_args_name += "_"
+            gen_kwargs_name = "generated_kwargs"
+            while gen_kwargs_name in existing_args_names:
+                gen_kwargs_name += "_"
+            args = [
+                Argument(Var(gen_args_name), AnyType(TypeOfAny.explicit), None, ARG_STAR),
+                *args,
+                Argument(Var(gen_kwargs_name), AnyType(TypeOfAny.explicit), None, ARG_STAR2),
+            ]
+        add_method_to_class(self._api, self._cls, "__init__", args=args, return_type=NoneType())
 
     def transform(self) -> bool:
         """Apply all the necessary transformations to the underlying
@@ -254,41 +490,7 @@ class DataclassTransformer:
         # processed them yet. In order to work around this, we can simply skip generating
         # __init__ if there are no attributes, because if the user truly did not define any,
         # then the object default __init__ with an empty signature will be present anyway.
-        if (
-            decorator_arguments["init"]
-            and ("__init__" not in info.names or info.names["__init__"].plugin_generated)
-            and attributes
-        ):
-            args = [
-                attr.to_argument(info, of="__init__")
-                for attr in attributes
-                if attr.is_in_init and not self._is_kw_only_type(attr.type)
-            ]
-
-            if info.fallback_to_any:
-                # Make positional args optional since we don't know their order.
-                # This will at least allow us to typecheck them if they are called
-                # as kwargs
-                for arg in args:
-                    if arg.kind == ARG_POS:
-                        arg.kind = ARG_OPT
-
-                existing_args_names = {arg.variable.name for arg in args}
-                gen_args_name = "generated_args"
-                while gen_args_name in existing_args_names:
-                    gen_args_name += "_"
-                gen_kwargs_name = "generated_kwargs"
-                while gen_kwargs_name in existing_args_names:
-                    gen_kwargs_name += "_"
-                args = [
-                    Argument(Var(gen_args_name), AnyType(TypeOfAny.explicit), None, ARG_STAR),
-                    *args,
-                    Argument(Var(gen_kwargs_name), AnyType(TypeOfAny.explicit), None, ARG_STAR2),
-                ]
-
-            add_method_to_class(
-                self._api, self._cls, "__init__", args=args, return_type=NoneType()
-            )
+        self._add_init(attributes, decorator_arguments)
 
         if (
             decorator_arguments["eq"]

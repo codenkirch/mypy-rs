@@ -55,6 +55,7 @@ mod checkpattern;
 mod checkstrformat;
 mod constraints;
 mod constraints_helpers;
+mod dataclasses;
 mod erase;
 mod erase_typevars;
 mod errors;
@@ -633,5 +634,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Attrs plugin transform (Issue #357): seam function for class decoration.
     module.add_function(wrap_pyfunction!(attrs::rust_transform_attrs, module)?)?;
     module.add_function(wrap_pyfunction!(attrs::rust_serialize_fields, module)?)?;
+    // Stage 30: dataclasses plugin transform seam (Issue #356). Computes
+    // the `__init__` argument names/kinds from serialized field metadata;
+    // Python validates and applies the AST mutation.
+    module.add_function(wrap_pyfunction!(
+        dataclasses::rust_dataclass_transform,
+        module
+    )?)?;
     Ok(())
 }
