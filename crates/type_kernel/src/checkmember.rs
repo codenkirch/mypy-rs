@@ -668,6 +668,205 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// analyze_member_access (GENERAL dispatch path)
+// ---------------------------------------------------------------------------
+
+/// GENERAL dispatch for `_analyze_member_access` (checkmember.py:311-350).
+///
+/// Ports the pure-type-transform branches that do not need live Python
+/// checker state, plugin hooks, or error reporting.  Returns `None`
+/// (Python `None`) for cases that need Python state — the Python caller
+/// falls through to the pure-Python implementation.
+///
+/// Handled by Rust:
+///   * AnyType → AnyType(from_another_any, source_any=typ).  Pure
+///     reconstruction; `from_another_any` = 7 (TypeOfAny value in types.py).
+///   * DeletedType → AnyType(from_error).  Rust cannot report the
+///     mx.msg.deleted_as_rvalue error, so it only returns the type.
+///   * UninhabitedType → new UninhabitedType preserving `ambiguous`.
+///   * TupleType → recurse on the fallback instance.
+///   * LiteralType / CallableType / Overloaded → recurse on fallback.
+///   * ParamSpecType / TypeVarTupleType → recurse on fallback (same
+///     path as the TypeVarType upper_bound branch in Python).
+///   * TypeAliasType → recurse on None (defer) since the wire format
+///     carries no alias target; `get_proper_type` cannot expand it.
+///
+/// Deferred to Python (return None):
+///   * Instance → needs `analyze_instance_member_access` / plugin hooks.
+///   * UnionType → needs `analyze_union_member_access` (needs mx).
+///   * TypeType → needs `analyze_type_type_member_access`.
+///   * TypedDictType → needs `analyze_typeddict_access`.
+///   * NoneType → needs `analyze_none_member_access` (special __bool__).
+///   * TypeVarType → needs `make_simplified_union` / upper_bound recursion.
+///   * UnboundType / Parameters / UnpackType → needs `report_missing_attribute`.
+///   * TypeVarType with values → needs union construction.
+///   * TypeVarType upper_bound → needs recursion on the bound.
+#[pyfunction]
+pub(crate) fn rust_analyze_member_access(
+    resolver: &NativeTypeResolver,
+    typ_bytes: &[u8],
+) -> PyResult<Option<Vec<u8>>> {
+    let typ = match decode_type(typ_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    analyze_member_access_inner(&typ, resolver.resolver()).map(encode_type).transpose()
+}
+
+fn analyze_member_access_inner<'a>(
+    typ: &'a Type,
+    resolver: &'a TypeResolver,
+) -> Option<Type> {
+    match typ {
+        // --- Instance ---
+        Type::Instance { .. } => {
+            // Needs analyze_instance_member_access (plugin hooks, method lookup).
+            None
+        }
+        // --- AnyType ---
+        Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } => {
+            // Python: AnyType(TypeOfAny.from_another_any, source_any=typ)
+            // from_another_any = 7 per types.py
+            Some(Type::AnyType {
+                type_of_any: 7, // TypeOfAny.from_another_any
+                source_any: Some(Box::new(typ.clone())),
+                missing_import_name: missing_import_name.clone(),
+            })
+        }
+        // --- UnionType ---
+        Type::UnionType { .. } => {
+            // Needs analyze_union_member_access (needs mx for disable_type_names).
+            None
+        }
+        // --- TypeType ---
+        Type::TypeType { .. } => {
+            // Needs analyze_type_type_member_access (needs mx, override_info).
+            None
+        }
+        // --- TupleType ---
+        Type::TupleType {
+            partial_fallback, ..
+        } => {
+            // Python: _analyze_member_access(name, tuple_fallback(typ), mx).
+            // Fall back to the partial fallback.
+            analyze_member_access_inner(partial_fallback, resolver)
+        }
+        // --- TypedDictType ---
+        Type::TypedDictType { .. } => {
+            // Needs analyze_typeddict_access.
+            None
+        }
+        // --- NoneType ---
+        Type::NoneType => {
+            // Python: __bool__ special case or recurse on object.
+            // Pure path: recurse on builtins.object.
+            Some(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        // --- TypeVarType ---
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            ..
+        } => {
+            if !values.is_empty() {
+                // Python: make_simplified_union(typ.values), mx.
+                // We cannot build a union without knowing how to join; defer.
+                None
+            } else {
+                // Python: _analyze_member_access(name, typ.upper_bound, mx).
+                analyze_member_access_inner(upper_bound, resolver)
+            }
+        }
+        // --- ParamSpecType ---
+        // ParamSpec has no `upper_bound` / `tuple_fallback` — just defer.
+        Type::ParamSpecType { .. } => None,
+        // --- TypeVarTupleType ---
+        Type::TypeVarTupleType { tuple_fallback, .. } => {
+            // No upper_bound for TypeVarTuple; fall back to tuple_fallback.
+            analyze_member_access_inner(tuple_fallback, resolver)
+        }
+        // --- DeletedType ---
+        Type::DeletedType { .. } => {
+            // Python: mx.msg.deleted_as_rvalue(typ, mx.context).
+            // Rust cannot report the error, but returns AnyType(from_error).
+            // from_error = 5 per types.py
+            Some(Type::AnyType {
+                type_of_any: 5, // TypeOfAny.from_error
+                source_any: None,
+                missing_import_name: None,
+            })
+        }
+        // --- UninhabitedType ---
+        Type::UninhabitedType { ambiguous } => {
+            // Python: new UninhabitedType with same ambiguous flag.
+            Some(Type::UninhabitedType {
+                ambiguous: *ambiguous,
+            })
+        }
+        // --- LiteralType ---
+        Type::LiteralType { fallback, .. } => {
+            // Python: _analyze_member_access(name, typ.fallback, mx).
+            analyze_member_access_inner(fallback, resolver)
+        }
+        // --- CallableType ---
+        Type::CallableType {
+            fallback,
+            ret_type,
+            ..
+        } => {
+            // Python: _analyze_member_access(name, typ.fallback, mx)
+            // when not is_type_obj(), else analyze_type_callable_member_access.
+            // Rust path: always recurse on fallback (pure).
+            analyze_member_access_inner(fallback, resolver)
+        }
+        // --- Overloaded ---
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                // Degenerate; defer.
+                None
+            } else {
+                // Python: check first item for is_type_obj().
+                if let Some(Type::CallableType {
+                    fallback, ret_type, ..
+                }) = items.first()
+                {
+                    if is_type_obj(fallback, ret_type, resolver) {
+                        // Type object — defer to Python's
+                        // analyze_type_callable_member_access.
+                        None
+                    } else {
+                        // Normal callable — recurse on fallback.
+                        analyze_member_access_inner(fallback, resolver)
+                    }
+                } else {
+                    // No CallableType first item (shouldn't happen); defer.
+                    None
+                }
+            }
+        }
+        // --- TypeAliasType ---
+        Type::TypeAliasType { .. } => {
+            // Wire format carries no resolved alias target.
+            None
+        }
+        // --- UnboundType, Parameters, UnpackType ---
+        _ => {
+            // Needs report_missing_attribute (needs mx).
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

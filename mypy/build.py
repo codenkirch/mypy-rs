@@ -1012,10 +1012,15 @@ class BuildManager:
             _set_native_checker_active,
             _set_native_checker_types_active,
         )
-        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
 
         _set_native_checkexpr_active(self.options.native_type_kernel)
         _set_native_checkexpr_resolver(None)
+        _set_native_checkcall_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
         # M20: gate checkmember bind_self_fast (trivial-self binding),

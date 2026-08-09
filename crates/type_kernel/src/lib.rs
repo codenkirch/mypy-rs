@@ -330,6 +330,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkcall::rust_possible_none_type_var_overlap,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(checkcall::rust_solve_generic_call, module)?)?;
     module.add_function(wrap_pyfunction!(
         checker_stmts::rust_type_requires_usage,
         module
@@ -580,6 +581,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkmember::rust_analyze_instance_member_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_member_access,
         module
     )?)?;
     module.add_class::<plugin_hooks::PluginHookRegistry>()?;

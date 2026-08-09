@@ -93,6 +93,7 @@ try:
     )
     from type_kernel import (
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
+        rust_analyze_member_access as _rust_analyze_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
         rust_instance_fallback as _rust_instance_fallback,
         rust_has_operator as _rust_has_operator,
@@ -109,6 +110,7 @@ except ImportError:
     _rust_has_operator = None  # type: ignore[assignment]
     _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
+    _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
@@ -312,6 +314,30 @@ def _analyze_member_access(
     name: str, typ: Type, mx: MemberContext, override_info: TypeInfo | None = None
 ) -> Type:
     typ = get_proper_type(typ)
+    # M20: gate the general dispatch path through Rust when the kernel
+    # is active.  Rust handles pure type-transform branches (AnyType,
+    # DeletedType, UninhabitedType, TupleType fallback recursion,
+    # Literal/Callable/Overloaded fallback recursion,
+    # ParamSpec/TypeVarTuple fallback recursion).  Returns None (Python
+    # None) for branches needing plugin state, union construction, error
+    # reporting, or resolver lookups — Python falls through.
+    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+        try:
+            result = _rust_analyze_member_access(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(typ),
+            )
+            if result is not None:
+                decoded = _deserialize_type_for_checkmember(bytes(result))
+                if decoded is not None:
+                    if isinstance(decoded, ProperType):
+                        decoded.line = typ.line
+                        decoded.column = typ.column
+                        if isinstance(decoded, CallableType):
+                            decoded.fallback.line = decoded.line
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(typ, Instance):
         return analyze_instance_member_access(name, typ, mx, override_info)
     elif isinstance(typ, AnyType):

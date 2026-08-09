@@ -240,6 +240,7 @@ try:
         rust_normalize_callable as _rust_normalize_callable,
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
         rust_real_union as _rust_real_union,
+        rust_solve_generic_call as _rust_solve_generic_call,
         rust_try_getting_literal as _rust_try_getting_literal,
     )
 
@@ -264,12 +265,25 @@ except ImportError:
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
+    _rust_solve_generic_call = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
     _CHECKEXPR_HAS_TYPE_KERNEL = False
 
 _native_checkexpr_active: bool = False
+
+# Stage 9 checkcall gate: when active, generic callable solving
+# (normalize + map + infer + solve + apply) routes through the Rust kernel.
+# Rust returns None for ParamSpec/TypeVarTuple/UnpackType/TypeAliasType
+# cases, so Python falls back to the full `infer_function_type_arguments` path.
+_native_checkcall_active: bool = False
+
+
+def _set_native_checkcall_active(active: bool) -> None:
+    """Called by build manager to enable/disable native checkcall solving."""
+    global _native_checkcall_active
+    _native_checkcall_active = active
 
 # M25: NativeTypeResolver shared with the checkexpr kernel for
 # `method_fullname`. Installed/cleared per build by BuildManager.
@@ -2056,11 +2070,45 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     callee = callee.copy_modified(arg_types=[new_arg_type])
 
         if callee.is_generic():
-            need_refresh = any(
+            # Stage 9: try native generic-call solving.
+            # Skip when caller already has ParamSpec/TypeVarTuple (needs refresh).
+            _native_checkcall_has_special = any(
                 isinstance(v, (ParamSpecType, TypeVarTupleType)) for v in callee.variables
             )
-            callee = self.infer_function_type_arguments(
-                callee, args, arg_kinds, arg_names, formal_to_actual, need_refresh, context
+            if (
+                _CHECKEXPR_HAS_TYPE_KERNEL
+                and _native_checkcall_active
+                and _native_checkexpr_resolver is not None
+                and not _native_checkcall_has_special
+            ):
+                # Collect arg types and formal-to-actual mapping for Rust.
+                try:
+                    arg_types_bytes = [
+                        _serialize_type_for_checkexpr(get_proper_type(self.accept(a)))
+                        for a in args
+                    ]
+                    resolved_bytes = _rust_solve_generic_call(
+                        _native_checkexpr_resolver,
+                        _serialize_type_for_checkexpr(callee),
+                        arg_types_bytes,
+                        formal_to_actual,
+                        self.chk.in_checked_function(),
+                        type_state.infer_unions,
+                    )
+                    if resolved_bytes is not None:
+                        resolved_callee = _deserialize_type_from_checkexpr(bytes(resolved_bytes))
+                        if isinstance(resolved_callee, CallableType):
+                            callee = resolved_callee
+                            # After native solve, skip Python's infer pass.
+                            _native_checkcall_has_special = True
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    pass  # Defer to Python
+
+            need_refresh = _native_checkcall_has_special
+            if not need_refresh:
+                callee = self.infer_function_type_arguments(
+                    callee, args, arg_kinds, arg_names, formal_to_actual, False, context
+                )
             )
             if need_refresh:
                 # Argument kinds etc. may have changed due to
