@@ -310,6 +310,20 @@ def _set_native_plugin_hook_registry(
     _native_plugin_hook_has_user_plugins = has_user_plugins
 
 
+def _set_native_plugin_hook_has_user_plugins(has_user_plugins: bool) -> None:
+    """Flip only the user-plugin bit of the Stage 4 plugin-hook snapshot.
+
+    The registry is built once per manager from config-static plugins;
+    the bit is normally True only when user plugins are configured. The
+    dmypy `suggest` flow temporarily inserts a SuggestionPlugin into the
+    live ChainedPlugin `_plugins` list, so the stale bit would let
+    `plugin_call_hook_known_absent` skip the collector hook. Flip it on
+    while such transient plugins are present, off when popped.
+    """
+    global _native_plugin_hook_has_user_plugins
+    _native_plugin_hook_has_user_plugins = has_user_plugins
+
+
 def plugin_call_hook_known_absent(callable_name: str | None) -> bool:
     """Stage 4 fast-path for the four call-hook existence checks.
 

@@ -426,11 +426,18 @@ class SuggestionEngine:
 
         collector_plugin = SuggestionPlugin(func.fullname)
 
+        # Stage 4: the transient collector plugin is missing from the
+        # config-static snapshot; flip the user-plugin bit so the probe
+        # defers to Python, then restore it (no-op when kernel is off).
+        from mypy.checkexpr import _set_native_plugin_hook_has_user_plugins
+
+        _set_native_plugin_hook_has_user_plugins(True)
         self.plugin._plugins.insert(0, collector_plugin)
         try:
             errors = self.try_type(func, new_type)
         finally:
             self.plugin._plugins.pop(0)
+            _set_native_plugin_hook_has_user_plugins(False)
 
         return collector_plugin.mystery_hits, errors
 

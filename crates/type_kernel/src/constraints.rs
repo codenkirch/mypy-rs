@@ -198,6 +198,19 @@ pub(crate) fn infer_constraints_full_inner(
     {
         return None;
     }
+    // Ignore suggestion-engine Any types before any constraint is emitted:
+    // constraints.py:546 runs before the TypeVar branch, so a recursive
+    // `(T, Any_suggestion)` pair yields `[]`, never `T <: Any` (the #337 fix).
+    if let Type::AnyType {
+        type_of_any,
+        source_any: None,
+        missing_import_name: None,
+    } = actual
+    {
+        if *type_of_any == ANY_SUGGESTION {
+            return Some(vec![]);
+        }
+    }
     // Template is a TypeVar -> single constraint (direction + target).
     if let Type::TypeVarType { .. } = template {
         // Same `from_type_type` wire loss as `infer_constraints_inner`:
@@ -211,18 +224,6 @@ pub(crate) fn infer_constraints_full_inner(
             op: direction,
             target: actual.clone(),
         }]);
-    }
-    // `template` cannot be a union here (deferred below); if `actual` is an
-    // Any-with-suggestion the result is empty (mirrors constraints.py:497).
-    if let Type::AnyType {
-        type_of_any,
-        source_any: None,
-        missing_import_name: None,
-    } = actual
-    {
-        if *type_of_any == ANY_SUGGESTION {
-            return Some(vec![]);
-        }
     }
     // Actual TypeVar rebinding (constraints.py:509-515).
     if let Type::TypeVarType {
