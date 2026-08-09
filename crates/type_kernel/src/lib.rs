@@ -430,6 +430,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_append_union_note, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_pretty_callable, module)?)?;
+    // Callable name helpers — ports callable_name and for_function.
+    module.add_function(wrap_pyfunction!(messages::rust_callable_name, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_for_function, module)?)?;
     // Issue #358: dmypy server pure helper — count_stats from mypy/util.py
     module.add_function(wrap_pyfunction!(messages::rust_count_stats, module)?)?;
     module.add_function(wrap_pyfunction!(
