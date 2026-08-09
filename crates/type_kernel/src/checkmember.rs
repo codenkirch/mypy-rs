@@ -668,6 +668,195 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
+// analyze_member_access (GENERAL dispatch path)
+// ---------------------------------------------------------------------------
+
+/// GENERAL dispatch for `_analyze_member_access` (checkmember.py:311-350).
+///
+/// Ports the pure-type-transform branches that do not need live Python
+/// checker state, plugin hooks, or error reporting.  Returns `None`
+/// (Python `None`) for cases that need Python state — the Python caller
+/// falls through to the pure-Python implementation.
+///
+/// Handled by Rust:
+///   * AnyType → AnyType(from_another_any, source_any=typ).  Pure
+///     reconstruction; `from_another_any` = 7 (TypeOfAny value in types.py).
+///   * UninhabitedType → new UninhabitedType preserving `ambiguous`.
+///   * TupleType → recurse on the fallback instance.
+///   * LiteralType / CallableType / Overloaded → recurse on fallback,
+///     deferring when `is_type_obj` (needs class-level lookup).
+///   * TypeVarType (no values) / ParamSpecType / TypeVarTupleType → recurse
+///     on `upper_bound` / `tuple_fallback` (matches Python's
+///     TypeVarLikeType branch).
+///   * TypeAliasType → defer (wire format carries no alias target).
+///
+/// Deferred to Python (return None):
+///   * Instance / UnionType / TypeType / TypedDictType / NoneType / DeletedType
+///     → need analyzer state, `mx`, or error reporting.  Rust must not drop a
+///     diagnostic (e.g. `deleted_as_rvalue`) or mis-answer (`__bool__`).
+///   * TypeVarType with values → needs `make_simplified_union`.
+///   * UnboundType / Parameters / UnpackType → needs `report_missing_attribute`.
+#[pyfunction]
+pub(crate) fn rust_analyze_member_access(
+    resolver: &NativeTypeResolver,
+    typ_bytes: &[u8],
+) -> PyResult<Option<Vec<u8>>> {
+    let typ = match decode_type(typ_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(analyze_member_access_inner(&typ, resolver.resolver()).and_then(|typ| encode_type(&typ)))
+}
+
+fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) -> Option<Type> {
+    match typ {
+        // --- Instance ---
+        Type::Instance { .. } => {
+            // Needs analyze_instance_member_access (plugin hooks, method lookup).
+            None
+        }
+        // --- AnyType ---
+        Type::AnyType {
+            type_of_any: _,
+            source_any: _,
+            missing_import_name: _,
+        } => {
+            // Python: AnyType(TypeOfAny.from_another_any, source_any=typ)
+            // from_another_any = 7 per types.py; always set regardless of
+            // the input's type_of_any (Python hardcodes it, does not copy).
+            Some(Type::AnyType {
+                type_of_any: 7, // TypeOfAny.from_another_any
+                source_any: Some(Box::new(typ.clone())),
+                missing_import_name: None,
+            })
+        }
+        // --- UnionType ---
+        Type::UnionType { .. } => {
+            // Needs analyze_union_member_access (needs mx for disable_type_names).
+            None
+        }
+        // --- TypeType ---
+        Type::TypeType { .. } => {
+            // Needs analyze_type_type_member_access (needs mx, override_info).
+            None
+        }
+        // --- TupleType ---
+        Type::TupleType {
+            partial_fallback, ..
+        } => {
+            // Python: _analyze_member_access(name, tuple_fallback(typ), mx).
+            // Fall back to the partial fallback.
+            analyze_member_access_inner(partial_fallback, resolver)
+        }
+        // --- TypedDictType ---
+        Type::TypedDictType { .. } => {
+            // Needs analyze_typeddict_access.
+            None
+        }
+        // --- NoneType ---
+        Type::NoneType => {
+            // Defer to Python: analyze_none_member_access special-cases
+            // `__bool__` -> Literal[False]; non-bool names recurse on
+            // builtins.object.  Both need mx / named_type.  Returning
+            // builtins.object unconditionally would mis-answer `__bool__`.
+            None
+        }
+        // --- TypeVarType ---
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            ..
+        } => {
+            if !values.is_empty() {
+                // Python: make_simplified_union(typ.values), mx.
+                // We cannot build a union without knowing how to join; defer.
+                None
+            } else {
+                // Python: _analyze_member_access(name, typ.upper_bound, mx).
+                analyze_member_access_inner(upper_bound, resolver)
+            }
+        }
+        // --- ParamSpecType ---
+        Type::ParamSpecType { upper_bound, .. } => {
+            // Python: TypeVarLikeType -> _analyze_member_access(name, typ.upper_bound, mx).
+            analyze_member_access_inner(upper_bound, resolver)
+        }
+        // --- TypeVarTupleType ---
+        Type::TypeVarTupleType { tuple_fallback, .. } => {
+            // No upper_bound for TypeVarTuple; fall back to tuple_fallback.
+            analyze_member_access_inner(tuple_fallback, resolver)
+        }
+        // --- DeletedType ---
+        Type::DeletedType { .. } => {
+            // Defer to Python: Python reports `deleted_as_rvalue` unless
+            // mx.suppress_errors, then returns AnyType(from_error).  Rust
+            // cannot know suppress_errors and must not drop the diagnostic.
+            None
+        }
+        // --- UninhabitedType ---
+        Type::UninhabitedType { ambiguous } => {
+            // Python: new UninhabitedType with same ambiguous flag.
+            Some(Type::UninhabitedType {
+                ambiguous: *ambiguous,
+            })
+        }
+        // --- LiteralType ---
+        Type::LiteralType { fallback, .. } => {
+            // Python: _analyze_member_access(name, typ.fallback, mx).
+            analyze_member_access_inner(fallback, resolver)
+        }
+        // --- CallableType ---
+        Type::CallableType {
+            fallback, ret_type, ..
+        } => {
+            // Python: analyze_type_callable_member_access when is_type_obj(),
+            // else recurse on fallback. Type objects need class-level
+            // lookup (mx, override_info), so defer when is_type_obj.
+            if is_type_obj(fallback, ret_type, resolver) {
+                None
+            } else {
+                analyze_member_access_inner(fallback, resolver)
+            }
+        }
+        // --- Overloaded ---
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                // Degenerate; defer.
+                None
+            } else {
+                // Python: check first item for is_type_obj().
+                if let Some(Type::CallableType {
+                    fallback, ret_type, ..
+                }) = items.first()
+                {
+                    if is_type_obj(fallback, ret_type, resolver) {
+                        // Type object — defer to Python's
+                        // analyze_type_callable_member_access.
+                        None
+                    } else {
+                        // Normal callable — recurse on fallback.
+                        analyze_member_access_inner(fallback, resolver)
+                    }
+                } else {
+                    // No CallableType first item (shouldn't happen); defer.
+                    None
+                }
+            }
+        }
+        // --- TypeAliasType ---
+        Type::TypeAliasType { .. } => {
+            // Wire format carries no resolved alias target.
+            None
+        }
+        // --- UnboundType, Parameters, UnpackType ---
+        _ => {
+            // Needs report_missing_attribute (needs mx).
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
