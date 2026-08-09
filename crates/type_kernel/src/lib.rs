@@ -330,7 +330,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkcall::rust_possible_none_type_var_overlap,
         module
     )?)?;
-    module.add_function(wrap_pyfunction!(checkcall::rust_solve_generic_call, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkcall::rust_solve_generic_call,
         module
