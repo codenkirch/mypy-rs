@@ -306,6 +306,60 @@ fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// checker narrowing stubs (issue #347)
+// ---------------------------------------------------------------------------
+//
+// These four entry points are the #347 checker-narrowing seam: each returns
+// `None` so the Python shim falls through to the pure-Python implementation.
+// They exist so the dispatch gate (`_native_checker_narrowing_active`) can be
+// wired and asserted for the functions that legitimately stay Python-only
+// (live expression nodes, the conditional type binder, symbol-table lookups,
+// and `PartialType` state are all un-serializable across the wire).
+//
+// `rust_narrow_declared_type` (also part of #347 but already ported) lives in
+// `meet.rs` and is registered from `meet::rust_narrow_declared_type`: it is the
+// authoritative seam wired into `mypy/meet.py`. It is intentionally NOT
+// duplicated here to avoid shadowing that registration.
+
+/// `mypy.checker.narrow_type` — general narrowing from a condition expression.
+///
+/// Returns `None` to defer to Python: this function operates on live
+/// expression nodes and the conditional type binder, which cannot be
+/// serialized through the wire format.
+#[pyfunction]
+pub(crate) fn rust_narrow_type(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(py.None())
+}
+
+/// `mypy.checker.infer_value_type` — literal inference from assignments.
+///
+/// Returns `None` to defer to Python: literal inference requires live
+/// symbol table lookups and expression node analysis.
+#[pyfunction]
+pub(crate) fn rust_infer_value_type(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(py.None())
+}
+
+/// `mypy.checker.find_isinstance_join` — union narrowing helper.
+///
+/// Returns `None` to defer to Python: this operates on live expression
+/// nodes, isinstance type arguments, and the conditional type binder.
+#[pyfunction]
+pub(crate) fn rust_find_isinstance_join(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(py.None())
+}
+
+/// `mypy.checker.partial_type_inference` — None-to-Optional for partially
+/// typed vars.
+///
+/// Returns `None` to defer to Python: requires live PartialType handling
+/// and binder state.
+#[pyfunction]
+pub(crate) fn rust_partial_type_inference(py: Python<'_>) -> PyResult<PyObject> {
+    Ok(py.None())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -676,5 +730,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // -- checker narrowing stubs (issue #347) --
+
+    #[test]
+    fn narrow_type_stub_defers() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(rust_narrow_type(py).unwrap().is_none(py));
+        });
+    }
+
+    #[test]
+    fn infer_value_type_stub_defers() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(rust_infer_value_type(py).unwrap().is_none(py));
+        });
+    }
+
+    #[test]
+    fn find_isinstance_join_stub_defers() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(rust_find_isinstance_join(py).unwrap().is_none(py));
+        });
+    }
+
+    #[test]
+    fn partial_type_inference_stub_defers() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            assert!(rust_partial_type_inference(py).unwrap().is_none(py));
+        });
     }
 }
