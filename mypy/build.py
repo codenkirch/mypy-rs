@@ -1410,7 +1410,7 @@ class BuildManager:
         plugins = self.plugin._plugins
         has_user_plugins = len(plugins) > 1
         registry = _type_kernel.PluginHookRegistry(list(DEFAULT_CALL_HOOK_FULLNAMES))
-        _set_native_plugin_hook_registry(registry, has_user_plugins)
+        _set_native_plugin_hook_registry(registry, has_user_plugins, plugins)
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
