@@ -6687,7 +6687,7 @@ class NativeCheckMemberSuite(Suite):
         assert decoded.arg_names == expected.arg_names
         assert decoded.arg_kinds == expected.arg_kinds
         assert decoded.ret_type == expected.ret_type
-        assert str(decoded.fallback.type) == str(expected.fallback.type)
+        assert decoded.fallback.type.fullname == expected.fallback.type.fullname
 
     def test_instance_member_access_parity_plain(self) -> None:
         # Non-generic static method: member type is just the ret type.
