@@ -226,6 +226,7 @@ try:
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_classify_call as _rust_classify_call,
+        rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -241,6 +242,7 @@ try:
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
         rust_real_union as _rust_real_union,
         rust_solve_generic_call as _rust_solve_generic_call,
+        rust_star_expr as _rust_star_expr,
         rust_try_getting_literal as _rust_try_getting_literal,
     )
 
@@ -249,6 +251,7 @@ try:
     _CHECKEXPR_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_any_type = None  # type: ignore[assignment]
+    _rust_conditional_expr_join = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
@@ -375,6 +378,41 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
 def _deserialize_type_from_checkexpr(b: bytes) -> Type:
     buf = _CheckExprReadBuffer(b)
     return _checkexpr_read_type(buf)
+
+
+# --- M8c: helper shims for visit_* visitor ports ---
+
+
+def _try_native_star_expr(type_bytes: bytes) -> bytes | None:
+    """Compute star-expr result type via the Rust kernel.
+
+    The star expression is just an identity pass-through:
+    `visit_star_expr` returns `self.accept(e.expr)`.  When the
+    caller has already computed the inner type, Rust can echo it
+    back without re-traversing.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_star_expr(type_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_conditional_expr_join(
+    if_bytes: bytes, else_bytes: bytes
+) -> bytes | None:
+    """Compute the join-type of a conditional expression via the Rust kernel.
+
+    Given serialized `if_expr` and `else_expr` types, returns the
+    join as serialized bytes, or None to defer to Python.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_conditional_expr_join(if_bytes, else_bytes, _native_checkexpr_resolver)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
 
 
 # Stage 4 dispatch kinds mirroring `checkcall.rs`. Values must match
@@ -6469,6 +6507,20 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             get_proper_type(self.type_context[-1]), UnionType
         ):
             # In rare cases with empty collections join may give a better result.
+            if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+                try:
+                    alt_bytes = _try_native_conditional_expr_join(
+                        _serialize_type_for_checkexpr(if_type),
+                        _serialize_type_for_checkexpr(else_type),
+                    )
+                    if alt_bytes is not None:
+                        alternative = _deserialize_type_from_checkexpr(alt_bytes)
+                        p_alt = get_proper_type(alternative)
+                        if not isinstance(p_alt, Instance) or p_alt.type.fullname != "builtins.object":
+                            res = alternative
+                            return res
+                except Exception:
+                    pass
             alternative = join.join_types(if_type, else_type)
             p_alt = get_proper_type(alternative)
             if not isinstance(p_alt, Instance) or p_alt.type.fullname != "builtins.object":
@@ -6870,7 +6922,17 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def visit_star_expr(self, e: StarExpr) -> Type:
         # TODO: should this ever be called (see e.g. mypyc visitor)?
-        return self.accept(e.expr)
+        inner = self.accept(e.expr)
+        # Native gate: star expr is identity; echo the already-computed inner type.
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                inner_bytes = _serialize_type_for_checkexpr(inner)
+                native_res = _try_native_star_expr(inner_bytes)
+                if native_res is not None:
+                    return _deserialize_type_from_checkexpr(native_res)
+            except Exception:
+                pass
+        return inner
 
     def object_type(self) -> Instance:
         """Return instance type 'object'."""

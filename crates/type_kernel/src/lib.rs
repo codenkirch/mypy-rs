@@ -292,6 +292,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_is_typeddict_type_context,
         module
     )?)?;
+    // M8c: visit_conditional_expr / visit_star_expr helpers.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_conditional_expr_join,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_star_expr,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_method_fullname,
         module
