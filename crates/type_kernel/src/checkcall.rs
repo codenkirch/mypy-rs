@@ -410,6 +410,265 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
     }
 }
 
+/// `rust_solve_generic_call`: normalize + map + infer + solve + apply.
+///
+/// Takes a generic callable (serialized), actual arg types (serialized),
+/// the formal-to-actual mapping, and metadata flags. Returns the
+/// fully-resolved (non-generic) callable with type args applied, or `None`
+/// to defer to Python.
+///
+/// The return value is a wire-format blob for the resolved callable if
+/// the Rust kernel successfully inferred and solved type arguments. The
+/// caller checks the first byte of the resolved callee's `variables`
+/// length — if 0 the callable is fully resolved; if >0 it still carries
+/// residual (non-inferred) type vars, and the caller may do additional
+/// passes or fall through to Python.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn rust_solve_generic_call(
+    _py: Python<'_>,
+    resolver: &crate::typeinfo::NativeTypeResolver,
+    callee_bytes: &[u8],
+    arg_types_bytes: Vec<Vec<u8>>,
+    formal_to_actual: Vec<Vec<i64>>,
+    strict: bool,
+    infer_unions: bool,
+) -> Option<Vec<u8>> {
+    // Decode the callee.
+    let mut buf = crate::wire::ReadBuffer::new(callee_bytes);
+    let callee = crate::wire::read_type(&mut buf, None).ok()?;
+
+    let Type::CallableType { .. } = &callee else {
+        return None;
+    };
+
+    // Step 1: Normalize (with_unpacked_kwargs + with_normalized_var_args).
+    let normalized = normalize_callable(&callee).ok()?;
+    let (formal_arg_types, _formal_arg_kinds, _formal_arg_names, variables) = match &normalized {
+        Type::CallableType {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            variables,
+            ..
+        } => (arg_types, arg_kinds, arg_names, variables),
+        _ => return None,
+    };
+
+    // Defer on ParamSpec/TypeVarTuple variables — expand_type defers.
+    if variables.iter().any(|v| {
+        matches!(
+            v,
+            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
+        )
+    }) {
+        return None;
+    }
+
+    // Step 2: Infer constraints by iterating formal-to-actual.
+    let mut all_constraints: Vec<crate::constraints::Constraint> = Vec::new();
+    let arg_types_vec: Vec<Type> = arg_types_bytes
+        .iter()
+        .map(|b| {
+            let mut b2 = crate::wire::ReadBuffer::new(b);
+            crate::wire::read_type(&mut b2, None).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    for (fi, actual_indices) in formal_to_actual.iter().enumerate() {
+        if actual_indices.is_empty() {
+            continue;
+        }
+        let formal_type = formal_arg_types.get(fi)?;
+
+        // Handle UnpackType formals (*args: *Tuple[...], etc.)
+        if let Type::UnpackType { typ: unpack_inner } = formal_type {
+            if let Type::TypeVarTupleType { tuple_fallback, .. } = unpack_inner.as_ref() {
+                // Collect expanded actual types for TupleType constraint.
+                let mut expanded: Vec<Type> = Vec::with_capacity(actual_indices.len());
+                for &ai in actual_indices {
+                    let at = arg_types_vec.get(ai as usize)?;
+                    if let Type::UnpackType { typ: inner } = at {
+                        if let Type::TupleType { items, .. } = inner.as_ref() {
+                            expanded.extend(items.iter().cloned());
+                        } else {
+                            expanded.push(at.clone());
+                        }
+                    } else {
+                        expanded.push(at.clone());
+                    }
+                }
+                if !expanded.is_empty() {
+                    let tuple_target = Type::TupleType {
+                        partial_fallback: Box::new(tuple_fallback.as_ref().clone()),
+                        items: expanded,
+                        implicit: false,
+                    };
+                    all_constraints.push(crate::constraints::Constraint {
+                        origin_type_var: unpack_inner.as_ref().clone(),
+                        op: crate::constraints::SUPERTYPE_OF,
+                        target: tuple_target,
+                    });
+                }
+            } else if let Type::TupleType { .. } = unpack_inner.as_ref() {
+                // *args: *Tuple[...] — not a TypeVarTuple.
+                // Each actual gets a constraint against the tuple element type.
+                // For simplicity, we defer this complex unpack case to Python.
+                return None;
+            }
+            continue;
+        }
+
+        // Standard case: infer constraints for each actual against formal.
+        for &ai in actual_indices {
+            let actual_type = arg_types_vec.get(ai as usize)?;
+            // Skip None actuals (argument was in a deferred pass).
+            let actual_proper = get_proper_or_none(actual_type)?;
+            if matches!(actual_proper, Type::AnyType { .. }) {
+                continue;
+            }
+            let formal_proper = get_proper_or_none(formal_type)?;
+            let constraints = crate::constraints::infer_constraints_full_inner(
+                formal_proper,
+                actual_proper,
+                crate::constraints::SUBTYPE_OF,
+                resolver.resolver(),
+            )?;
+            all_constraints.extend(constraints);
+        }
+    }
+
+    if all_constraints.is_empty() {
+        return None; // Nothing to solve.
+    }
+
+    // Step 3: Solve constraints for the callable's type vars.
+    let tvar_types: Vec<Type> = variables.to_vec();
+    let constraint_blobs: Vec<Vec<u8>> = all_constraints
+        .iter()
+        .map(|c| {
+            let mut b = crate::wire::WriteBuffer::new();
+            c.write(&mut b).ok()?;
+            Some(b.into_bytes())
+        })
+        .collect::<Option<Vec<_>>>()?;
+
+    let vars_blobs: Vec<Vec<u8>> = tvar_types
+        .iter()
+        .map(|t| {
+            let mut b = crate::wire::WriteBuffer::new();
+            crate::wire::write_type(&mut b, t).ok()?;
+            Some(b.into_bytes())
+        })
+        .collect::<Option<_>>()?;
+
+    let solve_result = crate::solve::rust_solve_constraints(
+        vars_blobs.clone(),
+        vars_blobs,
+        constraint_blobs,
+        strict,
+        infer_unions,
+        true, // strict_optional: assume strict
+        true, // skip_unsatisfied: safe for callable checking
+        resolver,
+    );
+
+    let Some((num_solved, sol_blob, _free_blob)) = solve_result else {
+        return None; // Solver deferred.
+    };
+    if num_solved == 0 {
+        return None;
+    }
+
+    // Step 4: Decode solutions and apply to callable.
+    let sol_bytes = sol_blob?;
+    let solutions = decode_solve_solutions(&sol_bytes)?;
+    let orig_types: Vec<Option<Type>> = variables
+        .iter()
+        .map(|tv| {
+            let key = solve_typevar_key(tv)?;
+            solutions
+                .iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, t)| t.clone())
+        })
+        .collect();
+
+    // Serialize orig_types in the wire format expected by apply_generic_arguments.
+    let orig_types_blob = serialize_optional_types(&orig_types)?;
+
+    let mut wbuf = crate::wire::WriteBuffer::new();
+    crate::wire::write_type(&mut wbuf, &normalized).ok()?;
+    crate::applytype::rust_apply_generic_arguments(
+        resolver,
+        wbuf.into_bytes().as_slice(),
+        &orig_types_blob,
+        true, // skip_unsatisfied
+        true, // strict_optional
+    )
+}
+
+/// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
+/// substituted type (None when the solver left it unsolved).
+type SolveEntry = ((i64, i64, String), Option<Type>);
+
+/// Decode `(raw, meta, ns, has_sol, type?)...` from a solve solutions blob.
+fn decode_solve_solutions(blob: &[u8]) -> Option<Vec<SolveEntry>> {
+    let mut buf = crate::wire::ReadBuffer::new(blob);
+    let count = crate::wire::read_int(&mut buf).ok()?;
+    let mut result = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let raw = crate::wire::read_int(&mut buf).ok()?;
+        let meta = crate::wire::read_int(&mut buf).ok()?;
+        let ns = crate::wire::read_str(&mut buf).ok()?;
+        let has_sol = crate::wire::read_int(&mut buf).ok()?;
+        let typ = if has_sol == 1 {
+            Some(crate::wire::read_type(&mut buf, None).ok()?)
+        } else {
+            None
+        };
+        result.push(((raw, meta, ns), typ));
+    }
+    Some(result)
+}
+
+/// Get the TypeVar key `(raw_id, meta_level, namespace)` from a Type.
+fn solve_typevar_key(t: &Type) -> Option<(i64, i64, String)> {
+    match t {
+        Type::TypeVarType {
+            raw_id,
+            meta_level,
+            namespace,
+            ..
+        } => Some((*raw_id, *meta_level, namespace.clone())),
+        Type::ParamSpecType {
+            raw_id, namespace, ..
+        } => Some((*raw_id, 0, namespace.clone())),
+        Type::TypeVarTupleType {
+            raw_id, namespace, ..
+        } => Some((*raw_id, 0, namespace.clone())),
+        _ => None,
+    }
+}
+
+/// Serialize an optional type list in the wire format expected by
+/// `apply_generic_arguments`: count (bare int) + for each entry: a 0/1 byte
+/// (0 = None, 1 = present) followed by a Type blob if present.
+fn serialize_optional_types(types: &[Option<Type>]) -> Option<Vec<u8>> {
+    let mut buf = crate::wire::WriteBuffer::new();
+    crate::wire::write_int(&mut buf, types.len() as i64).ok()?;
+    for t in types {
+        match t {
+            None => buf.push(0),
+            Some(t) => {
+                buf.push(1);
+                crate::wire::write_type(&mut buf, t).ok()?;
+            }
+        }
+    }
+    Some(buf.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
