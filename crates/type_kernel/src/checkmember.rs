@@ -681,26 +681,21 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 /// Handled by Rust:
 ///   * AnyType → AnyType(from_another_any, source_any=typ).  Pure
 ///     reconstruction; `from_another_any` = 7 (TypeOfAny value in types.py).
-///   * DeletedType → AnyType(from_error).  Rust cannot report the
-///     mx.msg.deleted_as_rvalue error, so it only returns the type.
 ///   * UninhabitedType → new UninhabitedType preserving `ambiguous`.
 ///   * TupleType → recurse on the fallback instance.
-///   * LiteralType / CallableType / Overloaded → recurse on fallback.
-///   * ParamSpecType / TypeVarTupleType → recurse on fallback (same
-///     path as the TypeVarType upper_bound branch in Python).
-///   * TypeAliasType → recurse on None (defer) since the wire format
-///     carries no alias target; `get_proper_type` cannot expand it.
+///   * LiteralType / CallableType / Overloaded → recurse on fallback,
+///     deferring when `is_type_obj` (needs class-level lookup).
+///   * TypeVarType (no values) / ParamSpecType / TypeVarTupleType → recurse
+///     on `upper_bound` / `tuple_fallback` (matches Python's
+///     TypeVarLikeType branch).
+///   * TypeAliasType → defer (wire format carries no alias target).
 ///
 /// Deferred to Python (return None):
-///   * Instance → needs `analyze_instance_member_access` / plugin hooks.
-///   * UnionType → needs `analyze_union_member_access` (needs mx).
-///   * TypeType → needs `analyze_type_type_member_access`.
-///   * TypedDictType → needs `analyze_typeddict_access`.
-///   * NoneType → needs `analyze_none_member_access` (special __bool__).
-///   * TypeVarType → needs `make_simplified_union` / upper_bound recursion.
+///   * Instance / UnionType / TypeType / TypedDictType / NoneType / DeletedType
+///     → need analyzer state, `mx`, or error reporting.  Rust must not drop a
+///     diagnostic (e.g. `deleted_as_rvalue`) or mis-answer (`__bool__`).
+///   * TypeVarType with values → needs `make_simplified_union`.
 ///   * UnboundType / Parameters / UnpackType → needs `report_missing_attribute`.
-///   * TypeVarType with values → needs union construction.
-///   * TypeVarType upper_bound → needs recursion on the bound.
 #[pyfunction]
 pub(crate) fn rust_analyze_member_access(
     resolver: &NativeTypeResolver,
@@ -710,7 +705,7 @@ pub(crate) fn rust_analyze_member_access(
         Some(t) => t,
         None => return Ok(None),
     };
-    analyze_member_access_inner(&typ, resolver.resolver()).map(encode_type).transpose()
+    Ok(analyze_member_access_inner(&typ, resolver.resolver()).and_then(|typ| encode_type(&typ)))
 }
 
 fn analyze_member_access_inner<'a>(
@@ -763,14 +758,11 @@ fn analyze_member_access_inner<'a>(
         }
         // --- NoneType ---
         Type::NoneType => {
-            // Python: __bool__ special case or recurse on object.
-            // Pure path: recurse on builtins.object.
-            Some(Type::Instance {
-                type_ref: "builtins.object".to_string(),
-                args: vec![],
-                last_known_value: None,
-                extra_attrs: None,
-            })
+            // Defer to Python: analyze_none_member_access special-cases
+            // `__bool__` -> Literal[False]; non-bool names recurse on
+            // builtins.object.  Both need mx / named_type.  Returning
+            // builtins.object unconditionally would mis-answer `__bool__`.
+            None
         }
         // --- TypeVarType ---
         Type::TypeVarType {
@@ -788,9 +780,9 @@ fn analyze_member_access_inner<'a>(
             }
         }
         // --- ParamSpecType ---
-        Type::ParamSpecType { tuple_fallback, .. } => {
-            // No upper_bound for ParamSpec; fall back to tuple_fallback.
-            analyze_member_access_inner(tuple_fallback, resolver)
+        Type::ParamSpecType { upper_bound, .. } => {
+            // Python: TypeVarLikeType -> _analyze_member_access(name, typ.upper_bound, mx).
+            analyze_member_access_inner(upper_bound, resolver)
         }
         // --- TypeVarTupleType ---
         Type::TypeVarTupleType { tuple_fallback, .. } => {
@@ -799,14 +791,10 @@ fn analyze_member_access_inner<'a>(
         }
         // --- DeletedType ---
         Type::DeletedType { .. } => {
-            // Python: mx.msg.deleted_as_rvalue(typ, mx.context).
-            // Rust cannot report the error, but returns AnyType(from_error).
-            // from_error = 5 per types.py
-            Some(Type::AnyType {
-                type_of_any: 5, // TypeOfAny.from_error
-                source_any: None,
-                missing_import_name: None,
-            })
+            // Defer to Python: Python reports `deleted_as_rvalue` unless
+            // mx.suppress_errors, then returns AnyType(from_error).  Rust
+            // cannot know suppress_errors and must not drop the diagnostic.
+            None
         }
         // --- UninhabitedType ---
         Type::UninhabitedType { ambiguous } => {

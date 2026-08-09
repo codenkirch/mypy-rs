@@ -95,10 +95,10 @@ try:
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
         rust_analyze_member_access as _rust_analyze_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
-        rust_instance_fallback as _rust_instance_fallback,
-        rust_has_operator as _rust_has_operator,
-        rust_meta_has_operator as _rust_meta_has_operator,
         rust_defined_in_superclass as _rust_defined_in_superclass,
+        rust_has_operator as _rust_has_operator,
+        rust_instance_fallback as _rust_instance_fallback,
+        rust_meta_has_operator as _rust_meta_has_operator,
     )
 
     from mypy.types import read_type as _checkmember_read_type
@@ -321,7 +321,11 @@ def _analyze_member_access(
     # ParamSpec/TypeVarTuple fallback recursion).  Returns None (Python
     # None) for branches needing plugin state, union construction, error
     # reporting, or resolver lookups — Python falls through.
-    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+    ):
         try:
             result = _rust_analyze_member_access(
                 _native_checkmember_resolver,
