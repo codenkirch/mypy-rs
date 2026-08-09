@@ -1975,6 +1975,17 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         old_allow_unpack = self.allow_unpack
         self.allow_unpack = allow_unpack
         try:
+            # Strangler-fig: try the native (Rust) path first.
+            # None means "Python must handle it" (deferred: UnboundType,
+            # TypeAliasType, PlaceholderType, or types needing lookup/hook).
+            analyzed = native_analyze_type(
+                t,
+                allow_tuple_literal=self.allow_tuple_literal,
+                allow_param_spec_literals=self.allow_param_spec_literals,
+                allow_unpack=self.allow_unpack,
+            )
+            if analyzed is not None:
+                return analyzed
             analyzed = t.accept(self)
         finally:
             if nested:
@@ -2564,6 +2575,7 @@ try:
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_explicit_any as _rust_has_explicit_any,
         rust_make_optional_type as _rust_make_optional_type,
+        rust_type_analyze as _rust_type_analyze,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -2575,6 +2587,7 @@ except ImportError:
     _rust_has_any_from_unimported_type = None  # type: ignore[assignment]
     _rust_collect_all_inner_types = None  # type: ignore[assignment]
     _rust_make_optional_type = None  # type: ignore[assignment]
+    _rust_type_analyze = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -2586,6 +2599,32 @@ _native_typeanal_active: bool = False
 def _set_native_typeanal_active(active: bool) -> None:
     global _native_typeanal_active
     _native_typeanal_active = active
+
+
+def native_analyze_type(
+    t: Type,
+    *,
+    allow_tuple_literal: bool = False,
+    allow_param_spec_literals: bool = False,
+    allow_unpack: bool = False,
+) -> Type | None:
+    """Try the native (Rust) type analyser for an already-bound type.
+
+    Returns the analysed Type as a live Python object, or ``None`` when the
+    Rust path does not handle the type (e.g. UnboundType, TypeAliasType,
+    PlaceholderType), matching Python's deferral semantics.  When ``None``
+    is returned the caller should fall through to the pure-Python visitor.
+    """
+    if not _TYPEANAL_HAS_KERNEL or not _native_typeanal_active:
+        return None
+    try:
+        payload = _serialize_typeanal_type(t)
+        result = _rust_type_analyze(payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack)
+        if result is not None:
+            return _typeanal_decode(result)
+    except (AssertionError, NotImplementedError):
+        pass
+    return None
 
 
 def _serialize_typeanal_type(t: Type) -> bytes:

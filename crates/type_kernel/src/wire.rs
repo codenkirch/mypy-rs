@@ -1967,6 +1967,20 @@ fn write_type_var_likes(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), Wir
 /// generic), `TypeType`. Other variants return `Err` so callers fail
 /// loudly rather than emit malformed bytes that `Type.read()` would
 /// reject.
+/// `write_parameters`: inverse of `read_parameters` (wire.rs:818) and mirror
+/// of `Parameters.write` in mypy/types.py:2115. Field order and bare-int kinds
+/// must match the reader or the wire round-trip desynchronizes.
+fn write_parameters(buf: &mut WriteBuffer, p: &Parameters) -> Result<(), WireError> {
+    write_tag(buf, PARAMETERS);
+    write_type_list(buf, &p.arg_types)?;
+    write_int_list(buf, &p.arg_kinds)?;
+    write_str_opt_list(buf, &p.arg_names)?;
+    write_type_var_likes(buf, &p.variables)?;
+    write_bool(buf, p.imprecise_arg_kinds);
+    write_tag(buf, END_TAG);
+    Ok(())
+}
+
 pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireError> {
     match t {
         Type::AnyType {
@@ -2139,6 +2153,56 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             if *meta_level != 0 {
                 write_int(buf, *meta_level)?;
             }
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor,
+            upper_bound,
+            default,
+        } => {
+            // Field order mirrors `read_param_spec_type` (wire.rs:790) and
+            // `ParamSpecType.write` in mypy/types.py:911. The prefix is an
+            // inlined Parameters record, not a nested tagged type.
+            write_tag(buf, PARAM_SPEC_TYPE);
+            write_parameters(buf, prefix)?;
+            write_str(buf, name)?;
+            write_str(buf, fullname)?;
+            write_int(buf, *raw_id)?;
+            write_str(buf, namespace)?;
+            write_int(buf, *flavor)?;
+            write_type(buf, upper_bound)?;
+            write_type(buf, default)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default,
+            min_len,
+        } => {
+            // Field order mirrors `read_type_var_tuple_type` (wire.rs:820) and
+            // `TypeVarTupleType.write` in mypy/types.py:993. tuple_fallback is
+            // an inlined Instance record.
+            write_tag(buf, TYPE_VAR_TUPLE_TYPE);
+            write_type(buf, tuple_fallback)?;
+            write_str(buf, name)?;
+            write_str(buf, fullname)?;
+            write_int(buf, *raw_id)?;
+            write_str(buf, namespace)?;
+            write_type(buf, upper_bound)?;
+            write_type(buf, default)?;
+            write_int(buf, *min_len)?;
             write_tag(buf, END_TAG);
             Ok(())
         }

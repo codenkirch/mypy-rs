@@ -124,8 +124,24 @@ def _try_native_constraint_builder(
     for blob in raw:
         data = _ReadBuffer(bytes(blob))
         origin = fixup_wire_type(read_type(data))
-        if not isinstance(origin, (TypeVarType, TypeVarTupleType)):
+        if not isinstance(origin, (TypeVarType, ParamSpecType, TypeVarTupleType)):
             raise NotImplementedError("origin not a type variable")
+        if isinstance(origin, (ParamSpecType, TypeVarTupleType)):
+            # The wire proto drops meta_level for ParamSpec/TypeVarTuple
+            # origins, so the decoded id never matches a fresh call-site var
+            # (meta_level > 0) and the constraint is dropped in solve. Rebuild
+            # the id from the matching live variable in the template. c.f.
+            # solve.py:693-695 for the same identity concern.
+            live = [
+                v
+                for v in mypy.typeops.get_all_type_vars(template)
+                if type(v) is type(origin)
+                and v.id.raw_id == origin.id.raw_id
+                and v.id.namespace == origin.id.namespace
+            ]
+            if len(live) != 1:
+                raise NotImplementedError("origin id not resolvable in template")
+            origin = origin.copy_modified(id=live[0].id)
         op = read_int(data)
         target = fixup_wire_type(read_type(data))
         if target is None:

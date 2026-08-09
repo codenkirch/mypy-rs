@@ -1932,10 +1932,11 @@ mod tests {
     }
 
     #[test]
-    fn get_type_vars_include_all_param_spec_unencodable() {
-        // ParamSpecType has no wire write arm, so it cannot cross the binary
-        // seam at any depth; the whole call defers to Python.
-        let ps = Type::ParamSpecType {
+    fn get_type_vars_include_all_param_spec_wire_encodable() {
+        // ParamSpecType has a wire write arm (used by the typeanal/constraint
+        // ports), so it crosses the binary seam at any depth; decode must
+        // round-trip the id (raw_id + namespace).
+        let encoded = super::encode_type(&Type::ParamSpecType {
             prefix: Box::new(crate::wire::Parameters {
                 arg_types: vec![],
                 arg_kinds: vec![],
@@ -1958,8 +1959,17 @@ mod tests {
                 source_any: None,
                 missing_import_name: None,
             }),
-        };
-        assert!(super::encode_type(&ps).is_none());
+        })
+        .expect("ParamSpecType must be wire-encodable");
+        match super::decode_type(&encoded).expect("round-trip decode") {
+            Type::ParamSpecType {
+                raw_id, namespace, ..
+            } => {
+                assert_eq!(raw_id, 2);
+                assert_eq!(namespace, "");
+            }
+            other => panic!("decoded to wrong variant: {other:?}"),
+        }
     }
 
     #[test]

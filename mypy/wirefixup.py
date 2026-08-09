@@ -255,6 +255,12 @@ class _TypeRefFixer(TypeTranslator):
     def visit_param_spec(self, t: ParamSpecType, /) -> Type:
         if self.missing:
             return t
+        # Visit upper_bound first: it may be a shared instance_cache
+        # singleton (INSTANCE_OBJECT compact tag) whose FakeInfo must be
+        # resolved in place before check_no_fake_info scans the tree.
+        _ = t.upper_bound.accept(self)
+        if self.missing:
+            return t  # type: ignore[unreachable]
         default = t.default.accept(self)
         if self.missing:
             return t  # type: ignore[unreachable]

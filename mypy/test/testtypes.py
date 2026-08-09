@@ -45,6 +45,7 @@ from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
+from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.traverser import (
     all_name_and_member_expressions,
     all_return_statements,
@@ -56,21 +57,25 @@ from mypy.traverser import (
     has_yield_expression,
     has_yield_from_expression,
 )
-from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.typeanal import (
+    _set_native_typeanal_active,
     collect_all_inner_types,
     has_any_from_unimported_type,
     has_explicit_any,
     make_optional_type,
+    native_analyze_type,
 )
 from mypy.typeops import false_only, make_simplified_union, true_only
 from mypy.types import (
     AnyType,
     CallableType,
+    DeletedType,
     Instance,
     LiteralType,
     NoneType,
     Overloaded,
+    ParamSpecFlavor,
+    ParamSpecType,
     ProperType,
     TupleType,
     Type,
@@ -5119,6 +5124,7 @@ class NativeTraverserSuite(Suite):
 
     def test_rust_count_matches_python_returns(self) -> None:
         from type_kernel import rust_count_return_statements
+
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
@@ -5138,6 +5144,7 @@ class NativeTraverserSuite(Suite):
 
     def test_rust_count_matches_python_yields(self) -> None:
         from type_kernel import rust_count_yield_expressions
+
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
@@ -5157,6 +5164,7 @@ class NativeTraverserSuite(Suite):
 
     def test_rust_count_matches_python_yield_from(self) -> None:
         from type_kernel import rust_count_yield_from_expressions
+
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
@@ -5176,6 +5184,7 @@ class NativeTraverserSuite(Suite):
 
     def test_rust_count_matches_python_name_member(self) -> None:
         from type_kernel import rust_count_name_and_member_expressions
+
         from mypy.astwire import serialize_node
         from mypy.cache import WriteBuffer
 
@@ -5326,16 +5335,14 @@ class NativeStrFormatSuite(Suite):
 
     def setUp(self) -> None:
         from mypy.checkstrformat import (
-            ConversionSpecifier,
             _set_native_strformat_active,
             find_non_escaped_targets,
             parse_conversion_specifiers,
             parse_format_value,
         )
         from mypy.errors import Errors
-        from mypy.options import Options
-
         from mypy.messages import MessageBuilder
+        from mypy.options import Options
 
         self._set_active = _set_native_strformat_active
         self._parse_conv = parse_conversion_specifiers
@@ -5576,7 +5583,6 @@ class NativeMessagesSuite(Suite):
         assert_equal(_type_kernel.rust_variance_string(0), "invariant")
 
     def test_any(self) -> None:
-        from mypy.messages import format_type_bare
 
         t = AnyType(TypeOfAny.special_form)
         self.assert_format_par(t)
@@ -6285,13 +6291,13 @@ class NativeCheckMemberSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
+        from librt.internal import WriteBuffer as _WB
 
         from mypy.checkmember import (
             _set_native_checkmember_active,
             _set_native_checkmember_resolver,
         )
         from mypy.wirefixup import set_wire_typeinfo_map
-        from librt.internal import WriteBuffer as _WB
 
         self._tk = _tk
         self._WB = _WB
@@ -6337,7 +6343,6 @@ class NativeCheckMemberSuite(Suite):
         return buf.getvalue()
 
     def _make_callable(self, arg_kinds: list, ret: Type | None = None) -> CallableType:
-        from mypy.nodes import ARG_POS
 
         return CallableType(
             arg_types=[self.fx.o],
@@ -6349,8 +6354,8 @@ class NativeCheckMemberSuite(Suite):
         )
 
     def test_bind_self_fast_plain_callable(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         method = self._make_callable([ARG_POS])
         result = bind_self_fast(method)
@@ -6361,8 +6366,8 @@ class NativeCheckMemberSuite(Suite):
         assert len(result.arg_names) == 0
 
     def test_bind_self_fast_preserves_ret_type(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         method = self._make_callable([ARG_POS], ret=self.fx.a)
         result = bind_self_fast(method)
@@ -6370,8 +6375,8 @@ class NativeCheckMemberSuite(Suite):
         assert result.ret_type == self.fx.a
 
     def test_bind_self_fast_preserves_variables(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         method = CallableType(
             arg_types=[self.fx.o],
@@ -6387,8 +6392,8 @@ class NativeCheckMemberSuite(Suite):
         assert len(result.variables) == 1
 
     def test_bind_self_fast_overloaded(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         item1 = self._make_callable([ARG_POS])
         item2 = self._make_callable([ARG_POS])
@@ -6400,8 +6405,8 @@ class NativeCheckMemberSuite(Suite):
             assert item.is_bound is True
 
     def test_bind_self_fast_defers_star_args(self) -> None:
-        from mypy.nodes import ARG_STAR
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_STAR
 
         method = self._make_callable([ARG_STAR])
         result = bind_self_fast(method)
@@ -6410,8 +6415,8 @@ class NativeCheckMemberSuite(Suite):
         assert len(result.arg_types) == 1
 
     def test_bind_self_fast_defers_star2(self) -> None:
-        from mypy.nodes import ARG_STAR2
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_STAR2
 
         method = self._make_callable([ARG_STAR2])
         result = bind_self_fast(method)
@@ -6493,8 +6498,8 @@ class NativeCheckMemberSuite(Suite):
         assert code == 11
 
     def test_bind_self_fast_preserves_name(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         method = CallableType(
             arg_types=[self.fx.o],
@@ -6510,8 +6515,8 @@ class NativeCheckMemberSuite(Suite):
         assert result.name == "my_method"
 
     def test_bind_self_fast_round_trip_multiple_args(self) -> None:
-        from mypy.nodes import ARG_POS
         from mypy.checkmember import bind_self_fast
+        from mypy.nodes import ARG_POS
 
         method = CallableType(
             arg_types=[self.fx.o, self.fx.a, self.fx.b],
@@ -7011,3 +7016,283 @@ class NativeCheckexprSuite(Suite):
         decoded = read_type(buf)
         self.assertIsInstance(decoded, UnionType)
         self.assertEqual(len(decoded.items), 2)
+# NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
+# Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
+# Python and Rust paths on the same Type, assert results match.
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeTypeAnalSuite(Suite):
+    """Parity tests for `rust_type_analyze` — the TypeAnalyser.anal_type hot path.
+
+    Runs the native path with `_set_native_typeanal_active(True)` and asserts
+    the decoded result round-trips str-identically to the input. For the
+    already-bound fixtures in this suite, `TypeAnalyser` is a no-op (type
+    analysis applies only to unbound or alias-laden types), so the input
+    itself is the reference. The differential across the whole suite (with and
+    without `TEST_NATIVE_TYPE_KERNEL=1`) is the same mechanism the
+    NativeJoinMeetSuite uses.
+
+    The Rust path returns ``None`` for types needing semantic context
+    (UnboundType, TypeAliasType, PlaceholderType), so those defer to Python
+    and parity is guaranteed by construction.
+
+    The test corpus covers: Instance, Callable, TypeVar, ParamSpec,
+    TypeVarTuple, Tuple, TypedDict, Union, TypeType, Literal, Any, None,
+    Uninhabited, Deleted, Overloaded — all types that rust_type_analyze can
+    handle without symbol lookup or alias expansion.
+    """
+
+    def setUp(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        type_infos = self._collect_type_infos()
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        self._set_active(False)
+
+    def _collect_type_infos(self) -> list:
+        from mypy.nodes import TypeInfo as _TI
+
+        return [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, _TI)
+        ]
+
+    def _assert_par(self, t: Type) -> Type:
+        """Run the native path with the gate on and assert the decoded result
+        round-trips to the input. Returns the decoded object."""
+        self._set_active(True)
+        rs = native_analyze_type(t, allow_unpack=True)
+        assert rs is not None, f"Rust returned None for {type(t).__name__}: {t!r}"
+        assert_equal(
+            str(rs),
+            str(t),
+            f"Rust/Python round-trip mismatch for {type(t).__name__}: {t!r}",
+        )
+        return rs
+
+    # --- Instance (already-bound, simple + generic + lkv) ---
+
+    def test_instance_simple(self) -> None:
+        result = self._assert_par(self.fx.a)
+        self.assertIsInstance(result, Instance)
+        assert result.type.fullname == "A"
+
+    def test_instance_generic(self) -> None:
+        result = self._assert_par(self.fx.ga)
+        self.assertIsInstance(result, Instance)
+
+    def test_instance_list_of_a(self) -> None:
+        result = self._assert_par(self.fx.lsta)
+        self.assertIsInstance(result, Instance)
+
+    # --- Callable ---
+
+    def test_callable_simple(self) -> None:
+        sig = CallableType(
+            arg_types=[self.fx.a, self.fx.b],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=[None, None],
+            ret_type=self.fx.anyt,
+            fallback=self.fx.function,
+        )
+        result = self._assert_par(sig)
+        self.assertIsInstance(result, CallableType)
+
+    def test_callable_with_typevars(self) -> None:
+        sig = CallableType(
+            arg_types=[self.fx.t],
+            arg_kinds=[ARG_POS],
+            arg_names=[None],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+            variables=[self.fx.t],
+        )
+        result = self._assert_par(sig)
+        self.assertIsInstance(result, CallableType)
+
+    def test_callable_star_args(self) -> None:
+        sig = CallableType(
+            arg_types=[self.fx.a],
+            arg_kinds=[ARG_STAR],
+            arg_names=[None],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        result = self._assert_par(sig)
+        self.assertIsInstance(result, CallableType)
+
+    def test_callable_return_type_type(self) -> None:
+        sig = CallableType(
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.type_a,
+            fallback=self.fx.function,
+        )
+        result = self._assert_par(sig)
+        self.assertIsInstance(result, CallableType)
+
+    # --- TypeVar ---
+
+    def test_type_var_simple(self) -> None:
+        result = self._assert_par(self.fx.t)
+        self.assertIsInstance(result, TypeVarType)
+        assert result.name == "T"
+
+    # --- ParamSpec ---
+
+    def test_param_spec_simple(self) -> None:
+        ps = ParamSpecType(
+            name="P",
+            fullname="P",
+            id=TypeVarId(-1),
+            flavor=ParamSpecFlavor.BARE,
+            upper_bound=Instance(self.fx.oi, [], -1),
+            default=NoneType(),
+        )
+        result = self._assert_par(ps)
+        self.assertIsInstance(result, ParamSpecType)
+
+    # --- TypeVarTuple ---
+
+    def test_type_var_tuple_simple(self) -> None:
+        tvt = TypeVarTupleType(
+            name="Ts",
+            fullname="Ts",
+            id=TypeVarId(-1),
+            upper_bound=self.fx.a,
+            tuple_fallback=self.fx.std_tuple,
+            default=NoneType(),
+        )
+        result = self._assert_par(tvt)
+        self.assertIsInstance(result, TypeVarTupleType)
+
+    # --- Tuple ---
+
+    def test_tuple_simple(self) -> None:
+        tup = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple, line=-1)
+        result = self._assert_par(tup)
+        self.assertIsInstance(result, TupleType)
+
+    # --- TypedDict ---
+
+    def test_typed_dict_simple(self) -> None:
+        td = TypedDictType(
+            items={"x": self.fx.a},
+            required_keys={"x"},
+            readonly_keys=set(),
+            fallback=Instance(self.fx.a.type, [], -1),
+        )
+        result = self._assert_par(td)
+        self.assertIsInstance(result, TypedDictType)
+
+    # --- Union ---
+
+    def test_union_two_types(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b], line=-1, column=-1)
+        result = self._assert_par(u)
+        self.assertIsInstance(result, UnionType)
+
+    def test_union_with_none(self) -> None:
+        u = UnionType([self.fx.a, NoneType()], line=-1, column=-1)
+        result = self._assert_par(u)
+        self.assertIsInstance(result, UnionType)
+
+    # --- TypeType ---
+
+    def test_type_type_simple(self) -> None:
+        tt = TypeType(self.fx.a, line=-1)
+        result = self._assert_par(tt)
+        self.assertIsInstance(result, TypeType)
+
+    # --- Literal ---
+
+    def test_literal_int(self) -> None:
+        result = self._assert_par(self.fx.lit1)
+        self.assertIsInstance(result, LiteralType)
+
+    # --- Any / None / Uninhabited ---
+
+    def test_any_type(self) -> None:
+        result = self._assert_par(AnyType(TypeOfAny.special_form))
+        self.assertIsInstance(result, AnyType)
+
+    def test_none_type(self) -> None:
+        result = self._assert_par(NoneType())
+        self.assertIsInstance(result, NoneType)
+
+    def test_uninhabited_type(self) -> None:
+        result = self._assert_par(UninhabitedType())
+        self.assertIsInstance(result, UninhabitedType)
+
+    # --- Deleted ---
+
+    def test_deleted_type(self) -> None:
+        result = self._assert_par(DeletedType(source="x"))
+        self.assertIsInstance(result, DeletedType)
+
+    # --- Overloaded ---
+
+    def test_overloaded(self) -> None:
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        c2 = CallableType(
+            [self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        ov = Overloaded([c1, c2])
+        result = self._assert_par(ov)
+        self.assertIsInstance(result, Overloaded)
+
+    # --- Unpack ---
+
+    def test_unpack_type(self) -> None:
+        ut = UnpackType(self.fx.a, line=-1, column=-1)
+        result = self._assert_par(ut)
+        self.assertIsInstance(result, UnpackType)
+
+    # --- Defer cases (Rust returns None, Python fallback is authoritative) ---
+
+    def test_defer_unbound_type(self) -> None:
+        """UnboundType requires symbol lookup — Rust always defers."""
+        self._set_active(True)
+        result = native_analyze_type(UnboundType("Foo"))
+        self.assertIsNone(result)
+        # Python fallback would look up "Foo" and process it.
+
+    def test_defer_type_alias_type(self) -> None:
+        """TypeAliasType requires alias target expansion — Rust always defers."""
+        self._set_active(True)
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        result = native_analyze_type(A, allow_unpack=True)
+        self.assertIsNone(result)
+        # Python fallback would expand the alias target via symbol lookup.
+
+    # --- Nesting / child analysis ---
+
+    def test_nested_instance_in_callable(self) -> None:
+        """Callable with Instance args should analyze children."""
+        sig = CallableType(
+            arg_types=[self.fx.ga],
+            arg_kinds=[ARG_POS],
+            arg_names=[None],
+            ret_type=self.fx.ga,
+            fallback=self.fx.function,
+        )
+        result = self._assert_par(sig)
+        self.assertIsInstance(result, CallableType)
+        self.assertEqual(len(result.arg_types), 1)
+        self.assertIsInstance(result.arg_types[0], Instance)
+
+
