@@ -43,6 +43,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
+mod attrs;
 mod cache;
 mod callable_compat;
 mod checkcall;
@@ -73,6 +74,7 @@ mod semanal_visitor;
 mod serverdeps;
 mod setops;
 mod solve;
+mod stubgen;
 mod subtypes;
 mod suggestions;
 mod traverser;
@@ -615,6 +617,23 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         serverdeps::rust_get_type_triggers,
         module
     )?)?;
+    // M354: pure server trigger/target computation
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_compute_wildcard_triggers,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_compute_target_modules,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_stubgen_render_type_args,
+        module
+    )?)?;
+    // Attrs plugin transform (Issue #357): seam function for class decoration.
+    module.add_function(wrap_pyfunction!(attrs::rust_transform_attrs, module)?)?;
+    module.add_function(wrap_pyfunction!(attrs::rust_serialize_fields, module)?)?;
     // Stage 30: dataclasses plugin transform seam. Currently returns None
     // (defer to Python) because the transform operates on live AST nodes
     // (ClassDef, TypeInfo, SymbolTableNode) rather than Type objects.

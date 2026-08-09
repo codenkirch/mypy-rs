@@ -977,7 +977,7 @@ fn collect_list(ts: &[Type], include_all: bool, out: &mut Vec<Type>) -> Option<(
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
-    use crate::wire::{LiteralValue, Type};
+    use crate::wire::{LiteralValue, Parameters, Type};
 
     #[test]
     fn simple_literal_type_extracts_fallback() {
@@ -1873,13 +1873,19 @@ mod tests {
 
     #[test]
     fn separate_union_literals_alias_defers() {
-        // TypeAliasType has no wire write arm, so a union whose item is an
-        // alias cannot cross the binary seam and the call defers to Python.
+        // A TypeAliasType in a union item defers the whole call: Python
+        // classifies via get_proper_type (expands aliases), which Rust cannot
+        // bucket without the resolver.
         let alias = Type::TypeAliasType {
-            type_ref: "mod.Alias".to_string(),
             args: vec![],
+            type_ref: "mod.Alias".to_string(),
         };
-        assert!(super::encode_type(&alias).is_none());
+        let i = plain_instance("builtins.int");
+        let union = union_of(vec![alias, i]);
+        // Alias-bearing types are not wire-encodable at all: writing one drops
+        // the alias node, so the wire refuses it and the call defers to Python
+        // at the encode boundary (same deferral intent as a None return).
+        assert!(super::encode_type(&union).is_none());
     }
 
     // ------------------------------------------------------------------
@@ -1985,10 +1991,16 @@ mod tests {
 
     #[test]
     fn get_type_vars_alias_defers() {
+        // A TypeAliasType anywhere in the shape defers: Python expands
+        // aliases eagerly (TypeQuery default traversal), Rust cannot without
+        // the resolver, so the whole extraction falls back to Python.
         let alias = Type::TypeAliasType {
+            args: vec![tv_type(1, "T")],
             type_ref: "mod.Alias".to_string(),
-            args: vec![],
         };
+        // Alias-bearing types never cross the wire: the writer refuses
+        // TypeAliasType (alias node would be lost), so extraction defers to
+        // the Python visitor at the encode boundary.
         assert!(super::encode_type(&alias).is_none());
     }
 }

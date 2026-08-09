@@ -216,13 +216,32 @@ pub(crate) fn join_types(
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
     // join.py:311-312: if s is UnionType and t is not, swap so s is
-    // the non-union. If both are unions, visit_union_type would need
-    // make_simplified_union to merge them — defer.
-    let (s, t, swapped) = match (s, t) {
-        (Type::UnionType { .. }, other) if !matches!(other, Type::UnionType { .. }) => (t, s, true),
-        (Type::UnionType { .. }, Type::UnionType { .. }) => return None,
-        _ => (s, t, false),
-    };
+    // the non-union. If both are unions, merge all items and call
+    // make_simplified_union — it handles flattening and dedup.
+    let (s, t, swapped) =
+        if matches!(s, Type::UnionType { .. }) && matches!(t, Type::UnionType { .. }) {
+            // Both UnionType: merge items, call make_simplified_union,
+            // return Encoded. (join.py:432-436 visit_union_type calls
+            // make_simplified_union([self.s, t]) when self.s is not
+            // a subtype of t; merging both sides is the equivalent operation.)
+            let Type::UnionType { items: s_items, .. } = s else {
+                unreachable!()
+            };
+            let Type::UnionType { items: t_items, .. } = t else {
+                unreachable!()
+            };
+            let mut merged = Vec::with_capacity(s_items.len() + t_items.len());
+            merged.extend(flatten_nested_unions(s_items)?);
+            merged.extend(flatten_nested_unions(t_items)?);
+            let simplified = make_simplified_union(&merged, ctx, resolver, true)?;
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &simplified).ok()?;
+            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+        } else if matches!(s, Type::UnionType { .. }) && !matches!(t, Type::UnionType { .. }) {
+            (t, s, true)
+        } else {
+            (s, t, false)
+        };
 
     // join.py:314-315: isinstance(s, AnyType) -> return s. The AnyType
     // is on the left after swap, so SameS is correct relative to the
@@ -256,22 +275,10 @@ pub(crate) fn join_types(
     let swapped = swapped ^ swap3;
 
     // normalize_callables (join.py:327) is a no-op for the Rust path:
-    // the Python shim serializes the post-normalization form. Both
-    // FunctionLike without identical shape defers (see visit_join).
-    let s_is_callable = matches!(
-        s,
-        Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
-    );
-    let t_is_callable = matches!(
-        t,
-        Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
-    );
-    let either_overloaded_or_params =
-        matches!(s, Type::Overloaded { .. } | Type::Parameters { .. })
-            || matches!(t, Type::Overloaded { .. } | Type::Parameters { .. });
-    if s_is_callable && t_is_callable && either_overloaded_or_params {
-        return None;
-    }
+    // the Python shim serializes the post-normalization form. The
+    // both-CallableType case is handled in visit_join (identical check
+    // + similar-callables combine + join_similar_callables).
+    // Overloaded and Parameters arms added below.
 
     // t.accept(TypeJoinVisitor(s)) — leaf visitors only. The visitor
     // returns SameS/SameT relative to the post-swap s/t; flip back to
@@ -967,14 +974,14 @@ fn combine_similar_callables(
     }
     let new_ret = setop_result_to_type(
         join_types(t_ret_type, s_ret_type, ctx, resolver),
-        s_ret_type,
         t_ret_type,
+        s_ret_type,
     )?;
     let new_instance_type = match (s_instance_type, t_instance_type) {
         (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
             join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
-            si.as_ref(),
             ti.as_ref(),
+            si.as_ref(),
         )?)),
         _ => None,
     };
@@ -1063,6 +1070,31 @@ fn extract_callable_invariants(
 fn encode_callable(t: Type) -> Option<SetOpResult> {
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &t).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// Encode a list of SetOpResult items as an Overloaded type via
+/// write_type and wrap as Encoded. Returns None if any item fails
+/// to decode back as a CallableType, or write_type fails.
+fn encode_overloaded(items: Vec<SetOpResult>) -> Option<SetOpResult> {
+    let mut all_items: Vec<Type> = Vec::with_capacity(items.len());
+    for item in items {
+        if let SetOpResult::Encoded(bytes) = item {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let typ = wire::read_type(&mut rbuf, None).ok()?;
+            match &typ {
+                Type::CallableType { .. } | Type::Overloaded { .. } => {
+                    all_items.push(typ);
+                }
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    let overloaded = Type::Overloaded { items: all_items };
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &overloaded).ok()?;
     Some(SetOpResult::Encoded(wbuf.into_bytes()))
 }
 
@@ -1304,24 +1336,177 @@ fn visit_join(
             visit_callable_fallback(s, fallback, ctx, resolver)
         }
 
-        // visit_overloaded (join.py:581-632), fallback case only. The
-        // both-FunctionLike case (s is CallableType/Overloaded) is
-        // already deferred by the pre-dispatch both-callable-like guard.
-        // The protocol-Instance case needs unpack_callback_proxy. The
-        // fallback case (join.py:632: join_types(t.fallback, s))
-        // recurses into the Instance-vs-s join. `t.fallback` is
-        // `items[0].fallback` (types.py:2744); the wire format stores
-        // only `items`, so extract it here.
+        // visit_overloaded (join.py:581-632).
         Type::Overloaded { items, .. } => {
             let first = items.first()?;
             let fallback = match first {
                 Type::CallableType { fallback, .. } => fallback.as_ref(),
-                // Non-Callable item violates the Overloaded invariant
-                // (types.py:2739: "_items: list[CallableType]"). Defer
-                // rather than panic: the wire format can't enforce this.
                 _ => return None,
             };
-            visit_callable_fallback(s, fallback, ctx, resolver)
+
+            // Both-FunctionLike: s is CallableType or Overloaded.
+            // join.py:644-658: for each (t_item, s_item) pair that is
+            // similar, if equivalent -> combine, if t_item <: s_item ->
+            // s_item. Result is either Overloaded(result) or the fallback
+            // join.
+            if let Type::Overloaded { items: s_items, .. } = s {
+                // s is also Overloaded: visit both lists.
+                if s_items.is_empty() {
+                    return None;
+                }
+                let mut result_items: Vec<SetOpResult> = Vec::new();
+                for t_item in items {
+                    let t_callable = match t_item {
+                        Type::CallableType { .. } => t_item,
+                        _ => return None,
+                    };
+                    for s_item in s_items {
+                        let s_callable = match s_item {
+                            Type::CallableType { .. } => s_item,
+                            _ => return None,
+                        };
+                        // is_similar_callables check.
+                        let t_arg_types = match &t_callable {
+                            Type::CallableType { arg_types, .. } => arg_types,
+                            _ => unreachable!(),
+                        };
+                        let t_arg_kinds = match &t_callable {
+                            Type::CallableType { arg_kinds, .. } => arg_kinds,
+                            _ => unreachable!(),
+                        };
+                        let s_arg_types = match &s_callable {
+                            Type::CallableType { arg_types, .. } => arg_types,
+                            _ => unreachable!(),
+                        };
+                        let s_arg_kinds = match &s_callable {
+                            Type::CallableType { arg_kinds, .. } => arg_kinds,
+                            _ => unreachable!(),
+                        };
+                        if !is_similar_callables(t_arg_types, t_arg_kinds, s_arg_types, s_arg_kinds)
+                        {
+                            continue;
+                        }
+                        // is_equivalent check.
+                        let t_ret = match &t_callable {
+                            Type::CallableType { ret_type, .. } => ret_type,
+                            _ => unreachable!(),
+                        };
+                        let s_ret = match &s_callable {
+                            Type::CallableType { ret_type, .. } => ret_type,
+                            _ => unreachable!(),
+                        };
+                        let t_arg_names = match &t_callable {
+                            Type::CallableType { arg_names, .. } => arg_names,
+                            _ => unreachable!(),
+                        };
+                        let s_arg_names = match &s_callable {
+                            Type::CallableType { arg_names, .. } => arg_names,
+                            _ => unreachable!(),
+                        };
+                        let equivalent = is_equivalent_callable(
+                            t_arg_types,
+                            t_ret,
+                            s_arg_types,
+                            s_ret,
+                            t_arg_names,
+                            s_arg_names,
+                            ctx,
+                            resolver,
+                        )?;
+                        if equivalent {
+                            // combine_similar_callables: build Encoded.
+                            let t_fallback = match &t_callable {
+                                Type::CallableType { fallback, .. } => fallback.as_ref(),
+                                _ => unreachable!(),
+                            };
+                            let s_fallback = match &s_callable {
+                                Type::CallableType { fallback, .. } => fallback.as_ref(),
+                                _ => unreachable!(),
+                            };
+                            let s_instance = match &s_callable {
+                                Type::CallableType { instance_type, .. } => instance_type,
+                                _ => unreachable!(),
+                            };
+                            let t_instance = match &t_callable {
+                                Type::CallableType { instance_type, .. } => instance_type,
+                                _ => unreachable!(),
+                            };
+                            if let SetOpResult::Encoded(bytes) = combine_similar_callables(
+                                s_callable,
+                                t_callable,
+                                s_arg_types,
+                                t_arg_types,
+                                s_ret,
+                                t_ret,
+                                s_fallback,
+                                t_fallback,
+                                s_instance,
+                                t_instance,
+                                s_arg_names,
+                                t_arg_names,
+                                s_arg_kinds,
+                                t_arg_kinds,
+                                ctx,
+                                resolver,
+                            )? {
+                                result_items.push(SetOpResult::Encoded(bytes));
+                            }
+                        } else if is_subtype(t_callable, s_callable, ctx, resolver)? {
+                            // t_item <: s_item -> s_item.
+                            result_items.push(match s_item {
+                                Type::Overloaded { items, .. } => {
+                                    // s_item is Overloaded, extract its first Callable
+                                    match items.first() {
+                                        Some(Type::CallableType { .. }) => {
+                                            // Encode the s_callable (which is s_item)
+                                            encode_callable(s_item.clone())?
+                                        }
+                                        _ => continue,
+                                    }
+                                }
+                                _ => continue,
+                            });
+                        }
+                    }
+                }
+                if result_items.is_empty() {
+                    // join.py:659: join_types(t.fallback, s.fallback)
+                    let s_fb = match s_items.first() {
+                        Some(Type::CallableType { fallback, .. }) => fallback.as_ref(),
+                        _ => return None,
+                    };
+                    visit_callable_fallback(s, s_fb, ctx, resolver)
+                } else if result_items.len() == 1 {
+                    match &result_items[0] {
+                        SetOpResult::Encoded(bytes) => {
+                            let mut rbuf = ReadBuffer::new(bytes);
+                            match wire::read_type(&mut rbuf, None) {
+                                Ok(Type::CallableType { .. }) => {
+                                    Some(SetOpResult::Encoded(bytes.clone()))
+                                }
+                                Ok(Type::Overloaded { .. }) => {
+                                    // Single Overloaded result item — keep it.
+                                    Some(SetOpResult::Encoded(bytes.clone()))
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    // Multiple result items -> Overloaded(result).
+                    // Encode each item and wrap as Overloaded.
+                    encode_overloaded(result_items)
+                }
+            } else if let Type::CallableType { .. } = s {
+                // s is CallableType, t is Overloaded. Swap and recurse:
+                // join.py:644: switch order to get to visit_overloaded.
+                join_types(t, s, ctx, resolver)
+            } else {
+                // s is neither FunctionLike nor protocol-Instance ->
+                // fallback join.
+                visit_callable_fallback(s, fallback, ctx, resolver)
+            }
         }
 
         // visit_type_type (join.py:854-864). Case 2 (s is Instance with
@@ -1349,8 +1534,8 @@ fn visit_join(
                 //   is_type_form=s.is_type_form or t.is_type_form)
                 let joined = setop_result_to_type(
                     join_types(t_item, s_item, ctx, resolver),
-                    s_item,
                     t_item,
+                    s_item,
                 )?;
                 let new_type = Type::TypeType {
                     item: Box::new(joined),
@@ -3491,7 +3676,8 @@ mod tests {
         // Both s and t are UnionType. The pre-dispatch swap only fires
         // when exactly one side is a union (join.py:311-312). When both
         // are unions, visit_union_type calls make_simplified_union
-        // which needs to merge/flatten -> defer (no Type encoder).
+        // which merges/flatten -> now returns Encoded union of
+        // [a.A, a.B] (no longer defers, the union encoder is available).
         let a = snap("a.A", "A");
         let b = snap("a.B", "B");
         let o = snap("builtins.object", "object");
@@ -3508,7 +3694,23 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            };
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]
@@ -4132,11 +4334,12 @@ mod tests {
 
     #[test]
     fn join_overloaded_with_overloaded_defers() {
-        // Both s and t are callable-like (Overloaded). The pre-dispatch
-        // defers because visit_overloaded's both-FunctionLike case
-        // (join.py:612-627) needs is_similar_callables +
-        // combine_similar_callables, which produce new CallableType /
-        // Overloaded. No Type encoder -> defer.
+        // Both s and t are callable-like (Overloaded). The both-FunctionLike
+        // case (join.py:612-627) uses is_similar_callables +
+        // combine_similar_callables which produces a new Overloaded via
+        // wire encoder. No longer defers — now returns Encoded(Overloaded).
+        // Fixed: combine_similar_callables was called with outer Overloaded
+        // types instead of inner CallableType items, causing a panic.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -4149,7 +4352,13 @@ mod tests {
         };
         let s = overloaded(vec![c()]);
         let t = overloaded(vec![c()]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert!(
+            matches!(
+                join_types(&s, &t, &ctx(true), &r),
+                Some(SetOpResult::Encoded(_))
+            ),
+            "overloaded-join should return Encoded, not defer"
+        );
     }
 
     #[test]

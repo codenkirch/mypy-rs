@@ -87,18 +87,6 @@ fn lkv_translate_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResu
         return lkv_visit_type_type(py, obj, refs);
     }
 
-    // --- LiteralType: TypeTranslator default ---
-    // LiteralType(value, translated fallback, line, column)
-    if is_instance(obj, refs.literal_type) {
-        return lkv_visit_literal(py, obj, refs);
-    }
-
-    // --- UnpackType: TypeTranslator default ---
-    // UnpackType(t.type.accept(self))
-    if is_instance(obj, refs.unpack_type) {
-        return lkv_visit_unpack(py, obj, refs);
-    }
-
     // --- TypedDictType, Parameters, and anything else: fall back ---
     // TypedDictType has complex dict construction + caching; Parameters is
     // rare in this context. Fall back to Python for correctness.
@@ -371,34 +359,6 @@ fn lkv_visit_type_type(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyRe
     kwargs.set_item("column", column)?;
     kwargs.set_item("is_type_form", is_type_form)?;
     let result = make_normalized.call((translated,), Some(kwargs))?;
-    Ok(result.into())
-}
-
-/// TypeTranslator.visit_literal_type default: LiteralType(value,
-/// translated fallback, line, column).
-fn lkv_visit_literal(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
-    let value = obj.getattr("value")?;
-    let fallback = obj.getattr("fallback")?;
-    let translated_fallback = lkv_translate_one(py, fallback, refs)?;
-    if is_fallback(&translated_fallback, py) {
-        return fallback_sentinel(py);
-    }
-    let line = obj.getattr("line")?;
-    let column = obj.getattr("column")?;
-    let result = refs
-        .literal_type
-        .call1((value, translated_fallback, line, column))?;
-    Ok(result.into())
-}
-
-/// TypeTranslator.visit_unpack_type default: UnpackType(t.type.accept(self)).
-fn lkv_visit_unpack(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
-    let typ = obj.getattr("type")?;
-    let translated = lkv_translate_one(py, typ, refs)?;
-    if is_fallback(&translated, py) {
-        return fallback_sentinel(py);
-    }
-    let result = refs.unpack_type.call1((translated,))?;
     Ok(result.into())
 }
 
