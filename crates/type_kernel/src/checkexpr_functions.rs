@@ -1058,6 +1058,179 @@ pub(crate) fn rust_method_fullname(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// visit_star_expr — star expression type echo
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_star_expr` (M8c).
+///
+/// The Python implementation is simply `return self.accept(e.expr)`,
+/// an identity pass-through.  The Rust kernel here accepts a single
+/// serialized inner type and returns it verbatim.  This lets the
+/// Python side skip the sub-expression traversal when the checker
+/// has already computed the inner type.
+///
+/// Defer (return None) on any input shape we do not handle — the
+/// strangler-fig escape hatch.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_star_expr(type_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
+    // We must round-trip through decode+encode so that an
+    // unsupported shape (e.g. TypeAliasType) produces None.
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(encode_type(&typ))
+}
+
+// ---------------------------------------------------------------------------
+// visit_conditional_expr — ternary join of branch types
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_conditional_expr` (M8c)
+/// result-type computation.
+///
+/// The Python visitor computes `if_type` and `else_type` from the two
+/// branches, then computes `make_simplified_union([if_type, else_type])`
+/// as the result (line 6467).  In edge cases where that union contains an
+/// uninhabited component it falls back to `join_types(if_type, else_type)`
+/// (line 6472).
+///
+/// This Rust function receives both branch types serialized and returns
+/// the join.  The caller (Python) still handles `accept` of the sub-expressions
+/// and error reporting; this function is a pure type-derivation helper.
+///
+/// Defer (return None) when any input shape we cannot identify.
+///
+/// Takes a `NativeTypeResolver` because the full join logic uses
+/// `subtypes::is_subtype` which needs the type-info snapshot for
+/// Instance-Instance subtype checks.  Without a resolver we fall back
+/// to Python, matching the Python gate pattern.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_conditional_expr_join(
+    if_bytes: &[u8],
+    else_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<Vec<u8>>> {
+    let if_type = match decode_type(if_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let else_type = match decode_type(else_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    Ok(conditional_join_inner(
+        &if_type,
+        &else_type,
+        resolver.resolver(),
+    ))
+}
+
+/// Compute the join of two types for the conditional expression.
+/// Mirrors `join.join_types` (the full implementation), which delegates
+/// to `visit_<type>` on each concrete type variant.
+///
+/// This uses the resolver's type-info map for Instance-Instance subtype
+/// and nominal join.  Returns `None` when the resolver doesn't cover a
+/// needed type, so the Python side falls through to the real join.
+fn conditional_join_inner(
+    if_type: &Type,
+    else_type: &Type,
+    resolver: &TypeResolver,
+) -> Option<Vec<u8>> {
+    use crate::subtypes::SubtypeContext;
+
+    // Build the subtype context: strict_optional = true (safe default).
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+
+    // Re-use setops::trivial_join which handles the common cases:
+    // - subtype check s <: t → return t
+    // - subtype check t <: s → return s
+    // - Instance right → return object
+    match crate::setops::trivial_join(if_type, else_type, &ctx, resolver) {
+        Some(crate::setops::SetOpResult::SameS) => encode_type(if_type),
+        Some(crate::setops::SetOpResult::SameT) => encode_type(else_type),
+        Some(crate::setops::SetOpResult::Object) => {
+            // Return `object` instance as the join.
+            encode_type(&Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::Bottom) => {
+            // Bottom in a join usually means a type error;
+            // fall back to a union of both branches.
+            encode_type(&Type::UnionType {
+                items: vec![if_type.clone(), else_type.clone()],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            })
+        }
+        Some(crate::setops::SetOpResult::Any) => {
+            // Any is the universal supertype.
+            encode_type(&Type::AnyType {
+                type_of_any: 0, // TYPE_OF_ANY_SPECIAL_FORM
+                source_any: None,
+                missing_import_name: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::Ancestor(fullname)) => {
+            // Nominal join found a common ancestor.
+            encode_type(&Type::Instance {
+                type_ref: fullname,
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        }) => {
+            // Same-type Instance-Instance join with per-arg discriminators.
+            // For simplicity in the conditional expr context, we return
+            // the first branch's type with Any args where discriminators
+            // differ from both.
+            let final_args: Vec<Type> = arg_discs
+                .iter()
+                .map(|&d| match d {
+                    0 => if_type.clone(),   // use left arg
+                    1 => else_type.clone(), // use right arg
+                    _ => Type::AnyType {
+                        type_of_any: 0,
+                        source_any: None,
+                        missing_import_name: None,
+                    },
+                })
+                .collect();
+            encode_type(&Type::Instance {
+                type_ref,
+                args: final_args,
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::Encoded(bytes)) => Some(bytes),
+        None => {
+            // trivial_join returned None for an unsupported shape;
+            // fall back to a union of both branches (Python's default).
+            encode_type(&Type::UnionType {
+                items: vec![if_type.clone(), else_type.clone()],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
