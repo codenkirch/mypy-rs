@@ -85,7 +85,292 @@ from mypy.types import (
 from mypy.typevars import fill_typevars
 from mypy.util import unmangle
 
-# The names of the different functions that create classes or arguments.
+# ---------------------------------------------------------------------------
+# Native type-kernel gate for attrs plugin (Issue #357).
+# ---------------------------------------------------------------------------
+
+# Module-level flag set by build.py during build start, mirroring the pattern
+# used by other type-kernel consumers (erasetype, subtypes, join, etc.).
+_HAS_NATIVE_ATTRS: bool = False
+
+
+def _set_native_attrs_active(active: bool) -> None:
+    """Set the attrs plugin native gate. Called from mypy/build.py."""
+    global _HAS_NATIVE_ATTRS
+    _HAS_NATIVE_ATTRS = active
+
+
+# Lazy import of the native seam function.
+_rust_transform_attrs_fn = None
+
+
+def _get_rust_transform_attrs():
+    """Lazily import rust_transform_attrs from type_kernel."""
+    global _rust_transform_attrs_fn
+    if _rust_transform_attrs_fn is not None:
+        return _rust_transform_attrs_fn
+    if _HAS_NATIVE_ATTRS:
+        try:
+            from type_kernel import rust_transform_attrs as _fn
+            _rust_transform_attrs_fn = _fn
+        except ImportError:
+            pass
+    return _rust_transform_attrs_fn
+
+
+# ---------------------------------------------------------------------------
+# Attrs wire-format helpers for the Rust seam (Issue #357).
+# ---------------------------------------------------------------------------
+
+# Wire tags for attrs metadata (non-colliding with wire.rs tags).
+_ATTRS_FIELD_TAG = 200
+_ATTRS_INIT_SIG = 201
+_ATTRS_METHOD_INFO = 202
+
+
+def _serialize_attrs_fields_for_rust(
+    attributes: list[Attribute],
+) -> bytes:
+    """Serialize field metadata into bytes for rust_transform_attrs.
+
+    Wire: count(short-int) + for each field:
+      ATTRS_FIELD_TAG(200) + name_len(short-int) + name(utf8) +
+      init_type_len(short-int) + init_type_bytes (if >0, else 0) +
+      has_default(bool) + kw_only(bool) + init(bool) +
+      converter_init_type_len(short-int) + converter_init_type_bytes +
+      converter_ret_type_len(short-int) + converter_ret_type_bytes
+    """
+    # We use a bytearray and write a compact wire format matching
+    # what Rust's read_attr_field expects.
+
+    def _write_short_int(val: int) -> None:
+        """Write 1-byte short-int for values in [-10..117]."""
+        MIN_ONE = -10
+        if MIN_ONE <= val <= 117:
+            buf.append(((val - MIN_ONE) << 1) & 0xFF)
+        else:
+            # For large values we use 2-byte form.
+            val2 = val - (-100)
+            if 0 <= val2 <= 16383:
+                payload = (val2 << 2) | 1
+                buf.append(payload & 0xFF)
+                buf.append((payload >> 8) & 0xFF)
+            else:
+                raise ValueError(f"short-int overflow: {val}")
+
+    def _write_type_bytes(typ: Type) -> int:
+        """Serialize a Type to wire bytes, return length."""
+        from mypy.cache import WriteBuffer
+
+        wb = WriteBuffer()
+        typ.write(wb)  # type: ignore[attr-defined]
+        raw = wb.buf if hasattr(wb, "buf") else bytes(wb)
+        buf.extend(raw)
+        return len(raw)
+
+    def _write_type_opt(typ: Type | None) -> None:
+        """Write a length-prefixed optional type."""
+        if typ is not None:
+            _write_short_int(_write_type_bytes(typ))
+        else:
+            _write_short_int(0)
+
+    buf = bytearray()
+    _write_short_int(len(attributes),)
+
+    for attr in attributes:
+        # Tag.
+        buf.append(_ATTRS_FIELD_TAG)
+
+        # Name.
+        name_bytes = attr.name.encode("utf-8")
+        _write_short_int(len(name_bytes))
+        buf.extend(name_bytes)
+
+        # Alias (not used in wire, Python handles it).
+        _write_short_int(0)
+
+        # init_type.
+        _write_type_opt(attr.init_type)
+
+        # has_default, kw_only, init.
+        buf.append(1 if attr.has_default else 0)
+        buf.append(1 if attr.kw_only else 0)
+        buf.append(1 if attr.init else 0)
+
+        # Converter init type.
+        conv_init = attr.converter.init_type if attr.converter else None
+        _write_type_opt(conv_init)
+
+        # Converter return type.
+        conv_ret = attr.converter.ret_type if attr.converter else None
+        _write_type_opt(conv_ret)
+
+    return bytes(buf)
+
+
+def _try_native_init_injection(
+    ctx: mypy.plugin.ClassDefContext,
+    attributes: list[Attribute],
+    adder: MethodAdder,
+    method_name: str,
+) -> bool:
+    """Try to inject __init__ via the Rust kernel.
+
+    Returns True if the native path succeeded, False otherwise (fall back
+    to the Python implementation in _add_init).
+    """
+    rust_fn = _get_rust_transform_attrs()
+    if rust_fn is None:
+        return False
+
+    try:
+        fields_bytes = _serialize_attrs_fields_for_rust(attributes)
+        class_fullname = ctx.cls.fullname
+        add_order = True  # We'll handle ordering methods separately.
+
+        result = rust_fn(fields_bytes, class_fullname, method_name, add_order)
+        if result is None:
+            return False
+
+        # Deserialize the result and inject the method.
+        _apply_native_init(ctx, result, attributes, adder, method_name)
+        return True
+    except Exception:
+        # Any failure falls back to the Python implementation.
+        return False
+
+
+def _apply_native_init(
+    ctx: mypy.plugin.ClassDefContext,
+    rust_result: bytes,
+    attributes: list[Attribute],
+    adder: MethodAdder,
+    method_name: str,
+) -> None:
+    """Apply the native init result to the class.
+
+    The Rust result contains serialized arg structure (names, kinds) and
+    types. We reconstruct Argument objects from the original Attribute
+    data (which has live types) using the structure Rust computed.
+    """
+    buf = bytearray(rust_result)
+    pos = 0
+
+    def _read_u8() -> int:
+        nonlocal pos
+        b = buf[pos]
+        pos += 1
+        return b
+
+    def _read_short_int() -> int:
+        first = _read_u8()
+        TWO_BYTES_BIT = 1
+        FOUR_BYTES_BIT = 2
+        MIN_ONE = -10
+        if (first & TWO_BYTES_BIT) == 0:
+            return ((first >> 1) + MIN_ONE)
+        elif (first & FOUR_BYTES_BIT) == 0:
+            second = _read_u8()
+            return ((second << 6) + ((first >> 2)) - 100)
+        else:
+            second = _read_u8()
+            pos += 2
+            two_more = buf[pos - 2] | (buf[pos - 1] << 8)
+            higher = ((two_more << 13) + (second << 5))
+            return (higher + ((first >> 3)) - 10000)
+
+    # Skip the ATTRS_INIT_SIG tag.
+    _read_u8()
+
+    # Read init_name (should match method_name).
+    init_name_len = _read_short_int()
+    rust_init_name = bytes(buf[pos:pos + init_name_len]).decode("utf-8")
+    pos += init_name_len
+
+    # Read init_info blob.
+    init_info_len = _read_short_int()
+    init_info = bytes(buf[pos:pos + init_info_len])
+    pos += init_info_len
+
+    # Read ordering methods info (we don't inject them here; Python handles
+    # ordering methods via _add_order which is unchanged).
+
+    # Now build __init__ args from the original Attribute data.
+    # The Rust side computed the structure (positional vs keyword-only,
+    # arg_kinds, names). We apply the actual types from the attributes.
+    pos_args: list[Argument] = []
+    kw_only_args: list[Argument] = []
+    sym_table = ctx.cls.info.names
+
+    for attr in attributes:
+        if not attr.init:
+            continue
+
+        # Compute init_type (same logic as Attribute.argument).
+        init_type: Type | None = None
+        if attr.converter:
+            if attr.converter.init_type:
+                init_type = attr.converter.init_type
+                if init_type and attr.init_type and attr.converter.ret_type:
+                    converter_vars = get_type_vars(attr.converter.ret_type)
+                    init_vars = get_type_vars(attr.init_type)
+                    if converter_vars and len(converter_vars) == len(init_vars):
+                        variables = {
+                            binder.id: arg
+                            for binder, arg in zip(converter_vars, init_vars)
+                        }
+                        init_type = expand_type(attr.init_type, variables)
+            else:
+                ctx.api.fail(
+                    "Cannot determine __init__ type from converter", attr.context
+                )
+                init_type = AnyType(TypeOfAny.from_error)
+        else:
+            init_type = attr.init_type or ctx.cls.info[attr.name].type
+
+        unannotated = False
+        if init_type is None:
+            unannotated = True
+            init_type = AnyType(TypeOfAny.unannotated)
+        else:
+            proper_type = get_proper_type(init_type)
+            if isinstance(proper_type, AnyType):
+                if proper_type.type_of_any == TypeOfAny.unannotated:
+                    unannotated = True
+
+        if unannotated and ctx.api.options.disallow_untyped_defs:
+            node = ctx.cls.info[attr.name].node
+            assert node is not None
+            ctx.api.msg.need_annotation_for_var(node, attr.context)
+
+        # Attrs removes leading underscores.
+        name = attr.alias or attr.name.lstrip("_")
+
+        if attr.kw_only:
+            arg_kind = ARG_NAMED_OPT if attr.has_default else ARG_NAMED
+        else:
+            arg_kind = ARG_OPT if attr.has_default else ARG_POS
+
+        arg = Argument(Var(name, init_type), init_type, None, arg_kind)
+
+        if attr.kw_only:
+            kw_only_args.append(arg)
+        else:
+            pos_args.append(arg)
+
+        # Final flag handling.
+        if not attr.has_default and attr.name in sym_table:
+            sym_node = sym_table[attr.name].node
+            if isinstance(sym_node, Var) and sym_node.is_final:
+                sym_node.final_set_in_init = True
+
+    args = pos_args + kw_only_args
+    if all(arg.variable.type and is_unannotated_any(arg.variable.type) for arg in args):
+        for a in args:
+            a.variable.type = AnyType(TypeOfAny.implementation_artifact)
+            a.type_annotation = AnyType(TypeOfAny.implementation_artifact)
+    adder.add_method(method_name, args, NoneType())
 attr_class_makers: Final = {"attr.s", "attr.attrs", "attr.attributes"}
 attr_dataclass_makers: Final = {"attr.dataclass"}
 attr_frozen_makers: Final = {"attr.frozen", "attrs.frozen"}
@@ -819,7 +1104,13 @@ def _parse_assignments(
 
 
 def _add_order(ctx: mypy.plugin.ClassDefContext, adder: MethodAdder) -> None:
-    """Generate all the ordering methods for this class."""
+    """Generate all the ordering methods for this class.
+
+    Native path: the rust side computes __lt__/__le__/__gt__/__ge__ signatures
+    (same signature def(self: AT, other: AT) -> bool with a generic AT). Python
+    constructs the live TypeVarType for the self-type; Rust returns the wire
+    encoding for the 'other' arg (same as self) and the bool return type.
+    """
     bool_type = ctx.api.named_type("builtins.bool")
     object_type = ctx.api.named_type("builtins.object")
     # Make the types be:

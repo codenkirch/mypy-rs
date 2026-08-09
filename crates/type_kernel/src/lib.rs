@@ -43,6 +43,7 @@ mod aliases;
 mod applytype;
 mod argmap;
 mod astwire;
+mod attrs;
 mod cache;
 mod callable_compat;
 mod checkcall;
@@ -620,5 +621,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         stubgen::rust_stubgen_render_type_args,
         module
     )?)?;
+    // Attrs plugin transform (Issue #357): seam function for class decoration.
+    module.add_function(wrap_pyfunction!(attrs::rust_transform_attrs, module)?)?;
+    module.add_function(wrap_pyfunction!(attrs::rust_serialize_fields, module)?)?;
     Ok(())
 }
