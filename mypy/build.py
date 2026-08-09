@@ -905,6 +905,10 @@ class BuildManager:
         from mypy.join import _set_native_join_active
 
         _set_native_join_active(self.options.native_type_kernel)
+        # Stage 3d: gate the attrs plugin __init__/eq/order injection path.
+        from mypy.plugins.attrs import _set_native_attrs_active
+
+        _set_native_attrs_active(self.options.native_type_kernel)
         # Clear stale resolvers from a previous build so the kernel
         # defers to Python until the new snapshot is installed in
         # `_build_native_resolvers` (process_stale_scc). Without this,
