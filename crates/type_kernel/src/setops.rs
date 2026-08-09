@@ -428,16 +428,20 @@ pub(crate) fn meet_types(
 
     // meet.py:147-148: isinstance(s, UnionType) and not isinstance(t,
     // UnionType) -> swap. Both UnionType -> visit_union_type builds a
-    // new union -> defer.
-    let (s, t, swapped) = match (s, t) {
-        (Type::UnionType { .. }, other) if !matches!(other, Type::UnionType { .. }) => (t, s, true),
-        (Type::UnionType { .. }, Type::UnionType { .. }) => return None,
-        _ => (s, t, false),
+    // new union via make_simplified_union.
+    let swapped = matches!(s, Type::UnionType { .. }) && !matches!(t, Type::UnionType { .. });
+    let (s, t) = if swapped {
+        (t, s)
+    } else if matches!(s, Type::UnionType { .. }) && matches!(t, Type::UnionType { .. }) {
+        // Both UnionType: build the pairwise meets and encode the result.
+        return meet_union(s, t, ctx, resolver).map(|r| flip_if(r, false));
+    } else {
+        (s, t)
     };
 
     // normalize_callables (meet.py:151) is a no-op for the Rust path:
-    // the Python shim serializes the post-normalization form. The
-    // both-FunctionLike case needs meet_similar_callables -> defer.
+    // the Python shim serializes the post-normalization form.
+    // Both-FunctionLike: build the meet (encoded).
     let s_is_callable = matches!(
         s,
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
@@ -447,12 +451,13 @@ pub(crate) fn meet_types(
         Type::CallableType { .. } | Type::Overloaded { .. } | Type::Parameters { .. }
     );
     if s_is_callable && t_is_callable {
-        return None;
+        // Both callable-like: meet_similar_callables or default.
+        return meet_callable_like(s, t, ctx, resolver).map(|r| flip_if(r, swapped));
     }
 
-    // t.accept(TypeMeetVisitor(s)) — leaf visitors only. The visitor
-    // returns SameS/SameT relative to the post-swap s/t; flip back to
-    // the original s/t frame.
+    // t.accept(TypeMeetVisitor(s)) — leaf visitors + recursive meet.
+    // The visitor returns SameS/SameT relative to the post-swap s/t;
+    // flip back to the original s/t frame.
     visit_meet(s, t, ctx, resolver).map(|r| flip_if(r, swapped))
 }
 
@@ -640,6 +645,230 @@ fn visit_meet(
         // swap) reach here and defer.
         _ => None,
     }
+}
+
+/// `visit_union_type` for `meet_types`: both sides are UnionType.
+///
+/// meet.py:962-970: pairwise meets then make_simplified_union.
+/// Produces a new UnionType encoded via wire format.
+fn meet_union(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let Type::UnionType { items: s_items, .. } = s else {
+        return None;
+    };
+    let Type::UnionType { items: t_items, .. } = t else {
+        return None;
+    };
+
+    let mut meets = Vec::with_capacity(s_items.len() * t_items.len());
+    for s_item in s_items {
+        for t_item in t_items {
+            let m = meet_types(s_item, t_item, ctx, resolver)?;
+            // Convert the SetOpResult discriminator to an actual Type
+            let meet_type = match m {
+                SetOpResult::SameS => s_item.clone(),
+                SetOpResult::SameT => t_item.clone(),
+                SetOpResult::Bottom => Type::UninhabitedType { ambiguous: true },
+                SetOpResult::Any => Type::AnyType {
+                    type_of_any: 3,
+                    source_any: None,
+                    missing_import_name: None,
+                },
+                SetOpResult::Object => Type::Instance {
+                    type_ref: "builtins.object".into(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+                SetOpResult::Ancestor(fullname) => Type::Instance {
+                    type_ref: fullname,
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+                SetOpResult::SameTypeWithArgs {
+                    type_ref,
+                    arg_discs,
+                } => {
+                    // Build Instance(type_ref, reconstructed args)
+                    let args = reconstruct_args_from_discs(&arg_discs, s_item, t_item);
+                    Type::Instance {
+                        type_ref,
+                        args,
+                        last_known_value: None,
+                        extra_attrs: None,
+                    }
+                }
+                SetOpResult::Encoded(bytes) => {
+                    // Decode the encoded type
+                    decode_type(&bytes)?
+                }
+            };
+            meets.push(meet_type);
+        }
+    }
+
+    // Drop UninhabitedType items, then call make_simplified_union
+    meets.retain(|item| !matches!(item, Type::UninhabitedType { .. }));
+
+    // make_simplified_union returns Option<Type>; wrap as Encoded(SetOpResult)
+    let joined = make_simplified_union(&meets, ctx, resolver, false)?;
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &joined).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// Reconstruct args from per-arg discriminators for SameTypeWithArgs.
+fn reconstruct_args_from_discs(arg_discs: &[i8], s_item: &Type, t_item: &Type) -> Vec<Type> {
+    arg_discs
+        .iter()
+        .map(|d| match d {
+            0 => s_item.clone(),
+            1 => t_item.clone(),
+            4 => Type::AnyType {
+                type_of_any: 3,
+                source_any: None,
+                missing_import_name: None,
+            },
+            _ => s_item.clone(),
+        })
+        .collect()
+}
+
+/// `meet_callable_like` (meet.py:1120-1146, 1148-1165): handles all
+/// callable-like (CallableType, Overloaded, Parameters) vs callable-like
+/// meet cases. Produces an encoded result or None (defer).
+fn meet_callable_like(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    // Normalize both to callable types for comparison
+    let s_callable = match s {
+        Type::CallableType { .. } => s.clone(),
+        Type::Overloaded { items } => {
+            // Use first overload item
+            items.first()?.clone()
+        }
+        Type::Parameters { .. } => s.clone(),
+        _ => return None,
+    };
+
+    let t_callable = match t {
+        Type::CallableType { .. } => t.clone(),
+        Type::Overloaded { items } => items.first()?.clone(),
+        Type::Parameters { .. } => t.clone(),
+        _ => return None,
+    };
+
+    // Both are CallableType: check similarity and meet
+    match (&s_callable, &t_callable) {
+        (
+            Type::CallableType {
+                arg_types: t_arg_types,
+                arg_kinds: t_arg_kinds,
+                ret_type: t_ret,
+                fallback: t_fallback,
+                instance_type: t_inst,
+                ..
+            },
+            Type::CallableType {
+                arg_types: s_arg_types,
+                arg_kinds: s_arg_kinds,
+                ret_type: s_ret,
+                fallback: s_fallback,
+                instance_type: s_inst,
+                ..
+            },
+        ) => {
+            if is_similar_callables(t_arg_types, t_arg_kinds, s_arg_types, s_arg_kinds) {
+                meet_similar_callables_impl(
+                    t_arg_types,
+                    t_ret.as_ref(),
+                    t_fallback.as_ref(),
+                    t_inst,
+                    s_arg_types,
+                    s_ret.as_ref(),
+                    s_fallback.as_ref(),
+                    s_inst,
+                    ctx,
+                    resolver,
+                )
+            } else {
+                // Not similar: fallback join
+                Some(SetOpResult::SameT)
+            }
+        }
+        // Overloaded vs callable-like: fallback join
+        _ => {
+            // Default: meet(t.fallback, s.fallback) or default(self.s)
+            // Conservative: return Bottom
+            Some(SetOpResult::Bottom)
+        }
+    }
+}
+
+/// `meet_similar_callables` (meet.py:1401-1427): arg types are joined
+/// (not met — args are contravariant), return type is met, instance_type
+/// is met, fallback is picked.
+#[allow(clippy::too_many_arguments)]
+fn meet_similar_callables_impl(
+    t_arg_types: &[Type],
+    t_ret: &Type,
+    t_fallback: &Type,
+    t_inst: &Option<Box<Type>>,
+    s_arg_types: &[Type],
+    s_ret: &Type,
+    s_fallback: &Type,
+    s_inst: &Option<Box<Type>>,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let mut new_arg_types = Vec::with_capacity(t_arg_types.len());
+    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
+        // Args are joined (contravariant), not met
+        new_arg_types.push(setop_result_to_type(
+            join_types(ta, sa, ctx, resolver),
+            ta,
+            sa,
+        )?);
+    }
+    let new_ret = setop_result_to_type(meet_types(t_ret, s_ret, ctx, resolver), s_ret, t_ret)?;
+    let new_instance_type = match (t_inst, s_inst) {
+        (Some(ti), Some(si)) => Some(Box::new(setop_result_to_type(
+            meet_types(ti, si, ctx, resolver),
+            si,
+            ti,
+        )?)),
+        _ => None,
+    };
+    let new_fallback = pick_fallback(s_fallback, t_fallback);
+
+    let new_callable = Type::CallableType {
+        fallback: Box::new(new_fallback),
+        instance_type: new_instance_type,
+        is_ellipsis_args: false,
+        implicit: false,
+        is_bound: false,
+        from_concatenate: false,
+        imprecise_arg_kinds: false,
+        unpack_kwargs: false,
+        arg_types: new_arg_types,
+        arg_kinds: vec![0; t_arg_types.len()],
+        arg_names: Vec::new(),
+        ret_type: Box::new(new_ret),
+        name: None,
+        variables: Vec::new(),
+        type_guard: None,
+        type_is: None,
+    };
+
+    encode_callable(new_callable)
 }
 
 /// `TypeMeetVisitor.visit_instance` (meet.py:913-996), args-less
@@ -5244,8 +5473,10 @@ mod tests {
     }
 
     #[test]
-    fn meet_types_both_union_defers() {
-        // Both UnionType -> visit_union_type builds a new union -> defer.
+    fn meet_types_both_union_resolves() {
+        // Both UnionType -> meet_union does pairwise meets then
+        // make_simplified_union.  For identical unions the result is
+        // the same union (encoded).
         let r = make_resolver(vec![]);
         let s = Type::UnionType {
             items: vec![instance("a.A", vec![])],
@@ -5259,14 +5490,16 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+        assert!(matches!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Encoded(_))
+        ));
     }
 
     #[test]
-    fn meet_types_both_callable_defers() {
-        // normalize_callables + visit_callable_type: both callable-like
-        // -> needs combine_similar_callables / meet_similar_callables
-        // (produces a new CallableType) -> defer.
+    fn meet_types_both_callable_resolves() {
+        // Both callable-like (identical) -> meet_similar_callables
+        // produces a new CallableType encoded in the wire format.
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let s = callable(
             "builtins.function",
@@ -5278,7 +5511,10 @@ mod tests {
             vec![],
             instance("builtins.int", vec![]),
         );
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+        assert!(matches!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Encoded(_))
+        ));
     }
 
     #[test]
