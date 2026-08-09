@@ -90,6 +90,17 @@ pub(crate) fn is_subtype(
         // and callable-compat paths bypass that, so defer unexpanded aliases.
         return None;
     }
+    // TupleType / TypeType / Overloaded left: the freshly added visitor
+    // ports for these three left-types are not at parity yet (variadic
+    // tuple, Unpack args, match-sequence patterns regress testcheck), so
+    // defer all three to Python's SubtypeVisitor. Port code stays below,
+    // dead, until a follow-up brings each visitor to parity.
+    if matches!(
+        left,
+        Type::TupleType { .. } | Type::TypeType { .. } | Type::Overloaded { .. }
+    ) {
+        return None;
+    }
     if !ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
         return Some(true);
     }
@@ -278,6 +289,239 @@ pub(crate) fn is_subtype(
         if let Type::TypeVarType { .. } = right {
             return Some(false);
         }
+    }
+    // visit_unbound_type (subtypes.py:528-530): unbound types are always
+    // subtypes (bad annotation). Fires regardless of self.right because
+    // the visitor's `accept` dispatches on left type.
+    if matches!(left, Type::UnboundType { .. }) {
+        return Some(true);
+    }
+    // visit_any (subtypes.py:534-535): proper subtype of Any only if
+    // right is also Any. Non-proper subtype of Any is always True.
+    if matches!(left, Type::AnyType { .. }) {
+        if ctx.proper_subtype {
+            return Some(matches!(right, Type::AnyType { .. }));
+        }
+        return Some(true);
+    }
+    // visit_union_type (subtypes.py:1175-1227): each item of left must be
+    // a subtype of right. Python first optimises for right being Instance
+    // or UnionType with literal-pruning; the general case is
+    // `all(self._is_subtype(item, self.orig_right) for item in left.items)`.
+    // We always fire the general case — Python's shim has already handled
+    // the UnionType-right case at the top-level entry (subtypes.py:362-408),
+    // so this only fires when left is UnionType and right is something else
+    // (or when the shim returned None).
+    if let Type::UnionType { items, .. } = left {
+        for item in items {
+            match is_subtype(item, right, ctx, resolver) {
+                Some(true) => {}
+                Some(false) => return Some(false),
+                None => return None,
+            }
+        }
+        return Some(true);
+    }
+    // visit_tuple_type (subtypes.py:870-935): TupleType left vs right.
+    // Handles right=Instance (Sized, TUPLE_LIKE, structural fallback, protocol)
+    // and right=TupleType (length, item-by-item, fallback matching).
+    // We handle the common TupleType vs TupleType and TupleType vs builtins.tuple paths;
+    // defer protocol/NamedTuple/Sized/variadic paths to Python.
+    if let Type::TupleType {
+        partial_fallback,
+        items: left_items,
+        ..
+    } = left
+    {
+        // TupleType vs Instance right.
+        if let Type::Instance {
+            type_ref: right_ref,
+            args: right_args,
+            ..
+        } = right
+        {
+            // TupleType vs builtins.tuple — common case.
+            // If right is builtins.tuple and the iterator type is Any,
+            // always True (subtypes.py:888-894).
+            if right_ref == "builtins.tuple" {
+                // Check if iter_type is AnyType.
+                // For builtins.tuple with args[0], check if it's Any.
+                if let Some(iter_type) = right_args.first() {
+                    if matches!(iter_type, Type::AnyType { .. }) {
+                        return Some(true);
+                    }
+                    // General case: each left item must be subtype of iter_type.
+                    // For proper_subtype without args, return False.
+                    if right_args.is_empty() && ctx.proper_subtype {
+                        return Some(false);
+                    }
+                    let iter_type = iter_type.clone();
+                    for li in left_items {
+                        match is_subtype(li, &iter_type, ctx, resolver) {
+                            Some(true) => {}
+                            Some(false) => return Some(false),
+                            None => return None,
+                        }
+                    }
+                    return Some(true);
+                }
+                // No args on builtins.tuple — general structural check.
+                for li in left_items {
+                    match is_subtype(li, right, ctx, resolver) {
+                        Some(true) => {}
+                        Some(false) => return Some(false),
+                        None => return None,
+                    }
+                }
+                return Some(true);
+            }
+            // TupleType vs other Instance: fallback check + protocol check.
+            // We do fallback check; defer protocol to Python.
+            if is_subtype(partial_fallback, right, ctx, resolver)? {
+                return Some(true);
+            }
+            return Some(false);
+        }
+        // TupleType vs TupleType right.
+        if let Type::TupleType {
+            items: right_items,
+            partial_fallback: right_fallback,
+            ..
+        } = right
+        {
+            // Length check (subtypes.py:906).
+            if left_items.len() != right_items.len() {
+                return Some(false);
+            }
+            // Item-by-item subtype check (subtypes.py:908).
+            for (l, r) in left_items.iter().zip(right_items.iter()) {
+                match is_subtype(l, r, ctx, resolver) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            // Fallback check: if right.fallback is builtins.tuple,
+            // no need to verify (subtypes.py:910-913).
+            if let Type::Instance {
+                type_ref: rfb_ref, ..
+            } = right_fallback.as_ref()
+            {
+                if rfb_ref == "builtins.tuple" {
+                    return Some(true);
+                }
+            }
+            // If left.fallback is builtins.tuple, it's NOT a subtype
+            // (subtypes.py:914-917).
+            if let Type::Instance {
+                type_ref: lfb_ref, ..
+            } = partial_fallback.as_ref()
+            {
+                if lfb_ref == "builtins.tuple" {
+                    return Some(false);
+                }
+            }
+            // Structural fallback check (subtypes.py:920).
+            return is_subtype(partial_fallback, right_fallback.as_ref(), ctx, resolver);
+        }
+        // TupleType vs anything else (CallableType, etc.): False.
+        return Some(false);
+    }
+    // visit_type_type (subtypes.py:1220-1280). Handles TypeType left.
+    if let Type::TypeType {
+        item: left_item,
+        is_type_form: left_is_type_form,
+    } = left
+    {
+        // left.is_type_form path (subtypes.py:1230-1244).
+        if *left_is_type_form {
+            // right is TypeType: must also be is_type_form, then recurse on items.
+            if let Type::TypeType {
+                item: right_item,
+                is_type_form: right_is_type_form,
+            } = right
+            {
+                if !*right_is_type_form {
+                    return Some(false);
+                }
+                return is_subtype(left_item, right_item, ctx, resolver);
+            }
+            // right is Instance: only true if builtins.object.
+            if let Type::Instance {
+                type_ref: right_ref,
+                ..
+            } = right
+            {
+                if right_ref == "builtins.object" {
+                    return Some(true);
+                }
+                return Some(false);
+            }
+            return Some(false);
+        }
+        // not left.is_type_form (subtypes.py:1239-1276).
+        // right is TypeType: recurse on items.
+        if let Type::TypeType {
+            item: right_item, ..
+        } = right
+        {
+            return is_subtype(left_item, right_item, ctx, resolver);
+        }
+        // right is CallableType: Type[X] <: Callable is unsound but done.
+        // We don't check __init__ signature.
+        if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
+            // Check if left.item has a __call__ equivalent.
+            // Simplified: if left_item is Instance, get its type_object_type
+            // and check return type match. For full parity, we defer to Python
+            // the complex callable matching.
+            return None;
+        }
+        // right is Instance.
+        if let Type::Instance {
+            type_ref: right_ref,
+            ..
+        } = right
+        {
+            // builtins.object and builtins.type are always True.
+            if right_ref == "builtins.object" || right_ref == "builtins.type" {
+                return Some(true);
+            }
+            // For other instances: check metaclass of left.item.
+            // Simplified: if left_item is Instance, check if it has a metaclass
+            // that is a subtype of right. Defer to Python for full accuracy.
+            return None;
+        }
+        return Some(false);
+    }
+    // visit_overloaded (subtypes.py:1104-1169): Overloaded left.
+    if let Type::Overloaded { items: left_items } = left {
+        // right is Instance (subtypes.py:1105-1119): for a protocol Instance
+        // the check is `find_member("__call__", right, right)` then a
+        // subtyping check plus `is_protocol_implementation`; for a plain
+        // Instance it recurses on `left.fallback`. Neither is ported
+        // (find_member / is_protocol_implementation stay on the Python
+        // side), so defer — deciding here produced a false "incompatible
+        // type" for an Overloaded passed to a __call__-Protocol.
+        if matches!(right, Type::Instance { .. }) {
+            return None;
+        }
+        // right is CallableType: at least one overload item must match.
+        if let Type::CallableType { .. } = right {
+            for item in left_items {
+                match is_subtype(item, right, ctx, resolver) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => return None,
+                }
+            }
+            return Some(false);
+        }
+        // right is Overloaded: structural overload matching (order-sensitive).
+        // Simplified: if left == right, True. Otherwise defer complex matching.
+        if left == right {
+            return Some(true);
+        }
+        return None;
     }
     let (left_ref, left_args) = match left {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
@@ -1124,17 +1368,17 @@ mod tests {
     }
 
     #[test]
-    fn non_instance_returns_none() {
-        // UnionType right, AnyType left: not the nominal path.
-        let r = make_resolver(vec![]);
-        let left = any_type();
-        let right = Type::UnionType {
+    fn tuple_left_returns_none() {
+        // TupleType left: the visitor port is not at parity yet, so
+        // is_subtype defers to Python (matches the TupleType guard).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let tuple = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
             items: vec![instance("a.A", vec![])],
-            uses_pep604_syntax: true,
-            can_be_true: true,
-            can_be_false: true,
+            implicit: true,
         };
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        let right = instance("a.A", vec![]);
+        assert_eq!(is_subtype(&tuple, &right, &ctx_nominal(), &r), None);
     }
 
     #[test]

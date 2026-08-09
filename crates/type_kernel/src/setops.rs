@@ -391,20 +391,25 @@ pub(crate) fn meet_types(
         }
     }
 
-    // meet.py:137-141: is_proper_subtype pre-check (ignore_promotions).
-    // Only fires for Instance-Instance (Rust is_subtype returns None
-    // for non-Instance, so ErasedType never reaches the check).
-    let proper_ctx = {
-        let mut c = ctx.clone();
-        c.proper_subtype = true;
-        c.ignore_promotions = true;
-        c
-    };
-    if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
-        return Some(SetOpResult::SameS);
-    }
-    if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
-        return Some(SetOpResult::SameT);
+    // meet.py:139-141: is_proper_subtype pre-check (ignore_promotions),
+    // skipped when either side is an UnboundType (meet.py:138) so an
+    // UnboundType is never eliminated by the sub-type pre-check; the
+    // visit_unbound_type visitor below decides the result instead.
+    let has_unbound =
+        matches!(s, Type::UnboundType { .. }) || matches!(t, Type::UnboundType { .. });
+    if !has_unbound {
+        let proper_ctx = {
+            let mut c = ctx.clone();
+            c.proper_subtype = true;
+            c.ignore_promotions = true;
+            c
+        };
+        if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
+            return Some(SetOpResult::SameS);
+        }
+        if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
+            return Some(SetOpResult::SameT);
+        }
     }
 
     // meet.py:143-144 (isinstance(s, ErasedType) -> return s) is
@@ -2937,14 +2942,14 @@ mod tests {
     }
 
     #[test]
-    fn trivial_meet_returns_none_when_subtype_defers() {
-        // Non-Instance left -> is_subtype returns None for both
-        // directions -> trivial_meet defers (returns None).
+    fn trivial_meet_defers_on_tuple_left() {
+        // TupleType left -> is_subtype defers for both directions ->
+        // trivial_meet defers (returns None).
         let r = make_resolver(vec![]);
-        let left = Type::AnyType {
-            type_of_any: 0,
-            source_any: None,
-            missing_import_name: None,
+        let left = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+            items: vec![],
+            implicit: true,
         };
         let right = instance("a.A", vec![]);
         assert_eq!(trivial_meet(&left, &right, &ctx(true), &r), None);
