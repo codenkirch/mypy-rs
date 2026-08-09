@@ -292,10 +292,15 @@ class _TypeRefFixer(TypeTranslator):
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
         if self.missing:
             return t
-        args = [a.accept(self) for a in t.args]
-        if self.missing:
-            return t  # type: ignore[unreachable]
-        return t.copy_modified(args=args)
+        # The wire never carries a live alias node, so a decoded
+        # TypeAliasType has alias=None and type_ref only. Fixing it up
+        # is impossible (there is nothing to resolve the type_ref to),
+        # and leaking an unfixed alias breaks is_recursive()/str() with
+        # an AssertionError or prints "<alias (unfixed)>". Defer to the
+        # pure-Python visitor instead, mirroring expand's _needs_python
+        # contract for nodes a kernel round-trip cannot carry.
+        self.missing = True
+        return t
 
 
 class _FakeInfoGuard(mypy.type_visitor.TypeQuery[bool]):
