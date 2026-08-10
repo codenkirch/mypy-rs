@@ -49,6 +49,7 @@ mod callable_compat;
 mod checkcall;
 mod checker_stmts;
 mod checker_visitor;
+mod checkexpr_argcheck;
 mod checkexpr_functions;
 mod checkmember;
 mod checkoperator;
@@ -383,6 +384,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checker_stmts::rust_stmt_outcome, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_argcheck::rust_check_arguments,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_stmts::rust_with_exit_suppresses,
         module

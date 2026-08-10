@@ -229,6 +229,7 @@ try:
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
+        rust_check_arguments as _rust_check_arguments,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
@@ -285,7 +286,9 @@ except ImportError:
     _rust_container_type = None  # type: ignore[assignment]
     _rust_tuple_context_matches = None  # type: ignore[assignment]
     _rust_build_tuple_type = None  # type: ignore[assignment]
+    _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
+    _rust_check_arguments = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -3410,6 +3413,49 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         self.check_var_args_kwargs(arg_types, arg_kinds, context)
 
         check_arg = check_arg or self.check_arg
+        # Rust seam (checkexpr_argcheck.rs): all-or-nothing per-call gate.
+        # Emits per-arg records (0=deleted, 1=abstract, 2=incompatible);
+        # Python mirrors messages. Any undecidable input defers all.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+            and check_arg is None
+        ):
+            try:
+                records = _rust_check_arguments(
+                    _native_checkexpr_resolver,
+                    _serialize_type_for_checkexpr(callee),
+                    [_serialize_type_for_checkexpr(get_proper_type(t)) for t in arg_types],
+                    [int(k.value) for k in arg_kinds],
+                    formal_to_actual,
+                    self.chk.options.strict_optional,
+                    self.chk.allow_abstract_call,
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                records = None
+            if records is not None:
+                for kind, ai, fi in records:
+                    actual_type = get_proper_type(arg_types[ai])
+                    callee_type = get_proper_type(callee.arg_types[fi])
+                    if kind == 0:
+                        self.msg.deleted_as_rvalue(actual_type, args[ai])
+                    elif kind == 1:
+                        self.msg.concrete_only_call(callee_type, args[ai])
+                    else:
+                        error = self.msg.incompatible_argument(
+                            ai + 1, fi + 1, callee, actual_type, arg_kinds[ai],
+                            object_type=object_type, context=args[ai],
+                            outer_context=context,
+                        )
+                        self.msg.incompatible_argument_note(
+                            actual_type, callee_type, args[ai], parent_error=error
+                        )
+                        if not self.msg.prefer_simple_messages():
+                            self.chk.check_possible_missing_await(
+                                actual_type, callee_type, args[ai], error.code
+                            )
+                return
         # Keep track of consumed tuple *arg items.
         mapper = ArgTypeExpander(self.argument_infer_context())
 
