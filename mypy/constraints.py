@@ -47,6 +47,30 @@ def _set_native_constraints_resolver(resolver: Any) -> None:
     _native_constraints_resolver = resolver
 
 
+def _fix_wire_type(data: _ReadBuffer) -> Type | None:
+    """Read a wire type and resolve type_refs, dropping NOT_READY singletons.
+
+    Mirrors typeops._deserialize_type: read_type may populate the shared
+    instance_cache primitives with NOT_READY Instances (INSTANCE_OBJECT
+    etc. compact tags). Clearing the cache first makes a missed fixup
+    (fixup_wire_type returning None because one type_ref is unresolvable,
+    e.g. during a stale SCC where Builtins isn't fixed yet) unable to
+    leak NOT_READY singletons into the type graph.
+    """
+    from mypy.types import instance_cache, read_type
+    from mypy.wirefixup import fixup_wire_type
+
+    decoded = read_type(data)
+    # Clear instance_cache primitives after read_type so NOT_READY
+    # singletons cannot leak into later builds (mirrors typeops.py).
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    return fixup_wire_type(decoded)
+
+
 def _try_native_infer_constraints(
     template: Type, actual: Type, direction: int
 ) -> list[Constraint]:
@@ -66,19 +90,17 @@ def _try_native_infer_constraints(
     if raw is None:
         raise NotImplementedError("template not a TypeVarType")
     from mypy.cache import read_int
-    from mypy.types import read_type
-    from mypy.wirefixup import fixup_wire_type
 
     constraints: list[Constraint] = []
     for blob in raw:
         data = _ReadBuffer(bytes(blob))
-        origin = fixup_wire_type(read_type(data))
+        origin = _fix_wire_type(data)
         if not isinstance(origin, TypeVarType):
             raise NotImplementedError("origin not a TypeVarType")
         op = read_int(data)
         if op != direction:
             raise NotImplementedError("op mismatch on wire")
-        target = fixup_wire_type(read_type(data))
+        target = _fix_wire_type(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
         # The wire round-trip rebuilds types as fresh objects; Rust validates
@@ -117,13 +139,11 @@ def _try_native_constraint_builder(
     if raw is None:
         raise NotImplementedError("constraint-builder path not supported")
     from mypy.cache import read_int
-    from mypy.types import read_type
-    from mypy.wirefixup import fixup_wire_type
 
     constraints: list[Constraint] = []
     for blob in raw:
         data = _ReadBuffer(bytes(blob))
-        origin = fixup_wire_type(read_type(data))
+        origin = _fix_wire_type(data)
         if not isinstance(origin, (TypeVarType, ParamSpecType, TypeVarTupleType)):
             raise NotImplementedError("origin not a type variable")
         if isinstance(origin, (ParamSpecType, TypeVarTupleType)):
@@ -143,7 +163,7 @@ def _try_native_constraint_builder(
                 raise NotImplementedError("origin id not resolvable in template")
             origin = origin.copy_modified(id=live[0].id)
         op = read_int(data)
-        target = fixup_wire_type(read_type(data))
+        target = _fix_wire_type(data)
         if target is None:
             raise NotImplementedError("target unresolvable on wire")
         constraints.append(Constraint(origin, op, target))

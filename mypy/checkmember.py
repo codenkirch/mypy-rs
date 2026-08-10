@@ -146,9 +146,18 @@ def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
     """
+    from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_checkmember_read_type(_CheckMemberReadBuffer(data)))
+    decoded = _checkmember_read_type(_CheckMemberReadBuffer(data))
+    # Clear instance_cache primitives after read_type so NOT_READY
+    # singletons cannot leak into later builds (mirrors typeops.py).
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    return fixup_wire_type(decoded)
 
 
 class MemberContext:

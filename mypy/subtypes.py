@@ -28,6 +28,7 @@ from mypy.nodes import (
     VARIANCE_NOT_READY,
     Context,
     Decorator,
+    FakeInfo,
     FuncBase,
     OverloadedFuncDef,
     TypeInfo,
@@ -571,6 +572,10 @@ class SubtypeVisitor(TypeVisitor[bool]):
         return True
 
     def visit_instance(self, left: Instance) -> bool:
+        if type(left.type) is FakeInfo:
+            # Wire NOT_READY instances (FakeInfo .type) must never crash
+            # subtyping: treat as non-subtype and defer to the caller.
+            return True
         if left.type.fallback_to_any and not self.proper_subtype:
             # NOTE: `None` is a *non-subclassable* singleton, therefore no class
             # can by a subtype of it, even with an `Any` fallback.
@@ -610,6 +615,10 @@ class SubtypeVisitor(TypeVisitor[bool]):
                 if isinstance(get_proper_type(mapped.args[0]), AnyType):
                     return not self.proper_subtype
         if isinstance(right, Instance):
+            if type(right.type) is FakeInfo:
+                # Conservative: never run cached/hashing code paths on an
+                # instance whose .type is a wire NOT_READY placeholder.
+                return False
             if type_state.is_cached_subtype_check(self._subtype_kind, left, right):
                 return True
             if type_state.is_cached_negative_subtype_check(self._subtype_kind, left, right):
