@@ -527,6 +527,17 @@ pub(crate) fn is_subtype(
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,
     };
+    // Python's visit_instance falls through to `return False` when right
+    // is Any under a proper-subtype check (the _is_subtype Any
+    // short-circuit at subtypes.py:348-355 is non-proper-only; visit_any
+    // handles left=Any; visit_union_type handles left-Union). Deciding
+    // here instead of deferring is required: is_proper_subtype(X, Any)
+    // is pervasive in thank-you paths like _remove_redundant_union_items,
+    // and a `None` deferral there would push the whole simplified union to
+    // Python, defeating the port.
+    if ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
+        return Some(false);
+    }
     let (right_ref, right_args) = match right {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,

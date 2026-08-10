@@ -2414,10 +2414,19 @@ mod tests {
         // AnyType with type_of_any == special form is not "any" here.
         let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
         let known = make_instance("builtins.str", vec![]);
-        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver());
-        // make_simplified_union([special-any, str]) with an empty resolver
-        // defers on the Instance-Instance subtype check.
-        assert_eq!(out, None);
+        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver()).unwrap();
+        // make_simplified_union([special-any, str]): proper-subtype dedup
+        // decides both directions (str <: Any is False under proper, Any <:
+        // str is False), so both items survive as a 2-item union. The
+        // special-form Any is not contagious, matching Python's
+        // _remove_redundant_union_items with an empty resolver.
+        let union: Vec<Type> = match decode_type(&out).unwrap() {
+            Type::UnionType { items, .. } => items,
+            other => panic!("expected union, got {other:?}"),
+        };
+        assert_eq!(union.len(), 2);
+        assert_eq!(union[0], any);
+        assert_eq!(union[1], known);
     }
 
     #[test]

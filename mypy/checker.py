@@ -315,9 +315,15 @@ try:
     from librt.internal import ReadBuffer as _CheckerReadBuffer, WriteBuffer as _CheckerWriteBuffer
     from type_kernel import (
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
+        rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
+        rust_get_generator_receive_type as _rust_get_generator_receive_type,
+        rust_get_generator_return_type as _rust_get_generator_return_type,
+        rust_get_generator_yield_type as _rust_get_generator_yield_type,
         rust_has_bool_item as _rust_has_bool_item,
+        rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_false_literal as _rust_is_false_literal,
+        rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
         rust_is_private as _rust_is_private,
@@ -364,6 +370,12 @@ except ImportError:
     _rust_is_property = None  # type: ignore[assignment]
     _rust_is_settable_property = None  # type: ignore[assignment]
     _rust_is_custom_settable_property = None  # type: ignore[assignment]
+    _rust_get_coroutine_return_type = None  # type: ignore[assignment]
+    _rust_get_generator_receive_type = None  # type: ignore[assignment]
+    _rust_get_generator_return_type = None  # type: ignore[assignment]
+    _rust_get_generator_yield_type = None  # type: ignore[assignment]
+    _rust_is_async_generator_return_type = None  # type: ignore[assignment]
+    _rust_is_generator_return_type = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
     _CheckerStmtWriteBuffer = None  # type: ignore[misc, assignment]
     _CheckerReadBuffer = None  # type: ignore[assignment,misc]
@@ -449,6 +461,90 @@ def _try_native_narrow_type_by_identity_equality(
     ):
         return None
     return (if_type_dec, else_type_dec)
+
+
+def _try_native_generator_return_type_helpers(
+    func: Callable[..., object], return_type: Type, is_coroutine: bool
+) -> Type | None:
+    """Native fast path for the generator/coroutine return-type helpers (#434).
+
+    `func` is a rust_get_generator_* that takes `(return_type_bytes,
+    is_coroutine, strict_optional, resolver)` and returns serialized wire Type
+    bytes (or None). Returns the deserialized Type, or None to defer.
+    """
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_types_active
+        and _native_checker_resolver is not None
+    ):
+        return None
+    try:
+        blob = func(
+            _serialize_type_for_checker(return_type),
+            is_coroutine,
+            state.strict_optional,
+            _native_checker_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+    if blob is None:
+        return None
+    dec = _deserialize_type_from_checker(bytes(blob))
+    # fixup_wire_type returns None when a type_ref cannot resolve to a live
+    # TypeInfo; defer rather than fabricate a type.
+    return dec
+
+
+def _try_native_is_generator_return_type(
+    typ: Type, is_coroutine: bool
+) -> bool | None:
+    """Native fast path for is_generator_return_type (#434)."""
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_types_active
+        and _native_checker_resolver is not None
+    ):
+        return None
+    try:
+        return _rust_is_generator_return_type(
+            _serialize_type_for_checker(typ),
+            is_coroutine,
+            state.strict_optional,
+            _native_checker_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_is_async_generator_return_type(typ: Type) -> bool | None:
+    """Native fast path for is_async_generator_return_type (#434)."""
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_types_active
+        and _native_checker_resolver is not None
+    ):
+        return None
+    try:
+        return _rust_is_async_generator_return_type(
+            _serialize_type_for_checker(typ),
+            state.strict_optional,
+            _native_checker_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_get_coroutine_return_type(return_type: Type) -> Type | None:
+    """Native fast path for get_coroutine_return_type (#434)."""
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_types_active):
+        return None
+    try:
+        blob = _rust_get_coroutine_return_type(_serialize_type_for_checker(return_type))
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+    if blob is None:
+        return None
+    return _deserialize_type_from_checker(bytes(blob))
 
 
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
@@ -1425,6 +1521,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         True if `typ` is a *supertype* of Generator or Awaitable.
         Also true it it's *exactly* AwaitableGenerator (modulo type parameters).
         """
+        native = _try_native_is_generator_return_type(typ, is_coroutine)
+        if native is not None:
+            return native
         typ = get_proper_type(typ)
         if is_coroutine:
             # This means we're in Python 3.5 or later.
@@ -1443,6 +1542,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         True if `typ` is a supertype of AsyncGenerator.
         """
+        native = _try_native_is_async_generator_return_type(typ)
+        if native is not None:
+            return native
         try:
             any_type = AnyType(TypeOfAny.special_form)
             agt = self.named_generic_type("typing.AsyncGenerator", [any_type, any_type])
@@ -1453,6 +1555,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def get_generator_yield_type(self, return_type: Type, is_coroutine: bool) -> Type:
         """Given the declared return type of a generator (t), return the type it yields (ty)."""
+        native = _try_native_generator_return_type_helpers(
+            _rust_get_generator_yield_type, return_type, is_coroutine
+        )
+        if native is not None:
+            return native
         return_type = get_proper_type(return_type)
 
         if isinstance(return_type, AnyType):
@@ -1487,6 +1594,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def get_generator_receive_type(self, return_type: Type, is_coroutine: bool) -> Type:
         """Given a declared generator return type (t), return the type its yield receives (tc)."""
+        native = _try_native_generator_return_type_helpers(
+            _rust_get_generator_receive_type, return_type, is_coroutine
+        )
+        if native is not None:
+            return native
         return_type = get_proper_type(return_type)
 
         if isinstance(return_type, AnyType):
@@ -1521,6 +1633,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             return NoneType()
 
     def get_coroutine_return_type(self, return_type: Type) -> Type:
+        native = _try_native_get_coroutine_return_type(return_type)
+        if native is not None:
+            return native
         return_type = get_proper_type(return_type)
         if isinstance(return_type, AnyType):
             return AnyType(TypeOfAny.from_another_any, source_any=return_type)
@@ -1530,6 +1645,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def get_generator_return_type(self, return_type: Type, is_coroutine: bool) -> Type:
         """Given the declared return type of a generator (t), return the type it returns (tr)."""
+        native = _try_native_generator_return_type_helpers(
+            _rust_get_generator_return_type, return_type, is_coroutine
+        )
+        if native is not None:
+            return native
         return_type = get_proper_type(return_type)
 
         if isinstance(return_type, AnyType):
