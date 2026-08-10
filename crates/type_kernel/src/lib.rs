@@ -65,6 +65,7 @@ mod errors;
 mod expand;
 mod expandtype;
 mod freshen;
+mod generators;
 mod lkv;
 mod maptype;
 mod meet;
@@ -347,6 +348,31 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #432: overload-ambiguity approximate-similarity.
     module.add_function(wrap_pyfunction!(
         argapprox::rust_arg_approximate_similarity,
+        module
+    )?)?;
+    // Issue #434: generator/coroutine return-type helpers.
+    module.add_function(wrap_pyfunction!(
+        generators::rust_is_generator_return_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        generators::rust_is_async_generator_return_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        generators::rust_get_generator_yield_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        generators::rust_get_generator_receive_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        generators::rust_get_generator_return_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        generators::rust_get_coroutine_return_type,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
