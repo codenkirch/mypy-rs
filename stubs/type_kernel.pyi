@@ -158,6 +158,7 @@ __all__ = [
     "rust_is_settable_property",
     "rust_is_custom_settable_property",
     "rust_can_have_shared_disjoint_base",
+    "rust_check_operator",
     "rust_is_trivial_bound",
     "rust_find_linear",
     "rust_separate_union_literals",
@@ -595,6 +596,13 @@ def rust_is_property(defn: Any) -> bool: ...
 def rust_is_settable_property(defn: Any) -> bool: ...
 def rust_is_custom_settable_property(defn: Any) -> bool: ...
 def rust_can_have_shared_disjoint_base(instances: list[Any]) -> bool: ...
+def rust_check_operator(
+    resolver: NativeTypeResolver,
+    op_name: str,
+    left: bytes,
+    right: bytes,
+    strict_optional: bool,
+) -> int | None: ...
 def rust_is_trivial_bound(type_bytes: bytes, allow_tuple: bool) -> bool | None: ...
 def rust_find_linear(
     constraint_bytes: bytes,
