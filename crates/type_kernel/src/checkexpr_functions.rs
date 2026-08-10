@@ -2457,4 +2457,265 @@ mod tests {
             None
         );
     }
+
+    // -- tuple_context_matches_inner --
+
+    #[test]
+    fn test_tuple_context_matches_fixed_ok() {
+        // Two non-star items, fixed 3-tuple context: 2 <= 3 → match.
+        let ctx = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+            ],
+        );
+        assert_eq!(tuple_context_matches_inner(&[0, 0], &ctx), Some(true));
+    }
+
+    #[test]
+    fn test_tuple_context_matches_fixed_too_many() {
+        // Four non-star items, fixed 3-tuple context: 4 > 3 → no match.
+        let ctx = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+                make_instance("int", vec![]),
+            ],
+        );
+        assert_eq!(
+            tuple_context_matches_inner(&[0, 0, 0, 0], &ctx),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_tuple_context_matches_variadic_ok() {
+        // One star at index 1, variadic context with unpack at index 1, same
+        // total length → match.
+        let ctx = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![
+                make_instance("int", vec![]),
+                Type::UnpackType {
+                    typ: Box::new(make_instance("builtins.tuple", vec![])),
+                },
+                make_instance("int", vec![]),
+            ],
+        );
+        assert_eq!(tuple_context_matches_inner(&[0, 1, 0], &ctx), Some(true));
+    }
+
+    #[test]
+    fn test_tuple_context_matches_variadic_two_stars_false() {
+        let ctx = make_tuple(
+            make_instance("builtins.tuple", vec![]),
+            vec![Type::UnpackType {
+                typ: Box::new(make_instance("builtins.tuple", vec![])),
+            }],
+        );
+        assert_eq!(tuple_context_matches_inner(&[1, 1], &ctx), Some(false));
+    }
+
+    #[test]
+    fn test_tuple_context_matches_non_tuple_context_false() {
+        assert_eq!(
+            tuple_context_matches_inner(&[0, 0], &make_instance("int", vec![])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_tuple_context_matches_alias_context_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        assert_eq!(tuple_context_matches_inner(&[0], &alias), None);
+    }
+
+    // -- find_unpack_in_list_inner --
+
+    #[test]
+    fn test_find_unpack_in_list_present() {
+        let items = vec![
+            make_instance("int", vec![]),
+            Type::UnpackType {
+                typ: Box::new(make_instance("builtins.tuple", vec![])),
+            },
+        ];
+        assert_eq!(find_unpack_in_list_inner(&items), Some(1));
+    }
+
+    #[test]
+    fn test_find_unpack_in_list_absent() {
+        let items = vec![make_instance("int", vec![])];
+        assert_eq!(find_unpack_in_list_inner(&items), None);
+    }
+
+    // -- conditional_join_inner --
+
+    fn make_native_resolver() -> NativeTypeResolver {
+        NativeTypeResolver::new(
+            TypeResolver::new(),
+            crate::aliases::TypeAliasResolver::new(),
+        )
+    }
+
+    #[test]
+    fn test_conditional_join_subtype_returns_supertype() {
+        // With a populated resolver, int <: object → join is object.
+        // Here (empty resolver) nominal subtype cannot be confirmed, so
+        // trivial_join defers and the union fallback is returned. This
+        // documents the conservative behavior: the kernel only returns
+        // a definite join when the resolver can prove the subtype chain.
+        let if_t = make_instance("builtins.int", vec![]);
+        let else_t = make_instance("builtins.object", vec![]);
+        let out = conditional_join_inner(&if_t, &else_t, &empty_resolver()).unwrap();
+        match decode_type(&out).unwrap() {
+            Type::UnionType { items, .. } => assert_eq!(items.len(), 2),
+            other => panic!("expected union fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_join_object_right_returns_object() {
+        // Instance right → trivial_join fast-path returns Object (line 115).
+        // Left is a non-Instance (Any) so the left-Instance gate is skipped
+        // and the Object result is produced without needing the resolver.
+        let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
+        let obj = make_instance("builtins.object", vec![]);
+        let out = conditional_join_inner(&any, &obj, &empty_resolver()).unwrap();
+        let decoded = decode_type(&out).unwrap();
+        match decoded {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.object"),
+            other => panic!("expected object, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_join_equal_instances_union_fallback() {
+        // Equal Instances with an empty resolver: is_subtype(int,int) is
+        // None (no TypeInfo snapshot), so trivial_join defers and the union
+        // of both branches is returned. Python's join would return int;
+        // the Rust kernel conservatively defers via the union fallback.
+        let t = make_instance("builtins.int", vec![]);
+        let out = conditional_join_inner(&t, &t, &empty_resolver()).unwrap();
+        match decode_type(&out).unwrap() {
+            Type::UnionType { items, .. } => assert_eq!(items.len(), 2),
+            other => panic!("expected union fallback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_join_unrelated_returns_union() {
+        let i = make_instance("builtins.int", vec![]);
+        let s = make_instance("builtins.str", vec![]);
+        let out = conditional_join_inner(&i, &s, &empty_resolver()).unwrap();
+        match decode_type(&out).unwrap() {
+            Type::UnionType { items, .. } => {
+                assert_eq!(items.len(), 2);
+            }
+            other => panic!("expected union, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_conditional_join_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        let i = make_instance("builtins.int", vec![]);
+        // trivial_join sees a TypeAliasType and returns None → defer.
+        assert_eq!(conditional_join_inner(&alias, &i, &empty_resolver()), None);
+    }
+
+    // -- join_type_list_inner --
+
+    #[test]
+    fn test_join_type_list_empty_defers() {
+        assert_eq!(join_type_list_inner(&[], &make_native_resolver()), None);
+    }
+
+    #[test]
+    fn test_join_type_list_single_passthrough() {
+        let i = make_instance("builtins.int", vec![]);
+        assert_eq!(
+            join_type_list_inner(&[i.clone()], &make_native_resolver()),
+            Some(i)
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_subtype_chain_defers() {
+        // [int, object] with an empty resolver: is_subtype(int, object) is
+        // None (no TypeInfo snapshot), so join_types returns None and
+        // join_type_list_inner defers. Documents conservative behavior.
+        let i = make_instance("builtins.int", vec![]);
+        let o = make_instance("builtins.object", vec![]);
+        assert_eq!(join_type_list_inner(&[i, o], &make_native_resolver()), None);
+    }
+
+    #[test]
+    fn test_join_type_list_any_left_returns_any() {
+        // join_types: AnyType left (post-swap s) → SameS (return s = Any).
+        // join.py:314-315 `isinstance(s, AnyType) -> return s`.
+        let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
+        let i = make_instance("builtins.int", vec![]);
+        assert_eq!(
+            join_type_list_inner(&[any.clone(), i], &make_native_resolver()),
+            Some(any)
+        );
+    }
+
+    // -- first_or_join_fast_item_inner --
+
+    #[test]
+    fn test_first_or_join_fast_item_single_instance() {
+        let i = make_instance("builtins.int", vec![]);
+        assert_eq!(
+            first_or_join_fast_item_inner(&[i.clone()], &make_native_resolver()),
+            Some(i)
+        );
+    }
+
+    #[test]
+    fn test_first_or_join_fast_item_empty_defers() {
+        assert_eq!(
+            first_or_join_fast_item_inner(&[], &make_native_resolver()),
+            None
+        );
+    }
+
+    // -- build_dict_type --
+
+    #[test]
+    fn test_build_dict_type_simple() {
+        let kt = make_instance("builtins.str", vec![]);
+        let vt = make_instance("builtins.int", vec![]);
+        let out = build_dict_type(&make_native_resolver(), &[kt, vt], 1).unwrap();
+        match decode_type(&out).unwrap() {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.dict");
+                assert_eq!(args.len(), 2);
+            }
+            other => panic!("expected dict instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_dict_type_empty_defers() {
+        assert_eq!(build_dict_type(&make_native_resolver(), &[], 0), None);
+    }
+
+    #[test]
+    fn test_build_dict_type_bad_n_keys_defers() {
+        let kt = make_instance("builtins.str", vec![]);
+        let vt = make_instance("builtins.int", vec![]);
+        // n_keys == len(elements) leaves no values → defer.
+        assert_eq!(build_dict_type(&make_native_resolver(), &[kt, vt], 2), None);
+    }
 }

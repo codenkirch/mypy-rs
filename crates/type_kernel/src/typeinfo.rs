@@ -840,7 +840,10 @@ impl NativeTypeResolver {
 }
 
 impl NativeTypeResolver {
-    fn new(resolver: TypeResolver, alias_resolver: crate::aliases::TypeAliasResolver) -> Self {
+    pub(crate) fn new(
+        resolver: TypeResolver,
+        alias_resolver: crate::aliases::TypeAliasResolver,
+    ) -> Self {
         Self {
             resolver,
             alias_resolver,
