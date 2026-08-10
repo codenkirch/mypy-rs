@@ -196,6 +196,21 @@ def tuple_fallback(typ: TupleType) -> Instance:
     info = typ.partial_fallback.type
     if info.fullname != "builtins.tuple":
         return typ.partial_fallback
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_tuple_fallback(
+                _serialize_type(typ), _native_typeops_resolver
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None and isinstance(decoded, Instance):
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     items = []
     for item in typ.items:
         if isinstance(item, UnpackType):
@@ -629,6 +644,15 @@ def bind_self(
 def erase_to_bound(t: Type) -> Type:
     # TODO: use value restrictions to produce a union?
     t = get_proper_type(t)
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_erase_to_bound(_serialize_type(t))
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if isinstance(t, TypeVarType):
         return t.upper_bound
     if isinstance(t, TypeType):
