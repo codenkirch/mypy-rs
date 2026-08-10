@@ -41,6 +41,7 @@
 
 mod aliases;
 mod applytype;
+mod argapprox;
 mod argmap;
 mod astwire;
 mod attrs;
@@ -341,6 +342,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_method_fullname,
+        module
+    )?)?;
+    // Issue #432: overload-ambiguity approximate-similarity.
+    module.add_function(wrap_pyfunction!(
+        argapprox::rust_arg_approximate_similarity,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
