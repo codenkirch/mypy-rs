@@ -134,6 +134,7 @@ __all__ = [
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
     "rust_solve_one",
+    "rust_check_overload_call",
     "rust_format_key_list",
     "rust_is_numeric_format_type",
     "rust_has_return_statement",
@@ -393,6 +394,14 @@ def rust_is_duplicate_mapping(
     actual_types: list[bytes],
     actual_kinds: list[int],
 ) -> bool | None: ...
+def rust_check_overload_call(
+    resolver: NativeTypeResolver,
+    targets_bytes: list[bytes],
+    arg_types_bytes: list[bytes],
+    arg_kinds: list[int],
+    arg_names: list[str | None] | None,
+    strict_optional: bool,
+) -> int | None: ...
 def rust_is_typed_callable(type_bytes: bytes) -> bool | None: ...
 def rust_is_private(node_name: str) -> bool: ...
 def rust_is_operator_method(fullname: str | None) -> bool: ...

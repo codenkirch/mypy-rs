@@ -230,6 +230,7 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_operator as _rust_check_operator,
+        rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
@@ -284,6 +285,7 @@ except ImportError:
     _rust_container_type = None  # type: ignore[assignment]
     _rust_tuple_context_matches = None  # type: ignore[assignment]
     _rust_build_tuple_type = None  # type: ignore[assignment]
+    _rust_check_overload_call = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -3584,6 +3586,48 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         plausible_targets = self.plausible_overload_call_targets(
             arg_types, arg_kinds, arg_names, callee
         )
+
+        # Native overload dispatch: Rust returns the first-match target index
+        # for the no-Any, no-union-arg, no-star-actual, non-generic-target path.
+        # We re-run check_call on the chosen target inside filter_errors and
+        # trust it only when it produces no new errors; otherwise Python flow
+        # proceeds unchanged.
+        native_idx: int | None = None
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkcall_active
+            and _native_checkexpr_resolver is not None
+            and plausible_targets
+            and not any(map(has_any_type, arg_types))
+            and not any(self.real_union(arg) for arg in arg_types)
+        ):
+            try:
+                native_idx = _rust_check_overload_call(
+                    _native_checkexpr_resolver,
+                    [_serialize_type_for_checkexpr(t) for t in plausible_targets],
+                    [_serialize_type_for_checkexpr(t) for t in arg_types],
+                    [k.value for k in arg_kinds],
+                    list(arg_names) if arg_names is not None else None,
+                    self.chk.options.strict_optional,
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError, IndexError):
+                native_idx = None
+        if native_idx is not None:
+            typ = plausible_targets[native_idx]
+            with self.msg.filter_errors(filter_revealed_type=True) as w:
+                with self.chk.local_type_map as m:
+                    ret_type, infer_type = self.check_call(
+                        callee=typ,
+                        args=args,
+                        arg_kinds=arg_kinds,
+                        arg_names=arg_names,
+                        context=context,
+                        callable_name=callable_name,
+                        object_type=object_type,
+                    )
+            if not w.has_new_errors():
+                self.chk.store_types(m)
+                return ret_type, infer_type
 
         # Step 2: If the arguments contain a union, we try performing union math first,
         #         instead of picking the first matching overload.
