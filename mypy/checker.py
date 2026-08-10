@@ -336,6 +336,7 @@ try:
         rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
         rust_is_unreachable_map as _rust_is_unreachable_map,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
+        rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
@@ -357,6 +358,7 @@ except ImportError:
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
+    _rust_is_valid_inferred_type = None  # type: ignore[assignment]
     _rust_type_requires_usage = None  # type: ignore[assignment]
     _rust_is_unreachable_map = None  # type: ignore[assignment]
     _rust_stmt_outcome = None  # type: ignore[assignment]
@@ -624,6 +626,32 @@ def _try_native_try_handler_union(typ: Type) -> list[bytes] | None:
     try:
         return _rust_try_handler_union(
             _serialize_type_for_checker(typ), state.strict_optional
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_is_valid_inferred_type(
+    typ: Type,
+    is_lvalue_final: bool,
+    is_lvalue_member: bool,
+    allow_redefinition: bool,
+) -> bool | None:
+    """Native fast path for is_valid_inferred_type (#445).
+
+    Mirrors checker.py:9748-9772 and the InvalidInferredTypes visitor
+    (checker.py:9775-9799). Pure boolean query on a type tree with no
+    diagnostics or side effects. Returns the bool result, or None to
+    defer to the pure-Python path.
+    """
+    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+        return None
+    try:
+        return _rust_is_valid_inferred_type(
+            _serialize_type_for_checker(typ),
+            is_lvalue_final,
+            is_lvalue_member,
+            allow_redefinition,
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
@@ -9757,6 +9785,11 @@ def is_valid_inferred_type(
     invalid.  When doing strict Optional checking, only None and types that are
     incompletely defined (i.e. contain UninhabitedType) are invalid.
     """
+    native = _try_native_is_valid_inferred_type(
+        typ, is_lvalue_final, is_lvalue_member, options.allow_redefinition
+    )
+    if native is not None:
+        return native
     proper_type = get_proper_type(typ)
     if isinstance(proper_type, NoneType):
         # If the lvalue is final, we may immediately infer NoneType when the
