@@ -242,6 +242,8 @@ pub(crate) fn infer_constraints_full_inner(
         Type::TupleType { .. } => visit_tuple_native(template, actual, direction, resolver),
         Type::TypedDictType { .. } => visit_typeddict_native(template, actual, direction, resolver),
         Type::TypeType { .. } => visit_type_type_native(template, actual, direction, resolver),
+        Type::CallableType { .. } => visit_callable_native(template, actual, direction, resolver),
+        Type::Overloaded { .. } => visit_overloaded_native(template, actual, direction, resolver),
         Type::AnyType { .. }
         | Type::NoneType
         | Type::UnboundType { .. }
@@ -254,11 +256,7 @@ pub(crate) fn infer_constraints_full_inner(
         }
         Type::UnionType { .. } | Type::TypeAliasType { .. } => None,
         // Unsupported template shapes: defer to Python.
-        Type::CallableType { .. }
-        | Type::Overloaded { .. }
-        | Type::TypeVarTupleType { .. }
-        | Type::UnpackType { .. }
-        | Type::Parameters(..) => None,
+        Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => None,
     }
 }
 
@@ -645,6 +643,183 @@ fn visit_type_type_native(
     }
 }
 
+/// Port of `visit_callable_type` (constraints.py:1350-1523). Only the
+/// `AnyType` actual branch is portable: it is a pure Type->Type transform
+/// with no `is_subtype`/`find_member`/`type_object_type` calls. Everything
+/// else (CallableType, Overloaded, TypeType, Instance actuals) needs live
+/// graph data Rust does not snapshot, so it defers with `None`.
+///
+/// The Any branch mirrors constraints.py:1478-1493:
+///  - If `param_spec is None`: `infer_against_any(arg_types, any)` +
+///    `infer_constraints(ret_type, any_type, direction)`.
+///  - If `param_spec is not None`: emit a `Constraint(param_spec, SUBTYPE_OF,
+///    Parameters([any, any], [ARG_STAR, ARG_STAR2], [None, None]))` +
+///    `infer_constraints(ret_type, any_type, direction)`. The Parameters
+///    construction requires `imprecise_arg_kinds=True` (constraints.py:1489).
+fn visit_callable_native(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    let callee = match template {
+        Type::CallableType {
+            arg_types,
+            arg_kinds,
+            ret_type,
+            variables,
+            ..
+        } => {
+            // ParamSpec/TypeVarTuple variables use the deferred constraint
+            // paths (constraints.py:509-512 filter_imprecise_kinds): defer.
+            if variables.iter().any(|v| {
+                matches!(
+                    v,
+                    Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
+                )
+            }) {
+                return None;
+            }
+            // UnpackType formals use the star-unpack branch
+            // (constraints.py:376-458): defer.
+            if arg_types
+                .iter()
+                .any(|t| matches!(t, Type::UnpackType { .. }))
+            {
+                return None;
+            }
+            (arg_types, arg_kinds, ret_type)
+        }
+        _ => return None,
+    };
+    let (formal_types, formal_kinds, ret_type) = callee;
+    // Only the AnyType actual branch is portable.
+    if !matches!(actual, Type::AnyType { .. }) {
+        return None;
+    }
+    // Build the derived Any: type_of_any=from_another_any, source_any=actual
+    // (constraints.py:1480-1481). Mirrors AnyType(TypeOfAny.from_another_any,
+    // source_any=self.actual).
+    let any_type = Type::AnyType {
+        type_of_any: 7, // TypeOfAny.from_another_any
+        source_any: Some(Box::new(actual.clone())),
+        missing_import_name: None,
+    };
+    // Detect ParamSpec (constraints.py:1361, types.py:2480-2497): the
+    // two final params must be ARG_STAR + ARG_STAR2, and the last-but-one
+    // arg type must be a ParamSpecType.
+    let param_spec = detect_param_spec(formal_types, formal_kinds);
+    let mut res = Vec::new();
+    if param_spec.is_none() {
+        res.extend(infer_against_any_native(
+            formal_types,
+            &any_type,
+            direction,
+            resolver,
+        )?);
+    } else {
+        let ps = param_spec?;
+        // Build Parameters([any, any], [ARG_STAR, ARG_STAR2], [None, None])
+        // with imprecise_arg_kinds=True (constraints.py:1485-1491).
+        let target = Type::Parameters(crate::wire::Parameters {
+            arg_types: vec![any_type.clone(), any_type.clone()],
+            arg_kinds: vec![2 /* ARG_STAR */, 4 /* ARG_STAR2 */],
+            arg_names: vec![None, None],
+            variables: Vec::new(),
+            imprecise_arg_kinds: true,
+        });
+        res.push(Constraint {
+            origin_type_var: ps,
+            op: SUBTYPE_OF,
+            target,
+        });
+    }
+    res.extend(push_inner(
+        ret_type.as_ref().clone(),
+        any_type.clone(),
+        direction,
+        resolver,
+    )?);
+    Some(res)
+}
+
+/// Detect a ParamSpec on a CallableType (mirrors `CallableType.param_spec()`
+/// in types.py:2480-2497). Returns the ParamSpecType (with flavor set to
+/// BARE=0) if the last two arg_kinds are [ARG_STAR, ARG_STAR2] and the
+/// last-but-one arg_type is a ParamSpecType, else None.
+fn detect_param_spec(arg_types: &[Type], arg_kinds: &[i64]) -> Option<Type> {
+    if arg_types.len() < 2 || arg_kinds.len() < 2 {
+        return None;
+    }
+    let n = arg_kinds.len();
+    // ARG_STAR = 2, ARG_STAR2 = 4 (nodes.py:2486,2490).
+    if arg_kinds[n - 2] != 2 || arg_kinds[n - 1] != 4 {
+        return None;
+    }
+    match &arg_types[arg_types.len() - 2] {
+        Type::ParamSpecType {
+            prefix,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            flavor: _,
+            upper_bound,
+            default,
+        } => {
+            // ParamSpecFlavor.BARE = 0 (types.py:2447).
+            let _ = prefix;
+            Some(Type::ParamSpecType {
+                prefix: Box::new(crate::wire::Parameters {
+                    arg_types: Vec::new(),
+                    arg_kinds: Vec::new(),
+                    arg_names: Vec::new(),
+                    variables: Vec::new(),
+                    imprecise_arg_kinds: false,
+                }),
+                name: name.clone(),
+                fullname: fullname.clone(),
+                raw_id: *raw_id,
+                namespace: namespace.clone(),
+                flavor: 0,
+                upper_bound: upper_bound.clone(),
+                default: default.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Port of `visit_overloaded` (constraints.py:1686-1694). Only the `else`
+/// branch (actual is not a CallableType) is portable: it iterates over
+/// `template.items` and recurses via `infer_constraints`. The
+/// `find_matching_overload_items` branch (actual IS CallableType) needs
+/// `is_callable_compatible`, which is not snapshot-able, so it defers.
+fn visit_overloaded_native(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    let items = match template {
+        Type::Overloaded { items } => items,
+        _ => return None,
+    };
+    // find_matching_overload_items needs is_callable_compatible: defer.
+    if matches!(actual, Type::CallableType { .. }) {
+        return None;
+    }
+    let mut res = Vec::new();
+    for t in items {
+        // Each item is asserted to be a CallableType (wire.rs:1002).
+        if !matches!(t, Type::CallableType { .. }) {
+            return None;
+        }
+        res.extend(push_inner(t.clone(), actual.clone(), direction, resolver)?);
+    }
+    Some(res)
+}
+
 /// Port of `infer_against_any` (constraints.py:1565).
 fn infer_against_any_native(
     items: &[Type],
@@ -789,5 +964,243 @@ mod tests {
         let c2 = Constraint::read(&mut read_buf).unwrap();
         assert_eq!(c2.origin_type_var, tv);
         assert_eq!(c2.target, any_type());
+    }
+
+    fn instance_builtins_object() -> Type {
+        Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn minimal_callable(ret: Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance_builtins_object()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![type_var(1, "T")],
+            arg_kinds: vec![0], // ARG_POS
+            arg_names: vec![None],
+            ret_type: Box::new(ret),
+            name: None,
+            variables: vec![type_var(1, "T")],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn param_spec_callable() -> Type {
+        // Callable[..., T] with ParamSpec P (*args: P.args, **kwargs: P.kwargs)
+        let ps = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 5,
+            namespace: "fn".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(any_type()),
+            default: Box::new(any_type()),
+        };
+        Type::CallableType {
+            fallback: Box::new(instance_builtins_object()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![ps.clone(), ps],
+            arg_kinds: vec![2, 4], // ARG_STAR, ARG_STAR2
+            arg_names: vec![None, None],
+            ret_type: Box::new(type_var(1, "T")),
+            name: None,
+            variables: vec![type_var(1, "T")],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn test_detect_param_spec_none_for_plain_callable() {
+        let types = vec![type_var(1, "T")];
+        let kinds = vec![0]; // ARG_POS only
+        assert!(detect_param_spec(&types, &kinds).is_none());
+    }
+
+    #[test]
+    fn test_detect_param_spec_found_for_star_star2() {
+        let ps = Type::ParamSpecType {
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 5,
+            namespace: "fn".to_string(),
+            flavor: 1,
+            upper_bound: Box::new(any_type()),
+            default: Box::new(any_type()),
+        };
+        let types = vec![ps, any_type()];
+        let kinds = vec![2, 4];
+        let detected = detect_param_spec(&types, &kinds).unwrap();
+        if let Type::ParamSpecType {
+            name,
+            raw_id,
+            flavor,
+            ..
+        } = &detected
+        {
+            assert_eq!(name, "P");
+            assert_eq!(*raw_id, 5);
+            assert_eq!(*flavor, 0); // BARE
+        } else {
+            panic!("not a ParamSpecType");
+        }
+    }
+
+    #[test]
+    fn test_visit_callable_any_no_param_spec() {
+        // Callable[[T], T] against Any -> [T <: Any, T :> Any via ret]
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let template = minimal_callable(type_var(1, "T"));
+        let res = visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver);
+        assert!(res.is_some());
+        let constraints = res.unwrap();
+        // arg_types=[T] -> infer_against_any yields T :> Any.
+        // ret_type=T -> infer_constraints(T, Any, SUPERTYPE_OF) yields T :> Any.
+        // Total: 2 constraints (duplicates are kept).
+        assert!(constraints
+            .iter()
+            .all(|c| matches!(c.origin_type_var, Type::TypeVarType { .. })));
+        assert!(constraints
+            .iter()
+            .all(|c| matches!(c.target, Type::AnyType { .. })));
+    }
+
+    #[test]
+    fn test_visit_callable_any_defers_non_any_actual() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let template = minimal_callable(type_var(1, "T"));
+        // Instance actual -> defer (not AnyType).
+        assert!(visit_callable_native(
+            &template,
+            &instance_builtins_object(),
+            SUBTYPE_OF,
+            &resolver
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_visit_callable_any_defers_unpack_formal() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let unpack = Type::UnpackType {
+            typ: Box::new(type_var(1, "T")),
+        };
+        let template = Type::CallableType {
+            fallback: Box::new(instance_builtins_object()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![unpack],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            ret_type: Box::new(type_var(1, "T")),
+            name: None,
+            variables: vec![type_var(1, "T")],
+            type_guard: None,
+            type_is: None,
+        };
+        assert!(visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_visit_callable_any_defers_paramspec_variable() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        // A CallableType with a ParamSpec in variables -> defer.
+        let template = Type::CallableType {
+            fallback: Box::new(instance_builtins_object()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![type_var(1, "T")],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            ret_type: Box::new(type_var(1, "T")),
+            name: None,
+            variables: vec![Type::ParamSpecType {
+                prefix: Box::new(crate::wire::Parameters {
+                    arg_types: Vec::new(),
+                    arg_kinds: Vec::new(),
+                    arg_names: Vec::new(),
+                    variables: Vec::new(),
+                    imprecise_arg_kinds: false,
+                }),
+                name: "P".to_string(),
+                fullname: "mod.P".to_string(),
+                raw_id: 5,
+                namespace: "fn".to_string(),
+                flavor: 0,
+                upper_bound: Box::new(any_type()),
+                default: Box::new(any_type()),
+            }],
+            type_guard: None,
+            type_is: None,
+        };
+        assert!(visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_visit_overloaded_defers_callable_actual() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let template = Type::Overloaded {
+            items: vec![minimal_callable(type_var(1, "T"))],
+        };
+        // CallableType actual -> defer (find_matching_overload_items needed).
+        let actual = minimal_callable(any_type());
+        assert!(visit_overloaded_native(&template, &actual, SUBTYPE_OF, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_visit_overloaded_any_actual_iterates_items() {
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let template = Type::Overloaded {
+            items: vec![minimal_callable(type_var(1, "T"))],
+        };
+        // AnyType actual -> each item (CallableType) recurses via
+        // visit_callable_native, which handles Any.
+        let res = visit_overloaded_native(&template, &any_type(), SUPERTYPE_OF, &resolver);
+        assert!(res.is_some());
+        let constraints = res.unwrap();
+        assert!(constraints
+            .iter()
+            .all(|c| matches!(c.target, Type::AnyType { .. })));
     }
 }
