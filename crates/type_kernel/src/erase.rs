@@ -250,6 +250,106 @@ pub(crate) fn erase_type(py: Python<'_>, typ: &PyAny) -> PyResult<PyObject> {
     erase_one(py, typ, &refs)
 }
 
+/// Native `shallow_erase_type_for_equality(typ) -> ProperType | None`.
+///
+/// Mirrors `mypy.erasetype.shallow_erase_type_for_equality` (erasetype.py:418-429):
+/// erase type variables off `Instance` args only (no deep recursion), recurse
+/// on `UnionType` items. All other types return as-is. Returns `None` for
+/// cases Rust does not handle so the Python caller falls back.
+#[pyfunction]
+pub(crate) fn shallow_erase_type_for_equality(py: Python<'_>, typ: &PyAny) -> PyResult<PyObject> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return fallback_sentinel(py),
+    };
+    shallow_erase_one(py, typ, &refs)
+}
+
+/// Shallow-erase a single `Type`. Only `Instance` (erase args via `erased_vars`)
+/// and `UnionType` (recurse items) have non-trivial behavior; all else is
+/// identity.
+fn shallow_erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
+    // Apply get_proper_type first (matches Python: p_typ = get_proper_type(typ)).
+    let types_mod = py.import("mypy.types")?;
+    let proper = types_mod.getattr("get_proper_type")?.call1((obj,))?;
+
+    if is_instance(proper, refs.instance) {
+        return shallow_erase_instance(py, proper, refs);
+    }
+    if is_instance(proper, refs.union_type) {
+        return shallow_erase_union(py, proper, refs);
+    }
+    // All other ProperType variants: return as-is.
+    Ok(proper.into())
+}
+
+/// Shallow-erase an `Instance`: if no args, return as-is; otherwise replace
+/// args with `erased_vars(type.defn.type_vars, special_form)` (same logic as
+/// `erase_instance`, but no recursion on the args themselves).
+fn shallow_erase_instance(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
+    let args = obj.getattr("args")?;
+    let args_vec: Vec<&PyAny> = if let Ok(list) = args.downcast::<PyList>() {
+        list.iter().collect()
+    } else if let Ok(tuple) = args.downcast::<pyo3::types::PyTuple>() {
+        tuple.iter().collect()
+    } else {
+        return fallback_sentinel(py);
+    };
+    if args_vec.is_empty() {
+        return Ok(obj.into());
+    }
+    // Reuse the same erased_vars logic as erase_instance.
+    let typ = obj.getattr("type")?;
+    let line = obj.getattr("line")?;
+    let defn = match typ.getattr("defn") {
+        Ok(d) => d,
+        Err(_) => return fallback_sentinel(py),
+    };
+    let type_vars = match defn.getattr("type_vars") {
+        Ok(tv) => match tv.downcast::<PyList>() {
+            Ok(list) => list,
+            Err(_) => return fallback_sentinel(py),
+        },
+        Err(_) => return fallback_sentinel(py),
+    };
+    let any_type = make_any(py, refs)?;
+    let mut erased_args: Vec<PyObject> = Vec::with_capacity(type_vars.len());
+    for tv in type_vars.iter() {
+        if is_instance(tv, refs.type_var_tuple_type) {
+            let tuple_fallback = tv.getattr("tuple_fallback")?;
+            let copy_modified = tuple_fallback.getattr("copy_modified")?;
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("args", vec![&any_type])?;
+            let erased_fallback = copy_modified.call((), Some(kwargs))?;
+            let unpack = refs.unpack_type.call1((erased_fallback,))?;
+            erased_args.push(unpack.into());
+        } else {
+            erased_args.push(any_type.clone_ref(py));
+        }
+    }
+    let args_pylist = PyList::new(py, &erased_args);
+    let result = refs.instance.call1((typ, args_pylist, line))?;
+    Ok(result.into())
+}
+
+/// Shallow-erase a `UnionType`: recurse on each item.
+fn shallow_erase_union(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObject> {
+    let items = obj.getattr("items")?.downcast::<PyList>()?;
+    let mut erased_items: Vec<PyObject> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let erased = shallow_erase_one(py, item, refs)?;
+        if is_fallback(&erased, py) {
+            return fallback_sentinel(py);
+        }
+        erased_items.push(erased);
+    }
+    let erased_list = PyList::new(py, &erased_items);
+    let types_mod = py.import("mypy.types")?;
+    let make_union = types_mod.getattr("UnionType")?.getattr("make_union")?;
+    let result = make_union.call1((erased_list,))?;
+    Ok(result.into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
