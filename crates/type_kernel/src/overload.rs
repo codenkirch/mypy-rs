@@ -1,0 +1,277 @@
+//! Overload dispatch: first-match index for `check_overload_call`.
+//!
+//! Ports the "Step 3" loop of `ExpressionChecker.check_overload_call`
+//! (checkexpr.py:~3570) to a Rust-native first-match indexer.
+//! Rust only accelerates the no-Any, no-union-arg, no-star-actual,
+//! non-generic-target path. Returns `Option<usize>` — the index of the
+//! first matching callable target, or `None` to defer to Python.
+//!
+//! Rust NEVER decides "no match" or "ambiguous". Any uncertainty
+//! (subtype could-not-decide, decode failure, unexpected actual kind)
+//! returns `None` immediately so Python re-runs the loop.
+
+use pyo3::prelude::*;
+
+use crate::argmap;
+use crate::checkexpr_functions;
+use crate::subtypes;
+use crate::typeinfo::NativeTypeResolver;
+use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+
+/// Whether a CallableType is a type object (i.e. its fallback is
+/// `builtins.type`). Mirrors `CallableType.is_type_obj()` — the wire
+/// format stores `fallback` + `from_concatenate` but not the computed
+/// `is_type_obj` boolean, so we reconstruct it here.
+fn is_type_obj(fallback: &Type, from_concatenate: bool) -> bool {
+    if from_concatenate {
+        return false;
+    }
+    matches!(
+        fallback,
+        Type::Instance { type_ref, .. } if type_ref == "builtins.type"
+    )
+}
+
+// ArgKind integer values (nodes.py:2480-2517).
+const ARG_POS: i64 = 0;
+const ARG_OPT: i64 = 1;
+const ARG_STAR: i64 = 2;
+const ARG_NAMED: i64 = 3;
+const ARG_STAR2: i64 = 4;
+const ARG_NAMED_OPT: i64 = 5;
+
+fn is_star(kind: i64) -> bool {
+    kind == ARG_STAR || kind == ARG_STAR2
+}
+
+/// Decode a single wire blob; on any failure, returns `None`.
+fn decode_type(blob: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(blob);
+    read_type(&mut buf, None).ok()
+}
+
+/// Encode a type to wire bytes; on failure returns `None`.
+#[allow(dead_code)] // kept for parity/debug symmetry with Python
+fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, typ).ok()?;
+    Some(wbuf.into_bytes())
+}
+
+/// Native overload-dispatch first-match indexer.
+///
+/// Returns the index of the first matching target in `targets_bytes`,
+/// or `None` to defer to Python's `infer_overload_return_type` loop.
+///
+/// The Python caller must have already:
+///   * Checked `not any(map(has_any_type, arg_types))`.
+///   * Checked `not any(self.real_union(arg) for arg in arg_types)`.
+///
+/// Algorithm contract:
+///   1. Any actual with ARG_STAR / ARG_STAR2 -> defer.
+///   2. Each target: must be CallableType + empty variables + NOT
+///      from_type_type (is_type_obj). Non-conforming -> None.
+///   3. rust_map_actuals_to_formals -> None = unknown -> defer.
+///   4. Count / duplicate checks mirror Python map + check_argument_count.
+///   5. rust_is_duplicate_mapping -> Some(true) = not match; None = defer.
+///   6. AnyType / UnionType actual -> defer (belt-and-suspenders).
+///   7. Subtype check per mapped (actual, formal): Some(false) = not match,
+///      None = defer immediately.
+///   8. First target where all formals pass -> Some(index).
+///
+/// Returns `None` on decode failures, buffer OOB, or any "could not
+/// decide" signal. Rust NEVER decides "no match" or "ambiguous".
+#[pyfunction]
+pub fn rust_check_overload_call(
+    _py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    targets_bytes: Vec<Vec<u8>>,
+    arg_types_bytes: Vec<Vec<u8>>,
+    arg_kinds: Vec<i64>,
+    strict_optional: bool,
+    arg_names: Option<Vec<Option<String>>>,
+) -> Option<usize> {
+    // 0 targets -> defer.
+    if targets_bytes.is_empty() {
+        return None;
+    }
+
+    let arg_names_inner = arg_names.as_deref();
+
+    // Step 1: Any actual with star? -> defer (whole thing).
+    if arg_kinds.iter().any(|&k| is_star(k)) {
+        return None;
+    }
+
+    let nformals_hint = targets_bytes.len();
+    let resolver_ref = resolver.resolver();
+
+    // Decode all arg types once.
+    let arg_types: Vec<Type> = arg_types_bytes
+        .iter()
+        .map(|b| decode_type(b))
+        .collect::<Option<Vec<_>>>()?;
+
+    // Decode all targets once, validating shape.
+    let mut decoded_targets: Vec<Type> = Vec::with_capacity(nformals_hint);
+    for blob in &targets_bytes {
+        let t = decode_type(blob);
+        match &t {
+            Some(Type::CallableType {
+                variables,
+                fallback,
+                from_concatenate,
+                ..
+            }) if variables.is_empty() && !is_type_obj(fallback, *from_concatenate) => {
+                decoded_targets.push(t.unwrap());
+            }
+            _ => return None, // non-conforming target -> defer whole thing
+        }
+    }
+
+    let ctx = subtypes::SubtypeContext::new(false, false, false, false, false, strict_optional);
+
+    for (idx, target) in decoded_targets.iter().enumerate() {
+        let Type::CallableType {
+            arg_kinds: target_kinds,
+            arg_names: target_names,
+            arg_types: target_arg_types,
+            ..
+        } = target
+        else {
+            return None; // should not happen after validation
+        };
+
+        let nformals = target_kinds.len();
+        if nformals == 0 {
+            continue; // empty-formal callable - trivially matches
+        }
+
+        // Step 3: map actuals -> formals. None = unknown -> defer.
+        let formal_to_actual = argmap::rust_map_actuals_to_formals(
+            arg_kinds.clone(),
+            arg_names_inner.unwrap_or(&[]).to_vec(),
+            target_kinds.clone(),
+            target_names.clone(),
+        )?;
+
+        // Step 4: count checks.
+        // 4a. Required formal with no mapped actual -> not a match.
+        let mut required_formal_unmet = false;
+        for (fi, &fk) in target_kinds.iter().enumerate() {
+            if fk == ARG_POS && formal_to_actual[fi].is_empty() {
+                required_formal_unmet = true;
+                break;
+            }
+        }
+        if required_formal_unmet {
+            continue; // this target doesn't match, try next
+        }
+
+        // 4b. Extra actual not appearing in any formal's mapped list -> not match.
+        let mut extra_actual = false;
+        for ai in 0..arg_kinds.len() {
+            if !formal_to_actual
+                .iter()
+                .any(|list| list.contains(&(ai as i64)))
+            {
+                extra_actual = true;
+                break;
+            }
+        }
+        if extra_actual {
+            continue;
+        }
+
+        // 4c. Named formal matched by a positional actual -> not match.
+        let mut pos_on_named = false;
+        for (fi, &fk) in target_kinds.iter().enumerate() {
+            if is_named(fk) {
+                for &ai in &formal_to_actual[fi] {
+                    let ak = arg_kinds.get(ai as usize);
+                    if ak == Some(&ARG_POS) || ak == Some(&ARG_OPT) {
+                        pos_on_named = true;
+                        break;
+                    }
+                }
+            }
+            if pos_on_named {
+                break;
+            }
+        }
+        if pos_on_named {
+            continue;
+        }
+
+        // Step 5: duplicate mapping check.
+        let mut has_duplicate = false;
+        for mapped_indices in formal_to_actual.iter() {
+            if mapped_indices.len() > 1 {
+                let mapping_for_formal: Vec<i64> = mapped_indices.clone();
+                let dup_types: Vec<Vec<u8>> = mapping_for_formal
+                    .iter()
+                    .filter_map(|&mi| arg_types_bytes.get(mi as usize).cloned())
+                    .collect();
+                let dup_kinds: Vec<i64> = mapping_for_formal
+                    .iter()
+                    .filter_map(|&mi| arg_kinds.get(mi as usize).copied())
+                    .collect();
+                if checkexpr_functions::rust_is_duplicate_mapping(
+                    mapping_for_formal.clone(),
+                    dup_types,
+                    dup_kinds,
+                )
+                .ok()
+                .flatten()
+                    == Some(true)
+                {
+                    has_duplicate = true;
+                    break;
+                }
+            }
+        }
+        if has_duplicate {
+            continue;
+        }
+
+        // Step 6 + 7: subtype checks for each mapped (actual, formal).
+        let mut target_match = true;
+        for (fi, mapped_indices) in formal_to_actual.iter().enumerate() {
+            let formal_type = {
+                let t = target_arg_types.get(fi)?;
+                t.clone()
+            };
+            for &ai in mapped_indices {
+                let actual = arg_types.get(ai as usize)?;
+
+                // Belt-and-suspenders: AnyType or UnionType actual.
+                if matches!(actual, Type::AnyType { .. })
+                    || matches!(actual, Type::UnionType { .. })
+                {
+                    return None;
+                }
+
+                match subtypes::is_subtype(actual, &formal_type, &ctx, resolver_ref) {
+                    Some(true) => {}
+                    Some(false) => {
+                        target_match = false;
+                        break;
+                    }
+                    None => return None, // uncertain -> defer
+                }
+            }
+        }
+
+        if target_match {
+            return Some(idx);
+        }
+    }
+
+    // All targets checked, none matched. Rust never decides "no match"
+    // (issue #383: Rust returns None for uncertain, not for failure).
+    None
+}
+
+fn is_named(kind: i64) -> bool {
+    kind == ARG_NAMED || kind == ARG_NAMED_OPT
+}

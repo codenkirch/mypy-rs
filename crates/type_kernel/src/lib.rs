@@ -68,6 +68,7 @@ mod meet;
 mod messages;
 mod mro;
 mod operators;
+mod overload;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
@@ -366,6 +367,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkcall::rust_solve_generic_call,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        overload::rust_check_overload_call,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
