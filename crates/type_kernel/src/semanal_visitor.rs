@@ -867,6 +867,114 @@ pub(crate) fn rust_get_name_repr_of_expr(py: Python<'_>, expr: &PyAny) -> PyResu
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// classify_member_resolution (Issue #421)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.visit_member_expr` resolution branch
+/// classification (semanal.py:6316-6364).
+///
+/// Rust computes which resolution branch applies to `expr` and returns the
+/// symbol that branch resolves to; Python applies the AST assignments
+/// (`expr.node` / `expr.kind` / `expr.fullname`), `record_imported_symbol`,
+/// and `process_placeholder`. Branches that mutate semantic state or
+/// construct new symbols (module re-export visibility checks,
+/// `record_incomplete_ref`, module `__getattr__` Var synthesis, missing-module
+/// Any Var synthesis) return `None` and run in pure Python unchanged.
+///
+/// The branch order mirrors semanal.py:6319-6364 exactly: the module
+/// attribute branch is checked BEFORE the class/instance member branch. In
+/// particular, a module definition whose node is a `TypeInfo` shadows a
+/// same-named class member and is classified as `"module"`, matching
+/// Python's precedence.
+///
+/// Returns
+///     `(None, None)` — unsupported / no classification (pure fallback).
+///     `(Some("module"), Some(sym))` — direct module-symbol table hit,
+///       including placeholder-node symbols.
+///     `(Some("none"), None)` — module symbol found but `module_hidden`
+///       (Python resolves `get_module_symbol` to None and leaves the
+///       expression unresolved).
+///     `(Some("member"), Some(sym))` — `TypeInfo.names` member whose node is
+///       a `MypyFile`, `TypeInfo`, or `TypeAlias`.
+///     `(Some("none"), None)` — `TypeInfo` member present but not in the
+///       (MypyFile, TypeInfo, TypeAlias) set, or an unbound symbol node
+///       (Python leaves the expression unresolved).
+#[pyfunction]
+pub(crate) fn rust_classify_member_resolution(
+    expr: &PyAny,
+    member_expr_cls: &PyType,
+    ref_expr_cls: &PyType,
+    mypy_file_cls: &PyType,
+    type_info_cls: &PyType,
+    type_alias_cls: &PyType,
+) -> PyResult<(Option<String>, Option<Py<PyAny>>)> {
+    let py = expr.py();
+    if !expr.is_instance(member_expr_cls)? {
+        return Ok((None, None));
+    }
+
+    // `base = expr.expr; base.accept(self)` happens in Python before this
+    // call; the base's analysis state (its `node` binding) is already
+    // applied by the time we classify.
+    let base = expr.getattr("expr")?;
+
+    // Module-attribute branch (semanal.py:6319-6329).
+    if base.is_instance(ref_expr_cls)? {
+        let base_node = base.getattr("node")?;
+        if !base_node.is_none() && base_node.is_instance(mypy_file_cls)? {
+            let member_name = expr.getattr("name")?;
+            let sym = base_node
+                .getattr("names")?
+                .call_method1("get", (member_name,))?;
+            if !sym.is_none() {
+                // Python: `elif sym.module_hidden: sym = None` runs before
+                // visit_member_expr's placeholder check, so check it first.
+                let module_hidden = sym.getattr("module_hidden")?;
+                if module_hidden.is_true()? {
+                    return Ok((Some("none".to_string()), None));
+                }
+                return Ok((Some("module".to_string()), Some(sym.into_py(py))));
+            }
+            // Missing name: get_module_symbol falls through to the re-export
+            // visibility check, incomplete-namespace deferral, __getattr__
+            // Var synthesis, or missing-module synthesis. All of those read
+            // or mutate semantic state, so they stay in Python.
+            return Ok((None, None));
+        }
+    }
+
+    // Class/instance member branch (semanal.py:6330-6363).
+    if !base.is_instance(ref_expr_cls)? {
+        return Ok((None, None));
+    }
+    let base_node = base.getattr("node")?;
+    if !base_node.is_instance(type_info_cls)? {
+        // self.bar / cls.bar via function args, and no-args TypeAlias bases,
+        // resolve type_info through Python state; not classified here.
+        return Ok((None, None));
+    }
+    let member_name = expr.getattr("name")?;
+    let sym = base_node
+        .getattr("names")?
+        .call_method1("get", (member_name,))?;
+    if sym.is_none() {
+        return Ok((None, None));
+    }
+    let sym_node = sym.getattr("node")?;
+    // Mirror `isinstance(n.node, (MypyFile, TypeInfo, TypeAlias))` directly.
+    if sym_node.is_none()
+        || (!sym_node.is_instance(mypy_file_cls)?
+            && !sym_node.is_instance(type_info_cls)?
+            && !sym_node.is_instance(type_alias_cls)?)
+    {
+        // Method / Var / FuncDef / etc. are handled by checkmember; Python
+        // leaves the expression unbound here.
+        return Ok((Some("none".to_string()), None));
+    }
+    Ok((Some("member".to_string()), Some(sym.into_py(py))))
+}
+
 /// Recursively build the prefix for a MemberExpr.
 fn get_member_expr_prefix(
     inner: &PyAny,
