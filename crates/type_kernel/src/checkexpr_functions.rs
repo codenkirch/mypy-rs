@@ -10,8 +10,10 @@
 //!     `TypeAliasType` since the wire format has no resolved alias target.
 
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use crate::operators::is_operator_method_name;
+use crate::setops::is_type_obj_callable;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
@@ -1229,6 +1231,345 @@ fn conditional_join_inner(
             })
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Container literal fast paths (issue #385)
+// ---------------------------------------------------------------------------
+
+/// `rust_container_type`: join + node construction for list/set/dict literal types.
+///
+/// Receives a tag ("list", "set", "dict") + already-serialized item types.
+/// Returns the container node serialized, or None to defer.
+///
+/// For list/set: `elements` is a flat list of serialized item types.
+/// For dict: `elements` is a flat list where the first `n_keys` elements
+/// are keys and the rest are values (Python passes the true deduped key
+/// count; key/value lists can differ in length after dedup).
+#[pyfunction]
+#[pyo3(signature = (resolver, tag, elements, _ctx, n_keys))]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_container_type<'py>(
+    py: Python<'py>,
+    resolver: &NativeTypeResolver,
+    tag: &str,
+    elements: Vec<Vec<u8>>,
+    _ctx: Option<Vec<u8>>,
+    n_keys: i64,
+) -> PyResult<Option<&'py PyBytes>> {
+    let original_len = elements.len();
+    // Decode all items; if any fail, treat as unsupported → defer.
+    let items: Vec<Type> = elements
+        .into_iter()
+        .filter_map(|b| decode_type(&b))
+        .collect();
+    if items.len() != original_len {
+        return Ok(None); // decode failure → defer to Python
+    }
+
+    match tag {
+        "list" | "set" => {
+            let container_fullname = match tag {
+                "list" => "builtins.list",
+                "set" => "builtins.set",
+                _ => unreachable!(),
+            };
+
+            let vt = first_or_join_fast_item_inner(&items, resolver);
+            match vt {
+                None => Ok(None),
+                Some(vt) => {
+                    let t = Type::Instance {
+                        type_ref: container_fullname.to_string(),
+                        // Python's `named_generic_type` strips LKV from
+                        // container args: `set(Literal['x']?)` is
+                        // `set[str]`, so mirror that strip here.
+                        args: vec![strip_lkv(&vt)],
+                        last_known_value: None,
+                        extra_attrs: None,
+                    };
+                    match encode_type(&t) {
+                        Some(b) => Ok(Some(PyBytes::new(py, &b))),
+                        None => Ok(None),
+                    }
+                }
+            }
+        }
+        "dict" => match build_dict_type(resolver, &items, n_keys) {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(PyBytes::new(py, &bytes))),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// Strip `last_known_value` from a wire `Type`, mirroring
+/// Python's `remove_instance_last_known_values`.
+fn strip_lkv(t: &Type) -> Type {
+    match t {
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value: Some(_),
+            extra_attrs,
+        } => Type::Instance {
+            type_ref: type_ref.clone(),
+            args: args.clone(),
+            last_known_value: None,
+            extra_attrs: extra_attrs.clone(),
+        },
+        _ => t.clone(),
+    }
+}
+
+/// Build a dict type from a flat list of key/value types.
+/// The first `n_keys` elements are the deduplicated keys, the rest are
+/// values. Python (`fast_dict_type`) passes the true key count, not half
+/// the element count: dedup can make key/value lists unequal lengths, and
+/// splitting at `n/2` mis-feeds keys into the values list (issue #385).
+fn build_dict_type(
+    resolver: &NativeTypeResolver,
+    elements: &[Type],
+    n_keys: i64,
+) -> Option<Vec<u8>> {
+    if elements.is_empty() {
+        return None;
+    }
+    if n_keys < 0 || n_keys as usize > elements.len() || n_keys >= elements.len() as i64 {
+        // Must have at least one key and one value.
+        return None;
+    }
+    let keys: Vec<Type> = elements[..n_keys as usize].to_vec();
+    let values: Vec<Type> = elements[n_keys as usize..].to_vec();
+    if keys.is_empty() || values.is_empty() {
+        return None;
+    }
+
+    let kt = first_or_join_fast_item_inner(&keys, resolver)?;
+    let vt = first_or_join_fast_item_inner(&values, resolver)?;
+
+    encode_type(&Type::Instance {
+        type_ref: "builtins.dict".to_string(),
+        // Python's `named_generic_type` strips LKV from dict args too;
+        // mirror that on both key and value.
+        args: vec![strip_lkv(&kt), strip_lkv(&vt)],
+        last_known_value: None,
+        extra_attrs: None,
+    })
+}
+
+/// Join a list of types, mirroring `join.join_type_list`.
+fn join_type_list_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option<Type> {
+    if items.is_empty() {
+        return None;
+    }
+    if items.len() == 1 {
+        return Some(items[0].clone());
+    }
+    let ctx = crate::subtypes::SubtypeContext::new(false, false, false, false, false, true);
+    let mut result = items[0].clone();
+    for item in &items[1..] {
+        let joined = crate::setops::join_types(&result, item, &ctx, resolver.resolver());
+        match joined {
+            Some(crate::setops::SetOpResult::SameS) => {}
+            Some(crate::setops::SetOpResult::SameT) => result = item.clone(),
+            Some(crate::setops::SetOpResult::Object) => {
+                result = Type::Instance {
+                    type_ref: "builtins.object".to_string(),
+                    args: vec![],
+                    last_known_value: None,
+                    extra_attrs: None,
+                };
+            }
+            Some(crate::setops::SetOpResult::Bottom) => {
+                result = Type::UnionType {
+                    items: vec![result.clone(), item.clone()],
+                    uses_pep604_syntax: false,
+                    can_be_true: true,
+                    can_be_false: true,
+                };
+            }
+            Some(crate::setops::SetOpResult::Any) => {
+                result = Type::AnyType {
+                    type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+                    source_any: None,
+                    missing_import_name: None,
+                };
+            }
+            Some(crate::setops::SetOpResult::Ancestor(fullname)) => {
+                result = Type::Instance {
+                    type_ref: fullname,
+                    args: vec![],
+                    last_known_value: None,
+                    extra_attrs: None,
+                };
+            }
+            Some(crate::setops::SetOpResult::SameTypeWithArgs {
+                type_ref,
+                arg_discs,
+            }) => {
+                let final_args: Vec<Type> = arg_discs
+                    .iter()
+                    .map(|&d| match d {
+                        0 => result.clone(),
+                        1 => item.clone(),
+                        _ => Type::AnyType {
+                            type_of_any: 0,
+                            source_any: None,
+                            missing_import_name: None,
+                        },
+                    })
+                    .collect();
+                result = Type::Instance {
+                    type_ref,
+                    args: final_args,
+                    last_known_value: None,
+                    extra_attrs: None,
+                };
+            }
+            Some(crate::setops::SetOpResult::Encoded(bytes)) => {
+                // Encoded carries a serialized Type; decode it into the join.
+                let decoded = decode_type(&bytes)?;
+                result = decoded;
+            }
+            None => return None,
+        }
+    }
+    Some(result)
+}
+
+/// `_first_or_join_fast_item` inner: mirroring the Python version.
+fn first_or_join_fast_item_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option<Type> {
+    if items.len() == 1 {
+        if is_type_obj_callable(&items[0], resolver.resolver()) {
+            return None;
+        }
+        return Some(items[0].clone());
+    }
+    let typ = join_type_list_inner(items, resolver);
+    let joined = typ?;
+    if items
+        .iter()
+        .any(|item| is_type_obj_callable(item, resolver.resolver()))
+    {
+        return None;
+    }
+    match allow_fast_container_literal_inner(&joined) {
+        Some(true) => Some(joined),
+        _ => None,
+    }
+}
+
+/// `rust_tuple_context_matches`: pure function matching `tuple_context_matches`.
+///
+/// `elements_tags`: sequence of ints; 0 for non-star items, 1 for star items
+/// (there may be several). The kernel counts stars and derives the first
+/// star's positional index from these tags.
+///
+/// `ctx_bytes`: serialized TupleType context.
+///
+/// Returns Some(true) if the context matches, Some(false) if it doesn't,
+/// or None for unsupported shapes (TypeAliasType context).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_tuple_context_matches(
+    elements_tags: Vec<i64>,
+    ctx_bytes: Vec<u8>,
+) -> PyResult<Option<bool>> {
+    let ctx = match decode_type(&ctx_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    Ok(tuple_context_matches_inner(&elements_tags, &ctx))
+}
+
+fn tuple_context_matches_inner(elements_tags: &[i64], ctx: &Type) -> Option<bool> {
+    let ctx = match ctx {
+        Type::TupleType { items, .. } => items,
+        Type::TypeAliasType { .. } => return None,
+        _ => return Some(false), // Not a TupleType context
+    };
+
+    let has_unpack_in_ctx = find_unpack_in_list_inner(ctx);
+    let non_star_count = elements_tags.iter().filter(|&&t| t == 0).count();
+
+    if has_unpack_in_ctx.is_none() {
+        // Fixed tuple context: accept if non-star count <= len(ctx.items)
+        Some(non_star_count <= ctx.len())
+    } else {
+        // Variadic context: need exactly one star and exact structure match
+        let star_count = elements_tags.iter().filter(|&&t| t == 1).count();
+        if star_count != 1 {
+            return Some(false);
+        }
+        let total = elements_tags.len();
+        // ctx_unpack_index == expr_star_index (position of the single star)
+        let expr_star_index = elements_tags.iter().position(|&t| t == 1).unwrap();
+        Some(total == ctx.len() && find_unpack_in_list_inner(ctx) == Some(expr_star_index))
+    }
+}
+
+/// Find UnpackType in a list, mirroring `find_unpack_in_list`.
+fn find_unpack_in_list_inner(items: &[Type]) -> Option<usize> {
+    items
+        .iter()
+        .position(|it| matches!(it, Type::UnpackType { .. }))
+}
+
+/// `rust_build_tuple_type`: build the final TupleType node.
+///
+/// `items_bytes`: serialized list of element types (the already-computed
+/// items from `self.accept` calls).
+///
+/// `seen_unpack`: whether an unpack was encountered (True/False as i64).
+///
+/// Returns the serialized TupleType, or None for unsupported shapes.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_build_tuple_type<'py>(
+    py: Python<'py>,
+    items_bytes: Vec<Vec<u8>>,
+    seen_unpack: i64,
+) -> PyResult<Option<&'py PyBytes>> {
+    let original_len = items_bytes.len();
+    // Decode all items; if any fail, treat as unsupported → defer.
+    let items: Vec<Type> = items_bytes
+        .into_iter()
+        .filter_map(|b| decode_type(&b))
+        .collect();
+    if items.len() != original_len {
+        return Ok(None); // decode failure → defer to Python
+    }
+
+    let fallback_item = Type::AnyType {
+        type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+        source_any: None,
+        missing_import_name: None,
+    };
+
+    let fallback = Type::Instance {
+        type_ref: "builtins.tuple".to_string(),
+        args: vec![fallback_item],
+        last_known_value: None,
+        extra_attrs: None,
+    };
+
+    let result = Type::TupleType {
+        partial_fallback: Box::new(fallback),
+        items,
+        implicit: false,
+    };
+
+    if seen_unpack == 1 {
+        // Python: `result = expand_type(result, {})` (checkexpr.py:6033-6035)
+        // splices UnpackType into the tuple (e.g. `(*a,)` with float...). The
+        // Rust item loop does not model that, so defer single-unpack tuples.
+        return Ok(None);
+    }
+
+    let bytes = encode_type(&result).unwrap_or_default();
+    Ok(Some(PyBytes::new(py, &bytes)))
 }
 
 #[cfg(test)]

@@ -115,6 +115,12 @@ __all__ = [
     "rust_is_string_literal",
     "rust_is_untyped_decorator",
     "rust_is_typeddict_type_context",
+    "rust_conditional_expr_join",
+    "rust_container_type",
+    "rust_tuple_context_matches",
+    "rust_build_tuple_type",
+    "rust_star_expr",
+    "rust_resolve_plugin_hook",
     "rust_method_fullname",
     "rust_format_messages_default",
     "rust_infer_constraints",
@@ -379,6 +385,26 @@ def rust_try_getting_literal(type_bytes: bytes) -> bytes | None: ...
 def rust_is_string_literal(type_bytes: bytes) -> bool | None: ...
 def rust_is_untyped_decorator(type_bytes: bytes) -> bool | None: ...
 def rust_is_typeddict_type_context(type_bytes: bytes) -> bool | None: ...
+def rust_conditional_expr_join(
+    if_bytes: bytes, else_bytes: bytes, resolver: NativeTypeResolver
+) -> bytes | None: ...
+def rust_container_type(
+    resolver: NativeTypeResolver,
+    tag: str,
+    elements: list[bytes],
+    ctx: list[bytes] | None,
+    n_keys: int,
+) -> bytes | None: ...
+def rust_tuple_context_matches(
+    elements_tags: list[int], ctx_bytes: bytes
+) -> bool | None: ...
+def rust_build_tuple_type(
+    items_bytes: list[bytes], seen_unpack: int
+) -> bytes | None: ...
+def rust_star_expr(type_bytes: bytes) -> bytes | None: ...
+def rust_resolve_plugin_hook(
+    registry: Any, callable_name: str, plugin_list: Any, hook_method_name: str
+) -> Any | None: ...
 def rust_method_fullname(
     resolver: NativeTypeResolver, type_bytes: bytes, method_name: str
 ) -> str | None: ...
@@ -405,6 +431,14 @@ def rust_is_similar_constraints(x_bytes: bytes, y_bytes: bytes) -> bool | None: 
 def rust_classify_call(callee_bytes: bytes) -> int | None: ...
 def rust_normalize_callable(callee_bytes: bytes) -> bytes | None: ...
 def rust_real_union(type_bytes: bytes, strict_optional: bool) -> bool | None: ...
+def rust_solve_generic_call(
+    resolver: NativeTypeResolver,
+    callee_bytes: bytes,
+    arg_types_bytes: list[bytes],
+    formal_to_actual: list[list[int]],
+    strict: bool,
+    infer_unions: bool,
+) -> bytes | None: ...
 def rust_possible_none_type_var_overlap(
     arg_type_bytes: list[bytes], target_bytes: list[bytes]
 ) -> bool | None: ...
