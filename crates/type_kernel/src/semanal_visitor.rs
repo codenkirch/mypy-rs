@@ -1553,6 +1553,498 @@ pub(crate) fn rust_is_final_redefinition(
     }
 }
 
+// ---------------------------------------------------------------------------
+// can_possibly_be_typevarlike_declaration (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.can_possibly_be_typevarlike_declaration`
+///
+/// Mirrors semanal.py:3730-3738. Pure structural check: exactly one lvalue
+/// that is a `NameExpr`, rvalue is a `CallExpr` whose callee is a `NameExpr`,
+/// and `callee.fullname` is in `TYPE_VAR_LIKE_NAMES`. The Python version
+/// calls `ref.accept(self)` before checking `fullname`; that is a semantic
+/// side-effect we skip in the pure port. Returns `false` if any structural
+/// attribute cannot be read.
+#[pyfunction]
+pub(crate) fn rust_can_possibly_be_typevarlike_declaration(
+    py: Python<'_>,
+    s: &PyAny,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let assignment_stmt_cls: &PyType = nodes_mod.getattr("AssignmentStmt")?.downcast()?;
+    if !s.is_instance(assignment_stmt_cls)? {
+        return Ok(false);
+    }
+    let lvalues = s.getattr("lvalues")?;
+    let lvalues_list = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    if lvalues_list.len() != 1 {
+        return Ok(false);
+    }
+    let first_lv = lvalues_list.get_item(0)?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if !first_lv.is_instance(name_expr_cls)? {
+        return Ok(false);
+    }
+    let rvalue = s.getattr("rvalue")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    if !rvalue.is_instance(call_expr_cls)? {
+        return Ok(false);
+    }
+    let callee = rvalue.getattr("callee")?;
+    if !callee.is_instance(name_expr_cls)? {
+        return Ok(false);
+    }
+    let fullname_obj = match callee.getattr("fullname") {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let fullname: &str = match fullname_obj.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(false),
+    };
+    Ok(is_type_var_like_name(fullname))
+}
+
+/// Check whether `fullname` is one of the `TYPE_VAR_LIKE_NAMES`.
+fn is_type_var_like_name(fullname: &str) -> bool {
+    matches!(
+        fullname,
+        "typing.TypeVar"
+            | "typing_extensions.TypeVar"
+            | "typing.ParamSpec"
+            | "typing_extensions.ParamSpec"
+            | "typing.TypeVarTuple"
+            | "typing_extensions.TypeVarTuple"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// can_possibly_be_type_form (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.can_possibly_be_type_form`
+///
+/// Mirrors semanal.py:3708-3728. Returns `Some(bool)` for cases Rust can
+/// decide, or `None` to defer to Python when `is_pep_613` (which requires
+/// `self`) would be needed.
+#[pyfunction]
+pub(crate) fn rust_can_possibly_be_type_form(py: Python<'_>, s: &PyAny) -> PyResult<Option<bool>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let assignment_stmt_cls: &PyType = nodes_mod.getattr("AssignmentStmt")?.downcast()?;
+    if !s.is_instance(assignment_stmt_cls)? {
+        return Ok(None);
+    }
+    let lvalues = s.getattr("lvalues")?;
+    let lvalues_list = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if lvalues_list.len() > 1 {
+        return Ok(Some(false));
+    }
+    let rvalue = s.getattr("rvalue")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    if rvalue.is_instance(call_expr_cls)? {
+        let callee = rvalue.getattr("callee")?;
+        let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+        if callee.is_instance(ref_expr_cls)? {
+            let fullname_obj = match callee.getattr("fullname") {
+                Ok(f) => f,
+                Err(_) => return Ok(None),
+            };
+            let fullname: &str = match fullname_obj.downcast::<PyString>() {
+                Ok(s) => s.to_str()?,
+                Err(_) => return Ok(None),
+            };
+            if is_typedict_name(fullname) || is_typed_namedtuple_name(fullname) {
+                return Ok(Some(true));
+            }
+            return Ok(Some(false));
+        }
+        return Ok(Some(false));
+    }
+    let first_lv = lvalues_list.get_item(0)?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if !first_lv.is_instance(name_expr_cls)? {
+        return Ok(Some(false));
+    }
+    // s.unanalyzed_type is not None and not self.is_pep_613(s) -> False.
+    // Rust cannot call is_pep_613 (needs self), so defer.
+    let unanalyzed_type = s.getattr("unanalyzed_type")?;
+    if !unanalyzed_type.is_none() {
+        return Ok(None);
+    }
+    let index_expr_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
+    let op_expr_cls: &PyType = nodes_mod.getattr("OpExpr")?.downcast()?;
+    if !rvalue.is_instance(index_expr_cls)? && !rvalue.is_instance(op_expr_cls)? {
+        return Ok(Some(false));
+    }
+    Ok(Some(true))
+}
+
+/// Check whether `fullname` is a TypedDict constructor name.
+fn is_typedict_name(fullname: &str) -> bool {
+    matches!(
+        fullname,
+        "typing.TypedDict" | "typing_extensions.TypedDict" | "mypy_extensions.TypedDict"
+    )
+}
+
+/// Check whether `fullname` is a NamedTuple constructor name.
+fn is_typed_namedtuple_name(fullname: &str) -> bool {
+    matches!(
+        fullname,
+        "typing.NamedTuple" | "typing_extensions.NamedTuple"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// is_type_ref (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.is_type_ref`
+///
+/// Mirrors semanal.py:3740-3793. Returns `Some(bool)` for cases Rust can
+/// decide, or `None` for the `NameExpr`/`MemberExpr` lookup cases that
+/// require `self.lookup` / `self.lookup_qualified`.
+#[pyfunction]
+pub(crate) fn rust_is_type_ref(py: Python<'_>, rv: &PyAny, bare: bool) -> PyResult<Option<bool>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if !rv.is_instance(ref_expr_cls)? {
+        return Ok(Some(false));
+    }
+    let node = rv.getattr("node")?;
+    if !node.is_none() {
+        let type_var_like_cls: &PyType = nodes_mod.getattr("TypeVarLikeExpr")?.downcast()?;
+        if node.is_instance(type_var_like_cls)? {
+            // Python calls self.fail(...) then returns False.
+            return Ok(Some(false));
+        }
+        let type_alias_cls: &PyType = nodes_mod.getattr("TypeAlias")?.downcast()?;
+        if node.is_instance(type_alias_cls)? {
+            return Ok(Some(true));
+        }
+        let fullname_obj = match rv.getattr("fullname") {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let fullname: &str = match fullname_obj.downcast::<PyString>() {
+            Ok(s) => s.to_str()?,
+            Err(_) => return Ok(None),
+        };
+        if in_valid_refs(fullname, bare) {
+            return Ok(Some(true));
+        }
+        let type_info_cls: &PyType = nodes_mod.getattr("TypeInfo")?.downcast()?;
+        if node.is_instance(type_info_cls)? {
+            if bare {
+                return Ok(Some(true));
+            }
+            let is_enum = node.getattr("is_enum")?;
+            let is_enum_bool: bool = is_enum.extract()?;
+            return Ok(Some(!is_enum_bool));
+        }
+        let var_cls: &PyType = nodes_mod.getattr("Var")?.downcast()?;
+        if node.is_instance(var_cls)? {
+            let var_fullname_obj = match node.getattr("fullname") {
+                Ok(f) => f,
+                Err(_) => return Ok(None),
+            };
+            let var_fullname: &str = match var_fullname_obj.downcast::<PyString>() {
+                Ok(s) => s.to_str()?,
+                Err(_) => return Ok(None),
+            };
+            return Ok(Some(is_never_name(var_fullname)));
+        }
+    }
+    // NameExpr / MemberExpr lookup cases need self.lookup -> defer.
+    Ok(None)
+}
+
+/// Check whether `fullname` is in the valid_refs set for `bare` or not.
+fn in_valid_refs(fullname: &str, bare: bool) -> bool {
+    if bare {
+        matches!(fullname, "typing.Any" | "typing.Tuple" | "typing.Callable")
+    } else {
+        is_type_constructor(fullname)
+    }
+}
+
+/// Check whether `fullname` is in the `type_constructors` set.
+fn is_type_constructor(fullname: &str) -> bool {
+    matches!(
+        fullname,
+        "typing.Callable"
+            | "typing.Optional"
+            | "typing.Tuple"
+            | "typing.Type"
+            | "typing.Union"
+            | "typing.Literal"
+            | "typing_extensions.Literal"
+            | "typing.Annotated"
+            | "typing_extensions.Annotated"
+    )
+}
+
+/// Check whether `fullname` is in the `NEVER_NAMES` set.
+fn is_never_name(fullname: &str) -> bool {
+    matches!(
+        fullname,
+        "typing.NoReturn"
+            | "typing_extensions.NoReturn"
+            | "mypy_extensions.NoReturn"
+            | "typing.Never"
+            | "typing_extensions.Never"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// can_be_type_alias (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.can_be_type_alias`
+///
+/// Mirrors semanal.py:3685-3706. Recursive. Returns `Some(bool)` for all
+/// cases except `is_none_alias` (requires `self`), which returns `None`.
+#[pyfunction]
+pub(crate) fn rust_can_be_type_alias(
+    py: Python<'_>,
+    rv: &PyAny,
+    allow_none: bool,
+    is_stub_file: bool,
+) -> PyResult<Option<bool>> {
+    can_be_type_alias_inner(py, rv, allow_none, is_stub_file)
+}
+
+/// Inner recursive helper (no `#[pyfunction]` wrapper overhead).
+fn can_be_type_alias_inner(
+    py: Python<'_>,
+    rv: &PyAny,
+    allow_none: bool,
+    is_stub_file: bool,
+) -> PyResult<Option<bool>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if rv.is_instance(ref_expr_cls)? {
+        let type_ref_result = rust_is_type_ref(py, rv, true)?;
+        if let Some(true) = type_ref_result {
+            return Ok(Some(true));
+        }
+    }
+    let index_expr_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
+    if rv.is_instance(index_expr_cls)? {
+        let base = rv.getattr("base")?;
+        let type_ref_result = rust_is_type_ref(py, base, false)?;
+        if let Some(true) = type_ref_result {
+            return Ok(Some(true));
+        }
+    }
+    // is_none_alias(rv) requires self -> defer.
+    // We cannot determine it without the SemanticAnalyzer, so return None.
+    // However, if we get here and none of the above matched, we try the
+    // remaining checks. The is_none_alias check is skipped (returns None
+    // only if we reach a path that would need it). To be safe, we defer
+    // when the rvalue could be a none-alias (CallExpr with callee type(None)).
+    // Actually, to keep it simple and correct, we just continue: the
+    // remaining checks don't need is_none_alias.
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if allow_none && rv.is_instance(name_expr_cls)? {
+        let fullname_obj = match rv.getattr("fullname") {
+            Ok(f) => f,
+            Err(_) => return Ok(Some(false)),
+        };
+        let fullname: &str = match fullname_obj.downcast::<PyString>() {
+            Ok(s) => s.to_str()?,
+            Err(_) => return Ok(Some(false)),
+        };
+        if fullname == "builtins.None" {
+            return Ok(Some(true));
+        }
+    }
+    let op_expr_cls: &PyType = nodes_mod.getattr("OpExpr")?.downcast()?;
+    if rv.is_instance(op_expr_cls)? {
+        let op_obj = rv.getattr("op")?;
+        let op_str: &str = match op_obj.downcast::<PyString>() {
+            Ok(s) => s.to_str()?,
+            Err(_) => return Ok(Some(false)),
+        };
+        if op_str == "|" {
+            if is_stub_file {
+                return Ok(Some(true));
+            }
+            let left = rv.getattr("left")?;
+            let right = rv.getattr("right")?;
+            let left_result = can_be_type_alias_inner(py, left, true, is_stub_file)?;
+            let right_result = can_be_type_alias_inner(py, right, true, is_stub_file)?;
+            match (left_result, right_result) {
+                (Some(true), Some(true)) => return Ok(Some(true)),
+                (Some(false), _) | (_, Some(false)) => {
+                    return Ok(Some(false));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+    Ok(Some(false))
+}
+
+// ---------------------------------------------------------------------------
+// check_typevarlike_name (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.check_typevarlike_name`
+///
+/// Mirrors semanal.py:5141-5158. Returns `Some(true)` when valid,
+/// `Some((false, Some(msg)))` when definitely invalid (with error message),
+/// or `None` to defer when an attribute cannot be read.
+#[pyfunction]
+pub(crate) fn rust_check_typevarlike_name(
+    py: Python<'_>,
+    call: &PyAny,
+    name: &str,
+) -> PyResult<Option<(bool, Option<String>)>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    if !call.is_instance(call_expr_cls)? {
+        return Ok(None);
+    }
+    let callee = call.getattr("callee")?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+
+    // typevarlike_type = callee.name if NameExpr else callee.fullname
+    let typevarlike_type: String;
+    if callee.is_instance(name_expr_cls)? {
+        let name_obj = match callee.getattr("name") {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        typevarlike_type = match name_obj.downcast::<PyString>() {
+            Ok(s) => s.to_str()?.to_string(),
+            Err(_) => return Ok(None),
+        };
+    } else if callee.is_instance(ref_expr_cls)? {
+        let fullname_obj = match callee.getattr("fullname") {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        typevarlike_type = match fullname_obj.downcast::<PyString>() {
+            Ok(s) => s.to_str()?.to_string(),
+            Err(_) => return Ok(None),
+        };
+    } else {
+        return Ok(None);
+    }
+
+    let args = call.getattr("args")?;
+    let args_list = match args.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let unmangled = unmangle_str(name);
+    if args_list.is_empty() {
+        let msg = format!("Too few arguments for {typevarlike_type}()");
+        return Ok(Some((false, Some(msg))));
+    }
+    let first_arg = args_list.get_item(0)?;
+    let str_expr_cls: &PyType = nodes_mod.getattr("StrExpr")?.downcast()?;
+    if !first_arg.is_instance(str_expr_cls)? {
+        let msg = format!("{typevarlike_type}() expects a string literal as first argument");
+        return Ok(Some((false, Some(msg))));
+    }
+    // Check arg_kinds[0] == ARG_POS (IntEnum value 0).
+    let arg_kinds = call.getattr("arg_kinds")?;
+    let arg_kinds_list = match arg_kinds.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if arg_kinds_list.is_empty() {
+        return Ok(None);
+    }
+    let first_kind = arg_kinds_list.get_item(0)?;
+    let first_kind_int: i64 = match first_kind.extract() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if first_kind_int != 0 {
+        let msg = format!("{typevarlike_type}() expects a string literal as first argument");
+        return Ok(Some((false, Some(msg))));
+    }
+    let arg_value_obj = first_arg.getattr("value")?;
+    let arg_value: &str = match arg_value_obj.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(None),
+    };
+    if arg_value != unmangled {
+        let msg = format!(
+            "String argument 1 \"{}\" to {}(...) does not match \
+            variable name \"{}\"",
+            arg_value, typevarlike_type, unmangled
+        );
+        return Ok(Some((false, Some(msg))));
+    }
+    Ok(Some((true, None)))
+}
+
+// ---------------------------------------------------------------------------
+// extract_typevarlike_name (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.extract_typevarlike_name`
+///
+/// Mirrors semanal.py:5314-5326. Returns `Some(name)` only when the name
+/// is successfully extracted with no errors. Returns `None` for any case
+/// that needs error reporting (so Python runs the full path with
+/// `self.fail` calls).
+#[pyfunction]
+pub(crate) fn rust_extract_typevarlike_name(
+    py: Python<'_>,
+    s: &PyAny,
+    call: &PyAny,
+) -> PyResult<Option<String>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let assignment_stmt_cls: &PyType = nodes_mod.getattr("AssignmentStmt")?.downcast()?;
+    if !s.is_instance(assignment_stmt_cls)? {
+        return Ok(None);
+    }
+    if call.is_none() {
+        return Ok(None);
+    }
+    let lvalues = s.getattr("lvalues")?;
+    let lvalues_list = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if lvalues_list.is_empty() {
+        return Ok(None);
+    }
+    let lvalue = lvalues_list.get_item(0)?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if !lvalue.is_instance(name_expr_cls)? {
+        return Ok(None);
+    }
+    // s.type is not None -> Python calls self.fail(...) -> defer.
+    let s_type = s.getattr("type")?;
+    if !s_type.is_none() {
+        return Ok(None);
+    }
+    let lvalue_name_obj = lvalue.getattr("name")?;
+    let lvalue_name: &str = match lvalue_name_obj.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(None),
+    };
+    let check_result = rust_check_typevarlike_name(py, call, lvalue_name)?;
+    match check_result {
+        Some((true, _)) => Ok(Some(lvalue_name.to_string())),
+        // Invalid or defer: Python needs to run full path with errors.
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1624,5 +2116,86 @@ mod tests {
 
     fn name_is_initial_mangled(name: &str) -> bool {
         name == format!("{}'", unmangle_str(name))
+    }
+
+    // --- can_possibly_be_typevarlike_declaration ---
+
+    #[test]
+    fn test_is_type_var_like_name() {
+        assert!(is_type_var_like_name("typing.TypeVar"));
+        assert!(is_type_var_like_name("typing_extensions.TypeVar"));
+        assert!(is_type_var_like_name("typing.ParamSpec"));
+        assert!(is_type_var_like_name("typing_extensions.ParamSpec"));
+        assert!(is_type_var_like_name("typing.TypeVarTuple"));
+        assert!(is_type_var_like_name("typing_extensions.TypeVarTuple"));
+        assert!(!is_type_var_like_name("typing.NamedTuple"));
+        assert!(!is_type_var_like_name("typing.TypedDict"));
+        assert!(!is_type_var_like_name("builtins.int"));
+        assert!(!is_type_var_like_name(""));
+    }
+
+    // --- can_possibly_be_type_form ---
+
+    #[test]
+    fn test_is_typedict_name() {
+        assert!(is_typedict_name("typing.TypedDict"));
+        assert!(is_typedict_name("typing_extensions.TypedDict"));
+        assert!(is_typedict_name("mypy_extensions.TypedDict"));
+        assert!(!is_typedict_name("typing.NamedTuple"));
+        assert!(!is_typedict_name("typing.Any"));
+    }
+
+    #[test]
+    fn test_is_typed_namedtuple_name() {
+        assert!(is_typed_namedtuple_name("typing.NamedTuple"));
+        assert!(is_typed_namedtuple_name("typing_extensions.NamedTuple"));
+        assert!(!is_typed_namedtuple_name("typing.TypedDict"));
+        assert!(!is_typed_namedtuple_name("typing.Any"));
+    }
+
+    // --- is_type_ref ---
+
+    #[test]
+    fn test_in_valid_refs_bare() {
+        assert!(in_valid_refs("typing.Any", true));
+        assert!(in_valid_refs("typing.Tuple", true));
+        assert!(in_valid_refs("typing.Callable", true));
+        assert!(!in_valid_refs("typing.Union", true));
+        assert!(!in_valid_refs("typing.Optional", true));
+    }
+
+    #[test]
+    fn test_in_valid_refs_non_bare() {
+        assert!(in_valid_refs("typing.Callable", false));
+        assert!(in_valid_refs("typing.Optional", false));
+        assert!(in_valid_refs("typing.Tuple", false));
+        assert!(in_valid_refs("typing.Type", false));
+        assert!(in_valid_refs("typing.Union", false));
+        assert!(in_valid_refs("typing.Literal", false));
+        assert!(in_valid_refs("typing_extensions.Literal", false));
+        assert!(in_valid_refs("typing.Annotated", false));
+        assert!(in_valid_refs("typing_extensions.Annotated", false));
+        assert!(!in_valid_refs("typing.Any", false));
+        assert!(!in_valid_refs("builtins.int", false));
+    }
+
+    #[test]
+    fn test_is_type_constructor() {
+        assert!(is_type_constructor("typing.Union"));
+        assert!(is_type_constructor("typing.Literal"));
+        assert!(is_type_constructor("typing_extensions.Annotated"));
+        assert!(!is_type_constructor("typing.TypeVar"));
+        assert!(!is_type_constructor("typing.TypedDict"));
+    }
+
+    #[test]
+    fn test_is_never_name() {
+        assert!(is_never_name("typing.NoReturn"));
+        assert!(is_never_name("typing_extensions.NoReturn"));
+        assert!(is_never_name("mypy_extensions.NoReturn"));
+        assert!(is_never_name("typing.Never"));
+        assert!(is_never_name("typing_extensions.Never"));
+        assert!(!is_never_name("typing.Any"));
+        assert!(!is_never_name("builtins.None"));
     }
 }

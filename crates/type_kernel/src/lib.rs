@@ -77,6 +77,7 @@ mod plugin_helpers;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
+mod semanal_shared;
 mod semanal_visitor;
 mod serverdeps;
 mod setops;
@@ -849,6 +850,52 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_is_final_redefinition,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_can_possibly_be_typevarlike_declaration,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_can_possibly_be_type_form,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(semanal_visitor::rust_is_type_ref, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_can_be_type_alias,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_check_typevarlike_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_extract_typevarlike_name,
+        module
+    )?)?;
+    // semanal_shared.py + sharedparse.py pure helpers.
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_special_function_elide_names,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_argument_elide_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_set_callable_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_has_placeholder,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_calculate_tuple_fallback,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_shared::rust_find_dataclass_transform_spec,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

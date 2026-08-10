@@ -25,17 +25,24 @@ from typing import Any, TypeVar
 from mypy.nodes import (
     AssignmentStmt,
     Block,
+    CallExpr,
+    ClassDef,
+    Context,
+    Decorator,
     Expression,
+    FuncDef,
     Lvalue,
     MypyFile,
     NameExpr,
+    Node,
+    OverloadedFuncDef,
     SymbolNode,
     SymbolTable,
     SymbolTableNode,
     TypeAlias,
     TypeInfo,
 )
-from mypy.types import ProperType, Type
+from mypy.types import DataclassTransformSpec, ProperType, TupleType, Type
 
 T = TypeVar("T")
 
@@ -201,6 +208,27 @@ __all__ = [
     "rust_method_name_sort_key",
     "rust_dataclass_transform",
     "rust_dataclass_post_init_transform",
+    "rust_classify_member_resolution",
+    "rust_var_is_typing_special_form",
+    "rust_get_typevarlike_declaration",
+    "rust_parse_bool",
+    "rust_is_mangled_global",
+    "rust_is_initial_mangled_global",
+    "rust_is_final_redefinition",
+    "rust_is_same_var_from_getattr",
+    "rust_can_possibly_be_typevarlike_declaration",
+    "rust_can_possibly_be_type_form",
+    "rust_is_type_ref",
+    "rust_can_be_type_alias",
+    "rust_check_typevarlike_name",
+    "rust_extract_typevarlike_name",
+    "rust_special_function_elide_names",
+    "rust_argument_elide_name",
+    "rust_set_callable_name",
+    "rust_has_placeholder",
+    "rust_calculate_tuple_fallback",
+    "rust_find_dataclass_transform_spec",
+    "rust_find_shallow_matching_overload_item",
 ]
 
 class NativeTypeResolver:
@@ -801,3 +829,48 @@ def rust_find_shallow_matching_overload_item(
     overload: Any,
     call: Any,
 ) -> int | None: ...
+def rust_classify_member_resolution(
+    expr: Expression,
+    member_expr_cls: type[Expression],
+    ref_expr_cls: type[Expression],
+    mypy_file_cls: type[Expression],
+    type_info_cls: type[Expression],
+    type_alias_cls: type[Expression],
+) -> tuple[str | None, SymbolTableNode | None]: ...
+def rust_var_is_typing_special_form(node: Any) -> bool: ...
+def rust_get_typevarlike_declaration(
+    s: AssignmentStmt,
+    typevarlike_types: tuple[str, ...],
+) -> CallExpr | None: ...
+def rust_parse_bool(expr: Expression) -> bool | None: ...
+def rust_is_mangled_global(name: str, globals: dict[str, Any]) -> bool: ...
+def rust_is_initial_mangled_global(name: str) -> bool: ...
+def rust_is_final_redefinition(
+    kind: int,
+    name: str,
+    globals: dict[str, Any],
+    type_names: Any,
+) -> bool: ...
+def rust_is_same_var_from_getattr(a: Any, b: Any) -> bool: ...
+def rust_can_possibly_be_typevarlike_declaration(s: AssignmentStmt) -> bool: ...
+def rust_can_possibly_be_type_form(s: AssignmentStmt) -> bool | None: ...
+def rust_is_type_ref(rv: Expression, bare: bool) -> bool | None: ...
+def rust_can_be_type_alias(
+    rv: Expression,
+    allow_none: bool,
+    is_stub_file: bool,
+) -> bool | None: ...
+def rust_check_typevarlike_name(
+    call: CallExpr,
+    name: str,
+) -> tuple[bool, str | None] | None: ...
+def rust_extract_typevarlike_name(
+    s: AssignmentStmt,
+    call: CallExpr,
+) -> str | None: ...
+def rust_special_function_elide_names(name: str) -> bool: ...
+def rust_argument_elide_name(name: str | None) -> bool: ...
+def rust_set_callable_name(sig: Type, fdef: FuncDef) -> ProperType | None: ...
+def rust_has_placeholder(typ: Type) -> bool | None: ...
+def rust_calculate_tuple_fallback(typ: TupleType) -> Type | None: ...
+def rust_find_dataclass_transform_spec(node: Node | None) -> DataclassTransformSpec | None: ...

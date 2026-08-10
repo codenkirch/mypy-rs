@@ -4,6 +4,25 @@ from typing import Final
 
 """Shared logic between our three mypy parser files."""
 
+try:
+    from type_kernel import (
+        rust_special_function_elide_names as _rust_special_function_elide_names,
+        rust_argument_elide_name as _rust_argument_elide_name,
+    )
+
+    _SHAREDPARSE_HAS_KERNEL = True
+except ImportError:
+    _rust_special_function_elide_names = None  # type: ignore[assignment]
+    _rust_argument_elide_name = None  # type: ignore[assignment]
+    _SHAREDPARSE_HAS_KERNEL = False
+
+_native_sharedparse_active: bool = False
+
+
+def _set_native_sharedparse_active(active: bool) -> None:
+    global _native_sharedparse_active
+    _native_sharedparse_active = active
+
 
 _NON_BINARY_MAGIC_METHODS: Final = {
     "__abs__",
@@ -107,8 +126,18 @@ MAGIC_METHODS_POS_ARGS_ONLY: Final = MAGIC_METHODS - MAGIC_METHODS_ALLOWING_KWAR
 
 
 def special_function_elide_names(name: str) -> bool:
+    if _SHAREDPARSE_HAS_KERNEL and _native_sharedparse_active:
+        try:
+            return _rust_special_function_elide_names(name)
+        except (AssertionError, NotImplementedError):
+            pass
     return name in MAGIC_METHODS_POS_ARGS_ONLY
 
 
 def argument_elide_name(name: str | None) -> bool:
+    if _SHAREDPARSE_HAS_KERNEL and _native_sharedparse_active:
+        try:
+            return _rust_argument_elide_name(name)
+        except (AssertionError, NotImplementedError):
+            pass
     return name is not None and name.startswith("__") and not name.endswith("__")
