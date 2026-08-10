@@ -227,6 +227,7 @@ try:
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
+        rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_arguments as _rust_check_arguments,
@@ -264,6 +265,7 @@ except ImportError:
     _rust_has_any_type = None  # type: ignore[assignment]
     _rust_conditional_expr_join = None  # type: ignore[assignment]
     _rust_analyze_cond_branch = None  # type: ignore[assignment]
+    _rust_arg_approximate_similarity = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_infer_function_type_arguments = None  # type: ignore[assignment]
@@ -7864,6 +7866,29 @@ def arg_approximate_similarity(actual: Type, formal: Type) -> bool:
     this function to help us identify which alternative the user might have
     *meant* to match.
     """
+    # Issue #432: port the whole decision to Rust when the kernel is active
+    # and a resolver is installed. Rust defers (returns None) on TypeAliasType
+    # (unexpandable on the wire), TypeVarTuple erasure, Overloaded erasure,
+    # and snapshot-missing / unsupported is_subtype pairs; those fall through
+    # to the pure-Python implementation below. The resolver guard (not None)
+    # is mandatory: parallel workers never build a resolver, so the gate must
+    # check it even when the kernel is active.
+    if (
+        _native_checkexpr_resolver is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+    ):
+        try:
+            result = _rust_arg_approximate_similarity(
+                _serialize_type_for_checkexpr(actual),
+                _serialize_type_for_checkexpr(formal),
+                state.strict_optional,
+                _native_checkexpr_resolver,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     actual = get_proper_type(actual)
     formal = get_proper_type(formal)
 
