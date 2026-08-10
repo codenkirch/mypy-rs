@@ -65,6 +65,7 @@ mod expand;
 mod expandtype;
 mod freshen;
 mod lkv;
+mod maptype;
 mod meet;
 mod messages;
 mod mro;
@@ -163,6 +164,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         typeops::rust_try_getting_int_literals_from_type,
+        module
+    )?)?;
+    // Issue #425: maptype nominal supertype mapping (M8d).
+    module.add_function(wrap_pyfunction!(
+        maptype::rust_map_instance_to_supertype,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        maptype::rust_class_derivation_paths,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        maptype::rust_map_instance_to_direct_supertypes,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
