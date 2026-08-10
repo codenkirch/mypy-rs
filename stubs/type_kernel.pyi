@@ -135,6 +135,7 @@ __all__ = [
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
     "rust_check_arguments",
+    "rust_check_callable_call",
     "rust_solve_one",
     "rust_check_overload_call",
     "rust_format_key_list",
@@ -468,6 +469,16 @@ def rust_check_arguments(
     strict_optional: bool,
     allow_abstract_call: bool,
 ) -> list[tuple[int, int, int]] | None: ...
+def rust_check_callable_call(
+    resolver: NativeTypeResolver,
+    callee_bytes: bytes,
+    arg_types_bytes: list[bytes],
+    callable_name: str | None,
+    object_type_present: bool,
+    registry: Any,
+    has_user_plugins: bool,
+    plugins: Any,
+) -> bytes | None: ...
 def rust_real_union(type_bytes: bytes, strict_optional: bool) -> bool | None: ...
 def rust_solve_generic_call(
     resolver: NativeTypeResolver,
