@@ -1570,6 +1570,10 @@ except ImportError:
 
 _NATIVE_WIRE_ENABLED = bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_WIRE
 
+_NATIVE_SEMANAL_LOOKUP_ENABLED = bool(
+    os.environ.get("TEST_NATIVE_TYPE_KERNEL")
+) and _HAS_TYPE_KERNEL_WIRE
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeWireSuite(Suite):
@@ -7701,3 +7705,115 @@ class NativeDecoratorClassifySuite(Suite):
             "type_check_only",
         ]
         self._assert_tags(decorators, expected)
+
+@skipUnless(_NATIVE_SEMANAL_LOOKUP_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLookupSuite(Suite):
+    """Parity tests for the Rust name-resolution decision (Issue #419).
+
+    Drives `type_kernel.rust_lookup` on constructed scope stacks and asserts
+    the returned decision + node matches what Python's `SemanticAnalyzer.
+    _lookup` (semanal.py) would produce for the same scopes. This is a direct
+    exercise of the seam, independent of the build-manager gate, so it runs
+    whenever the `type_kernel` extension is importable (the golden scope-stack
+    walk order in Rust is verified against the mirror steps below).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.nodes import SymbolTableNode, Var
+
+        self._tk = _tk
+        self._SymbolTableNode = SymbolTableNode
+        self._Var = Var
+
+    def _node(self, fullname: str) -> Any:
+        v = self._Var(fullname.rsplit(".", 1)[-1])
+        v._fullname = fullname
+        return self._SymbolTableNode(0, v)  # type: ignore[arg-type]
+
+    def _call(self, name: str, **kw: Any) -> Any:
+        return self._tk.rust_lookup(name, **kw)
+
+    def test_global_decl_found(self) -> None:
+        g = {"x": self._node("m.x")}
+        r = self._call("x", global_decls={"x"}, globals=g, nonlocal_decls=set(), locals=[],
+                       type_names=None, is_func_scope=True)
+        assert r is not None and r[0] == "found" and r[1] is g["x"]
+
+    def test_global_decl_undeclared(self) -> None:
+        r = self._call("x", global_decls={"x"}, globals={}, nonlocal_decls=set(),
+                       locals=[None], type_names=None, is_func_scope=True)
+        assert r == ("global_undeclared", None)
+
+    def test_nonlocal_found_in_enclosing(self) -> None:
+        inner = {"y": self._node("m.f.y")}
+        r = self._call("y", global_decls=set(), globals={}, nonlocal_decls={"y"},
+                       locals=[None, inner, None], type_names=None, is_func_scope=True)
+        # reversed(self.locals[:-1]) -> skips last (current) scope.
+        assert r is not None and r[0] == "found" and r[1] is inner["y"]
+
+    def test_nonlocal_undeclared(self) -> None:
+        r = self._call("y", global_decls=set(), globals={}, nonlocal_decls={"y"},
+                       locals=[None, None, None], type_names=None, is_func_scope=True)
+        assert r == ("nonlocal_undeclared", None)
+
+    def test_local_found(self) -> None:
+        inner = {"a": self._node("m.f.a")}
+        r = self._call("a", global_decls=set(), globals={}, nonlocal_decls=set(),
+                       locals=[None, inner], type_names=None, is_func_scope=True)
+        assert r is not None and r[0] == "found" and r[1] is inner["a"]
+
+    def test_global_scope_found(self) -> None:
+        g = {"b": self._node("m.b")}
+        r = self._call("b", global_decls=set(), globals=g, nonlocal_decls=set(),
+                       locals=[None], type_names=None, is_func_scope=False)
+        assert r is not None and r[0] == "found" and r[1] is g["b"]
+
+    def test_builtin_found(self) -> None:
+        builtin_names = {"len": self._node("builtins.len")}
+        builtins_mypyfile = _FakeNode(builtin_names)
+        b_entry = self._SymbolTableNode(0, builtins_mypyfile)  # type: ignore[arg-type]
+        g = {"__builtins__": b_entry}
+        r = self._call("len", global_decls=set(), globals=g, nonlocal_decls=set(),
+                       locals=[None], type_names=None, is_func_scope=False)
+        assert r is not None and r[0] == "found" and r[1] is builtin_names["len"]
+
+    def test_builtin_private(self) -> None:
+        builtin_names = {"_private": self._node("builtins._private")}
+        builtins_mypyfile = _FakeNode(builtin_names)
+        b_entry = self._SymbolTableNode(0, builtins_mypyfile)  # type: ignore[arg-type]
+        g = {"__builtins__": b_entry}
+        r = self._call("_private", global_decls=set(), globals=g, nonlocal_decls=set(),
+                       locals=[None], type_names=None, is_func_scope=False)
+        assert r == ("builtin_private", None)
+
+    def test_not_found(self) -> None:
+        r = self._call("nope", global_decls=set(), globals={}, nonlocal_decls=set(),
+                       locals=[None], type_names=None, is_func_scope=False)
+        assert r == ("not_found", None)
+
+    def test_qualname_synthesize_at_class_scope(self) -> None:
+        # Not in class namespace -> Rust says synthesize.
+        tn = {}
+        r = self._call("__qualname__", global_decls=set(), globals={}, nonlocal_decls=set(),
+                       locals=[None], type_names=tn, is_func_scope=False)
+        assert r == ("synthesize_qualname", None)
+
+    def test_class_attr_falls_back(self) -> None:
+        # Class attr present -> Rust falls back (None) for active gating.
+        tn = {"attr": self._node("m.C.attr")}
+        r = self._call("attr", global_decls=set(), globals={}, nonlocal_decls=set(),
+                       locals=[None], type_names=tn, is_func_scope=False)
+        assert r is None
+        # Non-class-scope (is_func_scope) -> class stack ignored.
+        r = self._call("attr", global_decls=set(), globals={}, nonlocal_decls=set(),
+                       locals=[None], type_names=tn, is_func_scope=True)
+        assert r == ("not_found", None)
+
+
+class _FakeNode:
+    """Minimal stand-in for a MypyFile with `.names` for builtins tests."""
+
+    def __init__(self, names: dict[str, Any]) -> None:
+        self.names = names

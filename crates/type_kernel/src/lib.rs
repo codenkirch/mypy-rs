@@ -653,6 +653,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_visitor::rust_classify_decorators,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_classify_imports,
         module

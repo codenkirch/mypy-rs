@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use pyo3::basic::CompareOp;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
 // ---------------------------------------------------------------------------
 // refers_to_fullname
@@ -1121,4 +1121,167 @@ pub(crate) fn rust_classify_imports(
         }
     }
     Ok(Some(result))
+}
+
+// ---------------------------------------------------------------------------
+// lookup (Issue #419)
+// ---------------------------------------------------------------------------
+
+/// The resolution decision for `SemanticAnalyzer._lookup` (semanal.py:6749-6818).
+///
+/// Rust implements the pure local → enclosing → global → builtins walk and
+/// returns *what was found*, leaving all side effects to Python: symbol-table
+/// bookkeeping, `record_imported_symbol`, `name_not_defined` error reporting,
+/// `is_active_symbol_in_class_body` gating, and the `__qualname__`/`__module__`
+/// `Var` synthesis (which needs a live `Var(name, self.str_type())` constructed
+/// through Python). This is the strangler-fig per-call gate: the walk itself is
+/// the valuable slice, and every mutating/error sub-case stays in Python.
+///
+/// Returns `Some(("found", node))` when a `SymbolTableNode` was resolved
+/// (the node is the table entry Python would return), `Some((reason, None))`
+/// for terminal non-found paths (Python runs `name_not_defined` or synthesizes
+/// the `Var`), and `None` when a sub-case is too entangled with Python state
+/// for Rust to decide — Python then falls back to the pure loop unchanged.
+///
+/// The class-body attribute branch (2a) is *always* a `None` fallback: an
+/// inactive class attribute does not terminate the walk, it falls through to
+/// the later scopes, and only Python owns `is_active_symbol_in_class_body`.
+/// Same for the implicit `self.x` assignment fallback (continuation-dependent).
+///
+/// Mirrors semanal.py:6761-6818: `global`/`nonlocal` decl precedence
+/// (1a/1b), local scopes (3), module globals (4), builtins with the
+/// single-underscore privacy filter (5), and the `__qualname__`/`__module__`
+/// synthesis (2b, checked before locals only at class scope). `global_decls`
+/// and `nonlocal_decls` are the top-of-stack decl sets (`self.global_decls[-1]`
+/// / `self.nonlocal_decls[-1]`); `locals` is the full `self.locals` stack;
+/// `type_names` is `self.type.names` (a dict) when inside a class, else `None`
+/// passed as Python `None`. `is_func_scope` comes from `self.is_func_scope()`.
+#[pyfunction]
+#[pyo3(signature = (name, global_decls, globals, nonlocal_decls, locals, type_names, is_func_scope))]
+#[allow(clippy::type_complexity)]
+pub(crate) fn rust_lookup(
+    name: &str,
+    global_decls: &PySet,
+    globals: &PyDict,
+    nonlocal_decls: &PySet,
+    locals: &PyAny,
+    type_names: &PyAny,
+    is_func_scope: bool,
+) -> PyResult<Option<(String, Option<PyObject>)>> {
+    let name = name.to_string();
+    let type_names = type_names.downcast::<PyDict>().ok();
+
+    // 1a. Name declared using 'global x' takes precedence.
+    if global_decls.contains(name.as_str())? {
+        if let Some(node) = globals.get_item(name.as_str())?.map(Into::into) {
+            return Ok(Some(("found".to_string(), Some(node))));
+        }
+        return Ok(Some(("global_undeclared".to_string(), None)));
+    }
+
+    // 1b. Name declared using 'nonlocal x' takes precedence: walk the
+    // enclosing function scopes only (reversed(self.locals[:-1])).
+    if nonlocal_decls.contains(name.as_str())? {
+        let locals_list = match locals.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(None),
+        };
+        let last_index = locals_list.len().saturating_sub(1);
+        for i in (0..last_index).rev() {
+            let table_item = locals_list.get_item(i)?;
+            if table_item.is_none() {
+                continue;
+            }
+            let table = match table_item.downcast::<PyDict>() {
+                Ok(d) => d,
+                Err(_) => return Ok(None),
+            };
+            if table.contains(name.as_str())? {
+                let node = table.get_item(name.as_str())?.map(Into::into);
+                return Ok(Some(("found".to_string(), node)));
+            }
+        }
+        return Ok(Some(("nonlocal_undeclared".to_string(), None)));
+    }
+
+    // 2a/2b only apply at class scope (type_names is Some, not a function
+    // scope).
+    if let Some(type_names) = type_names {
+        if !is_func_scope {
+            // 2a. Class-body attributes always fall back: an inactive class
+            // attribute falls through to later scopes, and only Python owns
+            // `is_active_symbol_in_class_body` (and the `implicit_name`
+            // self.x-assignment fallback).
+            if type_names.contains(name.as_str())? {
+                return Ok(None);
+            }
+            // 2b. Class attributes __qualname__ and __module__ are
+            // synthesized by Python (`Var(name, self.str_type())`); reaching
+            // here with a class scope guarantees the name is not in the
+            // class namespace (2a would have fallen back).
+            if name == "__qualname__" || name == "__module__" {
+                return Ok(Some(("synthesize_qualname".to_string(), None)));
+            }
+        }
+    }
+
+    // 3. Local (function) scopes: the full stack including the current scope.
+    let locals_list = match locals.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    for i in (0..locals_list.len()).rev() {
+        let table_item = locals_list.get_item(i)?;
+        if table_item.is_none() {
+            continue;
+        }
+        let table = match table_item.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        if table.contains(name.as_str())? {
+            let node = table.get_item(name.as_str())?.map(Into::into);
+            return Ok(Some(("found".to_string(), node)));
+        }
+    }
+
+    // 4. Current file global scope.
+    if globals.contains(name.as_str())? {
+        let node = globals.get_item(name.as_str())?.map(Into::into);
+        return Ok(Some(("found".to_string(), node)));
+    }
+
+    // 5. Builtins, with the single-underscore privacy filter.
+    if let Some(builtins_entry) = globals.get_item("__builtins__")? {
+        let builtin_node = match builtins_entry.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        if builtin_node.is_none() {
+            // Python: `b` truthy but the assert fails only on a corrupt
+            // builtins entry; treat as give-up (unreachable in practice).
+            return Ok(Some(("not_found".to_string(), None)));
+        }
+        let names_table = match builtin_node.getattr("names") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let table = match names_table.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        if table.contains(name.as_str())? {
+            let name_bytes = name.as_bytes();
+            if name_bytes.len() > 1 && name_bytes[0] == b'_' && name_bytes[1] != b'_' {
+                return Ok(Some(("builtin_private".to_string(), None)));
+            }
+            let node = table.get_item(name.as_str())?.map(Into::into);
+            return Ok(Some(("found".to_string(), node)));
+        }
+    }
+
+    // Give up. The give-up path returns `not_found` (no implicit class attr
+    // was seen — that case fell back at 2a), so Python's `implicit_name`
+    // variable is always False here.
+    Ok(Some(("not_found".to_string(), None)))
 }
