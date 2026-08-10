@@ -144,6 +144,7 @@ from mypy.typeanal import (
     validate_instance,
 )
 from mypy.typeops import (
+    _has_mutated_truthiness,
     callable_type,
     custom_special_method,
     erase_to_union_or_bound,
@@ -225,6 +226,7 @@ try:
     )
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
+        rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_classify_call as _rust_classify_call,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -255,6 +257,7 @@ try:
 except ImportError:
     _rust_has_any_type = None  # type: ignore[assignment]
     _rust_conditional_expr_join = None  # type: ignore[assignment]
+    _rust_analyze_cond_branch = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
@@ -576,6 +579,25 @@ def _try_native_build_tuple_type(
             return None
         res = _deserialize_type_from_checkexpr(rust_bytes)
         return res
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_analyze_cond_branch(
+    branch_bytes: bytes | None, known_bytes: bytes | None
+) -> bytes | None:
+    """Combine narrowed branch type with the outer context via the Rust kernel.
+
+    Serializes `_combined_context`'s inputs (the branch-derived type and
+    the outer type context). Returns the combined type as serialized
+    bytes, or None to defer to Python.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_analyze_cond_branch(
+            _native_checkexpr_resolver, branch_bytes, known_bytes
+        )
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -6775,6 +6797,24 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             return self.accept(node, type_context=context, allow_none_return=allow_none_return)
 
     def _combined_context(self, ty: Type | None) -> Type | None:
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and not any(
+                _has_mutated_truthiness(item)
+                for item in [ty, self.type_context[-1] if self.type_context else None]
+                if item is not None
+            )
+        ):
+            try:
+                branch_bytes = _serialize_type_for_checkexpr(ty) if ty is not None else None
+                outer = self.type_context[-1] if self.type_context else None
+                known_bytes = _serialize_type_for_checkexpr(outer) if outer is not None else None
+                result = _try_native_analyze_cond_branch(branch_bytes, known_bytes)
+                if result is not None:
+                    return _deserialize_type_from_checkexpr(result)
+            except Exception:
+                pass
         ctx_items = []
         if ty is not None:
             if has_any_type(ty):
