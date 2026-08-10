@@ -1920,25 +1920,36 @@ fn visit_join(
             None
         }
 
-        // visit_typeddict (join.py:811-835), case 2 Instance-s only.
-        // Case 1 (s is TypedDictType) builds a NEW TypedDictType via
-        // resolve_typeddict_item over zipall -> defer (no encoder).
-        // Case 2 (s is Instance) recurses into
-        // join_types(self.s, t.fallback). The recursive call is
-        // join_types(s, fallback) (s=left, fallback=right). SameS in
-        // the recursive frame means result=s -> outer SameS. SameT
-        // means result=fallback, which is neither s nor t (t is the
-        // TypedDict) -> defer. Ancestor/Object pass through.
-        // Case 3 (else) walks s's fallback chain -> defer.
-        //
-        // The fallback is always an Instance (the wire reader asserts
-        // the INSTANCE tag at wire.rs:987; types.py:3122 serializes
-        // `self.fallback.write(data)` where fallback is an Instance).
-        // No protocol deferral needed (unlike visit_callable_fallback):
-        // the recursion is a plain Instance-Instance join, no callback
-        // proxy unpacking involved.
-        Type::TypedDictType { fallback, .. } => {
-            if let Type::Instance { .. } = s {
+        // visit_typeddict (join.py:811-835).
+        // Case 1 (s is TypedDictType): build a NEW TypedDictType via
+        // resolve_typeddict_item over zipall, encode via write_type
+        // (M8u). Case 2 (s is Instance): recurse into
+        // join_types(self.s, t.fallback). Case 3 (else): defer.
+        Type::TypedDictType {
+            fallback,
+            items: t_items,
+            required_keys: t_req,
+            readonly_keys: t_ro,
+            is_closed: t_closed,
+        } => {
+            if let Type::TypedDictType {
+                fallback: s_fallback,
+                items: s_items,
+                required_keys: s_req,
+                readonly_keys: s_ro,
+                is_closed: s_closed,
+            } = s
+            {
+                // Case 1: both TypedDictType. Build the joined
+                // TypedDictType via resolve_typeddict_item over zipall.
+                visit_typeddict_both(
+                    s_items, s_req, s_ro, s_fallback, s_closed, t_items, t_req, t_ro, t_closed,
+                    ctx, resolver,
+                )
+            } else if let Type::Instance { .. } = s {
+                // Case 2: s is Instance -> join_types(s, t.fallback).
+                // SameS/SameT -> outer SameS (s==fallback or result=s);
+                // Ancestor/Object pass through.
                 match join_types(s, fallback, ctx, resolver)? {
                     SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
                     SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
@@ -2049,6 +2060,285 @@ fn visit_callable_fallback(
         // express without a Type encoder. Defer.
         _ => None,
     }
+}
+
+/// `TypeJoinVisitor.visit_typeddict_type` case 1 (join.py:812-831):
+/// both s and t are TypedDictType. Build the joined TypedDictType via
+/// `resolve_typeddict_item` over `zipall`, encode via `write_type`.
+///
+/// `zipall` (types.py:3232-3240) yields all keys from both TypedDicts
+/// (left first, then right's unique keys). For each key, `item(name)`
+/// (types.py:3218-3230) returns the TypedDictItem:
+/// - If the key is in `items`, use `(items[name], name in required,
+///   name in readonly)`.
+/// - If the key is NOT in `items` and `is_closed`, the item type is
+///   `UninhabitedType`, required=False, readonly=False.
+/// - If the key is NOT in `items` and NOT `is_closed`, the item type
+///   is `None` (implicit `NotRequired[ReadOnly[object]]`), required=
+///   False, readonly=True.
+///
+/// `resolve_typeddict_item` (join.py:802-823):
+/// - `is_required = s.required and t.required`.
+/// - If either `s.typ` or `t.typ` is None: `join_type = None`, omit
+///   the key (implicitly object in the join).
+/// - Else: `join_type = join_types(s.typ, t.typ)` (recursive).
+///   `is_readonly = True` if `s.required != t.required` or either
+///   is readonly. Otherwise `is_readonly = not is_equivalent(s.typ,
+///   t.typ)` (two-way subtype check).
+///
+/// `create_anonymous_fallback` (types.py:3170-3174): if the fallback
+/// type's fullname is in `TPDICT_FB_NAMES` (typing._TypedDict, etc.),
+/// the TypedDict is anonymous and `self.fallback` is returned as-is.
+/// For non-anonymous TypedDicts, Python recurses into
+/// `fallback.type.typeddict_type.create_anonymous_fallback()` to find
+/// the anonymous root. The wire format carries only `type_ref` (not
+/// the live TypeInfo with `.typeddict_type`), so we can't follow the
+/// chain. For anonymous TypedDicts (the common case in tests), the
+/// fallback is used directly. For non-anonymous, defer to Python.
+///
+/// Returns `Some(SetOpResult::Encoded(bytes))` on success, `None`
+/// when any recursive `join_types` or `is_equivalent` defers, or
+/// when the fallback is non-anonymous (can't compute
+/// `create_anonymous_fallback` from the snapshot alone).
+#[allow(clippy::too_many_arguments)]
+fn visit_typeddict_both(
+    s_items: &[(String, Type)],
+    s_req: &std::collections::HashSet<String>,
+    s_ro: &std::collections::HashSet<String>,
+    s_fallback: &Type,
+    s_closed: &bool,
+    t_items: &[(String, Type)],
+    t_req: &std::collections::HashSet<String>,
+    t_ro: &std::collections::HashSet<String>,
+    t_closed: &bool,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    // create_anonymous_fallback: only anonymous TypedDicts are
+    // supported (fallback type_ref in TPDICT_FB_NAMES). Non-anonymous
+    // needs the live TypeInfo chain -> defer.
+    let s_fb_ref = match s_fallback {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
+        _ => return None,
+    };
+    if !is_typeddict_fallback_anonymous(s_fb_ref) {
+        return None;
+    }
+
+    // zipall: iterate all keys from both items maps.
+    let s_map: std::collections::HashMap<&str, &Type> =
+        s_items.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    let t_map: std::collections::HashMap<&str, &Type> =
+        t_items.iter().map(|(k, v)| (k.as_str(), v)).collect();
+
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut new_items: Vec<(String, Type)> = Vec::new();
+    let mut new_required: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut new_readonly: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Left items first (zipall: left.keys() then right's unique keys).
+    for (name, s_typ) in s_items {
+        seen.insert(name.as_str());
+        let t_present = t_map.get(name.as_str()).copied();
+        let s_required = s_req.contains(name);
+        let s_readonly = s_ro.contains(name);
+        let (t_required, t_readonly) =
+            typeddict_item_flags(name, t_req, t_ro, t_present.is_some(), *t_closed);
+        let t_typ = typeddict_item_type_for_join(t_present, *t_closed);
+        let (item_type, is_required, is_readonly) = resolve_typeddict_item_inner(
+            Some(s_typ),
+            s_required,
+            s_readonly,
+            t_typ.as_ref(),
+            t_required,
+            t_readonly,
+            ctx,
+            resolver,
+        )?;
+        if let Some(typ) = item_type {
+            new_items.push((name.clone(), typ));
+            if is_required {
+                new_required.insert(name.clone());
+            }
+            if is_readonly {
+                new_readonly.insert(name.clone());
+            }
+        }
+    }
+    // Right items not in left.
+    for (name, t_typ) in t_items {
+        if seen.contains(name.as_str()) {
+            continue;
+        }
+        let s_present = s_map.get(name.as_str()).copied();
+        let (s_required, s_readonly) =
+            typeddict_item_flags(name, s_req, s_ro, s_present.is_some(), *s_closed);
+        let s_typ = typeddict_item_type_for_join(s_present, *s_closed);
+        let t_required = t_req.contains(name);
+        let t_readonly = t_ro.contains(name);
+        let (item_type, is_required, is_readonly) = resolve_typeddict_item_inner(
+            s_typ.as_ref(),
+            s_required,
+            s_readonly,
+            Some(t_typ),
+            t_required,
+            t_readonly,
+            ctx,
+            resolver,
+        )?;
+        if let Some(typ) = item_type {
+            new_items.push((name.clone(), typ));
+            if is_required {
+                new_required.insert(name.clone());
+            }
+            if is_readonly {
+                new_readonly.insert(name.clone());
+            }
+        }
+    }
+
+    let is_closed = *s_closed && *t_closed;
+    let new_td = Type::TypedDictType {
+        fallback: Box::new(s_fallback.clone()),
+        items: new_items,
+        required_keys: new_required,
+        readonly_keys: new_readonly,
+        is_closed,
+    };
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &new_td).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// `resolve_typeddict_item` inner logic (join.py:802-823).
+/// Returns `(Option<Type>, is_required, is_readonly)` or `None` (defer).
+/// `None` for the item_type means the key is omitted from the join.
+#[allow(clippy::too_many_arguments)]
+fn resolve_typeddict_item_inner(
+    s_typ: Option<&Type>,
+    s_required: bool,
+    s_readonly: bool,
+    t_typ: Option<&Type>,
+    t_required: bool,
+    t_readonly: bool,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<(Option<Type>, bool, bool)> {
+    let is_required = s_required && t_required;
+    if s_typ.is_none() || t_typ.is_none() {
+        return Some((None, is_required, true));
+    }
+    let s_t = s_typ.unwrap();
+    let t_t = t_typ.unwrap();
+    let join_type = setop_result_to_type(join_types(s_t, t_t, ctx, resolver), s_t, t_t)?;
+    // join.py:816-823: is_readonly = True if required mismatch or either
+    // is readonly; else not is_equivalent(s.typ, t.typ).
+    let is_readonly = if s_required != t_required || s_readonly || t_readonly {
+        true
+    } else {
+        !is_equivalent_types(s_t, t_t, ctx, resolver)?
+    };
+    Some((Some(join_type), is_required, is_readonly))
+}
+
+/// Get the item type for a key in a TypedDict for the join, per
+/// `TypedDictType.item` (types.py:3218-3230). If the key is present,
+/// return its type. If missing and `is_closed`, return
+/// `UninhabitedType`. If missing and NOT `is_closed`, return `None`.
+fn typeddict_item_type_for_join(present: Option<&Type>, is_closed: bool) -> Option<Type> {
+    if let Some(t) = present {
+        return Some(t.clone());
+    }
+    if is_closed {
+        Some(Type::UninhabitedType { ambiguous: true })
+    } else {
+        None
+    }
+}
+
+/// Get the required/readonly flags for a TypedDict key, per
+/// `TypedDictType.item` (types.py:3218-3230).
+fn typeddict_item_flags(
+    name: &str,
+    required: &std::collections::HashSet<String>,
+    readonly: &std::collections::HashSet<String>,
+    present: bool,
+    is_closed: bool,
+) -> (bool, bool) {
+    if present {
+        return (required.contains(name), readonly.contains(name));
+    }
+    if is_closed {
+        (false, false)
+    } else {
+        (false, true)
+    }
+}
+
+/// `is_equivalent` (subtypes.py:277-300) for two arbitrary types:
+/// `is_subtype(a, b) and is_subtype(b, a)`. Returns `None` (defer)
+/// if any `is_subtype` returns `None`; `Some(true)` if mutually
+/// subtype, `Some(false)` otherwise.
+fn is_equivalent_types(
+    a: &Type,
+    b: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let fwd = is_subtype(a, b, ctx, resolver)?;
+    if !fwd {
+        return Some(false);
+    }
+    let bwd = is_subtype(b, a, ctx, resolver)?;
+    Some(bwd)
+}
+
+/// Check if a TypedDict fallback fullname is one of the anonymous
+/// TypedDict fallback names (TPDICT_FB_NAMES in types.py:126-130).
+fn is_typeddict_fallback_anonymous(type_ref: &str) -> bool {
+    type_ref == "typing._TypedDict"
+        || type_ref == "typing_extensions._TypedDict"
+        || type_ref == "mypy_extensions._TypedDict"
+}
+
+/// `is_better` (join.py:794-810): given two possible results from
+/// `join_instances_via_supertype`, indicate whether `t` is the better
+/// one. Used by the nominal Instance-Instance join to pick the
+/// candidate with the longest MRO (closest common ancestor).
+///
+/// Pure comparison: no mutation, no plugin visibility, no messages.
+/// Ported as a standalone helper for testability and potential reuse
+/// by callers that need to compare join candidates.
+#[allow(dead_code)]
+fn is_better_join(t: &Type, s: &Type, resolver: &TypeResolver) -> bool {
+    if let Type::Instance {
+        type_ref: t_ref, ..
+    } = t
+    {
+        if !matches!(s, Type::Instance { .. }) {
+            return true;
+        }
+        if let Type::Instance {
+            type_ref: s_ref, ..
+        } = s
+        {
+            let t_snap = resolver.get(t_ref);
+            let s_snap = resolver.get(s_ref);
+            let t_is_protocol = t_snap.is_some_and(|snap| snap.is_protocol);
+            let s_is_protocol = s_snap.is_some_and(|snap| snap.is_protocol);
+            if t_is_protocol != s_is_protocol {
+                let t_is_object = t_ref == "builtins.object";
+                let s_is_object = s_ref == "builtins.object";
+                if !t_is_object && !s_is_object {
+                    return !t_is_protocol;
+                }
+            }
+            let t_mro = mro_len(t_ref, resolver);
+            let s_mro = mro_len(s_ref, resolver);
+            return t_mro > s_mro;
+        }
+    }
+    false
 }
 
 /// `TypeInfo.is_enum` (nodes.py:3753) read for a LiteralType's fallback
@@ -5943,5 +6233,300 @@ mod tests {
             meet_types(&s, &t, &ctx(true), &r),
             Some(SetOpResult::Bottom)
         );
+    }
+
+    // ---- visit_typeddict_type case 1 (both TypedDictType) (#436) ----
+    // Mirrors join.py:812-831. Builds a new TypedDictType via
+    // resolve_typeddict_item over zipall, encoded via write_type.
+
+    /// TypedDictType with items, required_keys, readonly_keys, and
+    /// a fallback of typing._TypedDict (anonymous).
+    fn typed_dict_full(
+        items: Vec<(&str, Type)>,
+        required: Vec<&str>,
+        readonly: Vec<&str>,
+        is_closed: bool,
+    ) -> Type {
+        let fallback = instance("typing._TypedDict", vec![]);
+        let items: Vec<(String, Type)> =
+            items.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let required_keys: std::collections::HashSet<String> =
+            required.into_iter().map(String::from).collect();
+        let readonly_keys: std::collections::HashSet<String> =
+            readonly.into_iter().map(String::from).collect();
+        Type::TypedDictType {
+            fallback: Box::new(fallback),
+            items,
+            required_keys,
+            readonly_keys,
+            is_closed,
+        }
+    }
+
+    #[test]
+    fn join_typeddict_both_identical_returns_encoded() {
+        // join(TD, TD) where both have the same items, same required,
+        // same readonly. The joined TypedDictType has the same items
+        // (each join_types(item, item) = item), same required/readonly.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            true,
+        );
+        let t = s.clone();
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let decoded = decode_type(&bytes).expect("decode failed");
+            let Type::TypedDictType {
+                items,
+                required_keys,
+                readonly_keys,
+                is_closed,
+                ..
+            } = decoded
+            else {
+                panic!("expected TypedDictType");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].0, "x");
+            assert!(required_keys.contains("x"));
+            assert!(readonly_keys.is_empty());
+            assert!(is_closed);
+        }
+    }
+
+    #[test]
+    fn join_typeddict_both_disjoint_keys_merges() {
+        // s has key "x", t has key "y". zipall yields both. Each
+        // item is joined with the other's missing key (is_closed=True
+        // -> UninhabitedType). join_types(A, Uninhabited) = A.
+        // Required: s.required(x)=True, t.required(x)=False (missing
+        // in closed TD) -> is_required = True and False = False.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            true,
+        );
+        let t = typed_dict_full(
+            vec![("y", instance("a.A", vec![]))],
+            vec!["y"],
+            vec![],
+            true,
+        );
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let decoded = decode_type(&bytes).expect("decode failed");
+            let Type::TypedDictType {
+                items,
+                required_keys,
+                is_closed,
+                ..
+            } = decoded
+            else {
+                panic!("expected TypedDictType");
+            };
+            assert_eq!(items.len(), 2);
+            // Neither key is required (each is missing from one side).
+            assert!(required_keys.is_empty());
+            assert!(is_closed);
+        }
+    }
+
+    #[test]
+    fn join_typeddict_both_different_types_for_same_key_joins() {
+        // s has key "x": A, t has key "x": A (same type). The joined
+        // item type is join_types(A, A) = A. is_equivalent(A, A) =
+        // True -> is_readonly = False.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            true,
+        );
+        let t = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            true,
+        );
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let decoded = decode_type(&bytes).expect("decode failed");
+            let Type::TypedDictType {
+                items,
+                required_keys,
+                readonly_keys,
+                ..
+            } = decoded
+            else {
+                panic!("expected TypedDictType");
+            };
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].0, "x");
+            assert!(required_keys.contains("x"));
+            // Same type, same required, no readonly -> not readonly.
+            assert!(readonly_keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn join_typeddict_both_required_mismatch_marks_readonly() {
+        // s has key "x" required, t has key "x" NOT required.
+        // is_required = False. is_readonly = True (required mismatch).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            true,
+        );
+        let t = typed_dict_full(vec![("x", instance("a.A", vec![]))], vec![], vec![], true);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let decoded = decode_type(&bytes).expect("decode failed");
+            let Type::TypedDictType {
+                items,
+                required_keys,
+                readonly_keys,
+                ..
+            } = decoded
+            else {
+                panic!("expected TypedDictType");
+            };
+            assert_eq!(items.len(), 1);
+            assert!(!required_keys.contains("x"));
+            assert!(readonly_keys.contains("x"));
+        }
+    }
+
+    #[test]
+    fn join_typeddict_both_open_td_missing_key_omits() {
+        // s has key "x" (open TD), t is open TD with no keys.
+        // t.item("x") with open TD -> typ=None, required=False,
+        // readonly=True. resolve_typeddict_item: s.typ=Some(A),
+        // t.typ=None -> join_type=None -> key omitted.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = typed_dict_full(
+            vec![("x", instance("a.A", vec![]))],
+            vec!["x"],
+            vec![],
+            false,
+        );
+        let t = typed_dict_full(vec![], vec![], vec![], false);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let decoded = decode_type(&bytes).expect("decode failed");
+            let Type::TypedDictType { items, .. } = decoded else {
+                panic!("expected TypedDictType");
+            };
+            // Key "x" is omitted (join_type=None).
+            assert!(items.is_empty());
+        }
+    }
+
+    #[test]
+    fn join_typeddict_non_anonymous_fallback_defers() {
+        // Non-anonymous fallback (not in TPDICT_FB_NAMES) -> defer
+        // (can't compute create_anonymous_fallback from snapshot).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = Type::TypedDictType {
+            fallback: Box::new(instance("a.MyDict", vec![])),
+            items: vec![("x".to_string(), instance("a.A", vec![]))],
+            required_keys: std::collections::HashSet::from(["x".to_string()]),
+            readonly_keys: std::collections::HashSet::new(),
+            is_closed: true,
+        };
+        let t = s.clone();
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    // ---- is_better_join standalone helper (#436) ----
+
+    #[test]
+    fn is_better_instance_vs_non_instance_returns_true() {
+        // t is Instance, s is not Instance -> True.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let t = instance("a.A", vec![]);
+        let s = Type::NoneType;
+        assert!(is_better_join(&t, &s, &r));
+    }
+
+    #[test]
+    fn is_better_longer_mro_returns_true() {
+        // t has longer MRO than s -> True.
+        let a = snap("a.A", "A");
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let r = make_resolver(vec![a, b]);
+        let t = instance("a.B", vec![]);
+        let s = instance("a.A", vec![]);
+        assert!(is_better_join(&t, &s, &r));
+    }
+
+    #[test]
+    fn is_better_shorter_mro_returns_false() {
+        // t has shorter MRO than s -> False.
+        let a = snap("a.A", "A");
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let r = make_resolver(vec![a, b]);
+        let t = instance("a.A", vec![]);
+        let s = instance("a.B", vec![]);
+        assert!(!is_better_join(&t, &s, &r));
+    }
+
+    #[test]
+    fn is_better_equal_mro_returns_false() {
+        // Same MRO length -> not better (Python is_better returns False
+        // when len(t.mro) <= len(s.mro)).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let t = instance("a.A", vec![]);
+        let s = instance("a.B", vec![]);
+        assert!(!is_better_join(&t, &s, &r));
+    }
+
+    #[test]
+    fn is_better_protocol_vs_non_protocol_returns_non_protocol() {
+        // t is non-protocol, s is protocol, neither is object -> t is
+        // better (non-protocol preferred).
+        let mut a = snap("a.A", "A");
+        a.is_protocol = true;
+        let b = snap("a.B", "B");
+        let r = make_resolver(vec![a, b]);
+        let t = instance("a.B", vec![]);
+        let s = instance("a.A", vec![]);
+        assert!(is_better_join(&t, &s, &r));
     }
 }
