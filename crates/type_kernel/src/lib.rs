@@ -545,6 +545,38 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(messages::rust_for_function, module)?)?;
     // Issue #358: dmypy server pure helper — count_stats from mypy/util.py
     module.add_function(wrap_pyfunction!(messages::rust_count_stats, module)?)?;
+    // Issue #438: pure string-message generators from mypy/messages.py
+    module.add_function(wrap_pyfunction!(messages::rust_too_few_arguments, module)?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_too_many_arguments, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_too_many_positional_arguments,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_missing_named_argument,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_unexpected_keyword_argument_for_function,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(messages::rust_invalid_index_type, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_wrong_number_values_to_unpack,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_undefined_in_superclass,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_signatures_incompatible,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        messages::rust_signature_incompatible_with_supertype,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
         module
