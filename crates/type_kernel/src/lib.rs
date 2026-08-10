@@ -363,6 +363,23 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_stmts::rust_try_handler_union,
         module
     )?)?;
+    // Issue #347: checker narrowing helpers. narrow_declared_type is already
+    // registered via meet::rust_narrow_declared_type (the authoritative
+    // meet.py seam); the other four defer (None) and exist only as
+    // entry-points so Python can call through the gate.
+    module.add_function(wrap_pyfunction!(checker_stmts::rust_narrow_type, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_infer_value_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_find_isinstance_join,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_partial_type_inference,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_is_true_literal,
         module
