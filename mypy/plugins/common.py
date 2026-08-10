@@ -4,6 +4,29 @@ from typing import NamedTuple
 
 from mypy.argmap import map_actuals_to_formals
 from mypy.modules_state import modules_state
+
+# Native type-kernel gate for find_shallow_matching_overload_item.
+# When type_kernel extension is available and _native_plugin_helpers_active
+# is True, the Rust path runs; otherwise the pure-Python implementation below
+# is used. Rust returns None for unsupported cases (star actuals), falling
+# through to the Python path.
+try:
+    from type_kernel import rust_find_shallow_matching_overload_item as _rust_fmo
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_fmo = None
+    _HAS_TYPE_KERNEL = False
+
+_native_plugin_helpers_active: bool = False
+
+
+def _set_native_plugin_helpers_active(active: bool) -> None:
+    """Called by the build manager from Options.native_type_kernel."""
+    global _native_plugin_helpers_active
+    _native_plugin_helpers_active = active
+
+
 from mypy.nodes import (
     ARG_POS,
     MDEF,
@@ -113,6 +136,11 @@ def find_shallow_matching_overload_item(overload: Overloaded, call: CallExpr) ->
 
     Return the first matching overload item, or the last one if nothing matches.
     """
+    # Native type-kernel gate: try Rust first; None → fall through to Python.
+    if _HAS_TYPE_KERNEL and _native_plugin_helpers_active:
+        idx = _rust_fmo(overload, call)
+        if idx is not None:
+            return overload.items[idx]
     for item in overload.items[:-1]:
         ok = True
         mapped = map_actuals_to_formals(

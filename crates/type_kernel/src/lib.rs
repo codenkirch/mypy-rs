@@ -69,6 +69,7 @@ mod messages;
 mod mro;
 mod operators;
 mod overload;
+mod plugin_helpers;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
@@ -761,6 +762,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #393: sibling seam for `__post_init__` (InitVar fields only).
     module.add_function(wrap_pyfunction!(
         dataclasses::rust_dataclass_post_init_transform,
+        module
+    )?)?;
+    // Issue #394: pure plugin common helpers.
+    module.add_function(wrap_pyfunction!(
+        plugin_helpers::rust_find_shallow_matching_overload_item,
         module
     )?)?;
     // Issue #389: dmypy_server pure helpers — plain-record shuffling.

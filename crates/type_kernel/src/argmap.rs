@@ -20,11 +20,11 @@ use crate::wire::{read_type, ReadBuffer, Type};
 
 // ArgKind integer values, mirroring `mypy.nodes.ARG_*` (nodes.py:2480-2517).
 // The wire format and the Python shim both pass `int(ArgKind.value)`.
-const ARG_POS: i64 = 0;
-const ARG_STAR: i64 = 2;
-const ARG_NAMED: i64 = 3;
-const ARG_STAR2: i64 = 4;
-const ARG_NAMED_OPT: i64 = 5;
+pub(crate) const ARG_POS: i64 = 0;
+pub(crate) const ARG_STAR: i64 = 2;
+pub(crate) const ARG_NAMED: i64 = 3;
+pub(crate) const ARG_STAR2: i64 = 4;
+pub(crate) const ARG_NAMED_OPT: i64 = 5;
 
 fn is_star(kind: i64) -> bool {
     kind == ARG_STAR || kind == ARG_STAR2
