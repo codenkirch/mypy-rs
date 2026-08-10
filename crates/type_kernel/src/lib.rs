@@ -471,6 +471,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_stmts::rust_narrow_type_by_identity_equality,
         module
     )?)?;
+    // Issue #445: is_valid_inferred_type pure boolean query.
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_is_valid_inferred_type,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_is_true_literal,
         module

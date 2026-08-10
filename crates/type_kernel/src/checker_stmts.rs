@@ -311,6 +311,208 @@ fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// is_valid_inferred_type (issue #445)
+// ---------------------------------------------------------------------------
+//
+// Ports `mypy.checker.is_valid_inferred_type` (checker.py:9748-9772) and its
+// `InvalidInferredTypes` visitor (checker.py:9775-9799). This is a pure
+// boolean query on a type tree with no diagnostics, no mutation, and no
+// side effects. It is the non-diagnostic helper called from the
+// `check_assignment` narrowing path for simple lvalues.
+//
+// `InvalidInferredTypes` is a `BoolTypeQuery(ANY_STRATEGY)` with these
+// overrides (checker.py:9785-9799):
+//   * `visit_uninhabited_type`: returns `t.ambiguous` (base: default=False).
+//   * `visit_erased_type`: returns `True` (unreachable on the wire, since
+//     `ErasedType` has no `write`/`read` in mypy/types.py, so it can never
+//     appear in serialized input).
+//   * `visit_type_var`: returns `t.id.is_meta_var()` i.e. `meta_level > 0`
+//     (base: query upper_bound + default + values).
+//   * `visit_tuple_type`: returns `query_types(t.items)` (base: query items
+//     + partial_fallback).
+//
+// The top-level `is_valid_inferred_type` first calls `get_proper_type`
+// (which needs the live alias target for a `TypeAliasType`, so any alias at
+// the top level defers). Then:
+//   * `NoneType`: `is_lvalue_final or (not is_lvalue_member and allow_redefinition)`.
+//   * `UninhabitedType`: `False`.
+//   * Otherwise: `not typ.accept(InvalidInferredTypes())`.
+//
+// Deferred (return None) cases:
+//   * Undecodable input bytes.
+//   * `TypeAliasType` at the top level (get_proper_type needs the live
+//     alias target).
+//   * `TypeAliasType` anywhere in the tree: the base `visit_type_alias_type`
+//     calls `get_proper_type` and recurses into the alias target, which
+//     needs the live `alias` node. The wire format stores only `type_ref`,
+//     so defer the entire query to the pure-Python path.
+
+/// `mypy.checker.is_valid_inferred_type` — pure boolean validity query.
+///
+/// Returns `Some(bool)` matching the Python result, or `None` to defer to
+/// the pure-Python path.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_is_valid_inferred_type(
+    type_bytes: &[u8],
+    is_lvalue_final: bool,
+    is_lvalue_member: bool,
+    allow_redefinition: bool,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(is_valid_inferred_type_inner(
+        &typ,
+        is_lvalue_final,
+        is_lvalue_member,
+        allow_redefinition,
+    ))
+}
+
+fn is_valid_inferred_type_inner(
+    typ: &Type,
+    is_lvalue_final: bool,
+    is_lvalue_member: bool,
+    allow_redefinition: bool,
+) -> Option<bool> {
+    // get_proper_type: TypeAliasType needs the live alias target.
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    // Top-level NoneType short-circuit.
+    if matches!(typ, Type::NoneType) {
+        return Some(is_lvalue_final || (!is_lvalue_member && allow_redefinition));
+    }
+    // Top-level UninhabitedType short-circuit.
+    if let Type::UninhabitedType { .. } = typ {
+        return Some(false);
+    }
+    // not typ.accept(InvalidInferredTypes()).
+    let invalid = invalid_inferred_types_query(typ)?;
+    Some(!invalid)
+}
+
+/// `InvalidInferredTypes` query: ANY_STRATEGY (short-circuit OR).
+///
+/// Returns `Some(true)` if any invalid component is found, `Some(false)`
+/// if none, or `None` to defer (a `TypeAliasType` encountered anywhere in
+/// the tree).
+fn invalid_inferred_types_query(typ: &Type) -> Option<bool> {
+    // Per-variant overrides mirror InvalidInferredTypes.visit_*.
+    match typ {
+        // visit_uninhabited_type: returns t.ambiguous.
+        Type::UninhabitedType { ambiguous } => Some(*ambiguous),
+        // visit_erased_type returns True, but ErasedType is not on the wire.
+        // visit_type_var: returns t.id.is_meta_var() (meta_level > 0),
+        // NOT the base query of upper_bound/default/values.
+        Type::TypeVarType { meta_level, .. } => Some(*meta_level > 0),
+        // visit_tuple_type: query_types(t.items) — excludes fallback.
+        Type::TupleType { items, .. } => {
+            // ANY_STRATEGY: any item invalid -> True. Short-circuit.
+            for item in items {
+                match invalid_inferred_types_query(item) {
+                    Some(true) => return Some(true),
+                    None => return None,
+                    Some(false) => {}
+                }
+            }
+            Some(false)
+        }
+        // TypeAliasType: base visit_type_alias_type needs get_proper_type
+        // (live alias target). Defer.
+        Type::TypeAliasType { .. } => None,
+        // Base BoolTypeQuery(ANY_STRATEGY) for all other variants.
+        _ => {
+            // default = False for ANY_STRATEGY. Query children.
+            for child in invalid_inferred_children(typ) {
+                match invalid_inferred_types_query(child) {
+                    Some(true) => return Some(true),
+                    None => return None,
+                    Some(false) => {}
+                }
+            }
+            Some(false)
+        }
+    }
+}
+
+/// Yield the child types that `InvalidInferredTypes`'s base visitor would
+/// query. This mirrors `BoolTypeQuery.visit_*` for variants not overridden
+/// by `InvalidInferredTypes`. `TypeVarType` and `TupleType` are excluded
+/// because they have overrides that do not recurse generically.
+fn invalid_inferred_children(typ: &Type) -> Vec<&Type> {
+    let mut out = Vec::new();
+    match typ {
+        Type::UnboundType { args, .. } => out.extend(args.iter()),
+        Type::UnpackType { typ } => out.push(typ),
+        Type::Instance {
+            args,
+            last_known_value,
+            ..
+        } => {
+            out.extend(args.iter());
+            if let Some(lkv) = last_known_value {
+                out.push(lkv);
+            }
+        }
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            variables,
+            instance_type,
+            ..
+        } => {
+            out.extend(arg_types.iter());
+            out.push(ret_type);
+            out.extend(variables.iter());
+            if let Some(it) = instance_type {
+                out.push(it);
+            }
+        }
+        Type::Overloaded { items } => out.extend(items.iter()),
+        Type::TypedDictType {
+            items, fallback, ..
+        } => {
+            out.push(fallback);
+            out.extend(items.iter().map(|(_, t)| t));
+        }
+        Type::LiteralType { fallback, .. } => out.push(fallback),
+        Type::UnionType { items, .. } => out.extend(items.iter()),
+        Type::TypeType { item, .. } => out.push(item),
+        Type::ParamSpecType {
+            upper_bound,
+            default,
+            prefix,
+            ..
+        } => {
+            out.push(upper_bound);
+            out.push(default);
+            // Parameters children: arg_types (visit_parameters queries
+            // t.arg_types).
+            out.extend(prefix.arg_types.iter());
+        }
+        Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => {
+            out.push(upper_bound);
+            out.push(default);
+        }
+        Type::AnyType {
+            source_any: Some(sa),
+            ..
+        } => out.push(sa),
+        // NoneType, UninhabitedType, AnyType (no source_any), DeletedType,
+        // Parameters (standalone): no children. ErasedType unreachable.
+        _ => {}
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // checker narrowing stubs (issue #347)
 // ---------------------------------------------------------------------------
 //
@@ -1028,6 +1230,235 @@ mod tests {
                     args: Vec::new(),
                 },
             ]
+        );
+    }
+
+    // -- is_valid_inferred_type (issue #445) --
+
+    #[test]
+    fn valid_inferred_none_final() {
+        let t = Type::NoneType;
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, true, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_none_non_member_allow_redef() {
+        let t = Type::NoneType;
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, true),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_none_member_no_redef() {
+        let t = Type::NoneType;
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, true, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_uninhabited() {
+        let t = uninhabited();
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_plain_instance() {
+        let t = instance("builtins.int");
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_ambiguous_uninhabited_inside_union() {
+        let t = Type::UnionType {
+            items: vec![
+                instance("builtins.int"),
+                Type::UninhabitedType { ambiguous: true },
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_non_ambiguous_uninhabited_inside_tuple() {
+        let t = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![Type::UninhabitedType { ambiguous: false }],
+            implicit: false,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_meta_var_typevar() {
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 1,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_non_meta_var_typevar() {
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_typevar_with_ambiguous_inside_upper_bound() {
+        // TypeVar override returns is_meta_var() and does NOT recurse into
+        // upper_bound, so an ambiguous UninhabitedType inside upper_bound
+        // is NOT detected.
+        let t = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(Type::UninhabitedType { ambiguous: true }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_tuple_excludes_fallback() {
+        // visit_tuple_type queries only items, not partial_fallback. An
+        // ambiguous UninhabitedType in the fallback must NOT be detected.
+        let t = Type::TupleType {
+            partial_fallback: Box::new(Type::UninhabitedType { ambiguous: true }),
+            items: vec![instance("builtins.int")],
+            implicit: false,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_alias_top_defers() {
+        let t = type_alias();
+        assert_eq!(is_valid_inferred_type_inner(&t, false, false, false), None);
+    }
+
+    #[test]
+    fn valid_inferred_alias_nested_defers() {
+        let t = Type::UnionType {
+            items: vec![instance("builtins.int"), type_alias()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(invalid_inferred_types_query(&t), None);
+    }
+
+    #[test]
+    fn valid_inferred_instance_with_ambiguous_arg() {
+        let t = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![Type::UninhabitedType { ambiguous: true }],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn valid_inferred_garbage_bytes_defers() {
+        assert_eq!(
+            rust_is_valid_inferred_type(b"\xff\xff", false, false, false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn valid_inferred_callable_with_ambiguous_ret() {
+        let t = Type::CallableType {
+            fallback: Box::new(instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![instance("builtins.int")],
+            arg_kinds: vec![0],
+            arg_names: vec![None],
+            ret_type: Box::new(Type::UninhabitedType { ambiguous: true }),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        };
+        assert_eq!(
+            is_valid_inferred_type_inner(&t, false, false, false),
+            Some(false)
         );
     }
 
