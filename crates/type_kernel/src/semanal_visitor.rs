@@ -23,6 +23,10 @@
 //!   symbol table (mutates the Python dict in-place).
 //! - `apply_semantic_analyzer_patches` — call patch callbacks sorted by
 //!   priority.
+//! - `is_init_only` — check whether a `Var` is a `dataclasses.InitVar` (Issue #391).
+//! - `erase_func_annotations` — erase type annotations from a `FuncDef` (Issue #391).
+//! - `get_deprecated` — extract deprecation string from a `CallExpr` decorator (Issue #391).
+//! - `get_name_repr_of_expr` — simplified textual representation of an expression (Issue #391).
 
 use std::collections::HashSet;
 
@@ -526,4 +530,197 @@ pub(crate) fn rust_apply_semantic_analyzer_patches(
         cb.call0()?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// is_init_only (Issue #391)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.is_init_only` — check whether a `Var` is a `dataclasses.InitVar`.
+///
+/// Mirrors semanal.py:8647-8651. Pure helper: checks if the variable's type,
+/// when properly resolved, is `dataclasses.InitVar`.
+#[pyfunction]
+pub(crate) fn rust_is_init_only(py: Python<'_>, node: &PyAny) -> PyResult<bool> {
+    let types_mod = py.import("mypy.types")?;
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+
+    let node_type = node.getattr("type")?;
+    let proper = get_proper_type.call1((node_type,))?;
+    if !proper.is_instance(instance_cls)? {
+        return Ok(false);
+    }
+
+    let type_obj = proper.getattr("type")?;
+    let fullname = type_obj.getattr("fullname")?;
+    let fullname_str: &str = fullname.downcast::<PyString>()?.to_str()?;
+    Ok(fullname_str == "dataclasses.InitVar")
+}
+
+// ---------------------------------------------------------------------------
+// erase_func_annotations (Issue #391)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.erase_func_annotations` — erase type annotations from a `FuncDef`.
+///
+/// Mirrors semanal.py:8654-8660. Mutates the `FuncDef` in-place: sets
+/// `type_args`, `arguments[*].type_annotation`, `arguments[*].variable.type`,
+/// `type`, and `unanalyzed_type` to `None`.
+#[pyfunction]
+pub(crate) fn rust_erase_func_annotations(py: Python<'_>, func: &PyAny) -> PyResult<()> {
+    func.setattr("type_args", py.None())?;
+
+    let arguments = func.getattr("arguments")?;
+    let args_list = arguments.downcast::<PyList>()?;
+    for arg in args_list.iter() {
+        arg.setattr("type_annotation", py.None())?;
+        let variable = arg.getattr("variable")?;
+        variable.setattr("type", py.None())?;
+    }
+
+    func.setattr("type", py.None())?;
+    func.setattr("unanalyzed_type", py.None())?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// get_deprecated (Issue #391)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.get_deprecated` — extract deprecation string from a
+/// `CallExpr` decorator (e.g. `@deprecated("msg")`).
+///
+/// Mirrors semanal.py:1487-1495. A pure static method: if `expression` is a
+/// `CallExpr` whose callee refers to `DEPRECATED_TYPE_NAMES` and whose first
+/// argument is a `StrExpr`, returns that string value; otherwise `None`.
+#[pyfunction]
+pub(crate) fn rust_get_deprecated(py: Python<'_>, expression: &PyAny) -> PyResult<Option<String>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    let str_expr_cls: &PyType = nodes_mod.getattr("StrExpr")?.downcast()?;
+
+    if !expression.is_instance(call_expr_cls)? {
+        return Ok(None);
+    }
+
+    let callee = expression.getattr("callee")?;
+    let args = expression.getattr("args")?;
+    let args_list = args.downcast::<PyList>()?;
+    if args_list.is_empty() {
+        return Ok(None);
+    }
+
+    // Check callee refers to DEPRECATED_TYPE_NAMES
+    let deprecated_names: Vec<&str> = vec!["warnings.deprecated", "typing_extensions.deprecated"];
+
+    // callee could be a NameExpr or MemberExpr; try to get fullname
+    let callee_fullname: Option<String> =
+        if callee.is_instance(nodes_mod.getattr("NameExpr")?.downcast()?)? {
+            let fn_val = callee.getattr("fullname")?;
+            fn_val.downcast::<PyString>()?.extract().ok()
+        } else if callee.is_instance(nodes_mod.getattr("MemberExpr")?.downcast()?)? {
+            // MemberExpr: build fullname from expr.name parts
+            let name = callee.getattr("name")?;
+            let name_str: &str = name.downcast::<PyString>()?.to_str()?;
+            let expr = callee.getattr("expr")?;
+            if expr.is_instance(nodes_mod.getattr("NameExpr")?.downcast()?)? {
+                let base = expr.getattr("name")?;
+                let base_str: &str = base.downcast::<PyString>()?.to_str()?;
+                Some(format!("{}.{}", base_str, name_str))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    if !deprecated_names.contains(&callee_fullname.as_deref().unwrap_or("")) {
+        return Ok(None);
+    }
+
+    // First arg must be a StrExpr
+    let first_arg = args_list.get_item(0)?;
+    if !first_arg.is_instance(str_expr_cls)? {
+        return Ok(None);
+    }
+
+    let value = first_arg.getattr("value")?;
+    let value_str: &str = value.downcast::<PyString>()?.to_str()?;
+    Ok(Some(value_str.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// get_name_repr_of_expr (Issue #391)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.get_name_repr_of_expr` — simplified textual representation
+/// of a base class expression.
+///
+/// Mirrors semanal.py:2677-2687. Pure helper: recurses through
+/// `IndexExpr`/`CallExpr` wrapping to reach a `NameExpr` or `MemberExpr`,
+/// building a dotted name like `module.Class`.
+#[pyfunction]
+pub(crate) fn rust_get_name_repr_of_expr(py: Python<'_>, expr: &PyAny) -> PyResult<Option<String>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    let member_expr_cls: &PyType = nodes_mod.getattr("MemberExpr")?.downcast()?;
+    let index_expr_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+
+    // Get the innermost base expression by peeling IndexExpr/CallExpr
+    let mut current: &PyAny = expr;
+    loop {
+        if current.is_instance(index_expr_cls)? {
+            current = current.getattr("base")?;
+        } else if current.is_instance(call_expr_cls)? {
+            current = current.getattr("callee")?;
+        } else {
+            break;
+        }
+    }
+
+    if current.is_instance(name_expr_cls)? {
+        let name = current.getattr("name")?;
+        let name_str: &str = name.downcast::<PyString>()?.to_str()?;
+        return Ok(Some(name_str.to_string()));
+    }
+
+    if current.is_instance(member_expr_cls)? {
+        // Build fullname from MemberExpr
+        let member_name = current.getattr("name")?;
+        let member_name_str: &str = member_name.downcast::<PyString>()?.to_str()?;
+        let inner = current.getattr("expr")?;
+        let prefix = get_member_expr_prefix(inner, name_expr_cls, member_expr_cls)?;
+        return match prefix {
+            Some(p) => Ok(Some(format!("{}.{}", p, member_name_str))),
+            None => Ok(None),
+        };
+    }
+
+    Ok(None)
+}
+
+/// Recursively build the prefix for a MemberExpr.
+fn get_member_expr_prefix(
+    inner: &PyAny,
+    name_expr_cls: &PyType,
+    member_expr_cls: &PyType,
+) -> PyResult<Option<String>> {
+    if inner.is_instance(name_expr_cls)? {
+        let name = inner.getattr("name")?;
+        let name_str: &str = name.downcast::<PyString>()?.to_str()?;
+        return Ok(Some(name_str.to_string()));
+    }
+    if inner.is_instance(member_expr_cls)? {
+        let member_name = inner.getattr("name")?;
+        let member_name_str: &str = member_name.downcast::<PyString>()?.to_str()?;
+        let prefix =
+            get_member_expr_prefix(inner.getattr("expr")?, name_expr_cls, member_expr_cls)?;
+        return match prefix {
+            Some(p) => Ok(Some(format!("{}.{}", p, member_name_str))),
+            None => Ok(None),
+        };
+    }
+    Ok(None)
 }

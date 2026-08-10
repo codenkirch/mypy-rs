@@ -419,6 +419,10 @@ try:
         rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
+        rust_is_init_only as _rust_is_init_only,
+        rust_erase_func_annotations as _rust_erase_func_annotations,
+        rust_get_deprecated as _rust_get_deprecated,
+        rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -433,6 +437,10 @@ except ImportError:
     _rust_names_modified_by_assignment = None  # type: ignore[assignment]
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
+    _rust_is_init_only = None  # type: ignore[assignment]
+    _rust_erase_func_annotations = None  # type: ignore[assignment]
+    _rust_get_deprecated = None  # type: ignore[assignment]
+    _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -8391,6 +8399,75 @@ def find_duplicate(list: list[T]) -> T | None:
     for i in range(1, len(list)):
         if list[i] in list[:i]:
             return list[i]
+    return None
+
+
+def is_init_only(node: Var) -> bool:
+    """Return True if node is a dataclasses.InitVar."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            if _rust_is_init_only(node):
+                return True
+        except (AssertionError, NotImplementedError):
+            pass
+    return (
+        isinstance(type := get_proper_type(node.type), Instance)
+        and type.type.fullname == "dataclasses.InitVar"
+    )
+
+
+def erase_func_annotations(func: FuncDef) -> None:
+    """Erase type annotations from a FuncDef."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            _rust_erase_func_annotations(func)
+            return
+        except (AssertionError, NotImplementedError):
+            pass
+    func.type_args = None
+    for arg in func.arguments:
+        arg.type_annotation = None
+        arg.variable.type = None
+    func.type = None
+    func.unanalyzed_type = None
+
+
+def get_deprecated(expression: Expression) -> str | None:
+    """Extract deprecation message from a CallExpr (e.g. @deprecated("msg"))."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            result = _rust_get_deprecated(expression)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
+    if (
+        isinstance(expression, CallExpr)
+        and refers_to_fullname(expression.callee, DEPRECATED_TYPE_NAMES)
+        and (len(args := expression.args) >= 1)
+        and isinstance(deprecated := args[0], StrExpr)
+    ):
+        return deprecated.value
+    return None
+
+
+def get_name_repr_of_expr(expr: Expression) -> str | None:
+    """Try finding a short simplified textual representation of an expression."""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            result = _rust_get_name_repr_of_expr(expr)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
+    if isinstance(expr, NameExpr):
+        return expr.name
+    if isinstance(expr, MemberExpr):
+        return get_member_expr_fullname(expr)
+    if isinstance(expr, IndexExpr):
+        return get_name_repr_of_expr(expr.base)
+    if isinstance(expr, CallExpr):
+        return get_name_repr_of_expr(expr.callee)
     return None
 
 

@@ -550,12 +550,32 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_visitor::rust_refers_to_class_or_function,
         module
     )?)?;
+    // Issue #391: additional pure semanal helpers (is_init_only, erase_func_annotations,
+    // get_deprecated, get_name_repr_of_expr) are registered below alongside the
+    // already-existing is_trivial_body, find_duplicate, etc.
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_is_trivial_body,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_find_duplicate,
+        module
+    )?)?;
+    // Issue #391: additional pure semanal pure helpers.
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_init_only,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_erase_func_annotations,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_get_deprecated,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_get_name_repr_of_expr,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
