@@ -1285,3 +1285,122 @@ pub(crate) fn rust_lookup(
     // variable is always False here.
     Ok(Some(("not_found".to_string(), None)))
 }
+
+// ---------------------------------------------------------------------------
+// var_is_typing_special_form (Issue #444)
+// ---------------------------------------------------------------------------
+
+/// The set of fullnames that `var_is_typing_special_form` accepts.
+///
+/// Mirrors semanal.py:8449-8461. A `Var` whose `fullname` is in this set
+/// and starts with "typing" is a typing special form and can appear as the
+/// base of an `IndexExpr` type expression (e.g. `Callable[...]`,
+/// `Literal[...]`, `Annotated[...]`).
+const TYPING_SPECIAL_FORMS: &[&str] = &[
+    "typing.Annotated",
+    "typing_extensions.Annotated",
+    "typing.Callable",
+    "typing.Literal",
+    "typing_extensions.Literal",
+    "typing.Optional",
+    "typing.TypeGuard",
+    "typing_extensions.TypeGuard",
+    "typing.TypeIs",
+    "typing_extensions.TypeIs",
+    "typing.Union",
+];
+
+/// `mypy.semanal.var_is_typing_special_form` — pure staticmethod.
+///
+/// Mirrors semanal.py:8449-8461. Returns `True` when `var.fullname` starts
+/// with "typing" and is in the fixed set of typing special-form names.
+/// Used by `try_parse_as_type_expression` to decide whether the base of
+/// an `IndexExpr` is a valid type form. The function is a pure name-set
+/// check with no side effects, making it safe to port directly.
+///
+/// Returns `false` if the object is not a `Var` or if `fullname` is not
+/// a string, deferring to the pure-Python path (which would raise
+/// `AttributeError` on a non-Var, caught by the wrapper).
+#[pyfunction]
+pub(crate) fn rust_var_is_typing_special_form(py: Python<'_>, var: &PyAny) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let var_cls: &PyType = nodes_mod.getattr("Var")?.downcast()?;
+    if !var.is_instance(var_cls)? {
+        return Ok(false);
+    }
+    let fullname_obj = match var.getattr("fullname") {
+        Ok(f) => f,
+        Err(_) => return Ok(false),
+    };
+    let fullname: &str = match fullname_obj.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(false),
+    };
+    if !fullname.starts_with("typing") {
+        return Ok(false);
+    }
+    Ok(TYPING_SPECIAL_FORMS.contains(&fullname))
+}
+
+/// Inner pure-logic core of `rust_var_is_typing_special_form`, testable
+/// without a Python interpreter. Returns `true` when `fullname` starts
+/// with "typing" and is in the fixed special-form set.
+#[cfg(test)]
+fn var_is_typing_special_form_inner(fullname: &str) -> bool {
+    if !fullname.starts_with("typing") {
+        return false;
+    }
+    TYPING_SPECIAL_FORMS.contains(&fullname)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_typing_special_form_known_forms() {
+        assert!(var_is_typing_special_form_inner("typing.Annotated"));
+        assert!(var_is_typing_special_form_inner(
+            "typing_extensions.Annotated"
+        ));
+        assert!(var_is_typing_special_form_inner("typing.Callable"));
+        assert!(var_is_typing_special_form_inner("typing.Literal"));
+        assert!(var_is_typing_special_form_inner(
+            "typing_extensions.Literal"
+        ));
+        assert!(var_is_typing_special_form_inner("typing.Optional"));
+        assert!(var_is_typing_special_form_inner("typing.TypeGuard"));
+        assert!(var_is_typing_special_form_inner(
+            "typing_extensions.TypeGuard"
+        ));
+        assert!(var_is_typing_special_form_inner("typing.TypeIs"));
+        assert!(var_is_typing_special_form_inner("typing_extensions.TypeIs"));
+        assert!(var_is_typing_special_form_inner("typing.Union"));
+    }
+
+    #[test]
+    fn test_typing_special_form_rejects_non_typing_prefix() {
+        assert!(!var_is_typing_special_form_inner("builtins.int"));
+        assert!(!var_is_typing_special_form_inner(
+            "collections.abc.Callable"
+        ));
+        assert!(!var_is_typing_special_form_inner("os.path"));
+    }
+
+    #[test]
+    fn test_typing_special_form_rejects_unknown_typing_name() {
+        assert!(!var_is_typing_special_form_inner("typing.Dict"));
+        assert!(!var_is_typing_special_form_inner("typing.List"));
+        assert!(!var_is_typing_special_form_inner("typing.TypeVar"));
+        assert!(!var_is_typing_special_form_inner(
+            "typing_extensions.overload"
+        ));
+    }
+
+    #[test]
+    fn test_typing_special_form_rejects_empty_and_prefix_only() {
+        assert!(!var_is_typing_special_form_inner(""));
+        assert!(!var_is_typing_special_form_inner("typing"));
+        assert!(!var_is_typing_special_form_inner("typing."));
+    }
+}

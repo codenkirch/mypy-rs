@@ -709,6 +709,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_var_is_typing_special_form,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_has_explicit_any,
         module
     )?)?;
