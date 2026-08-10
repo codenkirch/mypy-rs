@@ -486,6 +486,175 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
     }
 }
 
+/// Whether a CallableType is a type object: fallback is `builtins.type`
+/// and the return type is not UninhabitedType. Mirrors
+/// `CallableType.is_type_obj()` (types.py:2343-2346) on the wire, whose
+/// Instance carries only `type_ref` — so a fallback with a different
+/// `type_ref` (custom metaclass, ABCMeta) cannot be proven to be a
+/// metaclass and is treated as not-a-type-object (deferral territory for
+/// callers that must match Python exactly).
+fn is_type_obj_callable(ret_type: &Type, from_concatenate: bool, fallback: &Type) -> bool {
+    if from_concatenate {
+        return false;
+    }
+    if !matches!(
+        fallback,
+        Type::Instance { type_ref, .. } if type_ref == "builtins.type"
+    ) {
+        return false;
+    }
+    !matches!(ret_type, Type::UninhabitedType { .. })
+}
+
+/// Port of the `check_callable_call` tail that runs after argument
+/// binding (checkexpr.py:2548-2627): type-object return calibration plus
+/// the plugin-hook presence probe. Returns the serialized final callee
+/// when the native path handles the whole tail, or `None` so the caller
+/// falls back to the full Python tail (strangler-fig per-call gate).
+///
+/// Native handles exactly the case where Python's calibration
+/// (`copy_modified(ret_type=TypeType.make_normalized(arg_types[0]))`)
+/// applies, and where no plugin call hook fires for `callable_name`. Any
+/// uncertainty — user plugins, a live hook, a TypeAliasType component the
+/// wire cannot resolve, or an `instance_type` whose force-fallback walk
+/// could reach `builtins.type` — defers the entire tail to Python.
+#[pyfunction]
+#[pyo3(signature = (
+    _resolver,
+    callee_bytes,
+    arg_types_bytes,
+    callable_name,
+    object_type_present,
+    registry,
+    has_user_plugins,
+    plugins,
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_check_callable_call(
+    _py: Python<'_>,
+    _resolver: &crate::typeinfo::NativeTypeResolver,
+    callee_bytes: &[u8],
+    arg_types_bytes: Vec<Vec<u8>>,
+    callable_name: Option<String>,
+    object_type_present: bool,
+    registry: &PyAny,
+    has_user_plugins: bool,
+    plugins: &PyAny,
+) -> Option<Vec<u8>> {
+    if has_user_plugins {
+        // User-plugin hooks are not enumerable; defer the whole tail.
+        return None;
+    }
+    if let Some(name) = callable_name.as_deref() {
+        let hook_method = if object_type_present {
+            "get_method_hook"
+        } else {
+            "get_function_hook"
+        };
+        match crate::plugin_hooks::rust_resolve_plugin_hook(
+            _py,
+            registry,
+            name,
+            plugins,
+            hook_method,
+        ) {
+            // A hook exists (or the FFI probe failed): Python must run the
+            // full hook chain plus calibration.
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
+    }
+    let mut buf = ReadBuffer::new(callee_bytes);
+    let callee = read_type(&mut buf, None).ok()?;
+    let mut arg_types = Vec::with_capacity(arg_types_bytes.len());
+    for bytes in &arg_types_bytes {
+        let mut abuf = ReadBuffer::new(bytes);
+        arg_types.push(read_type(&mut abuf, None).ok()?);
+    }
+    let out = check_callable_call_tail(&callee, &arg_types)?;
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &out).ok()?;
+    Some(wbuf.into_bytes())
+}
+
+/// Pure calibration/assemble decision shared by `rust_check_callable_call`
+/// (hook probing happens in the pyfunction). Returns the final callee, or
+/// `None` to defer the whole tail to Python.
+fn check_callable_call_tail(callee: &Type, arg_types: &[Type]) -> Option<Type> {
+    let Type::CallableType {
+        ret_type,
+        instance_type,
+        from_concatenate,
+        fallback,
+        ..
+    } = callee
+    else {
+        return None; // not a CallableType; Python normalizes first
+    };
+    if !is_type_obj_callable(ret_type, *from_concatenate, fallback) {
+        // Python's calibration condition is False here (is_type_obj False),
+        // so defer: the pure tail also runs store_type, the plugin hook
+        // section, and returns the original callee (definition intact).
+        return None;
+    }
+    if arg_types.len() != 1 {
+        // Same defer reason: the single-argument calibration cannot fire.
+        return None;
+    }
+    // A TypeAliasType return could resolve to UninhabitedType (making
+    // is_type_obj False) or to a force-fallback source; the wire has no
+    // alias target, so defer.
+    if matches!(**ret_type, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    // get_instance_type(force_fallback=True): prefer instance_type, else
+    // walk ret_type; only Instance builtins.type triggers calibration.
+    let target_is_type = match instance_type {
+        Some(inst) => {
+            matches!(&**inst, Type::Instance { type_ref, .. } if type_ref == "builtins.type")
+        }
+        None => matches!(
+            &**ret_type,
+            Type::Instance { type_ref, .. } if type_ref == "builtins.type"
+        ),
+    };
+    if !target_is_type {
+        // An Instance with another type_ref, or a TypeVar/Tuple/TypedDict/
+        // Literal whose force-fallback walk could reach builtins.type —
+        // the wire cannot verify, so defer rather than risk a mismatch
+        // with Python's calibrated ret_type.
+        let walkable = |t: &Type| {
+            matches!(
+                t,
+                Type::TypeVarType { .. }
+                    | Type::TupleType { .. }
+                    | Type::TypedDictType { .. }
+                    | Type::LiteralType { .. }
+            )
+        };
+        let uncertain = match instance_type {
+            Some(inst) => walkable(inst),
+            None => walkable(ret_type),
+        };
+        if uncertain {
+            return None;
+        }
+        // A non-type-object target whose force-fallback walk cannot reach
+        // builtins.type means calibration would not fire; defer so the pure
+        // tail keeps definition/plugin-hook behavior intact.
+        return None;
+    }
+    // Python resolves TypeAliasType args before make_normalized; the wire
+    // cannot, so defer.
+    if matches!(arg_types[0], Type::TypeAliasType { .. }) {
+        return None;
+    }
+    let new_ret = crate::expandtype::make_type_normalized(arg_types[0].clone(), false);
+    let mut base = callable_base(callee).ok()?;
+    base.ret_type = Box::new(new_ret);
+    Some(base.into_type())
+}
+
 /// `rust_solve_generic_call`: normalize + map + infer + solve + apply.
 ///
 /// Takes a generic callable (serialized), actual arg types (serialized),
@@ -1401,5 +1570,148 @@ mod tests {
     fn calibrate_type_obj_defers_non_callable() {
         // Only CallableType callees are calibrated; anything else defers.
         assert_eq!(calibrate_bytes(&instance(), &str_instance()), None);
+    }
+
+    fn type_obj_callable(instance_type: bool, ret: Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.type".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: if instance_type {
+                Some(Box::new(Type::Instance {
+                    type_ref: "builtins.type".to_string(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                }))
+            } else {
+                None
+            },
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![str_instance()],
+            arg_kinds: vec![ARG_POS],
+            arg_names: vec![None],
+            ret_type: Box::new(ret),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn checkcall_tail_type_obj_calibrates() {
+        // Type[type] call with one str arg: ret becomes Type[str].
+        let callee = type_obj_callable(true, any_type());
+        let arg = str_instance();
+        let base = check_callable_call_tail(&callee, &[arg]).unwrap();
+        match base {
+            Type::CallableType { ret_type, .. } => {
+                assert_eq!(
+                    *ret_type,
+                    Type::TypeType {
+                        item: Box::new(str_instance()),
+                        is_type_form: false,
+                    }
+                );
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn checkcall_tail_ret_fallback_calibrates() {
+        // instance_type None but ret_type is Instance builtins.type;
+        // get_instance_type(force_fallback=True) walks to builtins.type.
+        let callee = type_obj_callable(false, instance_type());
+        let out = check_callable_call_tail(&callee, &[str_instance()]).unwrap();
+        let Type::CallableType { ret_type, .. } = out else {
+            panic!("expected CallableType");
+        };
+        assert_eq!(
+            *ret_type,
+            Type::TypeType {
+                item: Box::new(str_instance()),
+                is_type_form: false,
+            }
+        );
+    }
+
+    fn instance_type() -> Type {
+        Type::Instance {
+            type_ref: "builtins.type".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn checkcall_tail_non_type_obj_defers() {
+        // Fallback is not builtins.type -> is_type_obj False, Python must
+        // keep definition/plugin-hook behavior, so the tail defers.
+        let callee = callable_with_args(vec![str_instance()]);
+        assert_eq!(check_callable_call_tail(&callee, &[str_instance()]), None);
+    }
+
+    #[test]
+    fn checkcall_tail_uninhabited_not_type_obj() {
+        // UninhabitedType ret -> is_type_obj False, defer to Python.
+        let callee = type_obj_callable(true, Type::UninhabitedType { ambiguous: true });
+        assert_eq!(check_callable_call_tail(&callee, &[str_instance()]), None);
+    }
+
+    #[test]
+    fn checkcall_tail_two_args_defers() {
+        // arg_types.len() != 1 -> calibration cannot fire, defer.
+        let mut callee = type_obj_callable(true, any_type());
+        if let Type::CallableType { arg_types, .. } = &mut callee {
+            arg_types.push(int_instance());
+        }
+        assert_eq!(
+            check_callable_call_tail(&callee, &[str_instance(), int_instance()]),
+            None
+        );
+    }
+
+    #[test]
+    fn checkcall_tail_type_alias_arg_defers() {
+        // TypeAliasType arg cannot be resolved on the wire -> defer.
+        let callee = type_obj_callable(true, any_type());
+        let alias = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.Alias".to_string(),
+        };
+        assert_eq!(check_callable_call_tail(&callee, &[alias]), None);
+    }
+
+    #[test]
+    fn checkcall_tail_walkable_instance_type_defers() {
+        // instance_type Some(TypeVar) could force-fallback to builtins.type
+        // in Python; wire cannot resolve -> defer.
+        let mut callee = type_obj_callable(true, any_type());
+        if let Type::CallableType { instance_type, .. } = &mut callee {
+            *instance_type = Some(Box::new(type_var()));
+        }
+        assert_eq!(check_callable_call_tail(&callee, &[str_instance()]), None);
+    }
+
+    #[test]
+    fn checkcall_tail_non_walkable_instance_defers() {
+        // instance_type Some(Instance mod.C) is not walkable to builtins.type
+        // and target_is_type False -> defer to Python.
+        let mut callee = type_obj_callable(true, any_type());
+        if let Type::CallableType { instance_type, .. } = &mut callee {
+            *instance_type = Some(Box::new(instance()));
+        }
+        assert_eq!(check_callable_call_tail(&callee, &[str_instance()]), None);
     }
 }

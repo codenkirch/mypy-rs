@@ -230,6 +230,7 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_arguments as _rust_check_arguments,
+        rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
@@ -289,6 +290,7 @@ except ImportError:
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_check_arguments = None  # type: ignore[assignment]
+    _rust_check_callable_call = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -570,6 +572,67 @@ def _try_native_container_type(
             return None
         return _deserialize_type_from_checkexpr(rust_bytes)
     except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_check_callable_call(
+    callee: CallableType,
+    arg_types: list[Type],
+    callable_name: str | None,
+    object_type_present: bool,
+) -> CallableType | None:
+    """Port the check_callable_call arg-binding tail to Rust.
+
+    Mirrors `rust_check_callable_call` in crates/type_kernel: for a
+    type-object call with a single argument and no plugin call hook for
+    `callable_name`, the Rust side calibrates `ret_type` to
+    `TypeType.make_normalized(arg_types[0])` (the same shape as
+    `callee.copy_modified(ret_type=...)` in Python).  Returns the final
+    callee when Rust handled the whole tail, or None so the caller runs
+    the full pure-Python tail (strangler-fig per-call gate).
+
+    User plugins and the registry/plugin-list guards make every probe
+    conservative: identical to `_try_native_plugin_hook`, we defer to
+    Python whenever a user plugin is present or the builtin-hook snapshot
+    is unavailable, since plugins may match arbitrary fullnames.
+    """
+    if not (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkcall_active
+        and _native_checkexpr_resolver is not None
+    ):
+        return None
+    if _native_plugin_hook_has_user_plugins or _native_plugin_hook_registry is None:
+        return None
+    plugins = _native_plugin_hook_plugins
+    if plugins is None or len(plugins) == 0:
+        return None
+    try:
+        arg_types_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
+        raw = _rust_check_callable_call(
+            _native_checkexpr_resolver,
+            _serialize_type_for_checkexpr(callee),
+            arg_types_bytes,
+            callable_name,
+            object_type_present,
+            _native_plugin_hook_registry,
+            False,  # user plugins guarded out above; see has_user_plugins arg
+            plugins,
+        )
+        if raw is None:
+            return None
+        resolved = _deserialize_type_from_checkexpr(bytes(raw))
+        if not isinstance(resolved, CallableType):
+            return None
+        # The wire format has no line/column/special_sig/from_type_type;
+        # restore from the pre-edit callee exactly like the calibration path.
+        resolved.line = callee.line
+        resolved.column = callee.column
+        resolved.fallback.line = resolved.line
+        resolved.special_sig = callee.special_sig
+        resolved.from_type_type = callee.from_type_type
+        return resolved
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
         return None
 
 
@@ -2546,6 +2609,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 object_type=object_type,
             )
 
+        native_tail = _try_native_check_callable_call(
+            callee, arg_types, callable_name, object_type is not None
+        )
+        if native_tail is not None:
+            callee = native_tail
+            if callable_node:
+                self.chk.store_type(callable_node, callee)
+            return callee.ret_type, callee
         native_calibrated = False
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL

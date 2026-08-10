@@ -372,6 +372,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkcall::rust_check_callable_call,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         overload::rust_check_overload_call,
         module
     )?)?;
