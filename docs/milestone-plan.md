@@ -1,12 +1,13 @@
-# Remaining Milestones → Final Two Ports
+# Rust Migration: Plan Ports Complete
 
 ## Current State (verified live, August 2026)
 
 ### GitHub Language Stats
-- Python: 5,993,751 bytes (75.83%)
-- Rust: 1,910,231 bytes (24.17%)
+- Python: 5,993,751 bytes (75.83%) *(last measured; local tree now ~6.6MB)*
+- Rust: 1,910,231 bytes (24.17%) *(last measured; local tree now ~2.07MB)*
 - Total: 7,903,982
-- **Target: 20%+ Rust: met and sustained; now 24.17%**
+- **Target: 20%+ Rust: met and sustained; 23.88% on the merged `main`
+  tree (bytes, ex-typeshed + `/test/`)**
 
 ### Native Gates Status
 
@@ -27,6 +28,8 @@
   suggestions, `callable_name`, PRs #324, #397)
 - `checkmember` (active + resolver: `bind_self_fast`, operator helpers,
   method fast path; PRs #325, #332)
+- `maptype` (active + resolver: `map_instance_to_supertype` hot-path shim,
+  PR #427 — the plan's final module port)
 - `checkpattern` (active + resolver; PRs #315, #323)
 - `checkstrformat` (active; PR #297)
 - `serverdeps`, `server` (get_type_triggers PR #318; fine-grained
@@ -39,13 +42,19 @@
 
 **Subtype active:** SHIPPED (resolver + active flag in production, M18).
 
-**Not ported (no Rust counterpart):**
-| Python Module | Lines | Role |
-|---------------|-------|------|
-| `infer.py` | 80 | Type inference for anonymous code |
-| `maptype.py` | 109 | Type mapping utilities |
+**Ports complete (no un-ported modules remain):**
+- `infer.py` — closed without a port (#426): `infer_type_arguments` is
+  2 lines of glue over the native `rust_infer_constraints_full` →
+  `rust_solve_constraints` path, both already active in production.
+- `maptype.py` — landed as the final module port (#425, PR #427) via the
+  strangler-fig seam: `rust_map_instance_to_supertype` +
+  `rust_class_derivation_paths` + `rust_map_instance_to_direct_supertypes`
+  reuse the `subtypes::map_instance_to_supertype` derivation primitive and
+  the shared wire codec; the `builtins.tuple` tuple_fallback edge defers
+  to Python.
 
-**Remaining work is tracked per-issue; see `next-big-leap-issues.md`.**
+**Remaining work is per-issue optimization within ported modules; see
+`next-big-leap-issues.md`.**
 
 ### Performance (M17 graduation, cold self-check)
 - `parse_time`: 4.997s (1.0% reduction from Python)

@@ -6,20 +6,25 @@
 |--------|-------|
 | Rust bytes (GitHub) | 1,910,231 |
 | Python bytes (GitHub) | 5,993,751 |
-| Rust % | 24.17% |
+| Rust % (GitHub) | 24.17% |
+| Rust % (local tree, ex-typeshed+/test/) | 23.88% |
 | Total bytes | 7,903,982 |
 
-The 20% target is met and sustained. The next leap targets **~30% Rust**
-by completing the remaining hot-path ports in `mypy/checkexpr.py` plus
-the open parallel tracks.
+The 20% target is met and sustained. **The migration plan's module port
+list is exhausted**: `maptype.py` landed as the final port (PR #427) and
+`infer.py` closed without a port (#426, its wrapper is glue over the
+already-native constraints + solve path). Remaining work targets deeper
+coverage inside ported modules (checkexpr family, semanal scope handling) — the
+next leap is **~26-27% then 30%** via those.
 
 ## Roadmap summary (from the 11-milestone plan)
 
-The M18-M28 plan is essentially complete. Most M-issues shipped as
-self-contained helper subsets behind gates (strangler-fig, Python stays
-as fallback). The two original "final ports" #341 (check_callable_call)
-and #342 (analyze_member_access general) were re-scoped into the
-issue-per-port family (#380-#387) tracked below.
+The M18-M28 plan is complete. Most M-issues shipped as self-contained
+helper subsets behind gates (strangler-fig, Python stays as fallback).
+The two original "final ports" #341 (check_callable_call) and #342
+(analyze_member_access general) were re-scoped into the issue-per-port
+family (#380-#387) and all landed; the module-level "final two"
+(`infer.py`, `maptype.py`) are resolved as described above.
 
 ## The active ports
 
