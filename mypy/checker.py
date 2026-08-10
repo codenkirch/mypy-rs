@@ -65,6 +65,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
 from contextlib import ExitStack, contextmanager
 from typing import (
+    Any,
     Final,
     Generic,
     Literal,
@@ -97,7 +98,6 @@ from mypy.erasetype import (
     shallow_erase_type_for_equality,
 )
 from mypy.errorcodes import TYPE_VAR, UNUSED_AWAITABLE, UNUSED_COROUTINE, ErrorCode
-from mypy.fixup import TypeFixer
 from mypy.errors import (
     ErrorInfo,
     Errors,
@@ -107,6 +107,7 @@ from mypy.errors import (
     report_internal_error,
 )
 from mypy.expandtype import expand_type
+from mypy.fixup import TypeFixer
 from mypy.literals import Key, extract_var_from_literal_hash, literal, literal_hash
 from mypy.maptype import map_instance_to_supertype
 from mypy.meet import is_overlapping_types, meet_types
@@ -315,24 +316,25 @@ try:
     from type_kernel import (
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_has_bool_item as _rust_has_bool_item,
-        rust_is_private as _rust_is_private,
-        rust_is_string_literal as _rust_is_string_literal,
-        rust_is_typed_callable as _rust_is_typed_callable,
-        rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
-        rust_is_untyped_decorator as _rust_is_untyped_decorator,
-        rust_type_requires_usage as _rust_type_requires_usage,
-        rust_is_unreachable_map as _rust_is_unreachable_map,
-        rust_stmt_outcome as _rust_stmt_outcome,
-        rust_with_exit_suppresses as _rust_with_exit_suppresses,
-        rust_try_handler_union as _rust_try_handler_union,
-        rust_is_true_literal as _rust_is_true_literal,
+        rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_false_literal as _rust_is_false_literal,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
-        rust_is_static as _rust_is_static,
+        rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
         rust_is_settable_property as _rust_is_settable_property,
-        rust_is_custom_settable_property as _rust_is_custom_settable_property,
+        rust_is_static as _rust_is_static,
+        rust_is_string_literal as _rust_is_string_literal,
+        rust_is_true_literal as _rust_is_true_literal,
+        rust_is_typed_callable as _rust_is_typed_callable,
+        rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
+        rust_is_unreachable_map as _rust_is_unreachable_map,
+        rust_is_untyped_decorator as _rust_is_untyped_decorator,
+        rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
+        rust_stmt_outcome as _rust_stmt_outcome,
+        rust_try_handler_union as _rust_try_handler_union,
+        rust_type_requires_usage as _rust_type_requires_usage,
+        rust_with_exit_suppresses as _rust_with_exit_suppresses,
     )
 
     from mypy.astwire import serialize_node as _checker_serialize_node
@@ -342,6 +344,7 @@ try:
     _CHECKER_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_bool_item = None  # type: ignore[assignment]
+    _rust_narrow_type_by_identity_equality = None  # type: ignore[assignment]
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
@@ -389,6 +392,63 @@ def _set_native_checker_stmts_active(active: bool) -> None:
     """Enable statement-helper checker functions (M17, parity-only)."""
     global _native_checker_stmts_active
     _native_checker_stmts_active = active
+
+
+# #387: NativeTypeResolver shared with the checker narrowing kernel.
+# Installed/cleared per build by BuildManager.
+_native_checker_resolver: Any = None
+
+
+def _set_native_checker_resolver(resolver: Any) -> None:
+    """Install/clear the NativeTypeResolver shared with the checker kernel."""
+    global _native_checker_resolver
+    _native_checker_resolver = resolver
+
+
+def _try_native_narrow_type_by_identity_equality(
+    a: Type, b: Type, operator: str
+) -> tuple[Type | None, Type | None] | None:
+    """Native fast path for identity equality narrowing (#387, parity-only).
+
+    Ports the identity (`is` / `is not`) branch of
+    narrow_type_by_identity_equality. `b` is assumed already coerced by the
+    caller (identity sets should_coerce_literals=True). Returns
+    (if_type, else_type) with None meaning "no new information", or None to
+    defer to the pure-Python path.
+    """
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_stmts_active
+        and _native_checker_resolver is not None
+    ):
+        return None
+    try:
+        pair = _rust_narrow_type_by_identity_equality(
+            _serialize_type_for_checker(a),
+            _serialize_type_for_checker(b),
+            operator,
+            state.strict_optional,
+            _native_checker_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+    if pair is None:
+        return None
+    if_type, else_type = pair
+    if_type_dec = (
+        _deserialize_type_from_checker(bytes(if_type)) if if_type is not None else None
+    )
+    else_type_dec = (
+        _deserialize_type_from_checker(bytes(else_type)) if else_type is not None else None
+    )
+    # fixup_wire_type returns None when a type_ref cannot resolve to a live
+    # TypeInfo. An unresolvable branch must not surface as "no new info";
+    # defer the whole call to the pure-Python path instead.
+    if (if_type is not None and if_type_dec is None) or (
+        else_type is not None and else_type_dec is None
+    ):
+        return None
+    return (if_type_dec, else_type_dec)
 
 
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
@@ -476,8 +536,12 @@ def _serialize_type_for_checker(t: Type) -> bytes:
 
 
 def _deserialize_type_from_checker(b: bytes) -> Type:
-    buf = _CheckerReadBuffer(b)
-    return _checker_read_type(buf)
+    """Decode wire bytes from the checker kernel, resolving type_ref to live
+    TypeInfo via wirefixup. Mirrors erasetype._deserialize_type.
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    return fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
 
 
 T = TypeVar("T")
@@ -7227,14 +7291,20 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if narrowable_expr_type is None:
                     if_type = else_type = ambiguous_expr_type
                 else:
-                    narrowable_expr_type = try_expanding_sum_type_to_union(
-                        coerce_to_literal(narrowable_expr_type), None
+                    native_pair = _try_native_narrow_type_by_identity_equality(
+                        narrowable_expr_type, target_type, operator
                     )
-                    if_type, else_type = conditional_types(
-                        narrowable_expr_type,
-                        [TypeRange(target_type, is_upper_bound=False)],
-                        from_equality=True,
-                    )
+                    if native_pair is not None:
+                        if_type, else_type = native_pair
+                    else:
+                        narrowable_expr_type = try_expanding_sum_type_to_union(
+                            coerce_to_literal(narrowable_expr_type), None
+                        )
+                        if_type, else_type = conditional_types(
+                            narrowable_expr_type,
+                            [TypeRange(target_type, is_upper_bound=False)],
+                            from_equality=True,
+                        )
                     if ambiguous_expr_type is not None:
                         if_type = make_simplified_union(
                             [if_type or narrowable_expr_type, ambiguous_expr_type]

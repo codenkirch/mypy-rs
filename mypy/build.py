@@ -1014,6 +1014,7 @@ class BuildManager:
         # type-returning gate on since the truthiness wire fix (#201).
         from mypy.checker import (
             _set_native_checker_active,
+            _set_native_checker_resolver,
             _set_native_checker_types_active,
         )
         from mypy.checkexpr import (
@@ -1027,6 +1028,7 @@ class BuildManager:
         _set_native_checkcall_active(self.options.native_type_kernel)
         _set_native_checker_active(self.options.native_type_kernel)
         _set_native_checker_types_active(self.options.native_type_kernel)
+        _set_native_checker_resolver(None)
         # M20: gate checkmember bind_self_fast (trivial-self binding),
         # instance_fallback, and the resolver-snapshot operator helpers.
         # Rust strips the first arg; *args/**kwargs and non-callable defer.
@@ -1346,6 +1348,10 @@ class BuildManager:
 
         _set_native_checkexpr_resolver(resolver)
         _set_native_checkmember_resolver(resolver)
+        # #387: the checker narrowing kernel shares the same snapshot.
+        from mypy.checker import _set_native_checker_resolver
+
+        _set_native_checker_resolver(resolver)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.
@@ -1376,6 +1382,9 @@ class BuildManager:
         from mypy.checkmember import _set_native_checkmember_resolver
 
         _set_native_checkmember_resolver(None)
+        from mypy.checker import _set_native_checker_resolver
+
+        _set_native_checker_resolver(None)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
@@ -5261,6 +5270,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.checkmember import _set_native_checkmember_resolver
 
         _set_native_checkmember_resolver(None)
+        from mypy.checker import _set_native_checker_resolver
+
+        _set_native_checker_resolver(None)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
