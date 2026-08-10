@@ -39,6 +39,7 @@ from mypy.types import ProperType, Type
 T = TypeVar("T")
 
 __all__ = [
+    "rust_find_shallow_matching_overload_item",
     "NativeTypeResolver",
     "PluginHookRegistry",
     "erase_type",
@@ -706,3 +707,7 @@ def rust_dataclass_post_init_transform(
     fields_bytes: bytes,
     class_fullname: str,
 ) -> bytes | None: ...
+def rust_find_shallow_matching_overload_item(
+    overload: Any,
+    call: Any,
+) -> int | None: ...
