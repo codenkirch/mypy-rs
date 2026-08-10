@@ -486,6 +486,13 @@ def solve_iteratively(
 
 
 def _join_sorted_key(t: Type) -> int:
+    if _HAS_TYPE_KERNEL and _native_solve_active:
+        try:
+            result = _type_kernel.rust_join_sorted_key(_serialize_type_payload(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     t = get_proper_type(t)
     if isinstance(t, UnionType):
         return -2
@@ -879,6 +886,16 @@ def skip_reverse_union_constraints(cs: list[Constraint]) -> list[Constraint]:
 
 def get_vars(target: Type, vars: list[TypeVarId]) -> set[TypeVarId]:
     """Find type variables for which we are solving in a target type."""
+    if _HAS_TYPE_KERNEL and _native_solve_active and _bounds_wire_safe([target]):
+        try:
+            result = _type_kernel.rust_get_vars(
+                _serialize_type_payload(target),
+                [(v.raw_id, v.meta_level, v.namespace) for v in vars],
+            )
+            if result is not None:
+                return {TypeVarId(r, m, namespace=n) for r, m, n in result}
+        except (AssertionError, NotImplementedError):
+            pass
     return {tv.id for tv in get_all_type_vars(target)} & set(vars)
 
 
@@ -916,6 +933,20 @@ def pre_validate_solutions(
 
 
 def is_callable_protocol(t: Type) -> bool:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_solve_active
+        and _native_solve_resolver is not None
+        and _bounds_wire_safe([t])
+    ):
+        try:
+            result = _type_kernel.rust_is_callable_protocol(
+                _native_solve_resolver, _serialize_type_payload(t)
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     proper_t = get_proper_type(t)
     if isinstance(proper_t, Instance) and proper_t.type.is_protocol:
         return "__call__" in proper_t.type.protocol_members

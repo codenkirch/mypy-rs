@@ -559,6 +559,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_is_trivial_bound, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_find_linear, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_join_sorted_key, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_get_vars, module)?)?;
+    module.add_function(wrap_pyfunction!(solve::rust_is_callable_protocol, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_dependent, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_constraints, module)?)?;
     module.add_function(wrap_pyfunction!(
