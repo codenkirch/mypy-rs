@@ -417,13 +417,19 @@ try:
         rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
+        rust_get_typevarlike_declaration as _rust_get_typevarlike_declaration,
         rust_is_init_only as _rust_is_init_only,
+        rust_is_initial_mangled_global as _rust_is_initial_mangled_global,
+        rust_is_mangled_global as _rust_is_mangled_global,
+        rust_is_final_redefinition as _rust_is_final_redefinition,
         rust_is_same_symbol as _rust_is_same_symbol,
+        rust_is_same_var_from_getattr as _rust_is_same_var_from_getattr,
         rust_is_trivial_body as _rust_is_trivial_body,
         rust_is_valid_replacement as _rust_is_valid_replacement,
         rust_lookup as _rust_lookup,
         rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
         rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
+        rust_parse_bool as _rust_parse_bool,
         rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
@@ -451,6 +457,12 @@ except ImportError:
     _rust_get_deprecated = None  # type: ignore[assignment]
     _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
     _rust_var_is_typing_special_form = None  # type: ignore[assignment]
+    _rust_get_typevarlike_declaration = None  # type: ignore[assignment]
+    _rust_parse_bool = None  # type: ignore[assignment]
+    _rust_is_mangled_global = None  # type: ignore[assignment]
+    _rust_is_initial_mangled_global = None  # type: ignore[assignment]
+    _rust_is_final_redefinition = None  # type: ignore[assignment]
+    _rust_is_same_var_from_getattr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -4758,6 +4770,12 @@ class SemanticAnalyzer(
             self.make_name_lvalue_point_to_existing_def(lvalue, explicit_type, is_final)
 
     def is_final_redefinition(self, kind: int, name: str) -> bool:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                type_names = self.type.names if self.type is not None else None
+                return _rust_is_final_redefinition(kind, name, self.globals, type_names)
+            except (AssertionError, NotImplementedError):
+                pass
         if kind == GDEF:
             return self.is_mangled_global(name) and not self.is_initial_mangled_global(name)
         elif kind == MDEF and self.type:
@@ -5145,6 +5163,13 @@ class SemanticAnalyzer(
         """Returns the call expression if `s` is a declaration of `typevarlike_type`
         (TypeVar or ParamSpec), or None otherwise.
         """
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_get_typevarlike_declaration(s, typevarlike_types)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if len(s.lvalues) != 1 or not isinstance(s.lvalues[0], NameExpr):
             return None
         if not isinstance(s.rvalue, CallExpr):
@@ -8239,14 +8264,31 @@ class SemanticAnalyzer(
 
     def is_mangled_global(self, name: str) -> bool:
         # A global is mangled if there exists at least one renamed variant.
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                return _rust_is_mangled_global(name, self.globals)
+            except (AssertionError, NotImplementedError):
+                pass
         return unmangle(name) + "'" in self.globals
 
     def is_initial_mangled_global(self, name: str) -> bool:
         # If there are renamed definitions for a global, the first one has exactly one prime.
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                return _rust_is_initial_mangled_global(name)
+            except (AssertionError, NotImplementedError):
+                pass
         return name == unmangle(name) + "'"
 
     def parse_bool(self, expr: Expression) -> bool | None:
         # This wrapper is preserved for plugins.
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_parse_bool(expr)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         return parse_bool(expr)
 
     def parse_str_literal(self, expr: Expression) -> str | None:
@@ -8832,6 +8874,11 @@ def names_modified_in_lvalue(lvalue: Lvalue) -> list[NameExpr]:
 
 def is_same_var_from_getattr(n1: SymbolNode | None, n2: SymbolNode | None) -> bool:
     """Do n1 and n2 refer to the same Var derived from module-level __getattr__?"""
+    if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+        try:
+            return _rust_is_same_var_from_getattr(n1, n2)
+        except (AssertionError, NotImplementedError):
+            pass
     return (
         isinstance(n1, Var)
         and n1.from_module_getattr
