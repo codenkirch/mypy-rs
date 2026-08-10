@@ -433,6 +433,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(solve::rust_find_linear, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_dependent, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_constraints, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        solve::rust_infer_function_type_arguments,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_format_key_list, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_quote_type_string, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_capitalize, module)?)?;

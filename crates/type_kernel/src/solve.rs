@@ -1501,6 +1501,236 @@ pub(crate) fn rust_solve_constraints(
     Some((0, Some(out.0), Some(out.1)))
 }
 
+/// Stage 20 (#382): pass-1 generic-call type-argument inference.
+///
+/// Ports `infer_function_type_arguments` (infer.py:27-64) for the
+/// first pass: `infer_constraints_for_callable` (constraints.py:346-512,
+/// minus ParamSpec/TypeVarTuple/UnpackType branches) followed by
+/// non-polymorphic `solve_constraints`. Returns an optional-type list
+/// blob (`count` + per-var `0|1 + Type`) in `callee.variables` order,
+/// or `None` to defer the whole call to Python.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_infer_function_type_arguments(
+    _py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    callee_bytes: &[u8],
+    arg_types: Vec<Option<Vec<u8>>>,
+    arg_kinds: Vec<i64>,
+    formal_to_actual: Vec<Vec<i64>>,
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+) -> Option<Vec<u8>> {
+    let mut buf = ReadBuffer::new(callee_bytes);
+    let callee = wire::read_type(&mut buf, None).ok()?;
+    let Type::CallableType {
+        arg_types: formal_types,
+        arg_kinds: formal_kinds,
+        arg_names: formal_names,
+        variables,
+        ..
+    } = &callee
+    else {
+        return None;
+    };
+    // ParamSpec/TypeVarTuple variables use the deferred constraint paths
+    // (constraints.py:475-494, filter_imprecise_kinds): defer.
+    if variables.iter().any(|v| {
+        matches!(
+            v,
+            Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. }
+        )
+    }) {
+        return None;
+    }
+    // UnpackType formals use the star-unpack branch (constraints.py:388-438): defer.
+    if formal_types
+        .iter()
+        .any(|t| matches!(t, Type::UnpackType { .. }))
+    {
+        return None;
+    }
+    let vars_types = variables.clone();
+    let mut arg_types_vec: Vec<Option<Type>> = Vec::with_capacity(arg_types.len());
+    for b in &arg_types {
+        match b {
+            None => arg_types_vec.push(None),
+            Some(b2) => {
+                let mut b3 = ReadBuffer::new(b2);
+                arg_types_vec.push(Some(wire::read_type(&mut b3, None).ok()?));
+            }
+        }
+    }
+    let mut tuple_index: i64 = 0;
+    let mut kwargs_used: Option<Vec<String>> = None;
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for (i, actuals) in formal_to_actual.iter().enumerate() {
+        let formal_type = formal_types.get(i)?;
+        let formal_kind = *formal_kinds.get(i)?;
+        let formal_name = formal_names.get(i).and_then(|o| o.as_deref());
+        for &ai in actuals {
+            let actual_arg = match arg_types_vec.get(ai as usize) {
+                Some(Some(t)) => t,
+                _ => continue, // None actual (deferred pass) or OOB.
+            };
+            let actual_kind = *arg_kinds.get(ai as usize)?;
+            let expanded = expand_actual_arg(
+                &mut tuple_index,
+                &mut kwargs_used,
+                actual_arg,
+                actual_kind,
+                formal_name,
+                formal_kind,
+            )?;
+            constraints.extend(crate::constraints::infer_constraints_full_inner(
+                formal_type,
+                &expanded,
+                crate::constraints::SUPERTYPE_OF,
+                resolver.resolver(),
+            )?);
+        }
+    }
+    if constraints.is_empty() {
+        return None;
+    }
+    let (sol_blob, _free_blob) = solve_constraints_native(
+        &vars_types,
+        &vars_types,
+        &constraints,
+        strict,
+        infer_unions,
+        strict_optional,
+        false,
+        resolver.resolver(),
+    )
+    .ok()?;
+    // Re-encode in `variables` order as an optional-type list. The Python
+    // shim decodes this with `read_int` + `read_type` (count per var).
+    let solutions = decode_solve_solutions_here(&sol_blob)?;
+    let tvids: Vec<TvId> = vars_types
+        .iter()
+        .map(|t| tv_id(t).ok_or(()))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let mut out = WriteBuffer::new();
+    wire::write_int(&mut out, tvids.len() as i64).ok()?;
+    for tv in &tvids {
+        match solutions.iter().find(|(k, _)| k == tv) {
+            Some((_, Some(t))) => {
+                out.push(1);
+                wire::write_type(&mut out, t).ok()?;
+            }
+            _ => out.push(0),
+        }
+    }
+    Some(out.into_bytes())
+}
+
+/// One arg-expansion pass of `ArgTypeExpander.expand_actual_type`
+/// (argmap.py:269-364), returning the expanded `Type` directly. Branches
+/// that need `is_subtype` (Iterable/Mapping unpacking, TypeVarTuple upper
+/// bounds) or arbitrary-key TypedDict popping return `None` so the whole
+/// call defers to Python.
+fn expand_actual_arg(
+    tuple_index: &mut i64,
+    kwargs_used: &mut Option<Vec<String>>,
+    actual: &Type,
+    actual_kind: i64,
+    formal_name: Option<&str>,
+    formal_kind: i64,
+) -> Option<Type> {
+    // `get_proper_type`: wire has no alias target, defer.
+    if matches!(
+        actual,
+        Type::TypeAliasType { .. } | Type::UnboundType { .. }
+    ) {
+        return None;
+    }
+    match actual_kind {
+        2 => match actual {
+            Type::TupleType { items, .. } => {
+                let len = items.len() as i64;
+                *tuple_index = if *tuple_index >= len {
+                    1
+                } else {
+                    *tuple_index + 1
+                };
+                let mut item = items.get((*tuple_index - 1) as usize)?.clone();
+                if let Type::UnpackType { typ: inner } = &item {
+                    let unpacked = match inner.as_ref() {
+                        Type::TypeVarTupleType { upper_bound, .. } => upper_bound.as_ref(),
+                        other => other,
+                    };
+                    let Type::Instance { type_ref, args, .. } = unpacked else {
+                        return None;
+                    };
+                    if type_ref != "builtins.tuple" {
+                        return None;
+                    }
+                    item = args.first()?.clone();
+                }
+                Some(item)
+            }
+            Type::ParamSpecType { .. } => Some(actual.clone()),
+            // Iterable unpacking / TypeVarTuple upper bound: defer.
+            Type::Instance { .. } | Type::TypeVarTupleType { .. } => None,
+            _ => Some(Type::AnyType {
+                type_of_any: 2, // TypeOfAny.from_error
+                source_any: None,
+                missing_import_name: None,
+            }),
+        },
+        4 => match actual {
+            Type::TypedDictType { items, .. } => {
+                if formal_kind == 4 {
+                    return None;
+                }
+                let chosen = formal_name?;
+                if !items.iter().any(|(k, _)| k == chosen) {
+                    return None;
+                }
+                let used = kwargs_used.get_or_insert_with(Vec::new);
+                if !used.iter().any(|k| k == chosen) {
+                    used.push(chosen.to_string());
+                }
+                Some(items.iter().find(|(k, _)| k == chosen)?.1.clone())
+            }
+            Type::ParamSpecType { .. } => Some(actual.clone()),
+            // Mapping unpacking: defer.
+            Type::Instance { .. } => None,
+            _ => Some(Type::AnyType {
+                type_of_any: 2,
+                source_any: None,
+                missing_import_name: None,
+            }),
+        },
+        // No translation for other kinds: 1:1 mapping.
+        _ => Some(actual.clone()),
+    }
+}
+
+/// `decode_solve_solutions` (checkcall.py:614) — local copy.
+#[allow(clippy::type_complexity)]
+fn decode_solve_solutions_here(blob: &[u8]) -> Option<Vec<((i64, i64, String), Option<Type>)>> {
+    let mut buf = ReadBuffer::new(blob);
+    let count = wire::read_int(&mut buf).ok()?;
+    let mut result = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let raw = wire::read_int(&mut buf).ok()?;
+        let meta = wire::read_int(&mut buf).ok()?;
+        let ns = wire::read_str(&mut buf).ok()?;
+        let has_sol = wire::read_int(&mut buf).ok()?;
+        let typ = if has_sol == 1 {
+            Some(wire::read_type(&mut buf, None).ok()?)
+        } else {
+            None
+        };
+        result.push(((raw, meta, ns), typ));
+    }
+    Some(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
