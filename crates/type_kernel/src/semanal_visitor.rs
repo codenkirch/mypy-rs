@@ -53,56 +53,12 @@ use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
 /// (conservative: Python would never raise here).
 #[pyfunction]
 pub(crate) fn rust_refers_to_fullname(
-    py: Python<'_>,
+    _py: Python<'_>,
     node: &PyAny,
     fullnames: &PyAny,
 ) -> PyResult<bool> {
-    let nodes_mod = py.import("mypy.nodes")?;
-    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
-
-    if !node.is_instance(ref_expr_cls)? {
-        return Ok(false);
-    }
-
     let fullname_set = normalize_fullnames(fullnames)?;
-
-    let node_fullname = node.getattr("fullname")?;
-    let node_fullname_str: &str = node_fullname.downcast::<PyString>()?.to_str()?;
-    if fullname_set.contains(node_fullname_str) {
-        return Ok(true);
-    }
-
-    // Check if node.node is a TypeAlias (and not python_3_12_type_alias).
-    let node_attr = node.getattr("node")?;
-    if node_attr.is_none() {
-        return Ok(false);
-    }
-
-    let type_alias_cls: &PyType = nodes_mod.getattr("TypeAlias")?.downcast()?;
-    if !node_attr.is_instance(type_alias_cls)? {
-        return Ok(false);
-    }
-
-    let python_3_12 = node_attr.getattr("python_3_12_type_alias")?;
-    if python_3_12.is_true()? {
-        return Ok(false);
-    }
-
-    // Recurse: is_named_instance(node.node.target, fullnames).
-    let target = node_attr.getattr("target")?;
-    let types_mod = py.import("mypy.types")?;
-    let get_proper_type = types_mod.getattr("get_proper_type")?;
-    let proper = get_proper_type.call1((target,))?;
-
-    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
-    if !proper.is_instance(instance_cls)? {
-        return Ok(false);
-    }
-
-    let typ = proper.getattr("type")?;
-    let typ_fullname = typ.getattr("fullname")?;
-    let typ_fullname_str: &str = typ_fullname.downcast::<PyString>()?.to_str()?;
-    Ok(fullname_set.contains(typ_fullname_str))
+    refers_to_fullname(node, &fullname_set)
 }
 
 /// Normalize the `fullnames` argument (str or tuple of str) into a HashSet.
@@ -648,6 +604,216 @@ pub(crate) fn rust_get_deprecated(py: Python<'_>, expression: &PyAny) -> PyResul
     let value = first_arg.getattr("value")?;
     let value_str: &str = value.downcast::<PyString>()?.to_str()?;
     Ok(Some(value_str.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// classify_decorators (Issue #348)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.visit_decorator` decorator classification
+/// loop (semanal.py:1830-1897).
+///
+/// Each decorator expression in the list is classified against the same
+/// name-matches that Python checks, in the same branch order. Rust returns a
+/// single classification tag per decorator and Python applies the side
+/// effects (AST mutation, error reporting, scope checks). This is the
+/// strangler-fig per-call gate: every decorator receives a tag (including
+/// `other`), and Python runs the matching side-effect branch from the tag.
+/// Returns `None` only when the whole list cannot be classified, in which
+/// case Python falls back to the pure loop unchanged.
+///
+/// Mirrors the dispatch in semanal.py:1831-1897:
+///   1. `abc.abstractmethod` -> "abstract"
+///   2. `asyncio.coroutines.coroutine` / `types.coroutine` -> "awaitable"
+///   3. `builtins.staticmethod` -> "static"
+///   4. `builtins.classmethod` -> "class"
+///   5. `typing.override` / `typing_extensions.override` -> "override"
+///   6. `builtins.property` / `abc.abstractproperty` /
+///      `functools.cached_property` / `enum.property` /
+///      `types.DynamicClassAttribute` -> "property", "abstract_property", or
+///      "cached_property" depending on which name matched
+///   7. `typing.no_type_check` -> "no_type_check"
+///   8. `typing.final` / `typing_extensions.final` -> "final"
+///   9. `typing.type_check_only` / `typing_extensions.type_check_only`
+///      -> "type_check_only"
+///  10. `CallExpr` with callee `typing.dataclass_transform` /
+///      `typing_extensions.dataclass_transform` -> "dataclass_transform"
+///  11. a deprecation `CallExpr` (`get_deprecated` non-None)
+///      -> "deprecated"
+///  12. anything else -> "other"
+///
+/// A name-match on a node whose `.node` is a `TypeAlias` resolves the alias
+/// target to a named `Instance` first (same as `refers_to_fullname`). The
+/// `fullnames` argument is a tuple of name sets passed in from Python, so the
+/// name constants stay in `mypy/types.py`.
+///
+/// Returns `None` when the decorator list is not a list (Python would never
+/// hit that) or when `name_sets` does not contain exactly 13 entries (a
+/// caller mismatch). In both cases Python falls back to the pure loop.
+#[pyfunction]
+#[pyo3(signature = (decorators, name_sets))]
+pub(crate) fn rust_classify_decorators(
+    py: Python<'_>,
+    decorators: &PyAny,
+    name_sets: &PyTuple,
+) -> PyResult<Option<Vec<String>>> {
+    let dec_list = match decorators.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+
+    // Each entry is a single name (str) or a tuple of names
+    // (tuple[str, ...]); index order mirrors the branch order below.
+    let mut fullname_sets: Vec<HashSet<String>> = Vec::with_capacity(name_sets.len());
+    for item in name_sets.iter() {
+        fullname_sets.push(normalize_fullnames(item)?);
+    }
+    if fullname_sets.len() != 13 {
+        return Ok(None);
+    }
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+
+    let mut result: Vec<String> = Vec::with_capacity(dec_list.len());
+    for d in dec_list.iter() {
+        // Branch order mirrors semanal.py:1831-1897 exactly.
+        if refers_to_fullname(d, &fullname_sets[0])? {
+            result.push("abstract".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[1])? {
+            result.push("awaitable".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[2])? {
+            result.push("static".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[3])? {
+            result.push("class".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[4])? {
+            result.push("override".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[5])? {
+            // Property family: split on which name matched (mirrors the
+            // abstractproperty / cached_property sub-branches).
+            if refers_to_fullname(d, &fullname_sets[6])? {
+                result.push("abstract_property".to_string());
+            } else if refers_to_fullname(d, &fullname_sets[7])? {
+                result.push("cached_property".to_string());
+            } else {
+                result.push("property".to_string());
+            }
+        } else if refers_to_fullname(d, &fullname_sets[8])? {
+            result.push("no_type_check".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[9])? {
+            result.push("final".to_string());
+        } else if refers_to_fullname(d, &fullname_sets[10])? {
+            result.push("type_check_only".to_string());
+        } else if d.is_instance(call_expr_cls)? {
+            // dataclass_transform: CallExpr with callee referring to
+            // DATACLASS_TRANSFORM_NAMES.
+            let callee = d.getattr("callee")?;
+            if refers_to_fullname(callee, &fullname_sets[11])? {
+                result.push("dataclass_transform".to_string());
+            } else if is_deprecated_call(py, d, &fullname_sets[12])? {
+                result.push("deprecated".to_string());
+            } else {
+                result.push("other".to_string());
+            }
+        } else if is_deprecated_call(py, d, &fullname_sets[12])? {
+            result.push("deprecated".to_string());
+        } else {
+            result.push("other".to_string());
+        }
+    }
+    Ok(Some(result))
+}
+
+/// Name-or-set fullname match mirroring `mypy.semanal.refers_to_fullname`.
+///
+/// Factors the body of `rust_refers_to_fullname` so the decorator classifier
+/// reuses the exact same match semantics, including the `TypeAlias` target
+/// resolution to a named `Instance` when `python_3_12_type_alias` is False.
+fn refers_to_fullname(node: &PyAny, fullname_set: &HashSet<String>) -> PyResult<bool> {
+    let py = node.py();
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+
+    if !node.is_instance(ref_expr_cls)? {
+        return Ok(false);
+    }
+
+    let node_fullname = node.getattr("fullname")?;
+    let node_fullname_str: &str = node_fullname.downcast::<PyString>()?.to_str()?;
+    if fullname_set.contains(node_fullname_str) {
+        return Ok(true);
+    }
+
+    // Check if node.node is a TypeAlias (and not python_3_12_type_alias).
+    let node_attr = node.getattr("node")?;
+    if node_attr.is_none() {
+        return Ok(false);
+    }
+
+    let type_alias_cls: &PyType = nodes_mod.getattr("TypeAlias")?.downcast()?;
+    if !node_attr.is_instance(type_alias_cls)? {
+        return Ok(false);
+    }
+
+    let python_3_12 = node_attr.getattr("python_3_12_type_alias")?;
+    if python_3_12.is_true()? {
+        return Ok(false);
+    }
+
+    // Recurse: is_named_instance(node.node.target, fullnames).
+    let target = node_attr.getattr("target")?;
+    let types_mod = py.import("mypy.types")?;
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+    let proper = get_proper_type.call1((target,))?;
+
+    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+    if !proper.is_instance(instance_cls)? {
+        return Ok(false);
+    }
+
+    let typ = proper.getattr("type")?;
+    let typ_fullname = typ.getattr("fullname")?;
+    let typ_fullname_str: &str = typ_fullname.downcast::<PyString>()?.to_str()?;
+    Ok(fullname_set.contains(typ_fullname_str))
+}
+
+/// Whether a decorator expression is a deprecation call
+/// (`get_deprecated` would return a non-None string).
+///
+/// Mirrors `mypy.semanal.get_deprecated` (semanal.py:1495-1503): a
+/// `CallExpr` whose callee refers to `DEPRECATED_TYPE_NAMES` and whose first
+/// positional argument is a `StrExpr`. Any attribute access failure is
+/// treated as not-deprecated (conservative: Python would raise instead, so
+/// no fallback is needed for the common path).
+fn is_deprecated_call(
+    py: Python<'_>,
+    expression: &PyAny,
+    deprecated_names: &HashSet<String>,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    let str_expr_cls: &PyType = nodes_mod.getattr("StrExpr")?.downcast()?;
+
+    if !expression.is_instance(call_expr_cls)? {
+        return Ok(false);
+    }
+
+    let callee = expression.getattr("callee")?;
+    if !refers_to_fullname(callee, deprecated_names)? {
+        return Ok(false);
+    }
+
+    let args = expression.getattr("args")?;
+    let args_list = args.downcast::<PyList>()?;
+    if args_list.is_empty() {
+        return Ok(false);
+    }
+
+    let first_arg = args_list.get_item(0)?;
+    if !first_arg.is_instance(str_expr_cls)? {
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------

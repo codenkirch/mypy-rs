@@ -7522,3 +7522,182 @@ class NativeStubgenRenderSuite(Suite):
 
     def test_template_str(self) -> None:
         self._assert_render(self._tmpl("test"))
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDecoratorClassifySuite(Suite):
+    """Parity tests for the Rust decorator classification (Issue #348).
+
+    Each test builds a list of decorator expressions (NameExpr/MemberExpr/
+    CallExpr), classifies them via `type_kernel.rust_classify_decorators`, and
+    asserts the tags match what the Python classifier loop in
+    `semanal.visit_decorator` would produce for the same decorators. The
+    branch order and name sets mirror semanal.py:1831-1897 exactly.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.types import (
+            DATACLASS_TRANSFORM_NAMES,
+            DEPRECATED_TYPE_NAMES,
+            FINAL_DECORATOR_NAMES,
+            OVERRIDE_DECORATOR_NAMES,
+            TYPE_CHECK_ONLY_NAMES,
+        )
+
+        self._abstract_names = "abc.abstractmethod"
+        self._awaitable_names = ("asyncio.coroutines.coroutine", "types.coroutine")
+        self._static_names = "builtins.staticmethod"
+        self._class_names = "builtins.classmethod"
+        self._override_names = OVERRIDE_DECORATOR_NAMES
+        self._property_names = (
+            "builtins.property",
+            "abc.abstractproperty",
+            "functools.cached_property",
+            "enum.property",
+            "types.DynamicClassAttribute",
+        )
+        self._abstract_property_names = "abc.abstractproperty"
+        self._cached_property_names = "functools.cached_property"
+        self._no_type_check_names = "typing.no_type_check"
+        self._final_names = FINAL_DECORATOR_NAMES
+        self._type_check_only_names = TYPE_CHECK_ONLY_NAMES
+        self._dataclass_transform_names = DATACLASS_TRANSFORM_NAMES
+        self._deprecated_names = DEPRECATED_TYPE_NAMES
+
+    # --- node constructors ---
+    def _name(self, fullname: str) -> NameExpr:
+        node = NameExpr(fullname.rsplit(".", 1)[-1])
+        node.fullname = fullname
+        return node
+
+    def _member(self, base: str, attr: str) -> MemberExpr:
+        node = MemberExpr(self._name(base), attr)
+        node.fullname = f"{base}.{attr}"
+        return node
+
+    def _call(self, callee: NameExpr, args: list[Expression]) -> CallExpr:
+        kinds = [ARG_POS] * len(args)
+        return CallExpr(callee, args, kinds, [None] * len(args))
+
+    def _classify(self, decorators: list[Expression]) -> list[str]:
+        result = self._tk.rust_classify_decorators(
+            decorators,
+            (
+                self._abstract_names,
+                self._awaitable_names,
+                self._static_names,
+                self._class_names,
+                self._override_names,
+                self._property_names,
+                self._abstract_property_names,
+                self._cached_property_names,
+                self._no_type_check_names,
+                self._final_names,
+                self._type_check_only_names,
+                self._dataclass_transform_names,
+                self._deprecated_names,
+            ),
+        )
+        assert result is not None, f"Rust returned None for {decorators!r}"
+        return result
+
+    def _assert_tags(self, decorators: list[Expression], expected: list[str]) -> None:
+        actual = self._classify(decorators)
+        assert_equal(actual, expected, f"decorator classification mismatch: {actual!r}")
+
+    def test_abstract(self) -> None:
+        self._assert_tags([self._name("abc.abstractmethod")], ["abstract"])
+
+    def test_awaitable(self) -> None:
+        self._assert_tags([self._name("types.coroutine")], ["awaitable"])
+        self._assert_tags([self._name("asyncio.coroutines.coroutine")], ["awaitable"])
+
+    def test_static(self) -> None:
+        self._assert_tags([self._name("builtins.staticmethod")], ["static"])
+
+    def test_class(self) -> None:
+        self._assert_tags([self._name("builtins.classmethod")], ["class"])
+
+    def test_override(self) -> None:
+        self._assert_tags([self._name("typing.override")], ["override"])
+        self._assert_tags([self._name("typing_extensions.override")], ["override"])
+
+    def test_property(self) -> None:
+        self._assert_tags([self._name("builtins.property")], ["property"])
+        self._assert_tags([self._name("enum.property")], ["property"])
+        self._assert_tags([self._name("types.DynamicClassAttribute")], ["property"])
+
+    def test_abstract_property(self) -> None:
+        self._assert_tags([self._name("abc.abstractproperty")], ["abstract_property"])
+
+    def test_cached_property(self) -> None:
+        self._assert_tags([self._name("functools.cached_property")], ["cached_property"])
+
+    def test_no_type_check(self) -> None:
+        self._assert_tags([self._name("typing.no_type_check")], ["no_type_check"])
+
+    def test_final(self) -> None:
+        self._assert_tags([self._name("typing.final")], ["final"])
+        self._assert_tags([self._name("typing_extensions.final")], ["final"])
+
+    def test_type_check_only(self) -> None:
+        self._assert_tags([self._name("typing.type_check_only")], ["type_check_only"])
+        self._assert_tags([self._name("typing_extensions.type_check_only")], ["type_check_only"])
+
+    def test_dataclass_transform(self) -> None:
+        self._assert_tags(
+            [self._call(self._name("typing.dataclass_transform"), [])], ["dataclass_transform"]
+        )
+
+    def test_deprecated(self) -> None:
+        self._assert_tags(
+            [self._call(self._name("warnings.deprecated"), [StrExpr("msg")])], ["deprecated"]
+        )
+
+    def test_other(self) -> None:
+        self._assert_tags([self._name("some.random.decorator")], ["other"])
+        # MemberExpr with an unrecognized name.
+        self._assert_tags([self._member("mod", "decorator")], ["other"])
+
+    def test_multiple(self) -> None:
+        decorators = [
+            self._name("abc.abstractmethod"),
+            self._name("builtins.staticmethod"),
+            self._name("builtins.classmethod"),
+            self._name("builtins.property"),
+            self._name("functools.cached_property"),
+            self._name("abc.abstractproperty"),
+            self._name("typing.final"),
+            self._name("typing.no_type_check"),
+            self._name("typing.override"),
+            self._name("some.random.decorator"),
+            self._member("mod", "decorator"),
+            self._call(self._name("warnings.deprecated"), [StrExpr("msg")]),
+            self._call(self._name("typing.dataclass_transform"), []),
+            self._name("types.coroutine"),
+            self._name("enum.property"),
+            self._name("types.DynamicClassAttribute"),
+            self._name("typing_extensions.type_check_only"),
+        ]
+        expected = [
+            "abstract",
+            "static",
+            "class",
+            "property",
+            "cached_property",
+            "abstract_property",
+            "final",
+            "no_type_check",
+            "override",
+            "other",
+            "other",
+            "deprecated",
+            "dataclass_transform",
+            "awaitable",
+            "property",
+            "property",
+            "type_check_only",
+        ]
+        self._assert_tags(decorators, expected)

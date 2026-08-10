@@ -185,6 +185,7 @@ __all__ = [
     "rust_names_modified_by_assignment",
     "rust_remove_imported_names_from_symtable",
     "rust_apply_semantic_analyzer_patches",
+    "rust_classify_decorators",
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
     "rust_get_assigned_names",
@@ -710,6 +711,24 @@ def rust_names_modified_in_lvalue(lvalue: Lvalue) -> list[NameExpr]: ...
 def rust_names_modified_by_assignment(s: AssignmentStmt) -> list[NameExpr]: ...
 def rust_remove_imported_names_from_symtable(names: SymbolTable, module: str) -> None: ...
 def rust_apply_semantic_analyzer_patches(patches: list[tuple[int, Callable[[], None]]]) -> None: ...
+def rust_classify_decorators(
+    decorators: list[Expression],
+    name_sets: tuple[
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+    ],
+) -> list[str] | None: ...
 def rust_stubgen_render(expr: Expression) -> str | None: ...
 def rust_stubgen_render_type_args(items: list[Expression]) -> str | None: ...
 def rust_get_assigned_names(lvalues: list[Expression]) -> list[str]: ...

@@ -409,20 +409,21 @@ def _set_native_semanal_active(active: bool) -> None:
 # cannot handle, falling back to the pure-Python implementation.
 try:
     from type_kernel import (
-        rust_refers_to_fullname as _rust_refers_to_fullname,
-        rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
-        rust_is_trivial_body as _rust_is_trivial_body,
-        rust_find_duplicate as _rust_find_duplicate,
-        rust_is_valid_replacement as _rust_is_valid_replacement,
-        rust_is_same_symbol as _rust_is_same_symbol,
-        rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
-        rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
-        rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
-        rust_is_init_only as _rust_is_init_only,
+        rust_classify_decorators as _rust_classify_decorators,
         rust_erase_func_annotations as _rust_erase_func_annotations,
+        rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
+        rust_is_init_only as _rust_is_init_only,
+        rust_is_same_symbol as _rust_is_same_symbol,
+        rust_is_trivial_body as _rust_is_trivial_body,
+        rust_is_valid_replacement as _rust_is_valid_replacement,
+        rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
+        rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
+        rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
+        rust_refers_to_fullname as _rust_refers_to_fullname,
+        rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -437,6 +438,7 @@ except ImportError:
     _rust_names_modified_by_assignment = None  # type: ignore[assignment]
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
+    _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
@@ -1827,51 +1829,109 @@ class SemanticAnalyzer(
         removed: list[int] = []
         no_type_check = False
         could_be_decorated_property = False
+        # Issue #348: native decorator classification (strangler-fig). Rust
+        # assigns each decorator a tag mirroring the branch order below; the
+        # side effects stay 1:1 with the pure-Python loop. When the classifier
+        # returns None the pure loop below runs unchanged.
+        classifications: list[str] | None = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_classify_decorators(
+                    dec.decorators,
+                    (
+                        "abc.abstractmethod",
+                        ("asyncio.coroutines.coroutine", "types.coroutine"),
+                        "builtins.staticmethod",
+                        "builtins.classmethod",
+                        OVERRIDE_DECORATOR_NAMES,
+                        (
+                            "builtins.property",
+                            "abc.abstractproperty",
+                            "functools.cached_property",
+                            "enum.property",
+                            "types.DynamicClassAttribute",
+                        ),
+                        "abc.abstractproperty",
+                        "functools.cached_property",
+                        "typing.no_type_check",
+                        FINAL_DECORATOR_NAMES,
+                        TYPE_CHECK_ONLY_NAMES,
+                        DATACLASS_TRANSFORM_NAMES,
+                        DEPRECATED_TYPE_NAMES,
+                    ),
+                )
+                # A length mismatch would index out of range below; treat it
+                # as a classification failure and fall back to pure Python.
+                if result is not None and len(result) == len(dec.decorators):
+                    classifications = result
+            except (AssertionError, NotImplementedError):
+                pass
         for i, d in enumerate(dec.decorators):
+            # Native classification tag replaces the repeated
+            # refers_to_fullname / get_deprecated lookups below; when the
+            # native path is inactive `tag` is None and the original lookups
+            # run unchanged (byte-for-byte parity).
+            tag = classifications[i] if classifications is not None else None
             # A bunch of decorators are special cased here.
-            if refers_to_fullname(d, "abc.abstractmethod"):
+            if tag == "abstract" or (tag is None and refers_to_fullname(d, "abc.abstractmethod")):
                 removed.append(i)
                 dec.func.abstract_status = IS_ABSTRACT
                 self.check_decorated_function_is_method("abstractmethod", dec)
-            elif refers_to_fullname(d, ("asyncio.coroutines.coroutine", "types.coroutine")):
+            elif tag == "awaitable" or (
+                tag is None
+                and refers_to_fullname(d, ("asyncio.coroutines.coroutine", "types.coroutine"))
+            ):
                 removed.append(i)
                 dec.func.is_awaitable_coroutine = True
-            elif refers_to_fullname(d, "builtins.staticmethod"):
+            elif tag == "static" or (
+                tag is None and refers_to_fullname(d, "builtins.staticmethod")
+            ):
                 removed.append(i)
                 dec.func.is_static = True
                 dec.var.is_staticmethod = True
                 self.check_decorated_function_is_method("staticmethod", dec)
-            elif refers_to_fullname(d, "builtins.classmethod"):
+            elif tag == "class" or (tag is None and refers_to_fullname(d, "builtins.classmethod")):
                 removed.append(i)
                 dec.func.is_class = True
                 dec.var.is_classmethod = True
                 self.check_decorated_function_is_method("classmethod", dec)
-            elif refers_to_fullname(d, OVERRIDE_DECORATOR_NAMES):
+            elif tag == "override" or (
+                tag is None and refers_to_fullname(d, OVERRIDE_DECORATOR_NAMES)
+            ):
                 removed.append(i)
                 dec.func.is_explicit_override = True
                 self.check_decorated_function_is_method("override", dec)
-            elif refers_to_fullname(
-                d,
-                (
-                    "builtins.property",
-                    "abc.abstractproperty",
-                    "functools.cached_property",
-                    "enum.property",
-                    "types.DynamicClassAttribute",
-                ),
+            elif tag in ("property", "abstract_property", "cached_property") or (
+                tag is None
+                and refers_to_fullname(
+                    d,
+                    (
+                        "builtins.property",
+                        "abc.abstractproperty",
+                        "functools.cached_property",
+                        "enum.property",
+                        "types.DynamicClassAttribute",
+                    ),
+                )
             ):
                 removed.append(i)
                 dec.func.is_property = True
                 dec.var.is_property = True
-                if refers_to_fullname(d, "abc.abstractproperty"):
+                if tag == "abstract_property" or (
+                    tag is None and refers_to_fullname(d, "abc.abstractproperty")
+                ):
                     dec.func.abstract_status = IS_ABSTRACT
-                elif refers_to_fullname(d, "functools.cached_property"):
+                elif tag == "cached_property" or (
+                    tag is None and refers_to_fullname(d, "functools.cached_property")
+                ):
                     dec.var.is_settable_property = True
                 self.check_decorated_function_is_method("property", dec)
-            elif refers_to_fullname(d, "typing.no_type_check"):
+            elif tag == "no_type_check" or (
+                tag is None and refers_to_fullname(d, "typing.no_type_check")
+            ):
                 dec.var.type = AnyType(TypeOfAny.special_form)
                 no_type_check = True
-            elif refers_to_fullname(d, FINAL_DECORATOR_NAMES):
+            elif tag == "final" or (tag is None and refers_to_fullname(d, FINAL_DECORATOR_NAMES)):
                 if self.is_class_scope():
                     assert self.type is not None, "No type set at class scope"
                     if self.type.is_protocol:
@@ -1882,16 +1942,25 @@ class SemanticAnalyzer(
                     removed.append(i)
                 else:
                     self.fail("@final cannot be used with non-method functions", d)
-            elif refers_to_fullname(d, TYPE_CHECK_ONLY_NAMES):
+            elif tag == "type_check_only" or (
+                tag is None and refers_to_fullname(d, TYPE_CHECK_ONLY_NAMES)
+            ):
                 # TODO: support `@overload` funcs.
                 dec.func.is_type_check_only = True
-            elif isinstance(d, CallExpr) and refers_to_fullname(
-                d.callee, DATACLASS_TRANSFORM_NAMES
+            elif isinstance(d, CallExpr) and (
+                tag == "dataclass_transform"
+                or (tag is None and refers_to_fullname(d.callee, DATACLASS_TRANSFORM_NAMES))
             ):
                 dec.func.dataclass_transform_spec = self.parse_dataclass_transform_spec(d)
-            elif (deprecated := self.get_deprecated(d)) is not None:
+            elif tag == "deprecated" or (
+                tag is None and (deprecated := self.get_deprecated(d)) is not None
+            ):
+                # The native path classifies by tag only; re-derive the message
+                # for the side effect (the tag alone carries no deprecation text).
+                if tag == "deprecated":
+                    deprecated = self.get_deprecated(d)
                 dec.func.deprecated = f"function {dec.fullname} is deprecated: {deprecated}"
-            elif not dec.var.is_property:
+            elif (tag == "other" or tag is None) and not dec.var.is_property:
                 # We have seen a "non-trivial" decorator before seeing @property, if
                 # we will see a @property later, give an error, as we don't support this.
                 could_be_decorated_property = True

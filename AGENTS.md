@@ -251,6 +251,13 @@ including:
   Gated via `_set_native_server_deps_active` (wired from
   `mypy/server/deps.py` by `mypy/build.py`) and covered by
   `NativeServerDepsSuite` in `mypy/test/testtypes.py`.
+- `rust_classify_decorators` (issue #348) — mirrors the decorator
+  classification dispatch in `mypy.semanal.SemanticAnalyzer.visit_decorator`
+  (semanal.py:1831-1897). Rust assigns each decorator a tag by the same
+  `refers_to_fullname` / `get_deprecated` name-sets and branch order; Python
+  applies the side effects (AST mutation, error reporting, scope checks).
+  Parity-gated behind the semanal_visitor gate and unit-tested by
+  `NativeDecoratorClassifySuite` in `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
