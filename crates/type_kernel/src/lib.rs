@@ -88,6 +88,7 @@ mod traverser;
 mod typeanal_queries;
 mod typeinfo;
 mod typeops;
+mod types_impl;
 mod visitor;
 mod wire;
 
@@ -1013,5 +1014,37 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         serverdeps::rust_filter_out_missing_top_level_packages,
         module
     )?)?;
+    // Issue #456: pure Type object-model methods (can_be_true/false_default,
+    // CallableType accessors, TupleType/UnionType length).
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_can_be_true_default,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_can_be_false_default,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_min_args,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_is_var_arg,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_is_kw_arg,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_max_possible_positional_args,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_is_generic,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(types_impl::rust_tuple_length, module)?)?;
+    module.add_function(wrap_pyfunction!(types_impl::rust_union_length, module)?)?;
     Ok(())
 }

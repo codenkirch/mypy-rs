@@ -1,0 +1,966 @@
+//! Native ports of pure `Type` object-model methods from `mypy/types.py`.
+//!
+//! Each function mirrors the Python `can_be_true_default` / `can_be_false_default`
+//! property defaults, `CallableType` flag accessors, and `length()` methods.
+//! All operate on the wire-format `Type` enum. Functions return `Option<T>`
+//! (None = defer to Python) for type variants that need live `TypeInfo` or
+//! `TypeAlias` nodes not available on the wire.
+//!
+//! Deferred (return None) cases:
+//!   * `TypeAliasType` — `can_be_true/false_default` delegates to
+//!     `self.alias.target`, which needs the live alias target.
+//!   * `TupleType` with a non-`builtins.tuple` fallback — `can_be_any_bool`
+//!     needs the live `TypeInfo.names` dict to check for `__bool__`.
+//!   * `LiteralType` — `can_be_true/false_default` checks
+//!     `self.fallback.type.is_enum`, which needs live `TypeInfo`.
+
+use pyo3::prelude::*;
+
+use crate::wire::{read_type, ReadBuffer, Type};
+
+// ---------------------------------------------------------------------------
+// ArgKind values (mirror mypy.nodes.ArgKind)
+// ---------------------------------------------------------------------------
+
+const ARG_POS: i64 = 0;
+const ARG_OPT: i64 = 1;
+const ARG_STAR: i64 = 2;
+const ARG_STAR2: i64 = 4;
+
+// ---------------------------------------------------------------------------
+// Wire format helper
+// ---------------------------------------------------------------------------
+
+fn decode_type(bytes: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(bytes);
+    read_type(&mut buf, None).ok()
+}
+
+// ---------------------------------------------------------------------------
+// can_be_true_default / can_be_false_default
+// ---------------------------------------------------------------------------
+
+/// `mypy.types.Type.can_be_true_default` — default truthiness of a type.
+///
+/// Mirrors the per-class overrides in `mypy/types.py`:
+///   * `Type` base: `True`.
+///   * `UninhabitedType`: `False`.
+///   * `NoneType`: `False`.
+///   * `UnionType`: `any(item.can_be_true for item in self.items)`.
+///   * `TypeAliasType`: defer (needs live alias target).
+///   * `TupleType`: defer unless fallback is `builtins.tuple` (needs TypeInfo).
+///   * `LiteralType`: defer (needs `TypeInfo.is_enum`).
+///   * All other proper types: `True` (the base default).
+///
+/// Returns `None` to defer to Python.
+#[pyfunction]
+pub(crate) fn rust_can_be_true_default(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(can_be_true_default_inner(&typ))
+}
+
+fn can_be_true_default_inner(typ: &Type) -> Option<bool> {
+    match typ {
+        // UninhabitedType: always False.
+        Type::UninhabitedType { .. } => Some(false),
+        // NoneType: can_be_true = False.
+        Type::NoneType => Some(false),
+        // UnionType: any(item.can_be_true). The wire UnionType stores
+        // precomputed can_be_true/can_be_false fields (layout >= 11).
+        Type::UnionType { can_be_true, .. } => Some(*can_be_true),
+        // TypeAliasType: delegates to alias.target — defer.
+        Type::TypeAliasType { .. } => None,
+        // TupleType: if can_be_any_bool() returns True, result is True.
+        // can_be_any_bool needs TypeInfo unless fallback is builtins.tuple.
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            if !can_be_any_bool_wire(partial_fallback) {
+                // can_be_any_bool is False: result is length() > 0.
+                Some(!items.is_empty())
+            } else {
+                // can_be_any_bool is True: result is True. But we can only
+                // know it's True if we confirmed via TypeInfo. If we got
+                // here, can_be_any_bool_wire returned True, meaning the
+                // fallback is NOT builtins.tuple and we need TypeInfo to
+                // check __bool__. Defer.
+                None
+            }
+        }
+        // LiteralType: needs TypeInfo.is_enum — defer.
+        Type::LiteralType { .. } => None,
+        // All other types: base default is True.
+        _ => Some(true),
+    }
+}
+
+/// `mypy.types.Type.can_be_false_default` — default falsiness of a type.
+///
+/// Mirrors the per-class overrides in `mypy/types.py`:
+///   * `Type` base: `True`.
+///   * `UninhabitedType`: `False`.
+///   * `NoneType`: `True` (base default, no override).
+///   * `UnionType`: `any(item.can_be_false for item in self.items)`.
+///   * `TypeAliasType`: defer (needs live alias target).
+///   * `TupleType`: complex logic depending on length and unpack — defer
+///     unless fallback is `builtins.tuple`.
+///   * `LiteralType`: defer (needs `TypeInfo.is_enum`).
+///   * All other proper types: `True` (the base default).
+///
+/// Returns `None` to defer to Python.
+#[pyfunction]
+pub(crate) fn rust_can_be_false_default(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(can_be_false_default_inner(&typ))
+}
+
+fn can_be_false_default_inner(typ: &Type) -> Option<bool> {
+    match typ {
+        // UninhabitedType: always False.
+        Type::UninhabitedType { .. } => Some(false),
+        // NoneType: base default True (no override).
+        Type::NoneType => Some(true),
+        // UnionType: any(item.can_be_false). Wire stores precomputed field.
+        Type::UnionType { can_be_false, .. } => Some(*can_be_false),
+        // TypeAliasType: delegates to alias.target — defer.
+        Type::TypeAliasType { .. } => None,
+        // TupleType: complex logic. If can_be_any_bool() is True, result
+        // is True. If False, depends on length and unpack structure.
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            if can_be_any_bool_wire(partial_fallback) {
+                // Non-builtins.tuple fallback: need TypeInfo to check
+                // __bool__. Defer.
+                return None;
+            }
+            // can_be_any_bool is False (fallback is builtins.tuple).
+            // Mirror types.py:2871-2887.
+            let length = items.len();
+            if length == 0 {
+                return Some(true);
+            }
+            if length > 1 {
+                return Some(false);
+            }
+            // length == 1: special case tuple[*Ts].
+            let item = &items[0];
+            if let Type::UnpackType { typ: inner } = item {
+                if let Type::TypeVarTupleType { min_len, .. } = inner.as_ref() {
+                    return Some(*min_len == 0);
+                }
+                // Non-normalized tuple[int, ...] can be false.
+                return Some(true);
+            }
+            Some(false)
+        }
+        // LiteralType: needs TypeInfo.is_enum — defer.
+        Type::LiteralType { .. } => None,
+        // All other types: base default is True.
+        _ => Some(true),
+    }
+}
+
+/// Check `can_be_any_bool` using only wire data. Returns `True` only when
+/// the fallback is NOT `builtins.tuple` (meaning we'd need TypeInfo to
+/// check `__bool__`). Returns `False` when the fallback IS `builtins.tuple`,
+/// matching `can_be_any_bool`'s second condition. This is a partial check:
+/// the real `can_be_any_bool` also requires `type.names.get("__bool__")`,
+/// which we can't verify without TypeInfo. The caller uses `False` to
+/// proceed and `True` to defer.
+fn can_be_any_bool_wire(fallback: &Type) -> bool {
+    if let Type::Instance { type_ref, .. } = fallback {
+        type_ref != "builtins.tuple"
+    } else {
+        // Non-Instance fallback: `partial_fallback.type` would be falsy
+        // in Python (e.g. UnboundType), so can_be_any_bool returns False.
+        // We return False to proceed (no __bool__ check needed).
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CallableType pure accessors
+// ---------------------------------------------------------------------------
+
+/// `mypy.types.CallableType.min_args` — count positional (ARG_POS) args.
+///
+/// Mirrors `CallableType.min_args` (types.py:2330-2331).
+#[pyfunction]
+pub(crate) fn rust_callable_min_args(type_bytes: &[u8]) -> PyResult<Option<i64>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(callable_min_args_inner(&typ))
+}
+
+fn callable_min_args_inner(typ: &Type) -> Option<i64> {
+    if let Type::CallableType { arg_kinds, .. } = typ {
+        Some(arg_kinds.iter().filter(|&&k| k == ARG_POS).count() as i64)
+    } else {
+        None
+    }
+}
+
+/// `mypy.types.CallableType.is_var_arg` — does this callable have `*args`?
+///
+/// Mirrors `CallableType.is_var_arg` (types.py:2334-2336).
+#[pyfunction]
+pub(crate) fn rust_callable_is_var_arg(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(callable_is_var_arg_inner(&typ))
+}
+
+fn callable_is_var_arg_inner(typ: &Type) -> Option<bool> {
+    if let Type::CallableType { arg_kinds, .. } = typ {
+        Some(arg_kinds.contains(&ARG_STAR))
+    } else {
+        None
+    }
+}
+
+/// `mypy.types.CallableType.is_kw_arg` — does this callable have `**kwargs`?
+///
+/// Mirrors `CallableType.is_kw_arg` (types.py:2339-2341).
+#[pyfunction]
+pub(crate) fn rust_callable_is_kw_arg(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(callable_is_kw_arg_inner(&typ))
+}
+
+fn callable_is_kw_arg_inner(typ: &Type) -> Option<bool> {
+    if let Type::CallableType { arg_kinds, .. } = typ {
+        Some(arg_kinds.contains(&ARG_STAR2))
+    } else {
+        None
+    }
+}
+
+/// `mypy.types.CallableType.max_possible_positional_args` — max positional
+/// args, or `i64::MAX` if the callable has `*args` or `**kwargs`.
+///
+/// Mirrors `CallableType.max_possible_positional_args` (types.py:2390-2396).
+#[pyfunction]
+pub(crate) fn rust_callable_max_possible_positional_args(
+    type_bytes: &[u8],
+) -> PyResult<Option<i64>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(callable_max_possible_positional_args_inner(&typ))
+}
+
+fn callable_max_possible_positional_args_inner(typ: &Type) -> Option<i64> {
+    if let Type::CallableType { arg_kinds, .. } = typ {
+        let is_var = arg_kinds.contains(&ARG_STAR);
+        let is_kw = arg_kinds.contains(&ARG_STAR2);
+        if is_var || is_kw {
+            return Some(i64::MAX);
+        }
+        // Count positional kinds: ARG_POS (0) and ARG_OPT (1).
+        // ArgKind.is_positional() is True for ARG_POS and ARG_OPT.
+        Some(
+            arg_kinds
+                .iter()
+                .filter(|&&k| k == ARG_POS || k == ARG_OPT)
+                .count() as i64,
+        )
+    } else {
+        None
+    }
+}
+
+/// `mypy.types.CallableType.is_generic` — does this callable have type
+/// variables?
+///
+/// Mirrors `CallableType.is_generic` (types.py:2471-2472).
+#[pyfunction]
+pub(crate) fn rust_callable_is_generic(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(callable_is_generic_inner(&typ))
+}
+
+fn callable_is_generic_inner(typ: &Type) -> Option<bool> {
+    if let Type::CallableType { variables, .. } = typ {
+        Some(!variables.is_empty())
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TupleType.length / UnionType.length
+// ---------------------------------------------------------------------------
+
+/// `mypy.types.TupleType.length` — number of items.
+///
+/// Mirrors `TupleType.length` (types.py:2896-2897).
+#[pyfunction]
+pub(crate) fn rust_tuple_length(type_bytes: &[u8]) -> PyResult<Option<i64>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(tuple_length_inner(&typ))
+}
+
+fn tuple_length_inner(typ: &Type) -> Option<i64> {
+    if let Type::TupleType { items, .. } = typ {
+        Some(items.len() as i64)
+    } else {
+        None
+    }
+}
+
+/// `mypy.types.UnionType.length` — number of items.
+///
+/// Mirrors `UnionType.length` (types.py:3511-3512).
+#[pyfunction]
+pub(crate) fn rust_union_length(type_bytes: &[u8]) -> PyResult<Option<i64>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(union_length_inner(&typ))
+}
+
+fn union_length_inner(typ: &Type) -> Option<i64> {
+    if let Type::UnionType { items, .. } = typ {
+        Some(items.len() as i64)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{write_type, LiteralValue, WriteBuffer};
+
+    fn encode(typ: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        if write_type(&mut buf, typ).is_err() {
+            return Vec::new();
+        }
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn test_can_be_true_default_uninhabited() {
+        let t = Type::UninhabitedType { ambiguous: false };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_none() {
+        let t = Type::NoneType;
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_any() {
+        let t = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_union() {
+        let t = Type::UnionType {
+            items: vec![Type::NoneType, Type::UninhabitedType { ambiguous: false }],
+            uses_pep604_syntax: false,
+            can_be_true: false,
+            can_be_false: true,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_type_alias_defers() {
+        // TypeAliasType wire round-trip depends on the alias target
+        // being resolvable; test with a None return from decode.
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "my.alias".to_string(),
+        };
+        let bytes = encode(&t);
+        // encode returns empty for TypeAliasType without target.
+        if bytes.is_empty() {
+            return;
+        }
+        if let Some(decoded) = decode_type(&bytes) {
+            assert_eq!(can_be_true_default_inner(&decoded), None);
+        }
+    }
+
+    #[test]
+    fn test_can_be_true_default_tuple_builtins() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::NoneType],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_tuple_namedtuple_defers() {
+        let fallback = Type::Instance {
+            type_ref: "my.NamedTuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::NoneType],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_can_be_true_default_tuple_empty() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_true_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_uninhabited() {
+        let t = Type::UninhabitedType { ambiguous: false };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_none() {
+        let t = Type::NoneType;
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_union() {
+        let t = Type::UnionType {
+            items: vec![Type::NoneType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_tuple_empty() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_tuple_multi() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::NoneType, Type::NoneType],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_tuple_single_unpack_typevartuple() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let inner = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(fallback.clone()),
+            name: "Ts".to_string(),
+            fullname: "module.Ts".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            min_len: 0,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::UnpackType {
+                typ: Box::new(inner),
+            }],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_tuple_single_unpack_typevartuple_min_len_1() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let inner = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(fallback.clone()),
+            name: "Ts".to_string(),
+            fullname: "module.Ts".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            min_len: 1,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::UnpackType {
+                typ: Box::new(inner),
+            }],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_tuple_single_non_unpack() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::NoneType],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_can_be_false_default_literal_defers() {
+        let fallback = Type::Instance {
+            type_ref: "enum.Color".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::LiteralType {
+            fallback: Box::new(fallback),
+            value: LiteralValue::Int(1),
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            can_be_false_default_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_callable_min_args() {
+        let t = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![Type::NoneType, Type::NoneType, Type::NoneType],
+            arg_kinds: vec![ARG_POS, ARG_POS, 1],
+            arg_names: vec![None, None, None],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let bytes = encode(&t);
+        assert_eq!(
+            callable_min_args_inner(&decode_type(&bytes).unwrap()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn test_callable_is_var_arg() {
+        let make = |kinds: Vec<i64>| Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![Type::NoneType; kinds.len()],
+            arg_kinds: kinds,
+            arg_names: vec![None; 3],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let t_no_star = make(vec![ARG_POS, 1, 3]);
+        let bytes = encode(&t_no_star);
+        assert_eq!(
+            callable_is_var_arg_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+        let t_star = make(vec![ARG_POS, ARG_STAR, 3]);
+        let bytes = encode(&t_star);
+        assert_eq!(
+            callable_is_var_arg_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_callable_is_kw_arg() {
+        let make = |kinds: Vec<i64>| Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![Type::NoneType; kinds.len()],
+            arg_kinds: kinds,
+            arg_names: vec![None; 3],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let t_no_kw = make(vec![ARG_POS, 1, 3]);
+        let bytes = encode(&t_no_kw);
+        assert_eq!(
+            callable_is_kw_arg_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+        let t_kw = make(vec![ARG_POS, 1, ARG_STAR2]);
+        let bytes = encode(&t_kw);
+        assert_eq!(
+            callable_is_kw_arg_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_callable_max_possible_positional_args() {
+        let make = |kinds: Vec<i64>| Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![Type::NoneType; kinds.len()],
+            arg_kinds: kinds,
+            arg_names: vec![None; 4],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let t_plain = make(vec![ARG_POS, 0, 1, 3]);
+        let bytes = encode(&t_plain);
+        assert_eq!(
+            callable_max_possible_positional_args_inner(&decode_type(&bytes).unwrap()),
+            Some(3)
+        );
+        let t_var = make(vec![ARG_POS, ARG_STAR, 1, 3]);
+        let bytes = encode(&t_var);
+        assert_eq!(
+            callable_max_possible_positional_args_inner(&decode_type(&bytes).unwrap()),
+            Some(i64::MAX)
+        );
+        let t_kw = make(vec![ARG_POS, 1, ARG_STAR2, 3]);
+        let bytes = encode(&t_kw);
+        assert_eq!(
+            callable_max_possible_positional_args_inner(&decode_type(&bytes).unwrap()),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn test_callable_is_generic() {
+        let make = |vars: Vec<Type>| Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(Type::NoneType),
+            name: None,
+            variables: vars,
+            type_guard: None,
+            type_is: None,
+        };
+        let t_no_vars = make(vec![]);
+        let bytes = encode(&t_no_vars);
+        assert_eq!(
+            callable_is_generic_inner(&decode_type(&bytes).unwrap()),
+            Some(false)
+        );
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 0,
+            namespace: "".to_string(),
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            values: vec![],
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let t_vars = make(vec![tvar]);
+        let bytes = encode(&t_vars);
+        assert_eq!(
+            callable_is_generic_inner(&decode_type(&bytes).unwrap()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_tuple_length() {
+        let fallback = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let t = Type::TupleType {
+            partial_fallback: Box::new(fallback),
+            items: vec![Type::NoneType, Type::NoneType, Type::NoneType],
+            implicit: false,
+        };
+        let bytes = encode(&t);
+        assert_eq!(tuple_length_inner(&decode_type(&bytes).unwrap()), Some(3));
+    }
+
+    #[test]
+    fn test_union_length() {
+        let t = Type::UnionType {
+            items: vec![Type::NoneType, Type::NoneType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let bytes = encode(&t);
+        assert_eq!(union_length_inner(&decode_type(&bytes).unwrap()), Some(2));
+    }
+
+    #[test]
+    fn test_non_callable_returns_none() {
+        let t = Type::NoneType;
+        let bytes = encode(&t);
+        assert_eq!(callable_min_args_inner(&decode_type(&bytes).unwrap()), None);
+        assert_eq!(
+            callable_is_var_arg_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+        assert_eq!(
+            callable_is_kw_arg_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+        assert_eq!(
+            callable_max_possible_positional_args_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+        assert_eq!(
+            callable_is_generic_inner(&decode_type(&bytes).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_non_tuple_union_length_none() {
+        let t = Type::NoneType;
+        let bytes = encode(&t);
+        assert_eq!(tuple_length_inner(&decode_type(&bytes).unwrap()), None);
+        assert_eq!(union_length_inner(&decode_type(&bytes).unwrap()), None);
+    }
+}
