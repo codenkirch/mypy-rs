@@ -411,6 +411,7 @@ try:
     from type_kernel import (
         rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
         rust_classify_decorators as _rust_classify_decorators,
+        rust_classify_imports as _rust_classify_imports,
         rust_erase_func_annotations as _rust_erase_func_annotations,
         rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
@@ -439,6 +440,7 @@ except ImportError:
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
+    _rust_classify_imports = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
@@ -3107,7 +3109,54 @@ class SemanticAnalyzer(
 
     def visit_import(self, i: Import) -> None:
         self.statement = i
-        for id, as_id in i.ids:
+        # Issue #420: native import classification (strangler-fig). Rust
+        # performs the lookup/decision (target module found, module_public /
+        # module_hidden, scope kind) for each (id, as_id) pair; Python keeps
+        # the SymbolTableNode construction and the symbol-table mutation.
+        # When the classifier returns None the pure loop below runs
+        # unchanged (byte-for-byte parity).
+        classifications: list[tuple[str, str, bool, int | None]] | None = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_classify_imports(
+                    i.ids,
+                    self.is_stub_file,
+                    self.options.implicit_reexport,
+                    self.modules,
+                    self.scope_stack,
+                    self.type,
+                )
+                if result is not None and len(result) == len(i.ids):
+                    classifications = result
+            except (AssertionError, NotImplementedError):
+                pass
+        for idx, (id, as_id) in enumerate(i.ids):
+            # Native classification replaces the pure decision below; when
+            # the native path is inactive `imported_id` is None and the
+            # original loop body runs unchanged.
+            if classifications is not None:
+                imported_id, base_id, module_public, kind = classifications[idx]
+                if kind is not None:
+                    node = self.modules[base_id]
+                    symbol = SymbolTableNode(
+                        kind, node, module_public=module_public, module_hidden=not module_public
+                    )
+                    self.add_imported_symbol(
+                        imported_id,
+                        symbol,
+                        context=i,
+                        module_public=module_public,
+                        module_hidden=not module_public,
+                    )
+                else:
+                    self.add_unknown_imported_symbol(
+                        imported_id,
+                        context=i,
+                        target_name=base_id,
+                        module_public=module_public,
+                        module_hidden=not module_public,
+                    )
+                continue
             # Modules imported in a stub file without using 'import X as X' won't get exported
             # When implicit re-exporting is disabled, we have the same behavior as stubs.
             use_implicit_reexport = not self.is_stub_file and self.options.implicit_reexport

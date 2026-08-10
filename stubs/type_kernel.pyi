@@ -27,6 +27,7 @@ from mypy.nodes import (
     Block,
     Expression,
     Lvalue,
+    MypyFile,
     NameExpr,
     SymbolNode,
     SymbolTable,
@@ -186,6 +187,7 @@ __all__ = [
     "rust_remove_imported_names_from_symtable",
     "rust_apply_semantic_analyzer_patches",
     "rust_classify_decorators",
+    "rust_classify_imports",
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
     "rust_get_assigned_names",
@@ -729,6 +731,14 @@ def rust_classify_decorators(
         str | tuple[str, ...],
     ],
 ) -> list[str] | None: ...
+def rust_classify_imports(
+    ids: list[tuple[str, str | None]],
+    is_stub_file: bool,
+    implicit_reexport: bool,
+    modules: dict[str, MypyFile],
+    scope_stack: list[int],
+    self_type: TypeInfo | None,
+) -> list[tuple[str, str, bool, int | None]] | None: ...
 def rust_stubgen_render(expr: Expression) -> str | None: ...
 def rust_stubgen_render_type_args(items: list[Expression]) -> str | None: ...
 def rust_get_assigned_names(lvalues: list[Expression]) -> list[str]: ...
