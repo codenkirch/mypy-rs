@@ -6047,14 +6047,17 @@ mod tests {
     }
 
     #[test]
-    fn meet_type_type_both_type_type_defers() {
+    fn meet_type_type_both_type_type_returns_s() {
         // visit_type_type case 1 (meet.py:1249-1255): s is TypeType ->
-        // meet(t.item, s.item) + make_normalized -> produces a new
-        // TypeType -> defer (no encoder).
-        let r = make_resolver(vec![snap("a.A", "A")]);
+        // meet(t.item, s.item) + make_normalized. With TypeType now enabled
+        // (issue #443), the is_proper_subtype pre-check (meet.py:139-141)
+        // fires: is_proper_subtype(Type[A], Type[A]) recurses on items
+        // (subtypes.py:1264-1265) -> True, so the meet pre-check returns
+        // SameS before the visitor. This matches Python.
+        let r = make_resolver(vec![snap("a.A", "A"), snap("builtins.object", "object")]);
         let s = type_type("a.A");
         let t = type_type("a.A");
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
     }
 
     #[test]
