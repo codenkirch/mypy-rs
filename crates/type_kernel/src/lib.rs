@@ -627,6 +627,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkstrformat::rust_parse_placeholder_format,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkstrformat::rust_analyze_conversion_specifiers,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         traverser::rust_has_return_statement,
         module
     )?)?;
