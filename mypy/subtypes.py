@@ -83,12 +83,16 @@ from mypy.typevars import fill_typevars, fill_typevars_with_any
 # is_subtype path routes through Rust. Rust returns None for unhandled.
 try:
     import type_kernel as _type_kernel
-    from librt.internal import WriteBuffer as _WriteBuffer
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
+
+    from mypy.types import read_type as _read_type
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
+    _ReadBuffer = None  # type: ignore[assignment,misc]
     _WriteBuffer = None  # type: ignore[assignment,misc]
+    _read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
@@ -121,6 +125,24 @@ def _serialize_type(t: Type) -> bytes:
     buf = _WriteBuffer()
     t.write(buf)
     return buf.getvalue()
+
+
+def _deserialize_type(data: bytes) -> Type | None:
+    """Deserialize wire bytes to a Type, fixing type_ref strings.
+
+    Returns None if any type_ref cannot be resolved to a live TypeInfo
+    (so the caller defers to Python).
+    """
+    from mypy.types import instance_cache
+    from mypy.wirefixup import fixup_wire_type
+
+    decoded = _read_type(_ReadBuffer(data))
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    return fixup_wire_type(decoded)
 
 
 # Flags for detected protocol members
@@ -283,6 +305,24 @@ def is_equivalent(
     options: Options | None = None,
     subtype_context: SubtypeContext | None = None,
 ) -> bool:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+        and subtype_context is None
+    ):
+        try:
+            result = _type_kernel.rust_is_equivalent(
+                _serialize_type(a),
+                _serialize_type(b),
+                ignore_type_params,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
     return is_subtype(
         a,
         b,
@@ -324,6 +364,25 @@ def is_same_type(
         and a.upper_bound == b.upper_bound
     ):
         return True
+
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+        and subtype_context is None
+    ):
+        try:
+            result = _type_kernel.rust_is_same_type(
+                _serialize_type(a),
+                _serialize_type(b),
+                ignore_promotions,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
 
     # Note that using ignore_promotions=True (default) makes types like int and int64
     # considered not the same type (which is the case at runtime).
@@ -2268,6 +2327,25 @@ def try_restrict_literal_union(t: UnionType, s: Type) -> list[Type] | None:
 
     Otherwise, returns None
     """
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            result = _type_kernel.rust_try_restrict_literal_union(
+                _serialize_type(t),
+                _serialize_type(s),
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            decoded: list[Type] = []
+            for item_bytes in result:
+                item = _deserialize_type(bytes(item_bytes))
+                if item is None:
+                    return None
+                decoded.append(item)
+            return decoded
+
     ps = get_proper_type(s)
     if not mypy.typeops.is_simple_literal(ps):
         return None
@@ -2363,6 +2441,19 @@ def is_more_precise(left: Type, right: Type, *, ignore_promotions: bool = False)
     right = get_proper_type(right)
     if isinstance(right, AnyType):
         return True
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            result = _type_kernel.rust_is_more_precise(
+                _serialize_type(left),
+                _serialize_type(right),
+                ignore_promotions,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
     return is_proper_subtype(left, right, ignore_promotions=ignore_promotions)
 
 
@@ -2451,6 +2542,8 @@ def infer_variance(info: TypeInfo, i: int) -> bool:
 
 
 def has_underscore_prefix(name: str) -> bool:
+    if _HAS_TYPE_KERNEL and _native_subtype_active:
+        return _type_kernel.rust_has_underscore_prefix(name)
     return name.startswith("_") and not (name.startswith("__") and name.endswith("__"))
 
 
@@ -2485,6 +2578,13 @@ def erase_return_self_types(typ: Type, self_type: Instance) -> Type:
 
 def is_erased_instance(t: Instance) -> bool:
     """Is this an instance where all args are Any types?"""
+    if _HAS_TYPE_KERNEL and _native_subtype_active:
+        try:
+            result = _type_kernel.rust_is_erased_instance(_serialize_type(t))
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
     if not t.args:
         return False
     for arg in t.args:

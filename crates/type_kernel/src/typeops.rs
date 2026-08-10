@@ -67,7 +67,7 @@ fn simple_literal_type(t: &Type) -> Option<Type> {
 /// An `Instance` is simple if it has a `last_known_value` whose value is a
 /// string. The `is_enum` check needs the resolver snapshot; if the snapshot
 /// is missing, conservatively return `false` (defer to Python).
-fn is_simple_literal(t: &Type, resolver: &TypeResolver) -> Option<bool> {
+pub(crate) fn is_simple_literal(t: &Type, resolver: &TypeResolver) -> Option<bool> {
     match t {
         Type::LiteralType { fallback, .. } => {
             let Type::Instance { type_ref, .. } = fallback.as_ref() else {
