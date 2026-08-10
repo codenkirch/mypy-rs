@@ -134,6 +134,7 @@ __all__ = [
     "rust_classify_call",
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
+    "rust_check_arguments",
     "rust_solve_one",
     "rust_check_overload_call",
     "rust_format_key_list",
@@ -458,6 +459,15 @@ def rust_is_similar_constraints(x_bytes: bytes, y_bytes: bytes) -> bool | None: 
 def rust_classify_call(callee_bytes: bytes) -> int | None: ...
 def rust_calibrate_type_obj_return(callee_bytes: bytes, arg_type_bytes: bytes) -> bytes | None: ...
 def rust_normalize_callable(callee_bytes: bytes) -> bytes | None: ...
+def rust_check_arguments(
+    resolver: NativeTypeResolver,
+    callee_bytes: bytes,
+    arg_types_bytes: list[bytes],
+    arg_kinds: list[int],
+    formal_to_actual: list[list[int]],
+    strict_optional: bool,
+    allow_abstract_call: bool,
+) -> list[tuple[int, int, int]] | None: ...
 def rust_real_union(type_bytes: bytes, strict_optional: bool) -> bool | None: ...
 def rust_solve_generic_call(
     resolver: NativeTypeResolver,
