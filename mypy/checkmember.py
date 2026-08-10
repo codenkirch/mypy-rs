@@ -92,8 +92,13 @@ try:
         WriteBuffer as _CheckMemberWriteBuffer,
     )
     from type_kernel import (
+        rust_analyze_descriptor_access as _rust_analyze_descriptor_access,
+        rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
         rust_analyze_member_access as _rust_analyze_member_access,
+        rust_analyze_none_member_access as _rust_analyze_none_member_access,
+        rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
+        rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
         rust_defined_in_superclass as _rust_defined_in_superclass,
         rust_has_operator as _rust_has_operator,
@@ -112,6 +117,11 @@ except ImportError:
     _rust_defined_in_superclass = None  # type: ignore[assignment]
     _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
+    _rust_analyze_union_member_access = None  # type: ignore[assignment]
+    _rust_analyze_none_member_access = None  # type: ignore[assignment]
+    _rust_analyze_typeddict_access = None  # type: ignore[assignment]
+    _rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
+    _rust_analyze_descriptor_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
     _checkmember_read_type = None  # type: ignore[assignment]
@@ -655,6 +665,30 @@ def analyze_type_type_member_access(
 
 def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) -> Type:
     with mx.msg.disable_type_names():
+        # M20: gate the union-map through Rust when the kernel is active.
+        # Rust maps relevant_items through the pure-type-transform subset of
+        # _analyze_member_access and joins via make_simplified_union. Defer
+        # (None) when any item needs checker state — Python falls through.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_checkmember_active
+            and _native_checkmember_resolver is not None
+        ):
+            try:
+                result = _rust_analyze_union_member_access(
+                    _native_checkmember_resolver,
+                    _serialize_type_for_checkmember(typ),
+                    state.state.strict_optional,
+                )
+                if result is not None:
+                    decoded = _deserialize_type_for_checkmember(bytes(result))
+                    if decoded is not None:
+                        if isinstance(decoded, ProperType):
+                            decoded.line = typ.line
+                            decoded.column = typ.column
+                        return decoded
+            except (AssertionError, NotImplementedError):
+                pass
         results = []
         for subtype in typ.relevant_items():
             # Self types should be bound to every individual item of a union.
@@ -664,6 +698,32 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
 
 
 def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> Type:
+    # M20: gate the NoneType branch through Rust. __bool__ returns a pure
+    # CallableType (ret=Literal[False]); any other name recurses on
+    # builtins.object. Defer (None) when the recursion defers.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+    ):
+        try:
+            result = _rust_analyze_none_member_access(
+                _native_checkmember_resolver,
+                name,
+                _serialize_type_for_checkmember(typ),
+                state.state.strict_optional,
+            )
+            if result is not None:
+                decoded = _deserialize_type_for_checkmember(bytes(result))
+                if decoded is not None:
+                    if isinstance(decoded, ProperType):
+                        decoded.line = typ.line
+                        decoded.column = typ.column
+                        if isinstance(decoded, CallableType):
+                            decoded.fallback.line = decoded.line
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if name == "__bool__":
         literal_false = LiteralType(False, fallback=mx.named_type("builtins.bool"))
         return CallableType(
@@ -834,6 +894,29 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     descriptor_type = get_proper_type(descriptor_type)
 
     if isinstance(descriptor_type, UnionType):
+        # M20: gate the union-map through Rust. Rust maps each item through
+        # analyze_descriptor_access and joins via make_simplified_union.
+        # Defer (None) when any item defers — Python falls through.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_checkmember_active
+            and _native_checkmember_resolver is not None
+        ):
+            try:
+                result = _rust_analyze_descriptor_access(
+                    _native_checkmember_resolver,
+                    _serialize_type_for_checkmember(descriptor_type),
+                    state.state.strict_optional,
+                )
+                if result is not None:
+                    decoded = _deserialize_type_for_checkmember(bytes(result))
+                    if decoded is not None:
+                        if isinstance(decoded, ProperType):
+                            decoded.line = descriptor_type.line
+                            decoded.column = descriptor_type.column
+                        return decoded
+            except (AssertionError, NotImplementedError):
+                pass
         # Map the access over union types
         return make_simplified_union(
             [analyze_descriptor_access(typ, mx) for typ in descriptor_type.items]
@@ -1522,6 +1605,33 @@ def analyze_enum_class_attribute_access(
         ):
             return proper.args[0]
 
+    # M20: gate the enum_literal tail through Rust. Rust handles only the
+    # final branch (name in enum_members -> itype.copy_modified(last_known_value=
+    # LiteralType(name, fallback=itype))). The EXCLUDED and nonmember paths
+    # above need checker state / node types not in the snapshot — both run
+    # in Python before this gate. Defer (None) when the class snapshot is
+    # missing or name is not an enum member.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+    ):
+        try:
+            result = _rust_analyze_enum_class_attribute_access(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(itype),
+                name,
+            )
+            if result is not None:
+                decoded = _deserialize_type_for_checkmember(bytes(result))
+                if decoded is not None:
+                    if isinstance(decoded, ProperType):
+                        decoded.line = itype.line
+                        decoded.column = itype.column
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
+
     if name not in itype.type.enum_members:
         return None
 
@@ -1532,6 +1642,32 @@ def analyze_enum_class_attribute_access(
 def analyze_typeddict_access(
     name: str, typ: TypedDictType, mx: MemberContext, override_info: TypeInfo | None
 ) -> Type:
+    # M20: gate the __delitem__ branch through Rust (pure CallableType).
+    # __setitem__ needs checker state; the fallback branch recurses on an
+    # Instance (defers). Both defer to Python.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+    ):
+        try:
+            result = _rust_analyze_typeddict_access(
+                _native_checkmember_resolver,
+                name,
+                _serialize_type_for_checkmember(typ),
+                state.state.strict_optional,
+            )
+            if result is not None:
+                decoded = _deserialize_type_for_checkmember(bytes(result))
+                if decoded is not None:
+                    if isinstance(decoded, ProperType):
+                        decoded.line = typ.line
+                        decoded.column = typ.column
+                        if isinstance(decoded, CallableType):
+                            decoded.fallback.line = decoded.line
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if name == "__setitem__":
         if isinstance(mx.context, IndexExpr):
             # Since we can get this during `a['key'] = ...`

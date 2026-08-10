@@ -37,6 +37,8 @@
 
 use pyo3::prelude::*;
 
+use crate::setops::make_simplified_union;
+use crate::subtypes::SubtypeContext;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
@@ -45,7 +47,6 @@ use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 // ---------------------------------------------------------------------------
 
 /// `ArgKind.ARG_POS` = 0.
-#[cfg(test)]
 const ARG_POS: i64 = 0;
 /// `ArgKind.ARG_STAR` = 2.
 const ARG_STAR: i64 = 2;
@@ -857,6 +858,342 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
 }
 
 // ---------------------------------------------------------------------------
+// analyze_union_member_access
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_union_member_access` (checkmember.py:656-663).
+///
+/// Maps `relevant_items()` of the union through `_analyze_member_access`
+/// (the pure-type-transform Rust subset), then joins the results via
+/// `make_simplified_union`. Defer (None) when any item defers — Python
+/// falls through. The Python `disable_type_names()` context only affects
+/// error messages during the recursion; the pure branches Rust handles
+/// emit no errors, and non-pure branches defer, so the context is
+/// irrelevant on the Rust path. The per-item `self_type` override is also
+/// unused by the pure branches.
+#[pyfunction]
+pub(crate) fn rust_analyze_union_member_access(
+    resolver: &NativeTypeResolver,
+    union_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    let typ = match decode_type(union_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(
+        analyze_union_member_access_inner(&typ, strict_optional, resolver.resolver())
+            .and_then(|t| encode_type(&t)),
+    )
+}
+
+fn analyze_union_member_access_inner(
+    typ: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    let items = match typ {
+        Type::UnionType { items, .. } => items,
+        _ => return None,
+    };
+    // relevant_items(): skip NoneType when not strict_optional.
+    let relevant: Vec<&Type> = if strict_optional {
+        items.iter().collect()
+    } else {
+        items
+            .iter()
+            .filter(|i| !matches!(i, Type::NoneType))
+            .collect()
+    };
+    let mut results = Vec::with_capacity(relevant.len());
+    for item in &relevant {
+        let r = analyze_member_access_inner(item, resolver)?;
+        results.push(r);
+    }
+    let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
+    make_simplified_union(&results, &ctx, resolver, true)
+}
+
+// ---------------------------------------------------------------------------
+// analyze_none_member_access
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_none_member_access` (checkmember.py:666-677).
+///
+/// `__bool__` returns a pure CallableType ret=Literal[False]. Any other
+/// name recurses on `builtins.object` via `_analyze_member_access`. Defer
+/// (None) when the recursion on `builtins.object` defers.
+#[pyfunction]
+pub(crate) fn rust_analyze_none_member_access(
+    resolver: &NativeTypeResolver,
+    name: &str,
+    typ_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    // We only accept NoneType input; any other type is a caller bug — defer.
+    if !matches!(decode_type(typ_bytes), Some(Type::NoneType)) {
+        return Ok(None);
+    }
+    Ok(
+        analyze_none_member_access_inner(name, strict_optional, resolver.resolver())
+            .and_then(|t| encode_type(&t)),
+    )
+}
+
+fn analyze_none_member_access_inner(
+    name: &str,
+    _strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    if name == "__bool__" {
+        // LiteralType(False, fallback=builtins.bool)
+        let bool_inst = Type::Instance {
+            type_ref: "builtins.bool".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let literal_false = Type::LiteralType {
+            fallback: Box::new(bool_inst.clone()),
+            value: crate::wire::LiteralValue::Bool(false),
+        };
+        let func_inst = Type::Instance {
+            type_ref: "builtins.function".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        Some(Type::CallableType {
+            fallback: Box::new(func_inst),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(literal_false),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        })
+    } else {
+        // _analyze_member_access(name, builtins.object, mx)
+        let object_inst = Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        analyze_member_access_inner(&object_inst, resolver)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// analyze_typeddict_access (__delitem__ only)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_typeddict_access` (checkmember.py:1532-1568),
+/// `__delitem__` branch only. The `__setitem__` branch needs live checker
+/// state (`visit_typeddict_index_expr`, `readonly_keys_mutated`) and is
+/// deferred. The fallback branch recurses on `typ.fallback` (an Instance),
+/// which `analyze_member_access_inner` defers, so it is also deferred here.
+#[pyfunction]
+pub(crate) fn rust_analyze_typeddict_access(
+    resolver: &NativeTypeResolver,
+    name: &str,
+    typ_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    // Accept only TypedDictType input.
+    if !matches!(decode_type(typ_bytes), Some(Type::TypedDictType { .. })) {
+        return Ok(None);
+    }
+    Ok(
+        analyze_typeddict_access_inner(name, strict_optional, resolver.resolver())
+            .and_then(|t| encode_type(&t)),
+    )
+}
+
+fn analyze_typeddict_access_inner(
+    name: &str,
+    _strict_optional: bool,
+    _resolver: &TypeResolver,
+) -> Option<Type> {
+    if name == "__delitem__" {
+        let str_inst = Type::Instance {
+            type_ref: "builtins.str".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let func_inst = Type::Instance {
+            type_ref: "builtins.function".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        Some(Type::CallableType {
+            fallback: Box::new(func_inst),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![str_inst],
+            arg_kinds: vec![ARG_POS],
+            arg_names: vec![None],
+            ret_type: Box::new(Type::NoneType),
+            name: Some("__delitem__".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        })
+    } else {
+        // __setitem__ needs checker state; fallback branch recurses on
+        // an Instance, which defers. Both defer to Python.
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// analyze_enum_class_attribute_access (enum_literal tail only)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_enum_class_attribute_access`
+/// (checkmember.py:1507-1529), the enum-literal tail only.
+///
+/// Ports the final branch: when `name` is in `itype.type.enum_members`,
+/// construct `LiteralType(name, fallback=itype)` and return
+/// `itype.copy_modified(last_known_value=enum_literal)`. Defer (None)
+/// for the `EXCLUDED_ENUM_ATTRIBUTES` path (needs `report_missing_attribute`
+/// / `mx`) and the `nonmember` path (needs `node.type` from the resolver,
+/// which the snapshot does not carry). Also defer when the class snapshot
+/// is missing from the resolver.
+#[pyfunction]
+pub(crate) fn rust_analyze_enum_class_attribute_access(
+    resolver: &NativeTypeResolver,
+    instance_bytes: &[u8],
+    name: &str,
+) -> PyResult<Option<Vec<u8>>> {
+    let inst = match decode_type(instance_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(
+        analyze_enum_class_attribute_access_inner(&inst, name, resolver.resolver())
+            .and_then(|t| encode_type(&t)),
+    )
+}
+
+/// `EXCLUDED_ENUM_ATTRIBUTES` (nodes.py:3620): the set of attribute names
+/// that Enum strips. We defer these to Python (needs `report_missing_attribute`).
+const EXCLUDED_ENUM_ATTRIBUTES: &[&str] = &["_ignore_", "_order_", "__order__"];
+
+fn analyze_enum_class_attribute_access_inner(
+    inst: &Type,
+    name: &str,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    let (type_ref, args, _last_known_value, extra_attrs) = match inst {
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        } => (type_ref.as_str(), args, last_known_value, extra_attrs),
+        _ => return None,
+    };
+    // EXCLUDED path needs report_missing_attribute (mx) — defer.
+    if EXCLUDED_ENUM_ATTRIBUTES.contains(&name) {
+        return None;
+    }
+    let snap = resolver.get(type_ref)?;
+    if !snap.is_enum {
+        return None;
+    }
+    // The nonmember path needs node.type from the resolver snapshot,
+    // which is not carried — defer. We only handle the enum_literal tail.
+    if !snap.enum_members.iter().any(|m| m == name) {
+        return None;
+    }
+    let enum_literal = Type::LiteralType {
+        fallback: Box::new(inst.clone()),
+        value: crate::wire::LiteralValue::Str(name.to_string()),
+    };
+    Some(Type::Instance {
+        type_ref: type_ref.to_string(),
+        args: args.clone(),
+        last_known_value: Some(Box::new(enum_literal)),
+        extra_attrs: extra_attrs.clone(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// analyze_descriptor_access (Union-map + non-Instance guard only)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_descriptor_access` (checkmember.py:822-928),
+/// the pure-type-transform head only.
+///
+/// Ports two early-return guards:
+///   * `UnionType` → map each item through `analyze_descriptor_access`
+///     and `make_simplified_union`.
+///   * Not an `Instance` → return the original descriptor type unchanged.
+///
+/// Everything else needs `mx.chk` (checker state), `map_instance_to_supertype`,
+/// `expand_type_by_instance`, `check_call`, `warn_deprecated`, or
+/// `has_readable_member` on live TypeInfo — all deferred. The `is_lvalue`
+/// flag gates the `__set__`/`__get__` checks which need checker state, so
+/// even with `is_lvalue` we defer past the two guards above.
+#[pyfunction]
+pub(crate) fn rust_analyze_descriptor_access(
+    resolver: &NativeTypeResolver,
+    descriptor_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    let typ = match decode_type(descriptor_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(
+        analyze_descriptor_access_inner(&typ, strict_optional, resolver.resolver())
+            .and_then(|t| encode_type(&t)),
+    )
+}
+
+fn analyze_descriptor_access_inner(
+    typ: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    let proper = get_proper_or_none(typ)?;
+    match proper {
+        Type::UnionType { items, .. } => {
+            // Map the access over union types, then make_simplified_union.
+            let mut results = Vec::with_capacity(items.len());
+            for item in items {
+                let r = analyze_descriptor_access_inner(item, strict_optional, resolver)?;
+                results.push(r);
+            }
+            let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
+            make_simplified_union(&results, &ctx, resolver, true)
+        }
+        // Everything else deferred: the `not isinstance(...)` early return
+        // hands back the *original* descriptor object (identity-preserving,
+        // and it fires on every method-access call), and the Instance branch
+        // needs checker state (has_readable_member, get_method, check_call).
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1181,5 +1518,210 @@ mod tests {
             classify_member_access_inner(&callable, &resolver),
             MA_LITERAL_OR_FUNC
         );
+    }
+
+    // --- analyze_union_member_access_inner ---
+
+    fn make_union(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    #[test]
+    fn test_union_access_any_items_returns_any_union() {
+        let resolver = TypeResolver::new();
+        let union = make_union(vec![make_instance("builtins.int")]);
+        // Instance item defers -> union defers.
+        assert!(analyze_union_member_access_inner(&union, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_union_access_defers_on_instance_item() {
+        let resolver = TypeResolver::new();
+        let any_t = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let union = make_union(vec![any_t, make_instance("builtins.int")]);
+        // Instance item defers -> whole union defers.
+        assert!(analyze_union_member_access_inner(&union, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_union_access_single_any_returns_any() {
+        let resolver = TypeResolver::new();
+        let any_t = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let union = make_union(vec![any_t]);
+        let result =
+            analyze_union_member_access_inner(&union, true, &resolver).expect("single Any item");
+        match result {
+            Type::AnyType { .. } => {}
+            other => panic!("expected AnyType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_union_access_two_any_simplifies_to_any() {
+        let resolver = TypeResolver::new();
+        let any1 = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let any2 = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let union = make_union(vec![any1, any2]);
+        let result =
+            analyze_union_member_access_inner(&union, true, &resolver).expect("two Any items");
+        // make_simplified_union removes redundant items: Any <: Any, so
+        // the second Any is dropped and the result is a single Any.
+        match result {
+            Type::AnyType { .. } => {}
+            other => panic!("expected AnyType after simplification, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_union_access_non_union_defers() {
+        let resolver = TypeResolver::new();
+        let inst = make_instance("builtins.int");
+        assert!(analyze_union_member_access_inner(&inst, true, &resolver).is_none());
+    }
+
+    // --- analyze_none_member_access_inner ---
+
+    #[test]
+    fn test_none_access_bool_returns_callable_literal_false() {
+        let resolver = TypeResolver::new();
+        let result = analyze_none_member_access_inner("__bool__", true, &resolver)
+            .expect("__bool__ returns a callable");
+        match result {
+            Type::CallableType {
+                arg_types,
+                ret_type,
+                ..
+            } => {
+                assert!(arg_types.is_empty());
+                match &*ret_type {
+                    Type::LiteralType {
+                        value: crate::wire::LiteralValue::Bool(false),
+                        ..
+                    } => {}
+                    other => panic!("expected LiteralType(False), got {other:?}"),
+                }
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_none_access_object_defers() {
+        let resolver = TypeResolver::new();
+        // builtins.object is an Instance -> analyze_member_access_inner defers.
+        assert!(analyze_none_member_access_inner("foo", true, &resolver).is_none());
+    }
+
+    // --- analyze_typeddict_access_inner ---
+
+    #[test]
+    fn test_typeddict_delitem_returns_callable() {
+        let resolver = TypeResolver::new();
+        let result = analyze_typeddict_access_inner("__delitem__", true, &resolver)
+            .expect("__delitem__ returns a callable");
+        match result {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ret_type,
+                name,
+                ..
+            } => {
+                assert_eq!(arg_types.len(), 1);
+                assert_eq!(arg_kinds, vec![ARG_POS]);
+                assert!(matches!(&*ret_type, Type::NoneType));
+                assert_eq!(name.as_deref(), Some("__delitem__"));
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_typeddict_setitem_defers() {
+        let resolver = TypeResolver::new();
+        assert!(analyze_typeddict_access_inner("__setitem__", true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_typeddict_other_name_defers() {
+        let resolver = TypeResolver::new();
+        assert!(analyze_typeddict_access_inner("foo", true, &resolver).is_none());
+    }
+
+    // --- analyze_enum_class_attribute_access_inner ---
+
+    #[test]
+    fn test_enum_access_non_instance_defers() {
+        let resolver = TypeResolver::new();
+        let any_t = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert!(analyze_enum_class_attribute_access_inner(&any_t, "FOO", &resolver).is_none());
+    }
+
+    #[test]
+    fn test_enum_access_excluded_name_defers() {
+        let resolver = TypeResolver::new();
+        let inst = make_instance("mypy_types.Color");
+        assert!(analyze_enum_class_attribute_access_inner(&inst, "_ignore_", &resolver).is_none());
+    }
+
+    #[test]
+    fn test_enum_access_missing_snapshot_defers() {
+        let resolver = TypeResolver::new();
+        let inst = make_instance("mypy_types.Color");
+        // No snapshot in an empty resolver -> defer.
+        assert!(analyze_enum_class_attribute_access_inner(&inst, "RED", &resolver).is_none());
+    }
+
+    // --- analyze_descriptor_access_inner ---
+
+    #[test]
+    fn test_descriptor_access_non_union_defers() {
+        let resolver = TypeResolver::new();
+        let inst = make_instance("builtins.int");
+        // Instance branch needs checker state -> defer.
+        assert!(analyze_descriptor_access_inner(&inst, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_type_alias_defers() {
+        let resolver = TypeResolver::new();
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "some.Alias".to_string(),
+        };
+        assert!(analyze_descriptor_access_inner(&alias, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_union_with_instance_defers() {
+        let resolver = TypeResolver::new();
+        let union = make_union(vec![make_instance("builtins.int")]);
+        // Instance item defers -> union defers.
+        assert!(analyze_descriptor_access_inner(&union, true, &resolver).is_none());
     }
 }
