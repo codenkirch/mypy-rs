@@ -165,6 +165,21 @@ from mypy.types import (
 )
 from mypy.visitor import NodeVisitor
 
+# Native type-kernel seam (Issue #392): when the Rust `type_kernel`
+# extension is importable, route the pure stubgen collectors through it
+# first; on failure the Python body below stays as the identical fallback.
+try:
+    from type_kernel import (
+        rust_get_assigned_names as _rust_get_assigned_names,
+        rust_is_none_expr as _rust_is_none_expr,
+    )
+
+    _HAS_NATIVE_STUBGEN = True
+except ImportError:
+    _rust_get_assigned_names = None  # type: ignore[assignment]
+    _rust_is_none_expr = None  # type: ignore[assignment]
+    _HAS_NATIVE_STUBGEN = False
+
 # Common ways of naming package containing vendored modules.
 VENDOR_PACKAGES: Final = ["packages", "vendor", "vendored", "_vendor", "_vendored_packages"]
 
@@ -435,11 +450,23 @@ def find_defined_names(file: MypyFile) -> set[str]:
 
 
 def get_assigned_names(lvalues: Iterable[Expression]) -> Iterator[str]:
+    # This wrapper is a plain function so it can dispatch before any
+    # generator semantics kick in: `yield` lives only in the pure fallback
+    # helper below.
+    if _HAS_NATIVE_STUBGEN:
+        try:
+            return iter(_rust_get_assigned_names(list(lvalues)))
+        except Exception:
+            pass
+    return _pure_get_assigned_names(lvalues)
+
+
+def _pure_get_assigned_names(lvalues: Iterable[Expression]) -> Iterator[str]:
     for lvalue in lvalues:
         if isinstance(lvalue, NameExpr):
             yield lvalue.name
         elif isinstance(lvalue, TupleExpr):
-            yield from get_assigned_names(lvalue.items)
+            yield from _pure_get_assigned_names(lvalue.items)
 
 
 class DefinitionFinder(mypy.traverser.TraverserVisitor):
@@ -472,6 +499,11 @@ def find_referenced_names(file: MypyFile) -> set[str]:
 
 
 def is_none_expr(expr: Expression) -> bool:
+    if _HAS_NATIVE_STUBGEN:
+        try:
+            return _rust_is_none_expr(expr)
+        except Exception:
+            pass
     return isinstance(expr, NameExpr) and expr.name == "None"
 
 

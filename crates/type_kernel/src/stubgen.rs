@@ -404,3 +404,184 @@ pub fn rust_stubgen_render_type_args(py: Python<'_>, items: &PyAny) -> PyResult<
     }
     Ok(Some(rendered.join(", ")))
 }
+
+// ---------------------------------------------------------------------------
+// Issue #392: pure helpers from stubgen.py + stubgenc.py
+// ---------------------------------------------------------------------------
+
+/// Issue #392: `mypy.stubgen.get_assigned_names` — yield short names from
+/// assignment lvalues (NameExpr → name, TupleExpr → recurse).
+///
+/// Mirrors `get_assigned_names(lvalues)` at stubgen.py:437.
+#[pyfunction]
+pub fn rust_get_assigned_names(lvalues: &PyAny) -> PyResult<Vec<String>> {
+    let mut names = Vec::new();
+    let iterator = lvalues.iter()?;
+    for lvalue in iterator {
+        let lvalue = lvalue?;
+        get_assigned_names_inner(lvalue, &mut names)?;
+    }
+    Ok(names)
+}
+
+fn get_assigned_names_inner(node: &PyAny, out: &mut Vec<String>) -> PyResult<()> {
+    let type_name: String = node.get_type().name()?.into();
+    match type_name.as_str() {
+        "NameExpr" => {
+            let name: String = node.getattr("name")?.extract()?;
+            out.push(name);
+        }
+        "TupleExpr" => {
+            let items = node.getattr("items")?.downcast::<PyList>()?;
+            for item in items.iter() {
+                get_assigned_names_inner(item, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Issue #392: `mypy.stubgen.is_none_expr` — check if Expression is
+/// NameExpr with name "None".
+///
+/// Mirrors `is_none_expr(expr)` at stubgen.py:474.
+#[pyfunction]
+pub fn rust_is_none_expr(expr: &PyAny) -> PyResult<bool> {
+    let type_name: String = expr.get_type().name()?.into();
+    if type_name == "NameExpr" {
+        if let Ok(name) = expr.getattr("name").and_then(|v| v.extract::<String>()) {
+            return Ok(name == "None");
+        }
+    }
+    Ok(false)
+}
+
+/// Issue #392: `mypy.stubgen.is_pybind11_overloaded_function_docstring` —
+/// check if a docstring matches the pybind11 overload pattern.
+///
+/// Mirrors `is_pybind11_overloaded_function_docstring(docstring, name)` at
+/// stubgenc.py:143.
+#[pyfunction]
+pub fn rust_is_pybind11_overloaded_function_docstring(
+    docstring: &str,
+    name: &str,
+) -> PyResult<bool> {
+    let expected = format!("{name}(*args, **kwargs)\nOverloaded function.\n\n");
+    Ok(docstring.starts_with(&expected))
+}
+
+/// Issue #392: `mypy.stubgenc.method_name_sort_key` — sort key for method
+/// ordering in stubgen: constructor < normal methods < special methods.
+///
+/// Mirrors `method_name_sort_key(name)` at stubgenc.py:923.
+#[pyfunction]
+pub fn rust_method_name_sort_key(name: &str) -> (u8, String) {
+    if name == "__new__" || name == "__init__" {
+        (0, name.to_string())
+    } else if name.starts_with("__") && name.ends_with("__") {
+        (2, name.to_string())
+    } else {
+        (1, name.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::types::PyDict;
+
+    #[test]
+    fn assigned_names_walks_names_and_nested_tuples() {
+        // Fake node classes carry only the attributes the Rust seam reads
+        // (`get_type().name()`, `name`, `items`), so no mypy import is
+        // needed. The trailing plain `object()` exercises the skip arm.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                r#"
+class NameExpr:
+    def __init__(self, name):
+        self.name = name
+class TupleExpr:
+    def __init__(self, items):
+        self.items = items
+lvalues = [NameExpr("a"), TupleExpr([NameExpr("b"), TupleExpr([NameExpr("c")])]), object()]
+"#,
+                None,
+                Some(locals),
+            )
+            .unwrap();
+            let lvalues = locals.get_item("lvalues").unwrap().unwrap();
+            let result = rust_get_assigned_names(lvalues).unwrap();
+            assert_eq!(
+                result,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
+        });
+    }
+
+    #[test]
+    fn assigned_names_empty_input_yields_empty() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run("lvalues = []", None, Some(locals)).unwrap();
+            let lvalues = locals.get_item("lvalues").unwrap().unwrap();
+            let result = rust_get_assigned_names(lvalues).unwrap();
+            assert!(result.is_empty());
+        });
+    }
+
+    #[test]
+    fn is_none_expr_detects_none_names() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let locals = PyDict::new(py);
+            py.run(
+                r#"
+class NameExpr:
+    def __init__(self, name):
+        self.name = name
+none = NameExpr("None")
+other = NameExpr("x")
+plain = object()
+"#,
+                None,
+                Some(locals),
+            )
+            .unwrap();
+            let none = locals.get_item("none").unwrap().unwrap();
+            let other = locals.get_item("other").unwrap().unwrap();
+            let plain = locals.get_item("plain").unwrap().unwrap();
+            assert!(rust_is_none_expr(none).unwrap());
+            assert!(!rust_is_none_expr(other).unwrap());
+            assert!(!rust_is_none_expr(plain).unwrap());
+        });
+    }
+
+    #[test]
+    fn method_name_sort_key_constructs_first() {
+        assert_eq!(
+            rust_method_name_sort_key("__init__"),
+            (0, "__init__".into())
+        );
+        assert_eq!(rust_method_name_sort_key("__new__"), (0, "__new__".into()));
+    }
+
+    #[test]
+    fn method_name_sort_key_normal_before_special() {
+        assert_eq!(rust_method_name_sort_key("foo"), (1, "foo".into()));
+        assert_eq!(rust_method_name_sort_key("__len__"), (2, "__len__".into()));
+        assert_eq!(rust_method_name_sort_key("a__b"), (1, "a__b".into()));
+    }
+
+    #[test]
+    fn overloaded_docstring_prefix_match() {
+        let doc = "foo(*args, **kwargs)\nOverloaded function.\n\nDocstring body here.";
+        assert!(rust_is_pybind11_overloaded_function_docstring(doc, "foo").unwrap());
+        assert!(!rust_is_pybind11_overloaded_function_docstring(doc, "bar").unwrap());
+        assert!(!rust_is_pybind11_overloaded_function_docstring("plain docstring", "foo").unwrap());
+    }
+}

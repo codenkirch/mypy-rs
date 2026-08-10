@@ -40,6 +40,21 @@ from mypy.stubutil import (
 )
 from mypy.util import quote_docstring
 
+# Native type-kernel seam (Issue #392): when the Rust `type_kernel`
+# extension is importable, route the pure stubgenc collectors through it
+# first; on failure the Python body below stays as the identical fallback.
+try:
+    from type_kernel import (
+        rust_is_pybind11_overloaded_function_docstring as _rust_is_pybind11_overloaded_function_docstring,
+        rust_method_name_sort_key as _rust_method_name_sort_key,
+    )
+
+    _HAS_NATIVE_STUBGENC = True
+except ImportError:
+    _rust_is_pybind11_overloaded_function_docstring = None  # type: ignore[assignment]
+    _rust_method_name_sort_key = None  # type: ignore[assignment]
+    _HAS_NATIVE_STUBGENC = False
+
 
 class ExternalSignatureGenerator(SignatureGenerator):
     def __init__(
@@ -141,6 +156,11 @@ class DocstringSignatureGenerator(SignatureGenerator):
 
 
 def is_pybind11_overloaded_function_docstring(docstring: str, name: str) -> bool:
+    if _HAS_NATIVE_STUBGENC:
+        try:
+            return _rust_is_pybind11_overloaded_function_docstring(docstring, name)
+        except Exception:
+            pass
     return docstring.startswith(f"{name}(*args, **kwargs)\nOverloaded function.\n\n")
 
 
@@ -925,6 +945,11 @@ def method_name_sort_key(name: str) -> tuple[int, str]:
 
     I.e.: constructor, normal methods, special methods.
     """
+    if _HAS_NATIVE_STUBGENC:
+        try:
+            return _rust_method_name_sort_key(name)
+        except Exception:
+            pass
     if name in ("__new__", "__init__"):
         return 0, name
     if name.startswith("__") and name.endswith("__"):

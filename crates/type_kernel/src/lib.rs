@@ -676,6 +676,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         stubgen::rust_stubgen_render_type_args,
         module
     )?)?;
+    // Issue #392: stubgen pure collectors.
+    module.add_function(wrap_pyfunction!(stubgen::rust_get_assigned_names, module)?)?;
+    module.add_function(wrap_pyfunction!(stubgen::rust_is_none_expr, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_is_pybind11_overloaded_function_docstring,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        stubgen::rust_method_name_sort_key,
+        module
+    )?)?;
     // Attrs plugin transform (Issue #357): seam function for class decoration.
     module.add_function(wrap_pyfunction!(attrs::rust_transform_attrs, module)?)?;
     module.add_function(wrap_pyfunction!(attrs::rust_serialize_fields, module)?)?;
