@@ -1677,25 +1677,41 @@ class NativeTypeWireSuite(Suite):
 
     def test_callable_star(self) -> None:
         c = CallableType(
-            [self.fx.a], [ARG_STAR], [None], AnyType(TypeOfAny.special_form), self.fx.function
+            [self.fx.a],
+            [ARG_STAR],
+            [None],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
         )
         self.assert_wire_par(c)
 
     def test_callable_named(self) -> None:
         c = CallableType(
-            [self.fx.a], [ARG_NAMED], ["x"], AnyType(TypeOfAny.special_form), self.fx.function
+            [self.fx.a],
+            [ARG_NAMED],
+            ["x"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
         )
         self.assert_wire_par(c)
 
     def test_callable_named_opt(self) -> None:
         c = CallableType(
-            [self.fx.a], [ARG_NAMED_OPT], ["x"], AnyType(TypeOfAny.special_form), self.fx.function
+            [self.fx.a],
+            [ARG_NAMED_OPT],
+            ["x"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
         )
         self.assert_wire_par(c)
 
     def test_callable_star2(self) -> None:
         c = CallableType(
-            [self.fx.a], [ARG_STAR2], ["kwargs"], AnyType(TypeOfAny.special_form), self.fx.function
+            [self.fx.a],
+            [ARG_STAR2],
+            ["kwargs"],
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
         )
         self.assert_wire_par(c)
 
@@ -1813,7 +1829,9 @@ class NativeFreshenSuite(Suite):
         assert changed, f"rust freshen reported no change for {t!r}"
         assert next_raw_id > 1000000
         assert_equal(
-            _type_kernel.read_type_to_str(bytes(serialized)), str(expected), f"freshen {t!r}"
+            _type_kernel.read_type_to_str(bytes(serialized)),
+            str(expected),
+            f"freshen {t!r}",
         )
         # The real freshen signal: fresh meta-level-1 variables with a
         # bumped raw_id (str() prints only the name, which is unchanged).
@@ -1860,14 +1878,25 @@ class NativeFreshenSuite(Suite):
         self.assert_fresh_par(outer)
 
     def test_generic_with_upper_bound(self) -> None:
-        u = TypeVarType("U", "U", TypeVarId(10), [], self.fx.o, AnyType(TypeOfAny.special_form))
-        c = CallableType([self.fx.t], [ARG_POS], [None], u, self.fx.function, variables=[u])
+        u = TypeVarType(
+            "U", "U", TypeVarId(10), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], u, self.fx.function, variables=[u]
+        )
         self.assert_fresh_par(c)
 
     def test_generic_with_default_expansion(self) -> None:
-        t2 = TypeVarType("T2", "T2", TypeVarId(11), [], self.fx.o, self.fx.gt)
+        t2 = TypeVarType(
+            "T2", "T2", TypeVarId(11), [], self.fx.o, self.fx.gt
+        )
         c = CallableType(
-            [self.fx.t], [ARG_POS], [None], t2, self.fx.function, variables=[self.fx.t, t2]
+            [self.fx.t],
+            [ARG_POS],
+            [None],
+            t2,
+            self.fx.function,
+            variables=[self.fx.t, t2],
         )
         self.assert_fresh_par(c)
 
@@ -1894,8 +1923,12 @@ class FreshVarCanonicalizerSuite(Suite):
     def setUp(self) -> None:
         self.fx = TypeFixture()
         any_type = AnyType(TypeOfAny.special_form)
-        self.fresh1 = TypeVarType("T", "T", TypeVarId(1, meta_level=1), [], self.fx.o, any_type)
-        self.fresh2 = TypeVarType("S", "S", TypeVarId(2, meta_level=1), [], self.fx.o, any_type)
+        self.fresh1 = TypeVarType(
+            "T", "T", TypeVarId(1, meta_level=1), [], self.fx.o, any_type
+        )
+        self.fresh2 = TypeVarType(
+            "S", "S", TypeVarId(2, meta_level=1), [], self.fx.o, any_type
+        )
         self.declared = TypeVarType(
             "D", "D", TypeVarId(3), [], self.fx.o, any_type  # meta_level=0
         )
@@ -2134,10 +2167,12 @@ class NativeMethodFullnameSuite(Suite):
 
         self._set_active(False)
         py = ExpressionChecker.method_fullname(None, t, method_name)
-        rusted = _type_kernel.rust_method_fullname(self.resolver, self._bytes_of(t), method_name)
-        assert (
-            rusted if rusted is not None else py
-        ) == py, f"method_fullname({t!r}, {method_name!r}) rust={{}} py={{}}".format(rusted, py)
+        rusted = _type_kernel.rust_method_fullname(
+            self.resolver, self._bytes_of(t), method_name
+        )
+        assert (rusted if rusted is not None else py) == py, (
+            f"method_fullname({t!r}, {method_name!r}) rust={{}} py={{}}".format(rusted, py)
+        )
 
     def test_instance(self) -> None:
         self.assert_fullname_par(self.fx.a, "foo")
@@ -2154,7 +2189,9 @@ class NativeMethodFullnameSuite(Suite):
     def test_callable_type_obj(self) -> None:
         # A class-object callable: fallback is builtins.type (metaclass), so
         # both sides unwrap to the constructed instance.
-        c = CallableType([], [], [], self.fx.a, Instance(self.fx.type_typei, []))
+        c = CallableType(
+            [], [], [], self.fx.a, Instance(self.fx.type_typei, [])
+        )
         self.assert_fullname_par(c, "foo")
 
     def test_typeddict(self) -> None:
@@ -2671,7 +2708,10 @@ class NativeJoinInstanceWithArgsSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture(INVARIANT)
         type_infos = self._collect_type_infos()
@@ -2689,7 +2729,10 @@ class NativeJoinInstanceWithArgsSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -2751,7 +2794,10 @@ class NativeJoinCovariantArgsSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture(COVARIANT)
         type_infos = self._collect_type_infos()
@@ -2769,7 +2815,10 @@ class NativeJoinCovariantArgsSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -2852,7 +2901,10 @@ class NativeJoinUnionSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -2870,7 +2922,10 @@ class NativeJoinUnionSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -2967,7 +3022,10 @@ class NativeJoinCallableSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -2985,7 +3043,10 @@ class NativeJoinCallableSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3134,7 +3195,10 @@ class NativeJoinOverloadedSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3152,7 +3216,10 @@ class NativeJoinOverloadedSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3250,7 +3317,8 @@ class NativeJoinOverloadedSuite(Suite):
         from mypy.join import join_types
 
         ov = self.overloaded(
-            self.callable(self.fx.a, self.fx.b), self.callable(self.fx.b, self.fx.a)
+            self.callable(self.fx.a, self.fx.b),
+            self.callable(self.fx.b, self.fx.a),
         )
         c1 = self.callable(self.fx.a, self.fx.b)
         assert join_types(ov, c1) == c1
@@ -3287,7 +3355,10 @@ class NativeJoinTypeTypeSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3305,7 +3376,10 @@ class NativeJoinTypeTypeSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3380,7 +3454,10 @@ class NativeJoinLiteralSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3398,7 +3475,10 @@ class NativeJoinLiteralSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3444,7 +3524,9 @@ class NativeJoinLiteralSuite(Suite):
         inst_with_lkv = Instance(self.fx.ai, [], last_known_value=self.fx.lit1)
         assert join_types(inst_with_lkv, self.fx.lit1) == self.fx.lit1
 
-    def test_literal_with_instance_matching_last_known_value_defers_to_python(self) -> None:
+    def test_literal_with_instance_matching_last_known_value_defers_to_python(
+        self,
+    ) -> None:
         # join(Lit[2], Instance(A, lkv=Lit[1])) = A. Here s=Lit[2],
         # t=Instance(A, lkv=Lit[1]). Dispatch: t.accept(visitor(s)) where
         # t=Instance, s=Lit[2]. visit_instance case 6 (join.py:536):
@@ -3494,7 +3576,10 @@ class NativeJoinTypeVarSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3512,7 +3597,10 @@ class NativeJoinTypeVarSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3548,7 +3636,9 @@ class NativeJoinTypeVarSuite(Suite):
 
         assert join_types(self.fx.t, self.fx.s) == self.fx.o
 
-    def test_type_var_same_id_different_upper_bound_defers_to_python(self) -> None:
+    def test_type_var_same_id_different_upper_bound_defers_to_python(
+        self,
+    ) -> None:
         # join(T`1 with bound=A, T`1 with bound=B) = T`1 with bound=join(A,B).
         # visit_type_var case 1 copy_modified branch (join.py:468-470):
         # s.id == t.id but upper_bounds differ -> copy_modified(
@@ -3588,7 +3678,9 @@ class NativeJoinTypeVarSuite(Suite):
 
         assert join_types(self.fx.a, self.fx.t) == self.fx.o
 
-    def test_type_var_same_id_different_namespace_defers_to_python(self) -> None:
+    def test_type_var_same_id_different_namespace_defers_to_python(
+        self,
+    ) -> None:
         # TypeVarId.__eq__ (types.py:567-577) checks namespace. Same
         # raw_id, different namespace -> s.id != t.id -> case 2 -> defers.
         from mypy.join import join_types
@@ -3634,7 +3726,10 @@ class NativeJoinTypedDictSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3652,7 +3747,10 @@ class NativeJoinTypedDictSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3761,7 +3859,10 @@ class NativeJoinTupleSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3779,7 +3880,10 @@ class NativeJoinTupleSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -3877,7 +3981,10 @@ class NativeMeetSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -3895,7 +4002,10 @@ class NativeMeetSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -4051,7 +4161,10 @@ class NativeMeetUnboundSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -4069,7 +4182,10 @@ class NativeMeetUnboundSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -4135,7 +4251,10 @@ class NativeMeetTypeVarTupleSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         self.fx = TypeFixture()
         type_infos = self._collect_type_infos()
@@ -4153,7 +4272,10 @@ class NativeMeetTypeVarTupleSuite(Suite):
             _set_native_join_resolver,
             _set_native_join_typeinfo_map,
         )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
 
         _set_native_subtype_active(False)
         _set_native_subtype_resolver(None)
@@ -4312,7 +4434,11 @@ class NativeMroSuite(Suite):
         self._set_native_mro_resolver(None, None)
 
     def _make_class(
-        self, name: str, *, bases: list[Instance], mro: list[TypeInfo] | None
+        self,
+        name: str,
+        *,
+        bases: list[Instance],
+        mro: list[TypeInfo] | None,
     ) -> TypeInfo:
         from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
 
@@ -4376,7 +4502,11 @@ class NativeMroSuite(Suite):
         from mypy.mro import calculate_mro
 
         a = self._make_class("mymod.A", bases=[Instance(self.oi, [])], mro=None)
-        b = self._make_class("mymod.B", bases=[Instance(a, []), Instance(self.oi, [])], mro=None)
+        b = self._make_class(
+            "mymod.B",
+            bases=[Instance(a, []), Instance(self.oi, [])],
+            mro=None,
+        )
         self._install_resolver([b, a, self.oi])
         calculate_mro(b)
         assert self._mro_fullnames(b) == ["mymod.B", "mymod.A", "builtins.object"]
@@ -4480,7 +4610,10 @@ class NativePluginHookSuite(Suite):
     def setUp(self) -> None:
         import type_kernel as _type_kernel
 
-        from mypy.checkexpr import _set_native_plugin_hook_registry, plugin_call_hook_known_absent
+        from mypy.checkexpr import (
+            _set_native_plugin_hook_registry,
+            plugin_call_hook_known_absent,
+        )
         from mypy.options import Options
         from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES, DefaultPlugin
 
@@ -4506,9 +4639,9 @@ class NativePluginHookSuite(Suite):
     def test_known_absent_false_for_default_hook_fullnames(self) -> None:
         # Fullnames in the DefaultPlugin set are never "known absent".
         for fullname in self._fullnames:
-            assert not self._plugin_call_hook_known_absent(
-                fullname
-            ), f"{fullname!r} should not be known-absent (it has a hook)"
+            assert not self._plugin_call_hook_known_absent(fullname), (
+                f"{fullname!r} should not be known-absent (it has a hook)"
+            )
 
     def test_known_absent_true_for_unrelated_fullname(self) -> None:
         assert self._plugin_call_hook_known_absent("builtins.print")
@@ -4538,9 +4671,9 @@ class NativePluginHookSuite(Suite):
                 or self._default_plugin.get_method_signature_hook(fullname) is not None
                 or self._default_plugin.get_method_hook(fullname) is not None
             )
-            assert (
-                has_hook
-            ), f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
+            assert has_hook, (
+                f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
+            )
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -4703,7 +4836,12 @@ class NativeWireFixupSuite(Suite):
     def test_has_explicit_any_false_for_typeddict(self) -> None:
         from mypy.typeanal import _set_native_typeanal_active, has_explicit_any
 
-        td = TypedDictType({"x": self.fx.a}, {"x"}, set(), Instance(self.fx.std_listi, []))
+        td = TypedDictType(
+            {"x": self.fx.a},
+            {"x"},
+            set(),
+            Instance(self.fx.std_listi, []),
+        )
         _set_native_typeanal_active(False)
         expected = has_explicit_any(td)
         _set_native_typeanal_active(True)
@@ -4767,7 +4905,9 @@ class NativeWireFixupSuite(Suite):
         self._assert_no_fake_info(actual)
         assert_equal(actual, expected)
         assert isinstance(actual, UnionType)  # type: ignore[misc]
-        assert_equal(actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}")
+        assert_equal(
+            actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}"
+        )
 
     def test_make_optional_type_union_strips_none(self) -> None:
         from mypy.typeanal import _set_native_typeanal_active
@@ -4783,7 +4923,9 @@ class NativeWireFixupSuite(Suite):
         assert isinstance(actual, UnionType)  # type: ignore[misc]
         assert NoneType() in actual.items
         # Optional[B|C] == B|C|None, and None is absorbed.
-        assert_equal(actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}")
+        assert_equal(
+            actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}"
+        )
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -4833,7 +4975,9 @@ class NativeTraverserSuite(Suite):
         # cast() wraps the return expr in a CastExpr — previously
         # invisible to the Rust seeker.
         tree = self._parse(
-            "from typing import cast\n" "def f() -> int:\n" "    return cast(int, 42)\n"
+            "from typing import cast\n"
+            "def f() -> int:\n"
+            "    return cast(int, 42)\n"
         )
         fdef = self._find_func(tree, "f")
         assert has_return_statement(fdef) is True
@@ -4870,7 +5014,12 @@ class NativeTraverserSuite(Suite):
         assert has_yield_expression(fdef) is False
 
     def test_has_yield_expression_nested_func_skipped(self) -> None:
-        tree = self._parse("def f():\n" "    def g():\n" "        yield 1\n" "    return 2\n")
+        tree = self._parse(
+            "def f():\n"
+            "    def g():\n"
+            "        yield 1\n"
+            "    return 2\n"
+        )
         fdef = self._find_func(tree, "f")
         assert has_yield_expression(fdef) is False
 
@@ -4895,13 +5044,23 @@ class NativeTraverserSuite(Suite):
         assert has_await_expression(fdef) is False
 
     def test_all_return_statements_count(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    return 2\n" "    return\n")
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    return 2\n"
+            "    return\n"
+        )
         fdef = self._find_func(tree, "f")
         returns = all_return_statements(fdef)
         assert len(returns) == 3
 
     def test_all_return_statements_skips_nested(self) -> None:
-        tree = self._parse("def f():\n" "    return 1\n" "    def g():\n" "        return 2\n")
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    def g():\n"
+            "        return 2\n"
+        )
         fdef = self._find_func(tree, "f")
         returns = all_return_statements(fdef)
         assert len(returns) == 1
@@ -4913,33 +5072,50 @@ class NativeTraverserSuite(Suite):
         assert len(returns) == 0
 
     def test_all_yield_expressions_count(self) -> None:
-        tree = self._parse("def f():\n" "    yield 1\n" "    yield 2\n")
+        tree = self._parse(
+            "def f():\n"
+            "    yield 1\n"
+            "    yield 2\n"
+        )
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 2
 
     def test_all_yield_expressions_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    x = yield 1\n")
+        tree = self._parse(
+            "def f():\n"
+            "    x = yield 1\n"
+        )
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 1
         assert yields[0][1] is True  # in_assignment
 
     def test_all_yield_expressions_not_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    yield 1\n")
+        tree = self._parse(
+            "def f():\n"
+            "    yield 1\n"
+        )
         fdef = self._find_func(tree, "f")
         yields = all_yield_expressions(fdef)
         assert len(yields) == 1
         assert yields[0][1] is False
 
     def test_all_yield_from_expressions_count(self) -> None:
-        tree = self._parse("def f():\n" "    yield from range(10)\n" "    yield from g()\n")
+        tree = self._parse(
+            "def f():\n"
+            "    yield from range(10)\n"
+            "    yield from g()\n"
+        )
         fdef = self._find_func(tree, "f")
         yields = all_yield_from_expressions(fdef)
         assert len(yields) == 2
 
     def test_all_yield_from_expressions_in_assignment(self) -> None:
-        tree = self._parse("def f():\n" "    x = yield from g()\n")
+        tree = self._parse(
+            "def f():\n"
+            "    x = yield from g()\n"
+        )
         fdef = self._find_func(tree, "f")
         yields = all_yield_from_expressions(fdef)
         assert len(yields) == 1
@@ -4971,7 +5147,11 @@ class NativeTraverserSuite(Suite):
         from mypy.cache import WriteBuffer
 
         tree = self._parse(
-            "def f():\n" "    return 1\n" "    return 2\n" "    def g():\n" "        return 3\n"
+            "def f():\n"
+            "    return 1\n"
+            "    return 2\n"
+            "    def g():\n"
+            "        return 3\n"
         )
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
@@ -4987,7 +5167,11 @@ class NativeTraverserSuite(Suite):
         from mypy.cache import WriteBuffer
 
         tree = self._parse(
-            "def f():\n" "    yield 1\n" "    x = yield 2\n" "    def g():\n" "        yield 3\n"
+            "def f():\n"
+            "    yield 1\n"
+            "    x = yield 2\n"
+            "    def g():\n"
+            "        yield 3\n"
         )
         fdef = self._find_func(tree, "f")
         buf = WriteBuffer()
@@ -5025,10 +5209,13 @@ class NativeTraverserSuite(Suite):
         tree = self._parse("x = a.b.c + d.e + f\n")
         buf = WriteBuffer()
         serialize_node(tree, buf)
-        rust_names, rust_members = rust_count_name_and_member_expressions(buf.getvalue())
+        rust_names, rust_members = rust_count_name_and_member_expressions(
+            buf.getvalue()
+        )
         py_names, py_members = all_name_and_member_expressions(tree)
         assert rust_names == len(py_names)
         assert rust_members == len(py_members)
+
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -5045,14 +5232,20 @@ class NativeSuggestionsSuite(Suite):
 
         self._setter = _set_native_suggestions_active
 
-    def _check_best_matches(self, current: str, options: list[str], n: int) -> None:
+    def _check_best_matches(
+        self, current: str, options: list[str], n: int
+    ) -> None:
         from mypy.messages import best_matches
 
         self._setter(False)
         py_result = best_matches(current, options, n)
         self._setter(True)
         rs_result = best_matches(current, options, n)
-        assert_equal(rs_result, py_result, f"best_matches({current!r}, {options!r}, {n})")
+        assert_equal(
+            rs_result,
+            py_result,
+            f"best_matches({current!r}, {options!r}, {n})",
+        )
 
     def _check_pretty_seq(self, args: list[str], conjunction: str) -> None:
         from mypy.messages import pretty_seq
@@ -5061,13 +5254,19 @@ class NativeSuggestionsSuite(Suite):
         py_result = pretty_seq(args, conjunction)
         self._setter(True)
         rs_result = pretty_seq(args, conjunction)
-        assert_equal(rs_result, py_result, f"pretty_seq({args!r}, {conjunction!r})")
+        assert_equal(
+            rs_result,
+            py_result,
+            f"pretty_seq({args!r}, {conjunction!r})",
+        )
 
     def test_best_matches_identical(self) -> None:
         self._check_best_matches("foo", ["foo", "bar", "baz"], 3)
 
     def test_best_matches_fuzzy(self) -> None:
-        self._check_best_matches("helo", ["hello", "help", "hero", "hola", "foo"], 3)
+        self._check_best_matches(
+            "helo", ["hello", "help", "hero", "hola", "foo"], 3
+        )
 
     def test_best_matches_empty_current(self) -> None:
         self._check_best_matches("", ["a", "b"], 3)
@@ -5081,13 +5280,23 @@ class NativeSuggestionsSuite(Suite):
         self._check_best_matches("test", options, 3)
 
     def test_best_matches_tie_breaking(self) -> None:
-        self._check_best_matches("abc", ["abd", "abe", "abf", "abg"], 2)
+        self._check_best_matches(
+            "abc",
+            ["abd", "abe", "abf", "abg"],
+            2,
+        )
 
     def test_best_matches_partial_match(self) -> None:
-        self._check_best_matches("append", ["apend", "append", "prepend", "foo"], 3)
+        self._check_best_matches(
+            "append",
+            ["apend", "append", "prepend", "foo"],
+            3,
+        )
 
     def test_best_matches_case_sensitive(self) -> None:
-        self._check_best_matches("Sequence", ["sequence", "Sequence", "SEQUENCE"], 3)
+        self._check_best_matches(
+            "Sequence", ["sequence", "Sequence", "SEQUENCE"], 3
+        )
 
     def test_best_matches_n_larger_than_results(self) -> None:
         self._check_best_matches("foo", ["foo", "foobar"], 10)
@@ -5126,11 +5335,15 @@ except ImportError:
     _HAS_TYPE_KERNEL_STRFORMAT_TEST = False
 
 _NATIVE_STRFORMAT_ENABLED = (
-    bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")) and _HAS_TYPE_KERNEL_STRFORMAT_TEST
+    bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL"))
+    and _HAS_TYPE_KERNEL_STRFORMAT_TEST
 )
 
 
-@skipUnless(_NATIVE_STRFORMAT_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+@skipUnless(
+    _NATIVE_STRFORMAT_ENABLED,
+    "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext",
+)
 class NativeStrFormatSuite(Suite):
     """Parity tests for Rust format-string parsing (Stage 6b).
 
@@ -5204,19 +5417,9 @@ class NativeStrFormatSuite(Suite):
 
     def test_parse_conv_flags_width_precision(self) -> None:
         cases = [
-            "%05d",
-            "%-10s",
-            "%+d",
-            "%#x",
-            "%*d",
-            "%.*f",
-            "%10.2f",
-            "%-+5.3e",
-            "% #0*d",
-            "%8.0f",
-            "%5d",
-            "%.3s",
-            "%5.3f",
+            "%05d", "%-10s", "%+d", "%#x", "%*d", "%.*f",
+            "%10.2f", "%-+5.3e", "% #0*d", "%8.0f",
+            "%5d", "%.3s", "%5.3f",
         ]
         for s in cases:
             self._set_active(False)
@@ -5240,20 +5443,9 @@ class NativeStrFormatSuite(Suite):
 
         ctx = Context()
         cases = [
-            "{}",
-            "{name}",
-            "{0}",
-            "{0:d}",
-            "{name!r}",
-            "{{escaped}}",
-            "no targets",
-            "",
-            "{a} {b}",
-            "{0}{1}{2}",
-            "{:.2f}",
-            "{:>10}",
-            "{:s}",
-            "{!s}",
+            "{}", "{name}", "{0}", "{0:d}", "{name!r}", "{{escaped}}",
+            "no targets", "", "{a} {b}", "{0}{1}{2}",
+            "{:.2f}", "{:>10}", "{:s}", "{!s}",
         ]
         for s in cases:
             self._set_active(False)
@@ -5283,19 +5475,9 @@ class NativeStrFormatSuite(Suite):
 
         ctx = Context()
         cases = [
-            "{}",
-            "{0}",
-            "{name}",
-            "{:s}",
-            "{:d}",
-            "{:.2f}",
-            "{:>10}",
-            "{!r}",
-            "{!s}",
-            "{0:d} {1:s}",
-            "{{literal}}",
-            "no specs",
-            "",
+            "{}", "{0}", "{name}", "{:s}", "{:d}", "{:.2f}",
+            "{:>10}", "{!r}", "{!s}", "{0:d} {1:s}",
+            "{{literal}}", "no specs", "",
             "{name!r:>{width}}",
         ]
         for s in cases:
@@ -5397,9 +5579,18 @@ class NativeMessagesSuite(Suite):
         assert_equal(_type_kernel.rust_quote_type_string("Module"), "Module")
         assert_equal(_type_kernel.rust_capitalize("hello"), "Hello")
         assert_equal(_type_kernel.rust_capitalize(""), "")
-        assert_equal(_type_kernel.rust_pretty_seq(["a", "b"], "or"), '"a" or "b"')
-        assert_equal(_type_kernel.rust_format_string_list(["a", "b", "c"]), "a, b and c")
-        assert_equal(_type_kernel.rust_format_item_name_list(["a", "b"]), '("a", "b")')
+        assert_equal(
+            _type_kernel.rust_pretty_seq(["a", "b"], "or"),
+            '"a" or "b"',
+        )
+        assert_equal(
+            _type_kernel.rust_format_string_list(["a", "b", "c"]),
+            "a, b and c",
+        )
+        assert_equal(
+            _type_kernel.rust_format_item_name_list(["a", "b"]),
+            '("a", "b")',
+        )
         assert_equal(
             _type_kernel.rust_wrong_type_arg_count(1, 1, "0", "List"),
             '"List" expects 1 type argument, but none given',
@@ -5478,7 +5669,11 @@ class NativeMessagesSuite(Suite):
 
     def test_callable_simple(self) -> None:
         c = CallableType(
-            [self.fx.a, self.fx.b], [ARG_POS, ARG_POS], [None, None], self.fx.o, self.fx.function
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
         )
         self.assert_format_par(c)
 
@@ -5486,14 +5681,27 @@ class NativeMessagesSuite(Suite):
         # Named-arg callables use pretty_callable, which needs FuncDef
         # data not present in the wire format, so the Rust path defers
         # (returns None) and Python formats instead.
-        c = CallableType([self.fx.a], [ARG_NAMED], ["x"], self.fx.o, self.fx.function)
+        c = CallableType(
+            [self.fx.a],
+            [ARG_NAMED],
+            ["x"],
+            self.fx.o,
+            self.fx.function,
+        )
         actual = _type_kernel.rust_format_type_bare(
             self._bytes_of(c), self.resolver, 0, False, True
         )
         self.assertIsNone(actual, "named-arg callable should defer to Python")
 
     def test_ellipsis_callable(self) -> None:
-        c = CallableType([], [], [], self.fx.o, self.fx.function, is_ellipsis_args=True)
+        c = CallableType(
+            [],
+            [],
+            [],
+            self.fx.o,
+            self.fx.function,
+            is_ellipsis_args=True,
+        )
         self.assert_format_par(c)
 
     def test_tuple_type(self) -> None:
@@ -5515,7 +5723,12 @@ class NativeMessagesSuite(Suite):
         # treats the fallback as anonymous.
         fb_ti = self.fx.make_type_info("typing._TypedDict")
         fb = Instance(fb_ti, [])
-        t = TypedDictType({"x": self.fx.a, "y": self.fx.b}, {"x"}, set(), fb)
+        t = TypedDictType(
+            {"x": self.fx.a, "y": self.fx.b},
+            {"x"},
+            set(),
+            fb,
+        )
         self.assert_format_par(t)
 
     def test_deleted_type(self) -> None:
@@ -5552,19 +5765,8 @@ class NativeMessagesSuite(Suite):
         from mypy.messages import append_union_note
 
         # 11 items clears MAX_UNION_ITEMS so the non-matching tail can fire.
-        items = [
-            self.fx.a,
-            self.fx.b,
-            self.fx.c,
-            self.fx.d,
-            self.fx.e,
-            self.fx.f,
-            self.fx.e2,
-            self.fx.e3,
-            self.fx.o,
-            self.fx.str_type,
-            self.fx.bool_type,
-        ]
+        items = [self.fx.a, self.fx.b, self.fx.c, self.fx.d, self.fx.e, self.fx.f,
+                 self.fx.e2, self.fx.e3, self.fx.o, self.fx.str_type, self.fx.bool_type]
         arg_u = UnionType.make_union(items)
         exp_u = UnionType.make_union([self.fx.a, self.fx.b])
         expected = append_union_note([], arg_u, exp_u, self.options)
@@ -5595,8 +5797,6 @@ class NativeMessagesSuite(Suite):
         )
         self.assertIsNotNone(actual, "rust pretty_callable deferred on a plain callable")
         assert_equal(actual, expected, "pretty_callable mismatch")
-
-
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckPatternSuite(Suite):
     """Parity tests for the M22 checkpattern Rust helpers.
@@ -5711,7 +5911,10 @@ class NativeCheckPatternSuite(Suite):
         int_type = Instance(int_info, [])
         self_match_union = UnionType.make_union([int_type])
         result = _type_kernel.rust_should_self_match(
-            self._bytes_of(self.fx.a), False, self._bytes_of(self_match_union), resolver
+            self._bytes_of(self.fx.a),
+            False,
+            self._bytes_of(self_match_union),
+            resolver,
         )
         assert result is False
 
@@ -5725,7 +5928,10 @@ class NativeCheckPatternSuite(Suite):
         self_match_union = UnionType.make_union([int_type])
         any_t = AnyType(TypeOfAny.special_form)
         result = _type_kernel.rust_should_self_match(
-            self._bytes_of(any_t), False, self._bytes_of(self_match_union), resolver
+            self._bytes_of(any_t),
+            False,
+            self._bytes_of(self_match_union),
+            resolver,
         )
         assert result is False
 
@@ -5736,7 +5942,9 @@ class NativeCheckPatternSuite(Suite):
 
         seq_info = self.fx.make_type_info("typing.Sequence", mro=[self.fx.oi])
         str_info = self.fx.make_type_info("builtins.str")
-        resolver = build_native_resolver([seq_info, str_info, self.fx.oi], [])
+        resolver = build_native_resolver(
+            [seq_info, str_info, self.fx.oi], []
+        )
         non_seq_union = UnionType.make_union([Instance(str_info, [])])
         seq_type = Instance(seq_info, [self.fx.a])
         # object: is_subtype(str, object) is False (non_seq check passes),
@@ -5820,11 +6028,14 @@ class NativeCheckCallSuite(Suite):
 
         return tk.rust_real_union(self._serialize(t), strict_optional)
 
-    def _rust_overlap(self, arg_types: list[Type], targets: list[Type]) -> bool | None:
+    def _rust_overlap(
+        self, arg_types: list[Type], targets: list[Type]
+    ) -> bool | None:
         import type_kernel as tk
 
         return tk.rust_possible_none_type_var_overlap(
-            [self._serialize(t) for t in arg_types], [self._serialize(t) for t in targets]
+            [self._serialize(t) for t in arg_types],
+            [self._serialize(t) for t in targets],
         )
 
     def _py_real_union(self, t: Type, strict_optional: bool) -> bool:
@@ -5876,9 +6087,7 @@ class NativeCheckCallSuite(Suite):
 
     # --- possible_none_type_var_overlap ---
 
-    def _callable(
-        self, arg_types: list[Type], variables: list[Type] | None = None
-    ) -> CallableType:
+    def _callable(self, arg_types: list[Type], variables: list[Type] | None = None) -> CallableType:
         return CallableType(
             arg_types,
             [ARG_POS] * len(arg_types),
@@ -5948,7 +6157,9 @@ class NativeCheckCallSuite(Suite):
         assert self._rust_overlap([arg], [target1, target2]) is False
 
 
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
 class NativeServerDepsSuite(Suite):
     """Parity tests for the Rust `get_type_triggers` port (M28).
 
@@ -5976,7 +6187,11 @@ class NativeServerDepsSuite(Suite):
         py = get_type_triggers(typ, use_logical)
         self._set_active(True)
         rs = get_type_triggers(typ, use_logical)
-        assert_equal(rs, py, f"Rust/Python mismatch for {typ!r} (logical={use_logical})")
+        assert_equal(
+            rs,
+            py,
+            f"Rust/Python mismatch for {typ!r} (logical={use_logical})",
+        )
         return rs
 
     def test_instance_simple(self) -> None:
@@ -5996,7 +6211,9 @@ class NativeServerDepsSuite(Suite):
         assert_equal(triggers, [])
 
     def test_any_with_missing_import(self) -> None:
-        any_t = AnyType(TypeOfAny.from_unimported_type, missing_import_name="missing_mod")
+        any_t = AnyType(
+            TypeOfAny.from_unimported_type, missing_import_name="missing_mod"
+        )
         triggers = self._triggers(any_t)
         assert_equal(triggers, [self.make_trigger("missing_mod")])
 
@@ -6013,7 +6230,11 @@ class NativeServerDepsSuite(Suite):
         triggers = self._triggers(t)
         assert_equal(
             triggers,
-            [self.make_trigger("A"), self.make_trigger("B"), self.make_trigger("builtins.tuple")],
+            [
+                self.make_trigger("A"),
+                self.make_trigger("B"),
+                self.make_trigger("builtins.tuple"),
+            ],
         )
 
     def test_union_type(self) -> None:
@@ -6024,7 +6245,10 @@ class NativeServerDepsSuite(Suite):
     def test_type_var(self) -> None:
         triggers = self._triggers(self.fx.t)
         # The fixture TypeVar has fullname "T" set, plus upper_bound (object).
-        assert_equal(triggers, [self.make_trigger("T"), self.make_trigger("builtins.object")])
+        assert_equal(
+            triggers,
+            [self.make_trigger("T"), self.make_trigger("builtins.object")],
+        )
 
     def test_type_type_no_logical(self) -> None:
         triggers = self._triggers(self.fx.type_a, use_logical=False)
@@ -6061,8 +6285,12 @@ class NativeServerDepsSuite(Suite):
         assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
 
     def test_overloaded(self) -> None:
-        c1 = CallableType([self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function)
-        c2 = CallableType([self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function)
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        c2 = CallableType(
+            [self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
         ov = Overloaded([c1, c2])
         triggers = self._triggers(ov)
         assert_equal(triggers, [self.make_trigger("A"), self.make_trigger("B")])
@@ -6247,33 +6475,45 @@ class NativeCheckMemberSuite(Suite):
 
     def test_classify_member_access_instance(self) -> None:
         # Instance -> MA_INSTANCE (0).
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(self.fx.a))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(self.fx.a)
+        )
         assert code == 0
 
     def test_classify_member_access_none(self) -> None:
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(NoneType()))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(NoneType())
+        )
         assert code == 8
 
     def test_classify_member_access_union(self) -> None:
         u = UnionType([self.fx.a, self.fx.b])
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(u))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(u)
+        )
         assert code == 2
 
     def test_classify_member_access_type_type(self) -> None:
         tt = TypeType(self.fx.a)
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(tt))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(tt)
+        )
         assert code == 4
 
     def test_classify_member_access_deleted(self) -> None:
         from mypy.types import DeletedType
 
         dt = DeletedType("x")
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(dt))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(dt)
+        )
         assert code == 10
 
     def test_classify_member_access_uninhabited(self) -> None:
         ui = UninhabitedType()
-        code = self._tk.rust_classify_member_access(self.resolver, self._bytes_of(ui))
+        code = self._tk.rust_classify_member_access(
+            self.resolver, self._bytes_of(ui)
+        )
         assert code == 11
 
     def test_bind_self_fast_preserves_name(self) -> None:
@@ -6399,7 +6639,9 @@ class NativeCheckMemberSuite(Suite):
         v.has_explicit_value = True
         self.fx.ai.names["x"] = SymbolTableNode(MDEF, v)
         try:
-            local = self._tk.build_native_resolver([self.fx.bi, self.fx.ai, self.fx.oi], [])
+            local = self._tk.build_native_resolver(
+                [self.fx.bi, self.fx.ai, self.fx.oi], []
+            )
             self._set_resolver(local)
             self._set_active(False)
             try:
@@ -6471,7 +6713,11 @@ class NativeCheckMemberSuite(Suite):
         from mypy.checkmember import _deserialize_type_for_checkmember
 
         sig = CallableType(
-            arg_types=[], arg_kinds=[], arg_names=[], ret_type=self.fx.a, fallback=self.fx.function
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
         )
         expected = self._member_access_expected(self.fx.ga, self.fx.gi, sig)
         rust_bytes = self._rust_member_access(self.fx.ga, sig, "G")
@@ -6506,7 +6752,11 @@ class NativeCheckMemberSuite(Suite):
         from mypy.checkmember import _deserialize_type_for_checkmember
 
         sig = CallableType(
-            arg_types=[], arg_kinds=[], arg_names=[], ret_type=self.fx.a, fallback=self.fx.function
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
         )
         instance = Instance(self.fx.g2i, [self.fx.a])
         expected = self._member_access_expected(instance, self.fx.g2i, sig)
@@ -6519,27 +6769,47 @@ class NativeCheckMemberSuite(Suite):
 
     def test_instance_member_access_rust_none_for_overloaded(self) -> None:
         item = CallableType(
-            arg_types=[], arg_kinds=[], arg_names=[], ret_type=self.fx.a, fallback=self.fx.function
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
         )
         assert self._rust_member_access(self.fx.ga, Overloaded([item]), "G") is None
 
     def test_instance_member_access_rust_none_for_non_instance(self) -> None:
         # A non-Instance left operand is not handled: defer.
         sig = CallableType(
-            arg_types=[], arg_kinds=[], arg_names=[], ret_type=self.fx.a, fallback=self.fx.function
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
         )
         result = self._tk.rust_analyze_instance_member_access(
-            self.resolver, self._bytes_of(self.fx.o), self._bytes_of(sig), "G", False
+            self.resolver,
+            self._bytes_of(self.fx.o),
+            self._bytes_of(sig),
+            "G",
+            False,
         )
         assert result is None
 
     def test_instance_member_access_rust_none_for_unknown_class(self) -> None:
         # A method fullname with no resolver floor entry defers.
         sig = CallableType(
-            arg_types=[], arg_kinds=[], arg_names=[], ret_type=self.fx.a, fallback=self.fx.function
+            arg_types=[],
+            arg_kinds=[],
+            arg_names=[],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
         )
         result = self._tk.rust_analyze_instance_member_access(
-            self.resolver, self._bytes_of(self.fx.ga), self._bytes_of(sig), "NoSuchClass", False
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "NoSuchClass",
+            False,
         )
         assert result is None
 
@@ -6568,9 +6838,14 @@ class NativeCheckexprSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
-        from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
+        from librt.internal import (
+            ReadBuffer as _ReadBuffer,
+            WriteBuffer as _WriteBuffer,
+        )
 
-        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+        )
         from mypy.test.typefixture import TypeFixture
         from mypy.types import read_type as _read_type
 
@@ -6771,11 +7046,12 @@ class NativeCheckexprSuite(Suite):
         self.assertIsInstance(decoded, UnionType)
         self.assertEqual(len(decoded.items), 2)
 
-
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
 class NativeTypeAnalSuite(Suite):
     """Parity tests for `rust_type_analyze` — the TypeAnalyser.anal_type hot path.
 
@@ -6829,7 +7105,9 @@ class NativeTypeAnalSuite(Suite):
         rs = native_analyze_type(t, allow_unpack=True)
         assert rs is not None, f"Rust returned None for {type(t).__name__}: {t!r}"
         assert_equal(
-            str(rs), str(t), f"Rust/Python round-trip mismatch for {type(t).__name__}: {t!r}"
+            str(rs),
+            str(t),
+            f"Rust/Python round-trip mismatch for {type(t).__name__}: {t!r}",
         )
         return rs
 
@@ -6997,8 +7275,12 @@ class NativeTypeAnalSuite(Suite):
     # --- Overloaded ---
 
     def test_overloaded(self) -> None:
-        c1 = CallableType([self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function)
-        c2 = CallableType([self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function)
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        c2 = CallableType(
+            [self.fx.b], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
         ov = Overloaded([c1, c2])
         result = self._assert_par(ov)
         self.assertIsInstance(result, Overloaded)
@@ -7133,7 +7415,9 @@ class NativeStubgenRenderSuite(Suite):
         actual = self._tk.rust_stubgen_render(expr)
         assert actual is not None, f"Rust returned None for {expr!r}"
         assert_equal(
-            actual, expected, f"stubgen render mismatch: Python={expected!r} Rust={actual!r}"
+            actual,
+            expected,
+            f"stubgen render mismatch: Python={expected!r} Rust={actual!r}",
         )
 
     # --- NameExpr ---
@@ -7161,19 +7445,11 @@ class NativeStubgenRenderSuite(Suite):
         self._assert_render(self._idx(self._n("Optional"), self._n("str")))
 
     def test_index_list_tuple(self) -> None:
-        self._assert_render(
-            self._idx(
-                self._n("list"),
-                self._idx(self._n("tuple"), self._tup(self._n("str"), self._n("int"))),
-            )
-        )
+        self._assert_render(self._idx(self._n("list"), self._idx(self._n("tuple"), self._tup(self._n("str"), self._n("int")))))
 
     def test_index_callable(self) -> None:
         self._assert_render(
-            self._idx(
-                self._n("Callable"),
-                self._tup(self._lst(self._n("int"), self._n("str")), self._n("bool")),
-            )
+            self._idx(self._n("Callable"), self._tup(self._lst(self._n("int"), self._n("str")), self._n("bool")))
         )
 
     # --- UnaryExpr ---
@@ -7246,7 +7522,6 @@ class NativeStubgenRenderSuite(Suite):
 
     def test_template_str(self) -> None:
         self._assert_render(self._tmpl("test"))
-
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratorClassifySuite(Suite):

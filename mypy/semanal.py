@@ -438,11 +438,11 @@ except ImportError:
     _rust_names_modified_by_assignment = None  # type: ignore[assignment]
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
+    _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
     _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
-    _rust_classify_decorators = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -855,9 +855,9 @@ class SemanticAnalyzer(
                     "builtins.dict", [str_type, AnyType(TypeOfAny.special_form)]
                 )
                 if inst is None:
-                    assert (
-                        not self.final_iteration
-                    ), "Cannot find builtins.dict to add __annotations__"
+                    assert not self.final_iteration, (
+                        "Cannot find builtins.dict to add __annotations__"
+                    )
                     self.defer()
                     return
                 typ = inst
@@ -2024,9 +2024,9 @@ class SemanticAnalyzer(
             if self.is_defined_type_param(p.name):
                 self.fail(f'"{p.name}" already defined as a type parameter', context)
             else:
-                assert self.add_symbol(
-                    p.name, tv, context, no_progress=True, type_param=True
-                ), "Type parameter should not be discarded"
+                assert self.add_symbol(p.name, tv, context, no_progress=True, type_param=True), (
+                    "Type parameter should not be discarded"
+                )
 
         return tvs
 
@@ -7665,9 +7665,9 @@ class SemanticAnalyzer(
                             names = self.globals
                         else:
                             names_candidate = self.locals[-1 - i]
-                            assert (
-                                names_candidate is not None
-                            ), "Escaping comprehension from invalid scope"
+                            assert names_candidate is not None, (
+                                "Escaping comprehension from invalid scope"
+                            )
                             names = names_candidate
                         break
                 else:
