@@ -228,6 +228,7 @@ try:
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_build_tuple_type as _rust_build_tuple_type,
+        rust_check_operator as _rust_check_operator,
         rust_classify_call as _rust_classify_call,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
@@ -261,6 +262,7 @@ except ImportError:
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
+    _rust_check_operator = None  # type: ignore[assignment]
     _rust_has_bytes_component = None  # type: ignore[assignment]
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
@@ -600,6 +602,33 @@ def _try_native_analyze_cond_branch(
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
+
+
+def _try_native_operator_plan(
+    op_name: str, left_type: Type, right_type: Type, strict_optional: bool
+) -> int | None:
+    """Decide check_op_reversible's STEP 2a variant order via the Rust kernel.
+
+    Returns 0 (shortcut single), 2 (normal order), or None to defer to the
+    pure-Python chain. Rust never returns the code-1 (reverse-first) branch
+    since it needs covers_at_runtime, which is not portable.
+    """
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            return _rust_check_operator(
+                _native_checkexpr_resolver,
+                op_name,
+                _serialize_type_for_checkexpr(left_type),
+                _serialize_type_for_checkexpr(right_type),
+                strict_optional,
+            )
+        except (AssertionError, NotImplementedError, ValueError):
+            return None
+    return None
 
 
 # Stage 4 dispatch kinds mirroring `checkcall.rs`. Values must match
@@ -4832,7 +4861,19 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # We store the determined order inside the 'variants_raw' variable,
         # which records tuples containing the method, base type, and the argument.
 
-        if op_name in operators.op_methods_that_shortcut and is_same_type(left_type, right_type):
+        plan = _try_native_operator_plan(
+            op_name, left_type, right_type, self.chk.options.strict_optional
+        )
+        if plan == 0:
+            # Rust agrees with the shortcut single-variant branch below.
+            variants_raw = [(op_name, left_op, left_type, right_expr)]
+        elif plan == 2:
+            # Rust agrees with the normal-order else branch below.
+            variants_raw = [
+                (op_name, left_op, left_type, right_expr),
+                (rev_op_name, right_op, right_type, left_expr),
+            ]
+        elif op_name in operators.op_methods_that_shortcut and is_same_type(left_type, right_type):
             # When we do "A() + A()", for example, Python will only call the __add__ method,
             # never the __radd__ method.
             #
