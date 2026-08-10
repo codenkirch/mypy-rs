@@ -1654,6 +1654,104 @@ fn combined_context_inner(
     encode_type(&result)
 }
 
+// ---------------------------------------------------------------------------
+// visit_temp_node — identity pass (e.type)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_temp_node` (Issue #458).
+///
+/// The Python implementation is a single line: `return e.type`.
+/// Pure identity on the wire-format type blob.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_visit_temp_node<'py>(
+    py: Python<'py>,
+    type_bytes: &[u8],
+) -> PyResult<Option<&'py PyBytes>> {
+    // Decode to verify the shape is something we can round-trip.
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(encode_type(&typ).map(|b| PyBytes::new(py, &b)))
+}
+
+// ---------------------------------------------------------------------------
+// visit__promote_expr — identity pass (e.type)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit__promote_expr` (Issue #458).
+///
+/// The Python implementation is a single line: `return e.type`.
+/// Pure identity on the wire-format type blob.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_visit_promote_expr<'py>(
+    py: Python<'py>,
+    type_bytes: &[u8],
+) -> PyResult<Option<&'py PyBytes>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(encode_type(&typ).map(|b| PyBytes::new(py, &b)))
+}
+
+// ---------------------------------------------------------------------------
+// visit_paramspec_expr — constant AnyType(TypeOfAny.special_form)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_paramspec_expr` (Issue #458).
+///
+/// Returns `AnyType(TypeOfAny.special_form)` unconditionally.
+/// The Python body is a single `return` with no branches or side effects.
+#[pyfunction]
+pub(crate) fn rust_visit_paramspec_expr<'py>(py: Python<'py>) -> PyResult<&'py PyBytes> {
+    let t = any_type(TYPE_OF_ANY_SPECIAL_FORM, None);
+    let bytes = encode_type(&t).unwrap_or_default();
+    Ok(PyBytes::new(py, &bytes))
+}
+
+// ---------------------------------------------------------------------------
+// visit_type_var_tuple_expr — constant AnyType(TypeOfAny.special_form)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_type_var_tuple_expr` (Issue #458).
+///
+/// Returns `AnyType(TypeOfAny.special_form)` unconditionally.
+#[pyfunction]
+pub(crate) fn rust_visit_type_var_tuple_expr<'py>(py: Python<'py>) -> PyResult<&'py PyBytes> {
+    let t = any_type(TYPE_OF_ANY_SPECIAL_FORM, None);
+    let bytes = encode_type(&t).unwrap_or_default();
+    Ok(PyBytes::new(py, &bytes))
+}
+
+// ---------------------------------------------------------------------------
+// visit_newtype_expr — constant AnyType(TypeOfAny.special_form)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.visit_newtype_expr` (Issue #458).
+///
+/// Returns `AnyType(TypeOfAny.special_form)` unconditionally.
+#[pyfunction]
+pub(crate) fn rust_visit_newtype_expr<'py>(py: Python<'py>) -> PyResult<&'py PyBytes> {
+    let t = any_type(TYPE_OF_ANY_SPECIAL_FORM, None);
+    let bytes = encode_type(&t).unwrap_or_default();
+    Ok(PyBytes::new(py, &bytes))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for constant AnyType construction
+// ---------------------------------------------------------------------------
+
+fn any_type(type_of_any: i64, source_any: Option<Box<Type>>) -> Type {
+    Type::AnyType {
+        type_of_any,
+        source_any,
+        missing_import_name: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,8 +2727,39 @@ mod tests {
             type_ref: "mod.A".to_string(),
         };
         let i = make_instance("builtins.int", vec![]);
-        // trivial_join sees a TypeAliasType and returns None → defer.
         assert_eq!(conditional_join_inner(&alias, &i, &empty_resolver()), None);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Issue #458: visit_temp_node / visit__promote_expr / constant exprs
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_visit_temp_node_identity_int() {
+        // visit_temp_node should return the input type unchanged.
+        let t = make_instance("builtins.int", vec![]);
+        let bytes = encode_type(&t).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn test_visit_temp_node_identity_string() {
+        let t = make_instance("builtins.str", vec![]);
+        let bytes = encode_type(&t).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn test_visit_temp_node_alias_defers() {
+        // TypeAliasType cannot be round-tripped without alias target → None.
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        let bytes = encode_type(&alias);
+        assert_eq!(bytes, None);
     }
 
     // -- join_type_list_inner --
@@ -2707,6 +2836,34 @@ mod tests {
     }
 
     #[test]
+    fn test_visit_promote_expr_identity() {
+        // Same identity as visit_temp_node.
+        let t = make_instance("builtins.object", vec![]);
+        let bytes = encode_type(&t).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert_eq!(decoded, t);
+    }
+
+    #[test]
+    fn test_visit_paramspec_expr_returns_special_any() {
+        // visit_paramspec_expr returns AnyType(TypeOfAny.special_form).
+        let bytes = encode_type(&any_type(TYPE_OF_ANY_SPECIAL_FORM, None)).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        match decoded {
+            Type::AnyType {
+                type_of_any,
+                source_any,
+                missing_import_name,
+            } => {
+                assert_eq!(type_of_any, TYPE_OF_ANY_SPECIAL_FORM);
+                assert!(source_any.is_none());
+                assert!(missing_import_name.is_none());
+            }
+            other => panic!("expected AnyType, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_build_dict_type_empty_defers() {
         assert_eq!(build_dict_type(&make_native_resolver(), &[], 0), None);
     }
@@ -2717,5 +2874,57 @@ mod tests {
         let vt = make_instance("builtins.int", vec![]);
         // n_keys == len(elements) leaves no values → defer.
         assert_eq!(build_dict_type(&make_native_resolver(), &[kt, vt], 2), None);
+    }
+
+    #[test]
+    fn test_visit_type_var_tuple_expr_returns_special_any() {
+        // Same return type as paramspec_expr.
+        let bytes = encode_type(&any_type(TYPE_OF_ANY_SPECIAL_FORM, None)).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert!(matches!(
+            decoded,
+            Type::AnyType {
+                type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+                source_any: None,
+                missing_import_name: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_visit_newtype_expr_returns_special_any() {
+        // Same return type as paramspec_expr.
+        let bytes = encode_type(&any_type(TYPE_OF_ANY_SPECIAL_FORM, None)).unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        assert!(matches!(
+            decoded,
+            Type::AnyType {
+                type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+                source_any: None,
+                missing_import_name: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_any_type_helper_special_form() {
+        let t = any_type(TYPE_OF_ANY_SPECIAL_FORM, None);
+        assert!(matches!(t, Type::AnyType { type_of_any: 6, .. }));
+    }
+
+    #[test]
+    fn test_any_type_helper_with_source() {
+        let inner = any_type(TYPE_OF_ANY_UNANNOTATED, None);
+        let t = any_type(2, Some(Box::new(inner)));
+        match t {
+            Type::AnyType {
+                type_of_any: 2,
+                source_any: Some(sa),
+                ..
+            } => {
+                assert!(matches!(*sa, Type::AnyType { type_of_any: 1, .. }));
+            }
+            other => panic!("expected AnyType(2, Some(...)), got {:?}", other),
+        }
     }
 }

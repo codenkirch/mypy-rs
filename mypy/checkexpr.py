@@ -256,6 +256,11 @@ try:
         rust_star_expr as _rust_star_expr,
         rust_try_getting_literal as _rust_try_getting_literal,
         rust_tuple_context_matches as _rust_tuple_context_matches,
+        rust_visit_newtype_expr as _rust_visit_newtype_expr,
+        rust_visit_paramspec_expr as _rust_visit_paramspec_expr,
+        rust_visit_promote_expr as _rust_visit_promote_expr,
+        rust_visit_temp_node as _rust_visit_temp_node,
+        rust_visit_type_var_tuple_expr as _rust_visit_type_var_tuple_expr,
     )
 
     from mypy.types import read_type as _checkexpr_read_type
@@ -517,6 +522,59 @@ def _try_native_star_expr(type_bytes: bytes) -> bytes | None:
         return None
     try:
         return _rust_star_expr(type_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+# --- Issue #458: pure checkexpr visit_* identity / constant helpers ---
+
+
+def _try_native_visit_temp_node(type_bytes: bytes) -> bytes | None:
+    """Rust port of `visit_temp_node`: identity pass-through."""
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_visit_temp_node(type_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_visit_promote_expr(type_bytes: bytes) -> bytes | None:
+    """Rust port of `visit__promote_expr`: identity pass-through."""
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_visit_promote_expr(type_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_visit_paramspec_expr() -> bytes | None:
+    """Rust port of `visit_paramspec_expr`: returns AnyType(special_form)."""
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_visit_paramspec_expr()
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_visit_type_var_tuple_expr() -> bytes | None:
+    """Rust port of `visit_type_var_tuple_expr`: returns AnyType(special_form)."""
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_visit_type_var_tuple_expr()
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_visit_newtype_expr() -> bytes | None:
+    """Rust port of `visit_newtype_expr`: returns AnyType(special_form)."""
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_visit_newtype_expr()
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -7435,6 +7493,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return expr_type
 
     def visit_temp_node(self, e: TempNode) -> Type:
+        # Rust port exists but is not wired due to wire-format round-trip
+        # issues with plugin-injected types (attrs, singledispatch).
+        # See issue #458.
         return e.type
 
     def visit_type_var_expr(self, e: TypeVarExpr) -> Type:
@@ -7450,12 +7511,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return AnyType(TypeOfAny.special_form)
 
     def visit_paramspec_expr(self, e: ParamSpecExpr) -> Type:
+        # Rust port exists but is not wired due to wire-format round-trip issues.
         return AnyType(TypeOfAny.special_form)
 
     def visit_type_var_tuple_expr(self, e: TypeVarTupleExpr) -> Type:
+        # Rust port exists but is not wired due to wire-format round-trip issues.
         return AnyType(TypeOfAny.special_form)
 
     def visit_newtype_expr(self, e: NewTypeExpr) -> Type:
+        # Rust port exists but is not wired due to wire-format round-trip issues.
         return AnyType(TypeOfAny.special_form)
 
     def visit_namedtuple_expr(self, e: NamedTupleExpr) -> Type:
@@ -7489,6 +7553,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return AnyType(TypeOfAny.special_form)
 
     def visit__promote_expr(self, e: PromoteExpr) -> Type:
+        # Rust port exists but is not wired due to wire-format round-trip issues.
         return e.type
 
     def visit_star_expr(self, e: StarExpr) -> Type:

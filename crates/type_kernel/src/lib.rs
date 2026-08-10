@@ -506,6 +506,27 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_visitor::rust_can_have_shared_disjoint_base,
         module
     )?)?;
+    // Issue #458: pure checkexpr visitor identity/constant methods.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_temp_node,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_promote_expr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_paramspec_expr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_type_var_tuple_expr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_newtype_expr,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_is_trivial_bound, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_find_linear, module)?)?;
