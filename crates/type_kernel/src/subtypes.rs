@@ -20,7 +20,7 @@ use pyo3::prelude::*;
 use std::collections::HashSet;
 
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{self, ReadBuffer, Type};
+use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 /// Variance constants mirroring `mypy.nodes` (nodes.py:3146).
 pub(crate) const INVARIANT: i64 = 0;
@@ -1174,6 +1174,345 @@ fn check_type_parameter(
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     wire::read_type(&mut buf, None).ok()
+}
+
+// =====================================================================
+// Issue #465: pure-computation helpers from subtypes.py
+// =====================================================================
+
+/// `has_underscore_prefix` (subtypes.py:2453-2454): true when a name
+/// starts with `_` but is NOT a dunder (`__name__`).
+///
+/// Pure string function; no Type object or resolver needed.
+fn has_underscore_prefix(name: &str) -> bool {
+    name.starts_with('_') && !(name.starts_with("__") && name.ends_with("__"))
+}
+
+/// `#[pyfunction]` entry for `has_underscore_prefix`.
+#[pyfunction]
+pub(crate) fn rust_has_underscore_prefix(name: &str) -> bool {
+    has_underscore_prefix(name)
+}
+
+/// `is_erased_instance` (subtypes.py:2486-2500): true when an Instance
+/// has at least one arg and every arg is Any (after `get_proper_type`).
+/// `UnpackType` args are unpacked: the inner type must be
+/// `builtins.tuple` with `args[0]` being Any.
+///
+/// Returns `Some(bool)` when the wire form fully decodes; `None` when
+/// a `TypeAliasType` or other unhandled variant is in the tree (Python
+/// falls through with `get_proper_type` already applied).
+fn is_erased_instance(t: &Type) -> Option<bool> {
+    let Type::Instance { args, .. } = t else {
+        return Some(false);
+    };
+    if args.is_empty() {
+        return Some(false);
+    }
+    for arg in args {
+        if !is_erased_arg(arg)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Check a single arg of `is_erased_instance`. Returns `None` when the
+/// arg is a `TypeAliasType` (can't expand in the wire form); `Some(bool)`
+/// otherwise.
+fn is_erased_arg(arg: &Type) -> Option<bool> {
+    match arg {
+        Type::UnpackType { typ } => {
+            // get_proper_type(arg.type) — UnpackType wraps an Instance.
+            let inner = typ.as_ref();
+            if !matches!(inner, Type::Instance { .. }) {
+                return Some(false);
+            }
+            let Type::Instance {
+                type_ref,
+                args: inner_args,
+                ..
+            } = inner
+            else {
+                return Some(false);
+            };
+            if type_ref != "builtins.tuple" {
+                return Some(false);
+            }
+            // get_proper_type(unpacked.args[0]) must be AnyType.
+            let first = inner_args.first()?;
+            match first {
+                Type::AnyType { .. } => Some(true),
+                Type::TypeAliasType { .. } => None,
+                _ => Some(false),
+            }
+        }
+        Type::AnyType { .. } => Some(true),
+        Type::TypeAliasType { .. } => None,
+        _ => Some(false),
+    }
+}
+
+/// `#[pyfunction]` entry for `is_erased_instance`.
+#[pyfunction]
+pub(crate) fn rust_is_erased_instance(t_bytes: &[u8]) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    is_erased_instance(&t)
+}
+
+/// `try_restrict_literal_union` (subtypes.py:2264-2282): return the
+/// items of `t` (a UnionType) excluding any occurrence of `s`, iff
+/// every item and `s` are simple literals. Otherwise return `None`.
+///
+/// Returns `Some(Vec<Vec<u8>>)` (serialized remaining items) or `None`
+/// (not all simple literals, or a decode failure). An empty `Vec` means
+/// all items matched `s` (the union reduces to `Never`).
+fn try_restrict_literal_union(
+    t: &Type,
+    s: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Vec<u8>>> {
+    let Type::UnionType { items, .. } = t else {
+        return None;
+    };
+    let s_is_simple = crate::typeops::is_simple_literal(s, resolver)?;
+    if !s_is_simple {
+        return None;
+    }
+    let mut remaining: Vec<Vec<u8>> = Vec::new();
+    for item in items {
+        // relevant_items() (types.py:3517-3522): when strict_optional is
+        // off, NoneType items are skipped entirely.
+        if !strict_optional && matches!(item, Type::NoneType) {
+            continue;
+        }
+        let is_simple = crate::typeops::is_simple_literal(item, resolver)?;
+        if !is_simple {
+            return None;
+        }
+        // Compare by structural equality (get_proper_type already applied
+        // by the wire format — both are proper types here).
+        if item != s {
+            let mut buf = WriteBuffer::new();
+            wire::write_type(&mut buf, item).ok()?;
+            remaining.push(buf.into_bytes());
+        }
+    }
+    Some(remaining)
+}
+
+/// `#[pyfunction]` entry for `try_restrict_literal_union`.
+///
+/// Returns `Some(Vec<Vec<u8>>)` (serialized remaining items) or `None`
+/// (not all simple literals, or decode failure). Python deserializes
+/// each item back to a `Type` via the wire format.
+#[pyfunction]
+pub(crate) fn rust_try_restrict_literal_union(
+    t_bytes: &[u8],
+    s_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<Vec<u8>>> {
+    let t = decode_type(t_bytes)?;
+    let s = decode_type(s_bytes)?;
+    try_restrict_literal_union(&t, &s, strict_optional, resolver.resolver())
+}
+
+/// `is_more_precise` (subtypes.py:2355-2366): left is more precise than
+/// right when right is Any (any left qualifies), or left is a proper
+/// subtype of right.
+///
+/// Mirrors the Python: `right = get_proper_type(right); if isinstance(right,
+/// AnyType): return True; return is_proper_subtype(left, right, ...)`.
+/// The `get_proper_type` expansion is handled by the wire format (the
+/// Python shim serializes after expansion). `ignore_promotions` flows
+/// into the `SubtypeContext`.
+fn is_more_precise(
+    left: &Type,
+    right: &Type,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    // right is AnyType (after get_proper_type) -> True.
+    if matches!(right, Type::AnyType { .. }) {
+        return Some(true);
+    }
+    // is_proper_subtype(left, right, ignore_promotions=...)
+    let ctx = SubtypeContext::new(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        ignore_promotions,
+        true, // proper_subtype
+        strict_optional,
+    );
+    is_subtype(left, right, &ctx, resolver)
+}
+
+/// `#[pyfunction]` entry for `is_more_precise`.
+#[pyfunction]
+pub(crate) fn rust_is_more_precise(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    is_more_precise(
+        &left,
+        &right,
+        ignore_promotions,
+        strict_optional,
+        resolver.resolver(),
+    )
+}
+
+/// `is_equivalent` (subtypes.py:277-300): a <: b AND b <: a (non-proper
+/// subtype both ways). The Python shim handles `get_proper_type` and
+/// the `left == right` fast path before calling Rust.
+fn is_equivalent(
+    a: &Type,
+    b: &Type,
+    ignore_type_params: bool,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    let ctx = SubtypeContext::new(
+        ignore_type_params,
+        false, // ignore_declared_variance
+        false, // always_covariant
+        false, // ignore_promotions
+        false, // proper_subtype
+        strict_optional,
+    );
+    let fwd = is_subtype(a, b, &ctx, resolver)?;
+    if !fwd {
+        return Some(false);
+    }
+    let bwd = is_subtype(b, a, &ctx, resolver)?;
+    Some(fwd && bwd)
+}
+
+/// `#[pyfunction]` entry for `is_equivalent`.
+#[pyfunction]
+pub(crate) fn rust_is_equivalent(
+    a_bytes: &[u8],
+    b_bytes: &[u8],
+    ignore_type_params: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let a = decode_type(a_bytes)?;
+    let b = decode_type(b_bytes)?;
+    is_equivalent(
+        &a,
+        &b,
+        ignore_type_params,
+        strict_optional,
+        resolver.resolver(),
+    )
+}
+
+/// `is_same_type` (subtypes.py:303-335): a and b are proper subtypes of
+/// each other, with fast paths for common Instance and TypeVarType pairs.
+///
+/// Fast path 1 (Instance): same `type_ref`, same arg count, same
+/// `last_known_value` identity -> recurse on args.
+/// Fast path 2 (TypeVarType): same `raw_id`+`namespace` and same
+/// `upper_bound` -> True.
+/// General: `is_proper_subtype(a, b) and is_proper_subtype(b, a)`.
+fn is_same_type(
+    a: &Type,
+    b: &Type,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    // Fast path 1: both Instance, same type_ref, same arg count, same lkv.
+    if let (
+        Type::Instance {
+            type_ref: ra,
+            args: aa,
+            last_known_value: la,
+            ..
+        },
+        Type::Instance {
+            type_ref: rb,
+            args: ab,
+            last_known_value: lb,
+            ..
+        },
+    ) = (a, b)
+    {
+        if ra == rb && aa.len() == ab.len() && la == lb {
+            for (x, y) in aa.iter().zip(ab.iter()) {
+                let same = is_same_type(x, y, ignore_promotions, strict_optional, resolver)?;
+                if !same {
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+    }
+    // Fast path 2: both TypeVarType, same id (raw_id + namespace), same upper_bound.
+    if let (
+        Type::TypeVarType {
+            raw_id: ia,
+            namespace: na,
+            upper_bound: ua,
+            ..
+        },
+        Type::TypeVarType {
+            raw_id: ib,
+            namespace: nb,
+            upper_bound: ub,
+            ..
+        },
+    ) = (a, b)
+    {
+        if ia == ib && na == nb && ua == ub {
+            return Some(true);
+        }
+    }
+    // General: is_proper_subtype both ways.
+    let ctx = SubtypeContext::new(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        ignore_promotions,
+        true, // proper_subtype
+        strict_optional,
+    );
+    let fwd = is_subtype(a, b, &ctx, resolver)?;
+    if !fwd {
+        return Some(false);
+    }
+    let bwd = is_subtype(b, a, &ctx, resolver)?;
+    Some(fwd && bwd)
+}
+
+/// `#[pyfunction]` entry for `is_same_type`.
+#[pyfunction]
+pub(crate) fn rust_is_same_type(
+    a_bytes: &[u8],
+    b_bytes: &[u8],
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let a = decode_type(a_bytes)?;
+    let b = decode_type(b_bytes)?;
+    is_same_type(
+        &a,
+        &b,
+        ignore_promotions,
+        strict_optional,
+        resolver.resolver(),
+    )
 }
 
 /// `#[pyfunction]` entry: the Python-side shim calls this with the
