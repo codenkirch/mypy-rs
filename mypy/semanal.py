@@ -427,6 +427,7 @@ try:
         rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
+        rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -449,6 +450,7 @@ except ImportError:
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
     _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
+    _rust_var_is_typing_special_form = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -3113,20 +3115,61 @@ class SemanticAnalyzer(
 
     def visit_import(self, i: Import) -> None:
         self.statement = i
-        for id, as_id in i.ids:
-            # Modules imported in a stub file without using 'import X as X' won't get exported
-            # When implicit re-exporting is disabled, we have the same behavior as stubs.
-            use_implicit_reexport = not self.is_stub_file and self.options.implicit_reexport
-            if as_id is not None:
-                base_id = id
-                imported_id = as_id
-                module_public = use_implicit_reexport or id == as_id
+        use_implicit_reexport = not self.is_stub_file and self.options.implicit_reexport
+        # Issue #444: native import classification (strangler-fig). Rust
+        # computes (imported_id, base_id, module_public, kind) for every
+        # id in one call; the side effects (SymbolTableNode construction,
+        # add_imported_symbol / add_unknown_imported_symbol) stay in Python.
+        # When the classifier returns None the pure loop below runs unchanged.
+        classifications: list[tuple[str, str, bool, int | None]] | None = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_classify_imports(
+                    i.ids,
+                    self.is_stub_file,
+                    self.options.implicit_reexport,
+                    self.modules,
+                    self.scope_stack,
+                    self.type,
+                )
+                if result is not None and len(result) == len(i.ids):
+                    classifications = result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
+        for idx, (id, as_id) in enumerate(i.ids):
+            if classifications is not None:
+                imported_id, base_id, module_public, kind = classifications[idx]
             else:
-                base_id = id.split(".")[0]
-                imported_id = base_id
-                module_public = use_implicit_reexport
+                if as_id is not None:
+                    base_id = id
+                    imported_id = as_id
+                    module_public = use_implicit_reexport or id == as_id
+                else:
+                    base_id = id.split(".")[0]
+                    imported_id = base_id
+                    module_public = use_implicit_reexport
 
-            if base_id in self.modules:
+            if classifications is not None and kind is not None:
+                node = self.modules[base_id]
+                symbol = SymbolTableNode(
+                    kind, node, module_public=module_public, module_hidden=not module_public
+                )
+                self.add_imported_symbol(
+                    imported_id,
+                    symbol,
+                    context=i,
+                    module_public=module_public,
+                    module_hidden=not module_public,
+                )
+            elif classifications is not None:
+                self.add_unknown_imported_symbol(
+                    imported_id,
+                    context=i,
+                    target_name=base_id,
+                    module_public=module_public,
+                    module_hidden=not module_public,
+                )
+            elif base_id in self.modules:
                 node = self.modules[base_id]
                 if self.is_func_scope():
                     kind = LDEF
@@ -8447,6 +8490,15 @@ class SemanticAnalyzer(
 
     @staticmethod
     def var_is_typing_special_form(var: Var) -> bool:
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_var_is_typing_special_form is not None
+        ):
+            try:
+                return _rust_var_is_typing_special_form(var)
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         return var.fullname.startswith("typing") and var.fullname in [
             "typing.Annotated",
             "typing_extensions.Annotated",
