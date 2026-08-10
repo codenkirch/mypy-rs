@@ -398,6 +398,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_stmts::rust_partial_type_inference,
         module
     )?)?;
+    // Issue #387: identity-equality narrowing. Returns (if, else) type blobs
+    // or None to defer to the pure-Python path.
+    module.add_function(wrap_pyfunction!(
+        checker_stmts::rust_narrow_type_by_identity_equality,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_is_true_literal,
         module

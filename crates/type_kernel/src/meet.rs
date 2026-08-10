@@ -193,7 +193,7 @@ fn make_union(items: Vec<Type>) -> Type {
 
 /// The `_is_overlapping_types` recursive worker (meet.py:547-774).
 #[allow(clippy::too_many_arguments)]
-fn overlap(
+pub(crate) fn overlap(
     left: &Type,
     right: &Type,
     strict_optional: bool,

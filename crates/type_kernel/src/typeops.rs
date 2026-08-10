@@ -618,7 +618,7 @@ fn make_union(items: Vec<Type>) -> Type {
 /// captured at resolver-build time, when nonmember members (e.g.
 /// `z = nonmember(3)`) may not yet have their `Var.type` resolved, causing
 /// stale entries. Python reads `enum_members` live at type-check time.
-fn try_expanding_sum_type_to_union_inner(
+pub(crate) fn try_expanding_sum_type_to_union_inner(
     typ: &Type,
     target_fullname: Option<&str>,
     strict_optional: bool,
