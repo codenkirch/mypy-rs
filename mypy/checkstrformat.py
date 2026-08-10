@@ -140,12 +140,16 @@ try:
     _rust_parse_conversion_specifiers = _type_kernel.rust_parse_conversion_specifiers
     _rust_find_non_escaped_targets = _type_kernel.rust_find_non_escaped_targets
     _rust_parse_format_value = _type_kernel.rust_parse_format_value
+    _rust_parse_placeholder_format = _type_kernel.rust_parse_placeholder_format
+    _rust_analyze_conversion_specifiers = _type_kernel.rust_analyze_conversion_specifiers
     _HAS_TYPE_KERNEL_STRFORMAT = True
 except (ImportError, AttributeError):
     _rust_is_numeric_format_type = None  # type: ignore[assignment]
     _rust_parse_conversion_specifiers = None  # type: ignore[assignment]
     _rust_find_non_escaped_targets = None  # type: ignore[assignment]
     _rust_parse_format_value = None  # type: ignore[assignment]
+    _rust_parse_placeholder_format = None  # type: ignore[assignment]
+    _rust_analyze_conversion_specifiers = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL_STRFORMAT = False
 
 # Module-level flag read by the gates below. Set by the build manager from
@@ -165,6 +169,68 @@ def is_numeric_format_type(conv_type: str, is_new_style: bool) -> bool:
     if is_new_style:
         return conv_type in NUMERIC_TYPES_NEW
     return conv_type in NUMERIC_TYPES_OLD
+
+
+def parse_placeholder_format(
+    format_spec: str,
+) -> tuple[str | None, str | None, str | None, bool, bool, str, str | None, str, str] | None:
+    """Parse a format placeholder spec (the part after ':') into its components.
+
+    Returns (fill, align, sign, alternate, zero_pad, width, grouping,
+    precision, conv_type), or None if the spec does not match the built-in
+    format grammar.
+    """
+    if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+        return _rust_parse_placeholder_format(format_spec)
+    return _parse_placeholder_format_python(format_spec)
+
+
+def _parse_placeholder_format_python(
+    format_spec: str,
+) -> tuple[str | None, str | None, str | None, bool, bool, str, str | None, str, str] | None:
+    """Pure-Python fallback for parse_placeholder_format."""
+    m = FORMAT_RE_NEW.fullmatch(format_spec)
+    if m is None:
+        return None
+    gd = m.groupdict()
+    fill_align = gd.get("fill_align") or ""
+    fill: str | None = None
+    align: str | None = None
+    if fill_align:
+        if len(fill_align) == 2:
+            fill = fill_align[0]
+            align = fill_align[1]
+        else:
+            align = fill_align[0]
+    flags = gd.get("flags") or ""
+    sign: str | None = None
+    if flags and flags[0] in "+- ":
+        sign = flags[0]
+        flags = flags[1:]
+    alternate = "#" in flags
+    zero_pad = "0" in flags
+    width = gd.get("width") or ""
+    precision = gd.get("precision") or ""
+    conv_type = gd.get("type") or ""
+    # Grouping: check for _ or , in the remaining spec between width and precision.
+    # The regex doesn't capture grouping separately; we extract it from the
+    # full match by looking at what's between width and precision.
+    grouping: str | None = None
+    remaining = format_spec
+    if fill_align:
+        remaining = remaining[len(fill_align):]
+    if sign:
+        remaining = remaining[1:]
+    if alternate:
+        remaining = remaining[1:]
+    if zero_pad:
+        remaining = remaining[1:]
+    if width:
+        remaining = remaining[len(width):]
+    if remaining and remaining[0] in "_,[":
+        grouping = remaining[0]
+    return (fill, align, sign, alternate, zero_pad, width, grouping, precision, conv_type)
+
 
 # These types accept _only_ int.
 REQUIRE_INT_OLD: Final = {"o", "x", "X"}
@@ -836,6 +902,22 @@ class StringFormatterChecker:
     def analyze_conversion_specifiers(
         self, specifiers: list[ConversionSpecifier], context: Context
     ) -> bool | None:
+        if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
+            spec_infos = [
+                (spec.has_key(), spec.conv_type, spec.width, spec.precision)
+                for spec in specifiers
+            ]
+            result = _rust_analyze_conversion_specifiers(spec_infos)
+            if result is None:
+                has_star = any(spec.has_star() for spec in specifiers)
+                has_key = any(spec.has_key() for spec in specifiers)
+                if has_key and has_star:
+                    self.msg.string_interpolation_with_star_and_key(context)
+                    return None
+                self.msg.string_interpolation_mixing_key_and_non_keys(context)
+                return None
+            _has_star, has_key, _all_have_keys = result
+            return has_key
         has_star = any(specifier.has_star() for specifier in specifiers)
         has_key = any(specifier.has_key() for specifier in specifiers)
         all_have_keys = all(

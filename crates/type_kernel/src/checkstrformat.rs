@@ -516,6 +516,165 @@ fn parse_format_value_inner(format_value: &str, depth: u32) -> (i32, Vec<SpecTup
     (0, result)
 }
 
+// ===== Placeholder format spec taxonomy =====
+// Parses the format_spec (the part after ':' in a str.format() placeholder)
+// into its individual components, matching Python's FORMAT_RE_NEW structure.
+// Returns Option<(fill, align, sign, alt, zero_pad, width, grouping, precision, conv_type)>.
+
+/// Parsed placeholder format spec tuple returned to Python.
+/// Fields: (fill, align, sign, alternate, zero_pad, width, grouping, precision, conv_type)
+type PlaceholderSpecTuple = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
+    bool,
+    String,
+    Option<String>,
+    String,
+    String,
+);
+
+/// Parse a format placeholder spec string (the part after `:`) into its
+/// individual components. This mirrors the num_spec portion of FORMAT_RE_NEW.
+///
+/// Returns None if the spec does not match the built-in format grammar.
+/// On success, returns the decomposed fields:
+/// - fill: optional single char before align
+/// - align: one of < > = ^ or None
+/// - sign: one of + - space or None
+/// - alternate: # present
+/// - zero_pad: 0 present after # (if any)
+/// - width: digit string or ""
+/// - grouping: _ or , or None
+/// - precision: ".NNN" or ""
+/// - conv_type: single char or ""
+#[pyfunction]
+pub fn rust_parse_placeholder_format(format_spec: &str) -> Option<PlaceholderSpecTuple> {
+    parse_placeholder_format_inner(format_spec)
+}
+
+fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
+    // The input is the format_spec WITHOUT the leading colon, i.e. the part
+    // after ':' in the placeholder. This is what FORMAT_RE_NEW's format_spec
+    // group captures (minus the leading ':').
+    let bytes = spec.as_bytes();
+    let n = bytes.len();
+    let mut idx = 0;
+
+    // fill_align: .?[<>=^]? (greedy: tries 2 chars then 1)
+    let (fill, align) = if idx + 1 < n && matches!(bytes[idx + 1], b'<' | b'>' | b'=' | b'^') {
+        let f = Some(char::from(bytes[idx]).to_string());
+        let a = Some(char::from(bytes[idx + 1]).to_string());
+        idx += 2;
+        (f, a)
+    } else if idx < n && matches!(bytes[idx], b'<' | b'>' | b'=' | b'^') {
+        let a = Some(char::from(bytes[idx]).to_string());
+        idx += 1;
+        (None, a)
+    } else {
+        (None, None)
+    };
+
+    // sign: [+\- ]?
+    let sign = if idx < n && matches!(bytes[idx], b'+' | b'-' | b' ') {
+        let s = Some(char::from(bytes[idx]).to_string());
+        idx += 1;
+        s
+    } else {
+        None
+    };
+
+    // alternate: #?
+    let alternate = if idx < n && bytes[idx] == b'#' {
+        idx += 1;
+        true
+    } else {
+        false
+    };
+
+    // zero_pad: 0?
+    let zero_pad = if idx < n && bytes[idx] == b'0' {
+        idx += 1;
+        true
+    } else {
+        false
+    };
+
+    // width: \d+? (greedy, optional)
+    let width_start = idx;
+    while idx < n && bytes[idx].is_ascii_digit() {
+        idx += 1;
+    }
+    let width = String::from_utf8_lossy(&bytes[width_start..idx]).into_owned();
+
+    // grouping: [_,]? (optional)
+    let grouping = if idx < n && matches!(bytes[idx], b'_' | b',') {
+        let g = Some(char::from(bytes[idx]).to_string());
+        idx += 1;
+        g
+    } else {
+        None
+    };
+
+    // precision: \.\d+? (optional, includes the dot)
+    let precision = if idx < n && bytes[idx] == b'.' {
+        let p_start = idx;
+        idx += 1;
+        while idx < n && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+        String::from_utf8_lossy(&bytes[p_start..idx]).into_owned()
+    } else {
+        String::new()
+    };
+
+    // conv_type: .? (optional, single char)
+    let conv_type = if idx < n {
+        let ch = char::from(bytes[idx]);
+        idx += 1;
+        ch.to_string()
+    } else {
+        String::new()
+    };
+
+    // Must consume all input for a full match.
+    if idx != n {
+        return None;
+    }
+
+    Some((
+        fill, align, sign, alternate, zero_pad, width, grouping, precision, conv_type,
+    ))
+}
+
+// ===== Conversion specifier analysis =====
+// Mirrors analyze_conversion_specifiers: classifies a list of specifiers into
+// whether they have mapping keys, star widths/precisions, etc. Pure analysis,
+// no mutation or error reporting — Python handles those.
+
+/// Spec info needed for analysis: (key_present, conv_type, width, precision).
+/// key_present is True if key is Some and not empty.
+type SpecInfo = (bool, String, String, String);
+
+/// Analysis result: (has_star, has_key, all_have_keys)
+/// Returns None on error (has_key and has_star, or has_key and not
+/// all_have_keys). Python maps None to the appropriate error message.
+#[pyfunction]
+pub fn rust_analyze_conversion_specifiers(specs: Vec<SpecInfo>) -> Option<(bool, bool, bool)> {
+    let has_star = specs.iter().any(|(_, _, w, p)| w == "*" || p == "*");
+    let has_key = specs.iter().any(|(kp, _, _, _)| *kp);
+    let all_have_keys = specs.iter().all(|(kp, ct, _, _)| *kp || ct == "%");
+
+    if has_key && has_star {
+        return None;
+    }
+    if has_key && !all_have_keys {
+        return None;
+    }
+    Some((has_star, has_key, all_have_keys))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,5 +791,158 @@ mod tests {
         assert_eq!(err, 0);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].9, Some("!r".to_string()));
+    }
+
+    #[test]
+    fn test_parse_placeholder_simple() {
+        let spec = rust_parse_placeholder_format("");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, width, _, _, conv_type) = spec.unwrap();
+        assert_eq!(width, "");
+        assert_eq!(conv_type, "");
+    }
+
+    #[test]
+    fn test_parse_placeholder_type_only() {
+        let spec = rust_parse_placeholder_format("d");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, _, _, _, conv_type) = spec.unwrap();
+        assert_eq!(conv_type, "d");
+    }
+
+    #[test]
+    fn test_parse_placeholder_width_and_type() {
+        let spec = rust_parse_placeholder_format("10d");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, width, _, _, conv_type) = spec.unwrap();
+        assert_eq!(width, "10");
+        assert_eq!(conv_type, "d");
+    }
+
+    #[test]
+    fn test_parse_placeholder_align() {
+        let spec = rust_parse_placeholder_format("<10s");
+        assert!(spec.is_some());
+        let (fill, align, _, _, _, width, _, _, conv_type) = spec.unwrap();
+        assert_eq!(fill, None);
+        assert_eq!(align, Some("<".to_string()));
+        assert_eq!(width, "10");
+        assert_eq!(conv_type, "s");
+    }
+
+    #[test]
+    fn test_parse_placeholder_fill_and_align() {
+        let spec = rust_parse_placeholder_format("x<10s");
+        assert!(spec.is_some());
+        let (fill, align, _, _, _, _, _, _, _) = spec.unwrap();
+        assert_eq!(fill, Some("x".to_string()));
+        assert_eq!(align, Some("<".to_string()));
+    }
+
+    #[test]
+    fn test_parse_placeholder_sign_and_alt() {
+        let spec = rust_parse_placeholder_format("+#010x");
+        assert!(spec.is_some());
+        let (_, _, sign, alt, zero, width, _, _, conv_type) = spec.unwrap();
+        assert_eq!(sign, Some("+".to_string()));
+        assert!(alt);
+        assert!(zero);
+        assert_eq!(width, "10");
+        assert_eq!(conv_type, "x");
+    }
+
+    #[test]
+    fn test_parse_placeholder_precision() {
+        let spec = rust_parse_placeholder_format(".2f");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, _, _, precision, conv_type) = spec.unwrap();
+        assert_eq!(precision, ".2");
+        assert_eq!(conv_type, "f");
+    }
+
+    #[test]
+    fn test_parse_placeholder_grouping() {
+        let spec = rust_parse_placeholder_format(",d");
+        assert!(spec.is_some());
+        let (_, _, _, _, _, _, grouping, _, conv_type) = spec.unwrap();
+        assert_eq!(grouping, Some(",".to_string()));
+        assert_eq!(conv_type, "d");
+    }
+
+    #[test]
+    fn test_parse_placeholder_full() {
+        // "x<+#012,.3f" — fill=x, align=<, sign=+, alt=#, zero=0, width=12, grouping=,, precision=.3, type=f
+        let spec = rust_parse_placeholder_format("x<+#012,.3f");
+        assert!(spec.is_some());
+        let (fill, align, sign, alt, zero, width, grouping, precision, conv_type) = spec.unwrap();
+        assert_eq!(fill, Some("x".to_string()));
+        assert_eq!(align, Some("<".to_string()));
+        assert_eq!(sign, Some("+".to_string()));
+        assert!(alt);
+        assert!(zero);
+        assert_eq!(width, "12");
+        assert_eq!(grouping, Some(",".to_string()));
+        assert_eq!(precision, ".3");
+        assert_eq!(conv_type, "f");
+    }
+
+    #[test]
+    fn test_parse_placeholder_invalid() {
+        // After consuming the type char, extra characters = no fullmatch
+        let spec = rust_parse_placeholder_format("d extra");
+        assert!(spec.is_none());
+    }
+
+    #[test]
+    fn test_analyze_specs_simple() {
+        let specs = vec![(false, "s".to_string(), "".to_string(), "".to_string())];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, Some((false, false, false)));
+    }
+
+    #[test]
+    fn test_analyze_specs_with_keys() {
+        let specs = vec![
+            (true, "s".to_string(), "".to_string(), "".to_string()),
+            (true, "d".to_string(), "".to_string(), "".to_string()),
+        ];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, Some((false, true, true)));
+    }
+
+    #[test]
+    fn test_analyze_specs_mixed_keys_error() {
+        let specs = vec![
+            (true, "s".to_string(), "".to_string(), "".to_string()),
+            (false, "d".to_string(), "".to_string(), "".to_string()),
+        ];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_analyze_specs_key_and_star_error() {
+        let specs = vec![(true, "s".to_string(), "*".to_string(), "".to_string())];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_analyze_specs_star_only() {
+        let specs = vec![(false, "d".to_string(), "*".to_string(), "".to_string())];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, Some((true, false, false)));
+    }
+
+    #[test]
+    fn test_analyze_specs_percent_excluded_from_key_check() {
+        // %% specifier has conv_type "%" and no key, but should not fail
+        // the all_have_keys check when other specs have keys.
+        let specs = vec![
+            (true, "s".to_string(), "".to_string(), "".to_string()),
+            (false, "%".to_string(), "".to_string(), "".to_string()),
+        ];
+        let result = rust_analyze_conversion_specifiers(specs);
+        assert_eq!(result, Some((false, true, true)));
     }
 }
