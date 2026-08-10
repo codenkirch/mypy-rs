@@ -3556,6 +3556,8 @@ def pretty_seq(args: Sequence[str], conjunction: str) -> str:
         return _rust_pretty_seq(list(args), conjunction)
     if _HAS_TYPE_KERNEL and _native_messages_active:
         return _type_kernel.rust_pretty_seq(list(args), conjunction)
+    if not args:
+        return ""
     quoted = ['"' + a + '"' for a in args]
     if len(quoted) == 1:
         return quoted[0]

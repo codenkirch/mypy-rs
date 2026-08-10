@@ -4144,6 +4144,7 @@ class NativeMeetSuite(Suite):
         assert meet_types(tup1, tup2) == tup1
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMeetUnboundSuite(Suite):
     """Parity suite for the Rust `visit_unbound_type` meet (Stage 3c M8r).
 
@@ -4235,6 +4236,7 @@ class NativeMeetUnboundSuite(Suite):
             assert isinstance(result, UnboundType)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMeetTypeVarTupleSuite(Suite):
     """Parity suite for the Rust `visit_type_var_tuple` meet (Stage 3c M8r).
 
@@ -4926,6 +4928,7 @@ class NativeWireFixupSuite(Suite):
         )
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTraverserSuite(Suite):
     """Parity suite for the native AST traverser (Stage 14, #304).
 
@@ -5215,6 +5218,7 @@ class NativeTraverserSuite(Suite):
 
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSuggestionsSuite(Suite):
     """Parity suite for M27: did-you-mean suggestion ranking and formatting.
 
@@ -7322,6 +7326,7 @@ class NativeTypeAnalSuite(Suite):
         self.assertIsInstance(result.arg_types[0], Instance)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeStubgenRenderSuite(Suite):
     """Parity tests for the stubgen AliasPrinter render port (native).
 
