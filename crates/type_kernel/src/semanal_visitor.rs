@@ -1285,4 +1285,3 @@ pub(crate) fn rust_lookup(
     // variable is always False here.
     Ok(Some(("not_found".to_string(), None)))
 }
-
