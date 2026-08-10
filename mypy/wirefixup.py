@@ -59,6 +59,10 @@ def fixup_wire_type(typ: Type) -> Type | None:
     is absent, so the caller can defer to Python.
     """
     if _wire_typeinfo_map is None:
+        # No typeinfo map (erasetype/typeops seam): cannot resolve
+        # NOT_READY singletons, so evict them; a poisoned cache Instance
+        # must never leak into the type graph via a later read_type.
+        fixup_instance_cache()
         return None
     fixer = _TypeRefFixer(_wire_typeinfo_map)
     result = typ.accept(fixer)
@@ -76,18 +80,39 @@ def fixup_instance_cache() -> None:
     read_type populates instance_cache with NOT_READY Instances when it
     encounters INSTANCE_OBJECT/INSTANCE_STR/etc. tags. These must be
     resolved to live TypeInfo before they leak into the type graph.
+
+    Unresolvable singletons are evicted (not left in place): the cached
+    Instance may be wired into a type (e.g. copy_type's TypeShallowCopier
+    reuses the shared object), and its type_ref is never cleared in the
+    Python fallback. Keeping it would poison the shared cache for the
+    next read_type and the fixture cache with a FakeInfo object.
+
+    With no typeinfo map installed, every NOT_READY singleton is
+    unresolvable, so all are evicted.
     """
-    if _wire_typeinfo_map is None:
-        return
     from mypy.types import instance_cache
 
     for attr in ("str_type", "function_type", "int_type", "bool_type", "object_type"):
         inst = getattr(instance_cache, attr)
-        if inst is not None and inst.type_ref is not None:
-            info = _wire_typeinfo_map.get(inst.type_ref)
-            if info is not None and not isinstance(info, FakeInfo):
-                inst.type = info
-                inst.type_ref = None
+        if inst is None:
+            continue
+        if inst.type_ref is None:
+            # Already a live TypeInfo (or never wire-decoded): keep.
+            continue
+        if _wire_typeinfo_map is None:
+            # Nothing to resolve against: evict so the NOT_READY object
+            # cannot leak into the graph via a later read_type.
+            setattr(instance_cache, attr, None)
+            continue
+        info = _wire_typeinfo_map.get(inst.type_ref)
+        if info is not None and not isinstance(info, FakeInfo):
+            inst.type = info
+            inst.type_ref = None
+        else:
+            # Unresolvable (absent or FakeInfo placeholder): evict so a
+            # NOT_READY singleton wired to FakeInfo cannot survive. A
+            # later read_type recreates it and this pass fixes it up.
+            setattr(instance_cache, attr, None)
 
 
 class _FreshVarCanonicalizer(TypeTranslator):
@@ -178,7 +203,10 @@ class _TypeRefFixer(TypeTranslator):
     def visit_instance(self, t: Instance, /) -> Type:
         if t.type_ref is not None:
             info = self.typeinfo_map.get(t.type_ref)
-            if info is None:
+            if info is None or isinstance(info, FakeInfo):
+                # FakeInfo .type (NOT_READY placeholder, e.g. the
+                # builtins.bool cache singleton): defer to Python,
+                # never wire a fake TypeInfo into the graph.
                 self.missing = True
                 return t
             # Mutate in place: wire compact tags (INSTANCE_STR etc.)
