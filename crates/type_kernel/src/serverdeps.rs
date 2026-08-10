@@ -568,6 +568,185 @@ fn compute_module_prefix(
     None
 }
 
+// M388: Pure server update helpers (mypy/server/update.py).
+// These are pure data transformations — set dedup, dict construction,
+// regex string extraction — that have no dependency on live AST objects.
+
+/// Deduplicate a list of (module_id, path) tuples by module_id.
+///
+/// Mirrors `mypy.server.update:dedupe_modules` (line 744).
+#[pyfunction]
+pub fn rust_dedupe_modules(modules: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut result: Vec<(String, String)> = Vec::new();
+    for (id, path) in modules {
+        if seen.insert(id.clone()) {
+            result.push((id, path));
+        }
+    }
+    result
+}
+
+/// Build a module-to-path mapping from a graph dict.
+///
+/// Mirrors `mypy.server.update:get_module_to_path_map` (line 754).
+/// The Python `graph` is passed as a PyDict mapping module IDs to State objects.
+#[pyfunction]
+pub fn rust_get_module_to_path_map(
+    _py: Python<'_>,
+    graph: &PyDict,
+) -> PyResult<Vec<(String, String)>> {
+    let mut pairs: Vec<(String, String)> = Vec::with_capacity(graph.len());
+    for (module, node) in graph.iter() {
+        let module_id = module
+            .downcast::<PyString>()?
+            .to_str()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err("graph key is not a string"))?;
+        let xpath = node.getattr("xpath")?.extract::<String>().map_err(|_| {
+            pyo3::exceptions::PyAttributeError::new_err("node has no xpath attribute")
+        })?;
+        pairs.push((module_id.to_string(), xpath));
+    }
+    Ok(pairs)
+}
+
+/// Build a list of BuildSource objects from already-filtered changed-module info.
+///
+/// Mirrors `mypy.server.update:get_sources` (line 758).
+/// Takes a pre-filtered list of (module_id, path) pairs where the caller
+/// has already done `fscache.isfile(path)`. Constructs
+/// `BuildSource(path, id, None, followed=followed)` via FFI.
+#[pyfunction]
+pub fn rust_get_sources(
+    py: Python<'_>,
+    changed_modules: Vec<(String, String)>,
+    followed: bool,
+) -> PyResult<Vec<PyObject>> {
+    let build_source = py.import("mypy.build")?.getattr("BuildSource")?;
+    let none = py.None();
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("followed", followed)?;
+    let mut sources: Vec<PyObject> = Vec::new();
+    for (id, path) in changed_modules {
+        let src = build_source.call((&path, &id, &none), Some(kwargs))?;
+        sources.push(src.into());
+    }
+    Ok(sources)
+}
+
+/// Extract the file name prefix from a mypy message string.
+///
+/// Mirrors `mypy.server.update:extract_fnam_from_message` (line 1324).
+/// Matches `"module.py:123: error: ..."` → `"module.py"`.
+#[pyfunction]
+pub fn rust_extract_fnam_from_message(message: String) -> Option<String> {
+    // Manual regex match: prefix until `:`, then digits, then `: error|note: `
+    let mut ch = message.chars().peekable();
+    let mut prefix = String::new();
+    while let Some(&c) = ch.peek() {
+        if c == ':' {
+            break;
+        }
+        prefix.push(c);
+        ch.next();
+    }
+    if ch.next() != Some(':') {
+        return None;
+    }
+    // Check for digits
+    let mut has_digit = false;
+    while let Some(&c) = ch.peek() {
+        if c.is_ascii_digit() {
+            has_digit = true;
+            ch.next();
+        } else {
+            break;
+        }
+    }
+    if !has_digit {
+        return None;
+    }
+    if ch.next() != Some(':') {
+        return None;
+    }
+    let rest: String = ch.by_ref().collect();
+    if rest.starts_with(" error: ") || rest.starts_with(" note: ") {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+/// Extract possible file name prefix from a message.
+///
+/// Mirrors `mypy.server.update:extract_possible_fnam_from_message` (line 1331).
+/// Returns everything before the first `:` (may include non-path content).
+#[pyfunction]
+pub fn rust_extract_possible_fnam_from_message(message: String) -> String {
+    match message.split_once(':') {
+        Some((prefix, _)) => prefix.to_string(),
+        None => message,
+    }
+}
+
+/// Sort messages so file order is preserved.
+///
+/// Mirrors `mypy.server.update:sort_messages_preserving_file_order` (line 1336).
+/// Groups messages by file prefix and reorders groups to match prev_messages order.
+#[pyfunction]
+pub fn rust_sort_messages_preserving_file_order(
+    messages: Vec<String>,
+    prev_messages: Vec<String>,
+) -> Vec<String> {
+    // Phase 1: build file order from prev_messages
+    let mut order: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut n: usize = 0;
+    for msg in &prev_messages {
+        let fnam = rust_extract_fnam_from_message(msg.clone());
+        if let Some(f) = fnam {
+            if let std::collections::hash_map::Entry::Vacant(e) = order.entry(f) {
+                e.insert(n);
+                n += 1;
+            }
+        }
+    }
+
+    // Phase 2: group messages
+    let mut groups: Vec<(Option<usize>, Vec<String>)> = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let msg = &messages[i];
+        let maybe_fnam = rust_extract_possible_fnam_from_message(msg.clone());
+        let mut group = vec![msg.clone()];
+
+        if order.contains_key(&maybe_fnam) {
+            // Collect all lines related to this message
+            while i + 1 < messages.len() {
+                let next = &messages[i + 1];
+                let next_fnam = rust_extract_possible_fnam_from_message(next.clone());
+                let next_extracted = rust_extract_fnam_from_message(next.clone());
+
+                if next_fnam != maybe_fnam
+                    && next_extracted.is_none()
+                    && !next.starts_with("mypy: ")
+                {
+                    i += 1;
+                    group.push(next.clone());
+                } else {
+                    break;
+                }
+            }
+        }
+
+        groups.push((order.get(&maybe_fnam).copied(), group));
+        i += 1;
+    }
+
+    // Phase 3: sort groups by file order, then flatten
+    groups.sort_by_key(|g| g.0.unwrap_or(n));
+    groups.into_iter().flat_map(|(_, g)| g).collect()
+}
+
 // --- Helpers (for type-trigging; reused by serverdeps tests) ---
 
 #[cfg(test)]

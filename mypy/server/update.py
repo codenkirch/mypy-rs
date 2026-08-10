@@ -162,6 +162,35 @@ from mypy.server.trigger import WILDCARD_TAG, make_trigger
 from mypy.typestate import type_state
 from mypy.util import is_stdlib_file, module_prefix, split_target
 
+# Issue #388: pure server update helpers — native gate via type_kernel.
+try:
+    from type_kernel import (
+        rust_dedupe_modules as _rust_dedupe_modules,
+        rust_extract_fnam_from_message as _rust_extract_fnam_from_message,
+        rust_extract_possible_fnam_from_message as _rust_extract_possible_fnam_from_message,
+        rust_get_module_to_path_map as _rust_get_module_to_path_map,
+        rust_get_sources as _rust_get_sources,
+        rust_sort_messages_preserving_file_order as _rust_sort_messages_preserving_file_order,
+    )
+
+    _HAS_NATIVE_UPDATE = True
+except ImportError:
+    _rust_dedupe_modules = None  # type: ignore[assignment]
+    _rust_get_module_to_path_map = None  # type: ignore[assignment]
+    _rust_get_sources = None  # type: ignore[assignment]
+    _rust_extract_fnam_from_message = None  # type: ignore[assignment]
+    _rust_extract_possible_fnam_from_message = None  # type: ignore[assignment]
+    _rust_sort_messages_preserving_file_order = None  # type: ignore[assignment]
+    _HAS_NATIVE_UPDATE = False
+
+_native_update_active: bool = False
+
+
+def _set_native_update_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust update path."""
+    global _native_update_active
+    _native_update_active = active
+
 MAX_ITER: Final = 1000
 
 # These are modules beyond stdlib that have some special meaning for mypy.
@@ -742,6 +771,14 @@ def delete_module(module_id: str, path: str, graph: Graph, manager: BuildManager
 
 
 def dedupe_modules(modules: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    # Issue #388: native gate for dedupe_modules.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            result = _rust_dedupe_modules(modules)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     seen: set[str] = set()
     result = []
     for id, path in modules:
@@ -752,6 +789,14 @@ def dedupe_modules(modules: list[tuple[str, str]]) -> list[tuple[str, str]]:
 
 
 def get_module_to_path_map(graph: Graph) -> dict[str, str]:
+    # Issue #388: native gate for get_module_to_path_map.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            result = _rust_get_module_to_path_map(graph)
+            if result is not None:
+                return dict(result)
+        except Exception:
+            pass
     return {module: node.xpath for module, node in graph.items()}
 
 
@@ -761,7 +806,20 @@ def get_sources(
     changed_modules: list[tuple[str, str]],
     followed: bool,
 ) -> list[BuildSource]:
-    sources = []
+    # Issue #388: native gate for get_sources.
+    # The Rust path constructs BuildSource objects directly via FFI;
+    # Python still does its own fscache.isfile check for safety.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            filtered = [
+                (id, path) for id, path in changed_modules if fscache.isfile(path)
+            ]
+            result = _rust_get_sources(filtered, followed)
+            if result is not None:
+                return list(result)  # type: ignore[return-value]
+        except Exception:
+            pass
+    sources: list[BuildSource] = []
     for id, path in changed_modules:
         if fscache.isfile(path):
             sources.append(BuildSource(path, id, None, followed=followed))
@@ -1322,6 +1380,14 @@ def refresh_suppressed_submodules(
 
 
 def extract_fnam_from_message(message: str) -> str | None:
+    # Issue #388: native gate for extract_fnam_from_message.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            result = _rust_extract_fnam_from_message(message)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     m = re.match(r"([^:]+):[0-9]+: (error|note): ", message)
     if m:
         return m.group(1)
@@ -1329,6 +1395,14 @@ def extract_fnam_from_message(message: str) -> str | None:
 
 
 def extract_possible_fnam_from_message(message: str) -> str:
+    # Issue #388: native gate for extract_possible_fnam_from_message.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            result = _rust_extract_possible_fnam_from_message(message)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     # This may return non-path things if there is some random colon on the line
     return message.split(":", 1)[0]
 
@@ -1343,6 +1417,14 @@ def sort_messages_preserving_file_order(
     getting reshuffled continuously.  If there are messages in
     additional files, sort them towards the end.
     """
+    # Issue #388: native gate for sort_messages_preserving_file_order.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            result = _rust_sort_messages_preserving_file_order(messages, prev_messages)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     # Calculate file order from the previous messages
     n = 0
     order = {}

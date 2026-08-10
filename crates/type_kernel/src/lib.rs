@@ -632,6 +632,25 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         serverdeps::rust_compute_target_modules,
         module
     )?)?;
+    // M388: pure server update helpers (dedupe_modules, get_sources, message extraction)
+    module.add_function(wrap_pyfunction!(serverdeps::rust_dedupe_modules, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_get_module_to_path_map,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(serverdeps::rust_get_sources, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_extract_fnam_from_message,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_extract_possible_fnam_from_message,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_sort_messages_preserving_file_order,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
     module.add_function(wrap_pyfunction!(
         stubgen::rust_stubgen_render_type_args,
