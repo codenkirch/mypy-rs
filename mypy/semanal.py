@@ -412,6 +412,7 @@ try:
         rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_imports as _rust_classify_imports,
+        rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_erase_func_annotations as _rust_erase_func_annotations,
         rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
@@ -441,6 +442,7 @@ except ImportError:
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
+    _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
@@ -3109,54 +3111,7 @@ class SemanticAnalyzer(
 
     def visit_import(self, i: Import) -> None:
         self.statement = i
-        # Issue #420: native import classification (strangler-fig). Rust
-        # performs the lookup/decision (target module found, module_public /
-        # module_hidden, scope kind) for each (id, as_id) pair; Python keeps
-        # the SymbolTableNode construction and the symbol-table mutation.
-        # When the classifier returns None the pure loop below runs
-        # unchanged (byte-for-byte parity).
-        classifications: list[tuple[str, str, bool, int | None]] | None = None
-        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
-            try:
-                result = _rust_classify_imports(
-                    i.ids,
-                    self.is_stub_file,
-                    self.options.implicit_reexport,
-                    self.modules,
-                    self.scope_stack,
-                    self.type,
-                )
-                if result is not None and len(result) == len(i.ids):
-                    classifications = result
-            except (AssertionError, NotImplementedError):
-                pass
-        for idx, (id, as_id) in enumerate(i.ids):
-            # Native classification replaces the pure decision below; when
-            # the native path is inactive `imported_id` is None and the
-            # original loop body runs unchanged.
-            if classifications is not None:
-                imported_id, base_id, module_public, kind = classifications[idx]
-                if kind is not None:
-                    node = self.modules[base_id]
-                    symbol = SymbolTableNode(
-                        kind, node, module_public=module_public, module_hidden=not module_public
-                    )
-                    self.add_imported_symbol(
-                        imported_id,
-                        symbol,
-                        context=i,
-                        module_public=module_public,
-                        module_hidden=not module_public,
-                    )
-                else:
-                    self.add_unknown_imported_symbol(
-                        imported_id,
-                        context=i,
-                        target_name=base_id,
-                        module_public=module_public,
-                        module_hidden=not module_public,
-                    )
-                continue
+        for id, as_id in i.ids:
             # Modules imported in a stub file without using 'import X as X' won't get exported
             # When implicit re-exporting is disabled, we have the same behavior as stubs.
             use_implicit_reexport = not self.is_stub_file and self.options.implicit_reexport
@@ -6365,52 +6320,96 @@ class SemanticAnalyzer(
     def visit_member_expr(self, expr: MemberExpr) -> None:
         base = expr.expr
         base.accept(self)
-        if isinstance(base, RefExpr) and isinstance(base.node, MypyFile):
-            # Handle module attribute.
-            sym = self.get_module_symbol(base.node, expr.name)
-            if sym:
-                if isinstance(sym.node, PlaceholderNode):
-                    self.process_placeholder(expr.name, "attribute", expr)
-                    return
-                self.record_imported_symbol(sym)
-                expr.kind = sym.kind
-                expr.fullname = sym.fullname or ""
-                expr.node = sym.node
-        elif isinstance(base, RefExpr):
-            # This branch handles the case C.bar (or cls.bar or self.bar inside
-            # a classmethod/method), where C is a class and bar is a type
-            # definition or a module resulting from `import bar` (or a module
-            # assignment) inside class C. We look up bar in the class' TypeInfo
-            # namespace.  This is done only when bar is a module or a type;
-            # other things (e.g. methods) are handled by other code in
-            # checkmember.
-            type_info = None
-            if isinstance(base.node, TypeInfo):
-                # C.bar where C is a class
-                type_info = base.node
-            elif isinstance(base.node, Var) and self.type and self.function_stack:
-                # check for self.bar or cls.bar in method/classmethod
-                func_def = self.function_stack[-1]
-                if (
-                    func_def.has_self_or_cls_argument
-                    and func_def.info is self.type
-                    and isinstance(func_def.type, CallableType)
-                    and func_def.arguments
-                    and base.node is func_def.arguments[0].variable
-                ):
-                    type_info = self.type
-            elif isinstance(base.node, TypeAlias) and base.node.no_args:
-                assert isinstance(base.node.target, ProperType)
-                if isinstance(base.node.target, Instance):
-                    type_info = base.node.target.type
+        # Issue #421: native resolution-branch classification (strangler-fig).
+        # Rust decides which resolution branch applies and returns the symbol
+        # it resolves to; the AST assignments (expr.node/kind/fullname),
+        # record_imported_symbol, and process_placeholder stay in Python.
+        # state is None when the classifier is inactive or has no
+        # classification (module re-export / incomplete-namespace /
+        # __getattr__ / missing-module paths), in which case the pure
+        # branches below run unchanged.
+        state: tuple[str, SymbolTableNode | None] | None = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                classification, sym = _rust_classify_member_resolution(
+                    expr,
+                    MemberExpr,
+                    RefExpr,
+                    MypyFile,
+                    TypeInfo,
+                    TypeAlias,
+                )
+                if classification is not None:
+                    state = (classification, sym)
+            except (AssertionError, NotImplementedError):
+                pass
+        if state is None:
+            if isinstance(base, RefExpr) and isinstance(base.node, MypyFile):
+                # Handle module attribute.
+                sym = self.get_module_symbol(base.node, expr.name)
+                if sym:
+                    if isinstance(sym.node, PlaceholderNode):
+                        self.process_placeholder(expr.name, "attribute", expr)
+                        return
+                    self.record_imported_symbol(sym)
+                    expr.kind = sym.kind
+                    expr.fullname = sym.fullname or ""
+                    expr.node = sym.node
+            elif isinstance(base, RefExpr):
+                # This branch handles the case C.bar (or cls.bar or self.bar inside
+                # a classmethod/method), where C is a class and bar is a type
+                # definition or a module resulting from `import bar` (or a module
+                # assignment) inside class C. We look up bar in the class' TypeInfo
+                # namespace.  This is done only when bar is a module or a type;
+                # other things (e.g. methods) are handled by other code in
+                # checkmember.
+                type_info = None
+                if isinstance(base.node, TypeInfo):
+                    # C.bar where C is a class
+                    type_info = base.node
+                elif isinstance(base.node, Var) and self.type and self.function_stack:
+                    # check for self.bar or cls.bar in method/classmethod
+                    func_def = self.function_stack[-1]
+                    if (
+                        func_def.has_self_or_cls_argument
+                        and func_def.info is self.type
+                        and isinstance(func_def.type, CallableType)
+                        and func_def.arguments
+                        and base.node is func_def.arguments[0].variable
+                    ):
+                        type_info = self.type
+                elif isinstance(base.node, TypeAlias) and base.node.no_args:
+                    assert isinstance(base.node.target, ProperType)
+                    if isinstance(base.node.target, Instance):
+                        type_info = base.node.target.type
 
-            if type_info:
-                n = type_info.names.get(expr.name)
-                if n is not None and isinstance(n.node, (MypyFile, TypeInfo, TypeAlias)):
-                    self.record_imported_symbol(n)
-                    expr.kind = n.kind
-                    expr.fullname = n.fullname or ""
-                    expr.node = n.node
+                if type_info:
+                    n = type_info.names.get(expr.name)
+                    if n is not None and isinstance(n.node, (MypyFile, TypeInfo, TypeAlias)):
+                        self.record_imported_symbol(n)
+                        expr.kind = n.kind
+                        expr.fullname = n.fullname or ""
+                        expr.node = n.node
+            return
+        # Classified path: apply the same side effects as the pure branch the
+        # classifier selected. state == ("none", None) means Python also
+        # leaves the expression unresolved (module_hidden symbol or a TypeInfo
+        # member outside the (MypyFile, TypeInfo, TypeAlias) set).
+        _, sym = state
+        if sym is None:
+            return
+        if isinstance(sym.node, PlaceholderNode):
+            # Mirror the module branch: defer/error via process_placeholder
+            # without binding. Only module symbols classify as placeholders;
+            # a TypeInfo member whose node is a PlaceholderNode is never
+            # classified (it is outside the (MypyFile, TypeInfo, TypeAlias)
+            # set), so this is the module-branch path only.
+            self.process_placeholder(expr.name, "attribute", expr)
+            return
+        self.record_imported_symbol(sym)
+        expr.kind = sym.kind
+        expr.fullname = sym.fullname or ""
+        expr.node = sym.node
 
     def visit_op_expr(self, expr: OpExpr) -> None:
         expr.left.accept(self)
