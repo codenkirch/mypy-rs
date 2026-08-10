@@ -697,5 +697,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         dataclasses::rust_dataclass_transform,
         module
     )?)?;
+    // Issue #393: sibling seam for `__post_init__` (InitVar fields only).
+    module.add_function(wrap_pyfunction!(
+        dataclasses::rust_dataclass_post_init_transform,
+        module
+    )?)?;
     Ok(())
 }

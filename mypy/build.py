@@ -1098,9 +1098,8 @@ class BuildManager:
 
         _set_native_update_active(self.options.native_type_kernel)
         # Stage 30: gate the dataclasses plugin transform seam. The Rust
-        # path (`rust_dataclass_transform`) returns None for all inputs,
-        # so this is parity-only — Python always falls back to the
-        # `DataclassTransformer` port.
+        # path computes real `__init__`/`__post_init__` signatures; Python
+        # validates each result before applying, else falls back to Python.
         from mypy.plugins.dataclasses import _set_native_dataclasses_active
 
         _set_native_dataclasses_active(self.options.native_type_kernel)

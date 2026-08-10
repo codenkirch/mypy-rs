@@ -177,6 +177,7 @@ __all__ = [
     "rust_is_pybind11_overloaded_function_docstring",
     "rust_method_name_sort_key",
     "rust_dataclass_transform",
+    "rust_dataclass_post_init_transform",
 ]
 
 class NativeTypeResolver:
@@ -622,4 +623,8 @@ def rust_dataclass_transform(
     decorator_eq: bool,
     decorator_order: bool,
     decorator_frozen: bool,
+) -> bytes | None: ...
+def rust_dataclass_post_init_transform(
+    fields_bytes: bytes,
+    class_fullname: str,
 ) -> bytes | None: ...
