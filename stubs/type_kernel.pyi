@@ -173,6 +173,7 @@ __all__ = [
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
     "rust_dataclass_transform",
+    "rust_dataclass_post_init_transform",
 ]
 
 class NativeTypeResolver:
@@ -614,4 +615,8 @@ def rust_dataclass_transform(
     decorator_eq: bool,
     decorator_order: bool,
     decorator_frozen: bool,
+) -> bytes | None: ...
+def rust_dataclass_post_init_transform(
+    fields_bytes: bytes,
+    class_fullname: str,
 ) -> bytes | None: ...

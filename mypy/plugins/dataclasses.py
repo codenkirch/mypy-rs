@@ -83,11 +83,13 @@ if TYPE_CHECKING:
 try:
     from type_kernel import (
         rust_dataclass_transform as _rust_dataclass_transform,
+        rust_dataclass_post_init_transform as _rust_dataclass_post_init_transform,
     )
 
     _HAS_NATIVE_DATACLASS = True
 except ImportError:
     _rust_dataclass_transform = None  # type: ignore[assignment]
+    _rust_dataclass_post_init_transform = None  # type: ignore[assignment]
     _HAS_NATIVE_DATACLASS = False
 
 _native_dataclasses_active: bool = False
@@ -265,6 +267,47 @@ def _try_native_dataclass_transform(
         if rust_result is None:
             return False
         _apply_native_dataclass_transform(transformer, rust_result, filtered)
+        return True
+    except Exception:
+        return False
+
+
+def _try_native_dataclass_post_init(
+    transformer: DataclassTransformer, attributes: list[DataclassAttribute]
+) -> bool:
+    """Run the __post_init__ argument computation through the Rust seam.
+
+    The post-init signature is the InitVar fields only, in attribute order,
+    all positional with no defaults (mirrors `_add_internal_post_init_method`
+    and `to_argument` of="__post_init__"). Any failure falls back to the
+    Python path and returns False.
+    """
+    if not _HAS_NATIVE_DATACLASS or not _native_dataclasses_active:
+        return False
+    try:
+        rust_result = _rust_dataclass_post_init_transform(
+            _serialize_dataclass_fields_for_rust(attributes),
+            transformer._cls.fullname,
+        )
+        if rust_result is None:
+            return False
+        rust_names, rust_kinds = _parse_native_init_signature(rust_result)
+        expected_names = [attr.alias or attr.name for attr in attributes if attr.is_init_var]
+        expected_kinds = [0] * len(expected_names)
+        if rust_names != expected_names or rust_kinds != expected_kinds:
+            raise ValueError("native dataclass post-init signature mismatch")
+        args = [
+            attr.to_argument(transformer._cls.info, of="__post_init__")
+            for attr in attributes
+            if attr.is_init_var
+        ]
+        add_method_to_class(
+            transformer._api,
+            transformer._cls,
+            _INTERNAL_POST_INIT_SYM_NAME,
+            args=args,
+            return_type=NoneType(),
+        )
         return True
     except Exception:
         return False
@@ -626,6 +669,8 @@ class DataclassTransformer:
         )
 
     def _add_internal_post_init_method(self, attributes: list[DataclassAttribute]) -> None:
+        if _try_native_dataclass_post_init(self, attributes):
+            return
         add_method_to_class(
             self._api,
             self._cls,

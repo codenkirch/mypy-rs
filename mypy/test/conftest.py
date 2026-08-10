@@ -298,6 +298,8 @@ _NATIVE_GATE_GLOBALS: list[tuple[str, str]] = [
     ("mypy.semanal", "_native_semanal_active"),
     ("mypy.semanal", "_native_semanal_visitor_active"),
     ("mypy.server.deps", "_native_server_deps_active"),
+    ("mypy.server.update", "_native_update_active"),
+    ("mypy.plugins.dataclasses", "_native_dataclasses_active"),
     ("mypy.solve", "_native_solve_active"),
     ("mypy.solve", "_native_solve_resolver"),
     ("mypy.subtypes", "_native_subtype_active"),

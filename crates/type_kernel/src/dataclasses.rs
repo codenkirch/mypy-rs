@@ -1,8 +1,10 @@
-//! Dataclasses plugin `__init__` transform seam (Issue #356).
+//! Dataclasses plugin `__init__`/`__post_init__` transform seams
+//! (Issue #356, completed by #393).
 //!
 //! Receives serialized `@dataclass` field metadata, computes the `__init__`
-//! argument list (names and kinds), and returns wire-encoded result bytes.
-//! Python applies the AST mutation (`add_method_to_class`) using the
+//! argument list (names and kinds) — and the `__post_init__` argument list
+//! (the `dataclasses.InitVar` fields only) — and returns wire-encoded result
+//! bytes. Python applies the AST mutation (`add_method_to_class`) using the
 //! deserialized result. The Python caller fully validates the result against
 //! its own computation before applying it, so a Rust bug cannot silently
 //! change semantics.
@@ -10,7 +12,7 @@
 //! Strangler-fig contract: unsupported inputs return `None`; Python keeps
 //! its full implementation for those cases. This mirrors the attrs seam
 //! (`crates/type_kernel/src/attrs.rs`, Issue #357); the dataclass seam is
-//! narrower: it only computes `__init__` argument names and kinds, no types.
+//! narrower: it only computes argument names and kinds, no types.
 
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -142,7 +144,7 @@ fn compute_init_signature(fields: &[Field]) -> Result<Vec<(String, i64)>, WireEr
 #[pyfunction]
 #[pyo3(name = "rust_dataclass_transform")]
 pub fn rust_dataclass_transform(
-    _py: Python<'_>,
+    py: Python<'_>,
     fields_bytes: &[u8],
     _class_fullname: &str,
     _decorator_init: bool,
@@ -150,7 +152,6 @@ pub fn rust_dataclass_transform(
     _decorator_order: bool,
     _decorator_frozen: bool,
 ) -> PyResult<Option<Py<PyBytes>>> {
-    // Input: count + per-field [DC_FIELD tag, name, alias, 4 bools].
     let mut buf = ReadBuffer::new(fields_bytes);
     let fields = match deserialize_fields(&mut buf) {
         Some(f) => f,
@@ -160,20 +161,78 @@ pub fn rust_dataclass_transform(
         Ok(a) => a,
         Err(_) => return Ok(None),
     };
+    let bytes = encode_signature(&args);
+    Ok(Some(PyBytes::new(py, &bytes).into()))
+}
 
-    // Output: DC_INIT_SIG + len + [DC_INIT_SIG + n_args + per-arg
-    // (name, kind)] + returns-flag + NONE_TYPE + END_TAG.
+/// Compute the `__post_init__` argument list for the given fields.
+///
+/// Mirrors `mypy/plugins/dataclasses.py` `to_argument (of="__post_init__")`
+/// as used by `_add_internal_post_init_method`: only the `InitVar` fields,
+/// in attribute order, all as `ARG_POS` without defaults. The runtime
+/// `__post_init__` protocol resolves each value from the field default, so a
+/// parameter default would over-constrain direct calls.
+fn compute_post_init_signature(fields: &[Field]) -> Vec<(String, i64)> {
+    fields
+        .iter()
+        .filter(|f| f.is_init_var)
+        .map(|f| {
+            let arg_name = if f.alias.is_empty() {
+                f.name.clone()
+            } else {
+                f.alias.clone()
+            };
+            (arg_name, ARG_POS)
+        })
+        .collect()
+}
+
+/// `rust_dataclass_post_init_transform` — the dataclass `__post_init__`
+/// signature seam.
+///
+/// Same wire contract as `rust_dataclass_transform` (this is a sibling of
+/// that function, not a wire-format extension). Python serializes the full
+/// `DataclassAttribute` list; Rust selects the `InitVar` fields and emits
+/// their argument names and kinds, all `ARG_POS`. Python validates the
+/// result against its own computation and applies the AST mutation, so a
+/// Rust bug cannot silently change semantics.
+///
+/// Returns `Some(Py<PyBytes>)` of serialized signature, or `None` for
+/// unsupported cases (falls back to Python). `class_fullname` is accepted
+/// for ABI symmetry and does not affect the result.
+#[pyfunction]
+#[pyo3(name = "rust_dataclass_post_init_transform")]
+pub fn rust_dataclass_post_init_transform(
+    py: Python<'_>,
+    fields_bytes: &[u8],
+    _class_fullname: &str,
+) -> PyResult<Option<Py<PyBytes>>> {
+    let mut buf = ReadBuffer::new(fields_bytes);
+    let fields = match deserialize_fields(&mut buf) {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    let args = compute_post_init_signature(&fields);
+    let bytes = encode_signature(&args);
+    Ok(Some(PyBytes::new(py, &bytes).into()))
+}
+
+/// Encode a computed argument list in the dataclass signature wire format.
+///
+/// Output: DC_INIT_SIG + len + [DC_INIT_SIG + n_args + per-arg
+/// (name, kind)] + returns-flag + NONE_TYPE + END_TAG. Shared by the
+/// `__init__` and `__post_init__` seams so both emit byte-identical
+/// envelopes; only the arg computation differs.
+fn encode_signature(args: &[(String, i64)]) -> Vec<u8> {
     let mut body = WriteBuffer::new();
     write_u8(&mut body, DC_INIT_SIG);
-    crate::wire::write_int_bare(&mut body, args.len() as i64)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-    for (name, kind) in &args {
+    crate::wire::write_int_bare(&mut body, args.len() as i64).expect("arg count fits short-int");
+    for (name, kind) in args {
         let name_bytes = name.as_bytes();
         crate::wire::write_int_bare(&mut body, name_bytes.len() as i64)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            .expect("name length fits short-int");
         body.extend(name_bytes);
-        crate::wire::write_int_bare(&mut body, *kind)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        crate::wire::write_int_bare(&mut body, *kind).expect("kind fits short-int");
     }
     write_u8(&mut body, 0); // returns_flag: no annotation
     write_u8(&mut body, NONE_TYPE);
@@ -183,9 +242,9 @@ pub fn rust_dataclass_transform(
     let mut result = WriteBuffer::new();
     write_u8(&mut result, DC_INIT_SIG);
     crate::wire::write_int_bare(&mut result, body_bytes.len() as i64)
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        .expect("body length fits short-int");
     result.extend(&body_bytes);
-    Ok(Some(PyBytes::new(_py, &result.into_bytes()).into()))
+    result.into_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -216,46 +275,24 @@ mod tests {
         buf.into_bytes()
     }
 
-    /// Round-trip through the internal chain: deserialize -> compute ->
-    /// encode -> parse with a synthetic Python-side reader (names/kinds
-    /// only). Tests the same logic the seam entry point runs, without
-    /// needing the librt Python environment.
-    fn roundtrip(fields: &[Field]) -> Option<(Vec<String>, Vec<i64>)> {
-        let bytes = serialize(fields);
-        let mut buf = ReadBuffer::new(&bytes);
-        let parsed = deserialize_fields(&mut buf)?;
-        let args = compute_init_signature(&parsed).ok()?;
-
-        // Encode the result exactly as the seam does.
-        let mut body = WriteBuffer::new();
-        write_u8(&mut body, DC_INIT_SIG);
-        crate::wire::write_int_bare(&mut body, args.len() as i64).ok()?;
-        for (name, kind) in &args {
-            crate::wire::write_int_bare(&mut body, name.len() as i64).ok()?;
-            body.extend(name.as_bytes());
-            crate::wire::write_int_bare(&mut body, *kind).ok()?;
-        }
-        write_u8(&mut body, 0); // returns_flag
-        write_u8(&mut body, NONE_TYPE);
-        write_u8(&mut body, END_TAG);
-        let body_bytes = body.into_bytes();
-        let mut result = WriteBuffer::new();
-        write_u8(&mut result, DC_INIT_SIG);
-        crate::wire::write_int_bare(&mut result, body_bytes.len() as i64).ok()?;
-        result.extend(&body_bytes);
-        let result = result.into_bytes();
+    /// Encode `args` via `encode_signature` and parse it back with a
+    /// synthetic Python-side reader (names/kinds only). Exercises the same
+    /// encode path the seam entry points run, without needing the librt
+    /// Python environment.
+    fn parse_signature(args: &[(String, i64)]) -> (Vec<String>, Vec<i64>) {
+        let result = encode_signature(args);
 
         assert_eq!(result[0], DC_INIT_SIG);
         let mut buf = ReadBuffer::new(&result);
         assert_eq!(buf.read_u8().ok(), Some(DC_INIT_SIG));
-        let _body_len = read_int_bare(&mut buf).ok()?;
+        let _body_len = read_int_bare(&mut buf).unwrap();
         assert_eq!(buf.read_u8().ok(), Some(DC_INIT_SIG));
-        let n_args = read_int_bare(&mut buf).ok()?;
+        let n_args = read_int_bare(&mut buf).unwrap();
         let mut names = Vec::new();
         let mut kinds = Vec::new();
         for _ in 0..n_args {
-            let name = read_str_bare(&mut buf).ok()?;
-            let kind = read_int_bare(&mut buf).ok()?;
+            let name = read_str_bare(&mut buf).unwrap();
+            let kind = read_int_bare(&mut buf).unwrap();
             names.push(name);
             kinds.push(kind);
         }
@@ -263,7 +300,27 @@ mod tests {
         assert_eq!(buf.read_u8().ok(), Some(NONE_TYPE));
         assert_eq!(buf.read_u8().ok(), Some(END_TAG));
         assert_eq!(buf.read_u8().ok(), None); // fully consumed
-        Some((names, kinds))
+        (names, kinds)
+    }
+
+    /// Round-trip through the `__init__` chain: deserialize -> compute ->
+    /// encode (via `encode_signature`) -> parse back.
+    fn roundtrip(fields: &[Field]) -> Option<(Vec<String>, Vec<i64>)> {
+        let bytes = serialize(fields);
+        let mut buf = ReadBuffer::new(&bytes);
+        let parsed = deserialize_fields(&mut buf)?;
+        let args = compute_init_signature(&parsed).ok()?;
+        Some(parse_signature(&args))
+    }
+
+    /// Round-trip through the `__post_init__` chain (only `InitVar` fields,
+    /// all `ARG_POS`).
+    fn roundtrip_post_init(fields: &[Field]) -> Option<(Vec<String>, Vec<i64>)> {
+        let bytes = serialize(fields);
+        let mut buf = ReadBuffer::new(&bytes);
+        let parsed = deserialize_fields(&mut buf)?;
+        let args = compute_post_init_signature(&parsed);
+        Some(parse_signature(&args))
     }
 
     fn field(name: &str, alias: &str, has_default: bool, kw_only: bool) -> Field {
@@ -348,5 +405,110 @@ mod tests {
         let bytes = buf.into_bytes();
         let mut read = ReadBuffer::new(&bytes);
         assert!(deserialize_fields(&mut read).is_none());
+    }
+
+    #[test]
+    fn long_int_count_falls_back() {
+        // Python can never emit the long-int sentinel for the field count
+        // (`_write_short_int` always encodes a short int), but the wire
+        // reader must still defer rather than misread it.
+        let mut buf = WriteBuffer::new();
+        write_u8(&mut buf, 15); // LONG_INT_TRAILER first byte
+        let bytes = buf.into_bytes();
+        let mut read = ReadBuffer::new(&bytes);
+        assert!(deserialize_fields(&mut read).is_none());
+    }
+
+    #[test]
+    fn huge_count_falls_back() {
+        // count > 1000 is rejected outright; reading would be unreasonable.
+        let mut buf = WriteBuffer::new();
+        crate::wire::write_int_bare(&mut buf, 1001).expect("count");
+        let bytes = buf.into_bytes();
+        let mut read = ReadBuffer::new(&bytes);
+        assert!(deserialize_fields(&mut read).is_none());
+    }
+
+    #[test]
+    fn large_field_count_uses_two_byte_varint() {
+        // 200 fields force a 2-byte short-int arg-count on output; the
+        // synthetic Python reader must decode it back exactly.
+        let fields: Vec<Field> = (0..200)
+            .map(|i| field(&format!("f{i}"), "", false, false))
+            .collect();
+        let names_kinds = roundtrip(&fields).expect("200 fields handle");
+        assert_eq!(names_kinds.0.len(), 200);
+        assert_eq!(names_kinds.1, vec![0; 200]);
+        assert_eq!(names_kinds.0[0], "f0");
+        assert_eq!(names_kinds.0[199], "f199");
+    }
+
+    #[test]
+    fn post_init_only_keeps_init_var_fields() {
+        // __post_init__ receives only the InitVar fields, in attribute
+        // order, all positional without defaults.
+        let fields = vec![
+            Field {
+                name: "a".to_string(),
+                alias: String::new(),
+                has_default: false,
+                kw_only: false,
+                is_in_init: true,
+                is_init_var: false,
+            },
+            Field {
+                name: "b".to_string(),
+                alias: String::new(),
+                has_default: true,
+                kw_only: true,
+                is_in_init: true,
+                is_init_var: true,
+            },
+            Field {
+                name: "c".to_string(),
+                alias: String::new(),
+                has_default: false,
+                kw_only: false,
+                is_in_init: true,
+                is_init_var: true,
+            },
+        ];
+        let names_kinds = roundtrip_post_init(&fields).expect("post-init handles");
+        assert_eq!(names_kinds.0, vec!["b", "c"]);
+        assert_eq!(names_kinds.1, vec![0, 0]);
+    }
+
+    #[test]
+    fn post_init_kind_is_pos_even_with_default_or_kw_only() {
+        // Even a kw-only field with a default is a plain positional arg in
+        // __post_init__ (the runtime protocol resolves the value from the
+        // field default).
+        let fields = vec![Field {
+            name: "x".to_string(),
+            alias: String::new(),
+            has_default: true,
+            kw_only: true,
+            is_in_init: true,
+            is_init_var: true,
+        }];
+        let names_kinds = roundtrip_post_init(&fields).expect("post-init handles");
+        assert_eq!(names_kinds.0, vec!["x"]);
+        assert_eq!(names_kinds.1, vec![0]);
+    }
+
+    #[test]
+    fn post_init_uses_alias() {
+        // The argument name is `alias or name`, same as __init__.
+        let fields = vec![Field {
+            name: "y".to_string(),
+            alias: "provided".to_string(),
+            has_default: false,
+            kw_only: false,
+            is_in_init: true,
+            is_init_var: true,
+        }];
+        let names_kinds = roundtrip_post_init(&fields).expect("post-init handles");
+        assert_eq!(names_kinds.0, vec!["provided"]);
+        assert_eq!(names_kinds.1, vec![0]);
     }
 }
