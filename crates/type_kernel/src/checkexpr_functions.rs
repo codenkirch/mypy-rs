@@ -1572,6 +1572,88 @@ pub(crate) fn rust_build_tuple_type<'py>(
     Ok(Some(PyBytes::new(py, &bytes)))
 }
 
+/// Compute the combined type context for the right operand of a boolean
+/// `and`/`or` expression. Mirrors `ExpressionChecker._combined_context`.
+///
+/// The caller (Python) serializes the branch-derived type (`ty`, the
+/// left operand's type after narrowing) and the outer type context
+/// (`self.type_context[-1]`). Either may be absent.
+///
+/// Semantics match the Python original:
+/// * branch-derived type containing Any is contagious: return it
+///   verbatim (a union would lose the Any). TypeAliasType input defers
+///   (wire cannot serialize aliases); Python's `has_any_type` get_proper
+///   expansion then applies.
+/// * otherwise the combined context is `make_simplified_union` of the
+///   present items (branch type and/or outer context).
+/// * no items at all -> None (Python returns None too; serializing
+///   nothing costs nothing).
+///
+/// Returns None on any untranslatable shape; the caller falls back to
+/// the pure-Python implementation.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_analyze_cond_branch(
+    resolver: &NativeTypeResolver,
+    branch_bytes: Option<Vec<u8>>,
+    known_bytes: Option<Vec<u8>>,
+) -> PyResult<Option<Vec<u8>>> {
+    let branch = match branch_bytes {
+        Some(bytes) => match decode_type(&bytes) {
+            Some(t) => Some(t),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    let known = match known_bytes {
+        Some(bytes) => match decode_type(&bytes) {
+            Some(t) => Some(t),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    Ok(combined_context_inner(
+        branch.as_ref(),
+        known.as_ref(),
+        resolver.resolver(),
+    ))
+}
+
+fn combined_context_inner(
+    branch: Option<&Type>,
+    known: Option<&Type>,
+    resolver: &TypeResolver,
+) -> Option<Vec<u8>> {
+    use crate::subtypes::SubtypeContext;
+
+    // Any is contagious: `dict[str, Any] or <x>` should still infer Any
+    // in `x`, so return the branch type directly (no union with it).
+    if let Some(b) = branch {
+        match has_any_type_inner(b, false) {
+            Some(true) => return encode_type(b),
+            Some(false) => {}
+            None => return None, // TypeAliasType: defer, Python expands.
+        }
+    }
+    let mut items = Vec::with_capacity(2);
+    if let Some(b) = branch {
+        items.push(b.clone());
+    }
+    if let Some(k) = known {
+        items.push(k.clone());
+    }
+    if items.is_empty() {
+        return None;
+    }
+    // proper_subtype=True preserves Any/alias items (Python's
+    // _remove_redundant_union_items uses is_proper_subtype). Nested
+    // union items flatten (step 1), single items fast-path (step 2),
+    // aliases defer (flatten rejects them) -> Python get_proper_type.
+    let ctx = SubtypeContext::new(false, false, false, true, true, true);
+    let result = crate::setops::make_simplified_union(&items, &ctx, resolver, true)?;
+    encode_type(&result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2309,5 +2391,61 @@ mod tests {
     fn test_method_fullname_union_defers() {
         let t = make_union(vec![make_instance("mod.A", vec![])]);
         assert_eq!(method_fullname_inner(&t, "foo", &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_combined_context_no_items_defers() {
+        assert_eq!(combined_context_inner(None, None, &empty_resolver()), None);
+    }
+
+    #[test]
+    fn test_combined_context_any_contagion_returns_branch() {
+        // `dict[str, Any] or <x>`: the branch type contains Any, so it
+        // is returned verbatim (never unioned with the known context).
+        let any = make_any(TYPE_OF_ANY_UNANNOTATED);
+        let known = make_instance("builtins.str", vec![]);
+        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver());
+        let decoded = decode_type(&out.unwrap()).unwrap();
+        assert_eq!(decoded, any);
+    }
+
+    #[test]
+    fn test_combined_context_special_form_any_not_contagious() {
+        // AnyType with type_of_any == special form is not "any" here.
+        let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
+        let known = make_instance("builtins.str", vec![]);
+        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver());
+        // make_simplified_union([special-any, str]) with an empty resolver
+        // defers on the Instance-Instance subtype check.
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn test_combined_context_single_branch_fast_path() {
+        let int = make_instance("builtins.int", vec![]);
+        let out = combined_context_inner(Some(&int), None, &empty_resolver());
+        let decoded = decode_type(&out.unwrap()).unwrap();
+        assert_eq!(decoded, int);
+    }
+
+    #[test]
+    fn test_combined_context_known_only_fast_path() {
+        let str_inst = make_instance("builtins.str", vec![]);
+        let out = combined_context_inner(Some(&str_inst), None, &empty_resolver());
+        let decoded = decode_type(&out.unwrap()).unwrap();
+        assert_eq!(decoded, str_inst);
+    }
+
+    #[test]
+    fn test_combined_context_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.A".to_string(),
+        };
+        // has_any_type_inner(alias) returns None -> defer to Python.
+        assert_eq!(
+            combined_context_inner(Some(&alias), None, &empty_resolver()),
+            None
+        );
     }
 }
