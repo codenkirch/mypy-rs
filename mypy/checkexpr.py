@@ -225,8 +225,10 @@ try:
     )
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
+        rust_build_tuple_type as _rust_build_tuple_type,
         rust_classify_call as _rust_classify_call,
         rust_conditional_expr_join as _rust_conditional_expr_join,
+        rust_container_type as _rust_container_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -244,6 +246,7 @@ try:
         rust_solve_generic_call as _rust_solve_generic_call,
         rust_star_expr as _rust_star_expr,
         rust_try_getting_literal as _rust_try_getting_literal,
+        rust_tuple_context_matches as _rust_tuple_context_matches,
     )
 
     from mypy.types import read_type as _checkexpr_read_type
@@ -269,6 +272,9 @@ except ImportError:
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
     _rust_solve_generic_call = None  # type: ignore[assignment]
+    _rust_container_type = None  # type: ignore[assignment]
+    _rust_tuple_context_matches = None  # type: ignore[assignment]
+    _rust_build_tuple_type = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -440,9 +446,17 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_type_from_checkexpr(b: bytes) -> Type:
-    buf = _CheckExprReadBuffer(b)
-    return _checkexpr_read_type(buf)
+def _deserialize_type_from_checkexpr(b: bytes) -> Type | None:
+    """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
+
+    Bare read_type leaves Instance.type as NOT_READY with only type_ref
+    set; fixup resolves type_refs to live TypeInfo (or returns None so
+    the caller defers to Python), matching the other wire seams
+    (erasetype, join, typeops, solve).
+    """
+    from mypy.wirefixup import fixup_wire_type
+
+    return fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)))
 
 
 # --- M8c: helper shims for visit_* visitor ports ---
@@ -472,10 +486,96 @@ def _try_native_conditional_expr_join(
     Given serialized `if_expr` and `else_expr` types, returns the
     join as serialized bytes, or None to defer to Python.
     """
+    if not (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        return None
+    try:
+        return _rust_conditional_expr_join(
+            if_bytes, else_bytes, _native_checkexpr_resolver
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_container_type(
+    tag: str,
+    items: list[Type],
+    n_keys: int = 0,
+) -> Type | None:
+    """Compute the container type for a list/set/dict literal via the Rust kernel.
+
+    Given a tag ("list", "set", "dict") and the item types, returns
+    the container type, or None to defer to Python.
+
+    For list/set, `items` is the list of element types.
+    For dict, `items` is [key1, key2, ..., val1, val2, ...]
+    (deduplicated keys first, then values), and `n_keys` is the
+    number of keys, the key and value lists can differ in length
+    after dedup, so the boundary must be explicit.
+    """
+    if not (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        return None
+    try:
+        items_bytes = [_serialize_type_for_checkexpr(v) for v in items]
+        rust_bytes = _rust_container_type(
+            _native_checkexpr_resolver, tag, items_bytes, None, n_keys
+        )
+        if rust_bytes is None:
+            return None
+        return _deserialize_type_from_checkexpr(rust_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_tuple_context_matches(
+    elements_tags: list[int],
+    ctx: TupleType,
+) -> bool | None:
+    """Check whether a tuple expression's items match a TupleType context.
+
+    Returns True/False if the Rust kernel decided, or None to defer.
+    """
     if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
         return None
     try:
-        return _rust_conditional_expr_join(if_bytes, else_bytes, _native_checkexpr_resolver)
+        ctx_bytes = _serialize_type_for_checkexpr(ctx)
+        return _rust_tuple_context_matches(elements_tags, ctx_bytes)
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _try_native_build_tuple_type(
+    items: list[Type],
+    seen_unpack: bool,
+) -> Type | None:
+    """Build the final TupleType node for a tuple expression.
+
+    Given the item types and whether an unpack was seen, returns the
+    TupleType, or None to defer.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        # The binary wire format cannot carry `from_type_type`: a round-trip
+        # would reset it, mis-flagging concrete subclasses as abstract.
+        # Defer whenever a type-object callable item is present.
+        for it in items:
+            it_proper = get_proper_type(it)
+            if isinstance(it_proper, CallableType) and it_proper.is_type_obj():
+                return None
+        items_bytes = [_serialize_type_for_checkexpr(it) for it in items]
+        rust_bytes = _rust_build_tuple_type(items_bytes, 1 if seen_unpack else 0)
+        if rust_bytes is None:
+            return None
+        res = _deserialize_type_from_checkexpr(rust_bytes)
+        return res
     except (AssertionError, NotImplementedError, ValueError):
         return None
 
@@ -2259,6 +2359,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             resolved_callee = _deserialize_type_from_checkexpr(
                                 bytes(resolved_bytes)
                             )
+                            # Deserialize may return None when a type_ref cannot
+                            # be resolved to a live TypeInfo; in that case defer
+                            # to Python's generic-call inference below. The
+                            # isinstance also narrows None out of the union.
                             if isinstance(resolved_callee, CallableType):
                                 callee = resolved_callee
                                 # Native solve succeeded; skip Python's infer pass.
@@ -5762,6 +5866,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 values.append(typ)
                 values_set.add(typ)
 
+        # Try the native kernel join + node construction.
+        rust_result = _try_native_container_type(
+            container_fullname.split(".")[-1], values
+        )
+        if rust_result is not None:
+            return rust_result
+
+        # Fallback to Python path.
         vt = self._first_or_join_fast_item(values)
         if vt is None:
             return None
@@ -5814,6 +5926,12 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return remove_instance_last_known_values(out)
 
     def tuple_context_matches(self, expr: TupleExpr, ctx: TupleType) -> bool:
+        # Try the Rust kernel first (pure function of expr items + ctx);
+        # elements_tags: 0 for non-star items, 1 for star.
+        elements_tags = [1 if isinstance(item, StarExpr) else 0 for item in expr.items]
+        rust_result = _try_native_tuple_context_matches(elements_tags, ctx)
+        if rust_result is not None:
+            return rust_result
         ctx_unpack_index = find_unpack_in_list(ctx.items)
         if ctx_unpack_index is None:
             # For fixed tuples accept everything that can possibly match, even if this
@@ -5921,14 +6039,20 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     tt = self.accept(item, type_context_items[j])
                     j += 1
                 items.append(tt)
-        # This is a partial fallback item type. A precise type will be calculated on demand.
-        fallback_item = AnyType(TypeOfAny.special_form)
-        result: ProperType = TupleType(
-            items, self.chk.named_generic_type("builtins.tuple", [fallback_item])
-        )
-        if seen_unpack_in_items:
-            # Return already normalized tuple type just in case.
-            result = expand_type(result, {})
+        # Build the final TupleType node via Rust if possible.
+        result: Type
+        rust_result = _try_native_build_tuple_type(items, seen_unpack_in_items)
+        if rust_result is not None:
+            result = rust_result
+        else:
+            # Fallback: build TupleType in Python.
+            fallback_item = AnyType(TypeOfAny.special_form)
+            result = TupleType(
+                items, self.chk.named_generic_type("builtins.tuple", [fallback_item])
+            )
+            if seen_unpack_in_items:
+                # Return already normalized tuple type just in case.
+                result = expand_type(result, {})
         return result
 
     def fast_dict_type(self, e: DictExpr) -> Type | None:
@@ -5979,6 +6103,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 if value_t not in values_set:
                     values.append(value_t)
                     values_set.add(value_t)
+
+        # Try the Rust kernel on the already-accepted key/value types; the
+        # kernel has no `**expr` handling, so defer that case, and on a
+        # non-None result skip the Python join below.
+        if stargs is None:
+            rust_result = _try_native_container_type("dict", keys + values, len(keys))
+            if rust_result is not None:
+                return rust_result
 
         kt = self._first_or_join_fast_item(keys)
         if kt is None:
@@ -6610,10 +6742,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     )
                     if alt_bytes is not None:
                         alternative = _deserialize_type_from_checkexpr(alt_bytes)
-                        p_alt = get_proper_type(alternative)
-                        if not isinstance(p_alt, Instance) or p_alt.type.fullname != "builtins.object":
-                            res = alternative
-                            return res
+                        if alternative is not None:
+                            p_alt = get_proper_type(alternative)
+                            if not isinstance(p_alt, Instance) or p_alt.type.fullname != "builtins.object":
+                                res = alternative
+                                return res
                 except Exception:
                     pass
             alternative = join.join_types(if_type, else_type)
@@ -7024,7 +7157,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 inner_bytes = _serialize_type_for_checkexpr(inner)
                 native_res = _try_native_star_expr(inner_bytes)
                 if native_res is not None:
-                    return _deserialize_type_from_checkexpr(native_res)
+                    decoded = _deserialize_type_from_checkexpr(native_res)
+                    if decoded is not None:
+                        return decoded
             except Exception:
                 pass
         return inner

@@ -1345,9 +1345,9 @@ fn encode_overloaded(items: Vec<SetOpResult>) -> Option<SetOpResult> {
 
 /// Whether a CallableType is a type object (types.py:2323-2326).
 /// `is_type_obj` = fallback is a metaclass AND ret_type is not
-/// UninhabitedType. The wire format can't transmit `from_type_type`
+/// UninhabitedType. The wire format cannot transmit `from_type_type`
 /// (only 6 flags), so callers defer when either input is a type obj.
-fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
+pub(crate) fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
     let Type::CallableType {
         fallback, ret_type, ..
     } = t
@@ -1774,21 +1774,13 @@ fn visit_join(
                 is_type_form: s_itf,
             } = s
             {
-                // join.py:857-861: TypeType.make_normalized(
-                //   join_types(t.item, self.s.item),
-                //   is_type_form=s.is_type_form or t.is_type_form)
-                let joined = setop_result_to_type(
-                    join_types(t_item, s_item, ctx, resolver),
-                    t_item,
-                    s_item,
-                )?;
-                let new_type = Type::TypeType {
-                    item: Box::new(joined),
-                    is_type_form: *s_itf || *t_itf,
-                };
-                let mut wbuf = WriteBuffer::new();
-                wire::write_type(&mut wbuf, &new_type).ok()?;
-                return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                // Python `visit_type_type` (join.py:886-900). The wire
+                // cannot carry `from_type_type`; identical TypeTypes are
+                // lossless, anything else defers so Python keeps the flag.
+                if t_item == s_item && t_itf == s_itf {
+                    return Some(SetOpResult::SameS);
+                }
+                return None;
             }
             None
         }

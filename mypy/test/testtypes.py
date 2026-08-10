@@ -6834,16 +6834,16 @@ class NativeCheckexprSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
-
         from librt.internal import (
             ReadBuffer as _ReadBuffer,
             WriteBuffer as _WriteBuffer,
         )
+
         from mypy.checkexpr import (
             _set_native_checkexpr_active,
         )
-        from mypy.types import read_type as _read_type
         from mypy.test.typefixture import TypeFixture
+        from mypy.types import read_type as _read_type
 
         self._tk = _tk
         self._set_active = _set_native_checkexpr_active
@@ -6892,7 +6892,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import Instance, read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, Instance)
@@ -6902,7 +6903,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import AnyType, read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, AnyType)
@@ -6912,7 +6914,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, NoneType)
@@ -6923,7 +6926,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, UnionType)
@@ -6936,7 +6940,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, NoneType)
@@ -6951,7 +6956,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import Instance, read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, Instance)
@@ -6964,7 +6970,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import Instance, read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, Instance)
@@ -6977,7 +6984,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, NoneType)
@@ -6997,7 +7005,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, NoneType)
@@ -7026,7 +7035,8 @@ class NativeCheckexprSuite(Suite):
         self.assertIsNotNone(result)
         from mypy.types import UnionType, read_type
 
-        raw = bytes(result) if isinstance(result, list) else result
+        assert result is not None
+        raw = bytes(result)
         buf = self._ReadBuffer(raw)
         decoded = read_type(buf)
         self.assertIsInstance(decoded, UnionType)
@@ -7329,46 +7339,46 @@ class NativeStubgenRenderSuite(Suite):
         self._tk = _tk
 
     # --- node constructors (mirror stubgen_kernel_check.py helpers) ---
-    def _n(self, name: str) -> "NameExpr":
+    def _n(self, name: str) -> NameExpr:
         return NameExpr(name)
 
-    def _m(self, expr: "Expression", attr: str) -> "MemberExpr":
+    def _m(self, expr: Expression, attr: str) -> MemberExpr:
         return MemberExpr(expr, attr)
 
-    def _idx(self, base: "Expression", index: "Expression") -> "IndexExpr":
+    def _idx(self, base: Expression, index: Expression) -> IndexExpr:
         return IndexExpr(base, index)
 
-    def _unary(self, op: str, operand: "Expression") -> "UnaryExpr":
+    def _unary(self, op: str, operand: Expression) -> UnaryExpr:
         return UnaryExpr(op, operand)
 
-    def _tup(self, *items: "Expression") -> "TupleExpr":
+    def _tup(self, *items: Expression) -> TupleExpr:
         return TupleExpr(list(items))
 
-    def _s(self, v: str) -> "StrExpr":
+    def _s(self, v: str) -> StrExpr:
         return StrExpr(v)
 
-    def _i(self, v: int) -> "IntExpr":
+    def _i(self, v: int) -> IntExpr:
         return IntExpr(v)
 
-    def _b(self, v: bytes) -> "BytesExpr":
+    def _b(self, v: bytes) -> BytesExpr:
         return BytesExpr(v)
 
-    def _lst(self, *items: "Expression") -> "ListExpr":
+    def _lst(self, *items: Expression) -> ListExpr:
         return ListExpr(list(items))
 
-    def _st(self, *items: "Expression") -> "SetExpr":
+    def _st(self, *items: Expression) -> SetExpr:
         return SetExpr(list(items))
 
-    def _d(self, *kvs: tuple["StrExpr", "Expression"]) -> "DictExpr":
+    def _d(self, *kvs: tuple[StrExpr, Expression]) -> DictExpr:
         return DictExpr(list(kvs))
 
     def _call(
         self,
-        callee: "Expression",
-        args: list["Expression"],
+        callee: Expression,
+        args: list[Expression],
         arg_names: list[str | None] | None = None,
         arg_kinds: list[ArgKind] | None = None,
-    ) -> "CallExpr":
+    ) -> CallExpr:
         node = CallExpr(callee, args)
         if arg_names is not None:
             node.arg_names = arg_names
@@ -7376,23 +7386,23 @@ class NativeStubgenRenderSuite(Suite):
             node.arg_kinds = arg_kinds
         return node
 
-    def _op(self, op: str, left: "Expression", right: "Expression") -> "OpExpr":
+    def _op(self, op: str, left: Expression, right: Expression) -> OpExpr:
         return OpExpr(op, left, right)
 
-    def _slc(self, begin: "Expression | None", end: "Expression | None") -> "SliceExpr":
+    def _slc(self, begin: Expression | None, end: Expression | None) -> SliceExpr:
         return SliceExpr(begin, end, None)
 
-    def _star(self, expr: "Expression") -> "StarExpr":
+    def _star(self, expr: Expression) -> StarExpr:
         return StarExpr(expr)
 
-    def _ell(self) -> "EllipsisExpr":
+    def _ell(self) -> EllipsisExpr:
         return EllipsisExpr()
 
-    def _tmpl(self, s: str) -> "TemplateStrExpr":
+    def _tmpl(self, s: str) -> TemplateStrExpr:
         return TemplateStrExpr([StrExpr(s)])
 
-    def _assert_render(self, expr: "Expression") -> None:
-        from mypy.stubgen import ASTStubGenerator, AliasPrinter
+    def _assert_render(self, expr: Expression) -> None:
+        from mypy.stubgen import AliasPrinter, ASTStubGenerator
 
         gen = ASTStubGenerator()
         printer = AliasPrinter(gen)

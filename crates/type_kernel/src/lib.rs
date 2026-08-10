@@ -300,6 +300,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_conditional_expr_join,
         module
     )?)?;
+    // Issue #385: container-literal fast paths.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_container_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_tuple_context_matches,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_build_tuple_type,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_star_expr,
         module

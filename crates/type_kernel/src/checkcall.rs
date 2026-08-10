@@ -599,13 +599,152 @@ pub fn rust_solve_generic_call(
 
     let mut wbuf = crate::wire::WriteBuffer::new();
     crate::wire::write_type(&mut wbuf, &normalized).ok()?;
-    crate::applytype::rust_apply_generic_arguments(
+    let applied = crate::applytype::rust_apply_generic_arguments(
         resolver,
         wbuf.into_bytes().as_slice(),
         &orig_types_blob,
         true, // skip_unsatisfied
         true, // strict_optional
-    )
+    )?;
+    // The wire cannot carry `from_type_type`: serializing back would drop
+    // the abstract-error suppression. Defer when the result carries a
+    // type-object callable (directly or nested, e.g. dict[str, def() -> C]).
+    let mut dbuf = crate::wire::ReadBuffer::new(&applied);
+    if let Ok(t) = read_type(&mut dbuf, None) {
+        if contains_type_obj_callable(&t, resolver.resolver()) {
+            return None;
+        }
+    }
+    Some(applied)
+}
+
+/// Whether a type (recursively) contains a type-object `CallableType`.
+///
+/// `is_type_obj_callable` recognizes a bare type-obj callable; this walks
+/// the type tree so a callable nested inside an `Instance` arg, union,
+/// tuple, etc. is also detected. Conservative recursion: any unknown or
+/// undecidable branch is assumed to contain one (defers back to Python).
+fn contains_type_obj_callable(t: &Type, resolver: &crate::typeinfo::TypeResolver) -> bool {
+    match t {
+        Type::Instance {
+            args,
+            last_known_value,
+            extra_attrs,
+            ..
+        } => {
+            args.iter().any(|a| contains_type_obj_callable(a, resolver))
+                || last_known_value
+                    .as_deref()
+                    .is_some_and(|v| contains_type_obj_callable(v, resolver))
+                || extra_attrs.as_ref().is_some_and(|e| {
+                    e.attrs
+                        .values()
+                        .any(|a| contains_type_obj_callable(a, resolver))
+                })
+        }
+        Type::TypeAliasType { args, .. } => {
+            args.iter().any(|a| contains_type_obj_callable(a, resolver))
+        }
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            values
+                .iter()
+                .any(|a| contains_type_obj_callable(a, resolver))
+                || contains_type_obj_callable(upper_bound, resolver)
+                || contains_type_obj_callable(default, resolver)
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            contains_type_obj_callable(&Type::Parameters(prefix.as_ref().clone()), resolver)
+                || contains_type_obj_callable(upper_bound, resolver)
+                || contains_type_obj_callable(default, resolver)
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            contains_type_obj_callable(tuple_fallback, resolver)
+                || contains_type_obj_callable(upper_bound, resolver)
+                || contains_type_obj_callable(default, resolver)
+        }
+        Type::UnboundType { args, .. } => {
+            args.iter().any(|a| contains_type_obj_callable(a, resolver))
+        }
+        Type::UnpackType { typ } => contains_type_obj_callable(typ, resolver),
+        Type::AnyType { source_any, .. } => source_any
+            .as_deref()
+            .is_some_and(|a| contains_type_obj_callable(a, resolver)),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            type_guard,
+            type_is,
+            variables,
+            ..
+        } => {
+            crate::setops::is_type_obj_callable(t, resolver)
+                || contains_type_obj_callable(fallback, resolver)
+                || instance_type
+                    .as_deref()
+                    .is_some_and(|i| contains_type_obj_callable(i, resolver))
+                || arg_types
+                    .iter()
+                    .any(|a| contains_type_obj_callable(a, resolver))
+                || contains_type_obj_callable(ret_type, resolver)
+                || type_guard
+                    .as_deref()
+                    .is_some_and(|t| contains_type_obj_callable(t, resolver))
+                || type_is
+                    .as_deref()
+                    .is_some_and(|t| contains_type_obj_callable(t, resolver))
+                || variables
+                    .iter()
+                    .any(|v| contains_type_obj_callable(v, resolver))
+        }
+        Type::Overloaded { items } => items
+            .iter()
+            .any(|i| contains_type_obj_callable(i, resolver)),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            contains_type_obj_callable(partial_fallback, resolver)
+                || items
+                    .iter()
+                    .any(|i| contains_type_obj_callable(i, resolver))
+        }
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
+            contains_type_obj_callable(fallback, resolver)
+                || items
+                    .iter()
+                    .any(|(_, v)| contains_type_obj_callable(v, resolver))
+        }
+        Type::LiteralType { fallback, .. } => contains_type_obj_callable(fallback, resolver),
+        Type::UnionType { items, .. } => items
+            .iter()
+            .any(|i| contains_type_obj_callable(i, resolver)),
+        Type::TypeType { item, .. } => contains_type_obj_callable(item, resolver),
+        Type::Parameters(params) => params
+            .arg_types
+            .iter()
+            .any(|a| contains_type_obj_callable(a, resolver)),
+        Type::NoneType | Type::UninhabitedType { .. } | Type::DeletedType { .. } => false,
+    }
 }
 
 /// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
