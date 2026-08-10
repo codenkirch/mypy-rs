@@ -237,6 +237,7 @@ try:
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
+        rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
         rust_is_duplicate_mapping as _rust_is_duplicate_mapping,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
@@ -261,6 +262,7 @@ except ImportError:
     _rust_analyze_cond_branch = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
+    _rust_infer_function_type_arguments = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
     _rust_check_operator = None  # type: ignore[assignment]
     _rust_has_bytes_component = None  # type: ignore[assignment]
@@ -462,6 +464,31 @@ def _deserialize_type_from_checkexpr(b: bytes) -> Type | None:
     from mypy.wirefixup import fixup_wire_type
 
     return fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)))
+
+
+def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
+    """Decode a Rust optional-type list blob (`count` + per-var `0|1 + Type`).
+
+    Mirrors `checkcall.rs serialize_optional_types` output; returns None on
+    any decode failure so the caller falls back to Python inference.
+    """
+    try:
+        from mypy.cache import read_int
+
+        buf = _CheckExprReadBuffer(raw)
+        count = read_int(buf)
+        result: list[Type | None] = []
+        for _ in range(count):
+            has = read_int(buf)
+            if has == 1:
+                result.append(_checkexpr_read_type(buf))
+            elif has == 0:
+                result.append(None)
+            else:
+                return None
+        return result
+    except (AssertionError, ValueError, NotImplementedError):
+        return None
 
 
 # --- M8c: helper shims for visit_* visitor ports ---
@@ -2833,15 +2860,52 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 else:
                     pass1_args.append(arg)
 
-            inferred_args, _ = infer_function_type_arguments(
-                callee_type,
-                pass1_args,
-                arg_kinds,
-                arg_names,
-                formal_to_actual,
-                context=self.argument_infer_context(),
-                strict=self.chk.in_checked_function(),
-            )
+            # Stage 20 (#382): pass-1 type-argument inference through the
+            # Rust kernel. Rust returns None for ParamSpec/TypeVarTuple
+            # variables, UnpackType formals, TypeAliasType/UnboundType
+            # actuals and other deferred branches, so the whole call falls
+            # back to Python. Pass 2 (multi-pass inference, below) always
+            # stays in Python.
+            inferred_args: list[Type | None] | None = None
+            if (
+                _CHECKEXPR_HAS_TYPE_KERNEL
+                and _native_checkexpr_active
+                and _native_checkexpr_resolver is not None
+                and 2 not in arg_pass_nums
+            ):
+                try:
+                    raw = _rust_infer_function_type_arguments(
+                        _native_checkexpr_resolver,
+                        _serialize_type_for_checkexpr(callee_type),
+                        [
+                            _serialize_type_for_checkexpr(t) if t is not None else None
+                            for t in pass1_args
+                        ],
+                        [int(k.value) for k in arg_kinds],
+                        formal_to_actual,
+                        self.chk.in_checked_function(),
+                        type_state.infer_unions,
+                        state.strict_optional,
+                    )
+                    if raw is not None:
+                        decoded = _deserialize_optional_type_list(bytes(raw))
+                        if decoded is not None and len(decoded) == len(
+                            callee_type.variables
+                        ):
+                            inferred_args = decoded
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    pass  # Defer to Python.
+
+            if inferred_args is None:
+                inferred_args, _ = infer_function_type_arguments(
+                    callee_type,
+                    pass1_args,
+                    arg_kinds,
+                    arg_names,
+                    formal_to_actual,
+                    context=self.argument_infer_context(),
+                    strict=self.chk.in_checked_function(),
+                )
 
             if 2 in arg_pass_nums:
                 # Second pass of type inference.

@@ -166,6 +166,7 @@ __all__ = [
     "rust_solve_constraints",
     "rust_solve_dependent",
     "rust_replace_implicit_first_type",
+    "rust_infer_function_type_arguments",
     "rust_callables_compatible",
     "rust_is_overlapping_types",
     "rust_refers_to_fullname",
@@ -621,6 +622,16 @@ def rust_solve_constraints(
     skip_unsatisfied: bool,
     resolver: NativeTypeResolver,
 ) -> tuple[int, bytes | None, bytes | None] | None: ...
+def rust_infer_function_type_arguments(
+    resolver: NativeTypeResolver,
+    callee: bytes,
+    arg_types: list[bytes | None],
+    arg_kinds: list[int],
+    formal_to_actual: list[list[int]],
+    strict: bool,
+    infer_unions: bool,
+    strict_optional: bool,
+) -> bytes | None: ...
 def rust_solve_dependent(
     vars_bytes: list[bytes],
     constraints_bytes: list[bytes],
