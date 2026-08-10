@@ -1731,6 +1731,57 @@ fn decode_solve_solutions_here(blob: &[u8]) -> Option<Vec<((i64, i64, String), O
     Some(result)
 }
 
+// ---------------------------------------------------------------------------
+// Standalone PyO3 exports for pure-computation helpers (solve.py).
+// These mirror small pure functions that take `Type` objects and return
+// values without mutation or side effects. Each returns `None` to defer
+// to the Python fallback for any unhandled type variant.
+// ---------------------------------------------------------------------------
+
+/// `_join_sorted_key` (solve.py:488-497): sort key for `join_type_list`.
+/// UnionType=-2, NoneType=-1, Overloaded=1, else 0.
+/// `TypeAliasType` defers to Python (the key must run `get_proper_type`
+/// to unwrap the alias, which the wire format does not carry).
+#[pyfunction]
+pub(crate) fn rust_join_sorted_key(t_bytes: &[u8]) -> Option<i64> {
+    let t = decode_type(t_bytes)?;
+    if matches!(t, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    Some(join_sorted_key(&t))
+}
+
+/// `get_vars` (solve.py:880-882): ids of type variables in `target` that
+/// are also in `vars`. `vars` is a list of `(raw_id, meta_level,
+/// namespace)` triples. Returns the matching subset as a Vec of triples
+/// (set semantics on the Python side; duplicates are harmless).
+#[pyfunction]
+pub(crate) fn rust_get_vars(
+    target_bytes: &[u8],
+    vars: Vec<(i64, i64, String)>,
+) -> Option<Vec<(i64, i64, String)>> {
+    let t = decode_type(target_bytes)?;
+    let var_set: HashSet<TvId> = vars.into_iter().collect();
+    let found = get_vars(&t, &var_set);
+    Some(found.into_iter().collect())
+}
+
+/// `is_callable_protocol` (solve.py:918-922): True when `t` is an
+/// `Instance` whose `TypeInfo` is a protocol with `__call__` in its
+/// `protocol_members`. `TypeAliasType` defers (needs `get_proper_type`).
+#[pyfunction]
+pub(crate) fn rust_is_callable_protocol(
+    _py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    t_bytes: &[u8],
+) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    if matches!(t, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    Some(is_callable_protocol(&t, resolver.resolver()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
