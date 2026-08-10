@@ -890,3 +890,127 @@ fn get_member_expr_prefix(
     }
     Ok(None)
 }
+
+// ---------------------------------------------------------------------------
+// classify_imports (Issue #420)
+// ---------------------------------------------------------------------------
+
+/// One `import a.b [as c]` binding classified by `rust_classify_imports`:
+/// `(imported_id, base_id, module_public, kind)`. `kind` is `None` when the
+/// target module is missing (`add_unknown_imported_symbol` branch).
+pub(crate) type ImportClass = (String, String, bool, Option<i64>);
+
+/// `SemanticAnalyzer.visit_import` — classify `import a.b as c` bindings.
+///
+/// Mirrors semanal.py:3108-3148. Rust performs the lookup/decision for each
+/// `(id, as_id)` pair: which target module is imported, whether the symbol is
+/// module-public (implicit re-export), and which scope kind (LDEF/MDEF/GDEF)
+/// the binding gets. Python keeps `SymbolTableNode` construction and the
+/// symbol-table mutation (`add_imported_symbol` /
+/// `add_unknown_imported_symbol`).
+///
+/// Returns `None` when the argument shapes do not match what Python would
+/// feed (non-dict modules, non-tuple id pairs, scope stack shorter than 2)
+/// so the caller falls back to the pure-Python loop byte-for-byte.
+#[pyfunction]
+#[pyo3(signature = (ids, is_stub_file, implicit_reexport, modules, scope_stack, self_type))]
+pub(crate) fn rust_classify_imports(
+    py: Python<'_>,
+    ids: &PyAny,
+    is_stub_file: bool,
+    implicit_reexport: bool,
+    modules: &PyAny,
+    scope_stack: &PyAny,
+    self_type: &PyAny,
+) -> PyResult<Option<Vec<ImportClass>>> {
+    let ids_list = match ids.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let modules_dict = match modules.downcast::<PyDict>() {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let scope_list = match scope_stack.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if scope_list.is_empty() {
+        return Ok(None);
+    }
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let semanal_mod = py.import("mypy.semanal")?;
+    let gdef = nodes_mod.getattr("GDEF")?;
+    let ldef = nodes_mod.getattr("LDEF")?;
+    let mdef = nodes_mod.getattr("MDEF")?;
+    let func_scope: i64 = semanal_mod.getattr("SCOPE_FUNC")?.extract()?;
+    let comprehension_scope: i64 = semanal_mod.getattr("SCOPE_COMPREHENSION")?.extract()?;
+    let annotation_scope: i64 = semanal_mod.getattr("SCOPE_ANNOTATION")?.extract()?;
+
+    let gdef_val: i64 = gdef.extract()?;
+    let ldef_val: i64 = ldef.extract()?;
+    let mdef_val: i64 = mdef.extract()?;
+
+    let use_implicit_reexport = !is_stub_file && implicit_reexport;
+
+    let mut result: Vec<ImportClass> = Vec::with_capacity(ids_list.len());
+    for item in ids_list.iter() {
+        let pair = match item.downcast::<PyTuple>() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        if pair.len() != 2 {
+            return Ok(None);
+        }
+        let id = pair.get_item(0)?;
+        let as_id = pair.get_item(1)?;
+        let id_str: &str = id.downcast::<PyString>()?.to_str()?;
+        let has_alias = !as_id.is_none();
+        let (imported_id, base_id) = if has_alias {
+            let as_id_str: &str = as_id.downcast::<PyString>()?.to_str()?;
+            (as_id_str.to_string(), id_str.to_string())
+        } else {
+            let base_id = match id_str.split_once('.') {
+                Some((prefix, _)) => prefix.to_string(),
+                None => id_str.to_string(),
+            };
+            (base_id.clone(), base_id)
+        };
+
+        let module_public = if has_alias {
+            let as_id_str: &str = as_id.downcast::<PyString>()?.to_str()?;
+            use_implicit_reexport || id_str == as_id_str
+        } else {
+            use_implicit_reexport
+        };
+
+        match modules_dict.get_item(&base_id)? {
+            Some(_) => {
+                // Scope kind: mirror `is_func_scope` / `self.type is not None`.
+                // scope_stack is a stack: the current scope is the last element.
+                let top_idx = scope_list.len() - 1;
+                let top = scope_list.get_item(top_idx)?;
+                let mut scope_type: i64 = top.extract()?;
+                if scope_type == annotation_scope {
+                    if top_idx == 0 {
+                        return Ok(None);
+                    }
+                    scope_type = scope_list.get_item(top_idx - 1)?.extract()?;
+                }
+                let kind = if scope_type == func_scope || scope_type == comprehension_scope {
+                    ldef_val
+                } else if !self_type.is_none() {
+                    mdef_val
+                } else {
+                    gdef_val
+                };
+                result.push((imported_id, base_id, module_public, Some(kind)));
+            }
+            None => {
+                result.push((imported_id, base_id, module_public, None));
+            }
+        }
+    }
+    Ok(Some(result))
+}
