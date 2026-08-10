@@ -519,7 +519,11 @@ def _try_native_try_handler_union(typ: Type) -> list[bytes] | None:
     the result through make_simplified_union at the end (checker.py:5705),
     so parity holds. Returns None to defer to the pure-Python path.
     """
-    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_stmts_active
+        and _native_checker_resolver is not None
+    ):
         return None
     try:
         return _rust_try_handler_union(
