@@ -352,6 +352,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
     module.add_function(wrap_pyfunction!(
+        checkcall::rust_calibrate_type_obj_return,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkcall::rust_normalize_callable,
         module
     )?)?;
