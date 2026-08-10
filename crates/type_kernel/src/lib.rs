@@ -792,6 +792,26 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_union_member_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_none_member_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_typeddict_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_enum_class_attribute_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_descriptor_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkoperator::rust_check_operator,
         module
     )?)?;
