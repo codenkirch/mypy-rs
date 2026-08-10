@@ -718,16 +718,15 @@ pub fn rust_sort_messages_preserving_file_order(
         let msg = &messages[i];
         let maybe_fnam = rust_extract_possible_fnam_from_message(msg.clone());
         let mut group = vec![msg.clone()];
+        let mut group_key = None;
 
-        if order.contains_key(&maybe_fnam) {
-            // Collect all lines related to this message
+        if let Some(&key) = order.get(&maybe_fnam) {
+            // This looks like a file name. Collect all lines related to this message.
+            group_key = Some(key);
             while i + 1 < messages.len() {
                 let next = &messages[i + 1];
-                let next_fnam = rust_extract_possible_fnam_from_message(next.clone());
-                let next_extracted = rust_extract_fnam_from_message(next.clone());
-
-                if next_fnam != maybe_fnam
-                    && next_extracted.is_none()
+                if !order.contains_key(&rust_extract_possible_fnam_from_message(next.clone()))
+                    && rust_extract_fnam_from_message(next.clone()).is_none()
                     && !next.starts_with("mypy: ")
                 {
                     i += 1;
@@ -738,7 +737,7 @@ pub fn rust_sort_messages_preserving_file_order(
             }
         }
 
-        groups.push((order.get(&maybe_fnam).copied(), group));
+        groups.push((group_key, group));
         i += 1;
     }
 
@@ -899,6 +898,38 @@ typ = fx.a
             crate::serverdeps::compute_module_prefix(&modules, "missing.x.y"),
             None
         );
+    }
+
+    #[test]
+    fn sort_messages_groups_continuation_header_with_its_file() {
+        // A continuation header like `foo/y.py: In function "f":` has no line
+        // number (`extract_fnam` returns None) but its prefix `foo/y.py` IS a
+        // known file key, so it must be grouped with the `foo/y.py:123`
+        // messages that follow it and keep the file's `prev_messages` order.
+        let messages: Vec<String> = vec![
+            "x.py:1: error: \"int\" not callable".into(),
+            "and message continues (x: y)".into(),
+            "   1()".into(),
+            "   ^~~".into(),
+            "foo/y.py: In function \"f\":".into(),
+            "foo/y.py:123: note: \"X\" not defined".into(),
+            "and again message continues".into(),
+        ];
+        let prev: Vec<String> = vec![
+            "foo/y.py:12: note: \"Y\" not defined".into(),
+            "x.py:8: error: \"str\" not callable".into(),
+        ];
+        let result = rust_sort_messages_preserving_file_order(messages, prev);
+        let expected: Vec<String> = vec![
+            "foo/y.py: In function \"f\":".into(),
+            "foo/y.py:123: note: \"X\" not defined".into(),
+            "and again message continues".into(),
+            "x.py:1: error: \"int\" not callable".into(),
+            "and message continues (x: y)".into(),
+            "   1()".into(),
+            "   ^~~".into(),
+        ];
+        assert_eq!(result, expected);
     }
 
     #[ignore = "requires Python mypy in test environment; see AGENTS.md"]
