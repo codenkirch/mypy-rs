@@ -228,6 +228,7 @@ try:
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_build_tuple_type as _rust_build_tuple_type,
+        rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_operator as _rust_check_operator,
         rust_classify_call as _rust_classify_call,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -275,6 +276,7 @@ except ImportError:
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
+    _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
@@ -2539,8 +2541,41 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 object_type=object_type,
             )
 
+        native_calibrated = False
         if (
-            callee.is_type_obj()
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkcall_active
+            and _native_checkexpr_resolver is not None
+            and callee.is_type_obj()
+            and (len(arg_types) == 1)
+            and is_named_instance(callee.get_instance_type(), "builtins.type")
+        ):
+            try:
+                raw = _rust_calibrate_type_obj_return(
+                    _serialize_type_for_checkexpr(callee),
+                    _serialize_type_for_checkexpr(arg_types[0]),
+                )
+                if raw is not None:
+                    resolved = _deserialize_type_from_checkexpr(bytes(raw))
+                    if isinstance(resolved, CallableType):
+                        # The wire format has no line/column/special_sig/
+                        # from_type_type; the Rust round-trip defaults them.
+                        # Restore from the pre-edit callee to match
+                        # copy_modified(ret_type=...) exactly (freshen-seam
+                        # style, plus special_sig/from_type_type which affect
+                        # downstream protocol/tuple error paths).
+                        resolved.line = callee.line
+                        resolved.column = callee.column
+                        resolved.fallback.line = resolved.line
+                        resolved.special_sig = callee.special_sig
+                        resolved.from_type_type = callee.from_type_type
+                        callee = resolved
+                        native_calibrated = True
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass  # Defer to Python.
+        if (
+            not native_calibrated
+            and callee.is_type_obj()
             and (len(arg_types) == 1)
             and is_named_instance(callee.get_instance_type(), "builtins.type")
         ):

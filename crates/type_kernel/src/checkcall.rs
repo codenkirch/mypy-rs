@@ -136,6 +136,34 @@ fn normalize_callable(callee: &Type) -> Result<Type, WireError> {
     Ok(base.into_type())
 }
 
+/// `TypeType.make_normalized(arg_types[0])` calibration of a type-object
+/// callable's return type (checkexpr.py step 14). Defer (None) on wire
+/// failure, a non-CallableType callee, or an unresolved TypeAliasType arg
+/// (Python's `get_proper_type` would resolve the alias first; the wire has
+/// only the alias name, so the native path cannot match).
+#[pyfunction]
+pub(crate) fn rust_calibrate_type_obj_return(
+    callee_bytes: &[u8],
+    arg_type_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let mut buf = ReadBuffer::new(callee_bytes);
+    let callee = read_type(&mut buf, None).ok()?;
+    let mut abuf = ReadBuffer::new(arg_type_bytes);
+    let arg_type = read_type(&mut abuf, None).ok()?;
+    if matches!(arg_type, Type::TypeAliasType { .. }) {
+        // Python resolves the alias target first; defer to keep the union
+        // distribution and item-wrapping identical.
+        return None;
+    }
+    let new_ret = crate::expandtype::make_type_normalized(arg_type, false);
+    let mut base = callable_base(&callee).ok()?;
+    base.ret_type = Box::new(new_ret);
+    let out = base.into_type();
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, &out).ok()?;
+    Some(wbuf.into_bytes())
+}
+
 /// `with_unpacked_kwargs`: expand `**kwargs: TypedDict` into named keys.
 fn with_unpacked_kwargs(base: &mut CallableBase) -> Result<(), WireError> {
     if !base.unpack_kwargs {
@@ -249,6 +277,54 @@ fn with_normalized_var_args(base: &mut CallableBase) -> Result<(), WireError> {
     base.arg_kinds = [kinds_prefix, kinds_middle, kinds_suffix].concat();
     base.arg_names = [names_prefix, names_middle, names_suffix].concat();
     Ok(())
+}
+
+/// Copy a `Type::CallableType` into a `CallableBase` for field edits.
+///
+/// Returns `Err(WireError)` (caller defers to Python) when `callee` is not a
+/// `CallableType`, mirroring `normalize_callable`.
+fn callable_base(callee: &Type) -> Result<CallableBase, WireError> {
+    let Type::CallableType {
+        fallback,
+        instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        arg_types,
+        arg_kinds,
+        arg_names,
+        ret_type,
+        name,
+        variables,
+        type_guard,
+        type_is,
+    } = callee
+    else {
+        return Err(WireError::invalid(
+            "callable_base: callee is not a CallableType",
+        ));
+    };
+    Ok(CallableBase {
+        fallback: fallback.clone(),
+        instance_type: instance_type.clone(),
+        is_ellipsis_args: *is_ellipsis_args,
+        implicit: *implicit,
+        is_bound: *is_bound,
+        from_concatenate: *from_concatenate,
+        imprecise_arg_kinds: *imprecise_arg_kinds,
+        unpack_kwargs: *unpack_kwargs,
+        arg_types: arg_types.clone(),
+        arg_kinds: arg_kinds.clone(),
+        arg_names: arg_names.clone(),
+        ret_type: ret_type.clone(),
+        name: name.clone(),
+        variables: variables.clone(),
+        type_guard: type_guard.clone(),
+        type_is: type_is.clone(),
+    })
 }
 
 impl CallableBase {
@@ -827,6 +903,16 @@ mod tests {
         read_type(&mut rb, None).ok()
     }
 
+    fn calibrate_bytes(callee: &Type, arg: &Type) -> Option<Type> {
+        let mut cb = WriteBuffer::new();
+        write_type(&mut cb, callee).ok()?;
+        let mut ab = WriteBuffer::new();
+        write_type(&mut ab, arg).ok()?;
+        let out = rust_calibrate_type_obj_return(&cb.into_bytes(), &ab.into_bytes())?;
+        let mut rb = ReadBuffer::new(&out);
+        read_type(&mut rb, None).ok()
+    }
+
     fn typed_dict(required: &[&str], optional: &[(&str, Type)]) -> Type {
         let mut items: Vec<(String, Type)> = Vec::new();
         let mut required_keys: std::collections::HashSet<String> = Default::default();
@@ -1207,5 +1293,113 @@ mod tests {
             rust_possible_none_type_var_overlap(vec![arg], vec![target1, target2]),
             Some(false)
         );
+    }
+
+    fn str_instance() -> Type {
+        Type::Instance {
+            type_ref: "builtins.str".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn int_instance() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn calibrate_type_obj_wraps_ret_in_typetype() {
+        // Type[type(T)] call: callee ret becomes Type[str].
+        let callee = callable_with_args(vec![instance()]);
+        let out = calibrate_bytes(&callee, &str_instance()).unwrap();
+        match out {
+            Type::CallableType { ret_type, .. } => {
+                assert_eq!(
+                    *ret_type,
+                    Type::TypeType {
+                        item: Box::new(str_instance()),
+                        is_type_form: false,
+                    }
+                );
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_type_obj_distributes_union() {
+        // Type[Union[int, str]] -> Union[Type[int], Type[str]].
+        let callee = callable_with_args(vec![instance()]);
+        let arg = union_of(vec![int_instance(), str_instance()]);
+        let out = calibrate_bytes(&callee, &arg).unwrap();
+        let Type::CallableType { ret_type, .. } = out else {
+            panic!("expected CallableType");
+        };
+        assert_eq!(
+            *ret_type,
+            union_of(vec![
+                Type::TypeType {
+                    item: Box::new(int_instance()),
+                    is_type_form: false,
+                },
+                Type::TypeType {
+                    item: Box::new(str_instance()),
+                    is_type_form: false,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn calibrate_type_obj_keeps_other_fields() {
+        // Calibration must only rewrite ret_type; identity of other fields
+        // is preserved (mirrors copy_modified in types.py).
+        let mut callee = callable_with_args(vec![instance()]);
+        if let Type::CallableType { variables, .. } = &mut callee {
+            variables.push(type_var());
+        }
+        let out = calibrate_bytes(&callee, &str_instance()).unwrap();
+        let Type::CallableType {
+            arg_types,
+            variables,
+            ret_type,
+            ..
+        } = out
+        else {
+            panic!("expected CallableType");
+        };
+        assert_eq!(arg_types, vec![instance()]);
+        assert_eq!(variables.len(), 1);
+        assert_eq!(
+            *ret_type,
+            Type::TypeType {
+                item: Box::new(str_instance()),
+                is_type_form: false,
+            }
+        );
+    }
+
+    #[test]
+    fn calibrate_type_obj_defers_type_alias_arg() {
+        // TypeAliasType has no resolved target on the wire; both the
+        // caller and Python's get_proper_type would resolve it, so defer.
+        let callee = callable_with_args(vec![instance()]);
+        let alias = Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.Alias".to_string(),
+        };
+        assert_eq!(calibrate_bytes(&callee, &alias), None);
+    }
+
+    #[test]
+    fn calibrate_type_obj_defers_non_callable() {
+        // Only CallableType callees are calibrated; anything else defers.
+        assert_eq!(calibrate_bytes(&instance(), &str_instance()), None);
     }
 }
