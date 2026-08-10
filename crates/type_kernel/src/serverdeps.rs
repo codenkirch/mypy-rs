@@ -740,6 +740,8 @@ pub fn rust_sort_messages_preserving_file_order(
     // Phase 3: sort groups by file order, then flatten
     groups.sort_by_key(|g| g.0.unwrap_or(n));
     groups.into_iter().flat_map(|(_, g)| g).collect()
+}
+
 // ====================================================================
 // Issue #389: dmypy_server pure helpers — plain-record shuffling
 // ====================================================================
