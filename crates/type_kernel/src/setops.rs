@@ -1774,13 +1774,26 @@ fn visit_join(
                 is_type_form: s_itf,
             } = s
             {
-                // Python `visit_type_type` (join.py:886-900). The wire
-                // cannot carry `from_type_type`; identical TypeTypes are
-                // lossless, anything else defers so Python keeps the flag.
-                if t_item == s_item && t_itf == s_itf {
-                    return Some(SetOpResult::SameS);
-                }
-                return None;
+                // Python `visit_type_type` (join.py:886-890): both
+                // TypeTypes always build a fresh
+                // TypeType.make_normalized(join_types(t.item, s.item),
+                // is_type_form=s.is_type_form or t.is_type_form), even
+                // when the items are identical. Materialize the joined
+                // item via setop_result_to_type and encode the fresh
+                // TypeType. If the joined item is not encodable,
+                // setop_result_to_type returns None -> defer to Python.
+                let joined_item = setop_result_to_type(
+                    join_types(t_item, s_item, ctx, resolver),
+                    t_item,
+                    s_item,
+                )?;
+                let joined = Type::TypeType {
+                    item: Box::new(joined_item),
+                    is_type_form: *s_itf || *t_itf,
+                };
+                let mut wbuf = WriteBuffer::new();
+                wire::write_type(&mut wbuf, &joined).ok()?;
+                return Some(SetOpResult::Encoded(wbuf.into_bytes()));
             }
             None
         }
