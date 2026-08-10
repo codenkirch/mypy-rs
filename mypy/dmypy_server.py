@@ -26,7 +26,7 @@ import mypy.errors
 import mypy.main
 from mypy.dmypy_util import WriteToConn, receive, send
 from mypy.find_sources import InvalidSourceList, create_source_list
-from mypy.fscache import FileSystemCache, _HAS_RUST_CACHE
+from mypy.fscache import _HAS_RUST_CACHE, FileSystemCache
 from mypy.fswatcher import FileData, FileSystemWatcher
 from mypy.inspections import InspectionEngine
 from mypy.ipc import IPCServer
@@ -36,6 +36,33 @@ from mypy.server.update import FineGrainedBuildManager, refresh_suppressed_submo
 from mypy.suggestions import SuggestionEngine, SuggestionFailure
 from mypy.typestate import reset_global_state
 from mypy.util import FancyFormatter, count_stats
+
+# Issue #389: dmypy_server pure helpers — native seam.
+# When `type_kernel` is importable and `Options.native_type_kernel` is set,
+# each helper tries the Rust path first and falls back to Python on None.
+try:
+    from type_kernel import (
+        rust_add_all_sources_to_changed as _rust_add_all_sources_to_changed,
+        rust_filter_out_missing_top_level_packages as _rust_filter_out_missing_top_level_packages,
+        rust_find_all_sources_in_build as _rust_find_all_sources_in_build,
+        rust_fix_module_deps as _rust_fix_module_deps,
+        rust_get_meminfo as _rust_get_meminfo,
+        rust_ignore_suppressed_imports as _rust_ignore_suppressed_imports,
+        rust_response_metadata as _rust_response_metadata,
+    )
+
+    # process_start_options is not wired to Rust — it calls mypy.main.process_options
+    # which is a complex Python operation; the Rust side returns None to defer.
+    _HAS_SERVER_HELPERS = True
+except ImportError:
+    _rust_ignore_suppressed_imports = None  # type: ignore[assignment]
+    _rust_get_meminfo = None  # type: ignore[assignment]
+    _rust_response_metadata = None  # type: ignore[assignment]
+    _rust_find_all_sources_in_build = None  # type: ignore[assignment]
+    _rust_add_all_sources_to_changed = None  # type: ignore[assignment]
+    _rust_fix_module_deps = None  # type: ignore[assignment]
+    _rust_filter_out_missing_top_level_packages = None  # type: ignore[assignment]
+    _HAS_SERVER_HELPERS = False
 from mypy.version import __version__
 
 MEM_PROFILE: Final = False  # If True, dump memory profile after initialization
@@ -158,9 +185,13 @@ def process_start_options(flags: list[str], allow_sources: bool) -> Options:
 
 def ignore_suppressed_imports(module: str) -> bool:
     """Can we skip looking for newly unsuppressed imports to module?"""
-    # Various submodules of 'encodings' can be suppressed, since it
-    # uses module-level '__getattr__'. Skip them since there are many
-    # of them, and following imports to them is kind of pointless.
+    # encodings submodules use module-level __getattr__; skip them since
+    # there are many of them and following imports is pointless.
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        result = _rust_ignore_suppressed_imports(module)
+        if result is not None:
+            return result
     return module.startswith("encodings.")
 
 
@@ -215,8 +246,46 @@ class Server:
         self.formatter = FancyFormatter(sys.stdout, sys.stderr, options.hide_error_codes)
 
     def _response_metadata(self) -> dict[str, str]:
+        # Issue #389: try Rust-native path when available.
+        if _HAS_SERVER_HELPERS:
+            result = _rust_response_metadata(self.options)
+            if result is not None:
+                return result
         py_version = f"{self.options.python_version[0]}_{self.options.python_version[1]}"
         return {"platform": self.options.platform, "python_version": py_version}
+
+    def get_meminfo(self) -> dict[str, Any]:
+        """Return memory info dict for the current process."""
+        # Issue #389: try Rust-native path when available.
+        if _HAS_SERVER_HELPERS:
+            result = _rust_get_meminfo()
+            if result is not None:
+                return result
+        res: dict[str, Any] = {}
+        try:
+            import psutil
+        except ImportError:
+            res["memory_psutil_missing"] = (
+                "psutil not found, run pip install mypy[dmypy] "
+                "to install the needed components for dmypy"
+            )
+        else:
+            process = psutil.Process()
+            meminfo = process.memory_info()
+            res["memory_rss_mib"] = meminfo.rss / MiB
+            res["memory_vms_mib"] = meminfo.vms / MiB
+            if sys.platform == "win32":
+                res["memory_maxrss_mib"] = meminfo.peak_wset / MiB
+            else:
+                import resource  # Since it doesn't exist on Windows.
+
+                rusage = resource.getrusage(resource.RUSAGE_SELF)
+                if sys.platform == "darwin":
+                    factor = 1
+                else:
+                    factor = 1024  # Linux
+                res["memory_maxrss_mib"] = rusage.ru_maxrss * factor / MiB
+        return res
 
     def serve(self) -> None:
         """Serve requests, synchronously (no thread or fork)."""
@@ -916,7 +985,7 @@ class Server:
 
         self.add_explicitly_new(sources, changed)
 
-        # Find anything that has had its module path change because of added or removed __init__s
+        # Find anything whose module path changed due to added/removed __init__s
         last = {s.path: s.module for s in self.previous_sources}
         for s in sources:
             assert s.path
@@ -1059,6 +1128,11 @@ def get_meminfo() -> dict[str, Any]:
 def find_all_sources_in_build(
     graph: mypy.build.Graph, extra: Sequence[BuildSource] = ()
 ) -> list[BuildSource]:
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        result = _rust_find_all_sources_in_build(graph, extra)
+        if result is not None:
+            return result
     result = list(extra)
     seen = {source.module for source in result}
     for module, state in graph.items():
@@ -1073,6 +1147,10 @@ def add_all_sources_to_changed(sources: list[BuildSource], changed: list[tuple[s
     Use this when re-processing of unchanged files is needed (e.g. for
     the purpose of exporting types for inspections).
     """
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        _rust_add_all_sources_to_changed(sources, changed)
+        return
     changed_set = set(changed)
     changed.extend(
         [
@@ -1089,6 +1167,10 @@ def fix_module_deps(graph: mypy.build.Graph) -> None:
     This can make some suppressed dependencies non-suppressed, and vice versa (if modules
     have been added to or removed from the build).
     """
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        _rust_fix_module_deps(graph)
+        return
     for state in graph.values():
         new_suppressed = []
         new_dependencies = []
@@ -1113,6 +1195,11 @@ def filter_out_missing_top_level_packages(
     This is approximate: some packages that aren't actually valid may be
     included. However, all potentially valid packages must be returned.
     """
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        result = _rust_filter_out_missing_top_level_packages(packages, search_paths, fscache)
+        if result is not None:
+            return result
     # Start with a empty set and add all potential top-level packages.
     found = set()
     paths = (

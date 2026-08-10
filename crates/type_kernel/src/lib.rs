@@ -702,5 +702,32 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         dataclasses::rust_dataclass_post_init_transform,
         module
     )?)?;
+    // Issue #389: dmypy_server pure helpers — plain-record shuffling.
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_process_start_options,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_ignore_suppressed_imports,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(serverdeps::rust_get_meminfo, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_response_metadata,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_find_all_sources_in_build,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_add_all_sources_to_changed,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(serverdeps::rust_fix_module_deps, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_filter_out_missing_top_level_packages,
+        module
+    )?)?;
     Ok(())
 }

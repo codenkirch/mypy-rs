@@ -27,7 +27,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
 
 use crate::refs::{is_instance, TypeRefs};
 
@@ -409,13 +409,9 @@ fn class_name_is(obj: &PyAny, expected: &str) -> bool {
 // ====================================================================
 // M354: Pure server trigger/target computation
 // ====================================================================
-//
-// These functions take dependency records (triggers → target sets) and sets of
+// These functions take dependency records (triggers -> target sets) and sets of
 // fully-qualified names as pure inputs and return the computed results. They do
-// NOT touch live AST objects, symbol tables, or any mutable daemon state. The
-// Python caller provides the deps graph and the list of module IDs; Rust returns
-// the pure computation result, and Python handles the stateful parts
-// (lookup_target, reprocess_nodes, strip_target, etc.).
+// NOT touch live AST objects, symbol tables, or any mutable daemon state.
 
 /// WILDCARD_TAG must match `mypy.server.trigger.WILDCARD_TAG`.
 const WILDCARD_TAG: &str = "[wildcard]";
@@ -744,6 +740,444 @@ pub fn rust_sort_messages_preserving_file_order(
     // Phase 3: sort groups by file order, then flatten
     groups.sort_by_key(|g| g.0.unwrap_or(n));
     groups.into_iter().flat_map(|(_, g)| g).collect()
+// ====================================================================
+// Issue #389: dmypy_server pure helpers — plain-record shuffling
+// ====================================================================
+//
+// These functions port the pure (stateless) helpers from
+// `mypy.dmypy_server`. They take plain Python objects (dicts, lists,
+// strings, tuples) and return plain Python objects.  Each function
+// returns `None` when it cannot handle the input so the Python caller
+// falls back to the pure-Python implementation — the strangler-fig
+// per-call gate.
+
+/// Port of `mypy.dmypy_server.process_start_options`.
+///
+/// Parses CLI flags into `Options` via `mypy.main.process_options`,
+/// then applies dmypy-specific validation and mutations.
+/// Returns `None` if the options object is not recognized.
+#[pyfunction]
+pub(crate) fn rust_process_start_options(
+    py: Python<'_>,
+    flags: Vec<String>,
+    allow_sources: bool,
+) -> PyResult<Option<PyObject>> {
+    let _ = allow_sources; // unused in the pure path
+                           // Call mypy.main.process_options(["-i"] + flags, ...)
+    let main_mod = py.import("mypy.main")?;
+
+    // Build the args tuple: ("-i",) + tuple(flags)
+    let py_i = PyString::new(py, "-i");
+    let flags_strings: Vec<PyObject> = flags.iter().map(|s| PyString::new(py, s).into()).collect();
+    let args_vec: Vec<PyObject> = std::iter::once(py_i.into()).chain(flags_strings).collect();
+    let all_args_tuple = PyTuple::new(py, &args_vec);
+
+    // Build kwargs dict and call
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("require_targets", true)?;
+    kwargs.set_item("server_options", true)?;
+
+    let result = main_mod.call_method("process_options", (all_args_tuple,), Some(kwargs))?;
+
+    // result is a tuple (_, options)
+    let options = result.get_item(1)?;
+
+    // Apply dmypy-specific mutations via Python side effects
+    // if options.report_dirs: print(...)
+    if let Ok(report_dirs) = options.getattr("report_dirs") {
+        if !report_dirs.is_none() && report_dirs.is_true()? {
+            let sys_mod = py.import("sys")?;
+            let stdout = sys_mod.getattr("stdout")?;
+            let msg = "dmypy: Ignoring report generation settings. Start/restart cannot generate reports.";
+            stdout.call_method1("write", (msg,))?;
+            stdout.call_method0("flush")?;
+        }
+    }
+
+    // if options.junit_xml: print(...) then set to None
+    if let Ok(junit_xml) = options.getattr("junit_xml") {
+        if !junit_xml.is_none() && junit_xml.is_true()? {
+            let sys_mod = py.import("sys")?;
+            let stdout = sys_mod.getattr("stdout")?;
+            let msg = "dmypy: Ignoring report generation settings. Start/restart does not support --junit-xml. Pass it to check/recheck instead";
+            stdout.call_method1("write", (msg,))?;
+            stdout.call_method0("flush")?;
+            options.setattr("junit_xml", py.None())?;
+        }
+    }
+
+    // if not options.incremental: sys.exit(...)
+    if let Ok(incremental) = options.getattr("incremental") {
+        if !incremental.is_true()? {
+            let sys_mod = py.import("sys")?;
+            sys_mod.call_method1(
+                "exit",
+                ("dmypy: start/restart should not disable incremental mode",),
+            )?;
+        }
+    }
+
+    // if options.follow_imports not in ("skip", "error", "normal"): sys.exit(...)
+    if let Ok(follow_imports) = options.getattr("follow_imports") {
+        if let Ok(fi_str) = follow_imports.extract::<String>() {
+            if !["skip", "error", "normal"].contains(&fi_str.as_str()) {
+                let sys_mod = py.import("sys")?;
+                sys_mod.call_method1("exit", ("dmypy: follow-imports=silent not supported",))?;
+            }
+        }
+    }
+
+    // if not options.local_partial_types: sys.exit(...)
+    if let Ok(local_partial) = options.getattr("local_partial_types") {
+        if !local_partial.is_true()? {
+            let sys_mod = py.import("sys")?;
+            sys_mod.call_method1(
+                "exit",
+                ("dmypy: disabling local-partial-types not supported",),
+            )?;
+        }
+    }
+
+    Ok(Some(options.to_object(py)))
+}
+
+/// Port of `mypy.dmypy_server.ignore_suppressed_imports`.
+///
+/// Returns `Some(true)` if the module is an `encodings.*` submodule,
+/// `Some(false)` otherwise. Always returns `Some` because this
+/// function is trivially pure.
+#[pyfunction]
+pub(crate) fn rust_ignore_suppressed_imports(module: &PyString) -> Option<bool> {
+    Some(module.to_str().unwrap_or("").starts_with("encodings."))
+}
+
+/// Port of `mypy.dmypy_server.get_meminfo`.
+///
+/// Collects memory usage info from `psutil` or `resource`.
+/// Returns `None` if neither is importable (shouldn't happen).
+#[pyfunction]
+pub(crate) fn rust_get_meminfo(py: Python<'_>) -> PyResult<Option<PyObject>> {
+    let res_dict = PyDict::new(py);
+
+    // Try psutil first
+    let psutil_result = py.import("psutil");
+    match psutil_result {
+        Ok(psutil_mod) => {
+            let process_cls = psutil_mod.getattr("Process")?;
+            let process = process_cls.call0()?;
+            let meminfo = process.call_method0("memory_info")?;
+
+            let rss: f64 = meminfo.getattr("rss")?.extract()?;
+            let vms: f64 = meminfo.getattr("vms")?.extract()?;
+            let mib = 2f64.powf(20.0);
+
+            res_dict.set_item("memory_rss_mib", rss / mib)?;
+            res_dict.set_item("memory_vms_mib", vms / mib)?;
+
+            // Platform-specific peak RSS
+            let platform: String = py.import("sys")?.getattr("platform")?.extract()?;
+            if platform == "win32" {
+                let peak_wset: f64 = meminfo.getattr("peak_wset")?.extract()?;
+                res_dict.set_item("memory_maxrss_mib", peak_wset / mib)?;
+            } else {
+                let resource_mod = py.import("resource")?;
+                let rusage = resource_mod.call_method1("getrusage", ("RUSAGE_SELF",))?;
+                let ru_maxrss: i64 = rusage.getattr("ru_maxrss")?.extract()?;
+                let factor: i64 = if platform == "darwin" { 1 } else { 1024 };
+                res_dict.set_item(
+                    "memory_maxrss_mib",
+                    (ru_maxrss as f64) * (factor as f64) / mib,
+                )?;
+            }
+        }
+        Err(_) => {
+            res_dict.set_item(
+                "memory_psutil_missing",
+                "psutil not found, run pip install mypy[dmypy] to install the needed components for dmypy",
+            )?;
+        }
+    }
+
+    Ok(Some(res_dict.into()))
+}
+
+/// Port of `Server._response_metadata`.
+///
+/// Builds a small dict with platform and python_version from the
+/// options object. Returns `None` if options lacks the expected
+/// attributes (never happens in practice).
+#[pyfunction]
+pub(crate) fn rust_response_metadata(
+    py: Python<'_>,
+    options: &PyAny,
+) -> PyResult<Option<PyObject>> {
+    let py_ver = match options.getattr("python_version") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let platform = match options.getattr("platform") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let major = match py_ver.get_item(0) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let minor = match py_ver.get_item(1) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let py_ver_str = format!(
+        "{}_{}",
+        major.str()?.to_str().unwrap_or("?"),
+        minor.str()?.to_str().unwrap_or("?")
+    );
+
+    let result = PyDict::new(py);
+    result.set_item("platform", platform)?;
+    result.set_item("python_version", py_ver_str)?;
+    Ok(Some(result.into()))
+}
+
+/// Port of `mypy.dmypy_server.find_all_sources_in_build`.
+///
+/// Given a build graph (`dict[str] -> BuildState`) and an optional
+/// sequence of extra `BuildSource`s, returns a list of all `BuildSource`
+/// objects. Returns `None` if the graph structure is unexpected.
+#[pyfunction]
+pub(crate) fn rust_find_all_sources_in_build(
+    py: Python<'_>,
+    graph: &PyDict,
+    extra: &PyAny,
+) -> PyResult<Option<PyObject>> {
+    let build_source_cls = match py.import("mypy.build")?.getattr("BuildSource") {
+        Ok(cls) => cls,
+        Err(_) => return Ok(None),
+    };
+
+    // Start with extra sources
+    let mut result: Vec<PyObject> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for item in extra.iter()? {
+        let item = item?;
+        let module = match item.getattr("module") {
+            Ok(v) => match v.extract::<String>() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        seen.insert(module);
+        result.push(item.into());
+    }
+
+    // Walk graph
+    for (key, value) in graph.iter() {
+        let module: String = match key.extract() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        if seen.contains(&module) {
+            continue;
+        }
+        seen.insert(module.clone());
+
+        let path = match value.getattr("path") {
+            Ok(v) => match v.extract::<String>() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        let bs = match build_source_cls.call1((&path, &module)) {
+            Ok(bs) => bs,
+            Err(_) => continue,
+        };
+        result.push(bs.into());
+    }
+
+    Ok(Some(PyList::new(py, &result).into()))
+}
+
+/// Port of `mypy.dmypy_server.add_all_sources_to_changed`.
+///
+/// Appends sources without paths or already-seen paths to the
+/// `changed` list in place. Returns `None` to signal Python should
+/// fall back (shouldn't happen for normal inputs).
+#[pyfunction]
+pub(crate) fn rust_add_all_sources_to_changed(
+    py: Python<'_>,
+    sources: &PyAny,
+    changed: &PyAny,
+) -> PyResult<Option<()>> {
+    // Build changed_set
+    let mut changed_set: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for item in changed.iter()? {
+        let item = item?;
+        let (mod_name, path): (String, String) = match item.extract() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        changed_set.insert((mod_name, path));
+    }
+
+    // Build new items
+    let mut new_items: Vec<PyObject> = Vec::new();
+    for source in sources.iter()? {
+        let source = source?;
+        let path = match source.getattr("path") {
+            Ok(v) => match v.extract::<String>() {
+                Ok(s) if !s.is_empty() => s,
+                _ => continue,
+            },
+            Err(_) => continue,
+        };
+        let mod_name: String = match source.getattr("module") {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        if !changed_set.contains(&(mod_name.clone(), path.clone())) {
+            changed_set.insert((mod_name.clone(), path.clone()));
+            let py_pair: PyObject = (mod_name, path).into_py(py);
+            new_items.push(py_pair);
+        }
+    }
+
+    // Extend changed in place
+    if let Ok(extend_fn) = changed.getattr("extend") {
+        let new_list = PyList::new(py, &new_items);
+        extend_fn.call1((new_list,))?;
+    }
+
+    Ok(Some(()))
+}
+
+/// Port of `mypy.dmypy_server.fix_module_deps`.
+///
+/// Re-assigns `state.dependencies`, `state.dependencies_set`,
+/// `state.suppressed`, and `state.suppressed_set` based on whether
+/// each dep exists in the graph. Returns `None` if the graph
+/// structure is unexpected.
+#[pyfunction]
+pub(crate) fn rust_fix_module_deps(py: Python<'_>, graph: &PyDict) -> PyResult<Option<()>> {
+    // Collect valid module keys
+    let valid_modules: std::collections::HashSet<String> = graph
+        .keys()
+        .into_iter()
+        .filter_map(|k| k.extract().ok())
+        .collect();
+
+    for (_key, value) in graph.iter() {
+        // Get dependencies
+        let dependencies: Vec<String> = match value.getattr("dependencies") {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Get suppressed
+        let suppressed: Vec<String> = match value.getattr("suppressed") {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        // Classify
+        let mut new_dependencies: Vec<String> = Vec::new();
+        let mut new_suppressed: Vec<String> = Vec::new();
+
+        for dep in dependencies.iter().chain(suppressed.iter()) {
+            if valid_modules.contains(dep) {
+                new_dependencies.push(dep.clone());
+            } else {
+                new_suppressed.push(dep.clone());
+            }
+        }
+
+        // Set dependencies and dependencies_set
+        value.setattr("dependencies", PyList::new(py, &new_dependencies))?;
+        value.setattr("dependencies_set", PySet::new(py, &new_dependencies)?)?;
+
+        // Set suppressed and suppressed_set
+        value.setattr("suppressed", PyList::new(py, &new_suppressed))?;
+        value.setattr("suppressed_set", PySet::new(py, &new_suppressed)?)?;
+    }
+
+    Ok(Some(()))
+}
+
+/// Port of `mypy.dmypy_server.filter_out_missing_top_level_packages`.
+///
+/// Given a set of package names and a `SearchPaths` / `FileSystemCache`,
+/// returns the subset of packages that have entries on disk.
+/// Returns `None` if the expected attributes are missing.
+#[pyfunction]
+pub(crate) fn rust_filter_out_missing_top_level_packages(
+    py: Python<'_>,
+    packages: &PyAny,
+    search_paths: &PyAny,
+    fscache: &PyAny,
+) -> PyResult<Option<PyObject>> {
+    // Extract paths from SearchPaths
+    let path_attrs = ["python_path", "mypy_path", "package_path", "typeshed_path"];
+    let mut all_paths: Vec<String> = Vec::new();
+
+    for attr in &path_attrs {
+        if let Ok(val) = search_paths.getattr(*attr) {
+            if let Ok(paths) = val.extract::<Vec<String>>() {
+                all_paths.extend(paths);
+            }
+        }
+    }
+
+    // Collect entries from each path
+    let mut found: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let packages_set: std::collections::HashSet<String> = packages
+        .iter()?
+        .filter_map(|item| item.ok().and_then(|i| i.extract().ok()))
+        .collect();
+
+    for p in &all_paths {
+        let entries: Vec<String> = match fscache.call_method1("listdir", (p,)) {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+
+        for entry in &entries {
+            let cleaned = if entry.ends_with(".py") {
+                entry[..entry.len() - 3].to_string()
+            } else if entry.ends_with(".pyi") {
+                entry[..entry.len() - 4].to_string()
+            } else if entry.ends_with("-stubs") {
+                entry[..entry.len() - 6].to_string()
+            } else {
+                entry.clone()
+            };
+
+            if packages_set.contains(&cleaned) {
+                found.insert(cleaned);
+            }
+        }
+    }
+
+    let pkg_vec: Vec<&str> = found.iter().map(|s| s.as_str()).collect();
+    Ok(Some(PySet::new(py, &pkg_vec)?.into()))
 }
 
 // --- Helpers (for type-trigging; reused by serverdeps tests) ---
