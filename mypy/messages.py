@@ -925,6 +925,12 @@ class MessageBuilder:
         index_str, expected_str = format_type_distinctly(
             index_type, expected_type, options=self.options
         )
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_invalid_index_type(index_str, expected_str, base_str)
+                return self.fail(msg, context, code=code)
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         return self.fail(
             "Invalid index type {} for {}; expected type {}".format(
                 index_str, base_str, expected_str
@@ -947,6 +953,21 @@ class MessageBuilder:
     def too_few_arguments(
         self, callee: CallableType, context: Context, argument_names: Sequence[str | None] | None
     ) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                result = _type_kernel.rust_too_few_arguments(
+                    self.prefer_simple_messages(),
+                    list(argument_names) if argument_names is not None else None,
+                    list(callee.arg_names),
+                    callee.min_args,
+                    callable_name(callee),
+                    for_function(callee),
+                )
+                if result is not None:
+                    self.fail(result, context, code=codes.CALL_ARG)
+                    return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if self.prefer_simple_messages():
             msg = "Too few arguments"
         elif argument_names is not None:
@@ -969,11 +990,29 @@ class MessageBuilder:
         self.fail(msg, context, code=codes.CALL_ARG)
 
     def missing_named_argument(self, callee: CallableType, context: Context, name: str) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_missing_named_argument(name, for_function(callee))
+                self.fail(msg, context, code=codes.CALL_ARG)
+                self.note_defined_here(callee, context)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         msg = f'Missing named argument "{name}"' + for_function(callee)
         self.fail(msg, context, code=codes.CALL_ARG)
         self.note_defined_here(callee, context)
 
     def too_many_arguments(self, callee: CallableType, context: Context) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_too_many_arguments(
+                    self.prefer_simple_messages(), for_function(callee)
+                )
+                self.fail(msg, context, code=codes.CALL_ARG)
+                self.maybe_note_about_special_args(callee, context)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if self.prefer_simple_messages():
             msg = "Too many arguments"
         else:
@@ -995,6 +1034,17 @@ class MessageBuilder:
         self.fail(msg, context)
 
     def too_many_positional_arguments(self, callee: CallableType, context: Context) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_too_many_positional_arguments(
+                    self.prefer_simple_messages(), for_function(callee)
+                )
+                self.fail(msg, context, code=codes.CALL_ARG_MISC)
+                self.maybe_note_about_special_args(callee, context)
+                self.note_defined_here(callee, context, code=codes.CALL_ARG_MISC)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if self.prefer_simple_messages():
             msg = "Too many positional arguments"
         else:
@@ -1019,6 +1069,15 @@ class MessageBuilder:
     def unexpected_keyword_argument_for_function(
         self, for_func: str, name: str, context: Context, *, matches: list[str] | None = None
     ) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_unexpected_keyword_argument_for_function(
+                    for_func, name, matches
+                )
+                self.fail(msg, context, code=codes.CALL_ARG)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         msg = f'Unexpected keyword argument "{name}"' + for_func
         if matches:
             msg += f"; did you mean {pretty_seq(matches, 'or')}?"
@@ -1232,6 +1291,14 @@ class MessageBuilder:
     def wrong_number_values_to_unpack(
         self, provided: int, expected: int, context: Context
     ) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_wrong_number_values_to_unpack(provided, expected)
+                if msg:
+                    self.fail(msg, context)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if provided < expected:
             if provided == 1:
                 self.fail(f"Need more than 1 value to unpack ({expected} expected)", context)
@@ -1292,9 +1359,22 @@ class MessageBuilder:
         override: ProperType,
     ) -> None:
         target = self.override_target(name, name_in_super, supertype)
-        error = self.fail(
-            f'Signature of "{name}" incompatible with {target}', context, code=codes.OVERRIDE
-        )
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                error_msg = _type_kernel.rust_signature_incompatible_with_supertype(
+                    name, target
+                )
+                error = self.fail(error_msg, context, code=codes.OVERRIDE)
+            except (AssertionError, NotImplementedError, ValueError):
+                error = self.fail(
+                    f'Signature of "{name}" incompatible with {target}',
+                    context,
+                    code=codes.OVERRIDE,
+                )
+        else:
+            error = self.fail(
+                f'Signature of "{name}" incompatible with {target}', context, code=codes.OVERRIDE
+            )
 
         original_str, override_str = format_type_distinctly(
             original, override, options=self.options, bare=True
@@ -1498,6 +1578,13 @@ class MessageBuilder:
             )
 
     def undefined_in_superclass(self, member: str, context: Context) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_undefined_in_superclass(member)
+                self.fail(msg, context)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         self.fail(f'"{member}" undefined in superclass', context)
 
     def variable_may_be_undefined(self, name: str, context: Context) -> None:
@@ -1831,6 +1918,13 @@ class MessageBuilder:
         self.fail(f'Forward operator "{forward_method}" is not callable', context)
 
     def signatures_incompatible(self, method: str, other_method: str, context: Context) -> None:
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                msg = _type_kernel.rust_signatures_incompatible(method, other_method)
+                self.fail(msg, context)
+                return
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         self.fail(f'Signatures of "{method}" and "{other_method}" are incompatible', context)
 
     def yield_from_invalid_operand_type(self, expr: Type, context: Context) -> Type:

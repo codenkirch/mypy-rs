@@ -1912,6 +1912,172 @@ pub fn rust_count_stats(messages: Vec<String>) -> (i64, i64, i64) {
     (errors, notes, error_files)
 }
 
+// ---------------------------------------------------------------------------
+// Pure string-message generators (Issue #438)
+// ---------------------------------------------------------------------------
+// These mirror the message-body construction in mypy/messages.py for the
+// functions that take only pre-resolved strings/ints (no live Type). The
+// Python wrapper extracts the needed data from CallableType / context and
+// passes it here; if we return None, Python falls back to its own body.
+
+/// `mypy/messages.py:947` — too_few_arguments message body.
+///
+/// `argument_names` carries the call-site argument names (None = positional).
+/// `callee_arg_names` / `callee_min_args` come from the CallableType.
+/// `callee_name` is `callable_name(callee)` (already resolved, may be None).
+/// `for_func` is `for_function(callee)` (already resolved).
+/// Returns None when the `prefer_simple_messages` + `argument_names` branch
+/// produces a message that requires the `callee_name is not None and diff and
+/// all(d is not None for d in diff)` condition but `callee_name` is None — in
+/// that case Python's fallback uses `for_function(callee)` which we cannot
+/// reconstruct, so we return None to let Python handle it.
+#[pyfunction]
+#[pyo3(signature = (prefer_simple, argument_names, callee_arg_names, callee_min_args, callee_name, for_func))]
+#[allow(clippy::too_many_arguments)]
+pub fn rust_too_few_arguments(
+    prefer_simple: bool,
+    argument_names: Option<Vec<Option<String>>>,
+    callee_arg_names: Vec<Option<String>>,
+    callee_min_args: i64,
+    callee_name: Option<String>,
+    for_func: String,
+) -> Option<String> {
+    if prefer_simple {
+        return Some("Too few arguments".to_string());
+    }
+    if let Some(arg_names) = &argument_names {
+        let num_positional_args = arg_names.iter().filter(|k| k.is_none()).count();
+        // Python slice: callee.arg_names[num_positional_args : callee.min_args].
+        // Python returns empty when start > end or start > len; clamp to match.
+        let start = num_positional_args.min(callee_arg_names.len());
+        let end = (callee_min_args as usize).min(callee_arg_names.len());
+        let arguments_left: Vec<Option<String>> = if start >= end {
+            Vec::new()
+        } else {
+            callee_arg_names[start..end].to_vec()
+        };
+        let diff: Vec<Option<String>> = arguments_left
+            .iter()
+            .filter(|k| !arg_names.contains(k))
+            .cloned()
+            .collect();
+        let mut msg = if diff.len() == 1 {
+            "Missing positional argument".to_string()
+        } else {
+            "Missing positional arguments".to_string()
+        };
+        if let Some(cn) = &callee_name {
+            if !diff.is_empty() && diff.iter().all(|d| d.is_some()) {
+                let names: Vec<String> = diff.iter().map(|d| d.clone().unwrap()).collect();
+                let args = names.join("\", \"");
+                msg += format!(" \"{args}\" in call to {cn}").as_str();
+                return Some(msg);
+            }
+        }
+        // Fallback: "Too few arguments" + for_function(callee).
+        // If callee_name is None, Python's for_function returns "" so the
+        // message is just "Too few arguments". We can produce that here.
+        let _ = callee_name;
+        return Some(format!("Too few arguments{for_func}"));
+    }
+    Some(format!("Too few arguments{for_func}"))
+}
+
+/// `mypy/messages.py:976` — too_many_arguments message body.
+#[pyfunction]
+pub fn rust_too_many_arguments(prefer_simple: bool, for_func: String) -> String {
+    if prefer_simple {
+        "Too many arguments".to_string()
+    } else {
+        format!("Too many arguments{for_func}")
+    }
+}
+
+/// `mypy/messages.py:997` — too_many_positional_arguments message body.
+#[pyfunction]
+pub fn rust_too_many_positional_arguments(prefer_simple: bool, for_func: String) -> String {
+    if prefer_simple {
+        "Too many positional arguments".to_string()
+    } else {
+        format!("Too many positional arguments{for_func}")
+    }
+}
+
+/// `mypy/messages.py:971` — missing_named_argument message body.
+#[pyfunction]
+pub fn rust_missing_named_argument(name: String, for_func: String) -> String {
+    format!("Missing named argument \"{name}\"{for_func}")
+}
+
+/// `mypy/messages.py:1019` — unexpected_keyword_argument_for_function body.
+#[pyfunction]
+pub fn rust_unexpected_keyword_argument_for_function(
+    for_func: String,
+    name: String,
+    matches: Option<Vec<String>>,
+) -> String {
+    let mut msg = format!("Unexpected keyword argument \"{name}\"{for_func}");
+    if let Some(m) = &matches {
+        if !m.is_empty() {
+            msg.push_str(&format!("; did you mean {}?", pretty_seq(m, "or")));
+        }
+    }
+    msg
+}
+
+/// `mypy/messages.py:916` — invalid_index_type message body.
+///
+/// `index_str` and `expected_str` are already resolved via
+/// `format_type_distinctly` (Python side or Rust). `base_str` is the
+/// pre-resolved base type string.
+#[pyfunction]
+pub fn rust_invalid_index_type(
+    index_str: String,
+    expected_str: String,
+    base_str: String,
+) -> String {
+    format!("Invalid index type {index_str} for {base_str}; expected type {expected_str}")
+}
+
+/// `mypy/messages.py:1232` — wrong_number_values_to_unpack message body.
+#[pyfunction]
+pub fn rust_wrong_number_values_to_unpack(provided: i64, expected: i64) -> String {
+    if provided < expected {
+        if provided == 1 {
+            format!("Need more than 1 value to unpack ({expected} expected)")
+        } else {
+            format!("Need more than {provided} values to unpack ({expected} expected)")
+        }
+    } else if provided > expected {
+        format!("Too many values to unpack ({expected} expected, {provided} provided)")
+    } else {
+        // provided == expected: no error in Python. Return empty to signal
+        // no-op; Python wrapper checks for this.
+        String::new()
+    }
+}
+
+/// `mypy/messages.py:1500` — undefined_in_superclass message body.
+#[pyfunction]
+pub fn rust_undefined_in_superclass(member: String) -> String {
+    format!("\"{member}\" undefined in superclass")
+}
+
+/// `mypy/messages.py:1833` — signatures_incompatible message body.
+#[pyfunction]
+pub fn rust_signatures_incompatible(method: String, other_method: String) -> String {
+    format!("Signatures of \"{method}\" and \"{other_method}\" are incompatible")
+}
+
+/// `mypy/messages.py:1284` — signature_incompatible_with_supertype error body.
+///
+/// Only the `fail` line; the notes (format_type_distinctly, pretty_callable)
+/// stay on Python because they need live Type objects.
+#[pyfunction]
+pub fn rust_signature_incompatible_with_supertype(name: String, target: String) -> String {
+    format!("Signature of \"{name}\" incompatible with {target}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,5 +2357,188 @@ mod tests {
         );
         // Non-Instance expected type defers to Python.
         assert_eq!(append_numbers_notes_inner(&Type::NoneType), None);
+    }
+
+    // ── Issue #438: pure string-message generators ──────────────────────────
+
+    #[test]
+    fn test_too_few_arguments_simple() {
+        assert_eq!(
+            rust_too_few_arguments(true, None, vec![], 0, None, String::new()),
+            Some("Too few arguments".to_string())
+        );
+    }
+
+    #[test]
+    fn test_too_few_arguments_no_arg_names() {
+        assert_eq!(
+            rust_too_few_arguments(false, None, vec![], 0, None, " for \"f\"".to_string()),
+            Some("Too few arguments for \"f\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_too_few_arguments_with_names_single_diff() {
+        // callee arg_names: [None, "y"], min_args=2, call arg_names: ["x", None]
+        // num_positional=1, arguments_left = arg_names[1:2] = ["y"]
+        // diff = ["y"] (not in ["x", None]) -> single missing
+        let result = rust_too_few_arguments(
+            false,
+            Some(vec![Some("x".to_string()), None]),
+            vec![None, Some("y".to_string())],
+            2,
+            Some("\"f\"".to_string()),
+            " for \"f\"".to_string(),
+        );
+        assert_eq!(
+            result,
+            Some("Missing positional argument \"y\" in call to \"f\"".to_string())
+        );
+    }
+
+    #[test]
+    fn test_too_few_arguments_with_names_multi_diff() {
+        // callee arg_names: [None, "y", "z"], min_args=3, call: [None, None, None]
+        // num_positional=3, arguments_left = arg_names[3:3] = [] -> no diff
+        // falls through to for_function path
+        let result = rust_too_few_arguments(
+            false,
+            Some(vec![None, None, None]),
+            vec![None, Some("y".to_string()), Some("z".to_string())],
+            3,
+            Some("\"f\"".to_string()),
+            " for \"f\"".to_string(),
+        );
+        // diff is empty, so callee_name condition fails -> fallback
+        assert_eq!(result, Some("Too few arguments for \"f\"".to_string()));
+    }
+
+    #[test]
+    fn test_too_many_arguments() {
+        assert_eq!(
+            rust_too_many_arguments(true, String::new()),
+            "Too many arguments"
+        );
+        assert_eq!(
+            rust_too_many_arguments(false, " for \"f\"".to_string()),
+            "Too many arguments for \"f\""
+        );
+    }
+
+    #[test]
+    fn test_too_many_positional_arguments() {
+        assert_eq!(
+            rust_too_many_positional_arguments(true, String::new()),
+            "Too many positional arguments"
+        );
+        assert_eq!(
+            rust_too_many_positional_arguments(false, " for \"f\"".to_string()),
+            "Too many positional arguments for \"f\""
+        );
+    }
+
+    #[test]
+    fn test_missing_named_argument() {
+        assert_eq!(
+            rust_missing_named_argument("x".to_string(), " for \"f\"".to_string()),
+            "Missing named argument \"x\" for \"f\""
+        );
+        assert_eq!(
+            rust_missing_named_argument("x".to_string(), String::new()),
+            "Missing named argument \"x\""
+        );
+    }
+
+    #[test]
+    fn test_unexpected_keyword_argument_for_function() {
+        assert_eq!(
+            rust_unexpected_keyword_argument_for_function(
+                " for \"f\"".to_string(),
+                "x".to_string(),
+                None
+            ),
+            "Unexpected keyword argument \"x\" for \"f\""
+        );
+        assert_eq!(
+            rust_unexpected_keyword_argument_for_function(
+                String::new(),
+                "x".to_string(),
+                Some(vec!["y".to_string()])
+            ),
+            "Unexpected keyword argument \"x\"; did you mean \"y\"?"
+        );
+        assert_eq!(
+            rust_unexpected_keyword_argument_for_function(
+                String::new(),
+                "x".to_string(),
+                Some(vec!["y".to_string(), "z".to_string()])
+            ),
+            "Unexpected keyword argument \"x\"; did you mean \"y\" or \"z\"?"
+        );
+        // Empty matches -> no suggestion.
+        assert_eq!(
+            rust_unexpected_keyword_argument_for_function(
+                String::new(),
+                "x".to_string(),
+                Some(vec![])
+            ),
+            "Unexpected keyword argument \"x\""
+        );
+    }
+
+    #[test]
+    fn test_invalid_index_type() {
+        assert_eq!(
+            rust_invalid_index_type(
+                "str".to_string(),
+                "int".to_string(),
+                "list[str]".to_string()
+            ),
+            "Invalid index type str for list[str]; expected type int"
+        );
+    }
+
+    #[test]
+    fn test_wrong_number_values_to_unpack() {
+        assert_eq!(
+            rust_wrong_number_values_to_unpack(1, 3),
+            "Need more than 1 value to unpack (3 expected)"
+        );
+        assert_eq!(
+            rust_wrong_number_values_to_unpack(2, 3),
+            "Need more than 2 values to unpack (3 expected)"
+        );
+        assert_eq!(
+            rust_wrong_number_values_to_unpack(5, 3),
+            "Too many values to unpack (3 expected, 5 provided)"
+        );
+        assert_eq!(rust_wrong_number_values_to_unpack(3, 3), "");
+    }
+
+    #[test]
+    fn test_undefined_in_superclass() {
+        assert_eq!(
+            rust_undefined_in_superclass("foo".to_string()),
+            "\"foo\" undefined in superclass"
+        );
+    }
+
+    #[test]
+    fn test_signatures_incompatible() {
+        assert_eq!(
+            rust_signatures_incompatible("f".to_string(), "g".to_string()),
+            "Signatures of \"f\" and \"g\" are incompatible"
+        );
+    }
+
+    #[test]
+    fn test_signature_incompatible_with_supertype() {
+        assert_eq!(
+            rust_signature_incompatible_with_supertype(
+                "f".to_string(),
+                "supertype \"A\"".to_string()
+            ),
+            "Signature of \"f\" incompatible with supertype \"A\""
+        );
     }
 }
