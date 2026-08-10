@@ -781,6 +781,27 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_same_var_from_getattr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_get_typevarlike_declaration,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(semanal_visitor::rust_parse_bool, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_mangled_global,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_initial_mangled_global,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_final_redefinition,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_has_explicit_any,
         module
     )?)?;

@@ -1353,6 +1353,206 @@ fn var_is_typing_special_form_inner(fullname: &str) -> bool {
     TYPING_SPECIAL_FORMS.contains(&fullname)
 }
 
+// ---------------------------------------------------------------------------
+// is_same_var_from_getattr (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.is_same_var_from_getattr` — pure helper.
+///
+/// Mirrors semanal.py:8833-8840. Returns `True` when both `n1` and `n2` are
+/// `Var` instances, both have `from_module_getattr == True`, and both share
+/// the same `fullname`. Pure name + flag check, no side effects.
+#[pyfunction]
+pub(crate) fn rust_is_same_var_from_getattr(
+    py: Python<'_>,
+    n1: &PyAny,
+    n2: &PyAny,
+) -> PyResult<bool> {
+    if n1.is_none() || n2.is_none() {
+        return Ok(false);
+    }
+    let nodes_mod = py.import("mypy.nodes")?;
+    let var_cls: &PyType = nodes_mod.getattr("Var")?.downcast()?;
+    if !n1.is_instance(var_cls)? || !n2.is_instance(var_cls)? {
+        return Ok(false);
+    }
+    let a_getattr = n1.getattr("from_module_getattr")?;
+    let b_getattr = n2.getattr("from_module_getattr")?;
+    if !a_getattr.is_true()? || !b_getattr.is_true()? {
+        return Ok(false);
+    }
+    let a_full = n1.getattr("fullname")?;
+    let b_full = n2.getattr("fullname")?;
+    let a_str: &str = a_full.downcast::<PyString>()?.to_str()?;
+    let b_str: &str = b_full.downcast::<PyString>()?.to_str()?;
+    Ok(a_str == b_str)
+}
+
+// ---------------------------------------------------------------------------
+// get_typevarlike_declaration (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.get_typevarlike_declaration` — pure
+/// structural check.
+///
+/// Mirrors semanal.py:5142-5155. Returns the `CallExpr` if `s` is an
+/// assignment of the form `name = callee(...)` where `callee.fullname` is
+/// in `typevarlike_types`, otherwise `None`. Pure AST structure + fullname
+/// check with no side effects. Returns `None` (fallback) for any shape Rust
+/// cannot classify.
+#[pyfunction]
+pub(crate) fn rust_get_typevarlike_declaration(
+    py: Python<'_>,
+    s: &PyAny,
+    typevarlike_types: &PyAny,
+) -> PyResult<Option<PyObject>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let assignment_stmt_cls: &PyType = nodes_mod.getattr("AssignmentStmt")?.downcast()?;
+    if !s.is_instance(assignment_stmt_cls)? {
+        return Ok(None);
+    }
+    let lvalues = s.getattr("lvalues")?;
+    let lvalues_list = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if lvalues_list.len() != 1 {
+        return Ok(None);
+    }
+    let first_lv = lvalues_list.get_item(0)?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if !first_lv.is_instance(name_expr_cls)? {
+        return Ok(None);
+    }
+    let rvalue = s.getattr("rvalue")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    if !rvalue.is_instance(call_expr_cls)? {
+        return Ok(None);
+    }
+    let callee = rvalue.getattr("callee")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if !callee.is_instance(ref_expr_cls)? {
+        return Ok(None);
+    }
+    let callee_fullname = callee.getattr("fullname")?;
+    let callee_str: &str = match callee_fullname.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(None),
+    };
+    let target_set = normalize_fullnames(typevarlike_types)?;
+    if target_set.contains(callee_str) {
+        Ok(Some(rvalue.into_py(py)))
+    } else {
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// parse_bool (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal_shared.parse_bool` — pure NameExpr fullname check.
+///
+/// Mirrors semanal_shared.py:493-499. Returns `Some(true)` when
+/// `expr.fullname == "builtins.True"`, `Some(false)` for `"builtins.False"`,
+/// and `None` for anything else (non-NameExpr or different fullname).
+#[pyfunction]
+pub(crate) fn rust_parse_bool(py: Python<'_>, expr: &PyAny) -> PyResult<Option<bool>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    if !expr.is_instance(name_expr_cls)? {
+        return Ok(None);
+    }
+    let fullname_obj = match expr.getattr("fullname") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let fullname: &str = match fullname_obj.downcast::<PyString>() {
+        Ok(s) => s.to_str()?,
+        Err(_) => return Ok(None),
+    };
+    match fullname {
+        "builtins.True" => Ok(Some(true)),
+        "builtins.False" => Ok(Some(false)),
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// is_mangled_global / is_initial_mangled_global (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.is_mangled_global` — pure check.
+///
+/// Mirrors semanal.py:8240-8242. A global is mangled if there exists at
+/// least one renamed variant, i.e. `unmangle(name) + "'"` is a key in
+/// `self.globals`. `globals` is `self.globals` (a dict).
+#[pyfunction]
+#[pyo3(signature = (name, globals))]
+pub(crate) fn rust_is_mangled_global(name: &str, globals: &PyDict) -> PyResult<bool> {
+    let mangled = format!("{}'", unmangle_str(name));
+    globals.contains(mangled.as_str())
+}
+
+/// `mypy.semanal.SemanticAnalyzer.is_initial_mangled_global` — pure check.
+///
+/// Mirrors semanal.py:8244-8246. The first renamed definition for a global
+/// has exactly one prime: `name == unmangle(name) + "'"`.
+#[pyfunction]
+pub(crate) fn rust_is_initial_mangled_global(name: &str) -> PyResult<bool> {
+    Ok(name == format!("{}'", unmangle_str(name)))
+}
+
+/// Strip trailing `'` chars from a name (mirrors `mypy.util.unmangle`).
+fn unmangle_str(name: &str) -> &str {
+    name.trim_end_matches('\'')
+}
+
+// ---------------------------------------------------------------------------
+// is_final_redefinition (Issue #460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.is_final_redefinition` — pure check.
+///
+/// Mirrors semanal.py:4760-4764. At global scope (`GDEF`), a final
+/// redefinition occurs when the name is mangled but is not the initial
+/// mangled global. At class scope (`MDEF`), it occurs when
+/// `unmangle(name) + "'"` is present in `self.type.names`. For other
+/// scopes, returns `false`.
+///
+/// `globals` is `self.globals` (dict); `type_names` is `self.type.names`
+/// (dict) when inside a class, else `None`.
+#[pyfunction]
+#[pyo3(signature = (kind, name, globals, type_names))]
+pub(crate) fn rust_is_final_redefinition(
+    kind: i64,
+    name: &str,
+    globals: &PyDict,
+    type_names: &PyAny,
+) -> PyResult<bool> {
+    // GDEF == 1, MDEF == 2 (mypy.nodes)
+    match kind {
+        1 => {
+            // GDEF: is_mangled_global(name) and not is_initial_mangled_global(name)
+            let mangled_key = format!("{}'", unmangle_str(name));
+            let is_mangled = globals.contains(mangled_key.as_str())?;
+            if !is_mangled {
+                return Ok(false);
+            }
+            Ok(name != mangled_key.as_str())
+        }
+        2 => {
+            // MDEF: unmangle(name) + "'" in self.type.names
+            let key = format!("{}'", unmangle_str(name));
+            if let Ok(table) = type_names.downcast::<PyDict>() {
+                return table.contains(key.as_str());
+            }
+            Ok(false)
+        }
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1402,5 +1602,27 @@ mod tests {
         assert!(!var_is_typing_special_form_inner(""));
         assert!(!var_is_typing_special_form_inner("typing"));
         assert!(!var_is_typing_special_form_inner("typing."));
+    }
+
+    #[test]
+    fn test_unmangle_strips_trailing_primes() {
+        assert_eq!(unmangle_str("foo"), "foo");
+        assert_eq!(unmangle_str("foo'"), "foo");
+        assert_eq!(unmangle_str("foo''"), "foo");
+        assert_eq!(unmangle_str(""), "");
+    }
+
+    #[test]
+    fn test_is_initial_mangled_global_logic() {
+        // name == unmangle(name) + "'" only when there is exactly one trailing prime
+        assert!(name_is_initial_mangled("foo'"));
+        assert!(name_is_initial_mangled("x'"));
+        assert!(!name_is_initial_mangled("foo"));
+        assert!(!name_is_initial_mangled("foo''"));
+        assert!(!name_is_initial_mangled(""));
+    }
+
+    fn name_is_initial_mangled(name: &str) -> bool {
+        name == format!("{}'", unmangle_str(name))
     }
 }
