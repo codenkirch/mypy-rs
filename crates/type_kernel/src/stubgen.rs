@@ -404,3 +404,85 @@ pub fn rust_stubgen_render_type_args(py: Python<'_>, items: &PyAny) -> PyResult<
     }
     Ok(Some(rendered.join(", ")))
 }
+
+// ---------------------------------------------------------------------------
+// Issue #392: pure helpers from stubgen.py + stubgenc.py
+// ---------------------------------------------------------------------------
+
+/// Issue #392: `mypy.stubgen.get_assigned_names` — yield short names from
+/// assignment lvalues (NameExpr → name, TupleExpr → recurse).
+///
+/// Mirrors `get_assigned_names(lvalues)` at stubgen.py:437.
+#[pyfunction]
+pub fn rust_get_assigned_names(py: Python<'_>, lvalues: &PyAny) -> PyResult<Vec<String>> {
+    let mut names = Vec::new();
+    let iterator = lvalues.iter()?;
+    for lvalue in iterator {
+        get_assigned_names_inner(py, &lvalue, &mut names)?;
+    }
+    Ok(names)
+}
+
+fn get_assigned_names_inner(
+    py: Python<'_>, node: &PyAny, out: &mut Vec<String>,
+) -> PyResult<()> {
+    let type_name: String = node.get_type().name()?.into();
+    match type_name.as_str() {
+        "NameExpr" => {
+            let name: String = node.getattr("name")?.extract()?;
+            out.push(name);
+        }
+        "TupleExpr" => {
+            let items = node.getattr("items")?.downcast::<PyList>()?;
+            for item in items.iter() {
+                get_assigned_names_inner(py, item, out)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Issue #392: `mypy.stubgen.is_none_expr` — check if Expression is
+/// NameExpr with name "None".
+///
+/// Mirrors `is_none_expr(expr)` at stubgen.py:474.
+#[pyfunction]
+pub fn rust_is_none_expr(py: Python<'_>, expr: &PyAny) -> PyResult<bool> {
+    let type_name: String = expr.get_type().name()?.into();
+    if type_name == "NameExpr" {
+        if let Ok(name) = expr.getattr("name").and_then(|v| v.extract::<String>()) {
+            return Ok(name == "None");
+        }
+    }
+    Ok(false)
+}
+
+/// Issue #392: `mypy.stubgen.is_pybind11_overloaded_function_docstring` —
+/// check if a docstring matches the pybind11 overload pattern.
+///
+/// Mirrors `is_pybind11_overloaded_function_docstring(docstring, name)` at
+/// stubgenc.py:143.
+#[pyfunction]
+pub fn rust_is_pybind11_overloaded_function_docstring(
+    docstring: &str,
+    name: &str,
+) -> PyResult<bool> {
+    let expected = format!("{name}(*args, **kwargs)\nOverloaded function.\n\n");
+    Ok(docstring.starts_with(&expected))
+}
+
+/// Issue #392: `mypy.stubgenc.method_name_sort_key` — sort key for method
+/// ordering in stubgen: constructor < normal methods < special methods.
+///
+/// Mirrors `method_name_sort_key(name)` at stubgenc.py:923.
+#[pyfunction]
+pub fn rust_method_name_sort_key(name: &str) -> (u8, String) {
+    if name == "__new__" || name == "__init__" {
+        (0, name.to_string())
+    } else if name.starts_with("__") && name.ends_with("__") {
+        (2, name.to_string())
+    } else {
+        (1, name.to_string())
+    }
+}
