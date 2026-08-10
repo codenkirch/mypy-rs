@@ -188,6 +188,7 @@ __all__ = [
     "rust_apply_semantic_analyzer_patches",
     "rust_classify_decorators",
     "rust_classify_imports",
+    "rust_lookup",
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
     "rust_get_assigned_names",
@@ -747,6 +748,15 @@ def rust_classify_member_resolution(
     type_info_cls: type[Expression],
     type_alias_cls: type[Expression],
 ) -> tuple[str | None, SymbolTableNode | None]: ...
+def rust_lookup(
+    name: str,
+    global_decls: set[str],
+    globals: SymbolTable,
+    nonlocal_decls: set[str],
+    locals: list[SymbolTable | None],
+    type_names: SymbolTable | None,
+    is_func_scope: bool,
+) -> tuple[str, SymbolTableNode | None] | None: ...
 def rust_stubgen_render(expr: Expression) -> str | None: ...
 def rust_stubgen_render_type_args(items: list[Expression]) -> str | None: ...
 def rust_get_assigned_names(lvalues: list[Expression]) -> list[str]: ...

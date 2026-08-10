@@ -421,6 +421,7 @@ try:
         rust_is_same_symbol as _rust_is_same_symbol,
         rust_is_trivial_body as _rust_is_trivial_body,
         rust_is_valid_replacement as _rust_is_valid_replacement,
+        rust_lookup as _rust_lookup,
         rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
         rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
         rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
@@ -443,6 +444,7 @@ except ImportError:
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
+    _rust_lookup = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
@@ -6807,6 +6809,50 @@ class SemanticAnalyzer(
         defer.
         """
         implicit_name = False
+        # Issue #419: native name-resolution decision (strangler-fig). Rust
+        # runs the pure local -> enclosing -> global -> builtins walk and
+        # returns what it found; Python applies ALL side effects
+        # (record_imported_symbol in caller, name_not_defined below, class-body
+        # gating, __qualname__/__module__ Var synthesis). None means the walk
+        # hit a sub-case Rust cannot decide (class-body attribute gating,
+        # implicit self.x names, decl sets it can't see), and the pure loop
+        # below runs unchanged.
+        native_found = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                native_found = _rust_lookup(
+                    name,
+                    self.global_decls[-1],
+                    self.globals,
+                    self.nonlocal_decls[-1],
+                    self.locals,
+                    self.type.names if self.type else None,
+                    self.is_func_scope(),
+                )
+            except (AssertionError, NotImplementedError):
+                pass
+        if native_found is not None:
+            native_code, native_node = native_found
+            if native_code == "found":
+                assert native_node is not None
+                return native_node
+            if native_code == "synthesize_qualname":
+                v = Var(name, self.str_type())
+                v._fullname = self.qualified_name(name)
+                return SymbolTableNode(MDEF, v)
+            if native_code in ("global_undeclared", "nonlocal_undeclared"):
+                if not suppress_errors:
+                    self.name_not_defined(name, ctx)
+                return None
+            if native_code == "builtin_private":
+                if not suppress_errors:
+                    self.name_not_defined(name, ctx)
+                return None
+            if native_code == "not_found":
+                if not suppress_errors:
+                    self.name_not_defined(name, ctx)
+                return None
+            return None
         # 1a. Name declared using 'global x' takes precedence
         if name in self.global_decls[-1]:
             if name in self.globals:
