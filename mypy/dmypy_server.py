@@ -254,39 +254,6 @@ class Server:
         py_version = f"{self.options.python_version[0]}_{self.options.python_version[1]}"
         return {"platform": self.options.platform, "python_version": py_version}
 
-    def get_meminfo(self) -> dict[str, Any]:
-        """Return memory info dict for the current process."""
-        # Issue #389: try Rust-native path when available.
-        if _HAS_SERVER_HELPERS:
-            result = _rust_get_meminfo()
-            if result is not None:
-                return result
-        res: dict[str, Any] = {}
-        try:
-            import psutil
-        except ImportError:
-            res["memory_psutil_missing"] = (
-                "psutil not found, run pip install mypy[dmypy] "
-                "to install the needed components for dmypy"
-            )
-        else:
-            process = psutil.Process()
-            meminfo = process.memory_info()
-            res["memory_rss_mib"] = meminfo.rss / MiB
-            res["memory_vms_mib"] = meminfo.vms / MiB
-            if sys.platform == "win32":
-                res["memory_maxrss_mib"] = meminfo.peak_wset / MiB
-            else:
-                import resource  # Since it doesn't exist on Windows.
-
-                rusage = resource.getrusage(resource.RUSAGE_SELF)
-                if sys.platform == "darwin":
-                    factor = 1
-                else:
-                    factor = 1024  # Linux
-                res["memory_maxrss_mib"] = rusage.ru_maxrss * factor / MiB
-        return res
-
     def serve(self) -> None:
         """Serve requests, synchronously (no thread or fork)."""
 
@@ -1097,6 +1064,11 @@ MiB: Final = 2**20
 
 
 def get_meminfo() -> dict[str, Any]:
+    # Issue #389: try Rust-native path when available.
+    if _HAS_SERVER_HELPERS:
+        result = _rust_get_meminfo()
+        if result is not None:
+            return result
     res: dict[str, Any] = {}
     try:
         import psutil

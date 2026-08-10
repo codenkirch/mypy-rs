@@ -881,7 +881,11 @@ pub(crate) fn rust_get_meminfo(py: Python<'_>) -> PyResult<Option<PyObject>> {
                 res_dict.set_item("memory_maxrss_mib", peak_wset / mib)?;
             } else {
                 let resource_mod = py.import("resource")?;
-                let rusage = resource_mod.call_method1("getrusage", ("RUSAGE_SELF",))?;
+                // RUSAGE_SELF is an int (usually 0); fetch it, don't pass the
+                // literal string. call_method1 unpacked ("RUSAGE_SELF",) as a
+                // positional arg, so CPython got who="RUSAGE_SELF" -> TypeError.
+                let rusage_self = resource_mod.getattr("RUSAGE_SELF")?;
+                let rusage = resource_mod.call_method1("getrusage", (rusage_self,))?;
                 let ru_maxrss: i64 = rusage.getattr("ru_maxrss")?.extract()?;
                 let factor: i64 = if platform == "darwin" { 1 } else { 1024 };
                 res_dict.set_item(
