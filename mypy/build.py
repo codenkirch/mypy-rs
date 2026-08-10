@@ -1092,6 +1092,11 @@ class BuildManager:
         from mypy.server.deps import _set_native_server_deps_active
 
         _set_native_server_deps_active(self.options.native_type_kernel)
+        # Issue #388: gate pure server update helpers (dedupe_modules,
+        # get_module_to_path_map, get_sources, message extraction/sorting).
+        from mypy.server.update import _set_native_update_active
+
+        _set_native_update_active(self.options.native_type_kernel)
         # Stage 30: gate the dataclasses plugin transform seam. The Rust
         # path (`rust_dataclass_transform`) returns None for all inputs,
         # so this is parity-only — Python always falls back to the
