@@ -66,6 +66,9 @@ __all__ = [
     "rust_linearize_hierarchy",
     "rust_expand_type",
     "rust_expand_type_by_instance",
+    "rust_map_instance_to_supertype",
+    "rust_class_derivation_paths",
+    "rust_map_instance_to_direct_supertypes",
     "rust_make_simplified_union",
     "rust_simple_literal_type",
     "rust_is_simple_literal",
@@ -312,6 +315,23 @@ def rust_expand_type_by_instance(
     instance_bytes: bytes,
     strict_optional: bool,
 ) -> bytes | None: ...
+def rust_map_instance_to_supertype(
+    resolver: NativeTypeResolver,
+    instance_ref: str,
+    instance_args: bytes,
+    supertype_ref: str,
+) -> bytes | None: ...
+def rust_class_derivation_paths(
+    resolver: NativeTypeResolver,
+    typ_ref: str,
+    supertype_ref: str,
+) -> list[list[str]] | None: ...
+def rust_map_instance_to_direct_supertypes(
+    resolver: NativeTypeResolver,
+    instance_ref: str,
+    instance_args: bytes,
+    supertype_ref: str,
+) -> list[bytes] | None: ...
 def rust_freshen_all_functions_type_vars(
     start_raw_id: int,
     type_bytes: bytes,

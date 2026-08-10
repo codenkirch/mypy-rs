@@ -952,6 +952,13 @@ class BuildManager:
         from mypy.expandtype import _set_native_expand_type_active
 
         _set_native_expand_type_active(self.options.native_type_kernel)
+        # Stage 6 (issue #425): gate the map_instance_to_supertype hot
+        # path. The Rust primitive returns None for unsupported edges
+        # (missing TypeInfo, variadic tuples), so those fall through to
+        # the pure-Python maptype path. Mirrors the expand_type wiring.
+        from mypy.maptype import _set_native_map_active
+
+        _set_native_map_active(self.options.native_type_kernel)
         # Stage 3e typeops helpers. proper_subtype=True prevents
         # Any-absorption. Zero new regressions vs gate OFF. See #156.
         from mypy.typeops import _set_native_typeops_active
@@ -1323,6 +1330,11 @@ class BuildManager:
         _set_native_expand_type_active(True)
         _set_native_expand_type_typeinfo_map(typeinfo_map)
         _set_native_expand_type_resolver(resolver)
+        # Stage 6 (issue #425): maptype shares the same resolver snapshot
+        # as the subtype/expand paths.
+        from mypy.maptype import _set_native_map_resolver
+
+        _set_native_map_resolver(resolver)
         # Stage 3e typeops helpers. Resolver install now active in
         # production: typeops.rs is at full parity (testtypes + testcheck).
         from mypy.typeops import _set_native_typeops_resolver
@@ -1385,6 +1397,11 @@ class BuildManager:
         from mypy.checker import _set_native_checker_resolver
 
         _set_native_checker_resolver(None)
+        # Stage 6 (issue #425): maptype resolver shares the same snapshot
+        # as the subtype/expand paths.
+        from mypy.maptype import _set_native_map_resolver
+
+        _set_native_map_resolver(None)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
