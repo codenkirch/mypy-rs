@@ -2995,6 +2995,23 @@ def format_type(
     modification of the formatted string is required, callers should use
     format_type_bare.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_messages_active
+        and _native_messages_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_format_type(
+                _serialize_type_for_messages(typ),
+                _native_messages_resolver,
+                verbosity,
+                module_names,
+                options.use_star_unpack(),
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return quote_type_string(format_type_bare(typ, options, verbosity, module_names))
 
 
@@ -3425,6 +3442,12 @@ def format_item_name_list(s: Iterable[str]) -> str:
 
 
 def callable_name(type: FunctionLike) -> str | None:
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        name = type.get_name()
+        if name is not None:
+            result = _type_kernel.rust_callable_name(name)
+            if result is not None:
+                return result
     name = type.get_name()
     if name is not None and name[0] != "<":
         return f'"{name}"'.replace(" of ", '" of "')
@@ -3432,6 +3455,12 @@ def callable_name(type: FunctionLike) -> str | None:
 
 
 def for_function(callee: CallableType) -> str:
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        name = callee.get_name()
+        if name is not None:
+            result = _type_kernel.rust_for_function(name)
+            if result is not None:
+                return result
     name = callable_name(callee)
     if name is not None:
         return f" for {name}"
@@ -3479,8 +3508,10 @@ COMMON_MISTAKES: Final[dict[str, Sequence[str]]] = {"add": ("append", "extend")}
 # Rust. Falls back to the pure-Python path if the extension is unavailable
 # or the gate is off.
 try:
-    from type_kernel import rust_best_matches as _rust_best_matches
-    from type_kernel import rust_pretty_seq as _rust_pretty_seq
+    from type_kernel import (
+        rust_best_matches as _rust_best_matches,
+        rust_pretty_seq as _rust_pretty_seq,
+    )
 
     _HAS_SUGGESTIONS_KERNEL = True
 except ImportError:

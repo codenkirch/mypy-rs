@@ -1862,6 +1862,32 @@ pub fn rust_pretty_callable(
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Callable name helpers (messages.py:3427-3438)
+// ---------------------------------------------------------------------------
+
+/// `mypy/messages.py:3427` — return quoted callable name for messages.
+///
+/// If `name` starts with `<` or is `None`/empty, returns `None` so the Python
+/// caller falls back to the native path.
+#[pyfunction]
+pub fn rust_callable_name(name: String) -> Option<String> {
+    if name.is_empty() || name.starts_with('<') {
+        return None;
+    }
+    let quoted = format!("\"{}\"", name);
+    Some(quoted.replace(" of ", "\" of \""))
+}
+
+/// `mypy/messages.py:3434` — return `" for {name}"` or `""`.
+///
+/// Thin wrapper around `callable_name`: if the name is present, returns
+/// `" for <quoted_name>"`; otherwise `None` to let Python return `""`.
+#[pyfunction]
+pub fn rust_for_function(name: String) -> Option<String> {
+    rust_callable_name(name).map(|n| format!(" for {n}"))
+}
+
 // ── dmypy server helper (Issue #358) ──────────────────────────────────────────
 
 /// `mypy/util.py:count_stats` — count errors, notes and error_files in a message list.
