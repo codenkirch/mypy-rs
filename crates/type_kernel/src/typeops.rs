@@ -724,6 +724,128 @@ fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
     }
 }
 
+/// `mypy.typeops.erase_to_bound` (typeops.py:629-637): erase a type
+/// variable to its upper bound. A `TypeVarType` yields its `upper_bound`; a
+/// `TypeType` whose item is a `TypeVarType` yields `TypeType(upper_bound)`.
+/// All other types pass through unchanged.
+///
+/// `get_proper_type` is a no-op on wire types except for `TypeAliasType`,
+/// which has no proper form here, so it defers (returns `None`).
+fn erase_to_bound(t: &Type) -> Option<Type> {
+    if let Type::TypeAliasType { .. } = t {
+        return None;
+    }
+    match t {
+        Type::TypeVarType { upper_bound, .. } => Some((**upper_bound).clone()),
+        Type::TypeType { item, is_type_form } => {
+            if let Type::TypeVarType { upper_bound, .. } = item.as_ref() {
+                Some(Type::TypeType {
+                    item: Box::new((**upper_bound).clone()),
+                    is_type_form: *is_type_form,
+                })
+            } else {
+                Some(t.clone())
+            }
+        }
+        _ => Some(t.clone()),
+    }
+}
+
+/// `mypy.typeops.tuple_fallback` (typeops.py:194-220): compute the fallback
+/// `Instance` for a `TupleType`.
+///
+/// If the partial_fallback is not `builtins.tuple`, return it as-is.
+/// Otherwise collect item types (unpacking `UnpackType`s whose unwrapped
+/// type is `builtins.tuple` to their first arg), then build a single
+/// `Instance(type, [make_simplified_union(items, handle_recursive=False)])`
+/// preserving `extra_attrs`.
+///
+/// Defers (`None`) when: an `UnpackType` unpacks to a non-tuple (Python
+/// raises `NotImplementedError`), the simplified-union step defers, or any
+/// `make_simplified_union` subtype check needs the resolver and can't
+/// resolve. Needs the resolver for the union simplification.
+fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type> {
+    let Type::TupleType {
+        partial_fallback,
+        items,
+        ..
+    } = typ
+    else {
+        return None;
+    };
+    let Type::Instance {
+        type_ref,
+        extra_attrs,
+        ..
+    } = partial_fallback.as_ref()
+    else {
+        // Fallback isn't an Instance: defer (Python would crash too in
+        // practice, but the wire form can't represent it).
+        return None;
+    };
+    if type_ref != "builtins.tuple" {
+        return Some((**partial_fallback).clone());
+    }
+    let mut collected: Vec<Type> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            Type::UnpackType { typ } => {
+                let unpacked = typ.as_ref();
+                // Unwrap TypeVarTupleType to its upper_bound, matching
+                // get_proper_type(item.type) then the TypeVarTupleType
+                // branch (typeops.py:203-204).
+                let unwrapped = if let Type::TypeVarTupleType { upper_bound, .. } = unpacked {
+                    upper_bound.as_ref()
+                } else {
+                    unpacked
+                };
+                if let Type::Instance {
+                    type_ref: inner_ref,
+                    args,
+                    ..
+                } = unwrapped
+                {
+                    if inner_ref == "builtins.tuple" {
+                        if args.len() != 1 {
+                            return None;
+                        }
+                        collected.push(args[0].clone());
+                    } else {
+                        // Python raises NotImplementedError; defer.
+                        return None;
+                    }
+                } else {
+                    return None;
+                }
+            }
+            _ => collected.push(item.clone()),
+        }
+    }
+    // make_simplified_union(items, handle_recursive=False). The Rust
+    // make_simplified_union ignores handle_recursive (it always flattens
+    // with recursive=False semantics via flatten_nested_unions), so the
+    // behavior matches the Python handle_recursive=False call.
+    let ctx = SubtypeContext::new(false, false, false, true, true, true);
+    let union_type = crate::setops::make_simplified_union(&collected, &ctx, resolver, true)?;
+    let union_type = get_proper_type_or_none(&union_type)?;
+    Some(Type::Instance {
+        type_ref: type_ref.clone(),
+        args: vec![union_type],
+        last_known_value: None,
+        extra_attrs: extra_attrs.clone(),
+    })
+}
+
+/// `get_proper_type` shim: a `TypeAliasType` has no proper form in the wire
+/// representation (its target is unresolved), so defer. Otherwise the wire
+/// type is already proper.
+fn get_proper_type_or_none(t: &Type) -> Option<Type> {
+    if let Type::TypeAliasType { .. } = t {
+        return None;
+    }
+    Some(t.clone())
+}
+
 /// The shared walk behind `try_getting_str/int_literals_from_type`
 /// (typeops.py:1211-1264). Returns the scalar literal values when every
 /// candidate is a `LiteralType` whose fallback fullname equals
@@ -892,6 +1014,28 @@ pub(crate) fn rust_get_type_vars(t_bytes: &[u8], include_all: bool) -> Option<Ve
         blobs.push(encode_type(&tv)?);
     }
     Some(blobs)
+}
+
+/// `#[pyfunction]` entry for `erase_to_bound` (typeops.py:629-637). Takes
+/// serialized type bytes, returns encoded result bytes or `None`.
+#[pyfunction]
+pub(crate) fn rust_erase_to_bound(t_bytes: &[u8]) -> Option<Vec<u8>> {
+    let t = decode_type(t_bytes)?;
+    let result = erase_to_bound(&t)?;
+    encode_type(&result)
+}
+
+/// `#[pyfunction]` entry for `tuple_fallback` (typeops.py:194-220). Takes
+/// serialized tuple type bytes + `NativeTypeResolver`, returns encoded
+/// fallback Instance bytes or `None`.
+#[pyfunction]
+pub(crate) fn rust_tuple_fallback(
+    t_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let t = decode_type(t_bytes)?;
+    let result = tuple_fallback(&t, resolver.resolver())?;
+    encode_type(&result)
 }
 
 /// Return `None` when any shape needs alias expansion or is not handled,
@@ -2002,5 +2146,140 @@ mod tests {
         // TypeAliasType (alias node would be lost), so extraction defers to
         // the Python visitor at the encode boundary.
         assert!(super::encode_type(&alias).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // erase_to_bound
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn erase_to_bound_typevar_returns_upper_bound() {
+        let tv = tv_type(1, "T");
+        let bytes = encode(&tv);
+        let result = rust_erase_to_bound(&bytes).unwrap();
+        let decoded = super::decode_type(&result).unwrap();
+        // upper_bound of tv_type is AnyType(type_of_any=1).
+        assert!(matches!(decoded, Type::AnyType { type_of_any: 1, .. }));
+    }
+
+    #[test]
+    fn erase_to_bound_instance_passes_through() {
+        let inst = plain_instance("builtins.int");
+        let bytes = encode(&inst);
+        let result = rust_erase_to_bound(&bytes).unwrap();
+        let decoded = super::decode_type(&result).unwrap();
+        assert_eq!(decoded, inst);
+    }
+
+    #[test]
+    fn erase_to_bound_type_type_of_typevar_returns_type_of_bound() {
+        let tv = tv_type(1, "T");
+        let tt = Type::TypeType {
+            item: Box::new(tv),
+            is_type_form: false,
+        };
+        let bytes = encode(&tt);
+        let result = rust_erase_to_bound(&bytes).unwrap();
+        let decoded = super::decode_type(&result).unwrap();
+        // Should be TypeType { item: upper_bound (AnyType), is_type_form: false }
+        match decoded {
+            Type::TypeType { item, is_type_form } => {
+                assert!(!is_type_form);
+                assert!(matches!(
+                    item.as_ref(),
+                    Type::AnyType { type_of_any: 1, .. }
+                ));
+            }
+            other => panic!("expected TypeType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_to_bound_type_type_of_instance_passes_through() {
+        let inst = plain_instance("builtins.int");
+        let tt = Type::TypeType {
+            item: Box::new(inst.clone()),
+            is_type_form: true,
+        };
+        let bytes = encode(&tt);
+        let result = rust_erase_to_bound(&bytes).unwrap();
+        let decoded = super::decode_type(&result).unwrap();
+        assert_eq!(decoded, tt);
+    }
+
+    #[test]
+    fn erase_to_bound_alias_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mod.Alias".to_string(),
+        };
+        assert!(super::encode_type(&alias).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // tuple_fallback
+    // ------------------------------------------------------------------
+
+    fn tuple_instance_fallback(items: Vec<Type>) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(plain_instance("builtins.tuple")),
+            items,
+            implicit: false,
+        }
+    }
+
+    #[test]
+    fn tuple_fallback_non_tuple_fallback_returns_as_is() {
+        // When partial_fallback is not builtins.tuple, return it directly.
+        let inst = plain_instance("builtins.int");
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(inst.clone()),
+            items: vec![plain_instance("builtins.int")],
+            implicit: false,
+        };
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let result = super::tuple_fallback(&tup, &resolver);
+        assert_eq!(result, Some(inst));
+    }
+
+    #[test]
+    fn tuple_fallback_single_item_returns_tuple_instance() {
+        // A single-item tuple: make_simplified_union returns the item.
+        let item = plain_instance("builtins.int");
+        let tup = tuple_instance_fallback(vec![item.clone()]);
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let result = super::tuple_fallback(&tup, &resolver);
+        // With a single item, make_simplified_union fast-paths to the item.
+        // The result is Instance("builtins.tuple", [int]).
+        let decoded = result.unwrap();
+        match decoded {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert_eq!(args.len(), 1);
+                assert_eq!(args[0], item);
+            }
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tuple_fallback_unpack_non_tuple_defers() {
+        // UnpackType with a non-tuple instance defers (Python raises
+        // NotImplementedError).
+        let unpack = Type::UnpackType {
+            typ: Box::new(plain_instance("builtins.int")),
+        };
+        let tup = tuple_instance_fallback(vec![unpack]);
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let result = super::tuple_fallback(&tup, &resolver);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn tuple_fallback_not_tuple_type_defers() {
+        let inst = plain_instance("builtins.int");
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let result = super::tuple_fallback(&inst, &resolver);
+        assert!(result.is_none());
     }
 }
