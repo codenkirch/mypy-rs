@@ -59,6 +59,7 @@ try:
         remove_instance_last_known_values as _rust_remove_lkv,
         rust_erase_typevars as _rust_erase_typevars,
         rust_replace_meta_vars as _rust_replace_meta_vars,
+        shallow_erase_type_for_equality as _rust_shallow_erase,
     )
 
     from mypy.cache import write_str as _write_str_tagged
@@ -70,6 +71,7 @@ except ImportError:
     _rust_remove_lkv = None  # type: ignore[assignment]
     _rust_erase_typevars = None  # type: ignore[assignment]
     _rust_replace_meta_vars = None  # type: ignore[assignment]
+    _rust_shallow_erase = None  # type: ignore[assignment]
     _ReadBuffer = None  # type: ignore[assignment,misc]
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _write_int_bare = None  # type: ignore[assignment]
@@ -417,6 +419,10 @@ class LastKnownValueEraser(TypeTranslator):
 
 def shallow_erase_type_for_equality(typ: Type) -> ProperType:
     """Erase type variables from Instance's"""
+    if _HAS_TYPE_KERNEL and _native_erase_active:
+        result = _rust_shallow_erase(typ)
+        if result is not None:
+            return result
     p_typ = get_proper_type(typ)
     if isinstance(p_typ, Instance):
         if not p_typ.args:

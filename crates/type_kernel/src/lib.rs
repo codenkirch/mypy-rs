@@ -100,6 +100,10 @@ use pyo3::prelude::*;
 fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(erase::erase_type, module)?)?;
     module.add_function(wrap_pyfunction!(
+        erase::shallow_erase_type_for_equality,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         lkv::remove_instance_last_known_values,
         module
     )?)?;
