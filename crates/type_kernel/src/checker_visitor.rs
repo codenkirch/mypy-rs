@@ -493,3 +493,154 @@ fn is_disjoint_base(info: &PyAny) -> PyResult<bool> {
     }
     Ok(own_slot_found)
 }
+
+// ---------------------------------------------------------------------------
+// Node object-model pure predicates (Issue #457)
+// ---------------------------------------------------------------------------
+
+/// `mypy.nodes.FuncBase.has_self_or_cls_argument` — does a method have a
+/// `self`/`cls` argument for method binding?
+///
+/// Mirrors nodes.py:784-789: `not self.is_static or self.name == "__new__"`.
+/// A `Decorator` unwraps to its `FuncDef`; an `OverloadedFuncDef` delegates
+/// to its first item's name and `is_static`. Any node that is not a
+/// `FuncBase` subclass raises `AssertionError`, matching Python's contract.
+#[pyfunction]
+pub(crate) fn rust_func_has_self_or_cls_argument(py: Python<'_>, func: &PyAny) -> PyResult<bool> {
+    let decorator_cls = nodes_class(py, "Decorator")?;
+    if func.is_instance(decorator_cls)? {
+        let inner = func.getattr("func")?;
+        return rust_func_has_self_or_cls_argument(py, inner);
+    }
+    let overloaded_cls = nodes_class(py, "OverloadedFuncDef")?;
+    if func.is_instance(overloaded_cls)? {
+        let is_static = func.getattr("is_static")?.is_true()?;
+        let items = func.getattr("items")?.downcast::<PyList>()?;
+        let name = if !items.is_empty() {
+            let first = items.get_item(0)?;
+            first.getattr("name")?.extract::<String>()?
+        } else {
+            func.getattr("name")?.extract::<String>()?
+        };
+        return Ok(!is_static || name == "__new__");
+    }
+    let func_base_cls = nodes_class(py, "FuncBase")?;
+    if func.is_instance(func_base_cls)? {
+        let is_static = func.getattr("is_static")?.is_true()?;
+        let name: String = func.getattr("name")?.extract()?;
+        return Ok(!is_static || name == "__new__");
+    }
+    let typ = func.get_type();
+    let name = typeof_name(typ)?;
+    Err(PyAssertionError::new_err(format!(
+        "Unexpected func type: {name}"
+    )))
+}
+
+/// `mypy.nodes.FuncItem.is_dynamic` — is the function untyped?
+///
+/// Mirrors nodes.py:1080-1084: `self.type is None or (isinstance(type,
+/// CallableType) and type.implicit)`.
+#[pyfunction]
+pub(crate) fn rust_func_item_is_dynamic(py: Python<'_>, func: &PyAny) -> PyResult<bool> {
+    let typ = func.getattr("type")?;
+    if typ.is_none() {
+        return Ok(true);
+    }
+    let callable_cls = types_class(py, "CallableType")?;
+    if typ.is_instance(callable_cls)? {
+        return typ.getattr("implicit")?.is_true();
+    }
+    Ok(false)
+}
+
+/// `mypy.nodes.Decorator.is_dynamic` — is the decorated function untyped?
+///
+/// Mirrors nodes.py:1401-1402: delegates to `self.func.is_dynamic()`.
+/// The inner `func` is always a `FuncDef` (a `FuncItem`), so this recurses
+/// into `rust_func_item_is_dynamic`.
+#[pyfunction]
+pub(crate) fn rust_decorator_is_dynamic(py: Python<'_>, dec: &PyAny) -> PyResult<bool> {
+    let func = dec.getattr("func")?;
+    rust_func_item_is_dynamic(py, func)
+}
+
+/// `mypy.nodes.OverloadedFuncDef.is_dynamic` — are all overload items
+/// untyped?
+///
+/// Mirrors nodes.py:952: `all(item.is_dynamic() for item in self.items)`.
+/// Each item is a `FuncDef` or `Decorator`; the dispatch matches the Python
+/// `is_dynamic` method resolution.
+#[pyfunction]
+pub(crate) fn rust_overloaded_is_dynamic(py: Python<'_>, func: &PyAny) -> PyResult<bool> {
+    let items = func.getattr("items")?.downcast::<PyList>()?;
+    let decorator_cls = nodes_class(py, "Decorator")?;
+    for item in items.iter() {
+        if item.is_instance(decorator_cls)? {
+            if !rust_decorator_is_dynamic(py, item)? {
+                return Ok(false);
+            }
+        } else {
+            if !rust_func_item_is_dynamic(py, item)? {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+/// `mypy.nodes.TypeInfo.is_generic` — does the type have type variables?
+///
+/// Mirrors nodes.py:3942-3944: `len(self.type_vars) > 0`.
+#[pyfunction]
+pub(crate) fn rust_typeinfo_is_generic(info: &PyAny) -> PyResult<bool> {
+    let type_vars = info.getattr("type_vars")?.downcast::<PyList>()?;
+    Ok(!type_vars.is_empty())
+}
+
+/// `mypy.nodes.TypeInfo.is_metaclass` — is this type a metaclass?
+///
+/// Mirrors nodes.py:4128-4133: `self.has_base("builtins.type") or
+/// self.fullname == "abc.ABCMeta" or (self.fallback_to_any and not
+/// precise)`.
+#[pyfunction]
+pub(crate) fn rust_typeinfo_is_metaclass(
+    py: Python<'_>,
+    info: &PyAny,
+    precise: bool,
+) -> PyResult<bool> {
+    if rust_typeinfo_has_base(py, info, "builtins.type")? {
+        return Ok(true);
+    }
+    let fullname: String = info.getattr("fullname")?.extract()?;
+    if fullname == "abc.ABCMeta" {
+        return Ok(true);
+    }
+    if !precise && info.getattr("fallback_to_any")?.is_true()? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `mypy.nodes.TypeInfo.has_base` — does the MRO contain a base with the
+/// given fullname?
+///
+/// Mirrors nodes.py:4135-4143: walks `self.mro` and compares each
+/// `cls.fullname` to the target. Returns `false` if the MRO is not a list
+/// (conservative; Python would raise).
+#[pyfunction]
+pub(crate) fn rust_typeinfo_has_base(
+    _py: Python<'_>,
+    info: &PyAny,
+    fullname: &str,
+) -> PyResult<bool> {
+    let mro = info.getattr("mro")?;
+    let mro_list = mro.downcast::<PyList>()?;
+    for cls in mro_list.iter() {
+        let cls_fullname: String = cls.getattr("fullname")?.extract()?;
+        if cls_fullname == fullname {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

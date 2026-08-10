@@ -79,6 +79,45 @@ from mypy.options import Options
 from mypy.util import is_sunder, is_typeshed_file, short_type
 from mypy.visitor import ExpressionVisitor, NodeVisitor, StatementVisitor
 
+# Issue #457: Node object-model pure predicates. When the `type_kernel`
+# Rust extension is importable and `Options.native_type_kernel` is set,
+# the pure predicates below (`has_self_or_cls_argument`, `is_dynamic`,
+# `is_generic`, `is_metaclass`, `has_base`) route through Rust. The Rust
+# path raises AssertionError/NotImplementedError for unhandled cases, in
+# which case we fall back to the pure-Python implementation.
+try:
+    from type_kernel import (
+        rust_decorator_is_dynamic as _rust_decorator_is_dynamic,
+        rust_func_has_self_or_cls_argument as _rust_func_has_self_or_cls_argument,
+        rust_func_item_is_dynamic as _rust_func_item_is_dynamic,
+        rust_overloaded_is_dynamic as _rust_overloaded_is_dynamic,
+        rust_typeinfo_has_base as _rust_typeinfo_has_base,
+        rust_typeinfo_is_generic as _rust_typeinfo_is_generic,
+        rust_typeinfo_is_metaclass as _rust_typeinfo_is_metaclass,
+    )
+
+    _NODES_HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_func_has_self_or_cls_argument = None  # type: ignore[assignment]
+    _rust_func_item_is_dynamic = None  # type: ignore[assignment]
+    _rust_decorator_is_dynamic = None  # type: ignore[assignment]
+    _rust_overloaded_is_dynamic = None  # type: ignore[assignment]
+    _rust_typeinfo_is_generic = None  # type: ignore[assignment]
+    _rust_typeinfo_is_metaclass = None  # type: ignore[assignment]
+    _rust_typeinfo_has_base = None  # type: ignore[assignment]
+    _NODES_HAS_TYPE_KERNEL = False
+
+# Module-level flag read by the gates below. Set by the build manager from
+# `Options.native_type_kernel` at the start of each build.
+_native_nodes_active: bool = False
+
+
+def _set_native_nodes_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_nodes_active
+    _native_nodes_active = active
+
+
 if TYPE_CHECKING:
     from mypy.patterns import Pattern
 
@@ -787,6 +826,11 @@ class FuncBase(Node):
         This is true for `__new__` even though `__new__` does not undergo method binding,
         because we still usually assume that `cls` corresponds to the enclosing class.
         """
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_func_has_self_or_cls_argument(self)
+            except (AssertionError, NotImplementedError):
+                pass
         return not self.is_static or self.name == "__new__"
 
 
@@ -950,6 +994,11 @@ class OverloadedFuncDef(FuncBase, SymbolNode, Statement):
         return res
 
     def is_dynamic(self) -> bool:
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_overloaded_is_dynamic(self)
+            except (AssertionError, NotImplementedError):
+                pass
         return all(item.is_dynamic() for item in self.items)
 
 
@@ -1078,6 +1127,11 @@ class FuncItem(FuncBase):
         return self.max_pos
 
     def is_dynamic(self) -> bool:
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_func_item_is_dynamic(self)
+            except (AssertionError, NotImplementedError):
+                pass
         return (
             self.type is None
             or isinstance(self.type, mypy.types.CallableType)
@@ -1399,6 +1453,11 @@ class Decorator(SymbolNode, Statement):
         return dec
 
     def is_dynamic(self) -> bool:
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_decorator_is_dynamic(self)
+            except (AssertionError, NotImplementedError):
+                pass
         return self.func.is_dynamic()
 
 
@@ -3941,6 +4000,11 @@ class TypeInfo(SymbolNode):
 
     def is_generic(self) -> bool:
         """Is the type generic (i.e. does it have type variables)?"""
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_typeinfo_is_generic(self)
+            except (AssertionError, NotImplementedError):
+                pass
         return len(self.type_vars) > 0
 
     def get(self, name: str) -> SymbolTableNode | None:
@@ -4126,6 +4190,11 @@ class TypeInfo(SymbolNode):
         return None
 
     def is_metaclass(self, *, precise: bool = False) -> bool:
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_typeinfo_is_metaclass(self, precise)
+            except (AssertionError, NotImplementedError):
+                pass
         return (
             self.has_base("builtins.type")
             or self.fullname == "abc.ABCMeta"
@@ -4137,6 +4206,11 @@ class TypeInfo(SymbolNode):
 
         This can be either via extension or via implementation.
         """
+        if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            try:
+                return _rust_typeinfo_has_base(self, fullname)
+            except (AssertionError, NotImplementedError):
+                pass
         for cls in self.mro:
             if cls.fullname == fullname:
                 return True

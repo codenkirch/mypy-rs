@@ -527,6 +527,35 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_visit_newtype_expr,
         module
     )?)?;
+    // Issue #457: Node object-model pure predicates from mypy/nodes.py.
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_func_has_self_or_cls_argument,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_func_item_is_dynamic,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_decorator_is_dynamic,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_overloaded_is_dynamic,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_typeinfo_is_generic,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_typeinfo_is_metaclass,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_typeinfo_has_base,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(solve::rust_solve_one, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_is_trivial_bound, module)?)?;
     module.add_function(wrap_pyfunction!(solve::rust_find_linear, module)?)?;
