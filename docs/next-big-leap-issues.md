@@ -4,18 +4,30 @@
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (GitHub) | 1,910,231 |
-| Python bytes (GitHub) | 5,993,751 |
-| Rust % (GitHub) | 24.17% |
-| Rust % (local tree, ex-typeshed+/test/) | 23.88% |
-| Total bytes | 7,903,982 |
+| Rust bytes (GitHub) | 2,089,322 |
+| Python bytes (GitHub) | 6,058,670 |
+| Rust % (GitHub) | 25.57% |
+| Rust % (local tree, ex-typeshed+/test/) | 24.45% |
+| Total bytes | 8,172,202 |
 
 The 20% target is met and sustained. **The migration plan's module port
 list is exhausted**: `maptype.py` landed as the final port (PR #427) and
 `infer.py` closed without a port (#426, its wrapper is glue over the
-already-native constraints + solve path). Remaining work targets deeper
-coverage inside ported modules (checkexpr family, semanal scope handling) — the
-next leap is **~26-27% then 30%** via those.
+already-native constraints + solve path). The checkexpr-family slice ports
+(#380-#387) all landed, plus the semanal/plugin/daemon helper tracks
+(#389, #391) and the crash fixes (#429/#430). Overload-error-reporting
+helper `arg_approximate_similarity` ported as #432 (PR #433) with a
+kernel-ON/OFF differential of 911=911 and full-testtypes+testcheck 8726
+passed. The checker generator/coroutine return-type cluster
+(`is_generator_return_type`, yield/receive/return extraction,
+`get_coroutine_return_type`) ported as #434 (PR #435), which also fixed a
+shared `is_subtype` parity gap (`is_proper_subtype(Instance, Any)` now
+decides False instead of deferring); full kernel-ON vs OFF 8726=8726.
+
+Remaining work targets deeper coverage inside ported modules (checkexpr
+family, semanal scope handling) and the last large lever `semanal.py`
+symbol resolution + scope handling (#348) — the next plateau is
+**~28-30%** via those.
 
 ## Roadmap summary (from the 11-milestone plan)
 
