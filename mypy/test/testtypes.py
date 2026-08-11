@@ -61,6 +61,7 @@ from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
+from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.traverser import (
     all_name_and_member_expressions,
     all_return_statements,
@@ -7997,6 +7998,136 @@ class NativeLookupSuite(Suite):
         r = self._call("attr", global_decls=set(), globals={}, nonlocal_decls=set(),
                        locals=[None], type_names=tn, is_func_scope=True)
         assert r == ("not_found", None)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCallableArgConstraintsSuite(Suite):
+    """Parity tests for `rust_infer_callable_arguments_constraints`.
+
+    Differential harness: runs `infer_callable_arguments_constraints` with the
+    native gate on (resolver installed) and off (pure Python), and asserts the
+    two constraint lists are equal. The decoded native constraints resolve
+    live TypeInfos via the wirefixup map, so `Constraint.__eq__` holds against
+    the Python-built results. Covers the four argument-matching phases from
+    `subtypes.are_parameters_compatible` (star/star, corresponding arguments,
+    right *args, right **kwargs).
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Safe fallbacks so a failed differential never crosses suites.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_active, _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: list[str | None],
+        variables: list[TypeVarType] | None = None,
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            arg_names,
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+            variables=variables,
+        )
+
+    def _constraints(
+        self, template: Type, actual: Type, direction: int, native: bool
+    ) -> list:
+        from mypy.constraints import (
+            _set_native_constraints_active,
+            _set_native_constraints_resolver,
+            infer_callable_arguments_constraints,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_callable_arguments_constraints(template, actual, direction)
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._constraints(template, actual, direction, native=True)
+        python = self._constraints(template, actual, direction, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    # --- Phase 1b: corresponding positional/named arguments ---
+
+    def test_positional_simple(self) -> None:
+        template = self._callable([self.fx.t], [ARG_POS], [None], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_POS], [None])
+        self._assert_par(template, actual)
+
+    def test_positional_two(self) -> None:
+        template = self._callable(
+            [self.fx.t, self.fx.s], [ARG_POS, ARG_POS], [None, None],
+            variables=[self.fx.t, self.fx.s],
+        )
+        actual = self._callable([self.fx.a, self.fx.b], [ARG_POS, ARG_POS], [None, None])
+        self._assert_par(template, actual)
+
+    def test_named_argument(self) -> None:
+        template = self._callable([self.fx.t], [ARG_NAMED], ["x"], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_NAMED], ["x"])
+        self._assert_par(template, actual)
+
+    # --- Phase 1a: star vs star ---
+
+    def test_star_args_pair(self) -> None:
+        template = self._callable([self.fx.t], [ARG_STAR], [None], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_STAR], [None])
+        self._assert_par(template, actual)
+
+    def test_kwargs_pair(self) -> None:
+        template = self._callable([self.fx.t], [ARG_STAR2], [None], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_STAR2], [None])
+        self._assert_par(template, actual)
+
+    # --- Phase 1c: right *args compared against left positional args ---
+
+    def test_left_positional_against_right_star(self) -> None:
+        template = self._callable([self.fx.t], [ARG_POS], [None], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_STAR], [None])
+        self._assert_par(template, actual)
+
+    # --- Phase 1d: right **kwargs compared against left-only named args ---
+
+    def test_left_named_against_right_kwargs(self) -> None:
+        template = self._callable([self.fx.t], [ARG_NAMED], ["x"], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_STAR2], [None])
+        self._assert_par(template, actual)
+
+    # --- Direction variation ---
+
+    def test_supertypes_direction(self) -> None:
+        template = self._callable([self.fx.t], [ARG_POS], [None], variables=[self.fx.t])
+        actual = self._callable([self.fx.a], [ARG_POS], [None])
+        self._assert_par(template, actual, direction=SUPERTYPE_OF)
 
 
 class _FakeNode:

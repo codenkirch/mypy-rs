@@ -882,6 +882,198 @@ fn get_type_ref(t: &Type) -> Option<&str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// infer_callable_arguments_constraints (constraints.py:2032-2102)
+// ---------------------------------------------------------------------------
+
+/// `NormalizedCallableType | Parameters` arg fields, shared accessor for
+/// `infer_callable_arguments_constraints`. Both `CallableType` and
+/// `Parameters` carry `arg_types`/`arg_kinds`/`arg_names`; every other
+/// variant defers.
+#[allow(clippy::type_complexity)] // Mirrors the three field slices of the Python counterpart.
+fn callable_arg_fields(t: &Type) -> Option<(&[Type], &[i64], &[Option<String>])> {
+    match t {
+        Type::CallableType {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ..
+        }
+        | Type::Parameters(crate::wire::Parameters {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ..
+        }) => Some((arg_types, arg_kinds, arg_names)),
+        _ => None,
+    }
+}
+
+/// `infer_callable_arguments_constraints` (constraints.py:2032-2102).
+///
+/// Infers constraints between the argument types of two callables by
+/// extracting the four argument-matching phases of
+/// `subtypes.are_parameters_compatible` and substituting an
+/// `infer_constraints` call for each subtype check. Every phase routes
+/// through `infer_constraints_full_inner` (the direction-inverting
+/// `infer_directed_arg_constraints` core), so constraint identity is
+/// preserved via the existing `wire::Constraint` write path.
+///
+/// Wire layout in: template Type | actual Type | direction int.
+/// Wire layout out: count (bare int) + N× [origin Type | op int | target Type].
+///
+/// Defers (`None`) when either side is not a CallableType/Parameters, or
+/// any argument-matching step hits an unresolvable shape.
+#[pyfunction]
+pub(crate) fn rust_infer_callable_arguments_constraints(
+    resolver: &NativeTypeResolver,
+    template_bytes: &[u8],
+    actual_bytes: &[u8],
+    direction: i64,
+) -> Option<Vec<u8>> {
+    use crate::callable_compat::{
+        argument_by_name, argument_by_position, callable_corresponding_argument, formal_arguments,
+        kind_is_positional, kind_is_star, kw_arg, try_synthesizing_arg_from_kwarg,
+        try_synthesizing_arg_from_vararg, var_arg,
+    };
+
+    let template = read_type(&mut ReadBuffer::new(template_bytes), None).ok()?;
+    let actual = read_type(&mut ReadBuffer::new(actual_bytes), None).ok()?;
+
+    // Mirror `direction == SUBTYPE_OF: left, right = template, actual` else
+    // `left, right = actual, template` (constraints.py:2039-2042).
+    let (left, right): (&Type, &Type) = if direction == SUBTYPE_OF {
+        (&template, &actual)
+    } else {
+        (&actual, &template)
+    };
+    let (left_types, left_kinds, left_names) = callable_arg_fields(left)?;
+    let (right_types, right_kinds, right_names) = callable_arg_fields(right)?;
+
+    let left_star = var_arg(left_types, left_kinds);
+    let left_star2 = kw_arg(left_types, left_kinds);
+    let right_star = var_arg(right_types, right_kinds);
+    let right_star2 = kw_arg(right_types, right_kinds);
+
+    let mut res: Vec<Constraint> = Vec::new();
+
+    // Phase 1a: compare star vs star arguments.
+    if let (Some(ls), Some(rs)) = (&left_star, &right_star) {
+        res.extend(infer_directed_arg_constraints_native(
+            ls.typ.clone(),
+            rs.typ.clone(),
+            direction,
+            resolver.resolver(),
+        )?);
+    }
+    if let (Some(ls2), Some(rs2)) = (&left_star2, &right_star2) {
+        res.extend(infer_directed_arg_constraints_native(
+            ls2.typ.clone(),
+            rs2.typ.clone(),
+            direction,
+            resolver.resolver(),
+        )?);
+    }
+
+    // Phase 1b: compare left args with corresponding non-star right args.
+    for right_arg in formal_arguments(right_types, right_kinds, right_names) {
+        let left_arg =
+            match callable_corresponding_argument(left_types, left_kinds, left_names, &right_arg) {
+                // Python: `if left_arg is None: continue`.
+                Ok(None) => continue,
+                Ok(Some(a)) => a,
+                // The by-name/by-pos merge case needs `meet_types`, which the
+                // kernel cannot reconstruct: defer the whole call so constraints
+                // are neither dropped nor changed.
+                Err(_) => return None,
+            };
+        res.extend(infer_directed_arg_constraints_native(
+            left_arg.typ.clone(),
+            right_arg.typ.clone(),
+            direction,
+            resolver.resolver(),
+        )?);
+    }
+
+    // Phase 1c: compare left args with right *args.
+    if let Some(rs) = &right_star {
+        // Python asserts non-None here; right_star Some guarantees var_arg
+        // Some, so this cannot fail.
+        let right_by_position = try_synthesizing_arg_from_vararg(right_types, right_kinds, None)?;
+        let i = rs.pos?;
+        let mut j = i;
+        while j < left_kinds.len() && kind_is_positional(left_kinds[j], false) {
+            let left_by_position = argument_by_position(left_types, left_kinds, left_names, j)?;
+            res.extend(infer_directed_arg_constraints_native(
+                left_by_position.typ.clone(),
+                right_by_position.typ.clone(),
+                direction,
+                resolver.resolver(),
+            )?);
+            j += 1;
+        }
+    }
+
+    // Phase 1d: compare left args with right **kwargs.
+    if right_star2.is_some() {
+        let right_names_set: std::collections::HashSet<&str> =
+            right_names.iter().filter_map(|n| n.as_deref()).collect();
+        let mut left_only_names: Vec<String> = Vec::new();
+        for (name, kind) in left_names.iter().zip(left_kinds.iter()) {
+            if let Some(name) = name {
+                if !kind_is_star(*kind) && !right_names_set.contains(name.as_str()) {
+                    left_only_names.push(name.clone());
+                }
+            }
+        }
+        if !left_only_names.is_empty() {
+            let right_by_name = try_synthesizing_arg_from_kwarg(right_types, right_kinds, None)?;
+            for name in &left_only_names {
+                let left_by_name = argument_by_name(left_types, left_kinds, left_names, name)?;
+                res.extend(infer_directed_arg_constraints_native(
+                    left_by_name.typ.clone(),
+                    right_by_name.typ.clone(),
+                    direction,
+                    resolver.resolver(),
+                )?);
+            }
+        }
+    }
+
+    let mut output = WriteBuffer::new();
+    crate::wire::write_int_bare(&mut output, res.len() as i64).ok()?;
+    for c in &res {
+        write_type(&mut output, &c.origin_type_var).ok()?;
+        write_int(&mut output, c.op).ok()?;
+        write_type(&mut output, &c.target).ok()?;
+    }
+    Some(output.into_bytes())
+}
+
+/// `infer_directed_arg_constraints` core (constraints_filter.rs:310-365):
+/// ParamSpec/Unpack on either side -> [], else `infer_constraints_full_inner`
+/// on the inverted direction (argument contravariance). Reused by both the
+/// standalone `rust_infer_directed_arg_constraints` and the callable-args
+/// port so the constraint emission stays identical.
+pub(crate) fn infer_directed_arg_constraints_native(
+    left: Type,
+    right: Type,
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    if matches!(left, Type::ParamSpecType { .. } | Type::UnpackType { .. })
+        || matches!(right, Type::ParamSpecType { .. } | Type::UnpackType { .. })
+    {
+        return Some(vec![]);
+    }
+    let (template, actual, inferred_dir) = if direction == SUBTYPE_OF {
+        (left, right, neg_op(direction))
+    } else {
+        (right, left, neg_op(direction))
+    };
+    infer_constraints_full_inner(&template, &actual, inferred_dir, resolver)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

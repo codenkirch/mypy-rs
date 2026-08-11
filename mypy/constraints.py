@@ -2007,6 +2007,45 @@ def _try_native_infer_directed_arg_constraints(
     return constraints
 
 
+def _try_native_infer_callable_args(
+    template: Type, actual: Type, direction: int
+) -> list[Constraint] | None:
+    """Route infer_callable_arguments_constraints through the Rust kernel.
+
+    Requires a NativeTypeResolver snapshot. Any unsupported type shape
+    makes Rust return None, which we turn into an exception so the caller
+    falls back to Python.
+    """
+    if _native_constraints_resolver is None:
+        return None
+    template_buf = _WriteBuffer()
+    template.write(template_buf)
+    actual_buf = _WriteBuffer()
+    actual.write(actual_buf)
+    raw = _type_kernel.rust_infer_callable_arguments_constraints(
+        _native_constraints_resolver, template_buf.getvalue(), actual_buf.getvalue(), direction
+    )
+    if raw is None:
+        raise NotImplementedError("kernel deferred infer_callable_arguments_constraints")
+    data = _ReadBuffer(bytes(raw))
+    from mypy.cache import read_int_bare  # type: ignore[attr-defined]
+
+    count = read_int_bare(data)
+    constraints: list[Constraint] = []
+    for _ in range(count):
+        origin = _fix_wire_type(data)
+        if origin is None:
+            raise NotImplementedError("origin unresolvable on wire")
+        from mypy.cache import read_int
+
+        op = read_int(data)
+        target = _fix_wire_type(data)
+        if target is None:
+            raise NotImplementedError("target unresolvable on wire")
+        constraints.append(Constraint(origin, op, target))  # type: ignore[arg-type]
+    return constraints
+
+
 def infer_directed_arg_constraints(left: Type, right: Type, direction: int) -> list[Constraint]:
     """Infer constraints between two arguments using direction between original callables."""
     if _native_constraints_active and _HAS_TYPE_KERNEL:
@@ -2042,6 +2081,13 @@ def infer_callable_arguments_constraints(
     do not involve subtyping. Then in place of every subtype check we put an infer_constraints()
     call for the same types.
     """
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_infer_callable_args(template, actual, direction)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     res = []
     if direction == SUBTYPE_OF:
         left, right = template, actual

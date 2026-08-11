@@ -41,20 +41,20 @@ const ARG_NAMED_OPT: i64 = 5;
 /// Mirrors `mypy.types.FormalArgument` (types.py:252-270): one callable
 /// parameter, either by name or by position, in one of the lookup results.
 #[derive(Debug, Clone, PartialEq)]
-struct FormalArgument {
-    name: Option<String>,
-    pos: Option<usize>,
-    typ: Type,
-    required: bool,
+pub(crate) struct FormalArgument {
+    pub(crate) name: Option<String>,
+    pub(crate) pos: Option<usize>,
+    pub(crate) typ: Type,
+    pub(crate) required: bool,
 }
 
 /// `mypy.nodes.ArgKind.is_positional` (nodes.py:2480-2484).
-fn kind_is_positional(kind: i64, star: bool) -> bool {
+pub(crate) fn kind_is_positional(kind: i64, star: bool) -> bool {
     kind == ARG_POS || kind == ARG_OPT || (star && kind == ARG_STAR)
 }
 
 /// `mypy.nodes.ArgKind.is_named` (nodes.py:2486-2490).
-fn kind_is_named(kind: i64, star: bool) -> bool {
+pub(crate) fn kind_is_named(kind: i64, star: bool) -> bool {
     kind == ARG_NAMED || kind == ARG_NAMED_OPT || (star && kind == ARG_STAR2)
 }
 
@@ -69,7 +69,7 @@ fn kind_is_optional(kind: i64) -> bool {
 }
 
 /// `mypy.nodes.ArgKind.is_star` (nodes.py:2506-2508).
-fn kind_is_star(kind: i64) -> bool {
+pub(crate) fn kind_is_star(kind: i64) -> bool {
     kind == ARG_STAR || kind == ARG_STAR2
 }
 
@@ -88,7 +88,7 @@ fn is_any(t: &Type) -> bool {
 }
 
 /// `CallableType.var_arg` (types.py:2314-2320): the first `*args` arg.
-fn var_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
+pub(crate) fn var_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
     arg_kinds
         .iter()
         .position(|&k| k == ARG_STAR)
@@ -101,7 +101,7 @@ fn var_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
 }
 
 /// `CallableType.kw_arg` (types.py:2322-2327): the first `**kwargs` arg.
-fn kw_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
+pub(crate) fn kw_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
     arg_kinds
         .iter()
         .position(|&k| k == ARG_STAR2)
@@ -118,7 +118,7 @@ fn kw_arg(arg_types: &[Type], arg_kinds: &[i64]) -> Option<FormalArgument> {
 /// Python subtlety mirrored exactly: an arg whose kind is named-or-star flips
 /// `done_with_positional` *before* the star-continue, so a star arg still
 /// terminates the positional section.
-fn formal_arguments(
+pub(crate) fn formal_arguments(
     arg_types: &[Type],
     arg_kinds: &[i64],
     arg_names: &[Option<String>],
@@ -146,7 +146,7 @@ fn formal_arguments(
 }
 
 /// `CallableType.argument_by_name` (types.py:2421-2436).
-fn argument_by_name(
+pub(crate) fn argument_by_name(
     arg_types: &[Type],
     arg_kinds: &[i64],
     arg_names: &[Option<String>],
@@ -176,7 +176,7 @@ fn argument_by_name(
 }
 
 /// `CallableType.argument_by_position` (types.py:2438-2451).
-fn argument_by_position(
+pub(crate) fn argument_by_position(
     arg_types: &[Type],
     arg_kinds: &[i64],
     arg_names: &[Option<String>],
@@ -202,7 +202,7 @@ fn argument_by_position(
 
 /// `CallableType.try_synthesizing_arg_from_kwarg` (types.py:2453-2458):
 /// if the callable has a `**kwargs`, any name maps to its (optional) type.
-fn try_synthesizing_arg_from_kwarg(
+pub(crate) fn try_synthesizing_arg_from_kwarg(
     arg_types: &[Type],
     arg_kinds: &[i64],
     name: Option<String>,
@@ -218,7 +218,7 @@ fn try_synthesizing_arg_from_kwarg(
 
 /// `CallableType.try_synthesizing_arg_from_vararg` (types.py:2460-2465):
 /// if the callable has a `*args`, any out-of-range position maps to its type.
-fn try_synthesizing_arg_from_vararg(
+pub(crate) fn try_synthesizing_arg_from_vararg(
     arg_types: &[Type],
     arg_kinds: &[i64],
     position: Option<usize>,
@@ -315,7 +315,7 @@ fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
 /// deferral we signal through a sentinel: `Deferred` is only produced by the
 /// merge case, and `None` remains "no arg". The Python code returns the merged
 /// `meet_types` arg there; it defers until meet_types support lands.
-fn callable_corresponding_argument(
+pub(crate) fn callable_corresponding_argument(
     arg_types: &[Type],
     arg_kinds: &[i64],
     arg_names: &[Option<String>],
@@ -346,7 +346,7 @@ fn callable_corresponding_argument(
 
 /// Marker for "Rust cannot produce a decision; fall through to Python".
 #[derive(Debug, Clone, Copy)]
-struct Defer;
+pub(crate) struct Defer;
 
 /// Helper node for Phase 1a's `_incompatible` logic. Mirrors the Python
 /// `None`-propagation: a nested `is_compat` that returns `None` defers the
