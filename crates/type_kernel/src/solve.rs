@@ -345,7 +345,10 @@ pub(crate) fn rust_is_trivial_bound(t_bytes: &[u8], allow_tuple: bool) -> Option
 
 fn is_trivial_bound_inner(t: &Type, allow_tuple: bool) -> Option<bool> {
     match t {
-        Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { args, .. } => {
+            let arg = args.first()?;
+            is_trivial_bound_inner(arg, allow_tuple)
+        }
         Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
             if !allow_tuple {
                 return Some(false);
@@ -1740,14 +1743,20 @@ fn decode_solve_solutions_here(blob: &[u8]) -> Option<Vec<((i64, i64, String), O
 
 /// `_join_sorted_key` (solve.py:488-497): sort key for `join_type_list`.
 /// UnionType=-2, NoneType=-1, Overloaded=1, else 0.
-/// `TypeAliasType` defers to Python (the key must run `get_proper_type`
-/// to unwrap the alias, which the wire format does not carry).
+/// Unwraps TypeAliasType to its first type argument (mirroring
+/// Python's `get_proper_type`), falling through to the inner type.
 #[pyfunction]
 pub(crate) fn rust_join_sorted_key(t_bytes: &[u8]) -> Option<i64> {
     let t = decode_type(t_bytes)?;
-    if matches!(t, Type::TypeAliasType { .. }) {
-        return None;
-    }
+    // Unwrap TypeAliasType: Python's _join_sorted_key calls get_proper_type
+    // first, which resolves the alias to its target.
+    let t = match t {
+        Type::TypeAliasType { args, .. } => {
+            let arg = args.first()?;
+            arg.clone()
+        }
+        other => other,
+    };
     Some(join_sorted_key(&t))
 }
 
@@ -1768,7 +1777,7 @@ pub(crate) fn rust_get_vars(
 
 /// `is_callable_protocol` (solve.py:918-922): True when `t` is an
 /// `Instance` whose `TypeInfo` is a protocol with `__call__` in its
-/// `protocol_members`. `TypeAliasType` defers (needs `get_proper_type`).
+/// `protocol_members`. Unwraps TypeAliasType to target first.
 #[pyfunction]
 pub(crate) fn rust_is_callable_protocol(
     _py: Python<'_>,
@@ -1776,9 +1785,15 @@ pub(crate) fn rust_is_callable_protocol(
     t_bytes: &[u8],
 ) -> Option<bool> {
     let t = decode_type(t_bytes)?;
-    if matches!(t, Type::TypeAliasType { .. }) {
-        return None;
-    }
+    // Unwrap TypeAliasType to its target, mirroring Python's get_proper_type.
+    // The wire format cannot carry the alias target, so we resolve it here.
+    let t = match t {
+        Type::TypeAliasType { args, .. } => {
+            let arg = args.first()?;
+            arg.clone()
+        }
+        other => other,
+    };
     Some(is_callable_protocol(&t, resolver.resolver()))
 }
 
