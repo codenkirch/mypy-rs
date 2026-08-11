@@ -254,12 +254,65 @@ class _TypeRefFixer(TypeTranslator):
             if self.missing:
                 return t  # type: ignore[unreachable]
             type_is = ti
-        return result.copy_modified(
+        result = result.copy_modified(
             fallback=fallback,  # type: ignore[arg-type]
             variables=variables,  # type: ignore[arg-type]
             type_guard=type_guard,
             type_is=type_is,
         )
+        # The wire format drops CallableType.definition (only used for
+        # error messages); re-link it so messages render `f(self)` and
+        # self-typevar solving sees the original argument. Match the
+        # containing class's symbol table by name + arity, mirroring
+        # fixup.py's FuncDef/OverloadedFuncDef linking.
+        if result.definition is None and not self.missing:
+            definition = self._match_definition(result)
+            if definition is not None:
+                result = result.copy_modified(definition=definition)
+        return result
+
+    def _match_definition(self, t: CallableType) -> Any:
+        """Find the live FuncDef/OverloadedFuncDef item for a decoded callable.
+
+        Uses the (already fixed-up) fallback TypeInfo's symbol table and
+        matches on name + argument arity, mirroring how fixup.py links
+        ``func.type.definition = func`` and ``typ.definition = item`` for
+        overloads. Returns None when no match exists (e.g. builtins
+        primitives) so definition stays None and callers fall back.
+        """
+        info = t.fallback.type
+        if isinstance(info, FakeInfo) or not getattr(info, "names", None):
+            return None
+        from mypy.nodes import Decorator, FuncDef, OverloadedFuncDef
+        from mypy.types import Overloaded
+
+        if t.name is None:
+            return None
+        node = info.names.get(t.name)
+        if node is None:
+            return None
+        sym = node.node
+        if isinstance(sym, Decorator):
+            # Decorator wraps a FuncDef; its .type is the decorated callable.
+            ctyp = get_proper_type(sym.type) if sym.type else None
+            if isinstance(ctyp, CallableType) and len(ctyp.arg_types) == len(t.arg_types):
+                return sym.func
+            return None
+        if isinstance(sym, FuncDef):
+            ctyp = get_proper_type(sym.type) if sym.type else None
+            if isinstance(ctyp, CallableType) and len(ctyp.arg_types) == len(t.arg_types):
+                return sym
+            return None
+        if isinstance(sym, OverloadedFuncDef) and isinstance(sym.type, Overloaded):
+            for item in sym.items:
+                item_typ = getattr(item, "type", None)
+                if isinstance(item, Decorator):
+                    item_typ = item.var.type if item.var else item.func.type
+                cp = get_proper_type(item_typ) if item_typ is not None else None
+                if isinstance(cp, CallableType) and len(cp.arg_types) == len(t.arg_types):
+                    return item
+            return None
+        return None
 
     def visit_type_type(self, t: TypeType, /) -> Type:
         if self.missing:
