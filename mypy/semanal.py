@@ -397,10 +397,18 @@ except ImportError:
 
 _native_semanal_active: bool = False
 
+# Issue #491: native resolver for lookup_qualified dot-chain walk.
+_native_semanal_resolver: Any = None
+
 
 def _set_native_semanal_active(active: bool) -> None:
     global _native_semanal_active
     _native_semanal_active = active
+
+
+def _set_native_semanal_resolver(resolver: Any) -> None:
+    global _native_semanal_resolver
+    _native_semanal_resolver = resolver
 
 
 # Stage 16 (#209): native semanal_visitor seam (parity-only, default-off).
@@ -410,23 +418,30 @@ def _set_native_semanal_active(active: bool) -> None:
 try:
     from type_kernel import (
         rust_apply_semantic_analyzer_patches as _rust_apply_semantic_analyzer_patches,
+        rust_can_be_type_alias as _rust_can_be_type_alias,
+        rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
+        rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
+        rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_imports as _rust_classify_imports,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_erase_func_annotations as _rust_erase_func_annotations,
+        rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
         rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
         rust_get_typevarlike_declaration as _rust_get_typevarlike_declaration,
+        rust_is_final_redefinition as _rust_is_final_redefinition,
         rust_is_init_only as _rust_is_init_only,
         rust_is_initial_mangled_global as _rust_is_initial_mangled_global,
         rust_is_mangled_global as _rust_is_mangled_global,
-        rust_is_final_redefinition as _rust_is_final_redefinition,
         rust_is_same_symbol as _rust_is_same_symbol,
         rust_is_same_var_from_getattr as _rust_is_same_var_from_getattr,
         rust_is_trivial_body as _rust_is_trivial_body,
+        rust_is_type_ref as _rust_is_type_ref,
         rust_is_valid_replacement as _rust_is_valid_replacement,
         rust_lookup as _rust_lookup,
+        rust_lookup_qualified as _rust_lookup_qualified,
         rust_names_modified_by_assignment as _rust_names_modified_by_assignment,
         rust_names_modified_in_lvalue as _rust_names_modified_in_lvalue,
         rust_parse_bool as _rust_parse_bool,
@@ -434,12 +449,6 @@ try:
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
-        rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
-        rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
-        rust_is_type_ref as _rust_is_type_ref,
-        rust_can_be_type_alias as _rust_can_be_type_alias,
-        rust_check_typevarlike_name as _rust_check_typevarlike_name,
-        rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -458,6 +467,7 @@ except ImportError:
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_lookup = None  # type: ignore[assignment]
+    _rust_lookup_qualified = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
@@ -7142,6 +7152,80 @@ class SemanticAnalyzer(
         namespace = self.cur_mod_id
         sym = self.lookup(parts[0], ctx, suppress_errors=suppress_errors)
         if sym:
+            # Issue #491: native dot-chain walk for the TypeInfo case.
+            if (
+                _SEMANAL_VISITOR_HAS_KERNEL
+                and _native_semanal_active
+                and _native_semanal_resolver is not None
+                and _rust_lookup_qualified is not None
+            ):
+                node = sym.node
+                if isinstance(node, TypeInfo):
+                    first_kind = 0
+                    first_fullname = node.fullname
+                    first_is_any = False
+                elif isinstance(node, MypyFile):
+                    first_kind = 1
+                    first_fullname = node.fullname
+                    first_is_any = False
+                elif isinstance(node, PlaceholderNode):
+                    first_kind = 2
+                    first_fullname = getattr(node, "fullname", "") or ""
+                    first_is_any = False
+                elif isinstance(node, TypeAlias):
+                    first_kind = 3
+                    first_fullname = node.fullname
+                    first_is_any = False
+                elif isinstance(node, Var):
+                    first_kind = 4
+                    first_fullname = node.fullname
+                    _typ = get_proper_type(node.type)
+                    first_is_any = isinstance(_typ, AnyType)
+                elif isinstance(node, ParamSpecExpr):
+                    first_kind = 5
+                    first_fullname = node.fullname
+                    first_is_any = False
+                else:
+                    first_kind = 6
+                    first_fullname = getattr(node, "fullname", "") or ""
+                    first_is_any = False
+                try:
+                    result = _rust_lookup_qualified(
+                        _native_semanal_resolver, name, first_kind, first_fullname, first_is_any
+                    )
+                except (AssertionError, NotImplementedError):
+                    result = None
+                if result is not None:
+                    r_kind, r_fullname = result
+                    if r_kind == 0:
+                        # Resolved to TypeInfo member. Walk the chain
+                        # in Python to get the SymbolTableNode (matches
+                        # module_hidden check, record_imported_symbol).
+                        node = sym.node
+                        for i in range(1, len(parts)):
+                            part = parts[i]
+                            if isinstance(node, TypeInfo):
+                                nextsym = node.get(part)
+                            else:
+                                nextsym = None
+                                break
+                            if not nextsym or nextsym.module_hidden:
+                                if not suppress_errors:
+                                    self.name_not_defined(name, ctx, namespace=namespace)
+                                return None
+                            sym = nextsym
+                            node = sym.node
+                        if sym is not None:
+                            self.record_imported_symbol(sym)
+                        return sym
+                    elif r_kind == 2:
+                        # Placeholder: return current sym unchanged.
+                        return sym
+                    elif r_kind == -1:
+                        if not suppress_errors:
+                            self.name_not_defined(name, ctx, namespace=namespace)
+                        return None
+                    # Any other kind: fall through to Python loop.
             for i in range(1, len(parts)):
                 node = sym.node
                 part = parts[i]

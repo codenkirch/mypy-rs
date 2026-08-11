@@ -82,6 +82,7 @@ mod plugin_helpers;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
+mod semanal_lookup;
 mod semanal_shared;
 mod semanal_visitor;
 mod serverdeps;
@@ -888,6 +889,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_lookup::rust_lookup_qualified,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_classify_imports,
         module
