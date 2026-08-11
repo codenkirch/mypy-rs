@@ -825,23 +825,21 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
                 // Degenerate; defer.
                 None
             } else {
-                // Python: check first item for is_type_obj().
-                if let Some(Type::CallableType {
-                    fallback, ret_type, ..
-                }) = items.first()
-                {
-                    if is_type_obj(fallback, ret_type, resolver) {
-                        // Type object — defer to Python's
-                        // analyze_type_callable_member_access.
-                        None
-                    } else {
-                        // Normal callable — recurse on fallback.
-                        analyze_member_access_inner(fallback, resolver)
+                // Python iterates items, returns first non-None result.
+                for item in items {
+                    if let Type::CallableType {
+                        fallback, ret_type, ..
+                    } = item
+                    {
+                        if is_type_obj(fallback, ret_type, resolver) {
+                            continue;
+                        }
+                        if let Some(r) = analyze_member_access_inner(fallback, resolver) {
+                            return Some(r);
+                        }
                     }
-                } else {
-                    // No CallableType first item (shouldn't happen); defer.
-                    None
                 }
+                None
             }
         }
         // --- TypeAliasType ---
