@@ -73,12 +73,12 @@ pub(crate) const MA_MISSING: i64 = 12;
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-fn decode_type(bytes: &[u8]) -> Option<Type> {
+pub(crate) fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     read_type(&mut buf, None).ok()
 }
 
-fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+pub(crate) fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     let mut wbuf = WriteBuffer::new();
     write_type(&mut wbuf, typ).ok()?;
     Some(wbuf.into_bytes())
