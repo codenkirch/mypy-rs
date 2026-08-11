@@ -3342,30 +3342,4 @@ mod tests {
             other => panic!("expected AnyType(2, Some(...)), got {:?}", other),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Issue #486: visit_temp_node / visit__promote_expr / constant exprs
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_any_type_helper_special_form() {
-        let t = any_type(TYPE_OF_ANY_SPECIAL_FORM, None);
-        assert!(matches!(t, Type::AnyType { type_of_any: 6, .. }));
-    }
-
-    #[test]
-    fn test_any_type_helper_with_source() {
-        let inner = any_type(TYPE_OF_ANY_UNANNOTATED, None);
-        let t = any_type(2, Some(Box::new(inner)));
-        match t {
-            Type::AnyType {
-                type_of_any: 2,
-                source_any: Some(sa),
-                ..
-            } => {
-                assert!(matches!(*sa, Type::AnyType { type_of_any: 1, .. }));
-            }
-            other => panic!("expected AnyType(2, Some(...)), got {:?}", other),
-        }
-    }
 }
