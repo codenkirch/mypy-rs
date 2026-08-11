@@ -966,6 +966,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_make_optional_type,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_unknown_unpack,
+        module
+    )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
     // (Instance, Callable, TypeVar, Tuple, etc.). Returns None for types
     // needing semantic context, matching Python's deferral semantics.
