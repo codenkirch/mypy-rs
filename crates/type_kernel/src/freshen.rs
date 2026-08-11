@@ -54,7 +54,7 @@ pub(crate) fn rust_freshen_all_functions_type_vars(
 /// type variables replaced with fresh meta-level-1 variables.
 ///
 /// Returns `None` for deferred cases so the caller falls through to Python.
-fn freshen_type(
+pub(crate) fn freshen_type(
     typ: &Type,
     next_raw_id: &mut i64,
     changed: &mut bool,
