@@ -63,7 +63,7 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
 ///
 /// Returns `Some(bool)` when Rust decided; `None` to defer. The
 /// `check_all` flag controls union semantics (any vs all).
-fn custom_special_method_inner(
+pub(crate) fn custom_special_method_inner(
     typ: &Type,
     name: &str,
     check_all: bool,

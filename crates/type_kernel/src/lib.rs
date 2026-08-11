@@ -71,6 +71,7 @@ mod expand;
 mod expandtype;
 mod freshen;
 mod generators;
+mod lennarrow;
 mod lkv;
 mod maptype;
 mod meet;
@@ -559,6 +560,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_stmts::rust_narrow_type_by_identity_equality,
         module
     )?)?;
+    // Issue #493: len-based tuple narrowing. Returns (yes, no) type blobs
+    // or None to defer to the pure-Python path.
+    module.add_function(wrap_pyfunction!(lennarrow::rust_narrow_with_len, module)?)?;
     // Issue #445: is_valid_inferred_type pure boolean query.
     module.add_function(wrap_pyfunction!(
         checker_stmts::rust_is_valid_inferred_type,
