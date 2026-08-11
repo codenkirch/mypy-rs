@@ -434,6 +434,12 @@ try:
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
+        rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
+        rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
+        rust_is_type_ref as _rust_is_type_ref,
+        rust_can_be_type_alias as _rust_can_be_type_alias,
+        rust_check_typevarlike_name as _rust_check_typevarlike_name,
+        rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -463,6 +469,12 @@ except ImportError:
     _rust_is_initial_mangled_global = None  # type: ignore[assignment]
     _rust_is_final_redefinition = None  # type: ignore[assignment]
     _rust_is_same_var_from_getattr = None  # type: ignore[assignment]
+    _rust_can_possibly_be_typevarlike_declaration = None  # type: ignore[assignment]
+    _rust_can_possibly_be_type_form = None  # type: ignore[assignment]
+    _rust_is_type_ref = None  # type: ignore[assignment]
+    _rust_can_be_type_alias = None  # type: ignore[assignment]
+    _rust_check_typevarlike_name = None  # type: ignore[assignment]
+    _rust_extract_typevarlike_name = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -3688,6 +3700,13 @@ class SemanticAnalyzer(
         Note: this function should be only called for expressions where self.should_wait_rhs()
         returns False.
         """
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_can_be_type_alias(rv, allow_none, self.is_stub_file)
+                if result is True:
+                    return True
+            except (AssertionError, NotImplementedError):
+                pass
         if isinstance(rv, RefExpr) and self.is_type_ref(rv, bare=True):
             return True
         if isinstance(rv, IndexExpr) and self.is_type_ref(rv.base, bare=False):
@@ -3713,6 +3732,13 @@ class SemanticAnalyzer(
         is that we are only interested IndexExpr, CallExpr and OpExpr rvalues, since only those
         can be potentially recursive (things like `A = A` are never valid).
         """
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_can_possibly_be_type_form(s)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if len(s.lvalues) > 1:
             return False
         if isinstance(s.rvalue, CallExpr) and isinstance(s.rvalue.callee, RefExpr):
@@ -3729,6 +3755,12 @@ class SemanticAnalyzer(
 
     def can_possibly_be_typevarlike_declaration(self, s: AssignmentStmt) -> bool:
         """Check if r.h.s. can be a TypeVarLike declaration."""
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                if _rust_can_possibly_be_typevarlike_declaration(s):
+                    return True
+            except (AssertionError, NotImplementedError):
+                pass
         if len(s.lvalues) != 1 or not isinstance(s.lvalues[0], NameExpr):
             return False
         if not isinstance(s.rvalue, CallExpr) or not isinstance(s.rvalue.callee, NameExpr):
@@ -3755,6 +3787,13 @@ class SemanticAnalyzer(
         target for type alias call this method on expr.base (i.e. on C in C[int]).
         See also can_be_type_alias().
         """
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_is_type_ref(rv, bare)
+                if result is True:
+                    return True
+            except (AssertionError, NotImplementedError):
+                pass
         if not isinstance(rv, RefExpr):
             return False
         if isinstance(rv.node, TypeVarLikeExpr):
@@ -5140,6 +5179,16 @@ class SemanticAnalyzer(
 
     def check_typevarlike_name(self, call: CallExpr, name: str, context: Context) -> bool:
         """Checks that the name of a TypeVar or ParamSpec matches its variable."""
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_check_typevarlike_name(call, name)
+                if result is not None:
+                    valid, error_msg = result
+                    if error_msg is not None:
+                        self.fail(error_msg, context)
+                    return valid
+            except (AssertionError, NotImplementedError):
+                pass
         name = unmangle(name)
         assert isinstance(call.callee, RefExpr)
         typevarlike_type = (
@@ -5312,6 +5361,13 @@ class SemanticAnalyzer(
             return None
 
     def extract_typevarlike_name(self, s: AssignmentStmt, call: CallExpr) -> str | None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_extract_typevarlike_name(s, call)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         if not call:
             return None
 

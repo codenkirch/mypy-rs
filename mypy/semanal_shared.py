@@ -52,6 +52,30 @@ from mypy.types import (
     get_proper_type,
 )
 
+try:
+    from type_kernel import (
+        rust_set_callable_name as _rust_set_callable_name,
+        rust_has_placeholder as _rust_has_placeholder,
+        rust_calculate_tuple_fallback as _rust_calculate_tuple_fallback,
+        rust_find_dataclass_transform_spec as _rust_find_dataclass_transform_spec,
+    )
+
+    _SEMANAL_SHARED_HAS_KERNEL = True
+except ImportError:
+    _rust_set_callable_name = None  # type: ignore[assignment]
+    _rust_has_placeholder = None  # type: ignore[assignment]
+    _rust_calculate_tuple_fallback = None  # type: ignore[assignment]
+    _rust_find_dataclass_transform_spec = None  # type: ignore[assignment]
+    _SEMANAL_SHARED_HAS_KERNEL = False
+
+_native_semanal_shared_active: bool = False
+
+
+def _set_native_semanal_shared_active(active: bool) -> None:
+    global _native_semanal_shared_active
+    _native_semanal_shared_active = active
+
+
 # Subclasses can override these Var attributes with incompatible types. This can also be
 # set for individual attributes using 'allow_incompatible_override' of Var.
 ALLOW_INCOMPATIBLE_OVERRIDE: Final = ("__slots__", "__deletable__", "__match_args__")
@@ -264,6 +288,13 @@ class SemanticAnalyzerInterface(SemanticAnalyzerCoreInterface):
 
 
 def set_callable_name(sig: Type, fdef: FuncDef) -> ProperType:
+    if _SEMANAL_SHARED_HAS_KERNEL and _native_semanal_shared_active:
+        try:
+            result = _rust_set_callable_name(sig, fdef)
+            if result is not None:
+                return result  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
     sig = get_proper_type(sig)
     if isinstance(sig, FunctionLike):
         if fdef.info:
@@ -293,6 +324,14 @@ def calculate_tuple_fallback(typ: TupleType) -> None:
     can happen in later stages as well (they will generate errors, but
     we don't prevent their existence).
     """
+    if _SEMANAL_SHARED_HAS_KERNEL and _native_semanal_shared_active:
+        try:
+            result = _rust_calculate_tuple_fallback(typ)
+            if result is not None:
+                typ.partial_fallback.args = (result,)  # type: ignore[assignment]
+                return
+        except (AssertionError, NotImplementedError):
+            pass
     fallback = typ.partial_fallback
     assert fallback.type.fullname == "builtins.tuple"
     items = []
@@ -378,6 +417,13 @@ class HasPlaceholders(BoolTypeQuery):
 
 def has_placeholder(typ: Type) -> bool:
     """Check if a type contains any placeholder types (recursively)."""
+    if _SEMANAL_SHARED_HAS_KERNEL and _native_semanal_shared_active:
+        try:
+            result = _rust_has_placeholder(typ)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return typ.accept(HasPlaceholders())
 
 
@@ -389,6 +435,13 @@ def find_dataclass_transform_spec(node: Node | None) -> DataclassTransformSpec |
     transforms can be specified in multiple ways, including decorator functions and
     metaclasses/base classes. This function resolves the spec from any of these variants.
     """
+    if _SEMANAL_SHARED_HAS_KERNEL and _native_semanal_shared_active:
+        try:
+            result = _rust_find_dataclass_transform_spec(node)
+            if result is not None:
+                return result  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
 
     # The spec only lives on the function/class definition itself, so we need to unwrap down to that
     # point

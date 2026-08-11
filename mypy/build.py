@@ -1063,6 +1063,12 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_visitor_active
 
         _set_native_semanal_visitor_active(self.options.native_type_kernel)
+        from mypy.semanal_shared import _set_native_semanal_shared_active
+
+        _set_native_semanal_shared_active(self.options.native_type_kernel)
+        from mypy.sharedparse import _set_native_sharedparse_active
+
+        _set_native_sharedparse_active(self.options.native_type_kernel)
         # Issue #457: gate Node object-model pure predicates (is_dynamic,
         # has_self_or_cls_argument, is_generic, is_metaclass, has_base).
         from mypy.nodes import _set_native_nodes_active
