@@ -1557,6 +1557,15 @@ def custom_special_method(typ: Type, name: str, check_all: bool = False) -> bool
 
     If check_all is True ensure all items of a union have a custom method, not just some.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+        try:
+            result = _type_kernel.rust_custom_special_method(
+                _serialize_type(typ), name, check_all, _native_typeops_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     typ = get_proper_type(typ)
     if isinstance(typ, Instance):
         method = typ.type.get(name)

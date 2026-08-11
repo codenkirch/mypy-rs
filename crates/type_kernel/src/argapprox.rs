@@ -235,7 +235,7 @@ fn tuple_fallback(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option
 /// TypeVarTupleType (needs `copy_modified` on a live Instance),
 /// TypeAliasType (Python raises), Overloaded (the wire has no `.fallback`),
 /// Instance erasure when the snapshot or a TypeVarTuple defn var is present.
-fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option<Type> {
+pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option<Type> {
     match t {
         Type::TypeAliasType { .. } => None, // Python visit raises RuntimeError
         Type::UnboundType { .. } => Some(any_type(ANY_FROM_ERROR)),

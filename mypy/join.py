@@ -117,6 +117,20 @@ def _serialize_type(t: Type) -> bytes:
     return buf.getvalue()
 
 
+def _deserialize_type(data: bytes) -> Type | None:
+    """Deserialize wire bytes to a Type, fixing type_ref strings."""
+    from mypy.types import instance_cache
+    from mypy.wirefixup import fixup_wire_type
+
+    decoded = read_type(_ReadBuffer(data))
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    return fixup_wire_type(decoded)
+
+
 class InstanceJoiner:
     def __init__(self) -> None:
         self.seen_instances: list[tuple[Instance, Instance]] = []
@@ -1140,6 +1154,18 @@ def object_or_any_from_type(typ: ProperType) -> ProperType:
 
 
 def join_type_list(types: Sequence[Type]) -> Type:
+    if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
+        try:
+            blobs = [_serialize_type(t) for t in types]
+            result = _type_kernel.rust_join_type_list(
+                blobs, state.strict_optional, _native_join_resolver
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     if not types:
         # This is a little arbitrary but reasonable. Any empty tuple should be compatible
         # with all variable length tuples, and this makes it possible.

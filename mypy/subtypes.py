@@ -1513,6 +1513,24 @@ def is_protocol_implementation(
 def get_protocol_member(
     left: Instance, original_left: Type, member: str, class_obj: bool, is_lvalue: bool = False
 ) -> Type | None:
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            result = _type_kernel.rust_get_protocol_member(
+                _serialize_type(left),
+                _serialize_type(original_left),
+                member,
+                class_obj,
+                is_lvalue,
+                _native_subtype_resolver,
+            )
+            if result is not None:
+                if len(result) == 0:
+                    return None
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     if member == "__call__" and class_obj:
         # Special case: class objects always have __call__ that is just the constructor.
         return mypy.typeops.type_object_type(left.type)
@@ -2369,6 +2387,23 @@ def restrict_subtype_away(t: Type, s: Type, *, consider_runtime_isinstance: bool
     This is used for type inference of runtime type checks such as
     isinstance(). Currently, this just removes elements of a union type.
     """
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            from mypy.state import state
+
+            result = _type_kernel.rust_restrict_subtype_away(
+                _serialize_type(t),
+                _serialize_type(s),
+                consider_runtime_isinstance,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     p_t = get_proper_type(t)
     if isinstance(p_t, UnionType):
         new_items = try_restrict_literal_union(p_t, s)
