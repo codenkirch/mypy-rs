@@ -236,6 +236,7 @@ try:
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
+        rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
@@ -291,6 +292,7 @@ except ImportError:
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
     _rust_possible_none_type_var_overlap = None  # type: ignore[assignment]
+    _rust_combine_function_signatures = None  # type: ignore[assignment]
     _rust_solve_generic_call = None  # type: ignore[assignment]
     _rust_container_type = None  # type: ignore[assignment]
     _rust_tuple_context_matches = None  # type: ignore[assignment]
@@ -4350,6 +4352,42 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         callables = cast("list[CallableType]", types)
         if len(callables) == 1:
             return callables[0]
+
+        # Issue #489: native combine_function_signatures. Rust computes the
+        # merged callable (arg kinds, per-column unions, return union, merged
+        # variables). Returns None to defer to the pure-Python path below.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_combine_function_signatures is not None
+            and _native_checkexpr_resolver is not None
+        ):
+            try:
+                res = _rust_combine_function_signatures(
+                    _native_checkexpr_resolver,
+                    [_serialize_type_for_checkexpr(c) for c in callables],
+                    TypeVarId.next_raw_id,
+                    self.chk.options.strict_optional,
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                res = None
+            if res is not None:
+                next_raw_id, merged_bytes = res
+                TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
+                merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
+                if isinstance(merged, CallableType):
+                    # The wire format cannot carry line/column/definition/
+                    # fallback/special_sig/from_type_type; restore from the
+                    # pre-merge first callable like the check_callable_call
+                    # calibration path.
+                    first = callables[0]
+                    merged.line = first.line
+                    merged.column = first.column
+                    merged.definition = first.definition
+                    merged.special_sig = first.special_sig
+                    merged.from_type_type = first.from_type_type
+                    merged.fallback = first.fallback
+                    return merged
 
         # Note: we are assuming here that if a user uses some TypeVar 'T' in
         # two different functions, they meant for that TypeVar to mean the

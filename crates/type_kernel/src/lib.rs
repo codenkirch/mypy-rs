@@ -54,6 +54,7 @@ mod checker_visitor;
 mod checkexpr_argcheck;
 mod checkexpr_argcount;
 mod checkexpr_functions;
+mod checkexpr_overload;
 mod checkmember;
 mod checkoperator;
 mod checkpattern;
@@ -368,6 +369,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_method_fullname,
+        module
+    )?)?;
+    // Issue #489: overload-result family (combine_function_signatures body).
+    module.add_function(wrap_pyfunction!(
+        checkexpr_overload::rust_combine_function_signatures,
         module
     )?)?;
     // Issue #432: overload-ambiguity approximate-similarity.
