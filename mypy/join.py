@@ -684,6 +684,53 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
         Most of the trickiness comes from the variadic tuple items like *tuple[X, ...]
         since they can have arbitrary partial overlaps (while *Ts can't be split).
         """
+        # Stage 4 (M494) type-kernel seam: try the Rust join_tuples path.
+        # Rust returns None for unhandled cases (defer to Python).
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_join_active
+            and _native_join_resolver is not None
+        ):
+            try:
+                result = _type_kernel.rust_join_tuples(
+                    _serialize_type(s),
+                    _serialize_type(t),
+                    state.strict_optional,
+                    _native_join_resolver,
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                fixed_items: list[Type] | None = None
+                try:
+                    from mypy.types import instance_cache, read_type_list
+                    from mypy.wirefixup import fixup_wire_type
+
+                    decoded = read_type_list(_ReadBuffer(bytes(result)))
+                    # Rust re-serializes each joined item as a wire Type
+                    # carrying only a type_ref string; decode to live
+                    # TypeInfo via the same fixup as the rust_join_types
+                    # disc=7 path (join.py:389-402). A missing ref (or an
+                    # unset typeinfo map) returns None -> defer to Python
+                    # rather than wiring a FakeInfo into the type graph.
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    acc: list[Type] = []
+                    for item in decoded:
+                        fixed = fixup_wire_type(item)
+                        if fixed is None:
+                            break
+                        acc.append(fixed)
+                    else:
+                        fixed_items = acc
+                except Exception:
+                    pass
+                if fixed_items is not None:
+                    return fixed_items
+
         s_unpack_index = find_unpack_in_list(s.items)
         t_unpack_index = find_unpack_in_list(t.items)
         if s_unpack_index is None and t_unpack_index is None:
