@@ -59,6 +59,7 @@ mod checkmember;
 mod checkoperator;
 mod checkpattern;
 mod checkstrformat;
+mod condmaps;
 mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
@@ -1234,6 +1235,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checker_helpers::rust_get_protocol_member,
+        module
+    )?)?;
+    // Issue #488: conditional type-map algebra.
+    module.add_function(wrap_pyfunction!(
+        condmaps::rust_and_conditional_maps,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        condmaps::rust_or_conditional_maps,
         module
     )?)?;
     Ok(())

@@ -314,6 +314,7 @@ from mypy.visitor import NodeVisitor
 try:
     from librt.internal import ReadBuffer as _CheckerReadBuffer, WriteBuffer as _CheckerWriteBuffer
     from type_kernel import (
+        rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
@@ -340,6 +341,7 @@ try:
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
+        rust_or_conditional_maps as _rust_or_conditional_maps,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
         rust_type_requires_usage as _rust_type_requires_usage,
@@ -352,10 +354,12 @@ try:
 
     _CHECKER_HAS_TYPE_KERNEL = True
 except ImportError:
+    _rust_and_conditional_maps = None  # type: ignore[assignment]
     _rust_has_bool_item = None  # type: ignore[assignment]
     _rust_has_custom_eq_checks = None  # type: ignore[assignment]
     _rust_narrow_type_by_identity_equality = None  # type: ignore[assignment]
     _rust_narrow_with_len = None  # type: ignore[assignment]
+    _rust_or_conditional_maps = None  # type: ignore[assignment]
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
@@ -9387,6 +9391,42 @@ def and_conditional_maps(m1: TypeMap, m2: TypeMap, *, use_meet: bool = False) ->
     in terms of the information that we can learn from the truth of e1 and
     the truth of e2.
     """
+    _condmaps_disabled = True
+    if not _condmaps_disabled and (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+        and _rust_and_conditional_maps is not None
+    ):
+        try:
+            if not any(t is None for t in m1.values()) and not any(
+                t is None for t in m2.values()
+            ):
+                keys1 = [hash(literal_hash(e)) for e in m1]
+                vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
+                keys2 = [hash(literal_hash(e)) for e in m2]
+                vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
+                result = _rust_and_conditional_maps(
+                    keys1, vals1, keys2, vals2, use_meet,
+                    state.strict_optional, _native_checker_resolver,
+                )
+                if result is not None:
+                    out_keys, out_vals = result
+                    hash_to_expr: dict[int, Expression] = {}
+                    for e in m1:
+                        hash_to_expr[hash(literal_hash(e))] = e
+                    for e in m2:
+                        hash_to_expr.setdefault(hash(literal_hash(e)), e)
+                    result_map: TypeMap = {}
+                    for h, v in zip(out_keys, out_vals):
+                        expr = hash_to_expr.get(h)
+                        if expr is not None:
+                            decoded = _deserialize_type_from_checker(bytes(v))
+                            if decoded is not None:
+                                result_map[expr] = decoded
+                    return result_map
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     # Both conditions can be true; combine the information. Anything
     # we learn from either conditions' truth is valid.
     result = m2.copy()
@@ -9431,6 +9471,42 @@ def or_conditional_maps(m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False)
     the truth of e2. If coalesce_any is True, consider Any a supertype when
     joining restrictions.
     """
+    _condmaps_disabled = True
+    if not _condmaps_disabled and (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+        and _rust_or_conditional_maps is not None
+    ):
+        try:
+            if not any(t is None for t in m1.values()) and not any(
+                t is None for t in m2.values()
+            ):
+                keys1 = [hash(literal_hash(e)) for e in m1]
+                vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
+                keys2 = [hash(literal_hash(e)) for e in m2]
+                vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
+                result = _rust_or_conditional_maps(
+                    keys1, vals1, keys2, vals2, coalesce_any,
+                    state.strict_optional, _native_checker_resolver,
+                )
+                if result is not None:
+                    out_keys, out_vals = result
+                    hash_to_expr: dict[int, Expression] = {}
+                    for e in m1:
+                        hash_to_expr[hash(literal_hash(e))] = e
+                    for e in m2:
+                        hash_to_expr.setdefault(hash(literal_hash(e)), e)
+                    result_map: TypeMap = {}
+                    for h, v in zip(out_keys, out_vals):
+                        expr = hash_to_expr.get(h)
+                        if expr is not None:
+                            decoded = _deserialize_type_from_checker(bytes(v))
+                            if decoded is not None:
+                                result_map[expr] = decoded
+                    return result_map
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
 
     if is_unreachable_map(m1):
         return m2
