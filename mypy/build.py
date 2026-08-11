@@ -1375,6 +1375,10 @@ class BuildManager:
         from mypy.checker import _set_native_checker_resolver
 
         _set_native_checker_resolver(resolver)
+        # Issue #491: semanal lookup_qualified dot-chain walk.
+        from mypy.semanal import _set_native_semanal_resolver
+
+        _set_native_semanal_resolver(resolver)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.
@@ -1413,6 +1417,9 @@ class BuildManager:
         from mypy.maptype import _set_native_map_resolver
 
         _set_native_map_resolver(None)
+        from mypy.semanal import _set_native_semanal_resolver
+
+        _set_native_semanal_resolver(None)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
