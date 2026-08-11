@@ -47,17 +47,17 @@ const LONG_INT_TRAILER: u8 = 15;
 // Primitive literal tags (cache.py:303-310).
 const LITERAL_FALSE: u8 = 0;
 const LITERAL_TRUE: u8 = 1;
-const LITERAL_NONE: u8 = 2;
+pub(crate) const LITERAL_NONE: u8 = 2;
 const LITERAL_INT: u8 = 3;
-const LITERAL_STR: u8 = 4;
+pub(crate) const LITERAL_STR: u8 = 4;
 const LITERAL_BYTES: u8 = 5;
 const LITERAL_FLOAT: u8 = 6;
 
 // Collection tags (cache.py:313-318).
-const LIST_GEN: u8 = 20;
-const LIST_INT: u8 = 21;
-const LIST_STR: u8 = 22;
-const DICT_STR_GEN: u8 = 30;
+pub(crate) const LIST_GEN: u8 = 20;
+pub(crate) const LIST_INT: u8 = 21;
+pub(crate) const LIST_STR: u8 = 22;
+pub(crate) const DICT_STR_GEN: u8 = 30;
 
 // Misc class tags (cache.py:322-325).
 const EXTRA_ATTRS: u8 = 150;
@@ -1715,7 +1715,7 @@ impl WriteBuffer {
 }
 
 /// `write_tag`: a single byte.
-fn write_tag(buf: &mut WriteBuffer, tag: u8) {
+pub(crate) fn write_tag(buf: &mut WriteBuffer, tag: u8) {
     buf.push(tag);
 }
 
@@ -1780,7 +1780,7 @@ pub(crate) fn write_int_bare(buf: &mut WriteBuffer, value: i64) -> Result<(), Wi
 
 /// `write_str_bare`: short-int length prefix + UTF-8 body. Inverse of
 /// `read_str_bare` (wire.rs:261-274).
-fn write_str_bare(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
+pub(crate) fn write_str_bare(buf: &mut WriteBuffer, s: &str) -> Result<(), WireError> {
     write_int_bare(buf, s.len() as i64)?;
     buf.extend(s.as_bytes());
     Ok(())
