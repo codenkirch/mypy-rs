@@ -58,6 +58,7 @@ mod checkoperator;
 mod checkpattern;
 mod checkstrformat;
 mod constraints;
+mod constraints_filter;
 mod constraints_helpers;
 mod dataclasses;
 mod erase;
@@ -418,6 +419,27 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         constraints_helpers::rust_is_similar_constraints,
+        module
+    )?)?;
+    // Issue #474: pure constraint-list filtering functions.
+    module.add_function(wrap_pyfunction!(
+        constraints_filter::rust_skip_reverse_union_constraints,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_filter::rust_filter_imprecise_kinds,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_filter::rust_is_type_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_filter::rust_unwrap_type_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_filter::rust_infer_directed_arg_constraints,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;

@@ -868,6 +868,37 @@ def skip_reverse_union_constraints(cs: list[Constraint]) -> list[Constraint]:
     TODO: a cleaner solution may be to avoid inferring such constraints in first place, but
     this would require passing around a flag through all infer_constraints() calls.
     """
+    if _HAS_TYPE_KERNEL and _native_solve_active and _bounds_wire_safe([c.target for c in cs]):
+        try:
+            buf = _WriteBuffer()
+            from mypy.constraints import _write_option
+
+            _write_option(buf, cs)
+            raw = _type_kernel.rust_skip_reverse_union_constraints(buf.getvalue())
+            if raw is not None:
+                data = _ReadBuffer(bytes(raw))
+                from mypy.cache import read_int_bare  # type: ignore[attr-defined]
+
+                count = read_int_bare(data)
+                result: list[Constraint] = []
+                for _ in range(count):
+                    from mypy.cache import read_int
+
+                    from mypy.wirefixup import fixup_wire_type
+
+                    origin = read_type(data)
+                    origin = fixup_wire_type(origin)
+                    if origin is None:
+                        raise NotImplementedError("origin unresolvable on wire")
+                    op = read_int(data)
+                    target = read_type(data)
+                    target = fixup_wire_type(target)
+                    if target is None:
+                        raise NotImplementedError("target unresolvable on wire")
+                    result.append(Constraint(origin, op, target))  # type: ignore[arg-type]
+                return result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     reverse_union_cs = set()
     for c in cs:
         p_target = get_proper_type(c.target)

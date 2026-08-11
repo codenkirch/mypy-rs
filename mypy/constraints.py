@@ -244,6 +244,54 @@ def _try_native_is_similar_constraints(x: list[Constraint], y: list[Constraint])
     return _type_kernel.rust_is_similar_constraints(x_buf.getvalue(), y_buf.getvalue())
 
 
+def _try_native_filter_imprecise_kinds(cs: list[Constraint]) -> list[Constraint] | None:
+    """Route filter_imprecise_kinds through the Rust kernel, deferring on unsupported input."""
+    buf = _WriteBuffer()
+    _write_option(buf, cs)
+    raw = _type_kernel.rust_filter_imprecise_kinds(buf.getvalue())
+    if raw is None:
+        raise NotImplementedError("kernel deferred filter_imprecise_kinds")
+    return [cs[i] for i in _read_index_list(bytes(raw))]
+
+
+def _try_native_is_type_type(tp: ProperType) -> bool | None:
+    """Route _is_type_type through the Rust kernel, deferring on unsupported input."""
+    buf = _WriteBuffer()
+    tp.write(buf)
+    return _type_kernel.rust_is_type_type(buf.getvalue())
+
+
+def _try_native_unwrap_type_type(tp: ProperType) -> ProperType | None:
+    """Route _unwrap_type_type through the Rust kernel, deferring on unsupported input.
+
+    TypeType case returns the original `item` directly: the wire
+    round-trip would rebuild a TypeVarType (e.g. `type[Self]`) as a fresh
+    object, losing the identity the checker relies on when binding
+    self-types during constraint inference. Only the UnionType case
+    (built from TypeType items that are constraint-safe) takes the Rust
+    path.
+    """
+    if isinstance(tp, TypeType):
+        return tp.item
+    for o in tp.items:  # type: ignore[union-attr]
+        it = get_proper_type(o)
+        assert isinstance(it, TypeType)
+        if isinstance(it.item, (TypeVarType, ParamSpecType, TypeVarTupleType)):
+            # Wire round-trip would rebuild these as fresh objects,
+            # losing identity. Defer to Python.
+            raise NotImplementedError("identity-bearing item")
+    buf = _WriteBuffer()
+    tp.write(buf)
+    raw = _type_kernel.rust_unwrap_type_type(buf.getvalue())
+    if raw is None:
+        raise NotImplementedError("kernel deferred unwrap_type_type")
+    data = _ReadBuffer(bytes(raw))
+    result = _fix_wire_type(data)
+    if result is None:
+        raise NotImplementedError("result unresolvable on wire")
+    return result  # type: ignore[return-value]
+
+
 from mypy.argmap import ArgTypeExpander
 from mypy.erasetype import erase_typevars
 from mypy.expandtype import expand_type_by_instance
@@ -689,6 +737,13 @@ def _is_type_type(tp: ProperType) -> TypeGuard[TypeType | UnionType]:
     ``Type[A | B]`` is internally represented as ``type[A] | type[B]``, and this
     troubles the solver sometimes.
     """
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_is_type_type(tp)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     return (
         isinstance(tp, TypeType)
         or isinstance(tp, UnionType)
@@ -698,6 +753,13 @@ def _is_type_type(tp: ProperType) -> TypeGuard[TypeType | UnionType]:
 
 def _unwrap_type_type(tp: TypeType | UnionType) -> ProperType:
     """Extract the inner type from ``type[...]`` expression or a union thereof."""
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_unwrap_type_type(tp)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     if isinstance(tp, TypeType):
         return tp.item
     return UnionType.make_union([cast(TypeType, get_proper_type(o)).item for o in tp.items])
@@ -735,7 +797,7 @@ def select_trivial(options: Sequence[list[Constraint] | None]) -> list[list[Cons
             native_result = _try_native_select_trivial(options)
             if native_result is not None:
                 return native_result
-        except (NotImplementedError, ValueError):
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
     res = []
     for option in options:
@@ -863,7 +925,7 @@ def exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] |
             native_result = _try_native_exclude_non_meta_vars(option)
             if native_result is not None:
                 return native_result
-        except (NotImplementedError, ValueError):
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
     # However, if none of the options actually references meta vars, better remove
     # this constraint entirely.
@@ -904,7 +966,7 @@ def is_similar_constraints(x: list[Constraint], y: list[Constraint]) -> bool:
             native_result = _try_native_is_similar_constraints(x, y)
             if native_result is not None:
                 return native_result
-        except (NotImplementedError, ValueError):
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
     return _is_similar_constraints(x, y) and _is_similar_constraints(y, x)
 
@@ -1906,8 +1968,54 @@ def build_constraints_for_simple_unpack(
     return res
 
 
+def _try_native_infer_directed_arg_constraints(
+    left: Type, right: Type, direction: int
+) -> list[Constraint] | None:
+    """Route infer_directed_arg_constraints through the Rust kernel.
+
+    Requires a NativeTypeResolver snapshot. Any unsupported type shape
+    makes Rust return None, which we turn into an exception so the caller
+    falls back to Python.
+    """
+    if _native_constraints_resolver is None:
+        return None
+    left_buf = _WriteBuffer()
+    left.write(left_buf)
+    right_buf = _WriteBuffer()
+    right.write(right_buf)
+    raw = _type_kernel.rust_infer_directed_arg_constraints(
+        _native_constraints_resolver, left_buf.getvalue(), right_buf.getvalue(), direction
+    )
+    if raw is None:
+        raise NotImplementedError("kernel deferred infer_directed_arg_constraints")
+    data = _ReadBuffer(bytes(raw))
+    from mypy.cache import read_int_bare  # type: ignore[attr-defined]
+
+    count = read_int_bare(data)
+    constraints: list[Constraint] = []
+    for _ in range(count):
+        origin = _fix_wire_type(data)
+        if origin is None:
+            raise NotImplementedError("origin unresolvable on wire")
+        from mypy.cache import read_int
+
+        op = read_int(data)
+        target = _fix_wire_type(data)
+        if target is None:
+            raise NotImplementedError("target unresolvable on wire")
+        constraints.append(Constraint(origin, op, target))  # type: ignore[arg-type]
+    return constraints
+
+
 def infer_directed_arg_constraints(left: Type, right: Type, direction: int) -> list[Constraint]:
     """Infer constraints between two arguments using direction between original callables."""
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_infer_directed_arg_constraints(left, right, direction)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     if isinstance(left, (ParamSpecType, UnpackType)) or isinstance(
         right, (ParamSpecType, UnpackType)
     ):
@@ -1996,6 +2104,13 @@ def infer_callable_arguments_constraints(
 
 def filter_imprecise_kinds(cs: list[Constraint]) -> list[Constraint]:
     """For each ParamSpec remove all imprecise constraints, if at least one precise available."""
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_filter_imprecise_kinds(cs)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     have_precise = set()
     for c in cs:
         if not isinstance(c.origin_type_var, ParamSpecType):
