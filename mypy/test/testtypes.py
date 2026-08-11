@@ -7050,6 +7050,193 @@ class NativeCheckexprSuite(Suite):
         self.assertIsInstance(decoded, UnionType)
         self.assertEqual(len(decoded.items), 2)
 
+
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeCombineSignaturesSuite(Suite):
+    """Differential parity for issue #489: native `combine_function_signatures`.
+
+    `rust_combine_function_signatures` merges a list of CallableTypes into
+    one (per-column argument unions, return union, merged TypeVars), then
+    decodes and restores live-only fields. We call the Rust kernel directly,
+    decode via `_deserialize_type_from_checkexpr`, and assert the result
+    matches the pure-Python `ExpressionChecker.combine_function_signatures`
+    (run with the native gate off, so the oracle is the Python path).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.test.typefixture import TypeFixture
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._tk = _tk
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.std_tuplei,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        ret: Type,
+        variables: list[Type] | None = None,
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            ret,
+            self.fx.function,
+            variables=variables or [],
+        )
+
+    def assert_rust_par(self, callables: list[CallableType]) -> None:
+        """Assert Rust combine matches the pure-Python oracle."""
+        # Force the Python oracle off by disabling the native gates
+        # (the checkexpr gate and the freshen leaf's expandtype gate).
+        self._set_active(False)
+        old_expand = mypy.expandtype._native_expand_type_active
+        try:
+            from mypy.checkexpr import ExpressionChecker
+
+            mypy.expandtype._set_native_expand_type_active(False)
+            # Gate is off, so `self` is never touched; call unbound.
+            expected = ExpressionChecker.combine_function_signatures(None, callables)
+        finally:
+            mypy.expandtype._set_native_expand_type_active(old_expand)
+            self._set_active(True)
+        # Run the Rust kernel directly.
+        start_raw_id = TypeVarId.next_raw_id
+        res = self._tk.rust_combine_function_signatures(
+            self.resolver,
+            [self._bytes_of(c) for c in callables],
+            start_raw_id,
+            True,
+        )
+        assert res is not None, f"rust combine deferred for {callables!r}"
+        next_raw_id, merged_bytes = res
+        TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
+        from mypy.checkexpr import _deserialize_type_from_checkexpr
+
+        merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
+        assert isinstance(merged, CallableType), str(merged)
+        for live_field in ("line", "column", "definition", "special_sig", "from_type_type"):
+            assert getattr(merged, live_field) == getattr(expected, live_field), live_field
+        # `str()` renders arg unions, return union, variables, and
+        # fallback, so equality here is a full oracle check.
+        assert str(merged) == str(expected), f"rust {merged!r} != py {expected!r}"
+
+    def test_two_non_generic_same_shape(self) -> None:
+        # Merge of identical-shape callables whose args/returns are
+        # unrelated (A vs D): per-column argument union A | D and
+        # return union A | D (both columns contain both types).
+        call1 = self._callable([self.fx.a], self.fx.a)
+        call2 = self._callable([self.fx.d], self.fx.d)
+        self.assert_rust_par([call1, call2])
+
+        # Sanity: the union render shows both branches.
+        start_raw_id = TypeVarId.next_raw_id
+        res = self._tk.rust_combine_function_signatures(
+            self.resolver,
+            [self._bytes_of(call1), self._bytes_of(call2)],
+            start_raw_id,
+            True,
+        )
+        assert res is not None
+        _, merged_bytes = res
+        from mypy.checkexpr import _deserialize_type_from_checkexpr
+
+        merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
+        assert isinstance(merged, CallableType)
+        arg_union = get_proper_type(merged.arg_types[0])
+        assert isinstance(arg_union, UnionType) and len(arg_union.items) == 2
+        ret_union = get_proper_type(merged.ret_type)
+        assert isinstance(ret_union, UnionType) and len(ret_union.items) == 2
+
+    def test_two_non_generic_multi_arg(self) -> None:
+        call1 = self._callable([self.fx.a, self.fx.b], self.fx.a)
+        call2 = self._callable([self.fx.b, self.fx.a], self.fx.b)
+        self.assert_rust_par([call1, call2])
+
+    def test_two_non_generic_ret_union(self) -> None:
+        call1 = self._callable([self.fx.a], self.fx.a)
+        call2 = self._callable([self.fx.a], self.fx.b)
+        self.assert_rust_par([call1, call2])
+
+    def test_single_callable_deferred(self) -> None:
+        # Rust defers (None) on len(callables) == 1, like the Python gate.
+        res = self._tk.rust_combine_function_signatures(
+            self.resolver,
+            [self._bytes_of(self._callable([self.fx.a], self.fx.a))],
+            TypeVarId.next_raw_id,
+            True,
+        )
+        assert res is None
+
+    def test_two_generic_sharing_typevar(self) -> None:
+        # Both use `T` with different ids; merge renames to one exemplar.
+        default = AnyType(TypeOfAny.from_omitted_generics)
+        t1 = TypeVarType("T", "mod.T", TypeVarId(1), [], self.fx.o, default)
+        t2 = TypeVarType("T", "mod.T", TypeVarId(2), [], self.fx.o, default)
+        call1 = self._callable([t1], t1, variables=[t1])
+        call2 = self._callable([t2], t2, variables=[t2])
+        self.assert_rust_par([call1, call2])
+
+    def test_three_callables_merge(self) -> None:
+        call1 = self._callable([self.fx.a], self.fx.a)
+        call2 = self._callable([self.fx.b], self.fx.a)
+        call3 = self._callable([self.fx.b], self.fx.b)
+        self.assert_rust_par([call1, call2, call3])
+
+    def test_empty_callables_deferred(self) -> None:
+        res = self._tk.rust_combine_function_signatures(
+            self.resolver, [], TypeVarId.next_raw_id, True
+        )
+        assert res is None
+
+
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
