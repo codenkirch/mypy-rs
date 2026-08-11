@@ -48,6 +48,7 @@ mod attrs;
 mod cache;
 mod callable_compat;
 mod checkcall;
+mod checker_helpers;
 mod checker_stmts;
 mod checker_visitor;
 mod checkexpr_argcheck;
@@ -1059,5 +1060,26 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_tuple_length, module)?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_union_length, module)?)?;
+    // Issue #477: checker narrowing + type-validation pure helpers.
+    module.add_function(wrap_pyfunction!(
+        checker_helpers::rust_custom_special_method,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_helpers::rust_has_custom_eq_checks,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_helpers::rust_restrict_subtype_away,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_helpers::rust_join_type_list,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_helpers::rust_get_protocol_member,
+        module
+    )?)?;
     Ok(())
 }

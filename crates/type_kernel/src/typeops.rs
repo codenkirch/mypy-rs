@@ -764,7 +764,7 @@ fn erase_to_bound(t: &Type) -> Option<Type> {
 /// raises `NotImplementedError`), the simplified-union step defers, or any
 /// `make_simplified_union` subtype check needs the resolver and can't
 /// resolve. Needs the resolver for the union simplification.
-fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type> {
+pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type> {
     let Type::TupleType {
         partial_fallback,
         items,

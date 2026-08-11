@@ -320,6 +320,7 @@ try:
         rust_get_generator_return_type as _rust_get_generator_return_type,
         rust_get_generator_yield_type as _rust_get_generator_yield_type,
         rust_has_bool_item as _rust_has_bool_item,
+        rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_false_literal as _rust_is_false_literal,
@@ -351,6 +352,7 @@ try:
     _CHECKER_HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_has_bool_item = None  # type: ignore[assignment]
+    _rust_has_custom_eq_checks = None  # type: ignore[assignment]
     _rust_narrow_type_by_identity_equality = None  # type: ignore[assignment]
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
@@ -9491,6 +9493,15 @@ def reduce_and_conditional_type_maps(ms: list[TypeMap], *, use_meet: bool) -> Ty
 
 
 def has_custom_eq_checks(t: Type) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
+        try:
+            result = _rust_has_custom_eq_checks(
+                _serialize_type_for_checker(t), _native_checker_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     return custom_special_method(t, "__eq__", check_all=False) or custom_special_method(
         t, "__ne__", check_all=False
     )

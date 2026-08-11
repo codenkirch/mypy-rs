@@ -110,6 +110,14 @@ pub(crate) struct TypeInfoSnapshot {
     /// nodes and unreadable attributes). Feeds the M20 checkmember kernel
     /// (`has_operator`, `meta_has_operator`, `defined_in_superclass`).
     pub member_info: HashMap<String, (bool, bool)>,
+    /// Per-member node kind + definer fullname, for `custom_special_method`
+    /// (typeops.py:1555). Keyed by member name. `node_kind`: 0=FuncBase
+    /// (FuncDef/OverloadedFuncDef), 1=Decorator, 2=Var, -1=other/unknown.
+    /// `definer_fullname` is `node.info.fullname` (where the member was
+    /// defined); `custom_special_method` returns False when it starts with
+    /// `builtins.` or `typing.`. Empty for members that are not
+    /// FuncBase/Decorator/Var, or when unreadable.
+    pub member_definers: HashMap<String, (i64, String)>,
 }
 
 #[allow(dead_code)]
@@ -420,6 +428,61 @@ fn read_member_info(obj: &PyAny) -> HashMap<String, (bool, bool)> {
         out.insert(name, (implicit, has_explicit));
     }
     out
+}
+
+/// Read `TypeInfo.names` into a `name -> (node_kind, definer_fullname)`
+/// map for `custom_special_method` (typeops.py:1555). `node_kind`: 0=FuncBase
+/// (FuncDef/OverloadedFuncDef), 1=Decorator, 2=Var, -1=other. Only entries
+/// where the node is FuncBase/Decorator/Var are stored; `definer_fullname`
+/// is `node.info.fullname`.
+fn read_member_definers(obj: &PyAny) -> HashMap<String, (i64, String)> {
+    let names = match obj.getattr("names") {
+        Ok(n) => match n.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return HashMap::new(),
+        },
+        Err(_) => return HashMap::new(),
+    };
+    let mut out = HashMap::new();
+    for (key, value) in names.iter() {
+        let name = match key.extract::<String>() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let node = match value.getattr("node") {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let kind = node_kind(node);
+        if kind < 0 {
+            continue;
+        }
+        let definer = node
+            .getattr("info")
+            .ok()
+            .and_then(|info| info.getattr("fullname").ok())
+            .and_then(|f| f.extract::<String>().ok())
+            .unwrap_or_default();
+        out.insert(name, (kind, definer));
+    }
+    out
+}
+
+/// Classify a `SymbolTableNode.node` for `custom_special_method`.
+/// 0 = FuncBase (FuncDef / OverloadedFuncDef), 1 = Decorator, 2 = Var,
+/// -1 = other / unreadable. Mirrors the isinstance check in
+/// `typeops.py:1563` against `SYMBOL_FUNCBASE_TYPES` (nodes.py:1370).
+fn node_kind(node: &PyAny) -> i64 {
+    let type_name = match node.get_type().name() {
+        Ok(n) => n.to_string(),
+        Err(_) => return -1,
+    };
+    match type_name.as_str() {
+        "FuncDef" | "OverloadedFuncDef" => 0,
+        "Decorator" => 1,
+        "Var" => 2,
+        _ => -1,
+    }
 }
 
 /// Build a resolver (Python `dict[str, dict]`) from an iterable of live
@@ -936,6 +999,7 @@ pub(crate) fn build_native_resolver(
         // Duplicate `defn.type_vars` walk is confined to resolver build.
         let type_var_raw_ids = read_type_var_raw_ids(item);
         let member_info = read_member_info(item);
+        let member_definers = read_member_definers(item);
 
         let snap = TypeInfoSnapshot {
             fullname,
@@ -963,6 +1027,7 @@ pub(crate) fn build_native_resolver(
             type_var_upper_bounds,
             type_var_raw_ids,
             member_info,
+            member_definers,
         };
         resolver.insert(snap.fullname.clone(), snap);
     }
