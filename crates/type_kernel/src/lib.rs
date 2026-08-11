@@ -424,7 +424,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints_helpers::rust_is_similar_constraints,
         module
     )?)?;
-// Issue #474: pure constraint-list filtering functions.
+    // Issue #474: pure constraint-list filtering functions.
     module.add_function(wrap_pyfunction!(
         constraints_filter::rust_skip_reverse_union_constraints,
         module
