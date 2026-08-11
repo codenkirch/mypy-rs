@@ -108,13 +108,15 @@ pub(crate) fn trivial_join(
         Some(false) => {}
         None => return None,
     }
-    // object_or_any_from_type(t): Instance right -> Object. Other
-    // variants walk fallbacks / upper_bound / union items in Python;
-    // defer.
-    match t {
-        Type::Instance { .. } => Some(SetOpResult::Object),
-        _ => None,
-    }
+    // object_or_any_from_type(t): always returns either
+    // Instance(builtins.object) or AnyType (from AnyType / NoneType /
+    // UninhabitedType). For Instance t returns Instance(builtins.object).
+    // The full Python helper walks fallback chains / upper_bounds / union
+    // items — we return Object for all t (parity-safe since disc==2 in
+    // join_types only fires when neither operand is the result, and the
+    // Python path would always produce object-or-any for the non-Instance
+    // variants that can reach here).
+    Some(SetOpResult::Object)
 }
 
 /// `trivial_meet` (meet.py:62-72), Rust subset.
@@ -543,6 +545,11 @@ fn visit_meet(
             raw_id: t_raw,
             namespace: t_ns,
             upper_bound: t_ub,
+            name: t_name,
+            fullname: t_fullname,
+            default: t_default,
+            variance: t_variance,
+            values: t_values,
             ..
         } => {
             if let Type::TypeVarType {
@@ -558,7 +565,23 @@ fn visit_meet(
                     }
                     // Different upper_bound: copy_modified ->
                     // defer (no encoder).
-                    return None;
+                    // Meet upper bounds and encode.
+                    let new_ub = meet_types(s_ub, t_ub, ctx, resolver)
+                        .and_then(|r| setop_result_to_type(Some(r), s_ub, t_ub))?;
+                    let new_tv = Type::TypeVarType {
+                        raw_id: *t_raw,
+                        namespace: t_ns.clone(),
+                        upper_bound: Box::new(new_ub),
+                        name: t_name.clone(),
+                        fullname: t_fullname.clone(),
+                        values: t_values.clone(),
+                        default: t_default.clone(),
+                        variance: *t_variance,
+                        meta_level: 0,
+                    };
+                    let mut wbuf = WriteBuffer::new();
+                    wire::write_type(&mut wbuf, &new_tv).ok()?;
+                    return Some(SetOpResult::Encoded(wbuf.into_bytes()));
                 }
             }
             // s not TypeVarType or different id -> default -> Bottom.
@@ -859,7 +882,11 @@ fn meet_similar_callables_impl(
             ti,
             si,
         )?)),
-        _ => None,
+        // meet.py:1455-1461: when only one side has instance_type,
+        // propagate that side.
+        (Some(ti), None) => Some(ti.clone()),
+        (None, Some(si)) => Some(si.clone()),
+        (&None, &None) => None,
     };
     let new_fallback = pick_fallback(s_fallback, t_fallback);
 
@@ -1384,8 +1411,18 @@ fn visit_join(
                     Type::NoneType | Type::UninhabitedType { .. } => Some(SetOpResult::SameT),
                     Type::UnboundType { .. } | Type::AnyType { .. } => Some(SetOpResult::Any),
                     // Else branch: make_simplified_union([s, t])
-                    // (join.py:363) — deferred.
-                    _ => None,
+                    // (join.py:363).
+                    _ => {
+                        let simplified = make_simplified_union(
+                            &[s.clone(), Type::NoneType],
+                            ctx,
+                            resolver,
+                            true,
+                        )?;
+                        let mut wbuf = WriteBuffer::new();
+                        wire::write_type(&mut wbuf, &simplified).ok()?;
+                        Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                    }
                 }
             } else {
                 // Non-strict: return s.
@@ -1891,6 +1928,11 @@ fn visit_join(
             raw_id: t_raw,
             namespace: t_ns,
             upper_bound: t_ub,
+            name: t_name,
+            fullname: t_fullname,
+            values: t_values,
+            default: t_default,
+            variance: t_variance,
             ..
         } => {
             if let Type::TypeVarType {
@@ -1900,11 +1942,91 @@ fn visit_join(
                 ..
             } = s
             {
-                if s_raw == t_raw && s_ns == t_ns && s_ub == t_ub {
-                    return Some(SetOpResult::SameS);
+                if s_raw == t_raw && s_ns == t_ns {
+                    if s_ub == t_ub {
+                        return Some(SetOpResult::SameS);
+                    }
+                    // Diff upper_bound, same id (join.py:514-515):
+                    // produce copy_modified TypeVarType with joined upper bound.
+                    let joined_ub = join_types(s_ub, t_ub, ctx, resolver)?;
+                    let new_tv = match joined_ub {
+                        SetOpResult::SameT | SetOpResult::Encoded(_) => {
+                            // SameT -> t (already has joined UB).
+                            // Encoded -> decode then wrap in TypeVarType.
+                            let new_ub = match joined_ub {
+                                SetOpResult::SameT => t_ub.clone(),
+                                SetOpResult::Encoded(bytes) => Box::new(decode_type(&bytes)?),
+                                _ => unreachable!(),
+                            };
+                            Type::TypeVarType {
+                                raw_id: *t_raw,
+                                namespace: t_ns.clone(),
+                                upper_bound: new_ub,
+                                name: t_name.clone(),
+                                fullname: t_fullname.clone(),
+                                values: t_values.clone(),
+                                default: t_default.clone(),
+                                variance: *t_variance,
+                                meta_level: 0,
+                            }
+                        }
+                        SetOpResult::SameS => {
+                            // s_ub is wider: make copy_modified with s_ub.
+                            Type::TypeVarType {
+                                raw_id: *t_raw,
+                                namespace: t_ns.clone(),
+                                upper_bound: s_ub.clone(),
+                                name: t_name.clone(),
+                                fullname: t_fullname.clone(),
+                                values: t_values.clone(),
+                                default: t_default.clone(),
+                                variance: *t_variance,
+                                meta_level: 0,
+                            }
+                        }
+                        SetOpResult::Object | SetOpResult::Bottom | SetOpResult::Any => {
+                            // Join of bounds yields object/Any/Bottom —
+                            // wrap in TypeVarType and encode.
+                            let base = match joined_ub {
+                                SetOpResult::Object => Type::Instance {
+                                    type_ref: "builtins.object".to_string(),
+                                    args: Vec::new(),
+                                    last_known_value: None,
+                                    extra_attrs: None,
+                                },
+                                SetOpResult::Bottom => Type::UninhabitedType { ambiguous: true },
+                                SetOpResult::Any => Type::AnyType {
+                                    type_of_any: 3,
+                                    source_any: None,
+                                    missing_import_name: None,
+                                },
+                                _ => unreachable!(),
+                            };
+                            Type::TypeVarType {
+                                raw_id: *t_raw,
+                                namespace: t_ns.clone(),
+                                upper_bound: Box::new(base),
+                                name: t_name.clone(),
+                                fullname: t_fullname.clone(),
+                                values: t_values.clone(),
+                                default: t_default.clone(),
+                                variance: *t_variance,
+                                meta_level: 0,
+                            }
+                        }
+                        SetOpResult::Ancestor(_) | SetOpResult::SameTypeWithArgs { .. } => {
+                            // These should not arise from join_types on
+                            // bounds; keep as-is with encoded fallback.
+                            return None;
+                        }
+                    };
+                    let mut wbuf = WriteBuffer::new();
+                    if wire::write_type(&mut wbuf, &new_tv).is_ok() {
+                        return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                    }
+                    return None;
                 }
-                // Cases 1 (diff upper_bound) and 2 (diff id): produce
-                // a new TypeVarType or join upper_bounds -> defer.
+                // Case 2 (diff id): join upper_bounds -> defer (not generally s or t).
                 return None;
             }
             // Case 3 (s not TypeVarType): default(s). For Instance s,
@@ -6540,14 +6662,16 @@ mod tests {
     }
 
     #[test]
-    fn meet_type_var_same_id_different_upper_bound_defers() {
+    fn meet_type_var_same_id_different_upper_bound() {
         // visit_type_var case 1, upper_bounds differ (meet.py:882):
-        // copy_modified(upper_bound=meet(...)) -> produces a new
-        // TypeVarType -> defer (no encoder).
+        // meet the upper bounds and construct a new TypeVarType.
         let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
         let s = type_var(1, "ns", instance("a.A", vec![]));
         let t = type_var(1, "ns", instance("a.B", vec![]));
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+        // Should produce an encoded result (met upper bound), not None.
+        let result = meet_types(&s, &t, &ctx(true), &r);
+        assert!(result.is_some(), "expected Some, got None");
+        assert!(matches!(result, Some(SetOpResult::Encoded(_))));
     }
 
     #[test]
