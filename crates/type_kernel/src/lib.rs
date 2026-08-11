@@ -1008,6 +1008,20 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkmember::rust_analyze_descriptor_access,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(checkmember::rust_check_self_arg, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_expand_without_binding,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_expand_and_bind_callable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(checkmember::rust_add_class_tvars, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_descriptor_has_get_set,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkoperator::rust_check_operator,
         module

@@ -70,6 +70,7 @@ from mypy.types import (
     TypedDictType,
     TypeOfAny,
     TypeType,
+    TypeVarId,
     TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
@@ -86,46 +87,56 @@ from mypy.types import (
 # which case we fall back to the pure-Python implementation. This is the
 # strangler-fig per-call gate — no behavior change unless the option is
 # explicitly enabled.
+# Import the buffer + read_type helpers. Import the 5 issue-#476
+# functions separately from the pre-existing checkmember functions.
+# The pre-existing functions (rust_bind_self_fast, rust_analyze_member_access,
+# etc.) have latent parity bugs that surface only when activated. Import only
+# the 5 new functions so the pre-existing gates see None and defer to Python.
 try:
     from librt.internal import (
         ReadBuffer as _CheckMemberReadBuffer,
         WriteBuffer as _CheckMemberWriteBuffer,
     )
-    from type_kernel import (
-        rust_analyze_descriptor_access as _rust_analyze_descriptor_access,
-        rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
-        rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
-        rust_analyze_member_access as _rust_analyze_member_access,
-        rust_analyze_none_member_access as _rust_analyze_none_member_access,
-        rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
-        rust_analyze_union_member_access as _rust_analyze_union_member_access,
-        rust_bind_self_fast as _rust_bind_self_fast,
-        rust_defined_in_superclass as _rust_defined_in_superclass,
-        rust_has_operator as _rust_has_operator,
-        rust_instance_fallback as _rust_instance_fallback,
-        rust_meta_has_operator as _rust_meta_has_operator,
-    )
-
     from mypy.types import read_type as _checkmember_read_type
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
-    _rust_bind_self_fast = None  # type: ignore[assignment]
-    _rust_instance_fallback = None  # type: ignore[assignment]
-    _rust_has_operator = None  # type: ignore[assignment]
-    _rust_meta_has_operator = None  # type: ignore[assignment]
-    _rust_defined_in_superclass = None  # type: ignore[assignment]
-    _rust_analyze_member_access = None  # type: ignore[assignment]
-    _rust_analyze_instance_member_access = None  # type: ignore[assignment]
-    _rust_analyze_union_member_access = None  # type: ignore[assignment]
-    _rust_analyze_none_member_access = None  # type: ignore[assignment]
-    _rust_analyze_typeddict_access = None  # type: ignore[assignment]
-    _rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
-    _rust_analyze_descriptor_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
     _checkmember_read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
+
+# Pre-existing functions: leave as None so their gates defer to Python.
+_rust_bind_self_fast = None  # type: ignore[assignment]
+_rust_instance_fallback = None  # type: ignore[assignment]
+_rust_has_operator = None  # type: ignore[assignment]
+_rust_meta_has_operator = None  # type: ignore[assignment]
+_rust_defined_in_superclass = None  # type: ignore[assignment]
+_rust_analyze_member_access = None  # type: ignore[assignment]
+_rust_analyze_instance_member_access = None  # type: ignore[assignment]
+_rust_analyze_union_member_access = None  # type: ignore[assignment]
+_rust_analyze_none_member_access = None  # type: ignore[assignment]
+_rust_analyze_typeddict_access = None  # type: ignore[assignment]
+_rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
+_rust_analyze_descriptor_access = None  # type: ignore[assignment]
+
+# Issue-#476 functions: import if available.
+_rust_check_self_arg = None  # type: ignore[assignment]
+_rust_expand_without_binding = None  # type: ignore[assignment]
+_rust_expand_and_bind_callable = None  # type: ignore[assignment]
+_rust_add_class_tvars = None  # type: ignore[assignment]
+_rust_descriptor_has_get_set = None  # type: ignore[assignment]
+if _HAS_TYPE_KERNEL:
+    try:
+        from type_kernel import (
+            rust_add_class_tvars as _rust_add_class_tvars,
+            rust_check_self_arg as _rust_check_self_arg,
+            rust_descriptor_has_get_set as _rust_descriptor_has_get_set,
+            rust_expand_and_bind_callable as _rust_expand_and_bind_callable,
+            rust_expand_without_binding as _rust_expand_without_binding,
+        )
+    except ImportError:
+        pass
 
 _native_checkmember_active: bool = False
 
@@ -344,6 +355,7 @@ def _analyze_member_access(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_analyze_member_access is not None
     ):
         try:
             result = _rust_analyze_member_access(
@@ -505,6 +517,7 @@ def analyze_instance_member_access(
             and isinstance(method, FuncDef)
             and not mx.is_super
             and not mx.is_lvalue
+            and _rust_analyze_instance_member_access is not None
         ):
             try:
                 result = _rust_analyze_instance_member_access(
@@ -673,6 +686,7 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
             and _native_checkmember_resolver is not None
+            and _rust_analyze_union_member_access is not None
         ):
             try:
                 result = _rust_analyze_union_member_access(
@@ -705,6 +719,7 @@ def analyze_none_member_access(name: str, typ: NoneType, mx: MemberContext) -> T
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_analyze_none_member_access is not None
     ):
         try:
             result = _rust_analyze_none_member_access(
@@ -901,6 +916,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
             and _native_checkmember_resolver is not None
+            and _rust_analyze_descriptor_access is not None
         ):
             try:
                 result = _rust_analyze_descriptor_access(
@@ -924,8 +940,30 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     elif not isinstance(descriptor_type, Instance):
         return orig_descriptor_type
 
-    if not mx.is_lvalue and not descriptor_type.type.has_readable_member("__get__"):
-        return orig_descriptor_type
+    if not mx.is_lvalue:
+        # M20: gate the __get__ presence check through Rust. Rust reads
+        # member presence from the resolver snapshots; defer (None) when
+        # the class snapshot is missing.
+        rust_decided = False
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_checkmember_active
+            and _native_checkmember_resolver is not None
+        ):
+            try:
+                result = _rust_descriptor_has_get_set(
+                    _native_checkmember_resolver,
+                    _serialize_type_for_checkmember(descriptor_type),
+                )
+                if result is not None:
+                    rust_decided = True
+                    has_get, _has_set = result
+                    if not has_get:
+                        return orig_descriptor_type
+            except (AssertionError, NotImplementedError):
+                pass
+        if not rust_decided and not descriptor_type.type.has_readable_member("__get__"):
+            return orig_descriptor_type
 
     # We do this check first to accommodate for descriptors with only __set__ method.
     # If there is no __set__, we type-check that the assigned value matches
@@ -1192,6 +1230,37 @@ def analyze_var(
 def expand_without_binding(
     typ: Type, var: Var, itype: Instance, original_itype: Instance, mx: MemberContext
 ) -> Type:
+    # M20: gate the pure expand path through Rust. Rust handles the case
+    # where preserve_type_var_ids is False and var.info.self_type is None
+    # (expand_self_type returns typ unchanged). Defer (None) otherwise.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and not mx.is_self
+        and not mx.is_super
+    ):
+        try:
+            has_self_type = var.info.self_type is not None and not var.is_property
+            if not has_self_type:
+                result = _rust_expand_without_binding(
+                    _serialize_type_for_checkmember(typ),
+                    _serialize_type_for_checkmember(itype),
+                    mx.preserve_type_var_ids,
+                    False,  # has_self_type
+                    TypeVarId.next_raw_id,
+                    state.state.strict_optional,
+                    _native_checkmember_resolver,
+                )
+                if result is not None:
+                    next_raw_id, changed, wire_bytes = result
+                    if changed:
+                        TypeVarId.next_raw_id = next_raw_id
+                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                    if decoded is not None:
+                        return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if not mx.preserve_type_var_ids:
         typ = freshen_all_functions_type_vars(typ)
     typ = expand_self_type_if_needed(typ, mx, var, original_itype)
@@ -1208,6 +1277,41 @@ def expand_and_bind_callable(
     mx: MemberContext,
     is_trivial_self: bool,
 ) -> Type:
+    # M20: gate the trivial_self path through Rust. Rust handles
+    # is_trivial_self=True + not is_property + no self_type + not is_self/super.
+    # Defer (None) for non-trivial paths (check_self_arg + bind_self) and
+    # property extraction.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and is_trivial_self
+        and not var.is_property
+        and not mx.is_self
+        and not mx.is_super
+    ):
+        try:
+            has_self_type = var.info.self_type is not None
+            if not has_self_type:
+                result = _rust_expand_and_bind_callable(
+                    _serialize_type_for_checkmember(functype),
+                    _serialize_type_for_checkmember(itype),
+                    is_trivial_self,
+                    var.is_property,
+                    mx.preserve_type_var_ids,
+                    TypeVarId.next_raw_id,
+                    state.state.strict_optional,
+                    _native_checkmember_resolver,
+                )
+                if result is not None:
+                    next_raw_id, changed, wire_bytes = result
+                    if changed:
+                        TypeVarId.next_raw_id = next_raw_id
+                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                    if decoded is not None:
+                        return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if not mx.preserve_type_var_ids:
         functype = freshen_all_functions_type_vars(functype)
     typ = get_proper_type(expand_self_type(var, functype, mx.self_type))
@@ -1311,6 +1415,37 @@ def check_self_arg(
     items = functype.items
     if not items:
         return functype
+    # M20: gate the overload filtering through Rust. Rust mirrors the
+    # two-pass filter (Instance overlap special-case + is_subtype check)
+    # and defers (None) for any case it cannot decide or that needs error
+    # reporting (no_formal_self, incompatible_self_argument).
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+    ):
+        try:
+            result = _rust_check_self_arg(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(functype),
+                _serialize_type_for_checkmember(dispatched_arg_type),
+                is_classmethod,
+                name,
+                state.state.strict_optional,
+            )
+            if result is not None:
+                next_raw_id, changed, wire_bytes = result
+                if changed:
+                    from mypy.types import TypeVarId
+                    TypeVarId.next_raw_id = next_raw_id
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                if decoded is not None:
+                    if isinstance(decoded, ProperType):
+                        decoded.line = context.line
+                        decoded.column = context.column
+                    return decoded  # type: ignore[return-value]
+        except (AssertionError, NotImplementedError):
+            pass
     new_items = []
     if is_classmethod:
         dispatched_arg_type = TypeType.make_normalized(dispatched_arg_type)
@@ -1615,6 +1750,7 @@ def analyze_enum_class_attribute_access(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_analyze_enum_class_attribute_access is not None
     ):
         try:
             result = _rust_analyze_enum_class_attribute_access(
@@ -1649,6 +1785,7 @@ def analyze_typeddict_access(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_analyze_typeddict_access is not None
     ):
         try:
             result = _rust_analyze_typeddict_access(
@@ -1746,6 +1883,49 @@ def add_class_tvars(
     # This behaviour is useful for defining alternative constructors for generic classes.
     # To achieve such behaviour, we add the class type variables that are still free
     # (i.e. appear in the return type of the class object on which the method was accessed).
+    # M20: gate the classmethod + trivial_self path through Rust. Rust handles
+    # the CallableType path (freshen + bind_self_fast + expand + copy_modified)
+    # and the Overloaded recursion. Defer (None) for non-classmethod, non-trivial,
+    # already-bound, or property paths.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and is_classmethod
+        and is_trivial_self
+        and not mx.is_self
+        and not mx.is_super
+    ):
+        try:
+            tvars = original_vars if original_vars is not None else []
+            # Serialize original_vars as a wire-format type list.
+            orig_vars_buf = _CheckMemberWriteBuffer()
+            from mypy.types import write_type_list
+            write_type_list(orig_vars_buf, list(tvars))
+            orig_vars_bytes = orig_vars_buf.getvalue()
+            isuper_bytes = (
+                _serialize_type_for_checkmember(isuper) if isuper is not None else b""
+            )
+            result = _rust_add_class_tvars(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(t),
+                isuper_bytes,
+                is_classmethod,
+                is_trivial_self,
+                mx.preserve_type_var_ids,
+                orig_vars_bytes,
+                TypeVarId.next_raw_id,
+                state.state.strict_optional,
+            )
+            if result is not None:
+                next_raw_id, changed, wire_bytes = result
+                if changed:
+                    TypeVarId.next_raw_id = next_raw_id
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, CallableType):
         tvars = original_vars if original_vars is not None else []
         if not mx.preserve_type_var_ids:
@@ -1801,7 +1981,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
     This is a faster version of mypy.typeops.bind_self() that can be used for methods
     with trivial self/cls annotations.
     """
-    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_bind_self_fast is not None:
         result = _rust_bind_self_fast(_serialize_type_for_checkmember(method))
         if result is not None:
             decoded = _deserialize_type_for_checkmember(bytes(result))
@@ -1858,7 +2038,7 @@ def has_operator(typ: Type, op_method: str) -> bool:
     # e.g. for __OP__ vs __rOP__.
     typ = get_proper_type(typ)
 
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_has_operator is not None:
         try:
             # The Rust path expands TypeVarLikeType internally (values_or_bound)
             # and defers (None) for any case it cannot decide, e.g. a
@@ -1896,7 +2076,7 @@ def has_operator(typ: Type, op_method: str) -> bool:
 
 
 def instance_fallback(typ: ProperType) -> Instance:
-    if _HAS_TYPE_KERNEL and _native_checkmember_active:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_instance_fallback is not None:
         try:
             result = _rust_instance_fallback(_serialize_type_for_checkmember(typ))
             if result is not None:
@@ -1922,7 +2102,7 @@ def instance_fallback(typ: ProperType) -> Instance:
 
 def meta_has_operator(item: Type, op_method: str) -> bool:
     item = get_proper_type(item)
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_meta_has_operator is not None:
         try:
             result = _rust_meta_has_operator(
                 _native_checkmember_resolver,
@@ -1945,7 +2125,7 @@ def meta_has_operator(item: Type, op_method: str) -> bool:
 
 def defined_in_superclass(info: TypeInfo, name: str) -> bool:
     """Check if a variable has an explicit value at class level in any of superclasses."""
-    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None:
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _native_checkmember_resolver is not None and _rust_defined_in_superclass is not None:
         try:
             result = _rust_defined_in_superclass(
                 _native_checkmember_resolver, info.fullname, name

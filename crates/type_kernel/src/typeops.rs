@@ -731,7 +731,7 @@ fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
 ///
 /// `get_proper_type` is a no-op on wire types except for `TypeAliasType`,
 /// which has no proper form here, so it defers (returns `None`).
-fn erase_to_bound(t: &Type) -> Option<Type> {
+pub(crate) fn erase_to_bound(t: &Type) -> Option<Type> {
     if let Type::TypeAliasType { .. } = t {
         return None;
     }
@@ -1040,7 +1040,7 @@ pub(crate) fn rust_tuple_fallback(
 
 /// Return `None` when any shape needs alias expansion or is not handled,
 /// deferring the entire extraction to the Python `TypeVarExtractor`.
-fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
+pub(crate) fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>) -> Option<()> {
     match t {
         Type::TypeVarType { .. } => {
             out.push(t.clone());

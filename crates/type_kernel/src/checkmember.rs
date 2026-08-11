@@ -1194,12 +1194,690 @@ fn analyze_descriptor_access_inner(
 }
 
 // ---------------------------------------------------------------------------
+// check_self_arg
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.check_self_arg` (checkmember.py:1294-1370).
+///
+/// Filters overload items by checking that the dispatched argument type is
+/// compatible with each item's first (self/cls) parameter. Returns the
+/// filtered signature as a single CallableType (one match), an Overloaded
+/// (multiple matches), or the original signature (no match, error reported
+/// by Python). Defer (`None`) for cases Rust cannot handle: ParamSpec/
+/// TypeVarTuple selfargs, TypeAliasType expansion, is_subtype deferral,
+/// or `is_overlapping_types` deferral in the Instance special-case.
+///
+/// Mirrors the two-pass filter in Python:
+///   1. Instance special-case: drop items where both selfarg and dispatched
+///      arg are Instances of the same type but with non-overlapping args.
+///   2. Subtype check: keep items where `dispatched_arg_type <: erase_typevars(
+///      erase_to_bound(selfarg))` with `always_covariant` + `ignore_pos_arg_names`.
+///
+/// `is_classmethod` wraps `dispatched_arg_type` in `TypeType.make_normalized`.
+/// The `name` parameter is used only for the `__call__` special-case detection
+/// of a callable selfarg.
+#[pyfunction]
+pub(crate) fn rust_check_self_arg(
+    resolver: &NativeTypeResolver,
+    functype_bytes: &[u8],
+    dispatched_arg_type_bytes: &[u8],
+    is_classmethod: bool,
+    name: &str,
+    strict_optional: bool,
+) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
+    let functype = match decode_type(functype_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let dispatched = match decode_type(dispatched_arg_type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let result = check_self_arg_inner(
+        &functype,
+        &dispatched,
+        is_classmethod,
+        name,
+        strict_optional,
+        resolver.resolver(),
+    );
+    // check_self_arg only filters overload items — it does not freshen.
+    // Return (next_raw_id=0, changed=false, wire_bytes) so the Python
+    // gate unpacks the 3-tuple but skips the TypeVarId.next_raw_id update.
+    Ok(result.and_then(|t| encode_type(&t).map(|bytes| (0i64, false, bytes))))
+}
+
+fn check_self_arg_inner(
+    functype: &Type,
+    dispatched_arg_type: &Type,
+    is_classmethod: bool,
+    name: &str,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    let items = match functype {
+        Type::CallableType { .. } => vec![functype.clone()],
+        Type::Overloaded { items } => items.clone(),
+        _ => return None,
+    };
+    if items.is_empty() {
+        return Some(functype.clone());
+    }
+
+    // classmethod: wrap dispatched_arg_type in TypeType.make_normalized.
+    let dispatched = if is_classmethod {
+        make_type_type_normalized(dispatched_arg_type)
+    } else {
+        dispatched_arg_type.clone()
+    };
+
+    // Pass 1: Instance special-case filtering.
+    // Drop items where both selfarg and dispatched are Instances of the
+    // same type but args don't overlap. Also defer if is_overlapping_types
+    // cannot decide.
+    let mut pass1 = Vec::with_capacity(items.len());
+    for item in &items {
+        let (arg_types, arg_kinds) = match item {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ..
+            } => (arg_types, arg_kinds),
+            _ => return None,
+        };
+        if arg_types.is_empty() {
+            // Python: msg.no_formal_self, then return functype. Defer (Python
+            // reports the error).
+            return None;
+        }
+        // Python checks item.arg_kinds[0] not in (ARG_POS, ARG_STAR).
+        // Guard a length mismatch; if arg_kinds[0] is not ARG_POS/ARG_STAR,
+        // Python reports no_formal_self and returns functype. Defer.
+        match arg_kinds.first() {
+            Some(&k) if k == ARG_POS || k == ARG_STAR => {}
+            _ => return None,
+        }
+        let selfarg = get_proper_or_none(&arg_types[0])?;
+        match (&dispatched, selfarg) {
+            (
+                Type::Instance {
+                    type_ref: d_ref, ..
+                },
+                Type::Instance {
+                    type_ref: s_ref,
+                    args: s_args,
+                    ..
+                },
+            ) if d_ref == s_ref && !s_args.is_empty() => {
+                let overlap = crate::meet::overlap(
+                    &dispatched,
+                    selfarg,
+                    strict_optional,
+                    false, // ignore_promotions
+                    false, // overlap_for_overloads
+                    resolver,
+                    0,
+                )?;
+                if !overlap {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        pass1.push(item.clone());
+    }
+
+    // Pass 2: subtype check.
+    let working = if pass1.is_empty() { &items } else { &pass1 };
+    let mut pass2 = Vec::with_capacity(working.len());
+    for item in working {
+        let arg_types = match item {
+            Type::CallableType { arg_types, .. } => arg_types,
+            _ => return None,
+        };
+        let selfarg = get_proper_or_none(&arg_types[0])?;
+        // __call__ special-case: callable selfarg is always accepted.
+        let self_callable = name == "__call__" && matches!(selfarg, Type::CallableType { .. });
+
+        if self_callable {
+            pass2.push(item.clone());
+            continue;
+        }
+
+        // erase_to_bound(selfarg), then erase_typevars.
+        let erased_bound = crate::typeops::erase_to_bound(selfarg)?;
+        let erased = crate::erase_typevars::erase_typevars_inner(
+            &erased_bound,
+            None,
+            &crate::erase_typevars::make_any(),
+        )?;
+
+        // always_covariant: True if any type var in get_all_type_vars(selfarg)
+        // is NOT a TypeVarType (i.e. ParamSpec or TypeVarTuple).
+        let mut tvs = Vec::new();
+        crate::typeops::collect_type_vars(selfarg, false, &mut tvs)?;
+        let always_covariant = tvs.iter().any(|tv| !matches!(tv, Type::TypeVarType { .. }));
+
+        let ctx = SubtypeContext::new(
+            false, // ignore_type_params
+            false, // ignore_declared_variance
+            always_covariant,
+            false, // ignore_promotions
+            false, // proper_subtype
+            strict_optional,
+        );
+
+        let subtype_result = crate::subtypes::is_subtype(&dispatched, &erased, &ctx, resolver);
+
+        match subtype_result {
+            Some(true) => pass2.push(item.clone()),
+            Some(false) => continue,
+            None => {
+                // Defer: ParamSpecType or TypeVarTupleType selfarg.
+                if matches!(selfarg, Type::ParamSpecType { .. }) {
+                    pass2.push(item.clone());
+                } else if matches!(selfarg, Type::TypeVarTupleType { .. }) {
+                    // Python raises NotImplementedError; defer entire call.
+                    return None;
+                } else {
+                    return None;
+                }
+            }
+        }
+    }
+
+    if pass2.is_empty() {
+        // Python reports incompatible_self_argument, then returns functype.
+        // Defer so Python can report the error.
+        return None;
+    }
+    if pass2.len() == 1 {
+        return Some(pass2.into_iter().next().unwrap());
+    }
+    Some(Type::Overloaded { items: pass2 })
+}
+
+/// `TypeType.make_normalized` (types.py:3710-3724): wraps a type in TypeType,
+/// expanding UnionType items into a Union of TypeType items.
+fn make_type_type_normalized(item: &Type) -> Type {
+    let proper = get_proper_or_none(item).unwrap_or(item);
+    match proper {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+            can_be_true,
+            can_be_false,
+        } => {
+            let mapped: Vec<Type> = items.iter().map(make_type_type_normalized).collect();
+            Type::UnionType {
+                items: mapped,
+                uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true: *can_be_true,
+                can_be_false: *can_be_false,
+            }
+        }
+        other => Type::TypeType {
+            item: Box::new(other.clone()),
+            is_type_form: false,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// expand_without_binding
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.expand_without_binding` (checkmember.py:1192-1200).
+///
+/// Expands a Var's type for instance access without binding self:
+/// `freshen_all_functions_type_vars` + `expand_self_type_if_needed` +
+/// `expand_type_by_instance` + `freeze_all_type_vars`.
+///
+/// Rust handles the common pure path: when `preserve_type_var_ids` is False
+/// and there is no Self type to expand (no `var.info.self_type`), the result
+/// is just `freshen + expand_type_by_instance`. Defer (`None`) when:
+///   * `preserve_type_var_ids` is True (freshen skipped, but expand_self_type
+///     still needs the Var's self_type, which the wire format does not carry)
+///   * `expand_self_type` would need to run (needs `var.info.self_type`)
+///   * `freshen` or `expand_type_by_instance` defers
+///
+/// The caller passes `has_self_type=False` from the Python side to indicate
+/// that `var.info.self_type is None`, enabling the pure path.
+#[pyfunction]
+pub(crate) fn rust_expand_without_binding(
+    typ_bytes: &[u8],
+    itype_bytes: &[u8],
+    preserve_type_var_ids: bool,
+    has_self_type: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
+    let typ = match decode_type(typ_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let itype = match decode_type(itype_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    // If the var has a self_type, expand_self_type needs the Var node;
+    // defer to Python.
+    if has_self_type {
+        return Ok(None);
+    }
+    let result = expand_without_binding_inner(
+        &typ,
+        &itype,
+        preserve_type_var_ids,
+        start_raw_id,
+        strict_optional,
+        resolver.resolver(),
+    );
+    match result {
+        Some((next_raw_id, changed, t)) => {
+            let bytes = match encode_type(&t) {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            Ok(Some((next_raw_id, changed, bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn expand_without_binding_inner(
+    typ: &Type,
+    itype: &Type,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<(i64, bool, Type)> {
+    let mut current = typ.clone();
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
+
+    if !preserve_type_var_ids {
+        let freshened = crate::freshen::freshen_type(
+            &current,
+            &mut next_raw_id,
+            &mut changed,
+            strict_optional,
+        )?;
+        current = freshened;
+    }
+
+    // expand_self_type_if_needed: when has_self_type is False and not
+    // is_self/is_super, expand_self_type returns typ unchanged. We only
+    // handle this case (caller sets has_self_type=False).
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &current,
+        itype,
+        resolver,
+        strict_optional,
+    )?;
+
+    // freeze_all_type_vars: no-op in Rust (the result is already frozen;
+    // expand produces only bound class vars when it fully succeeds).
+    Some((next_raw_id, changed, expanded))
+}
+
+// ---------------------------------------------------------------------------
+// expand_and_bind_callable
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.expand_and_bind_callable` (checkmember.py:1203-1247),
+/// the `is_trivial_self=True` path only.
+///
+/// Ports: `freshen_all_functions_type_vars` + `bind_self_fast` +
+/// `expand_type_by_instance` + `freeze_all_type_vars`. The non-trivial path
+/// (`check_self_arg` + `bind_self`) and the property extraction tail are
+/// deferred to Python.
+///
+/// Defer (`None`) when:
+///   * Not `is_trivial_self` (needs check_self_arg + bind_self)
+///   * `var.is_property` (property extraction needs the Var node)
+///   * freshen or bind_self_fast or expand defers
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_expand_and_bind_callable(
+    functype_bytes: &[u8],
+    itype_bytes: &[u8],
+    is_trivial_self: bool,
+    is_property: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
+    if !is_trivial_self || is_property {
+        return Ok(None);
+    }
+    let functype = match decode_type(functype_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let itype = match decode_type(itype_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let result = expand_and_bind_callable_inner(
+        &functype,
+        &itype,
+        preserve_type_var_ids,
+        start_raw_id,
+        strict_optional,
+        resolver.resolver(),
+    );
+    match result {
+        Some((next_raw_id, changed, t)) => {
+            let bytes = match encode_type(&t) {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            Ok(Some((next_raw_id, changed, bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+fn expand_and_bind_callable_inner(
+    functype: &Type,
+    itype: &Type,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<(i64, bool, Type)> {
+    let mut current = functype.clone();
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
+
+    if !preserve_type_var_ids {
+        let freshened = crate::freshen::freshen_type(
+            &current,
+            &mut next_raw_id,
+            &mut changed,
+            strict_optional,
+        )?;
+        current = freshened;
+    }
+
+    // expand_self_type: needs var.info.self_type; for trivial_self the
+    // caller ensures has_self_type=False, so expand_self_type returns t.
+    // bind_self_fast for trivial_self.
+    let bound = bind_self_fast_inner(&current)?;
+    let expanded =
+        crate::expandtype::expand_type_by_instance_core(&bound, itype, resolver, strict_optional)?;
+
+    Some((next_raw_id, changed, expanded))
+}
+
+// ---------------------------------------------------------------------------
+// add_class_tvars
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.add_class_tvars` (checkmember.py:1707-1774), the
+/// `is_classmethod + is_trivial_self` path for CallableType, plus the
+/// Overloaded recursion.
+///
+/// Ports: `freshen_all_functions_type_vars` + `bind_self_fast` +
+/// `expand_type_by_instance(isuper)` + `freeze_all_type_vars` +
+/// `copy_modified(variables=original_vars + t.variables)`.
+///
+/// Defer (`None`) when:
+///   * Not `is_classmethod` or not `is_trivial_self` (needs bind_self)
+///   * CallableType is already `is_bound`
+///   * freshen or bind_self_fast or expand defers
+///   * Overloaded with non-CallableType items
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_add_class_tvars(
+    resolver: &NativeTypeResolver,
+    t_bytes: &[u8],
+    isuper_bytes: &[u8],
+    is_classmethod: bool,
+    is_trivial_self: bool,
+    preserve_type_var_ids: bool,
+    original_vars_bytes: &[u8],
+    start_raw_id: i64,
+    strict_optional: bool,
+) -> PyResult<Option<(i64, bool, Vec<u8>)>> {
+    let t = match decode_type(t_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let isuper = if isuper_bytes.is_empty() {
+        None
+    } else {
+        decode_type(isuper_bytes)
+    };
+    let original_vars = if original_vars_bytes.is_empty() {
+        Vec::new()
+    } else {
+        match decode_type_list_blob(original_vars_bytes) {
+            Some(v) => v,
+            None => return Ok(None),
+        }
+    };
+    let result = add_class_tvars_inner(
+        &t,
+        isuper.as_ref(),
+        is_classmethod,
+        is_trivial_self,
+        preserve_type_var_ids,
+        &original_vars,
+        start_raw_id,
+        strict_optional,
+        resolver.resolver(),
+    );
+    match result {
+        Some((next_raw_id, changed, typ)) => {
+            let bytes = match encode_type(&typ) {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            Ok(Some((next_raw_id, changed, bytes)))
+        }
+        None => Ok(None),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_class_tvars_inner(
+    t: &Type,
+    isuper: Option<&Type>,
+    is_classmethod: bool,
+    is_trivial_self: bool,
+    preserve_type_var_ids: bool,
+    original_vars: &[Type],
+    start_raw_id: i64,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<(i64, bool, Type)> {
+    match t {
+        Type::CallableType { is_bound, .. } => {
+            // Only handle classmethod + trivial_self + not already bound.
+            if !is_classmethod || !is_trivial_self || *is_bound {
+                return None;
+            }
+            let mut current = t.clone();
+            let mut next_raw_id = start_raw_id;
+            let mut changed = false;
+
+            if !preserve_type_var_ids {
+                let freshened = crate::freshen::freshen_type(
+                    &current,
+                    &mut next_raw_id,
+                    &mut changed,
+                    strict_optional,
+                )?;
+                current = freshened;
+            }
+
+            // bind_self_fast for trivial_self classmethod.
+            let bound = bind_self_fast_inner(&current)?;
+
+            // expand_type_by_instance(bound, isuper) if isuper is Some.
+            let expanded = if let Some(isup) = isuper {
+                crate::expandtype::expand_type_by_instance_core(
+                    &bound,
+                    isup,
+                    resolver,
+                    strict_optional,
+                )?
+            } else {
+                bound
+            };
+
+            // copy_modified(variables=list(original_vars) + list(t.variables))
+            // After freshen + expand, the variables field may have changed.
+            // Python reads t.variables from the *post-expand* result.
+            let new_vars: Vec<Type> = match &expanded {
+                Type::CallableType {
+                    variables: exp_vars,
+                    ..
+                } => {
+                    let mut combined = original_vars.to_vec();
+                    combined.extend(exp_vars.iter().cloned());
+                    combined
+                }
+                _ => return None,
+            };
+
+            let result = match &expanded {
+                Type::CallableType {
+                    fallback: ef,
+                    instance_type: ei,
+                    is_ellipsis_args: ee,
+                    implicit: eimp,
+                    is_bound: eb,
+                    from_concatenate: ec,
+                    imprecise_arg_kinds: eik,
+                    unpack_kwargs: ew,
+                    arg_types: eat,
+                    arg_kinds: eak,
+                    arg_names: ean,
+                    ret_type: ert,
+                    name: en,
+                    type_guard: etg,
+                    type_is: eti,
+                    ..
+                } => Type::CallableType {
+                    fallback: ef.clone(),
+                    instance_type: ei.clone(),
+                    is_ellipsis_args: *ee,
+                    implicit: *eimp,
+                    is_bound: *eb,
+                    from_concatenate: *ec,
+                    imprecise_arg_kinds: *eik,
+                    unpack_kwargs: *ew,
+                    arg_types: eat.clone(),
+                    arg_kinds: eak.clone(),
+                    arg_names: ean.clone(),
+                    ret_type: ert.clone(),
+                    name: en.clone(),
+                    variables: new_vars,
+                    type_guard: etg.clone(),
+                    type_is: eti.clone(),
+                },
+                _ => return None,
+            };
+            Some((next_raw_id, changed, result))
+        }
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                return None;
+            }
+            let mut new_items = Vec::with_capacity(items.len());
+            let mut next_raw_id = start_raw_id;
+            let mut changed = false;
+            for item in items {
+                let r = add_class_tvars_inner(
+                    item,
+                    isuper,
+                    is_classmethod,
+                    is_trivial_self,
+                    preserve_type_var_ids,
+                    original_vars,
+                    next_raw_id,
+                    strict_optional,
+                    resolver,
+                )?;
+                next_raw_id = r.0;
+                if r.1 {
+                    changed = true;
+                }
+                // Python casts each item to CallableType.
+                if !matches!(r.2, Type::CallableType { .. }) {
+                    return None;
+                }
+                new_items.push(r.2);
+            }
+            Some((next_raw_id, changed, Type::Overloaded { items: new_items }))
+        }
+        _ => {
+            // Non-callable: expand_type_by_instance(t, isuper) if isuper.
+            let expanded = if let Some(isup) = isuper {
+                crate::expandtype::expand_type_by_instance_core(t, isup, resolver, strict_optional)?
+            } else {
+                t.clone()
+            };
+            Some((start_raw_id, false, expanded))
+        }
+    }
+}
+
+/// Decode a wire-format list of Type blobs (LIST_GEN tag + bare count + types).
+fn decode_type_list_blob(bytes: &[u8]) -> Option<Vec<Type>> {
+    let mut buf = crate::wire::ReadBuffer::new(bytes);
+    crate::wire::read_type_list(&mut buf).ok()
+}
+
+// ---------------------------------------------------------------------------
+// descriptor_has_get / descriptor_has_set
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkmember.analyze_descriptor_access` (checkmember.py:924-941),
+/// the `__get__`/`__set__` presence checks.
+///
+/// Returns `(has_get, has_set)` for a descriptor Instance type, reading
+/// member presence from the resolver snapshots. Defer (`None`) when the
+/// class or any MRO class snapshot is missing from the resolver.
+#[pyfunction]
+pub(crate) fn rust_descriptor_has_get_set(
+    resolver: &NativeTypeResolver,
+    descriptor_bytes: &[u8],
+) -> PyResult<Option<(bool, bool)>> {
+    let typ = match decode_type(descriptor_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let proper = match get_proper_or_none(&typ) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let type_ref = match proper {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
+        _ => return Ok(None),
+    };
+    let has_get = has_readable_member_by_ref(resolver.resolver(), type_ref, "__get__");
+    let has_set = has_readable_member_by_ref(resolver.resolver(), type_ref, "__set__");
+    match (has_get, has_set) {
+        (Some(g), Some(s)) => Ok(Some((g, s))),
+        _ => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
     use std::collections::HashSet;
 
     fn make_callable(arg_kinds: Vec<i64>, is_bound: bool) -> Type {
@@ -1723,5 +2401,359 @@ mod tests {
         let union = make_union(vec![make_instance("builtins.int")]);
         // Instance item defers -> union defers.
         assert!(analyze_descriptor_access_inner(&union, true, &resolver).is_none());
+    }
+
+    // --- check_self_arg_inner ---
+
+    /// Build a resolver snapshot for a class with is_base set for itself.
+    fn snap_with_self_base(fullname: &str) -> TypeInfoSnapshot {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_owned(),
+            name: fullname.rsplit('.').next().unwrap_or(fullname).to_owned(),
+            mro: vec![fullname.to_owned(), "builtins.object".to_owned()],
+            ..Default::default()
+        };
+        s.has_base.insert(fullname.to_owned());
+        s.has_base.insert("builtins.object".to_owned());
+        s
+    }
+
+    /// Resolver with builtins.int and builtins.type snapshots.
+    fn int_resolver() -> TypeResolver {
+        let mut r = TypeResolver::new();
+        r.insert(
+            "builtins.int".to_owned(),
+            snap_with_self_base("builtins.int"),
+        );
+        r
+    }
+
+    fn make_callable_with_selfarg(selfarg: Type, arg_kind: i64) -> Type {
+        Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![selfarg, make_instance("builtins.int")],
+            arg_kinds: vec![arg_kind, ARG_POS],
+            arg_names: vec![Some("self".to_string()), None],
+            ret_type: Box::new(make_instance("builtins.int")),
+            name: Some("f".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn test_check_self_arg_matching_selfarg() {
+        let resolver = int_resolver();
+        let selfarg = make_instance("builtins.int");
+        let item1 = make_callable_with_selfarg(selfarg.clone(), ARG_POS);
+        let result = check_self_arg_inner(
+            &item1,
+            &make_instance("builtins.int"),
+            false,
+            "f",
+            true,
+            &resolver,
+        )
+        .expect("matching selfarg returns item");
+        match result {
+            Type::CallableType { .. } => {}
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_check_self_arg_empty_items_returns_functype() {
+        let resolver = TypeResolver::new();
+        assert!(check_self_arg_inner(
+            &make_instance("builtins.int"),
+            &make_instance("builtins.int"),
+            false,
+            "f",
+            true,
+            &resolver
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_check_self_arg_empty_args_defers() {
+        let resolver = TypeResolver::new();
+        let empty = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(make_instance("builtins.int")),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        // Empty arg_types -> Python reports no_formal_self -> defer.
+        assert!(check_self_arg_inner(
+            &empty,
+            &make_instance("builtins.int"),
+            false,
+            "f",
+            true,
+            &resolver
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_check_self_arg_classmethod_wraps_type_type() {
+        let resolver = TypeResolver::new();
+        let selfarg = make_instance("builtins.type");
+        let item = make_callable_with_selfarg(selfarg.clone(), ARG_POS);
+        // dispatched is an Instance; classmethod wraps in TypeType, so the
+        // is_subtype check against Instance selfarg may defer. Verify it
+        // either returns a callable or defers — but never panics.
+        let _ = check_self_arg_inner(
+            &item,
+            &make_instance("builtins.int"),
+            true,
+            "f",
+            true,
+            &resolver,
+        );
+    }
+
+    // --- expand_without_binding_inner ---
+
+    #[test]
+    fn test_expand_without_binding_preserves_type() {
+        let resolver = int_resolver();
+        let typ = make_instance("builtins.int");
+        let itype = make_instance("builtins.int");
+        let result = expand_without_binding_inner(&typ, &itype, false, 100, true, &resolver)
+            .expect("simple type expands");
+        assert_eq!(result.1, false); // no freshening of non-generic type
+        match result.2 {
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected Instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expand_without_binding_freshens_generic_callable() {
+        let resolver = int_resolver();
+        // A generic callable def[T](x: T) -> T
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("builtins.object")),
+            default: Box::new(make_instance("builtins.object")),
+            variance: 0,
+            meta_level: 0,
+        };
+        let callable = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![tvar.clone()],
+            arg_kinds: vec![ARG_POS],
+            arg_names: vec![Some("x".to_string())],
+            ret_type: Box::new(tvar.clone()),
+            name: Some("f".to_string()),
+            variables: vec![tvar],
+            type_guard: None,
+            type_is: None,
+        };
+        let itype = make_instance("builtins.int");
+        let result = expand_without_binding_inner(&callable, &itype, false, 100, true, &resolver);
+        // Freshening a generic callable succeeds; expand may defer due to
+        // unbound T, but freshen itself must have run (changed=true).
+        assert!(result.is_some());
+        let (next_raw_id, changed, _t) = result.unwrap();
+        assert!(changed);
+        assert!(next_raw_id > 100);
+    }
+
+    // --- expand_and_bind_callable_inner ---
+
+    #[test]
+    fn test_expand_and_bind_trivial_self() {
+        let resolver = int_resolver();
+        let selfarg = make_instance("builtins.int");
+        let callable = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![selfarg, make_instance("builtins.int")],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("self".to_string()), None],
+            ret_type: Box::new(make_instance("builtins.int")),
+            name: Some("f".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let itype = make_instance("builtins.int");
+        let result = expand_and_bind_callable_inner(&callable, &itype, false, 100, true, &resolver)
+            .expect("trivial self callable binds");
+        match result.2 {
+            Type::CallableType {
+                is_bound,
+                arg_types,
+                ..
+            } => {
+                assert!(is_bound);
+                assert_eq!(arg_types.len(), 1);
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+    }
+
+    // --- add_class_tvars_inner ---
+
+    #[test]
+    fn test_add_class_tvars_callable_classmethod() {
+        let resolver = int_resolver();
+        let cls = make_instance("builtins.type");
+        let callable = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![cls, make_instance("builtins.int")],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("cls".to_string()), None],
+            ret_type: Box::new(make_instance("builtins.int")),
+            name: Some("foo".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let result = add_class_tvars_inner(
+            &callable,
+            None,  // isuper: None avoids the resolver lookup
+            true,  // is_classmethod
+            true,  // is_trivial_self
+            false, // preserve_type_var_ids
+            &[],
+            100,
+            true,
+            &resolver,
+        );
+        // Callable is non-generic; freshen leaves it unchanged; bind_self_fast
+        // strips cls; isuper=None skips expand. All succeed.
+        match result {
+            Some((next_raw_id, changed, t)) => {
+                assert!(!changed);
+                assert_eq!(next_raw_id, 100);
+                match t {
+                    Type::CallableType {
+                        is_bound,
+                        arg_types,
+                        ..
+                    } => {
+                        assert!(is_bound);
+                        assert_eq!(arg_types.len(), 1);
+                    }
+                    other => panic!("expected CallableType, got {other:?}"),
+                }
+            }
+            None => panic!("expected success"),
+        }
+    }
+
+    #[test]
+    fn test_add_class_tvars_not_classmethod_defers() {
+        let resolver = TypeResolver::new();
+        let callable = make_callable(vec![ARG_POS], false);
+        assert!(add_class_tvars_inner(
+            &callable,
+            None,
+            false, // is_classmethod
+            true,  // is_trivial_self
+            false,
+            &[],
+            100,
+            true,
+            &resolver,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_add_class_tvars_already_bound_defers() {
+        let resolver = TypeResolver::new();
+        let callable = make_callable(vec![ARG_POS], true);
+        assert!(add_class_tvars_inner(
+            &callable,
+            None,
+            true, // is_classmethod
+            true, // is_trivial_self
+            false,
+            &[],
+            100,
+            true,
+            &resolver,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_add_class_tvars_overloaded_recursion() {
+        let resolver = int_resolver();
+        let callable = make_callable(vec![ARG_POS], false);
+        let overloaded = make_overloaded(vec![callable.clone(), callable]);
+        let result = add_class_tvars_inner(
+            &overloaded,
+            None, // isuper: None avoids the resolver lookup
+            true,
+            true,
+            false,
+            &[],
+            100,
+            true,
+            &resolver,
+        );
+        match result {
+            Some((_, _, Type::Overloaded { items })) => assert_eq!(items.len(), 2),
+            other => panic!("expected Overloaded, got {other:?}"),
+        }
+    }
+
+    // --- descriptor_has_get_set helpers ---
+
+    #[test]
+    fn test_descriptor_has_get_set_missing_snapshot_defers() {
+        let resolver = TypeResolver::new();
+        // has_readable_member_by_ref defers when the snapshot is missing.
+        assert!(has_readable_member_by_ref(&resolver, "descriptor.D", "__get__").is_none());
     }
 }

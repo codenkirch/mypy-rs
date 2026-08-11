@@ -102,7 +102,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// Construct the `AnyType(special_form)` replacement that Python's
 /// `erase_typevars` uses when `ids_to_erase` is None or matches.
 /// `TypeOfAny.special_form` == 12 in the wire format (types.py enum).
-fn make_any() -> Type {
+pub(crate) fn make_any() -> Type {
     Type::AnyType {
         type_of_any: 12,
         source_any: None,
