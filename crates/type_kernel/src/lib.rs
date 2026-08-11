@@ -1189,6 +1189,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_tuple_length, module)?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_union_length, module)?)?;
+    // Issue #487: CallableType/Parameters arg-query helpers.
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_formal_arguments,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_argument_by_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        types_impl::rust_callable_argument_by_position,
+        module
+    )?)?;
     // Issue #477: checker narrowing + type-validation pure helpers.
     module.add_function(wrap_pyfunction!(
         checker_helpers::rust_custom_special_method,

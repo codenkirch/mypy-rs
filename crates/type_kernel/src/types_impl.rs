@@ -25,7 +25,29 @@ use crate::wire::{read_type, ReadBuffer, Type};
 const ARG_POS: i64 = 0;
 const ARG_OPT: i64 = 1;
 const ARG_STAR: i64 = 2;
+const ARG_NAMED: i64 = 3;
 const ARG_STAR2: i64 = 4;
+const ARG_NAMED_OPT: i64 = 5;
+
+// ---------------------------------------------------------------------------
+// ArgKind helper predicates (mirror mypy.nodes.ArgKind methods)
+// ---------------------------------------------------------------------------
+
+fn kind_is_positional(kind: i64) -> bool {
+    kind == ARG_POS || kind == ARG_OPT
+}
+
+fn kind_is_named(kind: i64) -> bool {
+    kind == ARG_NAMED || kind == ARG_NAMED_OPT
+}
+
+fn kind_is_required(kind: i64) -> bool {
+    kind == ARG_POS || kind == ARG_NAMED
+}
+
+fn kind_is_star(kind: i64) -> bool {
+    kind == ARG_STAR || kind == ARG_STAR2
+}
 
 // ---------------------------------------------------------------------------
 // Wire format helper
@@ -333,7 +355,152 @@ fn tuple_length_inner(typ: &Type) -> Option<i64> {
     }
 }
 
-/// `mypy.types.UnionType.length` — number of items.
+// ---------------------------------------------------------------------------
+// CallableType / Parameters arg-query helpers (issue #487)
+// ---------------------------------------------------------------------------
+
+/// Return shape for callable arg queries: `(name, pos, required)`.
+/// The type is looked up by Python from the original callable; Rust
+/// only returns the flat metadata so the wire format stays out of it.
+type ArgRow = (Option<String>, Option<i64>, bool);
+
+/// `mypy.types.CallableType.formal_arguments` — walk arg_types/kinds/names
+/// and collect FormalArgument records, mirroring types.py:2446-2467.
+///
+/// Returns `None` (Python `None`) for a non-CallableType so the caller
+/// falls through. Always succeeds for CallableType (the loop is a
+/// straightforward dict scan).
+#[pyfunction]
+pub(crate) fn rust_callable_formal_arguments(type_bytes: &[u8]) -> PyResult<Option<Vec<ArgRow>>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let Type::CallableType {
+        arg_names,
+        arg_kinds,
+        ..
+    } = &typ
+    else {
+        return Ok(None);
+    };
+    Ok(Some(formal_arguments_inner(arg_names, arg_kinds)))
+}
+
+fn formal_arguments_inner(arg_names: &[Option<String>], arg_kinds: &[i64]) -> Vec<ArgRow> {
+    let mut args = Vec::with_capacity(arg_names.len());
+    let mut done_with_positional = false;
+    for i in 0..arg_names.len() {
+        let kind = arg_kinds[i];
+        if kind_is_named(kind) || kind_is_star(kind) {
+            done_with_positional = true;
+        }
+        let pos = if done_with_positional {
+            None
+        } else {
+            Some(i as i64)
+        };
+        args.push((arg_names[i].clone(), pos, kind_is_required(kind)));
+    }
+    args
+}
+
+/// `mypy.types.CallableType.argument_by_name` — scan by name, mirroring
+/// types.py:2469-2484.
+///
+/// Returns `None` (Python `None`) for a non-CallableType. For
+/// CallableType, returns `(name, pos, required)` or `None` when no match
+/// is found (including deferral to `try_synthesizing_arg_from_kwarg`).
+#[pyfunction]
+pub(crate) fn rust_callable_argument_by_name(
+    type_bytes: &[u8],
+    name: Option<String>,
+) -> PyResult<Option<ArgRow>> {
+    let name = match name {
+        Some(n) => n,
+        None => return Ok(None),
+    };
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let Type::CallableType {
+        arg_names,
+        arg_kinds,
+        ..
+    } = &typ
+    else {
+        return Ok(None);
+    };
+    Ok(argument_by_name_inner(arg_names, arg_kinds, &name))
+}
+
+fn argument_by_name_inner(
+    arg_names: &[Option<String>],
+    arg_kinds: &[i64],
+    name: &str,
+) -> Option<ArgRow> {
+    let mut seen_star = false;
+    for i in 0..arg_names.len() {
+        let kind = arg_kinds[i];
+        if kind_is_named(kind) || kind_is_star(kind) {
+            seen_star = true;
+        }
+        if kind_is_star(kind) {
+            continue;
+        }
+        if arg_names[i] == Some(name.to_string()) {
+            let pos = if seen_star { None } else { Some(i as i64) };
+            return Some((Some(name.to_string()), pos, kind_is_required(kind)));
+        }
+    }
+    // Try synthesizing from kwarg — defers here; Python fills from kw_arg.
+    None
+}
+
+/// `mypy.types.CallableType.argument_by_position` — scan by position, mirroring
+/// types.py:2486-2499.
+///
+/// Returns `None` for a non-CallableType or when position is None.
+#[pyfunction]
+pub(crate) fn rust_callable_argument_by_position(
+    type_bytes: &[u8],
+    position: Option<i64>,
+) -> PyResult<Option<ArgRow>> {
+    let pos = match position {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let Type::CallableType {
+        arg_names,
+        arg_kinds,
+        ..
+    } = &typ
+    else {
+        return Ok(None);
+    };
+    let pos_usize = pos as usize;
+    if pos_usize >= arg_names.len() {
+        // Try synthesizing from vararg — defers here; Python fills from var_arg.
+        return Ok(None);
+    }
+    let name = arg_names[pos_usize].clone();
+    let kind = arg_kinds[pos_usize];
+    if kind_is_positional(kind) {
+        Ok(Some((name, Some(pos), kind == ARG_POS)))
+    } else {
+        // Not purely positional — defer to try_synthesizing from vararg.
+        Ok(None)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TupleType.length / UnionType.length
+// ---------------------------------------------------------------------------
 ///
 /// Mirrors `UnionType.length` (types.py:3511-3512).
 #[pyfunction]
