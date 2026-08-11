@@ -1173,6 +1173,48 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
         function is roughly a mirror of join_tuples() w.r.t. to the fact that fixed
         tuples are subtypes of variadic ones but not vice versa.
         """
+        # Stage 4 (M494) type-kernel seam: try the Rust meet_tuples path.
+        # Rust returns None for unhandled cases (defer to Python).
+        if (
+            join._HAS_TYPE_KERNEL
+            and join._native_join_active
+            and join._native_join_resolver is not None
+        ):
+            try:
+                result = join._type_kernel.rust_meet_tuples(
+                    join._serialize_type(s),
+                    join._serialize_type(t),
+                    state.strict_optional,
+                    join._native_join_resolver,
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                fixed_items: list[Type] | None = None
+                try:
+                    from mypy.types import read_type_list
+                    from mypy.wirefixup import fixup_wire_type
+
+                    decoded = read_type_list(join._ReadBuffer(bytes(result)))
+                    # Rust re-serializes each met item as a wire Type
+                    # carrying only a type_ref string; decode to live
+                    # TypeInfo via the join_tuples fixup idiom. A missing
+                    # ref (or an unset typeinfo map) returns None -> defer
+                    # to Python rather than wiring a FakeInfo into the
+                    # type graph.
+                    acc: list[Type] = []
+                    for item in decoded:
+                        fixed = fixup_wire_type(item)
+                        if fixed is None:
+                            break
+                        acc.append(fixed)
+                    else:
+                        fixed_items = acc
+                except Exception:
+                    pass
+                if fixed_items is not None:
+                    return fixed_items
+
         s_unpack_index = find_unpack_in_list(s.items)
         t_unpack_index = find_unpack_in_list(t.items)
         if s_unpack_index is None and t_unpack_index is None:

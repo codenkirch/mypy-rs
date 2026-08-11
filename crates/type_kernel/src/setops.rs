@@ -3418,6 +3418,632 @@ pub(crate) fn rust_meet_types(
     meet_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
+/// `#[pyfunction]` entry for `join_tuples` (join.py:680-785).
+///
+/// Joins two wire-format `TupleType` values, handling variadic entries
+/// (`UnpackType`) via prefix/join-middle/suffix logic. Returns encoded
+/// bytes of the joined item list, or `None` (Python fallback).
+///
+/// Matches the Python algorithm exactly:
+///   * Both fixed-length, equal length → item-wise join, return items.
+///   * Both variadic, perfectly aligned → join prefix, join middle
+///     (the unpacked inner types), join suffix, return items.
+///   * Both variadic, one purely variadic (length 1) → join the inner
+///     args, return single `UnpackType`.
+///   * One variadic, one fixed → join prefix items, join middle against
+///     unpacked arg, return `UnpackType` + suffix.
+///
+/// Returns `None` (Python fallback) for:
+///   * Unequal fixed lengths.
+///   * Both variadic with misaligned structure.
+///   * Non-Instance unpack types.
+///   * Fixed length < variadic length - 1.
+///   * Any item that produces a type Rust cannot serialize (defer).
+#[pyfunction]
+pub(crate) fn rust_join_tuples(
+    s_bytes: &[u8],
+    t_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let s = decode_type(s_bytes)?;
+    let t = decode_type(t_bytes)?;
+    let (Type::TupleType { items: s_items, .. }, Type::TupleType { items: t_items, .. }) = (&s, &t)
+    else {
+        return None;
+    };
+    let result = join_tuples_inner(s_items, t_items, strict_optional, resolver.resolver())?;
+    encode_items(&result)
+}
+
+/// `#[pyfunction]` entry for `meet_tuples` (meet.py:1167-1243).
+///
+/// Meets two wire-format `TupleType` values, handling variadic entries
+/// (`UnpackType`) via prefix/meet-middle/suffix logic. Returns encoded
+/// bytes of the met item list, or `None` (Python fallback).
+///
+/// Matches the Python algorithm exactly:
+///   * Both fixed-length, equal length → item-wise meet, return items.
+///   * Both variadic, perfectly aligned → meet prefix items, meet middle
+///     (the unpacked inner types via `meet_types`), meet suffix items.
+///   * One variadic, one fixed → meet prefix items, meet middle items
+///     against unpacked arg, meet suffix items.
+///
+/// Returns `None` (Python fallback) for:
+///   * Unequal fixed lengths.
+///   * Both variadic with misaligned structure.
+///   * Non-Instance unpack types.
+///   * Fixed length < variadic length - 1.
+///   * Any item that produces a type Rust cannot serialize (defer).
+#[pyfunction]
+pub(crate) fn rust_meet_tuples(
+    s_bytes: &[u8],
+    t_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let s = decode_type(s_bytes)?;
+    let t = decode_type(t_bytes)?;
+    let (Type::TupleType { items: s_items, .. }, Type::TupleType { items: t_items, .. }) = (&s, &t)
+    else {
+        return None;
+    };
+    let result = meet_tuples_inner(s_items, t_items, strict_optional, resolver.resolver())?;
+    encode_items(&result)
+}
+
+/// Inner join_tuples logic on wire-format items.
+fn join_tuples_inner(
+    s_items: &[Type],
+    t_items: &[Type],
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let s_unpack_idx = find_unpack(s_items);
+    let t_unpack_idx = find_unpack(t_items);
+
+    match (s_unpack_idx, t_unpack_idx) {
+        (None, None) => {
+            // Both fixed-length.
+            if s_items.len() == t_items.len() {
+                let mut items = Vec::with_capacity(s_items.len());
+                for (si, ti) in s_items.iter().zip(t_items.iter()) {
+                    items.push(rust_join_types_inner(si, ti, strict_optional, resolver)?);
+                }
+                Some(items)
+            } else {
+                // Unequal fixed lengths → defer.
+                None
+            }
+        }
+        (Some(si), Some(ti)) => {
+            // Both variadic.
+            join_both_variadic(s_items, t_items, si, ti, strict_optional, resolver)
+        }
+        (Some(si), None) => {
+            // s is variadic, t is fixed.
+            join_one_variadic(s_items, t_items, si, true, strict_optional, resolver)
+        }
+        (None, Some(ti)) => {
+            // t is variadic, s is fixed.
+            join_one_variadic(t_items, s_items, ti, false, strict_optional, resolver)
+        }
+    }
+}
+
+/// Join both-tuples-variadic case.
+fn join_both_variadic(
+    s_items: &[Type],
+    t_items: &[Type],
+    s_unpack_idx: usize,
+    t_unpack_idx: usize,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let s_unpack = get_unpack_type(s_items.get(s_unpack_idx)?);
+    let t_unpack = get_unpack_type(t_items.get(t_unpack_idx)?);
+
+    let Type::Instance {
+        type_ref: _s_type_ref,
+        args: s_args,
+        ..
+    } = s_unpack
+    else {
+        return None;
+    };
+    let Type::Instance {
+        type_ref: _t_type_ref,
+        args: t_args,
+        ..
+    } = t_unpack
+    else {
+        return None;
+    };
+
+    // Case: perfect alignment (same unpack position and same total length).
+    if s_items.len() == t_items.len() && s_unpack_idx == t_unpack_idx {
+        let prefix_len = s_unpack_idx;
+        let suffix_len = s_items.len() - s_unpack_idx - 1;
+        let mut items = Vec::with_capacity(s_items.len());
+
+        // Join prefix items.
+        for (si, ti) in s_items
+            .iter()
+            .take(prefix_len)
+            .zip(t_items.iter().take(prefix_len))
+        {
+            items.push(rust_join_types_inner(si, ti, strict_optional, resolver)?);
+        }
+
+        // Join the unpacked inner types (the args[0] of each `tuple[T, ...]`).
+        let Type::Instance { args: s_inner, .. } = s_unpack else {
+            return None;
+        };
+        let Type::Instance { args: t_inner, .. } = t_unpack else {
+            return None;
+        };
+        let joined_inner = rust_join_types_inner(
+            s_inner.first()?,
+            t_inner.first()?,
+            strict_optional,
+            resolver,
+        )?;
+
+        // Build the resulting UnpackType — matches Python join.py:713-731.
+        // joined_inner is already a full Type (e.g., TypeVarTupleType, Instance(tuple), etc.);
+        // pass it through directly rather than destructuring partial fields.
+        items.push(Type::UnpackType {
+            typ: Box::new(joined_inner),
+        });
+
+        // Join suffix items.
+        if suffix_len > 0 {
+            let s_suffix_start = s_items.len() - suffix_len;
+            let t_suffix_start = t_items.len() - suffix_len;
+            for i in 0..suffix_len {
+                items.push(rust_join_types_inner(
+                    &s_items[s_suffix_start + i],
+                    &t_items[t_suffix_start + i],
+                    strict_optional,
+                    resolver,
+                )?);
+            }
+        }
+        return Some(items);
+    }
+
+    // Case: one tuple is purely variadic (length 1).
+    if s_items.len() == 1 || t_items.len() == 1 {
+        // Both must be Instance for the inner join to work.
+        let s_inner = s_args.first()?;
+        let t_inner = t_args.first()?;
+        let mid_joined = rust_join_types_inner(s_inner, t_inner, strict_optional, resolver)?;
+
+        // Collect "other" items (the non-unpack items from each).
+        let s_other: Vec<&Type> = s_items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != s_unpack_idx)
+            .map(|(_, t)| t)
+            .collect();
+        let t_other: Vec<&Type> = t_items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != t_unpack_idx)
+            .map(|(_, t)| t)
+            .collect();
+
+        // Join all "other" items into one, then join with mid_joined.
+        let other_joined = if s_other.is_empty() && t_other.is_empty() {
+            // Nothing else to join; use mid_joined as-is.
+            mid_joined.clone()
+        } else {
+            let mut all_others = Vec::new();
+            all_others.extend(s_other);
+            all_others.extend(t_other);
+            let mut acc = mid_joined.clone();
+            for o in all_others {
+                acc = rust_join_types_inner(&acc, o, strict_optional, resolver)?;
+            }
+            acc
+        };
+
+        // Produce single UnpackType(builtins.tuple[other_joined]).
+        let tuple_inst = Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![other_joined],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        return Some(vec![Type::UnpackType {
+            typ: Box::new(tuple_inst),
+        }]);
+    }
+
+    // TODO: other cases (both prefix/suffix shorter).
+    None
+}
+
+/// Join one variadic + one fixed tuple.
+fn join_one_variadic(
+    variadic_items: &[Type],
+    fixed_items: &[Type],
+    unpack_idx: usize,
+    // Whether variadic is `s` (true) or `t` (false).
+    // Not used in pure-join logic since join is commutative,
+    // but kept for clarity.
+    _variadic_is_s: bool,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let unpack = get_unpack_type(variadic_items.get(unpack_idx)?);
+    let Type::Instance { type_ref, args, .. } = unpack else {
+        return None;
+    };
+    // Must be builtins.tuple.
+    if type_ref != "builtins.tuple" {
+        return None;
+    }
+
+    let variadic_len = variadic_items.len();
+    if fixed_items.len() < variadic_len - 1 {
+        // Not enough fixed items to cover prefix + suffix.
+        return None;
+    }
+
+    let prefix_len = unpack_idx;
+    let suffix_len = variadic_len - prefix_len - 1;
+
+    // Split fixed items into prefix / middle / suffix.
+    let (prefix, middle, suffix) = {
+        let n = fixed_items.len();
+        if prefix_len.saturating_add(suffix_len) >= n {
+            (fixed_items.to_vec(), Vec::new(), Vec::new())
+        } else {
+            let mid_end = n.saturating_sub(suffix_len);
+            (
+                fixed_items[..prefix_len].to_vec(),
+                fixed_items[prefix_len..mid_end].to_vec(),
+                fixed_items[mid_end..].to_vec(),
+            )
+        }
+    };
+
+    let mut items = Vec::new();
+
+    // Join prefix items.
+    for (fi, vi) in prefix.iter().zip(variadic_items.iter().take(prefix_len)) {
+        items.push(rust_join_types_inner(fi, vi, strict_optional, resolver)?);
+    }
+
+    // Join middle items with unpacked inner type.
+    let unpacked_inner = args.first()?;
+    let mid_joined = if middle.is_empty() {
+        unpacked_inner.clone()
+    } else {
+        let mut acc = middle.first()?.clone();
+        for m in middle.iter().skip(1) {
+            acc = rust_join_types_inner(&acc, m, strict_optional, resolver)?;
+        }
+        rust_join_types_inner(&acc, unpacked_inner, strict_optional, resolver)?
+    };
+
+    items.push(Type::UnpackType {
+        typ: Box::new(Type::Instance {
+            type_ref: "builtins.tuple".to_string(),
+            args: vec![mid_joined],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+    });
+
+    // Join suffix items.
+    if suffix_len > 0 {
+        let var_start = variadic_len - suffix_len;
+        for (fi, vi) in suffix.iter().zip(variadic_items.iter().skip(var_start)) {
+            items.push(rust_join_types_inner(fi, vi, strict_optional, resolver)?);
+        }
+    }
+
+    Some(items)
+}
+
+/// Inner meet_tuples logic on wire-format items.
+fn meet_tuples_inner(
+    s_items: &[Type],
+    t_items: &[Type],
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let s_unpack_idx = find_unpack(s_items);
+    let t_unpack_idx = find_unpack(t_items);
+
+    match (s_unpack_idx, t_unpack_idx) {
+        (None, None) => {
+            if s_items.len() == t_items.len() {
+                let mut items = Vec::with_capacity(s_items.len());
+                for (si, ti) in s_items.iter().zip(t_items.iter()) {
+                    items.push(rust_meet_types_inner(si, ti, strict_optional, resolver)?);
+                }
+                Some(items)
+            } else {
+                None
+            }
+        }
+        (Some(si), Some(ti)) => {
+            // Both variadic — only handle perfectly-aligned case.
+            if s_items.len() == t_items.len() && si == ti {
+                meet_both_variadic(s_items, t_items, si, strict_optional, resolver)
+            } else {
+                None
+            }
+        }
+        (Some(si), None) => {
+            // s variadic, t fixed.
+            meet_one_variadic(s_items, t_items, si, strict_optional, resolver)
+        }
+        (None, Some(ti)) => {
+            // t variadic, s fixed.
+            meet_one_variadic(t_items, s_items, ti, strict_optional, resolver)
+        }
+    }
+}
+
+/// Meet both variadic — only the perfectly-aligned case.
+fn meet_both_variadic(
+    s_items: &[Type],
+    t_items: &[Type],
+    unpack_idx: usize,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let s_unpack = get_unpack_type(s_items.get(unpack_idx)?);
+    let t_unpack = get_unpack_type(t_items.get(unpack_idx)?);
+
+    if !is_instance_tuple(s_unpack) || !is_instance_tuple(t_unpack) {
+        return None;
+    }
+
+    // Destructure the Instance types to access fields.
+    let Type::Instance {
+        type_ref: s_type_ref,
+        args: s_args,
+        last_known_value: s_lkv,
+        extra_attrs: s_ea,
+    } = s_unpack
+    else {
+        return None;
+    };
+    let Type::Instance {
+        type_ref: t_type_ref,
+        args: t_args,
+        last_known_value: t_lkv,
+        extra_attrs: t_ea,
+    } = t_unpack
+    else {
+        return None;
+    };
+
+    let _s_inner = s_args.first()?;
+    let _t_inner = t_args.first()?;
+
+    // Meet the two Instance(tuple) types themselves.
+    let meet_inner = rust_meet_types_inner(
+        &Type::Instance {
+            type_ref: s_type_ref.clone(),
+            args: s_args.clone(),
+            last_known_value: s_lkv.clone(),
+            extra_attrs: s_ea.clone(),
+        },
+        &Type::Instance {
+            type_ref: t_type_ref.clone(),
+            args: t_args.clone(),
+            last_known_value: t_lkv.clone(),
+            extra_attrs: t_ea.clone(),
+        },
+        strict_optional,
+        resolver,
+    );
+
+    let Some(Type::Instance {
+        type_ref,
+        args,
+        last_known_value,
+        extra_attrs,
+    }) = meet_inner
+    else {
+        return None;
+    };
+
+    let mut items = Vec::with_capacity(s_items.len());
+
+    // Meet prefix items.
+    for (si, ti) in s_items
+        .iter()
+        .take(unpack_idx)
+        .zip(t_items.iter().take(unpack_idx))
+    {
+        items.push(rust_meet_types_inner(si, ti, strict_optional, resolver)?);
+    }
+
+    // Push the single UnpackType(meet).
+    items.push(Type::UnpackType {
+        typ: Box::new(Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        }),
+    });
+
+    // Meet suffix items.
+    let s_start = unpack_idx + 1;
+    let t_start = unpack_idx + 1;
+    for (si, ti) in s_items
+        .iter()
+        .skip(s_start)
+        .zip(t_items.iter().skip(t_start))
+    {
+        items.push(rust_meet_types_inner(si, ti, strict_optional, resolver)?);
+    }
+
+    Some(items)
+}
+
+/// Meet one variadic + one fixed tuple.
+fn meet_one_variadic(
+    variadic_items: &[Type],
+    fixed_items: &[Type],
+    unpack_idx: usize,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Vec<Type>> {
+    let unpack = get_unpack_type(variadic_items.get(unpack_idx)?);
+    if !is_instance_tuple(unpack) {
+        return None;
+    }
+
+    let variadic_len = variadic_items.len();
+    if fixed_items.len() < variadic_len - 1 {
+        return None;
+    }
+
+    let prefix_len = unpack_idx;
+    let suffix_len = variadic_len - prefix_len - 1;
+    let (prefix, middle, suffix) = {
+        let n = fixed_items.len();
+        if prefix_len.saturating_add(suffix_len) >= n {
+            (fixed_items.to_vec(), Vec::new(), Vec::new())
+        } else {
+            let mid_end = n.saturating_sub(suffix_len);
+            (
+                fixed_items[..prefix_len].to_vec(),
+                fixed_items[prefix_len..mid_end].to_vec(),
+                fixed_items[mid_end..].to_vec(),
+            )
+        }
+    };
+
+    let mut items = Vec::new();
+
+    // Meet prefix items.
+    for (fi, vi) in prefix.iter().zip(variadic_items.iter().take(prefix_len)) {
+        items.push(rust_meet_types_inner(fi, vi, strict_optional, resolver)?);
+    }
+
+    // Meet middle items with unpacked inner type.
+    let Type::Instance {
+        args: unpacked_args,
+        ..
+    } = unpack
+    else {
+        return None;
+    };
+    let unpacked_inner = unpacked_args.first()?;
+    for mi in &middle {
+        items.push(rust_meet_types_inner(
+            mi,
+            unpacked_inner,
+            strict_optional,
+            resolver,
+        )?);
+    }
+
+    // Meet suffix items.
+    if suffix_len > 0 {
+        let var_start = variadic_len - suffix_len;
+        for (fi, vi) in suffix.iter().zip(variadic_items.iter().skip(var_start)) {
+            items.push(rust_meet_types_inner(fi, vi, strict_optional, resolver)?);
+        }
+    }
+
+    Some(items)
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format helpers for TupleType items
+// ---------------------------------------------------------------------------
+
+/// Find the index of an `UnpackType` in a type list, or `None`.
+fn find_unpack(items: &[Type]) -> Option<usize> {
+    items
+        .iter()
+        .position(|t| matches!(t, Type::UnpackType { .. }))
+}
+
+/// Extract the inner type of an `UnpackType`.
+fn get_unpack_type(unpack: &Type) -> &Type {
+    match unpack {
+        Type::UnpackType { typ } => typ.as_ref(),
+        _ => unreachable!(),
+    }
+}
+
+/// Check whether a `Type` is `Instance(builtins.tuple, ...)`.
+fn is_instance_tuple(t: &Type) -> bool {
+    matches!(
+        t,
+        Type::Instance {
+            type_ref,
+            ..
+        } if type_ref == "builtins.tuple"
+    )
+}
+
+/// Encode a list of `Type`s into wire-format bytes (LIST_GEN + size + items + END_TAG).
+fn encode_items(items: &[Type]) -> Option<Vec<u8>> {
+    let mut buf = WriteBuffer::new();
+    wire::write_tag(&mut buf, wire::LIST_GEN);
+    if items.is_empty() {
+        wire::write_int_bare(&mut buf, 0).ok()?;
+    } else {
+        wire::write_int_bare(&mut buf, items.len() as i64).ok()?;
+    }
+    for item in items {
+        wire::write_type(&mut buf, item).ok()?;
+    }
+    wire::write_tag(&mut buf, 255u8);
+    Some(buf.into_bytes())
+}
+
+/// Inner join_types dispatcher — returns `None` (defer) when Rust
+/// doesn't handle the case, `Some(Type)` when it does.
+fn rust_join_types_inner(
+    s: &Type,
+    t: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    match join_types(
+        s,
+        t,
+        &SubtypeContext::new(false, false, false, false, false, strict_optional),
+        resolver,
+    ) {
+        Some(r) => setop_result_to_type(Some(r), s, t),
+        None => None,
+    }
+}
+
+/// Inner meet_types dispatcher — returns `None` (defer) when Rust
+/// doesn't handle the case, `Some(Type)` when it does.
+fn rust_meet_types_inner(
+    s: &Type,
+    t: &Type,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    match meet_types(
+        s,
+        t,
+        &SubtypeContext::new(false, false, false, false, false, strict_optional),
+        resolver,
+    ) {
+        Some(r) => setop_result_to_type(Some(r), s, t),
+        None => None,
+    }
+}
+
 /// Map `SetOpResult` to the Python-side
 /// `(disc, fullname, arg_discs, encoded)` 4-tuple. `disc` is 0=SameS,
 /// 1=SameT, 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname set,
