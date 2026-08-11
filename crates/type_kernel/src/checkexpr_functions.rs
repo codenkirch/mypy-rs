@@ -1752,6 +1752,421 @@ fn any_type(type_of_any: i64, source_any: Option<Box<Type>>) -> Type {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Issue #486: tuple-index / tuple-slice helpers (visit_tuple_index_helper,
+// visit_tuple_slice_helper, try_getting_int_literals)
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.try_getting_int_literals` — extract int literal values
+/// from a serialized type blob.
+///
+/// Mirrors the type-level part of `try_getting_int_literals`
+/// (checkexpr.py:5799-5835): given a `Type` that is `Literal[int]` or a
+/// `UnionType` of `Literal[int]`, returns the list of `int` values.
+/// Returns `None` (defer) for non-matching types.
+///
+/// The Python side resolves AST expressions (`IntExpr`, `UnaryExpr`) to
+/// types before calling this; Rust operates purely on the wire format.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_try_getting_int_literals(type_bytes: &[u8]) -> PyResult<Option<Vec<i64>>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(try_getting_int_literals_inner(&typ))
+}
+
+fn try_getting_int_literals_inner(typ: &Type) -> Option<Vec<i64>> {
+    match typ {
+        Type::LiteralType {
+            value: LiteralValue::Int(n),
+            ..
+        } => Some(vec![*n]),
+        Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } => try_getting_int_literals_inner(lkv),
+        Type::UnionType { items, .. } => {
+            let mut out = Vec::new();
+            for item in items {
+                out.extend(try_getting_int_literals_inner(item)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// `mypy.checkexpr.visit_tuple_index_helper` — resolve `tuple[n]` to the
+/// element type at position `n`.
+///
+/// Mirrors `visit_tuple_index_helper` (checkexpr.py:5719-5765). Returns
+/// `None` when:
+///   * The index is out of range for a fixed tuple.
+///   * The index exceeds the variadic length bound.
+///   * Any type class in the tuple items is unsupported (TypeAliasType).
+///
+/// `items_bytes`: serialized `TupleType.items` (flattened list).
+/// `partial_fallback_bytes`: serialized `TupleType.partial_fallback`.
+/// `n`: the integer index (may be negative).
+/// `line`, `column`: line/column for UnionType construction (passed through).
+/// `min_length`: pre-computed `min_tuple_length` to avoid recomputation.
+///
+/// Returns `Some(encoded_result_type)` or `None` to defer.
+#[pyfunction]
+#[pyo3(signature = (items_bytes, partial_fallback_bytes, n, line, column, min_length))]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(crate) fn rust_visit_tuple_index_helper(
+    items_bytes: Vec<Vec<u8>>,
+    partial_fallback_bytes: Vec<u8>,
+    n: i64,
+    line: i64,
+    column: i64,
+    min_length: i64,
+) -> PyResult<Option<Vec<u8>>> {
+    let original_len = items_bytes.len();
+    let items: Vec<Type> = items_bytes
+        .into_iter()
+        .filter_map(|b| decode_type(&b))
+        .collect();
+    if items.len() != original_len {
+        return Ok(None);
+    }
+    let partial_fallback = match decode_type(&partial_fallback_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    Ok(visit_tuple_index_helper_inner(
+        &items,
+        &partial_fallback,
+        n,
+        line,
+        column,
+        min_length,
+    ))
+}
+
+fn visit_tuple_index_helper_inner(
+    items: &[Type],
+    _partial_fallback: &Type,
+    n: i64,
+    _line: i64,
+    _column: i64,
+    min_length: i64,
+) -> Option<Vec<u8>> {
+    let unpack_index = find_unpack_in_list_inner(items);
+    if unpack_index.is_none() {
+        // Fixed tuple path
+        let mut idx = n;
+        if idx < 0 {
+            idx += items.len() as i64;
+        }
+        if 0 <= idx && idx < items.len() as i64 {
+            return encode_type(&items[idx as usize]);
+        }
+        return None;
+    }
+
+    let unpack_index = unpack_index.unwrap();
+    let unpack = &items[unpack_index];
+    let Type::UnpackType { typ } = unpack else {
+        return None;
+    };
+    let unpacked = get_proper_or_none(typ.as_ref())?;
+
+    // Extract `middle` from the unpacked type.
+    let middle = match unpacked {
+        Type::TypeVarTupleType { upper_bound, .. } => {
+            let bound = get_proper_or_none(upper_bound)?;
+            match bound {
+                Type::Instance { type_ref, args, .. }
+                    if type_ref == "builtins.tuple" && !args.is_empty() =>
+                {
+                    &args[0]
+                }
+                _ => return None,
+            }
+        }
+        Type::Instance { type_ref, args, .. }
+            if type_ref == "builtins.tuple" && !args.is_empty() =>
+        {
+            &args[0]
+        }
+        _ => return None,
+    };
+
+    let extra_items = min_length - items.len() as i64 + 1;
+    if n >= 0 {
+        if n >= min_length {
+            return None;
+        }
+        if n < unpack_index as i64 {
+            return encode_type(&items[n as usize]);
+        }
+        // UnionType: [middle] + items[unpack_index+1 .. max(n-extra_items+2, unpack_index+1)]
+        let end = std::cmp::max(n - extra_items + 2, unpack_index as i64 + 1);
+        let mut union_items = vec![middle.clone()];
+        for idx in (unpack_index + 1)..end as usize {
+            if idx < items.len() {
+                union_items.push(items[idx].clone());
+            }
+        }
+        let result = Type::UnionType {
+            items: union_items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        encode_type(&result)
+    } else {
+        let adjusted = n + min_length;
+        if adjusted < 0 {
+            return None;
+        }
+        if adjusted >= unpack_index as i64 + extra_items {
+            let real_idx = (adjusted - extra_items + 1) as usize;
+            if real_idx < items.len() {
+                return encode_type(&items[real_idx]);
+            }
+            return None;
+        }
+        let end_idx = std::cmp::min(adjusted as usize, unpack_index);
+        let mut prefix: Vec<Type> = items[..end_idx].to_vec();
+        prefix.push(middle.clone());
+        let result = Type::UnionType {
+            items: prefix,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        encode_type(&result)
+    }
+}
+
+/// `mypy.checkexpr.visit_tuple_slice_helper` — resolve `tuple[begin:end:stride]`.
+///
+/// Mirrors `visit_tuple_slice_helper` (checkexpr.py:5767-5797). Returns a
+/// `UnionType` of all slice results (via `itertools.product`).
+///
+/// `items_bytes`: serialized `TupleType.items`.
+/// `partial_fallback_bytes`: serialized `TupleType.partial_fallback`.
+/// `begin`: `Some(n)` or `None` for start.
+/// `end`: `Some(n)` or `None` for stop.
+/// `stride`: `Some(n)` or `None` for step.
+/// `line`, `column`: for UnionType construction.
+///
+/// Returns `Some(encoded_result_type)` or `None` to defer.
+/// `None` indicates the Python side should call `nonliteral_tuple_index_helper`
+/// (this function only handles the literal-slice path).
+#[pyfunction]
+#[pyo3(signature = (items_bytes, partial_fallback_bytes, begin, end, stride, line, column))]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
+pub(crate) fn rust_visit_tuple_slice_helper(
+    items_bytes: Vec<Vec<u8>>,
+    partial_fallback_bytes: Vec<u8>,
+    begin: Option<i64>,
+    end: Option<i64>,
+    stride: Option<i64>,
+    line: i64,
+    column: i64,
+) -> PyResult<Option<Vec<u8>>> {
+    let original_len = items_bytes.len();
+    let items: Vec<Type> = items_bytes
+        .into_iter()
+        .filter_map(|b| decode_type(&b))
+        .collect();
+    if items.len() != original_len {
+        return Ok(None);
+    }
+    let partial_fallback = match decode_type(&partial_fallback_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+
+    Ok(visit_tuple_slice_helper_inner(
+        &items,
+        &partial_fallback,
+        begin,
+        end,
+        stride,
+        line,
+        column,
+    ))
+}
+
+fn visit_tuple_slice_helper_inner(
+    items: &[Type],
+    partial_fallback: &Type,
+    begin: Option<i64>,
+    end: Option<i64>,
+    stride: Option<i64>,
+    _line: i64,
+    _column: i64,
+) -> Option<Vec<u8>> {
+    let begin_vals: Vec<Option<i64>> = begin.map(|v| vec![Some(v)]).unwrap_or_else(|| vec![None]);
+    let end_vals: Vec<Option<i64>> = end.map(|v| vec![Some(v)]).unwrap_or_else(|| vec![None]);
+    let stride_vals: Vec<Option<i64>> = stride.map(|v| vec![Some(v)]).unwrap_or_else(|| vec![None]);
+
+    let mut slice_results: Vec<Type> = Vec::new();
+    for &b in &begin_vals {
+        for &e in &end_vals {
+            for &s in &stride_vals {
+                let slice_type = tuple_slice(items, b, e, s, partial_fallback);
+                match slice_type {
+                    Some(t) => slice_results.push(t),
+                    None => {
+                        // AMBIGUOUS_SLICE_OF_VARIADIC_TUPLE — Python would
+                        // return AnyType. We defer; the Python side handles
+                        // error reporting.
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    if slice_results.is_empty() {
+        return None;
+    }
+    if slice_results.len() == 1 {
+        return encode_type(&slice_results[0]);
+    }
+
+    // make_simplified_union of slice results.
+    // We use the union constructor directly since the Python caller
+    // applies make_simplified_union afterward.
+    let result = Type::UnionType {
+        items: slice_results,
+        uses_pep604_syntax: false,
+        can_be_true: true,
+        can_be_false: true,
+    };
+    encode_type(&result)
+}
+
+/// `TupleType.slice` for the wire format: return the sliced TupleType or None
+/// (for ambiguous variadic slice).
+fn tuple_slice(
+    items: &[Type],
+    begin: Option<i64>,
+    end: Option<i64>,
+    stride: Option<i64>,
+    partial_fallback: &Type,
+) -> Option<Type> {
+    let stride_val = stride.unwrap_or(1);
+    if stride_val == 0 {
+        return None;
+    }
+
+    if let Some(unpack_idx_u) = find_unpack_in_list_inner(items) {
+        // Variadic tuple slicing — complex logic from mypy/types.py:3026-3068
+        let total = items.len() as i64;
+        let unpack_idx = unpack_idx_u as i64;
+
+        let result = if begin.is_none() && end.is_none() {
+            // Special-case: reversing or identity on variadic
+            match (stride_val, stride.is_none()) {
+                (-1, _) => {
+                    let mut rev = items.to_vec();
+                    rev.reverse();
+                    Some(rev)
+                }
+                (_, true) | (1, false) => Some(items.to_vec()),
+                _ => None,
+            }
+        } else {
+            let b = begin.unwrap_or(0);
+            let e = end.unwrap_or(total);
+            let prefix_ok = begin.is_none() || (unpack_idx >= b && b >= 0);
+            let suffix_ok = end.is_none() || (unpack_idx - total < e && e < 0);
+            let start_in_suffix = begin.is_some() && unpack_idx - total < b && b < 0;
+            let start_in_prefix = begin.is_none() || (unpack_idx >= b && b >= 0);
+            let end_in_prefix = end.is_none() || (unpack_idx >= e && e >= 0);
+
+            if prefix_ok && end_in_prefix {
+                // Start and end in prefix
+                Some(slice_items(items, begin, end, stride))
+            } else if start_in_suffix && suffix_ok {
+                // Start and end in suffix
+                Some(slice_items(items, begin, end, stride))
+            } else if start_in_prefix && suffix_ok {
+                // Start in prefix, end in suffix — trivial strides only
+                if stride.is_none() || stride_val == 1 {
+                    Some(slice_items(items, begin, end, stride))
+                } else {
+                    None
+                }
+            } else if start_in_suffix && end_in_prefix {
+                // Start in suffix, end in prefix — only -1 stride
+                if stride.is_none() || stride_val == -1 {
+                    Some(slice_items(items, begin, end, stride))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        Some(Type::TupleType {
+            partial_fallback: Box::new(partial_fallback.clone()),
+            items: result?,
+            implicit: false,
+        })
+    } else {
+        // Fixed tuple — simple slicing
+        let sliced = slice_items(items, begin, end, stride);
+        Some(Type::TupleType {
+            partial_fallback: Box::new(partial_fallback.clone()),
+            items: sliced,
+            implicit: false,
+        })
+    }
+}
+
+/// Slice a type list using begin/end/stride (mirrors Python list slicing).
+fn slice_items(
+    items: &[Type],
+    begin: Option<i64>,
+    end: Option<i64>,
+    stride: Option<i64>,
+) -> Vec<Type> {
+    let n = items.len() as i64;
+    let stride = stride.unwrap_or(1);
+    let b = begin.unwrap_or(if stride > 0 { 0 } else { n - 1 });
+    let e = end.unwrap_or(if stride > 0 { n } else { -n - 1 });
+
+    // Python slice semantics: indices are clamped, and negative indices
+    // count from the end. Both b and e are resolved against n first.
+    let clamp = |i: i64| if i < 0 { (i + n).max(0) } else { i.min(n) };
+    let b = clamp(b);
+    let e = clamp(e);
+
+    if stride == 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    if stride > 0 {
+        let mut i = b;
+        while i < e && i < n {
+            result.push(items[i as usize].clone());
+            i += stride;
+        }
+    } else {
+        // Negative stride: start at b, step down by |stride| until past e.
+        let mut i = b;
+        while i > e {
+            if i >= 0 && i < n {
+                result.push(items[i as usize].clone());
+            }
+            i += stride;
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -263,6 +263,9 @@ try:
         rust_visit_promote_expr as _rust_visit_promote_expr,
         rust_visit_temp_node as _rust_visit_temp_node,
         rust_visit_type_var_tuple_expr as _rust_visit_type_var_tuple_expr,
+        rust_try_getting_int_literals as _rust_try_getting_int_literals,
+        rust_visit_tuple_index_helper as _rust_visit_tuple_index_helper,
+        rust_visit_tuple_slice_helper as _rust_visit_tuple_slice_helper,
     )
 
     from mypy.types import read_type as _checkexpr_read_type
@@ -302,6 +305,9 @@ except ImportError:
     _rust_check_arguments = None  # type: ignore[assignment]
     _rust_check_argument_count = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
+    _rust_try_getting_int_literals = None  # type: ignore[assignment]
+    _rust_visit_tuple_index_helper = None  # type: ignore[assignment]
+    _rust_visit_tuple_slice_helper = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
     _checkexpr_read_type = None  # type: ignore[assignment]
@@ -5755,6 +5761,27 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return left.length() - 1
 
     def visit_tuple_index_helper(self, left: TupleType, n: int) -> Type | None:
+        if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
+                and _rust_visit_tuple_index_helper is not None
+                and find_unpack_in_list(left.items) is None):
+            # Only take the Rust path for fixed (non-variadic) tuples.
+            # Rust's variadic index result (middle + suffix unions) does
+            # not yet match Python (see #486: `args[1]` on
+            # `tuple[str, *tuple[int, ...], str, float]` must be `int | str`);
+            # defer variadic indexing to the pure-Python helper.
+            try:
+                items_bytes = [_serialize_type_for_checkexpr(it) for it in left.items]
+                pf_bytes = _serialize_type_for_checkexpr(left.partial_fallback)
+                min_length = self.min_tuple_length(left)
+                result = _rust_visit_tuple_index_helper(
+                    items_bytes, pf_bytes, n, left.line, left.column, min_length,
+                )
+                if result is not None:
+                    decoded = _deserialize_type_from_checkexpr(bytes(result))
+                    if decoded is not None:
+                        return decoded
+            except (AssertionError, NotImplementedError):
+                pass
         unpack_index = find_unpack_in_list(left.items)
         if unpack_index is None:
             if n < 0:
@@ -5803,6 +5830,55 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         )
 
     def visit_tuple_slice_helper(self, left_type: TupleType, slic: SliceExpr) -> Type:
+        if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
+                and _rust_visit_tuple_slice_helper is not None
+                and left_type.partial_fallback.type.fullname == "builtins.tuple"):
+            # Rust's tuple_slice output uses the tuple's own partial_fallback
+            # as result fallback, while Python's TupleType.slice defaults to
+            # self.named_type("builtins.tuple"). For plain builtins.tuple
+            # tuples these agree; subclass tuples (Tup2Class, NameTuple) get
+            # a plain-tuple result from Python, so defer them.
+            try:
+                items_bytes = [_serialize_type_for_checkexpr(it) for it in left_type.items]
+                pf_bytes = _serialize_type_for_checkexpr(left_type.partial_fallback)
+                begin_val = None
+                end_val = None
+                stride_val = None
+                # Only take the Rust path when every present bound is a
+                # single int literal. A non-literal or multi-value bound
+                # (e.g. `tup[n:]` with a Var, or `tup[L1|L2]`) makes Python
+                # route to nonliteral_tuple_index_helper / homogeneous
+                # variadic results that Rust cannot reproduce; defer.
+                ok = True
+                if slic.begin_index:
+                    raw = self.try_getting_int_literals(slic.begin_index)
+                    if raw is not None and len(raw) == 1:
+                        begin_val = raw[0]
+                    else:
+                        ok = False
+                if slic.end_index:
+                    raw = self.try_getting_int_literals(slic.end_index)
+                    if raw is not None and len(raw) == 1:
+                        end_val = raw[0]
+                    else:
+                        ok = False
+                if slic.stride:
+                    raw = self.try_getting_int_literals(slic.stride)
+                    if raw is not None and len(raw) == 1:
+                        stride_val = raw[0]
+                    else:
+                        ok = False
+                if ok:
+                    result = _rust_visit_tuple_slice_helper(
+                        items_bytes, pf_bytes, begin_val, end_val, stride_val,
+                        left_type.line, left_type.column,
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_from_checkexpr(bytes(result))
+                        if decoded is not None:
+                            return decoded
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         begin: Sequence[int | None] = [None]
         end: Sequence[int | None] = [None]
         stride: Sequence[int | None] = [None]

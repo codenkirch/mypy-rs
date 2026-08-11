@@ -341,6 +341,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_is_typeddict_type_context,
         module
     )?)?;
+    // Issue #486: tuple-index / tuple-slice helpers.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_try_getting_int_literals,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_tuple_index_helper,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_visit_tuple_slice_helper,
+        module
+    )?)?;
     // M8c: visit_conditional_expr / visit_star_expr helpers.
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_conditional_expr_join,
