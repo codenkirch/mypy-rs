@@ -445,6 +445,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints_filter::rust_infer_directed_arg_constraints,
         module
     )?)?;
+    // Issue #490: callable-arguments constraint inference.
+    module.add_function(wrap_pyfunction!(
+        constraints::rust_infer_callable_arguments_constraints,
+        module
+    )?)?;
     // Issue #475: Type.copy_modified field-swap seam.
     module.add_function(wrap_pyfunction!(copymodified::rust_copy_modified, module)?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
