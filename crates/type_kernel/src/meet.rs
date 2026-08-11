@@ -312,8 +312,18 @@ pub(crate) fn overlap(
     }
     if typed_dict_mapping_pair(&left, &right, res)? || typed_dict_mapping_pair(&right, &left, res)?
     {
-        // needs typed_dict_mapping_overlap (deferred).
-        return None;
+        let overlapping_inner = &|a: &Type, b: &Type| -> Option<bool> {
+            overlap(
+                a,
+                b,
+                strict_optional,
+                ignore_promotions,
+                overlap_for_overloads,
+                res,
+                depth + 1,
+            )
+        };
+        return typed_dict_mapping_overlap(&left, &right, overlapping_inner, res);
     }
     let left = match &left {
         Type::TypedDictType { fallback, .. } => fallback.as_ref().clone(),
@@ -480,6 +490,115 @@ fn typed_dict_mapping_pair(left: &Type, right: &Type, res: &TypeResolver) -> Opt
         Some(res.get(type_ref)?.has_base("typing.Mapping"))
     } else {
         Some(false)
+    }
+}
+
+/// `mypy.meet.typed_dict_mapping_overlap` (meet.py:1503-1573).
+///
+/// Check if a TypedDict type is overlapping with a Mapping type.
+/// Implements the logic from meet.py:1503-1573:
+/// - Required keys must each overlap with the mapping's value type
+/// - For TypedDicts with no required keys, at least one key must overlap with the value type
+fn typed_dict_mapping_overlap(
+    left: &Type,
+    right: &Type,
+    overlapping: &dyn Fn(&Type, &Type) -> Option<bool>,
+    res: &TypeResolver,
+) -> Option<bool> {
+    let (typed, other) = match (left, right) {
+        (Type::TypedDictType { .. }, Type::Instance { .. }) => (left, right),
+        (Type::Instance { .. }, Type::TypedDictType { .. }) => (right, left),
+        _ => return Some(false),
+    };
+
+    let Type::TypedDictType {
+        items: td_items,
+        required_keys: td_required,
+        readonly_keys: td_readonly,
+        fallback: td_fallback,
+        ..
+    } = typed
+    else {
+        return Some(false);
+    };
+    let Type::Instance {
+        type_ref: other_ref,
+        args: other_args,
+        ..
+    } = other
+    else {
+        return Some(false);
+    };
+
+    let other_snap = res.get(other_ref)?;
+
+    // mutable_mapping check: a TypedDict with readonly keys doesn't overlap MutableMapping
+    if !td_readonly.is_empty()
+        && other_snap
+            .mro
+            .iter()
+            .any(|base| base.as_str() == "typing.MutableMapping")
+    {
+        return Some(false);
+    }
+
+    // Find Mapping in MRO and map other onto it
+    let mapping_ref = other_snap
+        .mro
+        .iter()
+        .find(|base| base.as_str() == "typing.Mapping")
+        .cloned()?;
+    let mapped_args = map_instance_to_supertype(other_ref, other_args, &mapping_ref, res)?;
+
+    // key_type = mapped_args[0], value_type = mapped_args[1]
+    let key_type = get_proper(mapped_args.first()?)?;
+    let value_type = get_proper(mapped_args.get(1)?)?;
+
+    // Get str_type from TypedDict fallback (Mapping[str, object])
+    let Type::Instance {
+        args: fallback_args,
+        ..
+    } = td_fallback.as_ref()
+    else {
+        return Some(false);
+    };
+    let str_type = fallback_args.first()?.clone();
+
+    // Special case: no required keys + both key/value are Uninhabited
+    // -> overlapping iff TypedDict has no required keys (empty TypedDict overlaps empty dict)
+    if matches!(key_type, Type::UninhabitedType { .. })
+        && matches!(value_type, Type::UninhabitedType { .. })
+    {
+        return Some(td_required.is_empty());
+    }
+
+    // Check key_type overlaps str_type
+    if !overlapping(key_type, &str_type)? {
+        return Some(false);
+    }
+
+    // Build a lookup map for items since td_items is Vec<(String, Type)>
+    let items_map: HashMap<&String, &Type> = td_items.iter().map(|(k, v)| (k, v)).collect();
+
+    if td_required.is_empty() {
+        // No required keys: at least one non-required key must overlap with value_type
+        let has_overlap = td_items
+            .iter()
+            .filter(|(k, _)| !td_required.contains(k))
+            .any(|(_, item)| overlapping(item, value_type) == Some(true));
+        Some(has_overlap)
+    } else {
+        // All required keys must overlap with value_type
+        for k in td_required.iter() {
+            if let Some(item) = items_map.get(k) {
+                if overlapping(item, value_type) != Some(true) {
+                    return Some(false);
+                }
+            } else {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 }
 
