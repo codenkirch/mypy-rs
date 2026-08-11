@@ -51,6 +51,7 @@ mod checkcall;
 mod checker_stmts;
 mod checker_visitor;
 mod checkexpr_argcheck;
+mod checkexpr_argcount;
 mod checkexpr_functions;
 mod checkmember;
 mod checkoperator;
@@ -456,6 +457,20 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(checker_stmts::rust_stmt_outcome, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_argcheck::rust_check_arguments,
+        module
+    )?)?;
+    // Issue #473: check_argument_count + check_call_expr_with_callee_type
+    // pure dispatch (decision records, no message emission).
+    module.add_function(wrap_pyfunction!(
+        checkexpr_argcount::rust_check_argument_count,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_argcount::rust_check_call_expr_callable_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_argcount::rust_should_dispatch_union_call,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

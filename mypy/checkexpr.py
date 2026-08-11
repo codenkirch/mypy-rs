@@ -230,6 +230,7 @@ try:
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
+        rust_check_argument_count as _rust_check_argument_count,
         rust_check_arguments as _rust_check_arguments,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
@@ -297,6 +298,7 @@ except ImportError:
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_check_arguments = None  # type: ignore[assignment]
+    _rust_check_argument_count = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
     _CheckExprReadBuffer = None  # type: ignore[assignment,misc]
     _CheckExprWriteBuffer = None  # type: ignore[assignment,misc]
@@ -3377,6 +3379,69 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         if context is None:
             # Avoid "is None" checks
             context = TempNode(AnyType(TypeOfAny.special_form))
+
+        # Issue #473: native check_argument_count. Rust computes the full
+        # set of error decisions; Python translates each record to a message.
+        # Returns None to defer to the pure-Python path below.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_check_argument_count is not None
+        ):
+            try:
+                result = _rust_check_argument_count(
+                    _serialize_type_for_checkexpr(callee),
+                    [_serialize_type_for_checkexpr(get_proper_type(t)) for t in actual_types],
+                    [int(k.value) for k in actual_kinds],
+                    list(actual_names) if actual_names is not None else [],
+                    formal_to_actual,
+                    callee.special_sig,
+                    object_type is not None,
+                    callable_name,
+                    self.chk.in_checked_function(),
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                result = None
+            if result is not None:
+                ok, errors, _is_unexpected = result
+                for kind, index, _extra in errors:
+                    if kind == 0:  # ERR_EXTRA_UNNAMED
+                        self.msg.too_many_arguments(callee, context)
+                    elif kind == 1:  # ERR_EXTRA_NAMED
+                        assert actual_names is not None
+                        act_name = actual_names[index]
+                        assert act_name is not None
+                        self.msg.unexpected_keyword_argument(
+                            callee, act_name, actual_types[index], context
+                        )
+                    elif kind == 2:  # ERR_TOO_MANY_TUPLE
+                        self.msg.too_many_arguments(callee, context)
+                    elif kind == 3:  # ERR_TOO_MANY_TD
+                        actual_type = get_proper_type(actual_types[index])
+                        self.msg.too_many_arguments_from_typed_dict(
+                            callee, actual_type, context
+                        )
+                    elif kind == 4:  # ERR_TOO_FEW_POSITIONAL
+                        self.msg.too_few_arguments(callee, context, actual_names)
+                    elif kind == 5:  # ERR_MISSING_NAMED
+                        argname = callee.arg_names[index] or "?"
+                        self.msg.missing_named_argument(callee, context, argname)
+                    elif kind == 6:  # ERR_DUPLICATE
+                        self.msg.duplicate_argument_value(callee, index, context)
+                    elif kind == 7:  # ERR_TOO_MANY_POSITIONAL
+                        self.msg.too_many_positional_arguments(callee, context)
+                    elif kind == 8:  # ERR_PARAMSPEC_TOO_FEW
+                        self.msg.too_few_arguments(callee, context, actual_names)
+                    elif kind == 9:  # ERR_PARAMSPEC_ARGS_ONCE
+                        self.msg.fail("ParamSpec.args should only be passed once", context)
+                    elif kind == 10:  # ERR_PARAMSPEC_KWARGS_ONCE
+                        self.msg.fail("ParamSpec.kwargs should only be passed once", context)
+                    elif kind == 11:  # ERR_MISSING_CLASSVAR_NOTE
+                        if object_type and callable_name:
+                            self.missing_classvar_callable_note(
+                                object_type, callable_name, context
+                            )
+                return ok
 
         # TODO(jukka): We could return as soon as we find an error if messages is None.
 
