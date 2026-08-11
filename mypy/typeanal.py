@@ -2576,6 +2576,7 @@ try:
         rust_has_explicit_any as _rust_has_explicit_any,
         rust_make_optional_type as _rust_make_optional_type,
         rust_type_analyze as _rust_type_analyze,
+        rust_unknown_unpack as _rust_unknown_unpack,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -2588,6 +2589,7 @@ except ImportError:
     _rust_collect_all_inner_types = None  # type: ignore[assignment]
     _rust_make_optional_type = None  # type: ignore[assignment]
     _rust_type_analyze = None  # type: ignore[assignment]
+    _rust_unknown_unpack = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -2860,6 +2862,13 @@ def unknown_unpack(t: Type) -> bool:
     genuine undefined names here. But this worked well so far, although it looks
     quite fragile.
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_unknown_unpack(_serialize_typeanal_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, UnpackType):
         unpacked = get_proper_type(t.type)
         if isinstance(unpacked, AnyType) and unpacked.type_of_any == TypeOfAny.special_form:

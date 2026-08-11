@@ -4932,6 +4932,54 @@ class NativeWireFixupSuite(Suite):
             actual.items, [self.fx.b, self.fx.c, NoneType()], f"got {actual.items!r}"
         )
 
+    def test_unknown_unpack_false_for_plain_instance(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(Instance(self.fx.std_listi, [self.fx.a]))
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(Instance(self.fx.std_listi, [self.fx.a]))
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_unknown_unpack_true_for_special_form_any(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        t = UnpackType(AnyType(TypeOfAny.special_form))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_unknown_unpack_false_for_other_any(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+
+        t = UnpackType(AnyType(TypeOfAny.unannotated))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_unknown_unpack_falls_back_to_python_on_alias(self) -> None:
+        # The Rust kernel defers on a TypeAliasType unpack target (its
+        # proper expansion is not on the wire); both paths must agree.
+        from mypy.nodes import TypeAlias
+        from mypy.typeanal import _set_native_typeanal_active, unknown_unpack
+        from mypy.types import TypeAliasType
+
+        alias = TypeAlias(AnyType(TypeOfAny.special_form), "m.A", "m", -1, -1)
+        t = UnpackType(TypeAliasType(alias, []))
+        _set_native_typeanal_active(False)
+        expected = unknown_unpack(t)
+        _set_native_typeanal_active(True)
+        actual = unknown_unpack(t)
+        assert_equal(actual, expected)
+        assert actual is True
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTraverserSuite(Suite):

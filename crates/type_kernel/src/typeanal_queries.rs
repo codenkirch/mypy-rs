@@ -26,7 +26,6 @@ use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Typ
 // TypeOfAny constants (mirror mypy/types.py:213-239).
 const EXPLICIT: i64 = 2;
 const FROM_UNIMPORTED_TYPE: i64 = 3;
-#[cfg(test)]
 const SPECIAL_FORM: i64 = 6;
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
@@ -362,6 +361,38 @@ fn make_optional_type_inner(t: &Type) -> Option<Type> {
 }
 
 // ---------------------------------------------------------------------------
+// unknown_unpack
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.unknown_unpack` — true if `t` is an unpack of an unknown
+/// type: `UnpackType` whose proper type is `AnyType(TypeOfAny.special_form)`.
+///
+/// Mirrors typeanal.py:2856-2867. Pure query: returns `None` (defer) when
+/// the unpack target is a `TypeAliasType`, whose proper expansion is not
+/// available on the wire (`get_proper_type` needs the live alias target).
+#[pyfunction]
+pub(crate) fn rust_unknown_unpack(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    match decode_type(type_bytes) {
+        Some(t) => Ok(unknown_unpack_inner(&t)),
+        None => Ok(None),
+    }
+}
+
+fn unknown_unpack_inner(t: &Type) -> Option<bool> {
+    let Type::UnpackType { typ } = t else {
+        return Some(false);
+    };
+    // get_proper_type(UnpackType.typ): non-alias wire types are already
+    // proper, so only the alias case is indeterminate on the wire.
+    match typ.as_ref() {
+        Type::TypeAliasType { .. } => None,
+        // isinstance(unpacked, AnyType) and type_of_any == special_form.
+        Type::AnyType { type_of_any, .. } => Some(*type_of_any == SPECIAL_FORM),
+        _ => Some(false),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -684,6 +715,42 @@ mod tests {
             }
             _ => panic!("expected UnionType"),
         }
+    }
+
+    #[test]
+    fn test_unknown_unpack_false_for_non_unpack() {
+        assert_eq!(unknown_unpack_inner(&make_any(SPECIAL_FORM)), Some(false));
+        assert_eq!(
+            unknown_unpack_inner(&make_instance("m.B", Vec::new())),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_unknown_unpack_matches_special_form_any() {
+        let unpacked = Type::UnpackType {
+            typ: Box::new(make_any(SPECIAL_FORM)),
+        };
+        assert_eq!(unknown_unpack_inner(&unpacked), Some(true));
+    }
+
+    #[test]
+    fn test_unknown_unpack_other_any_is_false() {
+        let unpacked = Type::UnpackType {
+            typ: Box::new(make_any(EXPLICIT)),
+        };
+        assert_eq!(unknown_unpack_inner(&unpacked), Some(false));
+    }
+
+    #[test]
+    fn test_unknown_unpack_defers_on_alias_target() {
+        let unpacked = Type::UnpackType {
+            typ: Box::new(Type::TypeAliasType {
+                args: Vec::new(),
+                type_ref: "m.T".to_string(),
+            }),
+        };
+        assert_eq!(unknown_unpack_inner(&unpacked), None);
     }
 }
 
