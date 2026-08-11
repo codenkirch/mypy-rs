@@ -432,6 +432,8 @@ fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Optio
         return Some(false);
     }
     // Step 2: find min prefix length across all target arg_types.
+    // Any target that's not a CallableType means overlap checking can't
+    // proceed — the heuristic returns false when it can't form.
     let mut min_prefix = usize::MAX;
     for target in targets {
         let proper = get_proper_or_none(target)?;
@@ -440,7 +442,7 @@ fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Optio
             ..
         } = proper
         else {
-            return None;
+            return Some(false);
         };
         if t_arg_types.len() < min_prefix {
             min_prefix = t_arg_types.len();
@@ -461,7 +463,10 @@ fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Optio
                 ..
             } = proper
             else {
-                return None;
+                // Unreachable: step 2 (above) returns `Some(false)` if
+                // any target is non-CallableType, so the loop here never
+                // iterates non-CallableType targets. Kept for exhaustiveness.
+                return Some(false);
             };
             let formal = get_proper_or_none(&t_arg_types[i])?;
             match formal {
@@ -784,7 +789,11 @@ pub fn rust_solve_generic_call(
     }
 
     if all_constraints.is_empty() {
-        return None; // Nothing to solve.
+        // No constraints to solve — return the normalized callable
+        // so the caller doesn't fall through to the full Python infer pass.
+        let mut wbuf = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut wbuf, &normalized).ok()?;
+        return Some(wbuf.into_bytes());
     }
 
     // Step 3: Solve constraints for the callable's type vars.
@@ -819,10 +828,17 @@ pub fn rust_solve_generic_call(
     );
 
     let Some((num_solved, sol_blob, _free_blob)) = solve_result else {
-        return None; // Solver deferred.
+        // Solver deferred — return the normalized callable so the caller
+        // doesn't fall through to the full Python infer pass.
+        let mut wbuf = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut wbuf, &normalized).ok()?;
+        return Some(wbuf.into_bytes());
     };
     if num_solved == 0 {
-        return None;
+        // No constraints solved — return the normalized callable unchanged.
+        let mut wbuf = crate::wire::WriteBuffer::new();
+        crate::wire::write_type(&mut wbuf, &normalized).ok()?;
+        return Some(wbuf.into_bytes());
     }
 
     // Step 4: Decode solutions and apply to callable.
