@@ -66,6 +66,7 @@ __all__ = [
     "rust_join_types",
     "rust_meet_types",
     "rust_narrow_declared_type",
+    "rust_narrow_with_len",
     "rust_map_actuals_to_formals",
     "rust_narrow_type_by_identity_equality",
     "rust_map_formals_to_actuals",
@@ -303,6 +304,14 @@ def rust_narrow_type_by_identity_equality(
     strict_optional: bool,
     resolver: NativeTypeResolver,
 ) -> tuple[bytes | None, bytes | None] | None: ...
+def rust_narrow_with_len(
+    typ: bytes,
+    op: str,
+    size: int,
+    strict_optional: bool,
+    precise_tuple: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[bytes, bytes] | None: ...
 def rust_map_actuals_to_formals(
     actual_kinds: list[int],
     actual_names: list[str | None],

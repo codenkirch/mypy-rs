@@ -339,6 +339,7 @@ try:
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
+        rust_narrow_with_len as _rust_narrow_with_len,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
         rust_type_requires_usage as _rust_type_requires_usage,
@@ -354,6 +355,7 @@ except ImportError:
     _rust_has_bool_item = None  # type: ignore[assignment]
     _rust_has_custom_eq_checks = None  # type: ignore[assignment]
     _rust_narrow_type_by_identity_equality = None  # type: ignore[assignment]
+    _rust_narrow_with_len = None  # type: ignore[assignment]
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
@@ -7974,6 +7976,28 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def narrow_with_len(self, typ: Type, op: str, size: int) -> tuple[Type, Type]:
         """Dispatch tuple type narrowing logic depending on the kind of type we got."""
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_types_active
+            and _native_checker_resolver is not None
+            and _rust_narrow_with_len is not None
+        ):
+            try:
+                result = _rust_narrow_with_len(
+                    _serialize_type_for_checker(typ),
+                    op,
+                    size,
+                    state.strict_optional,
+                    PRECISE_TUPLE_TYPES in self.options.enable_incomplete_feature,
+                    _native_checker_resolver,
+                )
+                if result is not None:
+                    yes_bytes, no_bytes = result
+                    yes_type = _deserialize_type_from_checker(bytes(yes_bytes))
+                    no_type = _deserialize_type_from_checker(bytes(no_bytes))
+                    return yes_type, no_type
+            except (AssertionError, NotImplementedError):
+                pass
         typ = get_proper_type(typ)
         if isinstance(typ, TupleType):
             return self.refine_tuple_type_with_len(typ, op, size)
