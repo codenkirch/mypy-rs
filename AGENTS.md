@@ -258,6 +258,15 @@ including:
   applies the side effects (AST mutation, error reporting, scope checks).
   Parity-gated behind the semanal_visitor gate and unit-tested by
   `NativeDecoratorClassifySuite` in `mypy/test/testtypes.py`.
+- `rust_bind_self` (issue #492) — mirrors `mypy.typeops.bind_self`'s
+  non-generic fast path (typeops.py:540-641): strips the first parameter
+  and sets `is_bound=True` for non-variable-carrying `CallableType`s. Rust
+  defers (`None`) for generic signatures (needs `infer_type_arguments`),
+  so the typevar path stays in Python. The Python shim uses the Rust
+  result as a "handled" signal and builds the final object through
+  `copy_modified` on the live object so non-wire fields survive. Covered
+  by `NativeBindSelfSuite` in `mypy/test/testtypes.py`. `class_callable`
+  and `fill_typevars` are deferred (issue #492 follow-up).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

@@ -21,6 +21,11 @@ use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 use crate::setops;
 use crate::subtypes::SubtypeContext;
 
+/// `ArgKind.ARG_STAR` = 2 (checkmember.rs:52).
+const ARG_STAR: i64 = 2;
+/// `ArgKind.ARG_STAR2` = 4 (checkmember.rs:54).
+const ARG_STAR2: i64 = 4;
+
 // ---------------------------------------------------------------------------
 // Wire codec helpers
 // ---------------------------------------------------------------------------
@@ -1035,6 +1040,78 @@ pub(crate) fn rust_tuple_fallback(
 ) -> Option<Vec<u8>> {
     let t = decode_type(t_bytes)?;
     let result = tuple_fallback(&t, resolver.resolver())?;
+    encode_type(&result)
+}
+
+/// `#[pyfunction]` entry for `bind_self` (typeops.py:540-641): strip the
+/// first parameter of a `CallableType` and set `is_bound=True`.
+///
+/// Mirrors `bind_self`'s non-generic path. Deferred to Python (`None`):
+/// * Non-callable types
+/// * `CallableType` with non-empty `variables` (needs `infer_type_arguments`
+///   for type-var substitution)
+/// * `CallableType` with no args, or first arg `*args`/`**kwargs` — Python
+///   returns the method unchanged; the shim skips the native call in those
+///   cases rather than round-tripping an identical object.
+/// * `Overloaded` whose items include a variable-carrying or empty/star-arg
+///   callable
+fn bind_self_inner(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound: _,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            if !variables.is_empty() {
+                return None;
+            }
+            if arg_types.is_empty() {
+                return None;
+            }
+            match arg_kinds.first() {
+                Some(&kind) if kind == ARG_STAR || kind == ARG_STAR2 => None,
+                Some(_) => Some(Type::CallableType {
+                    fallback: fallback.clone(),
+                    instance_type: instance_type.clone(),
+                    is_ellipsis_args: *is_ellipsis_args,
+                    implicit: *implicit,
+                    is_bound: true,
+                    from_concatenate: *from_concatenate,
+                    imprecise_arg_kinds: *imprecise_arg_kinds,
+                    unpack_kwargs: *unpack_kwargs,
+                    arg_types: arg_types[1..].to_vec(),
+                    arg_kinds: arg_kinds[1..].to_vec(),
+                    arg_names: arg_names[1..].to_vec(),
+                    ret_type: ret_type.clone(),
+                    name: name.clone(),
+                    variables: variables.clone(),
+                    type_guard: type_guard.clone(),
+                    type_is: type_is.clone(),
+                }),
+                None => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[pyfunction]
+pub(crate) fn rust_bind_self(method_bytes: &[u8]) -> Option<Vec<u8>> {
+    let t = decode_type(method_bytes)?;
+    let result = bind_self_inner(&t)?;
     encode_type(&result)
 }
 

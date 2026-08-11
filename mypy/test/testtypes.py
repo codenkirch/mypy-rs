@@ -1990,6 +1990,116 @@ class FreshVarCanonicalizerSuite(Suite):
         assert fixed.ret_type is self.declared
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeBindSelfSuite(Suite):
+    """Parity tests for the Rust `bind_self` fast path (mypy.typeops.bind_self).
+
+    Each test serializes a `CallableType` via `Type.write(WriteBuffer)` and
+    asserts that `type_kernel.rust_bind_self` strips the first parameter and
+    sets `is_bound=True`, matching the pure-Python non-generic path
+    (typeops.py:663-670). Generic (variable-carrying) callables must defer
+    (return `None`) so Python runs `infer_type_arguments`.
+    """
+
+    def setUp(self) -> None:
+        from librt.internal import ReadBuffer as _RB
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._RB = _RB
+        type_infos = [
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.oi,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _bind(self, c: CallableType) -> CallableType | None:
+        result = _type_kernel.rust_bind_self(self._bytes_of(c))
+        if result is None:
+            return None
+        from mypy.types import instance_cache, read_type as _read_type
+        from mypy.wirefixup import fixup_wire_type
+
+        decoded = _read_type(self._RB(bytes(result)))
+        # Clear instance_cache primitives after read_type so NOT_READY
+        # singletons cannot leak into later tests (mirrors typeops.py).
+        instance_cache.int_type = None
+        instance_cache.str_type = None
+        instance_cache.bool_type = None
+        instance_cache.object_type = None
+        instance_cache.function_type = None
+        return fixup_wire_type(decoded)
+
+    def _assert_stripped(self, c: CallableType) -> None:
+        decoded = self._bind(c)
+        assert decoded is not None, f"rust_bind_self returned None for {c!r}"
+        assert isinstance(decoded, ProperType) and isinstance(decoded, CallableType)
+        assert decoded.is_bound, "expected is_bound=True"
+        assert_equal(len(decoded.arg_types), len(c.arg_types) - 1)
+        assert_equal(decoded.arg_types[0], c.arg_types[1])
+        assert_equal(decoded.ret_type, c.ret_type)
+        assert_equal(decoded.variables, c.variables)
+
+    def test_simple(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        self._assert_stripped(c)
+
+    def test_three_args(self) -> None:
+        c = CallableType(
+            [self.fx.a, self.fx.b, self.fx.c],
+            [ARG_POS, ARG_POS, ARG_POS],
+            [None, None, None],
+            self.fx.anyt,
+            self.fx.function,
+        )
+        self._assert_stripped(c)
+
+    def test_generic_defers(self) -> None:
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
+        )
+        assert self._bind(c) is None
+
+    def test_no_args_defers(self) -> None:
+        c = CallableType([], [], [], self.fx.anyt, self.fx.function)
+        assert self._bind(c) is None
+
+    def test_star_args_defers(self) -> None:
+        # bind_self returns the method unchanged for *args first param, so
+        # the native path reports "not handled" and Python does the same.
+        c = CallableType(
+            [self.fx.a], [ARG_STAR], [None], self.fx.anyt, self.fx.function
+        )
+        assert self._bind(c) is None
+
+    def test_star2_args_defers(self) -> None:
+        c = CallableType(
+            [self.fx.a], [ARG_STAR2], [None], self.fx.anyt, self.fx.function
+        )
+        assert self._bind(c) is None
+
+
 # Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader, with a TypeInfo resolver
 # built from the live Python TypeInfo graph, produces the same `str(t)` as

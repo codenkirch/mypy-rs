@@ -587,6 +587,35 @@ def bind_self(
     self_param_type = get_proper_type(func.arg_types[0])
 
     variables: Sequence[TypeVarLikeType]
+    # #492 native seam: for a non-generic CallableType the whole strip path
+    # is one Rust call that decides the case is handled. The decoded result
+    # is only a "handled" signal; the final object is built through
+    # copy_modified on the live object so non-wire fields (special_sig,
+    # from_type_type, definition, line/column) survive the roundtrip. Rust
+    # defers (None) on variables / star-args / empty args, so the typevar
+    # path below is untouched.
+    if (
+        not func.variables
+        and _HAS_TYPE_KERNEL
+        and _native_typeops_active
+    ):
+        try:
+            result = _type_kernel.rust_bind_self(_serialize_type(func))
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None and isinstance(decoded, CallableType):
+                    return cast(
+                        F,
+                        func.copy_modified(
+                            arg_types=func.arg_types[1:],
+                            arg_kinds=func.arg_kinds[1:],
+                            arg_names=func.arg_names[1:],
+                            variables=func.variables,
+                            is_bound=True,
+                        ),
+                    )
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     # Having a def __call__(self: Callable[...], ...) can cause infinite recursion. Although
     # this special-casing looks not very principled, there is nothing meaningful we can infer
     # from such definition, since it is inherently indefinitely recursive.
