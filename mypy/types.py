@@ -2062,6 +2062,14 @@ class Parameters(ProperType):
         return args
 
     def argument_by_name(self, name: str | None) -> FormalArgument | None:
+        # Issue #487: fast-path through native gate for simple name lookups.
+        if name is not None:
+            native_result = _native_callable_argument_by_name(self, name)
+            if native_result is not None:
+                n, p, r = native_result
+                typ = self.arg_types[p] if p is not None else None
+                if typ is not None:
+                    return FormalArgument(n, p, typ, r)
         if name is None:
             return None
         seen_star = False
@@ -2079,6 +2087,14 @@ class Parameters(ProperType):
         return self.try_synthesizing_arg_from_kwarg(name)
 
     def argument_by_position(self, position: int | None) -> FormalArgument | None:
+        # Issue #487: fast-path through native gate for positional lookups.
+        if position is not None:
+            native_result = _native_callable_argument_by_position(self, position)
+            if native_result is not None:
+                n, p, r = native_result
+                typ = self.arg_types[p] if p is not None else None
+                if typ is not None:
+                    return FormalArgument(n, p, typ, r)
         if position is None:
             return None
         if position >= len(self.arg_names):
@@ -2451,6 +2467,21 @@ class CallableType(FunctionLike):
 
         If you really want to include star args in the yielded output, set the
         'include_star_args' parameter to 'True'."""
+        # Issue #487: fast-path through native gate (only supports basic positional
+        # args; delegates to Python when *args/**kwargs or other complexity arises).
+        if not include_star_args:
+            native_result = _native_callable_formal_arguments(self)
+            if native_result is not None:
+                # Verify no star/kwarg args are present (Rust gate only handles clean
+                # positional cases; otherwise fall through to Python).
+                if not any(
+                    k in (ARG_STAR, ARG_STAR2, ARG_NAMED, ARG_NAMED_OPT)
+                    for k in self.arg_kinds
+                ):
+                    return [
+                        FormalArgument(n, p, self.arg_types[i], r)
+                        for i, (n, p, r) in enumerate(native_result)
+                    ]
         args = []
         done_with_positional = False
         for i in range(len(self.arg_types)):
@@ -2467,6 +2498,14 @@ class CallableType(FunctionLike):
         return args
 
     def argument_by_name(self, name: str | None) -> FormalArgument | None:
+        # Issue #487: fast-path through native gate for simple name lookups.
+        if name is not None:
+            native_result = _native_callable_argument_by_name(self, name)
+            if native_result is not None:
+                n, p, r = native_result
+                typ = self.arg_types[p] if p is not None else None
+                if typ is not None:
+                    return FormalArgument(n, p, typ, r)
         if name is None:
             return None
         seen_star = False
@@ -2484,6 +2523,14 @@ class CallableType(FunctionLike):
         return self.try_synthesizing_arg_from_kwarg(name)
 
     def argument_by_position(self, position: int | None) -> FormalArgument | None:
+        # Issue #487: fast-path through native gate for positional lookups.
+        if position is not None:
+            native_result = _native_callable_argument_by_position(self, position)
+            if native_result is not None:
+                n, p, r = native_result
+                typ = self.arg_types[p] if p is not None else None
+                if typ is not None:
+                    return FormalArgument(n, p, typ, r)
         if position is None:
             return None
         if position >= len(self.arg_names):
@@ -4345,6 +4392,9 @@ try:
         rust_callable_is_var_arg as _rust_callable_is_var_arg,
         rust_callable_max_possible_positional_args as _rust_callable_max_possible_positional_args,
         rust_callable_min_args as _rust_callable_min_args,
+        rust_callable_formal_arguments as _rust_callable_formal_arguments,
+        rust_callable_argument_by_name as _rust_callable_argument_by_name,
+        rust_callable_argument_by_position as _rust_callable_argument_by_position,
         rust_copy_type as _rust_copy_type,
         rust_find_unpack_in_list as _rust_find_unpack_in_list,
         rust_flatten_nested_tuples as _rust_flatten_nested_tuples,
@@ -4385,6 +4435,9 @@ except ImportError:
     _rust_callable_is_kw_arg = None  # type: ignore[assignment]
     _rust_callable_max_possible_positional_args = None  # type: ignore[assignment]
     _rust_callable_is_generic = None  # type: ignore[assignment]
+    _rust_callable_formal_arguments = None  # type: ignore[assignment]
+    _rust_callable_argument_by_name = None  # type: ignore[assignment]
+    _rust_callable_argument_by_position = None  # type: ignore[assignment]
     _rust_tuple_length = None  # type: ignore[assignment]
     _rust_union_length = None  # type: ignore[assignment]
     _VisitorWriteBuffer = None  # type: ignore[assignment,misc]
@@ -4525,6 +4578,44 @@ def _native_union_length(t: Type) -> int | None:
 def _deserialize_type_from_visitor(b: bytes) -> Type:
     buf = _ReadBuffer(b)
     return _visitor_read_type(buf)
+
+
+def _native_callable_formal_arguments(t: Type) -> list[tuple[str | None, int | None, bool]] | None:
+    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
+        return None
+    try:
+        raw = _rust_callable_formal_arguments(_serialize_type_for_visitor(t))
+        if raw is None:
+            return None
+        return [(n, p, r) for n, p, r in raw]
+    except (AssertionError, NotImplementedError):
+        return None
+
+
+def _native_callable_argument_by_name(t: Type, name: str | None) -> tuple[str | None, int | None, bool] | None:
+    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
+        return None
+    try:
+        raw = _rust_callable_argument_by_name(_serialize_type_for_visitor(t), name)
+        if raw is None:
+            return None
+        n, p, r = raw
+        return (n, p, r)
+    except (AssertionError, NotImplementedError):
+        return None
+
+
+def _native_callable_argument_by_position(t: Type, position: int | None) -> tuple[str | None, int | None, bool] | None:
+    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
+        return None
+    try:
+        raw = _rust_callable_argument_by_position(_serialize_type_for_visitor(t), position)
+        if raw is None:
+            return None
+        n, p, r = raw
+        return (n, p, r)
+    except (AssertionError, NotImplementedError):
+        return None
 
 
 def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
