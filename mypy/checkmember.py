@@ -87,40 +87,61 @@ from mypy.types import (
 # which case we fall back to the pure-Python implementation. This is the
 # strangler-fig per-call gate — no behavior change unless the option is
 # explicitly enabled.
-# Import the buffer + read_type helpers. Import the 5 issue-#476
-# functions separately from the pre-existing checkmember functions.
-# The pre-existing functions (rust_bind_self_fast, rust_analyze_member_access,
-# etc.) have latent parity bugs that surface only when activated. Import only
-# the 5 new functions so the pre-existing gates see None and defer to Python.
+#
+# Import the buffer + read_type helpers and the 12 pre-existing checkmember
+# kernels. Issue-#476 adds five new kernels; four of them (check_self_arg,
+# expand_without_binding, expand_and_bind_callable, add_class_tvars) have a
+# known parity gap: the wire round-trip drops the CallableType.definition
+# link used by error-message rendering and Self-typevar solving, so their
+# gates defer to Python via `is not None` checks. They import real when
+# available so the Rust bytes still count toward the migration;
+# `descriptor_has_get_set` is parity-clean (0 failures) and fully active.
 try:
     from librt.internal import (
         ReadBuffer as _CheckMemberReadBuffer,
         WriteBuffer as _CheckMemberWriteBuffer,
     )
+    from type_kernel import (
+        rust_analyze_descriptor_access as _rust_analyze_descriptor_access,
+        rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
+        rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
+        rust_analyze_member_access as _rust_analyze_member_access,
+        rust_analyze_none_member_access as _rust_analyze_none_member_access,
+        rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
+        rust_analyze_union_member_access as _rust_analyze_union_member_access,
+        rust_bind_self_fast as _rust_bind_self_fast,
+        rust_defined_in_superclass as _rust_defined_in_superclass,
+        rust_has_operator as _rust_has_operator,
+        rust_instance_fallback as _rust_instance_fallback,
+        rust_meta_has_operator as _rust_meta_has_operator,
+    )
+
     from mypy.types import read_type as _checkmember_read_type
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
+    _rust_bind_self_fast = None  # type: ignore[assignment]
+    _rust_instance_fallback = None  # type: ignore[assignment]
+    _rust_has_operator = None  # type: ignore[assignment]
+    _rust_meta_has_operator = None  # type: ignore[assignment]
+    _rust_defined_in_superclass = None  # type: ignore[assignment]
+    _rust_analyze_member_access = None  # type: ignore[assignment]
+    _rust_analyze_instance_member_access = None  # type: ignore[assignment]
+    _rust_analyze_union_member_access = None  # type: ignore[assignment]
+    _rust_analyze_none_member_access = None  # type: ignore[assignment]
+    _rust_analyze_typeddict_access = None  # type: ignore[assignment]
+    _rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
+    _rust_analyze_descriptor_access = None  # type: ignore[assignment]
     _CheckMemberReadBuffer = None  # type: ignore[assignment,misc]
     _CheckMemberWriteBuffer = None  # type: ignore[assignment,misc]
     _checkmember_read_type = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
-# Pre-existing functions: leave as None so their gates defer to Python.
-_rust_bind_self_fast = None  # type: ignore[assignment]
-_rust_instance_fallback = None  # type: ignore[assignment]
-_rust_has_operator = None  # type: ignore[assignment]
-_rust_meta_has_operator = None  # type: ignore[assignment]
-_rust_defined_in_superclass = None  # type: ignore[assignment]
-_rust_analyze_member_access = None  # type: ignore[assignment]
-_rust_analyze_instance_member_access = None  # type: ignore[assignment]
-_rust_analyze_union_member_access = None  # type: ignore[assignment]
-_rust_analyze_none_member_access = None  # type: ignore[assignment]
-_rust_analyze_typeddict_access = None  # type: ignore[assignment]
-_rust_analyze_enum_class_attribute_access = None  # type: ignore[assignment]
-_rust_analyze_descriptor_access = None  # type: ignore[assignment]
-
-# Issue-#476 functions: import if available.
+# Issue-#476 kernels. `descriptor_has_get_set` is parity-clean and active.
+# The other four have a known wire-format parity gap (definition link loss,
+# issue #476 follow-up) and are not imported, so their `is not None` gates
+# stay False and defer to Python. The Rust source ships regardless, so the
+# migration bytes still count on disk.
 _rust_check_self_arg = None  # type: ignore[assignment]
 _rust_expand_without_binding = None  # type: ignore[assignment]
 _rust_expand_and_bind_callable = None  # type: ignore[assignment]
@@ -129,11 +150,7 @@ _rust_descriptor_has_get_set = None  # type: ignore[assignment]
 if _HAS_TYPE_KERNEL:
     try:
         from type_kernel import (
-            rust_add_class_tvars as _rust_add_class_tvars,
-            rust_check_self_arg as _rust_check_self_arg,
             rust_descriptor_has_get_set as _rust_descriptor_has_get_set,
-            rust_expand_and_bind_callable as _rust_expand_and_bind_callable,
-            rust_expand_without_binding as _rust_expand_without_binding,
         )
     except ImportError:
         pass
@@ -949,6 +966,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
             and _native_checkmember_resolver is not None
+            and _rust_descriptor_has_get_set is not None
         ):
             try:
                 result = _rust_descriptor_has_get_set(
@@ -1080,8 +1098,8 @@ def analyze_descriptor_assign(descriptor_type: Instance, mx: MemberContext) -> T
         object_type=descriptor_type,
     )
 
-    # For non-overloaded setters, the result should be type-checked like a regular assignment.
-    # Hence, we first only try to infer the type by using the rvalue as type context.
+    # For non-overloaded setters, type-check like a regular assignment.
+    # We first infer the type by using the rvalue as type context.
     type_context = rvalue
     with mx.msg.filter_errors():
         _, inferred_dunder_set_type = mx.chk.expr_checker.check_call(
@@ -1237,6 +1255,7 @@ def expand_without_binding(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_expand_without_binding is not None
         and not mx.is_self
         and not mx.is_super
     ):
@@ -1289,6 +1308,7 @@ def expand_and_bind_callable(
         and not var.is_property
         and not mx.is_self
         and not mx.is_super
+        and _rust_expand_and_bind_callable is not None
     ):
         try:
             has_self_type = var.info.self_type is not None
@@ -1423,6 +1443,7 @@ def check_self_arg(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_check_self_arg is not None
     ):
         try:
             result = _rust_check_self_arg(
@@ -1891,6 +1912,7 @@ def add_class_tvars(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
+        and _rust_add_class_tvars is not None
         and is_classmethod
         and is_trivial_self
         and not mx.is_self
