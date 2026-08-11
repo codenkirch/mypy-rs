@@ -154,6 +154,15 @@ if _HAS_TYPE_KERNEL:
         )
     except ImportError:
         pass
+    try:
+        from type_kernel import (
+            rust_check_self_arg as _rust_check_self_arg,
+            rust_expand_without_binding as _rust_expand_without_binding,
+            rust_expand_and_bind_callable as _rust_expand_and_bind_callable,
+            rust_add_class_tvars as _rust_add_class_tvars,
+        )
+    except ImportError:
+        pass
 
 _native_checkmember_active: bool = False
 
@@ -185,7 +194,7 @@ def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
     Returns None when a type_ref is unresolvable so callers defer to Python.
     """
     from mypy.types import instance_cache
-    from mypy.wirefixup import fixup_wire_type
+    from mypy.wirefixup import fixup_wire_type, canonicalize_fresh_vars
 
     decoded = _checkmember_read_type(_CheckMemberReadBuffer(data))
     # Clear instance_cache primitives after read_type so NOT_READY
@@ -195,7 +204,59 @@ def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded)
+    if fixed is not None:
+        # Wire round-trip loses fresh meta-var identity; re-unify
+        # occurrences before returning (mirrors expandtype.py:463-467).
+        fixed = canonicalize_fresh_vars(fixed)
+    return fixed
+
+
+def _restore_definition(original: Type, decoded: Type) -> Type:
+    """Copy the ``definition`` link from ``original`` onto ``decoded``.
+
+    The wire format drops ``CallableType.definition`` (only used for error
+    messages). The ``_TypeRefFixer._match_definition`` fallback tries to
+    relink it from the fallback TypeInfo's symbol table, but for methods
+    the fallback is ``builtins.function``, not the defining class, so the
+    lookup fails. This helper restores the link directly from the original
+    live object, mirroring how ``bind_self_fast`` preserves non-wire fields
+    via ``copy_modified`` on the original object.
+    """
+    from mypy.types import CallableType, Overloaded
+
+    if isinstance(original, CallableType) and isinstance(decoded, CallableType):
+        if original.definition is not None and decoded.definition is None:
+            return decoded.copy_modified(definition=original.definition)
+    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):
+        if len(original.items) == len(decoded.items):
+            new_items = []
+            changed = False
+            for orig, dec in zip(original.items, decoded.items):
+                if (
+                    isinstance(orig, CallableType)
+                    and isinstance(dec, CallableType)
+                    and orig.definition is not None
+                    and dec.definition is None
+                ):
+                    new_items.append(dec.copy_modified(definition=orig.definition))
+                    changed = True
+                else:
+                    new_items.append(dec)
+            if changed:
+                return Overloaded(new_items)
+    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):
+        # check_self_arg filters an Overloaded to a single CallableType;
+        # find the matching item by arg-type signature to restore its
+        # definition link.
+        for orig in original.items:
+            if (
+                isinstance(orig, CallableType)
+                and orig.definition is not None
+                and len(orig.arg_types) == len(decoded.arg_types)
+            ):
+                return decoded.copy_modified(definition=orig.definition)
+    return decoded
 
 
 class MemberContext:
@@ -1277,7 +1338,8 @@ def expand_without_binding(
                         TypeVarId.next_raw_id = next_raw_id
                     decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                     if decoded is not None:
-                        return decoded
+                        freeze_all_type_vars(decoded)
+                        return _restore_definition(typ, decoded)
         except (AssertionError, NotImplementedError):
             pass
     if not mx.preserve_type_var_ids:
@@ -1329,7 +1391,8 @@ def expand_and_bind_callable(
                         TypeVarId.next_raw_id = next_raw_id
                     decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                     if decoded is not None:
-                        return decoded
+                        freeze_all_type_vars(decoded)
+                        return _restore_definition(functype, decoded)
         except (AssertionError, NotImplementedError):
             pass
     if not mx.preserve_type_var_ids:
@@ -1464,7 +1527,8 @@ def check_self_arg(
                     if isinstance(decoded, ProperType):
                         decoded.line = context.line
                         decoded.column = context.column
-                    return decoded  # type: ignore[return-value]
+                    freeze_all_type_vars(decoded)
+                    return _restore_definition(functype, decoded)  # type: ignore[return-value]
         except (AssertionError, NotImplementedError):
             pass
     new_items = []
@@ -1945,7 +2009,8 @@ def add_class_tvars(
                     TypeVarId.next_raw_id = next_raw_id
                 decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                 if decoded is not None:
-                    return decoded
+                    freeze_all_type_vars(decoded)
+                    return _restore_definition(t, decoded)
         except (AssertionError, NotImplementedError):
             pass
     if isinstance(t, CallableType):

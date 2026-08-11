@@ -288,7 +288,10 @@ class _TypeRefFixer(TypeTranslator):
 
         if t.name is None:
             return None
-        node = info.names.get(t.name)
+        lookup_name = t.name.split(" of ")[0] if " of " in t.name else t.name
+        node = info.names.get(lookup_name)
+        if node is None:
+            node = info.names.get(t.name)
         if node is None:
             return None
         sym = node.node
