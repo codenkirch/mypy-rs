@@ -1842,6 +1842,18 @@ class Instance(ProperType):
         args: Bogus[list[Type]] = _dummy,
         last_known_value: Bogus[LiteralType | None] = _dummy,
     ) -> Instance:
+        changes: dict[str, Any] = {}
+        if args is not _dummy:
+            changes["args"] = args
+        if last_known_value is not _dummy:
+            changes["last_known_value"] = last_known_value
+        native = _native_copy_modified(self, changes)
+        if native is not None:
+            # Python copies the truthiness flags from the original (the
+            # type is unchanged, so the effective flags stay the same).
+            native.can_be_true = self.can_be_true
+            native.can_be_false = self.can_be_false
+            return native
         new = Instance(
             typ=self.type,
             args=args if args is not _dummy else self.args,
@@ -2283,6 +2295,24 @@ class CallableType(FunctionLike):
         unpack_kwargs: Bogus[bool] = _dummy,
         instance_type: Bogus[ProperType | None] = _dummy,
     ) -> CT:
+        changes: dict[str, Any] = {}
+        if arg_types is not _dummy:
+            changes["arg_types"] = arg_types
+        if arg_kinds is not _dummy:
+            changes["arg_kinds"] = arg_kinds
+        if arg_names is not _dummy:
+            changes["arg_names"] = arg_names
+        if ret_type is not _dummy:
+            changes["ret_type"] = ret_type
+        if fallback is not _dummy:
+            changes["fallback"] = fallback
+        if type_guard is not _dummy:
+            changes["type_guard"] = type_guard
+        if type_is is not _dummy:
+            changes["type_is"] = type_is
+        native = _native_copy_modified(self, changes)
+        if native is not None:
+            return cast(CT, native)
         modified = CallableType(
             arg_types=arg_types if arg_types is not _dummy else self.arg_types,
             arg_kinds=arg_kinds if arg_kinds is not _dummy else self.arg_kinds,
@@ -2966,6 +2996,18 @@ class TupleType(ProperType):
     def copy_modified(
         self, *, fallback: Instance | None = None, items: list[Type] | None = None
     ) -> TupleType:
+        changes: dict[str, Any] = {}
+        if fallback is not None:
+            changes["fallback"] = fallback
+        if items is not None:
+            changes["items"] = items
+        native = _native_copy_modified(self, changes)
+        if native is not None:
+            # Python's TupleType(...) constructor always resets implicit
+            # to False, but the wire round-trip preserves the original
+            # value; reset it to match Python's behavior.
+            native.implicit = False  # type: ignore[attr-defined]
+            return native
         if fallback is None:
             fallback = self.partial_fallback
         if items is None:
@@ -3207,6 +3249,23 @@ class TypedDictType(ProperType):
         readonly_keys: set[str] | None = None,
         is_closed: bool | None = None,
     ) -> TypedDictType:
+        # item_names filtering is only supported on the Python path: the
+        # Rust seam cannot express the intersection semantics.
+        if item_names is None:
+            changes: dict[str, Any] = {}
+            if fallback is not None:
+                changes["fallback"] = fallback
+            if item_types is not None:
+                changes["items"] = dict(zip(self.items, item_types))
+            if required_keys is not None:
+                changes["required_keys"] = required_keys
+            if readonly_keys is not None:
+                changes["readonly_keys"] = readonly_keys
+            if is_closed is not None:
+                changes["is_closed"] = is_closed
+            native = _native_copy_modified(self, changes)
+            if native is not None:
+                return native
         if fallback is None:
             fallback = self.fallback
         if item_types is None:
@@ -4294,6 +4353,7 @@ try:
         rust_has_type_vars as _rust_has_type_vars,
         rust_is_literal_type as _rust_is_literal_type,
         rust_is_unannotated_any as _rust_is_unannotated_any,
+        rust_copy_modified as _rust_copy_modified,
         rust_remove_dups as _rust_remove_dups,
         rust_split_with_prefix_and_suffix as _rust_split_with_prefix_and_suffix,
         rust_tuple_length as _rust_tuple_length,
@@ -4309,6 +4369,7 @@ except ImportError:
     _rust_has_recursive_types = None  # type: ignore[assignment]
     _rust_is_literal_type = None  # type: ignore[assignment]
     _rust_is_unannotated_any = None  # type: ignore[assignment]
+    _rust_copy_modified = None  # type: ignore[assignment]
     _rust_remove_dups = None  # type: ignore[assignment]
     _rust_type_vars_as_args = None  # type: ignore[assignment]
     _rust_callable_with_ellipsis = None  # type: ignore[assignment]
@@ -4464,6 +4525,113 @@ def _native_union_length(t: Type) -> int | None:
 def _deserialize_type_from_visitor(b: bytes) -> Type:
     buf = _ReadBuffer(b)
     return _visitor_read_type(buf)
+
+
+def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
+    """Native fast path for `Type.copy_modified(**changes)` (#475).
+
+    Mirrors a single field swap on the wire-format Type in Rust. The
+    replacement fields travel as wire blobs built by
+    `_serialize_copy_modified_value`. Returns None (defer to Python) for
+    multi-field changes, unsupported classes/fields, or when the decoded
+    result cannot be fixed up (no typeinfo map / unresolved type_ref).
+    """
+    if not (_VISITOR_HAS_TYPE_KERNEL and _native_visitor_active):
+        return None
+    if len(changes) != 1:
+        return None
+    try:
+        (field, value), = changes.items()
+    except ValueError:
+        return None
+    # The in-flight guard stops recursion: `_serialize_type_for_visitor`
+    # calls Type.write, and UnionType.write reads can_be_true / can_be_false
+    # which route through the native default → re-serialize → infinite loop.
+    global _native_truthiness_in_flight
+    _native_truthiness_in_flight = True
+    try:
+        value_bytes = _serialize_copy_modified_value(field, value)
+        if value_bytes is None:
+            return None
+        result = _rust_copy_modified(
+            _serialize_type_for_visitor(t), field, value_bytes
+        )
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
+        return None
+    finally:
+        _native_truthiness_in_flight = False
+    if result is None:
+        return None
+    decoded = _deserialize_type_from_visitor(bytes(result))
+    from mypy.wirefixup import fixup_wire_type
+
+    fixed = fixup_wire_type(decoded)
+    if fixed is None:
+        return None
+    return fixed
+
+
+def _serialize_copy_modified_value(field: str, value: Any) -> bytes | None:
+    """Serialize a single copy_modified field value to the wire format.
+
+    Each value uses the same wire layout as the field inside the enclosing
+    type's write(). Returns None for unsupported field shapes.
+    """
+    if field in ("args", "arg_types", "items"):
+        # items is a list for TupleType/UnionType and a dict for
+        # TypedDictType; the blob layout differs, so branch on the value.
+        try:
+            buf = _VisitorWriteBuffer()
+            if isinstance(value, dict):
+                write_type_map(buf, value)
+            else:
+                write_type_list(buf, value)
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, TypeError):
+            return None
+    if field in ("last_known_value", "instance_type", "type_guard", "type_is"):
+        try:
+            buf = _VisitorWriteBuffer()
+            write_type_opt(buf, value)
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, TypeError):
+            return None
+    if field == "ret_type" or field == "fallback" or field == "item":
+        try:
+            buf = _VisitorWriteBuffer()
+            value.write(buf)
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, AttributeError):
+            return None
+    if field == "arg_kinds":
+        try:
+            buf = _VisitorWriteBuffer()
+            write_int_list(buf, [int(k.value) for k in value])
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, AttributeError, ValueError):
+            return None
+    if field == "arg_names":
+        try:
+            buf = _VisitorWriteBuffer()
+            write_str_opt_list(buf, value)
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, TypeError):
+            return None
+    if field in ("required_keys", "readonly_keys"):
+        try:
+            buf = _VisitorWriteBuffer()
+            write_str_list(buf, sorted(value))
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError, TypeError):
+            return None
+    if field == "is_closed" or field == "implicit":
+        try:
+            buf = _VisitorWriteBuffer()
+            write_bool(buf, bool(value))
+            return buf.getvalue()
+        except (AssertionError, NotImplementedError):
+            return None
+    return None
 
 
 def _serialize_type_list_for_visitor(types: Iterable[Type]) -> list[bytes]:

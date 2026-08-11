@@ -61,6 +61,7 @@ mod checkstrformat;
 mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
+mod copymodified;
 mod dataclasses;
 mod erase;
 mod erase_typevars;
@@ -423,7 +424,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints_helpers::rust_is_similar_constraints,
         module
     )?)?;
-    // Issue #474: pure constraint-list filtering functions.
+// Issue #474: pure constraint-list filtering functions.
     module.add_function(wrap_pyfunction!(
         constraints_filter::rust_skip_reverse_union_constraints,
         module
@@ -444,6 +445,8 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints_filter::rust_infer_directed_arg_constraints,
         module
     )?)?;
+    // Issue #475: Type.copy_modified field-swap seam.
+    module.add_function(wrap_pyfunction!(copymodified::rust_copy_modified, module)?)?;
     module.add_function(wrap_pyfunction!(checkcall::rust_classify_call, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkcall::rust_calibrate_type_obj_return,
