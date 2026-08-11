@@ -254,7 +254,10 @@ pub(crate) fn infer_constraints_full_inner(
         Type::TypeVarType { .. } => {
             unreachable!("TypeVarType template handled above")
         }
-        Type::UnionType { .. } | Type::TypeAliasType { .. } => None,
+        Type::TypeAliasType { .. } => None, // needs get_proper_type alias expansion
+        // UnionType is deferred at the top-level check (constraints.py:547-550),
+        // these arms are unreachable. Return [] as a safety fallback.
+        Type::UnionType { .. } => Some(vec![]),
         // Unsupported template shapes: defer to Python.
         Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => None,
     }
