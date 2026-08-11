@@ -138,10 +138,10 @@ except ImportError:
     _HAS_TYPE_KERNEL = False
 
 # Issue-#476 kernels. `descriptor_has_get_set` is parity-clean and active.
-# The other four have a known wire-format parity gap (definition link loss,
-# issue #476 follow-up) and are not imported, so their `is not None` gates
-# stay False and defer to Python. The Rust source ships regardless, so the
-# migration bytes still count on disk.
+# The other four were deferred in #484 because the wire format drops
+# CallableType.definition; wirefixup now re-links definition by name + arity
+# (issue #485), so they are active again via the inner try-block below.
+# Any kernels that fail to import fall back to Python (None gates).
 _rust_check_self_arg = None  # type: ignore[assignment]
 _rust_expand_without_binding = None  # type: ignore[assignment]
 _rust_expand_and_bind_callable = None  # type: ignore[assignment]
