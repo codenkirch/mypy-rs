@@ -84,6 +84,7 @@ mod plugin_helpers;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
+mod semanal_classprop;
 mod semanal_lookup;
 mod semanal_shared;
 mod semanal_visitor;
@@ -1244,6 +1245,23 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         condmaps::rust_or_conditional_maps,
+        module
+    )?)?;
+    // Issue #538: semanal_classprop.py class-property calculators.
+    module.add_function(wrap_pyfunction!(
+        semanal_classprop::rust_calculate_class_abstract_status,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_classprop::rust_check_protocol_status,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_classprop::rust_calculate_class_vars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_classprop::rust_add_type_promotion,
         module
     )?)?;
     Ok(())
