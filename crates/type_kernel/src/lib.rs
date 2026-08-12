@@ -103,6 +103,7 @@ mod typeanal_queries;
 mod typeinfo;
 mod typeops;
 mod types_impl;
+mod util;
 mod visitor;
 mod wire;
 
@@ -1305,13 +1306,26 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(
         semanal_classprop::rust_add_type_promotion,
         module
-    )?)?; // Issue #539: fixup.py NodeFixer/TypeFixer port.
+    )?)?;
+    // Issue #539: fixup.py NodeFixer/TypeFixer port.
     module.add_function(wrap_pyfunction!(fixup::rust_fixup_type, module)?)?;
     module.add_function(wrap_pyfunction!(fixup::rust_fixup_type_info, module)?)?;
     module.add_function(wrap_pyfunction!(fixup::rust_resolve_cross_ref, module)?)?;
     module.add_function(wrap_pyfunction!(fixup::rust_fixup_symbol_table, module)?)?;
     module.add_function(wrap_pyfunction!(
         fixup::rust_fixup_overloaded_func_def,
+        module
+    )?)?;
+    // Issue #533: pure utility functions from util.py.
+    module.add_function(wrap_pyfunction!(util::rust_is_dunder, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_is_sunder, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_split_module_names, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_module_prefix, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_split_target, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_short_type, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_find_python_encoding, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        util::rust_bytes_to_human_readable_repr,
         module
     )?)?;
     // Issue #534: pure helpers from mypy/errors.py.
@@ -1351,5 +1365,33 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(fixup::rust_fixup_decorator, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_decode_python_encoding, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_trim_source_line, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_get_mypy_comments, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_get_prefix, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        util::rust_correct_relative_import,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(util::rust_unmangle, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        util::rust_get_unique_redefinition_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(util::rust_count_stats, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_split_words, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_soft_wrap, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_hash_digest, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_hash_digest_bytes, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_hash_path_stem, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_is_sub_path_normabs, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_is_typeshed_file, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_is_stdlib_file, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_is_stub_package_file, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_unnamed_function, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_time_spent_us, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_plural_s, module)?)?;
+    module.add_function(wrap_pyfunction!(util::rust_json_dumps, module)?)?;
+    module.add_class::<util::IdMapper>()?;
     Ok(())
 }
