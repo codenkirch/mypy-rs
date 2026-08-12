@@ -71,6 +71,7 @@ mod errors;
 mod errors_helpers;
 mod expand;
 mod expandtype;
+mod fixup;
 mod freshen;
 mod generators;
 mod lennarrow;
@@ -1304,6 +1305,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(
         semanal_classprop::rust_add_type_promotion,
         module
+    )?)?; // Issue #539: fixup.py NodeFixer/TypeFixer port.
+    module.add_function(wrap_pyfunction!(fixup::rust_fixup_type, module)?)?;
+    module.add_function(wrap_pyfunction!(fixup::rust_fixup_type_info, module)?)?;
+    module.add_function(wrap_pyfunction!(fixup::rust_resolve_cross_ref, module)?)?;
+    module.add_function(wrap_pyfunction!(fixup::rust_fixup_symbol_table, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        fixup::rust_fixup_overloaded_func_def,
+        module
     )?)?;
     // Issue #534: pure helpers from mypy/errors.py.
     module.add_function(wrap_pyfunction!(
@@ -1341,5 +1350,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         treetransform::rust_transform_copy,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(fixup::rust_fixup_decorator, module)?)?;
     Ok(())
 }
