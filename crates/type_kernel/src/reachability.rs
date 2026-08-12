@@ -105,6 +105,8 @@ enum VersionInfoIndex {
 struct ReachabilityCtx<'py> {
     #[allow(dead_code)]
     py: Python<'py>,
+    // Kept alive to pin the mypy.nodes module for the class references below.
+    #[allow(dead_code)]
     nodes_mod: &'py PyModule,
     // Expression class types
     name_expr_cls: &'py PyType,
@@ -324,7 +326,7 @@ impl<'py> ReachabilityCtx<'py> {
 
         match (index, thing) {
             (Some(VersionInfoIndex::Index(idx)), Some(IntOrTuple::Int(thing_val))) => {
-                if 0 <= idx && idx <= 1 {
+                if (0..=1).contains(&idx) {
                     let pyver_val = self.pyversion.get(idx as usize).copied().unwrap_or(0);
                     Ok(fixed_comparison(&pyver_val, &op, &thing_val))
                 } else {
@@ -453,9 +455,7 @@ impl<'py> ReachabilityCtx<'py> {
         let mut name = String::new();
         let mut result = TRUTH_VALUE_UNKNOWN;
 
-        if expr.is_instance(self.name_expr_cls)? {
-            name = expr.getattr("name")?.extract()?;
-        } else if expr.is_instance(self.member_expr_cls)? {
+        if expr.is_instance(self.name_expr_cls)? || expr.is_instance(self.member_expr_cls)? {
             name = expr.getattr("name")?.extract()?;
         } else if expr.is_instance(self.op_expr_cls)? {
             let op: String = expr.getattr("op")?.extract()?;
@@ -542,7 +542,7 @@ pub(crate) fn rust_infer_condition_value(
 #[pyfunction]
 pub(crate) fn rust_infer_pattern_value(py: Python<'_>, pattern: &PyAny) -> PyResult<u8> {
     let dummy_options = create_dummy_options(py)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.infer_pattern_value(pattern)
 }
 
@@ -569,7 +569,7 @@ pub(crate) fn rust_consider_sys_version_info(
     pyversion: (i64, i64),
 ) -> PyResult<u8> {
     let dummy_options = create_dummy_options_with_version(py, pyversion)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.consider_sys_version_info(expr)
 }
 
@@ -582,7 +582,7 @@ pub(crate) fn rust_consider_sys_platform(
     platform: &str,
 ) -> PyResult<u8> {
     let dummy_options = create_dummy_options_with_platform(py, platform)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.consider_sys_platform(expr)
 }
 
@@ -590,7 +590,7 @@ pub(crate) fn rust_consider_sys_platform(
 #[pyfunction]
 pub(crate) fn rust_is_sys_attr(py: Python<'_>, expr: &PyAny, name: &str) -> PyResult<bool> {
     let dummy_options = create_dummy_options(py)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.is_sys_attr(expr, name)
 }
 
@@ -603,7 +603,7 @@ pub(crate) fn rust_contains_sys_version_info(
     expr: &PyAny,
 ) -> PyResult<Option<PyObject>> {
     let dummy_options = create_dummy_options(py)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     match ctx.contains_sys_version_info(expr)? {
         Some(VersionInfoIndex::Index(idx)) => Ok(Some(idx.into_py(py))),
         Some(VersionInfoIndex::Slice(begin, end)) => {
@@ -631,7 +631,7 @@ pub(crate) fn rust_contains_int_or_tuple_of_ints(
     expr: &PyAny,
 ) -> PyResult<Option<PyObject>> {
     let dummy_options = create_dummy_options(py)?;
-    let ctx = ReachabilityCtx::new(py, &dummy_options)?;
+    let ctx = ReachabilityCtx::new(py, dummy_options)?;
     match ctx.contains_int_or_tuple_of_ints(expr)? {
         Some(IntOrTuple::Int(val)) => Ok(Some(val.into_py(py))),
         Some(IntOrTuple::Tuple(items)) => {
