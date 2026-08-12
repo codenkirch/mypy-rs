@@ -161,10 +161,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(meet::rust_is_overlapping_types, module)?)?;
     module.add_function(wrap_pyfunction!(meet::rust_narrow_declared_type, module)?)?;
     // Issue #526: get_possible_variants alongside narrow_declared_type.
-    module.add_function(wrap_pyfunction!(
-        meet::rust_get_possible_variants,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_get_possible_variants, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
@@ -2038,5 +2035,30 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         message_registry::dataclass_post_init_must_be_a_function,
         module
     )?)?;
+    // Issue #525: is_overlapping_types + helpers from meet.py.
+    // rust_is_overlapping_types is already registered above (line 161).
+    module.add_function(wrap_pyfunction!(
+        meet::rust_is_overlapping_erased_types,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        meet::rust_are_typed_dicts_overlapping,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_are_tuples_overlapping, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        meet::rust_expand_tuple_if_possible,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_adjust_tuple, module)?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_is_tuple, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        meet::rust_is_enum_overlapping_union,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_is_literal_in_union, module)?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_is_object, module)?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_is_none_object_overlap, module)?)?;
+    module.add_function(wrap_pyfunction!(meet::rust_are_related_types, module)?)?;
     Ok(())
 }

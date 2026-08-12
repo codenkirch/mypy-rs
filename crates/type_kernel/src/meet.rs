@@ -1393,6 +1393,196 @@ pub(crate) fn rust_get_possible_variants(
     Some(wbuf.into_bytes())
 }
 
+// -----------------------------------------------------------------
+// Issue #525: wire-seam #[pyfunction] wrappers for meet.py helpers.
+// Each takes serialized Type bytes and returns Option<T> (None =
+// defer to Python). The internal functions above already implement
+// the logic; these wrappers just decode/encode at the seam.
+// -----------------------------------------------------------------
+
+/// `mypy.meet.is_object` (meet.py:425-427).
+#[pyfunction]
+pub(crate) fn rust_is_object(t_bytes: &[u8]) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    Some(is_object(&t))
+}
+
+/// `mypy.meet.is_tuple` (meet.py:872-876).
+#[pyfunction]
+pub(crate) fn rust_is_tuple(t_bytes: &[u8]) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    Some(is_tuple(&t))
+}
+
+/// `mypy.meet.is_none_object_overlap` (meet.py:429-434).
+#[pyfunction]
+pub(crate) fn rust_is_none_object_overlap(t1_bytes: &[u8], t2_bytes: &[u8]) -> Option<bool> {
+    let t1 = decode_type(t1_bytes)?;
+    let t2 = decode_type(t2_bytes)?;
+    Some(is_none_object_overlap(&t1, &t2))
+}
+
+/// `mypy.meet.is_literal_in_union` (meet.py:416-422).
+#[pyfunction]
+pub(crate) fn rust_is_literal_in_union(x_bytes: &[u8], y_bytes: &[u8]) -> Option<bool> {
+    let x = decode_type(x_bytes)?;
+    let y = decode_type(y_bytes)?;
+    is_literal_in_union(&x, &y)
+}
+
+/// `mypy.meet.is_enum_overlapping_union` (meet.py:403-413).
+#[pyfunction]
+pub(crate) fn rust_is_enum_overlapping_union(
+    x_bytes: &[u8],
+    y_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let x = decode_type(x_bytes)?;
+    let y = decode_type(y_bytes)?;
+    is_enum_overlapping_union(&x, &y, resolver.resolver())
+}
+
+/// `mypy.meet.are_related_types` (meet.py:447-456).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_are_related_types(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    proper_subtype: bool,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    let ctx = SubtypeContext::new(
+        false,
+        false,
+        false,
+        ignore_promotions,
+        proper_subtype,
+        strict_optional,
+    );
+    let a = is_subtype(&left, &right, &ctx, resolver.resolver())?;
+    let b = is_subtype(&right, &left, &ctx, resolver.resolver())?;
+    Some(a || b)
+}
+
+/// `mypy.meet.is_overlapping_erased_types` (meet.py:818-824).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_is_overlapping_erased_types(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    let left_erased = crate::argapprox::erase_type(&left, strict_optional, resolver.resolver())?;
+    let right_erased = crate::argapprox::erase_type(&right, strict_optional, resolver.resolver())?;
+    overlap(
+        &left_erased,
+        &right_erased,
+        strict_optional,
+        ignore_promotions,
+        false,
+        resolver.resolver(),
+        0,
+    )
+}
+
+/// `mypy.meet.are_typed_dicts_overlapping` (meet.py:786-807).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_are_typed_dicts_overlapping(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    strict_optional: bool,
+    ignore_promotions: bool,
+    overlap_for_overloads: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let left = get_proper(&left)?;
+    let right = get_proper(&right)?;
+    are_typed_dicts_overlapping(left, right, &|a, b| {
+        overlap(
+            a,
+            b,
+            strict_optional,
+            ignore_promotions,
+            overlap_for_overloads,
+            resolver.resolver(),
+            0,
+        )
+    })
+}
+
+/// `mypy.meet.are_tuples_overlapping` (meet.py:810-843).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_are_tuples_overlapping(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    strict_optional: bool,
+    ignore_promotions: bool,
+    overlap_for_overloads: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let left = get_proper(&left)?;
+    let right = get_proper(&right)?;
+    are_tuples_overlapping(left, right, &|a, b| {
+        overlap(
+            a,
+            b,
+            strict_optional,
+            ignore_promotions,
+            overlap_for_overloads,
+            resolver.resolver(),
+            0,
+        )
+    })
+}
+
+/// `mypy.meet.expand_tuple_if_possible` (meet.py:846-864).
+#[pyfunction]
+pub(crate) fn rust_expand_tuple_if_possible(tup_bytes: &[u8], target: usize) -> Option<Vec<u8>> {
+    let tup = decode_type(tup_bytes)?;
+    let result = expand_tuple_if_possible(&tup, target)?;
+    let mut wbuf = WriteBuffer::new();
+    crate::wire::write_type(&mut wbuf, &result).ok()?;
+    Some(wbuf.into_bytes())
+}
+
+/// `mypy.meet.adjust_tuple` (meet.py:867-872).
+/// Returns serialized TupleType bytes, or None (defer to Python —
+/// Python does `left = adjust_tuple(left, right) or left`, so a None
+/// result correctly keeps the original `left`).
+#[pyfunction]
+pub(crate) fn rust_adjust_tuple(left_bytes: &[u8], r_bytes: &[u8]) -> Option<Vec<u8>> {
+    let left = decode_type(left_bytes)?;
+    let r = decode_type(r_bytes)?;
+    match adjust_tuple(&left, &r) {
+        Some(t) => {
+            let mut wbuf = WriteBuffer::new();
+            crate::wire::write_type(&mut wbuf, &t).ok()?;
+            Some(wbuf.into_bytes())
+        }
+        None => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
