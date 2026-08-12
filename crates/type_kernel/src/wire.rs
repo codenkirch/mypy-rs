@@ -1896,7 +1896,7 @@ fn write_type_opt(buf: &mut WriteBuffer, value: Option<&Type>) -> Result<(), Wir
 
 /// `write_type_list`: `LIST_GEN` + bare size + N types. Inverse of
 /// `read_type_list` (wire.rs:4543-4553).
-fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireError> {
+pub(crate) fn write_type_list(buf: &mut WriteBuffer, items: &[Type]) -> Result<(), WireError> {
     write_tag(buf, LIST_GEN);
     write_int_bare(buf, items.len() as i64)?;
     for item in items {

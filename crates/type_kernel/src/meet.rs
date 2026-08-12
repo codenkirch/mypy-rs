@@ -1373,6 +1373,26 @@ pub(crate) fn rust_narrow_declared_type(
     Some(wbuf.into_bytes())
 }
 
+/// `#[pyfunction]` entry for `mypy.typeops.get_possible_variants`
+/// (meet.py:384-431).
+///
+/// Issue #526 wire seam: caller passes the serialized type; we return the
+/// serialized variant list, or `None` (defer to Python) when a case needs a
+/// live `TypeInfo` our snapshot cannot back (ParamSpec upper-bound MRO
+/// lookup) or a `TypeAliasType` needs expansion (`get_proper` -> None).
+#[pyfunction]
+#[allow(dead_code)]
+pub(crate) fn rust_get_possible_variants(
+    typ_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let typ = decode_type(typ_bytes)?;
+    let variants = get_possible_variants(&typ, resolver.resolver())?;
+    let mut wbuf = WriteBuffer::new();
+    crate::wire::write_type_list(&mut wbuf, &variants).ok()?;
+    Some(wbuf.into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
