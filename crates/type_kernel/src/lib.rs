@@ -1017,6 +1017,27 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_unknown_unpack,
         module
     )?)?;
+    // Issue #542: live-object query functions from typeanal.py.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_find_self_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_validate_instance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_check_vec_type_args,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_is_typevar_default_recursive,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_detect_diverging_alias,
+        module
+    )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
     // (Instance, Callable, TypeVar, Tuple, etc.). Returns None for types
     // needing semantic context, matching Python's deferral semantics.
