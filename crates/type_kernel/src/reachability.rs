@@ -338,12 +338,9 @@ impl<'py> ReachabilityCtx<'py> {
                     let lo_us = lo as usize;
                     let hi_us = hi as usize;
                     let val: Vec<i64> =
-                        self.pyversion[lo_us..hi_us.min(self.pyversion.len())]
-                            .to_vec();
+                        self.pyversion[lo_us..hi_us.min(self.pyversion.len())].to_vec();
                     if val.len() == thing_tuple.len()
-                        || (val.len() > thing_tuple.len()
-                            && op != "=="
-                            && op != "!=")
+                        || (val.len() > thing_tuple.len() && op != "==" && op != "!=")
                     {
                         Ok(fixed_comparison(&val, &op, &thing_tuple))
                     } else {
@@ -591,11 +588,7 @@ pub(crate) fn rust_consider_sys_platform(
 
 /// `mypy.reachability.is_sys_attr` — is `expr` a `sys.<name>` member expr?
 #[pyfunction]
-pub(crate) fn rust_is_sys_attr(
-    py: Python<'_>,
-    expr: &PyAny,
-    name: &str,
-) -> PyResult<bool> {
+pub(crate) fn rust_is_sys_attr(py: Python<'_>, expr: &PyAny, name: &str) -> PyResult<bool> {
     let dummy_options = create_dummy_options(py)?;
     let ctx = ReachabilityCtx::new(py, &dummy_options)?;
     ctx.is_sys_attr(expr, name)
@@ -642,10 +635,7 @@ pub(crate) fn rust_contains_int_or_tuple_of_ints(
     match ctx.contains_int_or_tuple_of_ints(expr)? {
         Some(IntOrTuple::Int(val)) => Ok(Some(val.into_py(py))),
         Some(IntOrTuple::Tuple(items)) => {
-            let tuple = PyTuple::new(
-                py,
-                items.iter().map(|v| v.into_py(py)).collect::<Vec<_>>(),
-            );
+            let tuple = PyTuple::new(py, items.iter().map(|v| v.into_py(py)).collect::<Vec<_>>());
             Ok(Some(tuple.into()))
         }
         None => Ok(None),
@@ -657,11 +647,7 @@ pub(crate) fn rust_contains_int_or_tuple_of_ints(
 /// Takes Python objects and compares them using Python comparison operators,
 /// returning a truth-value constant.
 #[pyfunction]
-pub(crate) fn rust_fixed_comparison(
-    left: &PyAny,
-    op: &str,
-    right: &PyAny,
-) -> PyResult<u8> {
+pub(crate) fn rust_fixed_comparison(left: &PyAny, op: &str, right: &PyAny) -> PyResult<u8> {
     use pyo3::basic::CompareOp;
     let rmap = |b: bool| if b { ALWAYS_TRUE } else { ALWAYS_FALSE };
     let op_enum = match op {
@@ -689,10 +675,7 @@ fn create_dummy_options(py: Python<'_>) -> PyResult<&PyAny> {
     Ok(options)
 }
 
-fn create_dummy_options_with_version(
-    py: Python<'_>,
-    pyversion: (i64, i64),
-) -> PyResult<&PyAny> {
+fn create_dummy_options_with_version(py: Python<'_>, pyversion: (i64, i64)) -> PyResult<&PyAny> {
     let options_cls = py.import("mypy.options")?.getattr("Options")?;
     let options = options_cls.call0()?;
     options.setattr("python_version", pyversion)?;
