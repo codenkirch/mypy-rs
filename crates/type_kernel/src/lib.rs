@@ -68,6 +68,7 @@ mod dataclasses;
 mod erase;
 mod erase_typevars;
 mod errors;
+mod errors_helpers;
 mod expand;
 mod expandtype;
 mod freshen;
@@ -1262,6 +1263,31 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_classprop::rust_add_type_promotion,
+        module
+    )?)?;
+    // Issue #534: pure helpers from mypy/errors.py.
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_remove_path_prefix,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_report_internal_error,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_format_messages_default_pretty,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_sort_within_context,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_create_errors,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        errors_helpers::rust_yield_nonoverlapping_types,
         module
     )?)?;
     Ok(())
