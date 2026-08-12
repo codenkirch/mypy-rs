@@ -81,6 +81,7 @@ mod messages;
 mod mro;
 mod operators;
 mod overload;
+mod partially_defined;
 mod plugin_helpers;
 mod plugin_hooks;
 mod refs;
@@ -1305,6 +1306,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         errors_helpers::rust_yield_nonoverlapping_types,
+        module
+    )?)?;
+    // Issue #537: partially-defined variable detection
+    // (port of mypy.partially_defined.PossiblyUndefinedVariableVisitor).
+    module.add_function(wrap_pyfunction!(
+        partially_defined::rust_find_possibly_undefined,
         module
     )?)?;
     Ok(())
