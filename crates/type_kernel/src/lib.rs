@@ -97,6 +97,7 @@ mod stubgen;
 mod subtypes;
 mod suggestions;
 mod traverser;
+mod treetransform;
 mod typeanal_queries;
 mod typeinfo;
 mod typeops;
@@ -1312,6 +1313,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // (port of mypy.partially_defined.PossiblyUndefinedVariableVisitor).
     module.add_function(wrap_pyfunction!(
         partially_defined::rust_find_possibly_undefined,
+        module
+    )?)?;
+    // Issue #536: TransformVisitor identity deep-copy port.
+    module.add_function(wrap_pyfunction!(
+        treetransform::rust_transform_copy,
         module
     )?)?;
     Ok(())
