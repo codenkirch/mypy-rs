@@ -56,11 +56,13 @@ jobs:
         run: cargo clippy -p mypy-type-kernel --lib -- -D warnings
 
       - name: cargo test (pure-Rust type_kernel suites)
-        env:
-          # treetransform tests import `mypy.nodes` from the checkout root at
-          # cargo-test time; make the repo importable as a package.
-          PYTHONPATH: ${{ github.workspace }}
-        run: cargo test -p mypy-type-kernel
+        run: |
+          # treetransform tests import mypy.nodes (+ deps) at cargo-test time;
+          # the pyo3-embedded interpreter must see the repo root and the uv
+          # venv's site-packages, and link against the venv python.
+          SITE=$(uv run python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          PYO3_PYTHON=$(uv run python -c "import sys; print(sys.executable)") \
+          PYTHONPATH="$GITHUB_WORKSPACE:$SITE" cargo test -p mypy-type-kernel
 
       - name: Build type_kernel extension
         run: |

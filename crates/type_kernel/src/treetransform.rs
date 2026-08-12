@@ -1377,6 +1377,9 @@ fn transform_node(
         }
         // --- Block ---
         "Block" => visit_block(py, node, var_map, fpm),
+        // Var can appear at top level (e.g. class-level attrs); mirror the
+        // Python visit_var instead of falling through to None.
+        "Var" => Ok(visit_var(py, node, var_map, fpm)?.into_py(py)),
         _ => {
             // Unhandled: return None to defer to Python.
             Ok(py.None())
