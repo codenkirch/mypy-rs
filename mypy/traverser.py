@@ -128,6 +128,19 @@ try:
     from type_kernel import (
         rust_count_name_and_member_expressions as _rust_count_name_and_member_exprs,
     )
+    from type_kernel import (
+        rust_count_return_statements_and_flags as _rust_count_returns_and_flags,
+    )
+    from type_kernel import rust_count_all_returns as _rust_count_all_returns
+    from type_kernel import rust_has_yield_return as _rust_has_yield_return
+    from type_kernel import rust_has_complex_slice as _rust_has_complex_slice
+    from type_kernel import (
+        rust_count_non_extension_handlers as _rust_count_non_extension_handlers,
+    )
+    from type_kernel import rust_is_global_expr as _rust_is_global_expr
+    from type_kernel import (
+        rust_count_non_literal_handlers as _rust_count_non_literal_handlers,
+    )
     from mypy.astwire import serialize_node as _ast_serialize_node
     from mypy.cache import WriteBuffer as _AstWriteBuffer
 
@@ -142,6 +155,13 @@ except ImportError:
     _rust_count_yield_expressions = None  # type: ignore[assignment]
     _rust_count_yield_from_expressions = None  # type: ignore[assignment]
     _rust_count_name_and_member_exprs = None  # type: ignore[assignment]
+    _rust_count_returns_and_flags = None  # type: ignore[assignment]
+    _rust_count_all_returns = None  # type: ignore[assignment]
+    _rust_has_yield_return = None  # type: ignore[assignment]
+    _rust_has_complex_slice = None  # type: ignore[assignment]
+    _rust_count_non_extension_handlers = None  # type: ignore[assignment]
+    _rust_is_global_expr = None  # type: ignore[assignment]
+    _rust_count_non_literal_handlers = None  # type: ignore[assignment]
     _ast_serialize_node = None  # type: ignore[assignment]
     _AstWriteBuffer = None  # type: ignore[assignment,misc]
     _TRAVERSER_HAS_KERNEL = False
@@ -1217,3 +1237,210 @@ def all_yield_from_expressions(node: Node) -> list[tuple[YieldFromExpr, bool]]:
     v = YieldFromCollector()
     node.accept(v)
     return v.yield_from_expressions
+
+
+# ---------------------------------------------------------------------------
+# Issue #541: remaining seekers (structural, wire-format backed).
+# These functions do not have pre-existing pure-Python collectors in
+# traverser.py. Each uses the Rust extension for the structural walk
+# and falls back to a pure-Python implementation on ImportError or
+# runtime error.
+
+
+class ReturnAndFlagsCollector(FuncCollectorBase):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_finally = False
+        self.return_statements: list[tuple[ReturnStmt, bool]] = []
+
+    def visit_try_stmt(self, o: TryStmt) -> None:
+        # TraverserVisitor.visit_try_stmt visits body, handlers, else,
+        # then finally. We set in_finally only while visiting finally_body.
+        o.body.accept(self)
+        for i in range(len(o.types)):
+            tp = o.types[i]
+            if tp is not None:
+                tp.accept(self)
+            o.handlers[i].accept(self)
+        for v in o.vars:
+            if v is not None:
+                v.accept(self)
+        if o.else_body is not None:
+            o.else_body.accept(self)
+        if o.finally_body is not None:
+            old = self.in_finally
+            self.in_finally = True
+            o.finally_body.accept(self)
+            self.in_finally = old
+
+    def visit_return_stmt(self, stmt: ReturnStmt) -> None:
+        self.return_statements.append((stmt, self.in_finally))
+
+
+def all_return_statements_and_flags(
+    node: Node,
+) -> list[tuple[ReturnStmt, bool]]:
+    """Collect (ReturnStmt, in_finally) pairs."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            total, in_finally = _rust_count_returns_and_flags(
+                _serialize_ast_node(node)
+            )
+            if total == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = ReturnAndFlagsCollector()
+    node.accept(v)
+    return v.return_statements
+
+
+def count_returns(node: Node) -> int:
+    """Count ALL return statements, including those in nested functions."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            return _rust_count_all_returns(_serialize_ast_node(node))
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    count = 0
+
+    class Counter(TraverserVisitor):
+        def visit_return_stmt(self, o: ReturnStmt) -> None:
+            nonlocal count
+            count += 1
+
+    v = Counter()
+    node.accept(v)
+    return count
+
+
+class YieldReturnSeeker(TraverserVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.found = False
+
+    def visit_return_stmt(self, o: ReturnStmt) -> None:
+        if o.expr is not None and isinstance(o.expr, YieldExpr):
+            self.found = True
+
+
+def has_yield_return(node: Node) -> bool:
+    """Check if the subtree contains `return yield <expr>`."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            return _rust_has_yield_return(_serialize_ast_node(node))
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = YieldReturnSeeker()
+    node.accept(v)
+    return v.found
+
+
+class ComplexSliceSeeker(TraverserVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.found = False
+
+    def visit_slice_expr(self, o: SliceExpr) -> None:
+        if o.stride is not None:
+            self.found = True
+
+
+def has_complex_slice(node: Node) -> bool:
+    """Check if the subtree contains a slice with a stride (step)."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            return _rust_has_complex_slice(_serialize_ast_node(node))
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = ComplexSliceSeeker()
+    node.accept(v)
+    return v.found
+
+
+class NonExtensionHandlerCollector(TraverserVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.funcs: list[FuncDef] = []
+
+    def visit_class_def(self, o: ClassDef) -> None:
+        for d in o.defs.body:
+            if isinstance(d, FuncDef) and not d.is_decorated:
+                self.funcs.append(d)
+
+
+def find_non_extension_handlers(node: Node) -> list[FuncDef]:
+    """Find methods (FuncDef) not wrapped in a Decorator."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            if _rust_count_non_extension_handlers(
+                _serialize_ast_node(node)
+            ) == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = NonExtensionHandlerCollector()
+    node.accept(v)
+    return v.funcs
+
+
+class GlobalDeclSeeker(TraverserVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.found = False
+
+    def visit_global_decl(self, o: GlobalDecl) -> None:
+        self.found = True
+
+
+def is_global_expr(node: Node) -> bool:
+    """Check if the subtree contains a `global` declaration."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            return _rust_is_global_expr(_serialize_ast_node(node))
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = GlobalDeclSeeker()
+    node.accept(v)
+    return v.found
+
+
+class NonLiteralHandlerCollector(TraverserVisitor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.funcs: list[FuncDef] = []
+
+    def visit_class_def(self, o: ClassDef) -> None:
+        for d in o.defs.body:
+            if isinstance(d, FuncDef) and not _is_literal_handler(d):
+                self.funcs.append(d)
+
+
+def _is_literal_handler(func: FuncDef) -> bool:
+    """A literal handler has only literal expr stmts or pass in its body."""
+    for stmt in func.body.body:
+        if isinstance(stmt, PassStmt):
+            continue
+        if isinstance(stmt, ExpressionStmt):
+            expr = stmt.expr
+            if isinstance(
+                expr, (IntExpr, StrExpr, FloatExpr, BytesExpr, ComplexExpr, EllipsisExpr)
+            ):
+                continue
+        return False
+    return True
+
+
+def find_non_literal_handlers(node: Node) -> list[FuncDef]:
+    """Find methods whose body is not all-literal expressions."""
+    if _TRAVERSER_HAS_KERNEL:
+        try:
+            if _rust_count_non_literal_handlers(
+                _serialize_ast_node(node)
+            ) == 0:
+                return []
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    v = NonLiteralHandlerCollector()
+    node.accept(v)
+    return v.funcs

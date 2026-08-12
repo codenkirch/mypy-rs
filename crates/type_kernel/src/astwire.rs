@@ -284,6 +284,42 @@ pub(crate) fn is_assignment_stmt(tag: u8) -> bool {
     tag == ASSIGNMENT_STMT
 }
 
+/// Check if a node is a TryStmt.
+pub(crate) fn is_try_stmt(tag: u8) -> bool {
+    tag == TRY_STMT
+}
+
+/// Check if a node is a SliceExpr.
+pub(crate) fn is_slice_expr(tag: u8) -> bool {
+    tag == SLICE_EXPR
+}
+
+/// Check if a node is a GlobalDecl.
+pub(crate) fn is_global_decl(tag: u8) -> bool {
+    tag == GLOBAL_DECL
+}
+
+/// Check if a node is a Decorator.
+pub(crate) fn is_decorator(tag: u8) -> bool {
+    tag == DECORATOR
+}
+
+/// Check if a node is a ClassDef.
+pub(crate) fn is_class_def(tag: u8) -> bool {
+    tag == CLASS_DEF
+}
+
+/// Check if a node is a literal leaf expression
+/// (IntExpr, StrExpr, FloatExpr, BytesExpr, ComplexExpr, EllipsisExpr).
+pub(crate) fn is_literal_expr(tag: u8) -> bool {
+    tag == INT_EXPR
+        || tag == STR_EXPR
+        || tag == FLOAT_EXPR
+        || tag == BYTES_EXPR
+        || tag == COMPLEX_EXPR
+        || tag == ELLIPSIS_EXPR
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
