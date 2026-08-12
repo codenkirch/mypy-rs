@@ -18,9 +18,18 @@
 //! All four queries defer on `TypeAliasType`; `rust_type_analyze` also defers on
 //! TypeAliasType and UnboundType because their analysis requires the live alias
 //! target or symbol lookup respectively.
+//!
+//! Live-object queries (Stage 18):
+//! - `find_self_type` — BoolTypeQuery with lookup callback, checks SELF_TYPE_NAMES.
+//! - `validate_instance` — argument count/position validation on a live Instance.
+//! - `check_vec_type_args` — vec type argument validation.
+//! - `is_typevar_default_recursive` — BFS over `default_depends` graph.
+//! - `detect_diverging_alias` — DivergingAliasDetector visitor.
 
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
 
+use crate::refs::{is_instance, TypeRefs};
 use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Type, WriteBuffer};
 
 // TypeOfAny constants (mirror mypy/types.py:213-239).
@@ -389,6 +398,1078 @@ fn unknown_unpack_inner(t: &Type) -> Option<bool> {
         // isinstance(unpacked, AnyType) and type_of_any == special_form.
         Type::AnyType { type_of_any, .. } => Some(*type_of_any == SPECIAL_FORM),
         _ => Some(false),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// find_self_type (live-object BoolTypeQuery with lookup callback)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.find_self_type` — true if `typ` contains a Self type.
+///
+/// Mirrors `HasSelfType` (typeanal.py:2846-2855): a `BoolTypeQuery` with
+/// `ANY_STRATEGY` that overrides `visit_unbound_type` to check if the
+/// unbound name resolves to a symbol in `SELF_TYPE_NAMES`. All other
+/// type variants use the default `BoolTypeQuery` descent (ANY_STRATEGY
+/// over children).
+///
+/// `lookup` is a Python callable `Callable[[str], SymbolTableNode | None]`.
+/// Returns `None` (defer) when a type variant is not handled by Rust.
+#[pyfunction]
+pub(crate) fn rust_find_self_type(
+    py: Python<'_>,
+    typ: &PyAny,
+    lookup: &PyAny,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let ctx = SelfTypeCtx {
+        refs: &refs,
+        lookup,
+    };
+    match find_self_type_inner(py, typ, &ctx) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+struct DeferError;
+
+struct SelfTypeCtx<'a> {
+    refs: &'a TypeRefs<'a>,
+    lookup: &'a PyAny,
+}
+
+fn find_self_type_inner(
+    py: Python<'_>,
+    obj: &PyAny,
+    ctx: &SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    // UnboundType: lookup name, check SELF_TYPE_NAMES, then descend args.
+    if is_instance(obj, ctx.refs.unpack_type) && class_name_is(obj, "UnboundType") {
+        return self_type_visit_unbound(py, obj, ctx);
+    }
+    if class_name_is(obj, "UnboundType") {
+        return self_type_visit_unbound(py, obj, ctx);
+    }
+    // TypeVar-like types: no Self type inside.
+    if is_instance(obj, ctx.refs.type_var_type)
+        || is_instance(obj, ctx.refs.param_spec_type)
+        || is_instance(obj, ctx.refs.type_var_tuple_type)
+    {
+        return Ok(false);
+    }
+    // AnyType: no Self type.
+    if is_instance(obj, ctx.refs.any_type) {
+        return Ok(false);
+    }
+    // NoneType, UninhabitedType, DeletedType, LiteralType: no children.
+    if is_instance(obj, ctx.refs.none_type)
+        || is_instance(obj, ctx.refs.uninhabited_type)
+        || is_instance(obj, ctx.refs.deleted_type)
+        || is_instance(obj, ctx.refs.literal_type)
+    {
+        return Ok(false);
+    }
+    // UnpackType: recurse into typ.
+    if is_instance(obj, ctx.refs.unpack_type) {
+        let typ = get_attr_or_defer(obj, "type")?;
+        return find_self_type_inner(py, typ, ctx);
+    }
+    // Instance: recurse into args + last_known_value.
+    if is_instance(obj, ctx.refs.instance) {
+        return self_type_any_children(py, obj, &["args"], ctx, true);
+    }
+    // CallableType: recurse arg_types, ret_type, instance_type.
+    if is_instance(obj, ctx.refs.callable_type) {
+        return self_type_callable(py, obj, ctx);
+    }
+    // Overloaded: recurse items.
+    if is_instance(obj, ctx.refs.overloaded) {
+        let items = get_attr_or_defer(obj, "items")?;
+        return self_type_any_seq(py, items, ctx);
+    }
+    // TupleType: recurse items + partial_fallback.
+    if is_instance(obj, ctx.refs.tuple_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        if self_type_any_seq(py, items, ctx)? {
+            return Ok(true);
+        }
+        let fb = get_attr_or_defer(obj, "partial_fallback")?;
+        return find_self_type_inner(py, fb, ctx);
+    }
+    // TypedDictType: recurse items values + fallback.
+    if is_instance(obj, ctx.refs.typed_dict_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
+        for (_, v) in dict.iter() {
+            if find_self_type_inner(py, v, ctx)? {
+                return Ok(true);
+            }
+        }
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        return find_self_type_inner(py, fb, ctx);
+    }
+    // UnionType: recurse items (ANY_STRATEGY).
+    if is_instance(obj, ctx.refs.union_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        return self_type_any_seq(py, items, ctx);
+    }
+    // TypeType: recurse item.
+    if is_instance(obj, ctx.refs.type_type) {
+        let item = get_attr_or_defer(obj, "item")?;
+        return find_self_type_inner(py, item, ctx);
+    }
+    // TypeAliasType: recurse args (skip alias target, matching
+    // BoolTypeQuery default with skip_alias_target not set — the
+    // default visit_type_alias_type in BoolTypeQuery queries args).
+    if is_instance(obj, ctx.refs.type_alias_type) {
+        let args = get_attr_or_defer(obj, "args")?;
+        return self_type_any_seq(py, args, ctx);
+    }
+    // Parameters: recurse arg_types.
+    if class_name_is(obj, "Parameters") {
+        let arg_types = get_attr_or_defer(obj, "arg_types")?;
+        return self_type_any_seq(py, arg_types, ctx);
+    }
+    // Unknown type variant: defer.
+    Err(DeferError)
+}
+
+/// `visit_unbound_type`: lookup name, check SELF_TYPE_NAMES, then args.
+fn self_type_visit_unbound(
+    py: Python<'_>,
+    obj: &PyAny,
+    ctx: &SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    let name = obj.getattr("name").map_err(|_| DeferError)?;
+    let name_str: String = if name.is_none() {
+        return Err(DeferError);
+    } else {
+        let s = name.downcast::<PyString>().map_err(|_| DeferError)?;
+        s.to_str().map(|s| s.to_string()).map_err(|_| DeferError)?
+    };
+    // Call lookup(name) -> SymbolTableNode | None.
+    let sym = ctx.lookup.call1((&name_str,)).map_err(|_| DeferError)?;
+    if !sym.is_none() {
+        let fullname = sym.getattr("fullname").map_err(|_| DeferError)?;
+        if !fullname.is_none() {
+            let fn_str = fullname.downcast::<PyString>().map_err(|_| DeferError)?;
+            let fn_s = fn_str.to_str().map_err(|_| DeferError)?;
+            if fn_s == "typing.Self" || fn_s == "typing_extensions.Self" {
+                return Ok(true);
+            }
+        }
+    }
+    // super().visit_unbound_type(t) -> query_types(t.args).
+    let args = obj.getattr("args").map_err(|_| DeferError)?;
+    self_type_any_seq(py, args, ctx)
+}
+
+/// ANY_STRATEGY over a sequence of child types.
+fn self_type_any_seq(
+    py: Python<'_>,
+    seq: &PyAny,
+    ctx: &SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    for child in iter_seq(seq)? {
+        if find_self_type_inner(py, child, ctx)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// ANY_STRATEGY over named attrs, optionally also last_known_value.
+fn self_type_any_children(
+    py: Python<'_>,
+    obj: &PyAny,
+    attrs: &[&str],
+    ctx: &SelfTypeCtx<'_>,
+    check_lkv: bool,
+) -> Result<bool, DeferError> {
+    for attr_name in attrs {
+        let seq = get_attr_or_defer(obj, attr_name)?;
+        if self_type_any_seq(py, seq, ctx)? {
+            return Ok(true);
+        }
+    }
+    if check_lkv {
+        let lkv = obj.getattr("last_known_value").map_err(|_| DeferError)?;
+        if !lkv.is_none() && find_self_type_inner(py, lkv, ctx)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// ANY_STRATEGY over callable's arg_types, ret_type, instance_type.
+fn self_type_callable(
+    py: Python<'_>,
+    obj: &PyAny,
+    ctx: &SelfTypeCtx<'_>,
+) -> Result<bool, DeferError> {
+    let arg_types = get_attr_or_defer(obj, "arg_types")?;
+    if self_type_any_seq(py, arg_types, ctx)? {
+        return Ok(true);
+    }
+    let ret = get_attr_or_defer(obj, "ret_type")?;
+    if find_self_type_inner(py, ret, ctx)? {
+        return Ok(true);
+    }
+    let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
+    if !inst.is_none() && find_self_type_inner(py, inst, ctx)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// validate_instance (live Instance argument count/position validation)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.validate_instance` — check well-formedness of an
+/// `Instance` with respect to argument count/positions.
+///
+/// Mirrors typeanal.py:2768-2839. Returns `None` (defer) when any
+/// sub-check needs information Rust can't access (e.g. unknown_unpack
+/// on a type the wire can't decode), so the Python caller re-runs the
+/// full validation. When the check passes or fails deterministically,
+/// returns `Some(true)` or `Some(false)`. The `fail` callback is a
+/// Python `MsgCallback` that takes `(message, context, code=...)`.
+#[pyfunction]
+pub(crate) fn rust_validate_instance(
+    py: Python<'_>,
+    t: &PyAny,
+    fail: &PyAny,
+    indexed: bool,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    match validate_instance_inner(py, t, fail, indexed, &refs) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+fn validate_instance_inner(
+    py: Python<'_>,
+    t: &PyAny,
+    fail: &PyAny,
+    indexed: bool,
+    refs: &TypeRefs<'_>,
+) -> Result<bool, DeferError> {
+    let args = get_attr_or_defer(t, "args")?;
+    let arg_list = iter_seq(args)?;
+    // any(unknown_unpack(a) for a in t.args) — defer on unknown types.
+    for a in &arg_list {
+        if !is_instance(a, refs.unpack_type) {
+            continue;
+        }
+        // unknown_unpack: UnpackType whose proper type is
+        // AnyType(special_form). Defer on alias target.
+        let unpacked = a.getattr("type").map_err(|_| DeferError)?;
+        if is_instance(unpacked, refs.type_alias_type) {
+            return Err(DeferError);
+        }
+        if is_instance(unpacked, refs.any_type) {
+            let toa = unpacked.getattr("type_of_any").map_err(|_| DeferError)?;
+            let sf = refs
+                .type_of_any
+                .getattr("special_form")
+                .map_err(|_| DeferError)?;
+            if toa.eq(sf).unwrap_or(false) {
+                return Ok(false);
+            }
+        }
+    }
+    let empty_tuple_index = indexed && arg_list.is_empty();
+    let typ_type = get_attr_or_defer(t, "type")?;
+
+    let has_tvt = typ_type
+        .getattr("has_type_var_tuple_type")
+        .map_err(|_| DeferError)?;
+    let has_tvt: bool = has_tvt.is_true().map_err(|_| DeferError)?;
+
+    if has_tvt {
+        return validate_instance_variadic(py, t, fail, &arg_list, empty_tuple_index, typ_type);
+    }
+
+    // Non-variadic path.
+    if arg_list.iter().any(|a| is_instance(a, refs.unpack_type)) {
+        // Variadic unpack in fixed-size instance.
+        fail_call(py, fail, "Invalid unpack position", t);
+        // t.args = () — set on the live object.
+        let _ = t.setattr("args", PyList::empty(py));
+        return Ok(false);
+    }
+
+    let type_vars = typ_type.getattr("type_vars").map_err(|_| DeferError)?;
+    let tv_list = iter_seq(type_vars)?;
+    let expected = tv_list.len();
+    if arg_list.len() != expected {
+        // Check min_tv_count and emit error, but always return false.
+        let defn = typ_type.getattr("defn").map_err(|_| DeferError)?;
+        let defn_type_vars = defn.getattr("type_vars").map_err(|_| DeferError)?;
+        let defn_list = iter_seq(defn_type_vars)?;
+        let min_tv_count = defn_list
+            .iter()
+            .filter(|tv| {
+                let has_def = tv.getattr("has_default").map_err(|_| false);
+                match has_def {
+                    Ok(f) => !f.is_true().unwrap_or(true),
+                    Err(_) => false,
+                }
+            })
+            .count();
+        let arg_count = arg_list.len();
+        if (arg_count > 0 || empty_tuple_index)
+            && (arg_count < min_tv_count || arg_count > expected)
+        {
+            let type_name = typ_type.getattr("name").map_err(|_| DeferError)?;
+            let name_str = type_name
+                .downcast::<PyString>()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            let msg = wrong_type_arg_count_msg(min_tv_count, expected, arg_count, &name_str);
+            fail_call(py, fail, &msg, t);
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Variadic instance validation (has_type_var_tuple_type == True).
+fn validate_instance_variadic(
+    py: Python<'_>,
+    t: &PyAny,
+    fail: &PyAny,
+    arg_list: &[&PyAny],
+    empty_tuple_index: bool,
+    typ_type: &PyAny,
+) -> Result<bool, DeferError> {
+    let refs = TypeRefs::try_new(py).map_err(|_| DeferError)?;
+    let defn = typ_type.getattr("defn").map_err(|_| DeferError)?;
+    let defn_type_vars = defn.getattr("type_vars").map_err(|_| DeferError)?;
+    let defn_list = iter_seq(defn_type_vars)?;
+    let min_tv_count = defn_list
+        .iter()
+        .filter(|tv| {
+            let has_def = tv.getattr("has_default").ok();
+            let is_tvt = is_instance(tv, refs.type_var_tuple_type);
+            match has_def {
+                Some(f) => !f.is_true().unwrap_or(true) && !is_tvt,
+                None => !is_tvt,
+            }
+        })
+        .count();
+    // Python: correct = len(t.args) >= min_tv_count
+    //         if any(unpack-Instance): correct = True
+    let mut correct = arg_list.len() >= min_tv_count;
+    for a in arg_list {
+        if !is_instance(a, refs.unpack_type) {
+            continue;
+        }
+        let inner = match a.getattr("type") {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        if is_instance(inner, refs.type_alias_type) {
+            return Err(DeferError);
+        }
+        if is_instance(inner, refs.instance) {
+            correct = true;
+            break;
+        }
+    }
+
+    if arg_list.is_empty() {
+        if !(empty_tuple_index && {
+            let tvs = typ_type.getattr("type_vars").map_err(|_| DeferError)?;
+            iter_seq(tvs)?.len() == 1
+        }) {
+            if empty_tuple_index && min_tv_count > 0 {
+                let msg = format!("At least {min_tv_count} type argument(s) expected, none given");
+                fail_call(py, fail, &msg, t);
+            }
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    if !correct {
+        let msg = format!(
+            "Bad number of arguments, expected: at least {min_tv_count}, \
+             given: {}",
+            arg_list.len()
+        );
+        fail_call(py, fail, &msg, t);
+        return Ok(false);
+    }
+    // Check TypeVarTuple split.
+    let unpack_idx = arg_list
+        .iter()
+        .position(|a| is_instance(a, refs.unpack_type));
+    if let Some(idx) = unpack_idx {
+        let unpack_arg = arg_list[idx];
+        let inner = unpack_arg.getattr("type").map_err(|_| DeferError)?;
+        if is_instance(inner, refs.type_var_tuple_type) {
+            let exp_prefix = typ_type
+                .getattr("type_var_tuple_prefix")
+                .map_err(|_| DeferError)?;
+            if exp_prefix.is_none() {
+                return Err(DeferError);
+            }
+            let exp_suffix = typ_type
+                .getattr("type_var_tuple_suffix")
+                .map_err(|_| DeferError)?;
+            if exp_suffix.is_none() {
+                return Err(DeferError);
+            }
+            let exp_prefix: i64 = exp_prefix.extract().map_err(|_| DeferError)?;
+            let exp_suffix: i64 = exp_suffix.extract().map_err(|_| DeferError)?;
+            let act_prefix = idx as i64;
+            let act_suffix = (arg_list.len() - idx - 1) as i64;
+            if act_prefix < exp_prefix || act_suffix < exp_suffix {
+                fail_call(py, fail, "TypeVarTuple cannot be split", t);
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn wrong_type_arg_count_msg(min: usize, max: usize, given: usize, type_name: &str) -> String {
+    if min == max {
+        format!("{type_name} expects {min} type arguments, but {given} given")
+    } else {
+        format!("{type_name} expects {min} to {max} type arguments, but {given} given")
+    }
+}
+
+fn fail_call(py: Python<'_>, fail: &PyAny, msg: &str, context: &PyAny) {
+    let _ = py.import("mypy.messages").and_then(|m| {
+        let code = m.getattr("codes")?.getattr("TYPE_ARG")?;
+        let _ = fail.call1((msg, context, code));
+        Ok::<(), pyo3::PyErr>(())
+    });
+}
+
+// ---------------------------------------------------------------------------
+// check_vec_type_args (live type argument validation for 'vec')
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.check_vec_type_args` — report an error if type args
+/// for 'vec' are invalid. Returns `None` to defer.
+///
+/// Mirrors typeanal.py:3038-3086. The `api` object must provide
+/// `is_stub_file` (bool) and `fail` (callable). Recurses on
+/// optional unions.
+#[pyfunction]
+pub(crate) fn rust_check_vec_type_args(
+    py: Python<'_>,
+    args: &PyAny,
+    ctx: &PyAny,
+    api: &PyAny,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    match check_vec_type_args_inner(py, args, ctx, api, &refs) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+fn check_vec_type_args_inner(
+    py: Python<'_>,
+    args: &PyAny,
+    ctx: &PyAny,
+    api: &PyAny,
+    refs: &TypeRefs<'_>,
+) -> Result<bool, DeferError> {
+    let arg_list = iter_seq(args)?;
+    let mut ok = true;
+    if arg_list.len() != 1 {
+        ok = false;
+    } else {
+        let arg = arg_list[0];
+        // get_proper_type — defer on alias.
+        if is_instance(arg, refs.type_alias_type) {
+            return Err(DeferError);
+        }
+        if is_instance(arg, refs.instance) {
+            let typ = arg.getattr("type").map_err(|_| DeferError)?;
+            let fullname = typ.getattr("fullname").map_err(|_| DeferError)?;
+            let fn_str = fullname.downcast::<PyString>().map_err(|_| DeferError)?;
+            let fn_s = fn_str.to_str().map_err(|_| DeferError)?;
+            if fn_s == "builtins.int" {
+                ok = false;
+            }
+        } else if is_instance(arg, refs.union_type) {
+            ok = check_vec_union(py, arg, ctx, api, refs)?;
+            if !ok {
+                return Ok(false);
+            }
+        } else if is_instance(arg, refs.type_var_type) {
+            let is_stub = api.getattr("is_stub_file").map_err(|_| DeferError)?;
+            if !is_stub.is_true().map_err(|_| DeferError)? {
+                ok = false;
+            }
+        } else {
+            ok = false;
+        }
+    }
+    if !ok {
+        let _ = api.call1(("fail", "Invalid item type for \"vec\"", ctx));
+    }
+    Ok(ok)
+}
+
+/// Check vec args for a UnionType (Optional handling).
+fn check_vec_union(
+    py: Python<'_>,
+    arg: &PyAny,
+    ctx: &PyAny,
+    api: &PyAny,
+    refs: &TypeRefs<'_>,
+) -> Result<bool, DeferError> {
+    let items = get_attr_or_defer(arg, "items")?;
+    let item_list = iter_seq(items)?;
+    if item_list.len() != 2 {
+        return Ok(false);
+    }
+    let i0 = item_list[0];
+    let i1 = item_list[1];
+    // get_proper_type on each — defer on alias.
+    if is_instance(i0, refs.type_alias_type) || is_instance(i1, refs.type_alias_type) {
+        return Err(DeferError);
+    }
+    let non_optional: Option<&PyAny> = if is_instance(i0, refs.none_type) {
+        Some(i1)
+    } else if is_instance(i1, refs.none_type) {
+        Some(i0)
+    } else {
+        None
+    };
+    if non_optional.is_none() {
+        return Ok(false);
+    }
+    let nopt = non_optional.unwrap();
+    if is_instance(nopt, refs.instance) {
+        let typ = nopt.getattr("type").map_err(|_| DeferError)?;
+        let fullname = typ.getattr("fullname").map_err(|_| DeferError)?;
+        let fn_str = fullname.downcast::<PyString>().map_err(|_| DeferError)?;
+        let fn_s = fn_str.to_str().map_err(|_| DeferError)?;
+        if fn_s == "mypy_extensions.i64"
+            || fn_s == "mypy_extensions.i32"
+            || fn_s == "mypy_extensions.i16"
+            || fn_s == "mypy_extensions.u8"
+            || fn_s == "builtins.int"
+            || fn_s == "builtins.float"
+            || fn_s == "builtins.bool"
+            || fn_s == "librt.vecs.vec"
+        {
+            return Ok(false);
+        }
+        return Ok(true);
+    }
+    // Recurse: check_vec_type_args([non_optional], ctx, api)
+    let single = PyList::new(py, [nopt]);
+    check_vec_type_args_inner(py, single.as_ref(), ctx, api, refs)
+}
+
+// ---------------------------------------------------------------------------
+// is_typevar_default_recursive (BFS over default_depends graph)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.is_typevar_default_recursive` — check if the type
+/// variable can lead to infinite recursion via defaults.
+///
+/// Mirrors typeanal.py:2478-2495. Pure BFS over the `default_depends`
+/// dict on the `start` object (TypeInfo or TypeAlias). Returns `None`
+/// (defer) on any attribute access failure.
+#[pyfunction]
+pub(crate) fn rust_is_typevar_default_recursive(
+    py: Python<'_>,
+    tv_fname: &str,
+    start: &PyAny,
+) -> PyResult<Option<bool>> {
+    match is_typevar_default_recursive_inner(py, tv_fname, start) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+fn is_typevar_default_recursive_inner(
+    _py: Python<'_>,
+    tv_fname: &str,
+    start: &PyAny,
+) -> Result<bool, DeferError> {
+    let dd = start.getattr("default_depends").map_err(|_| DeferError)?;
+    let dd: &PyDict = dd.downcast().map_err(|_| DeferError)?;
+    // tv_fname not in start.default_depends -> False
+    let key = PyString::new(_py, tv_fname);
+    if !dd.contains(key).unwrap_or(false) {
+        return Ok(false);
+    }
+    let initial = dd.get_item(key).map_err(|_| DeferError)?;
+    let initial = match initial {
+        Some(i) if !i.is_none() => i,
+        _ => return Ok(false),
+    };
+    let mut todo: Vec<PyObject> = {
+        let set: &PySet = initial.downcast().map_err(|_| DeferError)?;
+        set.iter().map(|o| o.into()).collect()
+    };
+    let start_ptr = start.as_ptr() as usize;
+    let mut seen: HashSet<usize> = HashSet::new();
+    while let Some(node_obj) = todo.pop() {
+        let node: &PyAny = node_obj.as_ref(_py);
+        if node.as_ptr() as usize == start_ptr {
+            return Ok(true);
+        }
+        let ptr = node.as_ptr() as usize;
+        if seen.contains(&ptr) {
+            continue;
+        }
+        seen.insert(ptr);
+        let node_dd = node.getattr("default_depends").map_err(|_| DeferError)?;
+        let node_dd: &PyDict = node_dd.downcast().map_err(|_| DeferError)?;
+        for (_, dep_set) in node_dd.iter() {
+            if let Ok(s) = dep_set.downcast::<PySet>() {
+                for dep in s.iter() {
+                    todo.push(dep.into());
+                }
+            } else if let Ok(l) = dep_set.downcast::<PyList>() {
+                for dep in l.iter() {
+                    todo.push(dep.into());
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+use std::collections::HashSet;
+
+// ---------------------------------------------------------------------------
+// detect_diverging_alias (DivergingAliasDetector visitor)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.detect_diverging_alias` — detect type aliases that
+/// will diverge during type checking.
+///
+/// Mirrors typeanal.py:2528-2551. `node` is a `TypeAlias` Python object,
+/// `target` is a `Type` Python object. Returns `None` to defer.
+#[pyfunction]
+pub(crate) fn rust_detect_diverging_alias(
+    py: Python<'_>,
+    node: &PyAny,
+    target: &PyAny,
+) -> PyResult<Option<bool>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    match detect_diverging_alias_inner(py, node, target, &refs) {
+        Ok(b) => Ok(Some(b)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+fn detect_diverging_alias_inner(
+    py: Python<'_>,
+    node: &PyAny,
+    target: &PyAny,
+    refs: &TypeRefs<'_>,
+) -> Result<bool, DeferError> {
+    // is_recursive = node._is_recursive
+    let is_recursive = node.getattr("_is_recursive").map_err(|_| DeferError)?;
+    let is_rec: bool = if is_recursive.is_none() {
+        // node._is_recursive is None: compute via CollectAliasesVisitor.
+        // This requires a full traversal of target.accept(CollectAliases).
+        // Defer — the CollectAliasesVisitor is a complex visitor we
+        // don't port here. Python handles this path.
+        return Err(DeferError);
+    } else {
+        is_recursive.is_true().map_err(|_| DeferError)?
+    };
+    if !is_rec {
+        return Ok(false);
+    }
+    // node._is_recursive = True (cache positive case).
+    let _ = node.setattr("_is_recursive", true);
+    // visitor = DivergingAliasDetector({node}); target.accept(visitor).
+    let seen: HashSet<usize> = std::iter::once(node.as_ptr() as usize).collect();
+    let mut diverging = false;
+    diverging_alias_visit(py, target, &seen, &mut diverging, refs)?;
+    Ok(diverging)
+}
+
+/// Recursively walk `obj` looking for diverging alias expansions.
+/// Mirrors DivergingAliasDetector.visit_type_alias_type.
+fn diverging_alias_visit(
+    py: Python<'_>,
+    obj: &PyAny,
+    seen: &HashSet<usize>,
+    diverging: &mut bool,
+    refs: &TypeRefs<'_>,
+) -> Result<(), DeferError> {
+    if *diverging {
+        return Ok(());
+    }
+    // TypeAliasType: the key visit.
+    if is_instance(obj, refs.type_alias_type) {
+        return diverging_visit_alias_type(py, obj, seen, diverging, refs);
+    }
+    // Recurse into children for all other composite types.
+    diverging_recurse_children(py, obj, seen, diverging, refs)
+}
+
+/// DivergingAliasDetector.visit_type_alias_type.
+fn diverging_visit_alias_type(
+    py: Python<'_>,
+    obj: &PyAny,
+    seen: &HashSet<usize>,
+    diverging: &mut bool,
+    refs: &TypeRefs<'_>,
+) -> Result<(), DeferError> {
+    let alias = obj.getattr("alias").map_err(|_| DeferError)?;
+    if alias.is_none() {
+        return Err(DeferError);
+    }
+    let alias_ptr = alias.as_ptr() as usize;
+    if seen.contains(&alias_ptr) {
+        // Check each arg: if it's not TypeVarLike / Unpack(TypeVarLike)
+        // and has_type_vars(arg) -> diverging = True.
+        let args = obj.getattr("args").map_err(|_| DeferError)?;
+        let arg_list = iter_seq(args)?;
+        for arg in arg_list {
+            if !is_typevarlike_or_unpack_tvl(arg, refs) && has_type_vars_live(py, arg, refs)? {
+                *diverging = true;
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    // Not in seen: expand alias target, recurse with seen | {alias}.
+    let mut new_seen = seen.clone();
+    new_seen.insert(alias_ptr);
+    // get_proper_type(t).accept(visitor) — for a TypeAliasType, this
+    // expands the alias and recurses into the expansion. We need the
+    // alias target.
+    let target = alias.getattr("target").map_err(|_| DeferError)?;
+    diverging_alias_visit(py, target, &new_seen, diverging, refs)?;
+    // Also recurse into args of this alias type.
+    let args = obj.getattr("args").map_err(|_| DeferError)?;
+    let arg_list = iter_seq(args)?;
+    for arg in arg_list {
+        diverging_alias_visit(py, arg, &new_seen, diverging, refs)?;
+    }
+    Ok(())
+}
+
+/// Check if `obj` is a TypeVarLikeType or UnpackType(TypeVarLikeType).
+fn is_typevarlike_or_unpack_tvl(obj: &PyAny, refs: &TypeRefs<'_>) -> bool {
+    if is_instance(obj, refs.type_var_type)
+        || is_instance(obj, refs.param_spec_type)
+        || is_instance(obj, refs.type_var_tuple_type)
+    {
+        return true;
+    }
+    if is_instance(obj, refs.unpack_type) {
+        let inner = obj.getattr("type").ok();
+        if let Some(inner) = inner {
+            return is_instance(inner, refs.type_var_type)
+                || is_instance(inner, refs.param_spec_type)
+                || is_instance(inner, refs.type_var_tuple_type);
+        }
+    }
+    false
+}
+
+/// has_type_vars on a live Python Type object.
+/// Mirrors mypy.types.has_type_vars (BoolTypeQuery, ANY_STRATEGY).
+#[allow(clippy::only_used_in_recursion)]
+fn has_type_vars_live(
+    py: Python<'_>,
+    obj: &PyAny,
+    refs: &TypeRefs<'_>,
+) -> Result<bool, DeferError> {
+    if is_instance(obj, refs.type_var_type)
+        || is_instance(obj, refs.param_spec_type)
+        || is_instance(obj, refs.type_var_tuple_type)
+    {
+        return Ok(true);
+    }
+    if is_instance(obj, refs.unpack_type) {
+        let typ = get_attr_or_defer(obj, "type")?;
+        return has_type_vars_live(py, typ, refs);
+    }
+    if is_instance(obj, refs.instance) {
+        let args = get_attr_or_defer(obj, "args")?;
+        for a in iter_seq(args)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        let lkv = obj.getattr("last_known_value").map_err(|_| DeferError)?;
+        if !lkv.is_none() {
+            return has_type_vars_live(py, lkv, refs);
+        }
+        return Ok(false);
+    }
+    if is_instance(obj, refs.callable_type) {
+        let arg_types = get_attr_or_defer(obj, "arg_types")?;
+        for a in iter_seq(arg_types)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        let ret = get_attr_or_defer(obj, "ret_type")?;
+        if has_type_vars_live(py, ret, refs)? {
+            return Ok(true);
+        }
+        let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
+        if !inst.is_none() && has_type_vars_live(py, inst, refs)? {
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    if is_instance(obj, refs.union_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if is_instance(obj, refs.tuple_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        let fb = get_attr_or_defer(obj, "partial_fallback")?;
+        return has_type_vars_live(py, fb, refs);
+    }
+    if is_instance(obj, refs.type_type) {
+        let item = get_attr_or_defer(obj, "item")?;
+        return has_type_vars_live(py, item, refs);
+    }
+    if is_instance(obj, refs.overloaded) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    if is_instance(obj, refs.typed_dict_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
+        for (_, v) in dict.iter() {
+            if has_type_vars_live(py, v, refs)? {
+                return Ok(true);
+            }
+        }
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        return has_type_vars_live(py, fb, refs);
+    }
+    if is_instance(obj, refs.literal_type) {
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        return has_type_vars_live(py, fb, refs);
+    }
+    if is_instance(obj, refs.any_type) {
+        let sa = obj.getattr("source_any").map_err(|_| DeferError)?;
+        if !sa.is_none() {
+            return has_type_vars_live(py, sa, refs);
+        }
+        return Ok(false);
+    }
+    if is_instance(obj, refs.type_alias_type) {
+        let args = get_attr_or_defer(obj, "args")?;
+        for a in iter_seq(args)? {
+            if has_type_vars_live(py, a, refs)? {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // NoneType, UninhabitedType, DeletedType, UnboundType, Parameters:
+    // no type vars.
+    Ok(false)
+}
+
+/// Recurse into all children of `obj` for diverging alias detection.
+fn diverging_recurse_children(
+    py: Python<'_>,
+    obj: &PyAny,
+    seen: &HashSet<usize>,
+    diverging: &mut bool,
+    refs: &TypeRefs<'_>,
+) -> Result<(), DeferError> {
+    if is_instance(obj, refs.instance) {
+        let args = get_attr_or_defer(obj, "args")?;
+        for a in iter_seq(args)? {
+            diverging_alias_visit(py, a, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.callable_type) {
+        let arg_types = get_attr_or_defer(obj, "arg_types")?;
+        for a in iter_seq(arg_types)? {
+            diverging_alias_visit(py, a, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        let ret = get_attr_or_defer(obj, "ret_type")?;
+        diverging_alias_visit(py, ret, seen, diverging, refs)?;
+        if *diverging {
+            return Ok(());
+        }
+        let inst = obj.getattr("instance_type").map_err(|_| DeferError)?;
+        if !inst.is_none() {
+            diverging_alias_visit(py, inst, seen, diverging, refs)?;
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.union_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            diverging_alias_visit(py, a, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.tuple_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            diverging_alias_visit(py, a, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        let fb = get_attr_or_defer(obj, "partial_fallback")?;
+        return diverging_alias_visit(py, fb, seen, diverging, refs);
+    }
+    if is_instance(obj, refs.typed_dict_type) {
+        let items = get_attr_or_defer(obj, "items")?;
+        let dict: &PyDict = items.downcast().map_err(|_| DeferError)?;
+        for (_, v) in dict.iter() {
+            diverging_alias_visit(py, v, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        return diverging_alias_visit(py, fb, seen, diverging, refs);
+    }
+    if is_instance(obj, refs.type_type) {
+        let item = get_attr_or_defer(obj, "item")?;
+        return diverging_alias_visit(py, item, seen, diverging, refs);
+    }
+    if is_instance(obj, refs.overloaded) {
+        let items = get_attr_or_defer(obj, "items")?;
+        for a in iter_seq(items)? {
+            diverging_alias_visit(py, a, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.literal_type) {
+        let fb = get_attr_or_defer(obj, "fallback")?;
+        return diverging_alias_visit(py, fb, seen, diverging, refs);
+    }
+    if is_instance(obj, refs.unpack_type) {
+        let typ = get_attr_or_defer(obj, "type")?;
+        return diverging_alias_visit(py, typ, seen, diverging, refs);
+    }
+    if is_instance(obj, refs.any_type) {
+        let sa = obj.getattr("source_any").map_err(|_| DeferError)?;
+        if !sa.is_none() {
+            diverging_alias_visit(py, sa, seen, diverging, refs)?;
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.type_var_type)
+        || is_instance(obj, refs.param_spec_type)
+        || is_instance(obj, refs.type_var_tuple_type)
+    {
+        // TypeVar-like: recurse upper_bound, default, values.
+        let ub = get_attr_or_defer(obj, "upper_bound")?;
+        diverging_alias_visit(py, ub, seen, diverging, refs)?;
+        if *diverging {
+            return Ok(());
+        }
+        let default = get_attr_or_defer(obj, "default")?;
+        diverging_alias_visit(py, default, seen, diverging, refs)?;
+        if *diverging {
+            return Ok(());
+        }
+        let values = get_attr_or_defer(obj, "values")?;
+        for v in iter_seq(values)? {
+            diverging_alias_visit(py, v, seen, diverging, refs)?;
+            if *diverging {
+                return Ok(());
+            }
+        }
+        return Ok(());
+    }
+    if is_instance(obj, refs.type_alias_type) {
+        return diverging_visit_alias_type(py, obj, seen, diverging, refs);
+    }
+    // NoneType, UninhabitedType, DeletedType, UnboundType, Parameters:
+    // no children to recurse.
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers (live-object traversal)
+// ---------------------------------------------------------------------------
+
+fn get_attr_or_defer<'a>(obj: &'a PyAny, name: &str) -> Result<&'a PyAny, DeferError> {
+    obj.getattr(name).map_err(|_| DeferError)
+}
+
+fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
+    if let Ok(list) = obj.downcast::<PyList>() {
+        Ok(list.iter().collect())
+    } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        Ok(tuple.iter().collect())
+    } else {
+        Err(DeferError)
+    }
+}
+
+fn class_name_is(obj: &PyAny, expected: &str) -> bool {
+    let class = match obj.getattr("__class__") {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let name = match class.getattr("__name__") {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match name.downcast::<PyString>() {
+        Ok(s) => s.to_str().unwrap_or("") == expected,
+        Err(_) => false,
     }
 }
 
