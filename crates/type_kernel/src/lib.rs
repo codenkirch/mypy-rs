@@ -160,6 +160,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(meet::rust_is_overlapping_types, module)?)?;
     module.add_function(wrap_pyfunction!(meet::rust_narrow_declared_type, module)?)?;
+    // Issue #526: get_possible_variants alongside narrow_declared_type.
+    module.add_function(wrap_pyfunction!(
+        meet::rust_get_possible_variants,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_join, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_trivial_meet, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_join_types, module)?)?;
