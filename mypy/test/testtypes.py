@@ -65,13 +65,20 @@ from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.traverser import (
     all_name_and_member_expressions,
     all_return_statements,
+    all_return_statements_and_flags,
     all_yield_expressions,
     all_yield_from_expressions,
+    count_returns,
+    find_non_extension_handlers,
+    find_non_literal_handlers,
     has_await_expression,
+    has_complex_slice,
     has_return_statement,
     has_str_expression,
     has_yield_expression,
     has_yield_from_expression,
+    has_yield_return,
+    is_global_expr,
 )
 from mypy.typeanal import (
     _set_native_typeanal_active,
@@ -5378,6 +5385,262 @@ class NativeTraverserSuite(Suite):
         py_names, py_members = all_name_and_member_expressions(tree)
         assert rust_names == len(py_names)
         assert rust_members == len(py_members)
+
+    # --- Issue #541: remaining seeker parity tests ---
+
+    def test_all_return_statements_and_flags_no_finally(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        results = all_return_statements_and_flags(fdef)
+        assert len(results) == 2
+        assert all(not flag for _, flag in results)
+
+    def test_all_return_statements_and_flags_in_finally(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    try:\n"
+            "        return 1\n"
+            "    finally:\n"
+            "        return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        results = all_return_statements_and_flags(fdef)
+        assert len(results) == 2
+        # At least one return is in a finally block.
+        assert any(flag for _, flag in results)
+
+    def test_all_return_statements_and_flags_empty(self) -> None:
+        tree = self._parse("def f():\n    x = 1\n")
+        fdef = self._find_func(tree, "f")
+        results = all_return_statements_and_flags(fdef)
+        assert len(results) == 0
+
+    def test_count_returns_includes_nested(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    def g():\n"
+            "        return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        # count_returns includes nested function returns (unlike
+        # all_return_statements which skips nested funcs).
+        assert count_returns(fdef) == 2
+
+    def test_count_returns_no_returns(self) -> None:
+        tree = self._parse("def f():\n    x = 1\n")
+        fdef = self._find_func(tree, "f")
+        assert count_returns(fdef) == 0
+
+    def test_has_yield_return_true(self) -> None:
+        tree = self._parse("def f():\n    return (yield 1)\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_return(fdef) is True
+
+    def test_has_yield_return_false(self) -> None:
+        tree = self._parse("def f():\n    return 1\n")
+        fdef = self._find_func(tree, "f")
+        assert has_yield_return(fdef) is False
+
+    def test_has_complex_slice_true(self) -> None:
+        tree = self._parse("x = a[::2]\n")
+        assert has_complex_slice(tree) is True
+
+    def test_has_complex_slice_false(self) -> None:
+        tree = self._parse("x = a[1:10]\n")
+        assert has_complex_slice(tree) is False
+
+    def test_has_complex_slice_no_slice(self) -> None:
+        tree = self._parse("x = a[0]\n")
+        assert has_complex_slice(tree) is False
+
+    def test_find_non_extension_handlers(self) -> None:
+        tree = self._parse(
+            "class C:\n"
+            "    def f(self):\n"
+            "        return 1\n"
+            "    @property\n"
+            "    def g(self):\n"
+            "        return 2\n"
+        )
+        funcs = find_non_extension_handlers(tree)
+        # `f` is bare (no decorator), `g` is decorated.
+        assert len(funcs) == 1
+        assert funcs[0].name == "f"
+
+    def test_find_non_extension_handlers_empty(self) -> None:
+        tree = self._parse(
+            "class C:\n"
+            "    @property\n"
+            "    def g(self):\n"
+            "        return 2\n"
+        )
+        funcs = find_non_extension_handlers(tree)
+        assert len(funcs) == 0
+
+    def test_is_global_expr_true(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    global x\n"
+            "    x = 1\n"
+        )
+        fdef = self._find_func(tree, "f")
+        assert is_global_expr(fdef) is True
+
+    def test_is_global_expr_false(self) -> None:
+        tree = self._parse(
+            "def f():\n"
+            "    x = 1\n"
+        )
+        fdef = self._find_func(tree, "f")
+        assert is_global_expr(fdef) is False
+
+    def test_find_non_literal_handlers(self) -> None:
+        tree = self._parse(
+            "class C:\n"
+            "    def lit(self):\n"
+            "        42\n"
+            "    def nonlit(self):\n"
+            "        return 1\n"
+        )
+        funcs = find_non_literal_handlers(tree)
+        # `lit` has a literal body (just `42`), `nonlit` has a return
+        # stmt which is not a literal expression.
+        assert len(funcs) == 1
+        assert funcs[0].name == "nonlit"
+
+    def test_find_non_literal_handlers_pass_only(self) -> None:
+        tree = self._parse(
+            "class C:\n"
+            "    def p(self):\n"
+            "        pass\n"
+        )
+        funcs = find_non_literal_handlers(tree)
+        # pass-only body is a literal handler.
+        assert len(funcs) == 0
+
+    def test_rust_count_returns_and_flags_matches_python(self) -> None:
+        from type_kernel import rust_count_return_statements_and_flags
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    try:\n"
+            "        return 1\n"
+            "    finally:\n"
+            "        return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        rust_total, rust_finally = rust_count_return_statements_and_flags(
+            buf.getvalue()
+        )
+        py_results = all_return_statements_and_flags(fdef)
+        py_total = len(py_results)
+        py_finally = sum(1 for _, flag in py_results if flag)
+        assert rust_total == py_total
+        assert rust_finally == py_finally
+
+    def test_rust_count_all_returns_matches_python(self) -> None:
+        from type_kernel import rust_count_all_returns
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    return 1\n"
+            "    def g():\n"
+            "        return 2\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        rust_count = rust_count_all_returns(buf.getvalue())
+        assert rust_count == count_returns(fdef)
+
+    def test_rust_has_yield_return_matches_python(self) -> None:
+        from type_kernel import rust_has_yield_return
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse("def f():\n    return (yield 1)\n")
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        assert rust_has_yield_return(buf.getvalue()) == has_yield_return(fdef)
+
+    def test_rust_has_complex_slice_matches_python(self) -> None:
+        from type_kernel import rust_has_complex_slice
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse("x = a[::2]\n")
+        buf = WriteBuffer()
+        serialize_node(tree, buf)
+        assert rust_has_complex_slice(buf.getvalue()) == has_complex_slice(tree)
+
+    def test_rust_count_non_extension_matches_python(self) -> None:
+        from type_kernel import rust_count_non_extension_handlers
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "class C:\n"
+            "    def f(self):\n"
+            "        return 1\n"
+            "    @property\n"
+            "    def g(self):\n"
+            "        return 2\n"
+        )
+        buf = WriteBuffer()
+        serialize_node(tree, buf)
+        rust_count = rust_count_non_extension_handlers(buf.getvalue())
+        assert rust_count == len(find_non_extension_handlers(tree))
+
+    def test_rust_is_global_expr_matches_python(self) -> None:
+        from type_kernel import rust_is_global_expr
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "def f():\n"
+            "    global x\n"
+            "    x = 1\n"
+        )
+        fdef = self._find_func(tree, "f")
+        buf = WriteBuffer()
+        serialize_node(fdef, buf)
+        assert rust_is_global_expr(buf.getvalue()) == is_global_expr(fdef)
+
+    def test_rust_count_non_literal_matches_python(self) -> None:
+        from type_kernel import rust_count_non_literal_handlers
+
+        from mypy.astwire import serialize_node
+        from mypy.cache import WriteBuffer
+
+        tree = self._parse(
+            "class C:\n"
+            "    def lit(self):\n"
+            "        42\n"
+            "    def nonlit(self):\n"
+            "        return 1\n"
+        )
+        buf = WriteBuffer()
+        serialize_node(tree, buf)
+        rust_count = rust_count_non_literal_handlers(buf.getvalue())
+        assert rust_count == len(find_non_literal_handlers(tree))
 
 
 

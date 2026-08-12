@@ -818,6 +818,23 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         traverser::rust_count_name_and_member_expressions,
         module
     )?)?;
+    // Issue #541: remaining traverser seekers.
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_return_statements_and_flags,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(traverser::rust_count_all_returns, module)?)?;
+    module.add_function(wrap_pyfunction!(traverser::rust_has_yield_return, module)?)?;
+    module.add_function(wrap_pyfunction!(traverser::rust_has_complex_slice, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_non_extension_handlers,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(traverser::rust_is_global_expr, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        traverser::rust_count_non_literal_handlers,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_algebra::rust_make_any_non_explicit,
         module
