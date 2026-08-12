@@ -55,6 +55,7 @@ from mypy.nodes import (
     TupleExpr,
     TypeInfo,
     UnaryExpr,
+    Var,
 )
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
@@ -8556,3 +8557,107 @@ class _FakeNode:
 
     def __init__(self, names: dict[str, Any]) -> None:
         self.names = names
+
+
+class NativeBinderSuite(Suite):
+    """Parity tests for the Rust `get_declaration` (Issue #527).
+
+    Each test builds a live mypy AST expression (`NameExpr`/`MemberExpr`/
+    other), calls `type_kernel.rust_get_declaration(node)` and compares it
+    to `mypy.binder.get_declaration(node)`. The two must agree on:
+
+    * non-`RefExpr` nodes -> None
+    * `RefExpr` with no node -> None
+    * `Var` with a declared/inferred type -> that type
+    * `Var` with a `PartialType` -> None
+    * `Var` with `type=None` -> None
+    * `TypeInfo` node -> `TypeType(fill_typevars_with_any(info))`
+    * node that is neither `Var` nor `TypeInfo` -> None
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.binder import get_declaration as _py_get_declaration
+
+        self._ref = _py_get_declaration
+        self.fx = TypeFixture()
+
+    def _check(self, expr: Expression, label: str) -> None:
+        py = self._ref(expr)
+        rust = self._tk.rust_get_declaration(expr)
+        if py is None:
+            assert rust is None, f"{label}: Rust returned {rust!r}, Python None"
+        else:
+            assert rust is not None, f"{label}: Rust returned None, Python {py!r}"
+            assert_equal(str(rust), str(py), f"{label}: type mismatch")
+            assert_type(type(py), rust)
+
+    # --- non-RefExpr ---
+
+    def test_non_ref_expr(self) -> None:
+        e = IntExpr(42)
+        self._check(e, "IntExpr")
+
+    def test_index_expr(self) -> None:
+        # IndexExpr is not a RefExpr.
+        e = IndexExpr(NameExpr("base"), IntExpr(0))
+        self._check(e, "IndexExpr")
+
+    # --- RefExpr with no node ---
+
+    def test_name_expr_no_node(self) -> None:
+        e = NameExpr("x")
+        self._check(e, "NameExpr without node")
+
+    # --- Var with declared type ---
+
+    def test_var_with_type(self) -> None:
+        v = Var("x", self.fx.a)
+        e = NameExpr("x")
+        e.node = v
+        self._check(e, "Var[int]")
+
+    def test_var_none_type_fallback(self) -> None:
+        # get_declaration returns None when the Var has no type yet.
+        v = Var("y")
+        e = NameExpr("y")
+        e.node = v
+        self._check(e, "Var without type")
+
+    # --- Var with PartialType ---
+
+    def test_var_partial_type(self) -> None:
+        from mypy.types import PartialType
+
+        # A PartialType is what get_declaration must refuse to return.
+        v = Var("p")
+        v.type = PartialType(None, v)
+        e = NameExpr("p")
+        e.node = v
+        self._check(e, "Var with PartialType")
+
+    # --- TypeInfo node ---
+
+    def test_type_info(self) -> None:
+        info = self.fx.ai  # TypeInfo for builtins.A
+        e = NameExpr("A")
+        e.node = info
+        self._check(e, "TypeInfo A")
+
+    def test_type_info_alt(self) -> None:
+        info = self.fx.oi  # second TypeInfo
+        e = MemberExpr(NameExpr("mod"), "O")
+        e.node = info
+        self._check(e, "TypeInfo O via MemberExpr")
+
+    # --- node neither Var nor TypeInfo ---
+
+    def test_other_node(self) -> None:
+        from mypy.nodes import FuncDef
+
+        fn = FuncDef("f")
+        e = NameExpr("f")
+        e.node = fn
+        self._check(e, "FuncDef node")

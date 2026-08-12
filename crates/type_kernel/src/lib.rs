@@ -47,6 +47,7 @@ mod argapprox;
 mod argmap;
 mod astwire;
 mod attrs;
+mod binder;
 mod cache;
 mod callable_compat;
 mod checkcall;
@@ -2122,5 +2123,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         reachability::rust_fixed_comparison,
         module
     )?)?;
+
+    // Issue #527: binder.py pure helper (get_declaration).
+    module.add_function(wrap_pyfunction!(binder::rust_get_declaration, module)?)?;
+
     Ok(())
 }
