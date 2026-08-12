@@ -94,6 +94,7 @@ mod semanal_algebra;
 mod semanal_classprop;
 mod semanal_lookup;
 mod semanal_shared;
+mod semanal_typeddict;
 mod semanal_visitor;
 mod serverdeps;
 mod setops;
@@ -2060,5 +2061,31 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(meet::rust_is_object, module)?)?;
     module.add_function(wrap_pyfunction!(meet::rust_is_none_object_overlap, module)?)?;
     module.add_function(wrap_pyfunction!(meet::rust_are_related_types, module)?)?;
+
+    // Issue #532: semanal_typeddict + semanal_namedtuple helpers.
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_extract_meta_info,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_check_namedtuple_field_name,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_namedtuple_prohibited_names,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_primary_source,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_verify_requiredness_compatibility,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeddict::rust_verify_field_against_closed_bases,
+        module
+    )?)?;
     Ok(())
 }
