@@ -79,6 +79,7 @@ mod lkv;
 mod maptype;
 mod meet;
 mod messages;
+mod modulefinder;
 mod mro;
 mod operators;
 mod overload;
@@ -1306,6 +1307,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(
         semanal_classprop::rust_add_type_promotion,
         module
+    )?)?; // Issue #540: pure helpers from mypy/modulefinder.py.
+    module.add_function(wrap_pyfunction!(modulefinder::rust_is_init_file, module)?)?;
+    module.add_function(wrap_pyfunction!(modulefinder::rust_parse_version, module)?)?;
+    module.add_function(wrap_pyfunction!(modulefinder::rust_mypy_path, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_typeshed_py_version,
+        module
     )?)?;
     // Issue #539: fixup.py NodeFixer/TypeFixer port.
     module.add_function(wrap_pyfunction!(fixup::rust_fixup_type, module)?)?;
@@ -1393,5 +1401,28 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(util::rust_plural_s, module)?)?;
     module.add_function(wrap_pyfunction!(util::rust_json_dumps, module)?)?;
     module.add_class::<util::IdMapper>()?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_default_lib_path,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_load_stdlib_py_versions,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_matches_exclude,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_get_search_dirs,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        modulefinder::rust_compute_search_paths,
+        module
+    )?)?;
+    module.add_class::<modulefinder::SearchPaths>()?;
+    module.add_class::<modulefinder::BuildSource>()?;
+    module.add_class::<modulefinder::BuildSourceSet>()?;
     Ok(())
 }
