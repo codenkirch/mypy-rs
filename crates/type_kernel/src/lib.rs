@@ -88,6 +88,7 @@ mod operators;
 mod overload;
 mod partially_defined;
 mod plugin_helpers;
+mod reachability;
 mod plugin_hooks;
 mod refs;
 mod semanal_algebra;
@@ -2085,6 +2086,40 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_typeddict::rust_verify_field_against_closed_bases,
+        module
+    )?)?;
+    // Issue #560: reachability.py port.
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_infer_condition_value,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_infer_pattern_value,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_assert_will_always_fail,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_consider_sys_version_info,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_consider_sys_platform,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(reachability::rust_is_sys_attr, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_contains_sys_version_info,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_contains_int_or_tuple_of_ints,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        reachability::rust_fixed_comparison,
         module
     )?)?;
     Ok(())
