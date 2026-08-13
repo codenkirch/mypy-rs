@@ -920,6 +920,12 @@ impl NativeTypeResolver {
         &self.resolver
     }
 
+    /// Borrow the `TypeAliasResolver` so checkexpr helpers can expand
+    /// `TypeAliasType` wire nodes (B3a). Used by `checkexpr_functions`.
+    pub(crate) fn alias_resolver(&self) -> &crate::aliases::TypeAliasResolver {
+        &self.alias_resolver
+    }
+
     /// Borrow the snapshots for the dict-view builder. Returns an iterator
     /// of `(fullname, &TypeInfoSnapshot)`.
     fn resolver_snapshots_for_render(
@@ -1039,8 +1045,11 @@ pub(crate) fn build_native_resolver(
             Ok(f) => f,
             Err(_) => continue,
         };
-        let target = match serialize_type_to_bytes(py, item) {
-            Some(b) => b,
+        let target = match item.getattr("target").ok() {
+            Some(t) => match serialize_type_to_bytes(py, &t) {
+                Some(b) => b,
+                None => continue,
+            },
             None => continue,
         };
         let alias_tvars = read_alias_tvar_names_pub(item);

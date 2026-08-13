@@ -63,7 +63,7 @@ pub(crate) const DICT_STR_GEN: u8 = 30;
 const EXTRA_ATTRS: u8 = 150;
 
 // Reserved / end markers (cache.py:327-328).
-const END_TAG: u8 = 255;
+pub(crate) const END_TAG: u8 = 255;
 
 // Instance family tags (types.py:4425-4432).
 const INSTANCE: u8 = 80;
@@ -76,7 +76,7 @@ const INSTANCE_BOOL: u8 = 86;
 const INSTANCE_OBJECT: u8 = 87;
 
 // Other type tags (types.py:4435-4452).
-const TYPE_ALIAS_TYPE: u8 = 100;
+pub(crate) const TYPE_ALIAS_TYPE: u8 = 100;
 const TYPE_VAR_TYPE: u8 = 101;
 const PARAM_SPEC_TYPE: u8 = 102;
 const TYPE_VAR_TUPLE_TYPE: u8 = 103;

@@ -103,6 +103,7 @@ from mypy.types import (
     ProperType,
     TupleType,
     Type,
+    TypeAliasType,
     TypedDictType,
     TypeOfAny,
     TypeType,
@@ -2916,6 +2917,122 @@ class NativeSubtypeTupleSuite(Suite):
         t1 = self._tup(self.fx.a)
         t2 = TupleType([UnpackType(Instance(self.fx.std_tuplei, [self.fx.a]))], self.fx.std_tuple)
         assert is_subtype(t1, t2)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeTypeContextSuite(Suite):
+    """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
+
+    Exercises TypeType, unions, and the alias-expansion path: an alias
+    whose frozen target is `Type[X]` must answer True without deferring,
+    while `List[X]` targets answer False. The native resolver is built
+    from the TypeFixture type_infos and a real `TypeAlias` whose `target`
+    is serialized through the fixture, matching production's
+    `build_native_resolver` alias snapshot. Requires TEST_NATIVE_TYPE_KERNEL=1.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self.resolver = self._build_resolver([])
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.bi,
+                self.fx.str_type_info,
+                self.fx.type_typei,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+            ],
+            aliases,
+        )
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        self.resolver = self._build_resolver(aliases)
+        _set_native_checkexpr_resolver(self.resolver)
+
+    def assert_par(self, t: Type, expected: bool) -> None:
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            is_type_type_context,
+        )
+
+        assert is_type_type_context(t) is expected
+        # The Rust side must actually decide (non-None) for the alias
+        # cases, proving the resolver snapshot expansion fired rather than
+        # falling back to Python's `get_proper_type`.
+        rusted = _type_kernel.rust_is_type_type_context(
+            self.resolver, _serialize_type_for_checkexpr(t)
+        )
+        assert rusted is not None, f"Rust deferred on {t!r}"
+        assert rusted is expected
+
+    def test_type_type(self) -> None:
+        self.assert_par(TypeType(self.fx.a), True)
+
+    def test_plain_instance(self) -> None:
+        self.assert_par(self.fx.a, False)
+
+    def test_union_with_type_type(self) -> None:
+        self.assert_par(UnionType.make_union([self.fx.a, TypeType(self.fx.b)]), True)
+
+    def test_union_without_type_type(self) -> None:
+        self.assert_par(UnionType.make_union([self.fx.a, self.fx.b]), False)
+
+    def test_alias_to_type_type(self) -> None:
+        # TypeAlias whose target is Type[A]: the Rust side expands the
+        # alias via the resolver snapshot and answers True without defer.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(TypeType(self.fx.a), "mod.TA", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        self.assert_par(TypeAliasType(alias, []), True)
+
+    def test_alias_to_list_false(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.a]), "mod.TB", "mod", -1, -1
+        )
+        self._rebuild_with_aliases([alias])
+        self.assert_par(TypeAliasType(alias, []), False)
+
+    def test_union_with_alias_to_type_type(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(TypeType(self.fx.b), "mod.TC", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        self.assert_par(UnionType.make_union([self.fx.a, TypeAliasType(alias, [])]), True)
+
+    def test_nested_alias_to_type_type(self) -> None:
+        # B = A, A = Type[A]; the snapshot chain must be followed and the
+        # Rust side must answer True without defer (Python expands both).
+        from mypy.nodes import TypeAlias
+
+        alias_a = TypeAlias(TypeType(self.fx.a), "mod.TA", "mod", -1, -1)
+        alias_b = TypeAlias(TypeAliasType(alias_a, []), "mod.TB", "mod", -1, -1)
+        self._rebuild_with_aliases([alias_a, alias_b])
+        self.assert_par(TypeAliasType(alias_b, []), True)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
