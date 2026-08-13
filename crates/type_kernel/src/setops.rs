@@ -2083,37 +2083,102 @@ fn visit_join(
             }
         }
 
-        // visit_tuple_type (join.py:741-775), case 2 non-TupleType-s
-        // only. Case 1 (s is TupleType) builds a new TupleType via
-        // join_tuples + InstanceJoiner -> defer (no encoder). Case 2
-        // (else) calls join_types(self.s, tuple_fallback(t)).
+        // visit_tuple_type (join.py:741-775). Two cases:
         //
-        // `tuple_fallback(t)` (typeops.py:105-129) equals
-        // `t.partial_fallback` only when the fallback is NOT
-        // `builtins.tuple` (typeops.py:108-109). When it IS
-        // `builtins.tuple`, it constructs `Instance(builtins.tuple,
-        // [make_simplified_union(items)])` — a new Instance the Rust
-        // path can't replicate without a Type encoder -> defer.
+        // Case 1 (s is TupleType): build a new TupleType via join_tuples
+        // + InstanceJoiner.join_instances(tuple_fallback(s),
+        // tuple_fallback(t)). Encoded result.
         //
-        // When the fallback is a non-builtin (e.g. a namedtuple class),
-        // `tuple_fallback(t) == t.partial_fallback`, and the recursive
-        // call join_types(s, partial_fallback) lands on the
-        // Instance-Instance nominal path. SameS -> outer SameS
-        // (result = s); Ancestor/Object pass through; SameT (result =
-        // fallback != t) defers.
+        // Case 2 (s is not TupleType): join_types(self.s,
+        // tuple_fallback(t)). SameS/SameT -> outer SameS; Ancestor/Object
+        // pass through; else defer.
+        //
+        // `tuple_fallback(t)` (typeops.py:194-235) equals
+        // `t.partial_fallback` when the fallback is NOT `builtins.tuple`.
+        // When it IS `builtins.tuple`, it constructs
+        // `Instance(builtins.tuple, [make_simplified_union(items)])`.
         //
         // The partial_fallback is always an Instance (wire reader
         // asserts the INSTANCE tag at wire.rs:968; types.py:2909
         // serializes `self.partial_fallback.write(data)`).
         Type::TupleType {
-            partial_fallback, ..
+            partial_fallback: t_pf,
+            items: t_items,
+            ..
         } => {
-            if let Type::Instance {
-                type_ref: fb_ref, ..
-            } = partial_fallback.as_ref()
+            if let Type::TupleType {
+                partial_fallback: _s_pf,
+                items: s_items,
+                ..
+            } = s
             {
+                // Case 1: both TupleType (join.py:848-868).
+                // 1. Join fallbacks: instance_joiner.join_instances(
+                //    tuple_fallback(s), tuple_fallback(t)).
+                // 2. Join items: self.join_tuples(s, t).
+                // 3. If items is None: subtype-check fallback
+                //    (join.py:863-868).
+                // 4. If items has 1 UnpackType(Instance): return the
+                //    unpacked Instance (avoid double-wrapping, join.py:857-860).
+                // 5. Else: TupleType(items, fallback).
+                let s_fb = crate::typeops::tuple_fallback(s, resolver)?;
+                let t_fb = crate::typeops::tuple_fallback(t, resolver)?;
+                let joined_fb = rust_join_types_inner(&s_fb, &t_fb, ctx.strict_optional, resolver)?;
+
+                let items = join_tuples_inner(s_items, t_items, ctx.strict_optional, resolver);
+
+                match items {
+                    None => {
+                        // join.py:862-868: items is None -> fallback.
+                        // Python: if is_proper_subtype(s, t): return t;
+                        // elif is_proper_subtype(t, s): return s;
+                        // else: return fallback.
+                        let proper_ctx = SubtypeContext {
+                            proper_subtype: true,
+                            ..*ctx
+                        };
+                        if let Some(true) = is_subtype(s, t, &proper_ctx, resolver) {
+                            Some(SetOpResult::SameT)
+                        } else if let Some(true) = is_subtype(t, s, &proper_ctx, resolver) {
+                            Some(SetOpResult::SameS)
+                        } else {
+                            // Return the joined fallback.
+                            let mut wbuf = WriteBuffer::new();
+                            wire::write_type(&mut wbuf, &joined_fb).ok()?;
+                            Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                        }
+                    }
+                    Some(items) => {
+                        // join.py:857-860: if len(items) == 1 and
+                        // isinstance(item, UnpackType) and
+                        // isinstance(unpacked, Instance): return unpacked.
+                        if items.len() == 1 {
+                            if let Type::UnpackType { typ } = &items[0] {
+                                if let Type::Instance { .. } = typ.as_ref() {
+                                    let mut wbuf = WriteBuffer::new();
+                                    wire::write_type(&mut wbuf, typ.as_ref()).ok()?;
+                                    return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                                }
+                            }
+                        }
+                        // join.py:861: return TupleType(items, fallback).
+                        let result = Type::TupleType {
+                            partial_fallback: Box::new(joined_fb),
+                            items,
+                            implicit: false,
+                        };
+                        let mut wbuf = WriteBuffer::new();
+                        wire::write_type(&mut wbuf, &result).ok()?;
+                        Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                    }
+                }
+            } else if let Type::Instance {
+                type_ref: fb_ref, ..
+            } = t_pf.as_ref()
+            {
+                // Case 2: s is not TupleType. join_types(s, tuple_fallback(t)).
                 if fb_ref != "builtins.tuple" {
-                    match join_types(s, partial_fallback, ctx, resolver)? {
+                    match join_types(s, t_pf, ctx, resolver)? {
                         SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
                         SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
                         SetOpResult::Object => Some(SetOpResult::Object),
@@ -6279,15 +6344,29 @@ mod tests {
     }
 
     #[test]
-    fn join_tuple_with_tuple_defers() {
+    fn join_tuple_with_tuple_returns_encoded() {
         // visit_tuple_type case 1 (join.py:753-773): s is TupleType ->
-        // builds a new TupleType via join_tuples + InstanceJoiner.
-        // Produces a new type -> defer (no Type encoder).
+        // builds a new TupleType via join_tuples + InstanceJoiner. Now
+        // encoded rather than deferred (Phase B1, issue #587).
         let o = snap("builtins.object", "object");
         let r = make_resolver(vec![o]);
         let s = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
         let t = tuple_type("nt.NT", vec![instance("builtins.int", vec![])]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(result.is_some(), "should not defer");
+        match result.unwrap() {
+            SetOpResult::Encoded(bytes) => {
+                let mut rbuf = ReadBuffer::new(&bytes);
+                let decoded = read_type(&mut rbuf, None).expect("decode failed");
+                match decoded {
+                    Type::TupleType { items, .. } => {
+                        assert_eq!(items.len(), 1, "one item");
+                    }
+                    other => panic!("expected TupleType, got {other:?}"),
+                }
+            }
+            other => panic!("expected Encoded, got {other:?}"),
+        }
     }
 
     // ---- meet_types (M8p) ----

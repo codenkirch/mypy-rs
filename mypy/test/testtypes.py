@@ -3971,9 +3971,9 @@ class NativeJoinTupleSuite(Suite):
     Exercises the TupleType-vs-non-TupleType fallback case (join.py:
     774-775) when `partial_fallback` is NOT `builtins.tuple` (so
     `tuple_fallback(t) == t.partial_fallback`). Case 1 (s is
-    TupleType, builds a new TupleType) and the `builtins.tuple`
-    fallback case (constructs `Instance(builtins.tuple, [union])`)
-    defer to Python.
+    TupleType, builds a new TupleType) is handled in Rust (Phase B1,
+    issue #587); the `builtins.tuple` fallback case (constructs
+    `Instance(builtins.tuple, [union])`) still defers to Python.
     """
 
     def setUp(self) -> None:
@@ -4073,11 +4073,11 @@ class NativeJoinTupleSuite(Suite):
         # this via tuple_fallback. The Rust path defers.
         assert join_types(self.fx.std_tuple, tup) == self.fx.std_tuple
 
-    def test_tuple_with_tuple_defers_to_python(self) -> None:
+    def test_tuple_with_tuple_uses_rust_path(self) -> None:
         # join(Tuple1, Tuple2) = new TupleType. visit_tuple_type case 1
         # (join.py:753-773): s is TupleType -> builds a new TupleType
-        # via join_tuples + InstanceJoiner. Defers to Python. Result
-        # identical regardless of which path computed it.
+        # via join_tuples + InstanceJoiner. Now handled in Rust (Phase B1,
+        # issue #587). Result identical to Python path.
         from mypy.join import join_types
         from mypy.types import TupleType
 
