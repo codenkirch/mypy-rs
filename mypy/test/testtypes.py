@@ -2815,6 +2815,110 @@ class NativeJoinInstanceSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSubtypeTupleSuite(Suite):
+    """Parity suite for the Rust `visit_tuple_type` port (Phase B2, #589).
+
+    Exercises the fixed-tuple paths in is_subtype with the resolver built
+    from the TypeFixture: TupleType vs Instance (Sized, tuple-like,
+    structural fallback), TupleType vs TupleType (length, item-wise,
+    fallback), and the deferred variadic/Unpack cases. Because Rust
+    returns None for the deferred cases (Python decides), every assertion
+    here matches the pure-Python result either way. Requires
+    TEST_NATIVE_TYPE_KERNEL=1 to route through Rust.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _tup(self, *items: Type) -> TupleType:
+        return TupleType(list(items), self.fx.std_tuple)
+
+    def test_tuple_vs_sized(self) -> None:
+        # Any tuple <: typing.Sized -> True (short-circuit on type_ref
+        # before any resolver lookup, subtypes.py:953-954).
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef("Sized", Block([]), None, [])
+        defn.fullname = "typing.Sized"
+        sized = Instance(TypeInfo(SymbolTable(), defn, "Sized"), [])
+        assert is_subtype(self._tup(self.fx.a), sized)
+        assert is_subtype(self._tup(), sized)
+
+    def test_tuple_vs_builtins_tuple_any(self) -> None:
+        # (A,) <: tuple[Any] -> True (Any iter type special case,
+        # subtypes.py:962-966).
+        assert is_subtype(self._tup(self.fx.a), self.fx.std_tuple)
+        assert is_subtype(self._tup(), self.fx.std_tuple)
+
+    def test_tuple_vs_builtins_tuple_exact(self) -> None:
+        # (A,) <: tuple[A] -> True (each item subtype of iter_type).
+        tuple_a = Instance(self.fx.std_tuplei, [self.fx.a])
+        assert is_subtype(self._tup(self.fx.a), tuple_a)
+        # (A,) !<: tuple[B] when A !<: B.
+        tuple_b = Instance(self.fx.std_tuplei, [self.fx.b])
+        assert not is_subtype(self._tup(self.fx.a), tuple_b)
+
+    def test_tuple_vs_tuple_equal(self) -> None:
+        # (A,) <: (A,) -> True (length + item-wise + fallback).
+        assert is_subtype(self._tup(self.fx.a), self._tup(self.fx.a))
+
+    def test_tuple_vs_tuple_length_mismatch(self) -> None:
+        # (A,) !<: (A, A) -> False (length mismatch).
+        assert not is_subtype(self._tup(self.fx.a), self._tup(self.fx.a, self.fx.a))
+
+    def test_tuple_vs_tuple_item_mismatch(self) -> None:
+        # (A,) !<: (B,) when A !<: B -> False.
+        assert not is_subtype(self._tup(self.fx.a), self._tup(self.fx.b))
+
+    def test_tuple_vs_tuple_any_item(self) -> None:
+        # (A,) <: (Any,) -> True (Any left is always a subtype non-proper).
+        assert is_subtype(self._tup(self.fx.a), self._tup(AnyType(TypeOfAny.special_form)))
+
+    def test_tuple_vs_unrelated_instance_defer_or_false(self) -> None:
+        # (A,) !<: D (unrelated Instance, not a protocol). Result must be
+        # False (matches Python: fallback check fails, no protocol).
+        assert not is_subtype(self._tup(self.fx.a), self.fx.d)
+
+    def test_tuple_variadic_unpack_defers(self) -> None:
+        # Unpack items are not handled by the fixed-tuple port; the result
+        # must still match Python (variadic_tuple_subtype decides). The
+        # async test asserts the *pure-Python* outcome is stable here:
+        # (A,) <: (*tuple[A, ...],) via the infinite-union mapping is
+        # True (the Rust path either decides it or defers, both correct).
+        t1 = self._tup(self.fx.a)
+        t2 = TupleType([UnpackType(Instance(self.fx.std_tuplei, [self.fx.a]))], self.fx.std_tuple)
+        assert is_subtype(t1, t2)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstanceWithArgsSuite(Suite):
     """Parity suite for the Rust `visit_instance` same-type-with-args join
     (Stage 3c M8g).
