@@ -100,12 +100,13 @@ fn py_abspath(py: Python<'_>, path: &str) -> PyResult<String> {
 
 fn py_join(py: Python<'_>, base: &str, parts: &[&str]) -> PyResult<String> {
     let os_path = py.import("os.path")?;
+    let join = os_path.getattr("join")?;
     let mut args: Vec<PyObject> = vec![PyString::new(py, base).into()];
     for p in parts {
         args.push(PyString::new(py, p).into());
     }
     let tup = PyTuple::new(py, &args);
-    os_path.call_method1("join", (tup,))?.extract()
+    join.call1(tup)?.extract()
 }
 
 /// Internal: default_lib_path without the pyfunction wrapper.
@@ -562,7 +563,10 @@ impl SearchPaths {
 #[pymethods]
 impl SearchPaths {
     #[new]
-    #[pyo3(signature = (python_path=vec![], mypy_path=vec![], package_path=vec![], typeshed_path=vec![]))]
+    #[pyo3(signature = (
+        python_path = vec![], mypy_path = vec![],
+        package_path = vec![], typeshed_path = vec![],
+    ))]
     pub fn py_new(
         py: Python<'_>,
         python_path: Vec<String>,

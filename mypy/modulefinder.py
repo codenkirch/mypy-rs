@@ -31,6 +31,35 @@ from mypy.stubinfo import (
 )
 from mypy.util import os_path_join
 
+# Issue #540: native modulefinder helpers from type_kernel.
+# Each function below delegates to its Rust counterpart when the
+# extension is importable, else falls back to the pure-Python body.
+try:
+    from type_kernel import (
+        rust_is_init_file as _rust_is_init_file,
+        rust_parse_version as _rust_parse_version,
+        rust_mypy_path as _rust_mypy_path,
+        rust_typeshed_py_version as _rust_typeshed_py_version,
+        rust_default_lib_path as _rust_default_lib_path,
+        rust_load_stdlib_py_versions as _rust_load_stdlib_py_versions,
+        rust_matches_exclude as _rust_matches_exclude,
+        rust_get_search_dirs as _rust_get_search_dirs,
+        rust_compute_search_paths as _rust_compute_search_paths,
+    )
+
+    _HAS_RUST_MODULEFINDER = True
+except ImportError:
+    _rust_is_init_file = None  # type: ignore[assignment]
+    _rust_parse_version = None  # type: ignore[assignment]
+    _rust_mypy_path = None  # type: ignore[assignment]
+    _rust_typeshed_py_version = None  # type: ignore[assignment]
+    _rust_default_lib_path = None  # type: ignore[assignment]
+    _rust_load_stdlib_py_versions = None  # type: ignore[assignment]
+    _rust_matches_exclude = None  # type: ignore[assignment]
+    _rust_get_search_dirs = None  # type: ignore[assignment]
+    _rust_compute_search_paths = None  # type: ignore[assignment]
+    _HAS_RUST_MODULEFINDER = False
+
 if TYPE_CHECKING:
     import module_resolver
 
@@ -81,10 +110,9 @@ class ModuleNotFoundReason(Enum):
     # implementation (with or without a py.typed file).
     NOT_FOUND = 0
 
-    # The implementation for this module plausibly exists (e.g. we
-    # found a matching folder or *.py file), but either the parent package
-    # did not contain a py.typed file or we were unable to find a
-    # corresponding *-stubs package.
+    # The implementation plausibly exists (matching folder or *.py file),
+    # but either the parent package lacked a py.typed file or no
+    # corresponding *-stubs package was found.
     FOUND_WITHOUT_TYPE_HINTS = 1
 
     # The module was not found in the current working directory, but
@@ -212,12 +240,9 @@ class FindModuleCache:
         self.stdlib_py_versions = stdlib_py_versions or load_stdlib_py_versions(
             custom_typeshed_dir
         )
-        # Pre-computed stubinfo tables for the native resolver. Rust replicates
-        # stub_distribution_name() using these two collections:
-        #   * _stub_flat: top-level names with a flat (legacy-bundled or
-        #     non_bundled_packages_flat) dist lookup.
-        #   * _stub_namespace: flattened namespace-lookup table
-        #     (module_name -> dist_name), walked longest-first.
+        # Pre-computed stubinfo tables for the native resolver. Rust
+        # replicates stub_distribution_name() using _stub_flat and
+        # _stub_namespace (flattened namespace lookup, longest-first).
         self._stub_flat: set[str] = {
             *non_bundled_packages_flat,
             *_legacy_bundled_packages,
@@ -225,11 +250,9 @@ class FindModuleCache:
         self._stub_namespace: dict[str, str] = {}
         for _ns_top, _ns_map in non_bundled_packages_namespace.items():
             self._stub_namespace.update(_ns_map)
-        # Long-lived Rust resolver: holds the stable resolver config (search
-        # paths, stubinfo tables) and the cross-call resolution caches. Reads
-        # through the shared FsCache owned by self.fscache, so there is exactly
-        # one FS cache per transaction. Lazily constructed on first native
-        # resolve so the extension import stays out of the non-native hot path.
+        # Long-lived Rust resolver: stable config (search paths, stubinfo
+        # tables) + cross-call caches. Lazily constructed on first native
+        # resolve to keep the extension import out of the non-native path.
         self._native_resolver: module_resolver.NativeResolver | None = None
 
     def clear(self) -> None:
@@ -786,6 +809,8 @@ class FindModuleCache:
 def matches_exclude(
     subpath: str, excludes: list[str], fscache: FileSystemCache, verbose: bool
 ) -> bool:
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_matches_exclude(subpath, excludes, fscache, verbose)
     if not excludes:
         return False
     subpath_str = os.path.relpath(subpath).replace(os.sep, "/")
@@ -861,6 +886,8 @@ def find_gitignores(dir: str) -> list[tuple[str, GitIgnoreSpec]]:
 
 
 def is_init_file(path: str) -> bool:
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_is_init_file(path)
     return os.path.basename(path) in ("__init__.py", "__init__.pyi")
 
 
@@ -894,6 +921,8 @@ def highest_init_level(fscache: FileSystemCache, id: str, path: str, prefix: str
 
 
 def mypy_path() -> list[str]:
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_mypy_path()
     path_env = os.getenv("MYPYPATH")
     if not path_env:
         return []
@@ -904,6 +933,8 @@ def default_lib_path(
     data_dir: str, pyversion: tuple[int, int], custom_typeshed_dir: str | None
 ) -> list[str]:
     """Return default standard library search paths. Guaranteed to be normalised."""
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_default_lib_path(data_dir, pyversion, custom_typeshed_dir)
 
     data_dir = os.path.abspath(data_dir)
     path: list[str] = []
@@ -959,6 +990,8 @@ def get_search_dirs(python_executable: str | None) -> tuple[list[str], list[str]
     To avoid repeatedly calling a subprocess (which can be slow!) we
     lru_cache the results.
     """
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_get_search_dirs(python_executable)
 
     if python_executable is None:
         return ([], [])
@@ -1001,6 +1034,17 @@ def compute_search_paths(
     - installed package directories (which will later be split into stub-only and inline)
     - typeshed
     """
+    if _HAS_RUST_MODULEFINDER:
+        rust_sp = _rust_compute_search_paths(sources, options, data_dir, alt_lib_path)
+        # Convert the Rust pyclass to the Python SearchPaths so downstream
+        # type annotations (manager.search_paths: SearchPaths) hold.
+        return SearchPaths(
+            python_path=rust_sp.python_path,
+            mypy_path=rust_sp.mypy_path,
+            package_path=rust_sp.package_path,
+            typeshed_path=rust_sp.typeshed_path,
+        )
+
     # Determine the default module search path.
     lib_path = collections.deque(
         default_lib_path(
@@ -1086,6 +1130,8 @@ def load_stdlib_py_versions(custom_typeshed_dir: str | None) -> StdlibVersions:
 
     None means there is no maximum version.
     """
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_load_stdlib_py_versions(custom_typeshed_dir)
     typeshed_dir = custom_typeshed_dir or os_path_join(os.path.dirname(__file__), "typeshed")
     stdlib_dir = os_path_join(typeshed_dir, "stdlib")
     result = {}
@@ -1108,10 +1154,14 @@ def load_stdlib_py_versions(custom_typeshed_dir: str | None) -> StdlibVersions:
 
 
 def parse_version(version: str) -> tuple[int, int]:
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_parse_version(version)
     major, minor = version.strip().split(".")
     return int(major), int(minor)
 
 
 def typeshed_py_version(options: Options) -> tuple[int, int]:
     """Return Python version used for checking whether module supports typeshed."""
+    if _HAS_RUST_MODULEFINDER:
+        return _rust_typeshed_py_version(options)
     return max(options.python_version, (3, 10))
