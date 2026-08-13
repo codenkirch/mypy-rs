@@ -120,6 +120,7 @@ from mypy.nodes import (
     MypyFile,
     OverloadedFuncDef,
     SymbolTable,
+    TypeAlias,
     TypeInfo,
 )
 from mypy.options import OPTIONS_AFFECTING_CACHE_NO_PLATFORM
@@ -1266,6 +1267,26 @@ class BuildManager:
                     infos.append(node)
         return infos
 
+    def _collect_aliases(self) -> list[TypeAlias]:
+        """Walk all loaded modules and collect every `TypeAlias` node.
+
+        Mirrors `_collect_type_infos`. The aliases feed the native
+        resolver's alias snapshot (Phase B3a, #591) so shape-only
+        predicates (`is_type_type_context`, `method_fullname`) can expand
+        `TypeAliasType` in Rust instead of deferring to Python. Safe to
+        call from `__init__` (returns `[]` when no modules are loaded)
+        and from `process_stale_scc` after semantic analysis.
+        """
+        aliases: list[TypeAlias] = []
+        for module in self.modules.values():
+            if module is None:
+                continue  # type: ignore[unreachable]
+            for sym in module.names.values():
+                node = sym.node
+                if isinstance(node, TypeAlias):
+                    aliases.append(node)
+        return aliases
+
     def _build_native_resolvers(self) -> None:
         """Build the `NativeTypeResolver` snapshot from the live TypeInfo
         graph and install it on the subtype/join shims.
@@ -1307,7 +1328,8 @@ class BuildManager:
         from mypy.subtypes import _set_native_subtype_resolver
 
         type_infos = self._collect_type_infos()
-        resolver = _type_kernel.build_native_resolver(type_infos, [])
+        aliases = self._collect_aliases()
+        resolver = _type_kernel.build_native_resolver(type_infos, aliases)
         typeinfo_map = {info.fullname: info for info in type_infos}
         # Stage 3c resolvers wired: the subtype/join kernels now defer
         # (return None) for all unsupported generic substitution edges,

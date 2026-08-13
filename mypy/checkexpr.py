@@ -256,16 +256,16 @@ try:
         rust_real_union as _rust_real_union,
         rust_solve_generic_call as _rust_solve_generic_call,
         rust_star_expr as _rust_star_expr,
+        rust_try_getting_int_literals as _rust_try_getting_int_literals,
         rust_try_getting_literal as _rust_try_getting_literal,
         rust_tuple_context_matches as _rust_tuple_context_matches,
         rust_visit_newtype_expr as _rust_visit_newtype_expr,
         rust_visit_paramspec_expr as _rust_visit_paramspec_expr,
         rust_visit_promote_expr as _rust_visit_promote_expr,
         rust_visit_temp_node as _rust_visit_temp_node,
-        rust_visit_type_var_tuple_expr as _rust_visit_type_var_tuple_expr,
-        rust_try_getting_int_literals as _rust_try_getting_int_literals,
         rust_visit_tuple_index_helper as _rust_visit_tuple_index_helper,
         rust_visit_tuple_slice_helper as _rust_visit_tuple_slice_helper,
+        rust_visit_type_var_tuple_expr as _rust_visit_type_var_tuple_expr,
     )
 
     from mypy.types import read_type as _checkexpr_read_type
@@ -8378,10 +8378,15 @@ def get_partial_instance_type(t: Type | None) -> PartialType | None:
 
 
 def is_type_type_context(context: Type | None) -> bool:
-    if context is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        context is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(context)
-            result = _rust_is_type_type_context(type_bytes)
+            result = _rust_is_type_type_context(_native_checkexpr_resolver, type_bytes)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

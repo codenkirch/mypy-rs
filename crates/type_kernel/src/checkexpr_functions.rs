@@ -61,6 +61,42 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
     }
 }
 
+/// Expand a `TypeAliasType` wire node to its frozen `target` snapshot
+/// (B3a). This is a *shape-only* expansion: the target is decoded as-is
+/// and the alias's type arguments are NOT substituted. That is parity-safe
+/// for shape predicates (`is_type_type_context`, `method_fullname`,
+/// `has_any_type`) because the answer depends only on the target's type
+/// class and name, never on `Instance` args; exactly the difference
+/// between `A = Type[X]` and `B = List[X]`.
+///
+/// Aliasing a chain (`B = A`, `A = Type[X]`) is legal in mypy, so the
+/// snapshots are followed until a non-alias target is found. Recursion
+/// would loop forever on `A = Tuple[A, ...]`, so aliases already seen on
+/// this chain cause a defer (Python's `get_proper_type` also cannot
+/// terminate those, and the shape predicates preserve Python behavior by
+/// deferring). Returns `Some(expanded)` when the chain resolves, `None`
+/// to defer (missing snapshot, undecodable target, or a cycle).
+pub(crate) fn expand_alias_shape(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Type> {
+    let mut current = typ.clone();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let type_ref = match &current {
+            Type::TypeAliasType { type_ref, .. } => type_ref.clone(),
+            _ => return Some(current),
+        };
+        if seen.contains(&type_ref) {
+            return None;
+        }
+        seen.push(type_ref.clone());
+        let snap = aliases.get(&type_ref)?;
+        let mut buf = ReadBuffer::new(&snap.target);
+        current = read_type(&mut buf, None).ok()?;
+    }
+}
+
 /// Whether a CallableType is a type object (i.e. its fallback is
 /// `builtins.type`). Mirrors `CallableType.is_type_obj()` — the wire
 /// format stores `fallback` + `from_concatenate` but not the computed
@@ -654,24 +690,32 @@ fn count_max_positional(arg_kinds: &[i64]) -> usize {
 /// `mypy.checkexpr.is_type_type_context` — whether context is a TypeType
 /// or a union containing TypeType.
 ///
-/// Mirrors `is_type_type_context` (checkexpr.py:7031-7036). Defers on alias.
+/// Mirrors `is_type_type_context` (checkexpr.py:7031-7036). Expands
+/// TypeAliasType via the alias resolver (B3a); defers only when the
+/// alias snapshot is missing or its target cannot be decoded.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_is_type_type_context(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+pub(crate) fn rust_is_type_type_context(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(is_type_type_context_inner(&typ))
+    Ok(is_type_type_context_inner(&typ, resolver.alias_resolver()))
 }
 
-pub(crate) fn is_type_type_context_inner(typ: &Type) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
+pub(crate) fn is_type_type_context_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let expanded = expand_alias_shape(typ, aliases)?;
+    match expanded {
         Type::TypeType { .. } => Some(true),
         Type::UnionType { items, .. } => {
-            for t in items {
-                match is_type_type_context_inner(t) {
+            for t in &items {
+                match is_type_type_context_inner(t, aliases) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -2522,14 +2566,198 @@ mod tests {
             item: Box::new(make_instance("int", vec![])),
             is_type_form: false,
         };
-        assert_eq!(is_type_type_context_inner(&t), Some(true));
+        assert_eq!(
+            is_type_type_context_inner(&t, &crate::aliases::TypeAliasResolver::new()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_is_type_type_context_false() {
         assert_eq!(
-            is_type_type_context_inner(&make_instance("int", vec![])),
+            is_type_type_context_inner(
+                &make_instance("int", vec![]),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
             Some(false)
+        );
+    }
+
+    fn alias_resolver_with_targets(targets: &[(&str, Type)]) -> crate::aliases::TypeAliasResolver {
+        let mut r = crate::aliases::TypeAliasResolver::new();
+        for (fullname, target) in targets {
+            let bytes = encode_type(target).expect("target must encode");
+            r.insert(
+                fullname.to_string(),
+                crate::aliases::TypeAliasSnapshot {
+                    fullname: fullname.to_string(),
+                    target: bytes,
+                    ..Default::default()
+                },
+            );
+        }
+        r
+    }
+
+    /// Build a resolver whose `fullname -> target` mapping has its target
+    /// serialized by hand. `write_type` refuses `TypeAliasType`, but
+    /// Python's `Type.write` encodes nested aliases (the production snapshot
+    /// path), so alias chains only occur in bytes we craft here. Mirrors
+    /// `read_type_alias_type` (wire.rs:1101): TYPE_ALIAS_TYPE tag, arg list,
+    /// ref string, END_TAG. Returns a Vec so a caller can extend a resolver
+    /// built from real targets with the hand-crafted chain edges.
+    fn alias_resolver_with_alias_targets(
+        targets: &[(&str, String)],
+    ) -> Vec<(String, crate::aliases::TypeAliasSnapshot)> {
+        let mut out = Vec::new();
+        for (fullname, inner_ref) in targets {
+            let mut wbuf = WriteBuffer::new();
+            crate::wire::write_tag(&mut wbuf, crate::wire::TYPE_ALIAS_TYPE);
+            crate::wire::write_type_list(&mut wbuf, &[]).expect("empty args encode");
+            crate::wire::write_str(&mut wbuf, inner_ref).expect("ref encodes");
+            crate::wire::write_tag(&mut wbuf, crate::wire::END_TAG);
+            out.push((
+                fullname.to_string(),
+                crate::aliases::TypeAliasSnapshot {
+                    fullname: fullname.to_string(),
+                    target: wbuf.into_bytes(),
+                    ..Default::default()
+                },
+            ));
+        }
+        out
+    }
+
+    fn insert_chain_edges(
+        resolver: &mut crate::aliases::TypeAliasResolver,
+        edges: Vec<(String, crate::aliases::TypeAliasSnapshot)>,
+    ) {
+        for (name, snap) in edges {
+            resolver.insert(name, snap);
+        }
+    }
+
+    fn make_type_alias(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn test_is_type_type_context_expands_alias() {
+        // Alias whose target is `Type[int]` must answer true.
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.A",
+            Type::TypeType {
+                item: Box::new(make_instance("int", vec![])),
+                is_type_form: false,
+            },
+        )]);
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_type_type_context_expands_list_alias_false() {
+        // Alias whose target is `List[int]` must answer false.
+        let aliases = alias_resolver_with_targets(&[("mod.B", make_instance("list", vec![]))]);
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.B"), &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_type_type_context_alias_missing_defers() {
+        assert_eq!(
+            is_type_type_context_inner(
+                &make_type_alias("mod.Missing"),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_type_type_context_union_expands_alias_item() {
+        // `Union[int, Type[int]]` where the TypeType arm is behind an alias.
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.T",
+            Type::TypeType {
+                item: Box::new(make_instance("str", vec![])),
+                is_type_form: false,
+            },
+        )]);
+        let t = Type::UnionType {
+            items: vec![make_instance("int", vec![]), make_type_alias("mod.T")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(is_type_type_context_inner(&t, &aliases), Some(true));
+    }
+
+    #[test]
+    fn test_is_type_type_context_expands_alias_chain() {
+        // B = A, A = Type[int]; the snapshot chain must be followed.
+        // Nested-alias targets don't round-trip through Rust's write_type,
+        // so craft the B->A edge bytes by hand (Python's Type.write encodes
+        // nested aliases, matching the production snapshot path).
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        {
+            let target = Type::TypeType {
+                item: Box::new(make_instance("int", vec![])),
+                is_type_form: false,
+            };
+            let bytes = encode_type(&target).expect("TypeType target must encode");
+            aliases.insert(
+                "mod.A".to_string(),
+                crate::aliases::TypeAliasSnapshot {
+                    fullname: "mod.A".to_string(),
+                    target: bytes,
+                    ..Default::default()
+                },
+            );
+        }
+        let chain = alias_resolver_with_alias_targets(&[("mod.Alias", "mod.A".to_string())]);
+        insert_chain_edges(&mut aliases, chain);
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.Alias"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_type_type_context_cyclic_alias_defers() {
+        // A = A is a degenerate cycle; expansion must defer, not loop.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_chain_edges(
+            &mut aliases,
+            alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]),
+        );
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            None
+        );
+    }
+
+    #[test]
+    fn test_is_type_type_context_two_cycle_defers() {
+        // A = B, B = A; mutual recursion must defer, not loop.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_chain_edges(
+            &mut aliases,
+            alias_resolver_with_alias_targets(&[
+                ("mod.A", "mod.B".to_string()),
+                ("mod.B", "mod.A".to_string()),
+            ]),
+        );
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            None
         );
     }
 
