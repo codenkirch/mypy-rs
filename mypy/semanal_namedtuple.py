@@ -72,6 +72,15 @@ from mypy.types import (
 )
 from mypy.util import get_unique_redefinition_name
 
+try:
+    from type_kernel import (
+        rust_check_namedtuple_field_name as _rust_check_namedtuple_field_name,
+    )
+    _HAS_RUST_NAMEDTUPLE = True
+except ImportError:
+    _rust_check_namedtuple_field_name = None  # type: ignore[assignment]
+    _HAS_RUST_NAMEDTUPLE = False
+
 # Matches "_prohibited" in typing.py, but adds __annotations__, which works at runtime but can't
 # easily be supported in a static checker.
 NAMEDTUPLE_PROHIBITED_NAMES: Final = (
@@ -665,6 +674,11 @@ class NamedTupleAnalyzer:
 
     def check_namedtuple_field_name(self, field: str, seen_names: Container[str]) -> str | None:
         """Return None for valid fields, a string description for invalid ones."""
+        if _HAS_RUST_NAMEDTUPLE:
+            try:
+                return _rust_check_namedtuple_field_name(field, seen_names)
+            except Exception:
+                pass
         if field in seen_names:
             return f'has duplicate field name "{field}"'
         elif not field.isidentifier():
