@@ -147,10 +147,8 @@ pub fn rust_find_python_encoding(text: &[u8]) -> (String, i64) {
 /// Mirrors the Python regex:
 /// `([ \t\v]*#.*(\r\n?|\n))??[ \t\v]*#.*coding[:=][ \t]*([-\w.]+)`
 fn find_encoding_re(text: &[u8]) -> Option<(String, bool)> {
-    // Find the encoding declaration. Python's regex is:
-    // ([ \t\v]*#.*(\r\n?|\n))??[ \t\v]*#.*coding[:=][ \t]*([-\w.]+)
-    // This matches an optional first comment line, then a line with
-    // coding[:=] directive.
+    // Find the encoding declaration (PEP 263). Matches an optional
+    // first comment line, then a line with `coding[:=]` directive.
     let lines: Vec<&[u8]> = text.split(|&b| b == b'\n').collect();
     if lines.is_empty() {
         return None;
@@ -531,8 +529,8 @@ pub fn rust_hash_digest(data: &[u8]) -> String {
 
 /// `mypy/util.py:hash_digest_bytes` — SHA-1 raw digest.
 #[pyfunction]
-pub fn rust_hash_digest_bytes(data: &[u8]) -> Vec<u8> {
-    sha1(data).to_vec()
+pub fn rust_hash_digest_bytes(py: Python<'_>, data: &[u8]) -> PyObject {
+    PyBytes::new(py, &sha1(data)).into()
 }
 
 fn sha1(data: &[u8]) -> [u8; 20] {
