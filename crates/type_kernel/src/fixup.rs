@@ -130,8 +130,14 @@ fn tf_visit_instance(
         return Ok(());
     }
     let type_ref_str: String = type_ref.extract()?;
-    inst.setattr("type_ref", py.None())?;
+    // Resolve the type_ref BEFORE clearing it. If the lookup (or any
+    // nested lazy-fixup it triggers) raises, the Python fallback in
+    // TypeFixer.fixup retries via visit_instance — which checks
+    // type_ref and bails if it is already None. Clearing type_ref only
+    // after the lookup succeeds prevents the fallback from silently
+    // skipping an unfixed Instance (leaving type=NOT_READY).
     let typ = lookup_typeinfo(py, &type_ref_str, modules, allow_missing)?;
+    inst.setattr("type_ref", py.None())?;
     inst.setattr("type", typ)?;
 
     // Also fix up the bases, just in case (Python: if base.type
@@ -184,8 +190,9 @@ fn tf_visit_type_alias_type(
         return Ok(());
     }
     let type_ref_str: String = type_ref.extract()?;
-    t.setattr("type_ref", py.None())?;
+    // Same pattern as tf_visit_instance: resolve before clearing.
     let alias = lookup_alias(py, &type_ref_str, modules, allow_missing)?;
+    t.setattr("type_ref", py.None())?;
     t.setattr("alias", alias)?;
     recurse_children(py, t.getattr("args")?, modules, allow_missing, cache)
 }
@@ -220,11 +227,9 @@ fn tf_visit_callable_type(
     }
 
     let variables = ct.getattr("variables")?;
-    if let Ok(var_list) = variables.downcast::<PyList>() {
-        for var in var_list.iter() {
-            fixup_type(py, var, modules, allow_missing, cache)?;
-        }
-    }
+    // CallableType.variables is a tuple, not a list, so downcast::<PyList>
+    // silently fails and skips TypeVarType fixup (issue #585).
+    recurse_children(py, variables, modules, allow_missing, cache)?;
 
     let type_guard = ct.getattr("type_guard")?;
     if !type_guard.is_none() {
