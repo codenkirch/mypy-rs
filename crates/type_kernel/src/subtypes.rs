@@ -408,10 +408,7 @@ pub(crate) fn is_subtype(
                         let Type::Instance { args, .. } = unpacked else {
                             return None;
                         };
-                        match args.first() {
-                            Some(el) => el,
-                            None => return None,
-                        }
+                        args.first()?
                     } else {
                         li
                     };
