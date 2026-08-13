@@ -32,6 +32,31 @@ from mypy.options import Options
 from mypy.patterns import AsPattern, OrPattern, Pattern
 from mypy.traverser import TraverserVisitor
 
+try:
+    from type_kernel import (
+        rust_infer_condition_value as _rust_infer_condition_value,
+        rust_infer_pattern_value as _rust_infer_pattern_value,
+        rust_assert_will_always_fail as _rust_assert_will_always_fail,
+        rust_consider_sys_version_info as _rust_consider_sys_version_info,
+        rust_consider_sys_platform as _rust_consider_sys_platform,
+        rust_is_sys_attr as _rust_is_sys_attr,
+        rust_contains_sys_version_info as _rust_contains_sys_version_info,
+        rust_contains_int_or_tuple_of_ints as _rust_contains_int_or_tuple_of_ints,
+        rust_fixed_comparison as _rust_fixed_comparison,
+    )
+    _HAS_RUST_REACHABILITY = True
+except ImportError:
+    _rust_infer_condition_value = None  # type: ignore[assignment]
+    _rust_infer_pattern_value = None  # type: ignore[assignment]
+    _rust_assert_will_always_fail = None  # type: ignore[assignment]
+    _rust_consider_sys_version_info = None  # type: ignore[assignment]
+    _rust_consider_sys_platform = None  # type: ignore[assignment]
+    _rust_is_sys_attr = None  # type: ignore[assignment]
+    _rust_contains_sys_version_info = None  # type: ignore[assignment]
+    _rust_contains_int_or_tuple_of_ints = None  # type: ignore[assignment]
+    _rust_fixed_comparison = None  # type: ignore[assignment]
+    _HAS_RUST_REACHABILITY = False
+
 # Inferred truth value of an expression.
 ALWAYS_TRUE: Final = 1
 MYPY_TRUE: Final = 2  # True in mypy, False at runtime
@@ -102,6 +127,11 @@ def infer_reachability_of_match_statement(s: MatchStmt, options: Options) -> Non
 
 
 def assert_will_always_fail(s: AssertStmt, options: Options) -> bool:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_assert_will_always_fail(s, options)
+        except Exception:
+            pass
     return infer_condition_value(s.expr, options) in (ALWAYS_FALSE, MYPY_FALSE)
 
 
@@ -112,6 +142,11 @@ def infer_condition_value(expr: Expression, options: Options) -> int:
     MYPY_TRUE if true under mypy and false at runtime, MYPY_FALSE if
     false under mypy and true at runtime, else TRUTH_VALUE_UNKNOWN.
     """
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_infer_condition_value(expr, options)
+        except Exception:
+            pass
     if isinstance(expr, UnaryExpr) and expr.op == "not":
         positive = infer_condition_value(expr.expr, options)
         return inverted_truth_mapping[positive]
@@ -169,6 +204,11 @@ def infer_condition_value(expr: Expression, options: Options) -> int:
 
 
 def infer_pattern_value(pattern: Pattern) -> int:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_infer_pattern_value(pattern)
+        except Exception:
+            pass
     if isinstance(pattern, AsPattern) and pattern.pattern is None:
         return ALWAYS_TRUE
     elif isinstance(pattern, OrPattern) and any(
@@ -184,6 +224,11 @@ def consider_sys_version_info(expr: Expression, pyversion: tuple[int, ...]) -> i
 
     Return ALWAYS_TRUE, ALWAYS_FALSE, or TRUTH_VALUE_UNKNOWN.
     """
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_consider_sys_version_info(expr, pyversion)
+        except Exception:
+            pass
     # Cases supported:
     # - sys.version_info[<int>] <compare_op> <int>
     # - sys.version_info[:<int>] <compare_op> <tuple_of_n_ints>
@@ -228,6 +273,11 @@ def consider_sys_platform(expr: Expression, platform: str) -> int:
 
     Return ALWAYS_TRUE, ALWAYS_FALSE, or TRUTH_VALUE_UNKNOWN.
     """
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_consider_sys_platform(expr, platform)
+        except Exception:
+            pass
     # Cases supported:
     # - sys.platform == 'linux'
     # - sys.platform != 'win32'
@@ -266,6 +316,11 @@ Targ = TypeVar("Targ", int, str, tuple[int, ...])
 
 
 def fixed_comparison(left: Targ, op: str, right: Targ) -> int:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_fixed_comparison(left, op, right)
+        except Exception:
+            pass
     rmap = {False: ALWAYS_FALSE, True: ALWAYS_TRUE}
     if op == "==":
         return rmap[left == right]
@@ -283,6 +338,11 @@ def fixed_comparison(left: Targ, op: str, right: Targ) -> int:
 
 
 def contains_int_or_tuple_of_ints(expr: Expression) -> None | int | tuple[int, ...]:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_contains_int_or_tuple_of_ints(expr)
+        except Exception:
+            pass
     if isinstance(expr, IntExpr):
         return expr.value
     if isinstance(expr, TupleExpr):
@@ -297,6 +357,11 @@ def contains_int_or_tuple_of_ints(expr: Expression) -> None | int | tuple[int, .
 
 
 def contains_sys_version_info(expr: Expression) -> None | int | tuple[int | None, int | None]:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_contains_sys_version_info(expr)
+        except Exception:
+            pass
     if is_sys_attr(expr, "version_info"):
         return (None, None)  # Same as sys.version_info[:]
     if isinstance(expr, IndexExpr) and is_sys_attr(expr.base, "version_info"):
@@ -321,6 +386,11 @@ def contains_sys_version_info(expr: Expression) -> None | int | tuple[int | None
 
 
 def is_sys_attr(expr: Expression, name: str) -> bool:
+    if _HAS_RUST_REACHABILITY:
+        try:
+            return _rust_is_sys_attr(expr, name)
+        except Exception:
+            pass
     # TODO: This currently doesn't work with code like this:
     # - import sys as _sys
     # - from sys import version_info
