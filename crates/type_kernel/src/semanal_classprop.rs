@@ -132,7 +132,7 @@ pub(crate) fn rust_calculate_class_abstract_status(
     for (name, status) in &abstract_attrs {
         let tup = PyTuple::new(
             py,
-            &[
+            [
                 PyString::new(py, name) as &PyAny,
                 (*status).into_py(py).into_ref(py) as &PyAny,
             ],
