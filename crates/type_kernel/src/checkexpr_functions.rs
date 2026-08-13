@@ -2654,14 +2654,20 @@ mod tests {
                 is_type_form: false,
             },
         )]);
-        assert_eq!(is_type_type_context_inner(&make_type_alias("mod.A"), &aliases), Some(true));
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_is_type_type_context_expands_list_alias_false() {
         // Alias whose target is `List[int]` must answer false.
         let aliases = alias_resolver_with_targets(&[("mod.B", make_instance("list", vec![]))]);
-        assert_eq!(is_type_type_context_inner(&make_type_alias("mod.B"), &aliases), Some(false));
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.B"), &aliases),
+            Some(false)
+        );
     }
 
     #[test]
@@ -2728,8 +2734,14 @@ mod tests {
     fn test_is_type_type_context_cyclic_alias_defers() {
         // A = A is a degenerate cycle; expansion must defer, not loop.
         let mut aliases = crate::aliases::TypeAliasResolver::new();
-        insert_chain_edges(&mut aliases, alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]));
-        assert_eq!(is_type_type_context_inner(&make_type_alias("mod.A"), &aliases), None);
+        insert_chain_edges(
+            &mut aliases,
+            alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]),
+        );
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            None
+        );
     }
 
     #[test]
@@ -2743,7 +2755,10 @@ mod tests {
                 ("mod.B", "mod.A".to_string()),
             ]),
         );
-        assert_eq!(is_type_type_context_inner(&make_type_alias("mod.A"), &aliases), None);
+        assert_eq!(
+            is_type_type_context_inner(&make_type_alias("mod.A"), &aliases),
+            None
+        );
     }
 
     #[test]
