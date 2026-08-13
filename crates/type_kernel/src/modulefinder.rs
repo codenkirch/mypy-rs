@@ -9,7 +9,7 @@
 
 use pyo3::exceptions::{PySystemExit, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PySet, PyTuple};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -98,15 +98,14 @@ fn py_abspath(py: Python<'_>, path: &str) -> PyResult<String> {
     os_path.call_method1("abspath", (path,))?.extract()
 }
 
-fn py_join(py: Python<'_>, base: &str, parts: &[&str]) -> PyResult<String> {
-    let os_path = py.import("os.path")?;
-    let join = os_path.getattr("join")?;
-    let mut args: Vec<PyObject> = vec![PyString::new(py, base).into()];
+fn py_join(_py: Python<'_>, base: &str, parts: &[&str]) -> PyResult<String> {
+    // PathBuf::push matches os.path.join semantics: an absolute part
+    // replaces the path. Avoids PyO3 call1 tuple-unpacking issues.
+    let mut path = PathBuf::from(base);
     for p in parts {
-        args.push(PyString::new(py, p).into());
+        path.push(p);
     }
-    let tup = PyTuple::new(py, &args);
-    join.call1(tup)?.extract()
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Internal: default_lib_path without the pyfunction wrapper.

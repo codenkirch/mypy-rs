@@ -719,11 +719,8 @@ fn validate_instance_inner(
         let min_tv_count = defn_list
             .iter()
             .filter(|tv| {
-                let has_def = tv.getattr("has_default").map_err(|_| false);
-                match has_def {
-                    Ok(f) => !f.is_true().unwrap_or(true),
-                    Err(_) => false,
-                }
+                let has_def = tv.call_method0("has_default").map(|v| v.is_true().unwrap_or(true)).unwrap_or(true);
+                !has_def
             })
             .count();
         let arg_count = arg_list.len();
@@ -759,12 +756,9 @@ fn validate_instance_variadic(
     let min_tv_count = defn_list
         .iter()
         .filter(|tv| {
-            let has_def = tv.getattr("has_default").ok();
+            let has_def = tv.call_method0("has_default").map(|v| v.is_true().unwrap_or(true)).unwrap_or(true);
             let is_tvt = is_instance(tv, refs.type_var_tuple_type);
-            match has_def {
-                Some(f) => !f.is_true().unwrap_or(true) && !is_tvt,
-                None => !is_tvt,
-            }
+            !has_def && !is_tvt
         })
         .count();
     // Python: correct = len(t.args) >= min_tv_count
@@ -843,17 +837,28 @@ fn validate_instance_variadic(
 }
 
 fn wrong_type_arg_count_msg(min: usize, max: usize, given: usize, type_name: &str) -> String {
-    if min == max {
-        format!("{type_name} expects {min} type arguments, but {given} given")
+    let s = if min == max {
+        if min == 0 {
+            "no type arguments".to_string()
+        } else if min == 1 {
+            "1 type argument".to_string()
+        } else {
+            format!("{min} type arguments")
+        }
     } else {
-        format!("{type_name} expects {min} to {max} type arguments, but {given} given")
-    }
+        format!("between {min} and {max} type arguments")
+    };
+    let given_str = if given == 0 { "none" } else { &given.to_string() };
+    format!("\"{type_name}\" expects {s}, but {given_str} given")
 }
 
 fn fail_call(py: Python<'_>, fail: &PyAny, msg: &str, context: &PyAny) {
     let _ = py.import("mypy.messages").and_then(|m| {
         let code = m.getattr("codes")?.getattr("TYPE_ARG")?;
-        let _ = fail.call1((msg, context, code));
+        // MsgCallback.__call__ has `code` as keyword-only: (msg, ctx, *, code=None).
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("code", code).ok();
+        let _ = fail.call((msg, context), Some(kwargs));
         Ok::<(), pyo3::PyErr>(())
     });
 }
@@ -911,9 +916,29 @@ fn check_vec_type_args_inner(
                 ok = false;
             }
         } else if is_instance(arg, refs.union_type) {
-            ok = check_vec_union(py, arg, ctx, api, refs)?;
-            if !ok {
-                return Ok(false);
+            // Distinguish Instance-in-deny-list (outer emits) from
+            // non-Instance recursive call (already emitted, skip).
+            let union_ok = check_vec_union(py, arg, ctx, api, refs)?;
+            if !union_ok {
+                let items = get_attr_or_defer(arg, "items")?;
+                let item_list = iter_seq(items)?;
+                if item_list.len() == 2 {
+                    let i0 = item_list[0];
+                    let i1 = item_list[1];
+                    let nopt = if is_instance(i0, refs.none_type) {
+                        Some(i1)
+                    } else if is_instance(i1, refs.none_type) {
+                        Some(i0)
+                    } else {
+                        None
+                    };
+                    if let Some(n) = nopt {
+                        if !is_instance(n, refs.instance) {
+                            return Ok(false);
+                        }
+                    }
+                }
+                ok = false;
             }
         } else if is_instance(arg, refs.type_var_type) {
             let is_stub = api.getattr("is_stub_file").map_err(|_| DeferError)?;
@@ -925,7 +950,7 @@ fn check_vec_type_args_inner(
         }
     }
     if !ok {
-        let _ = api.call1(("fail", "Invalid item type for \"vec\"", ctx));
+        let _ = api.getattr("fail").and_then(|f| f.call1(("Invalid item type for \"vec\"", ctx)));
     }
     Ok(ok)
 }
