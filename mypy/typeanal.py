@@ -2537,6 +2537,13 @@ def detect_diverging_alias(node: TypeAlias, target: Type) -> bool:
     They may be handy in rare cases, e.g. to express a union of non-mixed nested lists:
     Nested = Union[T, Nested[List[T]]] ~> Union[T, List[T], List[List[T]], ...]
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_detect_diverging_alias(node, target)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     is_recursive = node._is_recursive
     if is_recursive is None:
         is_recursive = node in node.target.accept(CollectAliasesVisitor())
@@ -2577,6 +2584,10 @@ try:
         rust_make_optional_type as _rust_make_optional_type,
         rust_type_analyze as _rust_type_analyze,
         rust_unknown_unpack as _rust_unknown_unpack,
+        rust_validate_instance as _rust_validate_instance,
+        rust_detect_diverging_alias as _rust_detect_diverging_alias,
+        rust_find_self_type as _rust_find_self_type,
+        rust_check_vec_type_args as _rust_check_vec_type_args,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -2590,6 +2601,10 @@ except ImportError:
     _rust_make_optional_type = None  # type: ignore[assignment]
     _rust_type_analyze = None  # type: ignore[assignment]
     _rust_unknown_unpack = None  # type: ignore[assignment]
+    _rust_validate_instance = None  # type: ignore[assignment]
+    _rust_detect_diverging_alias = None  # type: ignore[assignment]
+    _rust_find_self_type = None  # type: ignore[assignment]
+    _rust_check_vec_type_args = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -2767,6 +2782,13 @@ def make_optional_type(t: Type) -> Type:
 
 def validate_instance(t: Instance, fail: MsgCallback, indexed: bool) -> bool:
     """Check if this is a well-formed instance with respect to argument count/positions."""
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_validate_instance(t, fail, indexed)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     # TODO: combine logic with instantiate_type_alias().
     if any(unknown_unpack(a) for a in t.args):
         # This type is not ready to be validated, because of unknown total count.
@@ -2840,6 +2862,13 @@ def validate_instance(t: Instance, fail: MsgCallback, indexed: bool) -> bool:
 
 
 def find_self_type(typ: Type, lookup: Callable[[str], SymbolTableNode | None]) -> bool:
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_find_self_type(typ, lookup)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return typ.accept(HasSelfType(lookup))
 
 
@@ -3042,6 +3071,13 @@ def check_vec_type_args(
 
     Return False on error.
     """
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_check_vec_type_args(args, ctx, api)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     ok = True
     if len(args) != 1:
         ok = False

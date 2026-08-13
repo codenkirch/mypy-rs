@@ -297,6 +297,10 @@ __all__ = [
     "rust_check_namedtuple_field_name",
     "rust_verify_requiredness_compatibility",
     "rust_verify_field_against_closed_bases",
+    "rust_validate_instance",
+    "rust_detect_diverging_alias",
+    "rust_find_self_type",
+    "rust_check_vec_type_args",
     "IdMapper",
 ]
 
@@ -1039,6 +1043,12 @@ def rust_verify_requiredness_compatibility(
 def rust_verify_field_against_closed_bases(
     field_name: str, closed_bases: Any, primary_source_base: Any
 ) -> list[str]: ...
+
+# Issue #578: typeanal_queries functions (live PyO3 objects)
+def rust_validate_instance(t: Any, fail: Any, indexed: bool) -> bool | None: ...
+def rust_detect_diverging_alias(node: Any, target: Any) -> bool | None: ...
+def rust_find_self_type(typ: Any, lookup: Any) -> bool | None: ...
+def rust_check_vec_type_args(args: Any, ctx: Any, api: Any) -> bool | None: ...
 
 class IdMapper:
     def __init__(self) -> None: ...
