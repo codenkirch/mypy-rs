@@ -19,9 +19,10 @@ use std::collections::HashMap;
 /// Frozen snapshot of a `mypy.nodes.TypeAlias`, keyed by `fullname`.
 ///
 /// Field set is the union of Stage 3c `is_subtype` consumers:
-/// `target` (expand the alias), `alias_tvars` (name list for
-/// arg-position dispatch), `tvar_tuple_index` (variadic alias dispatch),
-/// `no_args` (`A = List` vs `A = List[Any]` distinction, nodes.py:4560).
+/// `target` (expand the alias), `alias_tvars` (declared typevar
+/// identities, for arg-position substitution), `tvar_tuple_index`
+/// (variadic alias dispatch), `no_args` (`A = List` vs `A = List[Any]`
+/// distinction, nodes.py:4560).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct TypeAliasSnapshot {
@@ -30,11 +31,10 @@ pub(crate) struct TypeAliasSnapshot {
     /// `TypeAlias.target` serialized as a wire-format `Type` blob
     /// (nodes.py:4611). Stage 3c decodes via `wire::read_type`.
     pub target: Vec<u8>,
-    /// `TypeAlias.alias_tvars` as a list of names (nodes.py:4614).
-    /// Each entry is a `TypeVarLikeType.name`; the kind (TypeVar vs
-    /// ParamSpec vs TypeVarTuple) is not needed for the M8b nominal
-    /// path, which returns `None` for `TypeAliasType`.
-    pub alias_tvars: Vec<String>,
+    /// `TypeAlias.alias_tvars` in declaration order (nodes.py:4614).
+    /// Each entry carries the declared typevar's identity so a
+    /// substitution env can be built by zipping with the alias `args`.
+    pub alias_tvars: Vec<AliasTvar>,
     /// `TypeAlias.tvar_tuple_index` (nodes.py:4622). `None` if the
     /// alias has no `TypeVarTupleType` in `alias_tvars`.
     pub tvar_tuple_index: Option<usize>,
@@ -42,6 +42,27 @@ pub(crate) struct TypeAliasSnapshot {
     /// (no_args=True, no arg substitution) from `A = List[Any]`
     /// (no_args=False).
     pub no_args: bool,
+    /// `TypeAlias.python_3_12_type_alias` (nodes.py:4616). The
+    /// `BoolTypeQuery` alias handler visits `t.args` only for new-style
+    /// (PEP 695) aliases (type_visitor.py:614).
+    pub python_3_12_type_alias: bool,
+}
+
+/// Identity of one declared type variable of a `TypeAlias` (an element
+/// of `TypeAlias.alias_tvars`). Mirrors `TypeVarId` equality
+/// (types.py:574-576): `(raw_id, meta_level, namespace)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AliasTvar {
+    /// `TypeVarLikeType.name` (nodes.py:4614), e.g. `"T"`.
+    pub name: String,
+    /// `TypeVarLikeType.id.raw_id`.
+    pub raw_id: i64,
+    /// `TypeVarLikeType.id.meta_level`.
+    pub meta_level: i64,
+    /// `TypeVarLikeType.id.namespace`.
+    pub namespace: String,
+    /// Whether this is a `TypeVarTupleType` (vs TypeVar / ParamSpec).
+    pub is_type_var_tuple: bool,
 }
 
 #[allow(dead_code)]
@@ -98,6 +119,14 @@ mod tests {
         TypeAliasSnapshot {
             fullname: fullname.to_owned(),
             target,
+            ..Default::default()
+        }
+    }
+
+    fn tvar(name: &str, raw_id: i64) -> AliasTvar {
+        AliasTvar {
+            name: name.to_owned(),
+            raw_id,
             ..Default::default()
         }
     }
