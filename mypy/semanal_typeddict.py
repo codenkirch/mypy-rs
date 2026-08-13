@@ -56,6 +56,19 @@ from mypy.types import (
     get_proper_type,
 )
 
+try:
+    from type_kernel import (
+        rust_primary_source as _rust_primary_source,
+        rust_verify_requiredness_compatibility as _rust_verify_requiredness_compatibility,
+        rust_verify_field_against_closed_bases as _rust_verify_field_against_closed_bases,
+    )
+    _HAS_RUST_TYPEDDICT = True
+except ImportError:
+    _rust_primary_source = None  # type: ignore[assignment]
+    _rust_verify_requiredness_compatibility = None  # type: ignore[assignment]
+    _rust_verify_field_against_closed_bases = None  # type: ignore[assignment]
+    _HAS_RUST_TYPEDDICT = False
+
 TPDICT_CLASS_ERROR: Final = (
     'Invalid statement in TypedDict definition; expected "field_name: field_type"'
 )
@@ -264,6 +277,11 @@ class TypedDictAnalyzer:
         The primary source will be the last in the list, skipping readonly
         base class sources unless they are the only available option.
         """
+        if _HAS_RUST_TYPEDDICT:
+            try:
+                return _rust_primary_source(sources)  # type: ignore[no-any-return]
+            except Exception:
+                pass
         if not sources[-1].base:
             return sources[-1]
         mutable_sources = (s for s in reversed(sources) if not s.is_readonly)
@@ -278,6 +296,16 @@ class TypedDictAnalyzer:
         ctx: Context,
     ) -> None:
         """Verify requiredness compatibility of the final child type field with a base class source."""
+        if _HAS_RUST_TYPEDDICT:
+            try:
+                msg = _rust_verify_requiredness_compatibility(
+                    field_name, source, is_required, primary_source_base
+                )
+                if msg is not None:
+                    self.fail(msg, ctx)
+                return
+            except Exception:
+                pass
         assert source.base
         if source.is_required and not is_required:
             if primary_source_base is None:
@@ -309,6 +337,16 @@ class TypedDictAnalyzer:
         primary_source_base: TypeInfo | None,
         ctx: Context,
     ) -> None:
+        if _HAS_RUST_TYPEDDICT:
+            try:
+                errors = _rust_verify_field_against_closed_bases(
+                    field_name, closed_bases, primary_source_base
+                )
+                for msg in errors:
+                    self.fail(msg, ctx)
+                return
+            except Exception:
+                pass
         for closed_base_type, closed_base_fields in closed_bases:
             if field_name in closed_base_fields:
                 continue
