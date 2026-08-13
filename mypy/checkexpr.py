@@ -7889,10 +7889,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
 def has_any_type(t: Type, ignore_in_type_obj: bool = False) -> bool:
     """Whether t contains an Any type"""
-    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(t)
-            result = _rust_has_any_type(type_bytes, ignore_in_type_obj)
+            result = _rust_has_any_type(_native_checkexpr_resolver, type_bytes, ignore_in_type_obj)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

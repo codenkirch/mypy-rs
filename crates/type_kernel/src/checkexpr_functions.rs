@@ -27,6 +27,12 @@ const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 /// `TypeOfAny.unannotated` == 1.
 const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
 
+/// `TypeOfAny.from_omitted_generics` == 4. Mypy uses this as the "no
+/// default" sentinel for TypeVar-like types: `has_default()` returns
+/// False exactly when the default is this Any, so the default must not
+/// be treated as a real Any by `has_any_type`.
+const TYPE_OF_ANY_FROM_OMITTED_GENERICS: i64 = 4;
+
 /// `ArgKind.ARG_POS` = 0. `ArgKind.ARG_OPT` = 1. `ArgKind.ARG_STAR` = 2.
 /// `ArgKind.ARG_NAMED` = 3. `ArgKind.ARG_STAR2` = 4. `ArgKind.ARG_NAMED_OPT` = 5.
 const ARG_POS: i64 = 0;
@@ -64,10 +70,11 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
 /// Expand a `TypeAliasType` wire node to its frozen `target` snapshot
 /// (B3a). This is a *shape-only* expansion: the target is decoded as-is
 /// and the alias's type arguments are NOT substituted. That is parity-safe
-/// for shape predicates (`is_type_type_context`, `method_fullname`,
-/// `has_any_type`) because the answer depends only on the target's type
-/// class and name, never on `Instance` args; exactly the difference
-/// between `A = Type[X]` and `B = List[X]`.
+/// for shape predicates (`is_type_type_context`, `method_fullname`)
+/// because the answer depends only on the target's type class and name,
+/// never on `Instance` args; exactly the difference between `A = Type[X]`
+/// and `B = List[X]`. (`has_any_type` switched to the substituting
+/// `expanded_alias_target` in B3b since it must see type args.)
 ///
 /// Aliasing a chain (`B = A`, `A = Type[X]`) is legal in mypy, so the
 /// snapshots are followed until a non-alias target is found. Recursion
@@ -97,6 +104,87 @@ pub(crate) fn expand_alias_shape(
     }
 }
 
+/// Expand a `TypeAliasType` wire node to its **type-argument-substituted**
+/// target, mirroring `TypeAliasType._expand_once` (types.py:361-392) then
+/// `get_proper_type`'s chain loop. This is what the `BoolTypeQuery`
+/// predicates need: Python's base `visit_type_alias_type` visits
+/// `get_proper_type(t)` (the substituted target) and `t.args`.
+///
+/// Returns `(target, args, python_3_12)` where `target` is the
+/// chain-resolved target with the alias's type arguments substituted for
+/// its declared typevars (`no_args` aliases keep the target as-is), `args`
+/// are the top-level `TypeAliasType`'s own arguments, and
+/// `python_3_12` is the top-level snapshot's `python_3_12_type_alias`
+/// flag. Returns `None` to defer: missing snapshot, undecodable target,
+/// an alias cycle, or a substitution the kernel cannot perform exactly
+/// (ParamSpec/TypeVarTuple, leftover typevar, etc.). Deferral is
+/// parity-safe: the caller falls back to the pure-Python visitor.
+pub(crate) fn expanded_alias_target(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<(Type, Vec<Type>, bool)> {
+    let mut current = typ.clone();
+    let mut args: Vec<Type> = Vec::new();
+    let mut python_3_12 = false;
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let (type_ref, cur_args) = match &current {
+            Type::TypeAliasType { type_ref, args } => (type_ref.clone(), args.clone()),
+            _ => return Some((current, args, python_3_12)),
+        };
+        if seen.contains(&type_ref) {
+            return None;
+        }
+        seen.push(type_ref.clone());
+        let snap = aliases.get(&type_ref)?;
+        // The outermost TypeAliasType's args + python_3_12 flag drive the
+        // substitution and the args-visit below.
+        if args.is_empty() {
+            args = cur_args;
+        }
+        if !python_3_12 {
+            python_3_12 = snap.python_3_12_type_alias;
+        }
+        let mut buf = ReadBuffer::new(&snap.target);
+        let target = read_type(&mut buf, None).ok()?;
+        if snap.no_args {
+            return Some((target, args, python_3_12));
+        }
+        if snap.alias_tvars.is_empty() {
+            current = target;
+            continue;
+        }
+        // Build the substitution env from zip(alias_tvars, args),
+        // mirroring _expand_once's `v.id: s ...}` mapping. If the arg
+        // count mismatches, Python's zip truncates and leaves some
+        // typevars unbound, which would leave TypeVar nodes in the
+        // target that the predicate can safely treat as non-Any. The
+        // exact flag is a defer (conservative).
+        let env = build_alias_env(&snap.alias_tvars, &args)?;
+        let substituted = crate::expandtype::expand_type_inner(&target, &env, true)?;
+        current = substituted;
+    }
+}
+
+/// Build the `TypeVarId -> Type` substitution map for an alias
+/// application, mirroring `_expand_once` (types.py:375-385). Returns
+/// `None` if the arg count mismatches the declared typevar count or an
+/// identity is missing (defer).
+fn build_alias_env(
+    alias_tvars: &[crate::aliases::AliasTvar],
+    args: &[Type],
+) -> Option<std::collections::HashMap<crate::expandtype::EnvKey, Type>> {
+    use std::collections::HashMap;
+    let mut env = HashMap::with_capacity(alias_tvars.len());
+    for (tv, arg) in alias_tvars.iter().zip(args) {
+        env.insert(
+            (tv.raw_id, tv.meta_level, tv.namespace.clone()),
+            arg.clone(),
+        );
+    }
+    Some(env)
+}
+
 /// Whether a CallableType is a type object (i.e. its fallback is
 /// `builtins.type`). Mirrors `CallableType.is_type_obj()` — the wire
 /// format stores `fallback` + `from_concatenate` but not the computed
@@ -118,11 +206,12 @@ fn is_type_obj(fallback: &Type, from_concatenate: bool) -> bool {
 /// `mypy.checkexpr.has_any_type` — whether a type contains an Any type.
 /// Special forms (type_of_any == 6) are not counted as real Any.
 ///
-/// Mirrors `HasAnyType` (checkexpr.py:6633-6660). Defers (returns None)
-/// on TypeAliasType.
+/// Mirrors `HasAnyType` (checkexpr.py:7890-7926) with the resolver for
+/// alias expansion (B3b). Deferral is parity-safe.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn rust_has_any_type(
+    resolver: &NativeTypeResolver,
     type_bytes: &[u8],
     ignore_in_type_obj: bool,
 ) -> PyResult<Option<bool>> {
@@ -130,12 +219,56 @@ pub(crate) fn rust_has_any_type(
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(has_any_type_inner(&typ, ignore_in_type_obj))
+    Ok(has_any_type_inner(
+        &typ,
+        ignore_in_type_obj,
+        resolver.alias_resolver(),
+    ))
 }
 
-pub(crate) fn has_any_type_inner(typ: &Type, ignore_in_type_obj: bool) -> Option<bool> {
-    if let Type::TypeAliasType { .. } = typ {
-        return None;
+pub(crate) fn has_any_type_inner(
+    typ: &Type,
+    ignore_in_type_obj: bool,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    // `seen` holds alias fullnames already visited on this descent,
+    // mirroring BoolTypeQuery.seen_aliases (type_visitor.py:604-607):
+    // a repeated alias short-circuits to the strategy default (false
+    // for ANY_STRATEGY). This terminates recursive aliases like
+    // `A = List[A]` that `expanded_alias_target`'s per-call chain
+    // detection cannot see across the has_any_type recursion boundary.
+    let mut seen: Vec<String> = Vec::new();
+    has_any_type_inner_seen(typ, ignore_in_type_obj, aliases, &mut seen)
+}
+
+fn has_any_type_inner_seen(
+    typ: &Type,
+    ignore_in_type_obj: bool,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    if let Type::TypeAliasType { type_ref, .. } = typ {
+        // Python's BoolTypeQuery.visit_type_alias_type (type_visitor.py:598)
+        // visits the substituted target and (for new-style aliases only)
+        // the args. `expanded_alias_target` substitutes exactly like
+        // TypeAliasType._expand_once; when the substitution defers we
+        // defer the whole query (parity-safe).
+        if seen.contains(type_ref) {
+            return Some(false);
+        }
+        seen.push(type_ref.clone());
+        let (target, args, python_3_12) = expanded_alias_target(typ, aliases)?;
+        if has_any_type_inner_seen(&target, ignore_in_type_obj, aliases, seen)? {
+            return Some(true);
+        }
+        if python_3_12 {
+            for arg in &args {
+                if has_any_type_inner_seen(arg, ignore_in_type_obj, aliases, seen)? {
+                    return Some(true);
+                }
+            }
+        }
+        return Some(false);
     }
     match typ {
         Type::AnyType { type_of_any, .. } => Some(*type_of_any != TYPE_OF_ANY_SPECIAL_FORM),
@@ -152,32 +285,32 @@ pub(crate) fn has_any_type_inner(typ: &Type, ignore_in_type_obj: bool) -> Option
                 return Some(false);
             }
             for t in arg_types {
-                match has_any_type_inner(t, ignore_in_type_obj) {
+                match has_any_type_inner_seen(t, ignore_in_type_obj, aliases, seen) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
                 }
             }
-            match has_any_type_inner(ret_type, ignore_in_type_obj) {
+            match has_any_type_inner_seen(ret_type, ignore_in_type_obj, aliases, seen) {
                 Some(true) => return Some(true),
                 None => return None,
                 Some(false) => {}
             }
             for v in variables {
-                match has_any_type_inner(v, ignore_in_type_obj) {
+                match has_any_type_inner_seen(v, ignore_in_type_obj, aliases, seen) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
                 }
             }
             if let Some(it) = instance_type {
-                return has_any_type_inner(it, ignore_in_type_obj);
+                return has_any_type_inner_seen(it, ignore_in_type_obj, aliases, seen);
             }
             Some(false)
         }
         _ => {
             for child in children(typ) {
-                match has_any_type_inner(child, ignore_in_type_obj) {
+                match has_any_type_inner_seen(child, ignore_in_type_obj, aliases, seen) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -230,6 +363,64 @@ fn children(typ: &Type) -> Vec<&Type> {
         Type::AnyType {
             source_any: None, ..
         } => {}
+        // TypeVar families carry bounds/defaults/values that must be
+        // queried: Python's BoolTypeQuery.visit_type_var / param_spec /
+        // type_var_tuple visit upper_bound + default (only when
+        // has_default()) + values/prefix. The no-default sentinel
+        // (from_omitted_generics) is not a real Any and is skipped.
+        // TypeVarTupleType's tuple_fallback is NOT visited by Python.
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            out.push(upper_bound);
+            if !matches!(
+                default.as_ref(),
+                Type::AnyType {
+                    type_of_any: TYPE_OF_ANY_FROM_OMITTED_GENERICS,
+                    ..
+                }
+            ) {
+                out.push(default);
+            }
+            out.extend(values.iter());
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            out.push(upper_bound);
+            if !matches!(
+                default.as_ref(),
+                Type::AnyType {
+                    type_of_any: TYPE_OF_ANY_FROM_OMITTED_GENERICS,
+                    ..
+                }
+            ) {
+                out.push(default);
+            }
+            out.extend(prefix.arg_types.iter());
+        }
+        Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => {
+            out.push(upper_bound);
+            if !matches!(
+                default.as_ref(),
+                Type::AnyType {
+                    type_of_any: TYPE_OF_ANY_FROM_OMITTED_GENERICS,
+                    ..
+                }
+            ) {
+                out.push(default);
+            }
+        }
         // CallableType handled separately. Parameters, leaves: none.
         _ => {}
     }
@@ -952,39 +1143,6 @@ fn all_children(typ: &Type) -> Vec<&Type> {
             out.push(it);
         }
     }
-    if let Type::TypeVarType {
-        upper_bound,
-        default,
-        values,
-        ..
-    } = typ
-    {
-        out.push(upper_bound);
-        out.push(default);
-        out.extend(values.iter());
-    }
-    if let Type::ParamSpecType {
-        upper_bound,
-        default,
-        prefix,
-        ..
-    } = typ
-    {
-        out.push(upper_bound);
-        out.push(default);
-        out.extend(prefix.arg_types.iter());
-    }
-    if let Type::TypeVarTupleType {
-        upper_bound,
-        default,
-        tuple_fallback,
-        ..
-    } = typ
-    {
-        out.push(upper_bound);
-        out.push(default);
-        out.push(tuple_fallback);
-    }
     if let Type::Parameters(p) = typ {
         out.extend(p.arg_types.iter());
     }
@@ -1660,6 +1818,7 @@ pub(crate) fn rust_analyze_cond_branch(
         branch.as_ref(),
         known.as_ref(),
         resolver.resolver(),
+        resolver.alias_resolver(),
     ))
 }
 
@@ -1667,13 +1826,14 @@ fn combined_context_inner(
     branch: Option<&Type>,
     known: Option<&Type>,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<u8>> {
     use crate::subtypes::SubtypeContext;
 
     // Any is contagious: `dict[str, Any] or <x>` should still infer Any
     // in `x`, so return the branch type directly (no union with it).
     if let Some(b) = branch {
-        match has_any_type_inner(b, false) {
+        match has_any_type_inner(b, false, aliases) {
             Some(true) => return encode_type(b),
             Some(false) => {}
             None => return None, // TypeAliasType: defer, Python expands.
@@ -2243,13 +2403,20 @@ mod tests {
 
     #[test]
     fn test_has_any_type_true() {
-        assert_eq!(has_any_type_inner(&make_any(2), false), Some(true));
+        assert_eq!(
+            has_any_type_inner(&make_any(2), false, &empty_alias_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_has_any_type_special_form_false() {
         assert_eq!(
-            has_any_type_inner(&make_any(TYPE_OF_ANY_SPECIAL_FORM), false),
+            has_any_type_inner(
+                &make_any(TYPE_OF_ANY_SPECIAL_FORM),
+                false,
+                &empty_alias_resolver()
+            ),
             Some(false)
         );
     }
@@ -2257,24 +2424,572 @@ mod tests {
     #[test]
     fn test_has_any_type_in_instance() {
         let inst = make_instance("Foo", vec![make_any(2)]);
-        assert_eq!(has_any_type_inner(&inst, false), Some(true));
+        assert_eq!(
+            has_any_type_inner(&inst, false, &empty_alias_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_has_any_type_false_simple() {
         assert_eq!(
-            has_any_type_inner(&make_instance("int", vec![]), false),
+            has_any_type_inner(
+                &make_instance("int", vec![]),
+                false,
+                &empty_alias_resolver()
+            ),
             Some(false)
         );
     }
 
     #[test]
-    fn test_has_any_type_alias_defers() {
+    fn test_has_any_type_alias_defers_without_snapshot() {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
         };
-        assert_eq!(has_any_type_inner(&alias, false), None);
+        // No snapshot in the resolver -> expanded_alias_target defers.
+        assert_eq!(
+            has_any_type_inner(&alias, false, &empty_alias_resolver()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_expands_typevar_arg_any_true() {
+        // A[T] = List[T], applied as A[Any]: the substitution must
+        // replace T with Any so has_any_type answers true (B3b core).
+        // The snapshot's alias_tvars declares T with raw_id 7;
+        // the wire TypeAliasType node carries args=[Any].
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 7,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tvar_type],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let snap = crate::aliases::TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_type(&target).expect("target must encode"),
+            alias_tvars: vec![tv],
+            python_3_12_type_alias: true,
+            ..Default::default()
+        };
+        resolver.insert("mod.A".to_string(), snap);
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_any(2)],
+        };
+        assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
+    }
+
+    #[test]
+    fn test_has_any_type_alias_expands_typevar_arg_int_false() {
+        // A[T] = List[T], applied A[int]: substitution yields List[int]
+        // (no Any) and the old-style alias does not visit args, so the
+        // answer is false (Python parity: visit_type_alias_type visits the
+        // proper target only).
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 7,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tvar_type],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&target).expect("target must encode"),
+                alias_tvars: vec![tv],
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_instance("int", vec![])],
+        };
+        assert_eq!(
+            has_any_type_inner(&alias_app, false, &resolver),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_python312_visits_args() {
+        // New-style (PEP 695) alias A[T] = Callable[[T], int] applied
+        // A[Any]: the target Callable[[Any], int] contains Any, so true
+        // regardless of the args-visit; use an alias whose target has NO
+        // typevars so only the args can carry Any.
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 9,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        // Target is plain `int` (no T in target): dead typevar.
+        let target = make_instance("int", vec![]);
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&target).expect("target must encode"),
+                alias_tvars: vec![tv],
+                python_3_12_type_alias: true,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_any(2)],
+        };
+        // New-style alias: `res or query_types(args)` -> args=[Any] -> true.
+        assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
+    }
+
+    #[test]
+    fn test_has_any_type_alias_oldstyle_skips_args() {
+        // Same dead-typevar alias but old-style (python_3_12 == false):
+        // `res or args` -> only the target is visited, args are ignored,
+        // so has_any_type is false even though args=[Any].
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 9,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let target = make_instance("int", vec![]);
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&target).expect("target must encode"),
+                alias_tvars: vec![tv],
+                python_3_12_type_alias: false,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_any(2)],
+        };
+        assert_eq!(
+            has_any_type_inner(&alias_app, false, &resolver),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_arg_count_mismatch_defers() {
+        // A[T] = List[T] applied with zero args: build_alias_env sees a
+        // length mismatch? No, zip truncates, leaving T unbound. Python
+        // leaves the TypeVar in the target (not Any), so has_any_type is
+        // false. The Rust env maps nothing (zip over empty), the TypeVar
+        // survives, and Instance[List[T]] has no Any -> false. This
+        // matches Python's zip-truncate semantics.
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 7,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tvar_type],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&target).expect("target must encode"),
+                alias_tvars: vec![tv],
+                python_3_12_type_alias: false,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            has_any_type_inner(&alias_app, false, &resolver),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_no_args_defer() {
+        // no_args alias: target returned as-is (parity-safe, production
+        // strips typevars). Chain-extension with the top-level args is not
+        // needed; verify a no_args alias with a plain target answers
+        // correctly.
+        let mut resolver = empty_alias_resolver();
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&make_instance("list", vec![])).expect("target must encode"),
+                no_args: true,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            has_any_type_inner(&alias_app, false, &resolver),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_closure_cycle_defers() {
+        // A = List[A]: expanded_alias_target must detect the cycle and
+        // defer, never looping. Python's get_proper_type also cannot
+        // terminate on recursive aliases, and BoolTypeQuery's
+        // seen_aliases set short-circuits to default, so defer is the
+        // parity-safe answer.
+        let mut resolver = empty_alias_resolver();
+        // Self-referential target A = List[A]: build via hand-crafted
+        // wire bytes (write_type refuses TypeAliasType).
+        let mut wbuf = WriteBuffer::new();
+        crate::wire::write_tag(&mut wbuf, crate::wire::TYPE_ALIAS_TYPE);
+        crate::wire::write_type_list(&mut wbuf, &[]).expect("empty args encode");
+        crate::wire::write_str(&mut wbuf, "mod.A").expect("ref encodes");
+        crate::wire::write_tag(&mut wbuf, crate::wire::END_TAG);
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: wbuf.into_bytes(),
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        assert_eq!(has_any_type_inner(&alias_app, false, &resolver), None);
+    }
+
+    #[test]
+    fn test_has_any_type_alias_typevar_never_bound_defers() {
+        // A[T] = List[T] applied A[int] where the env's TypeVar key does
+        // not match (raw_id 7 vs declared 8): expand_type_inner leaves T
+        // unbound -> the target keeps a TypeVar node. has_any_type only
+        // traverses values/upper_bound/default of TypeVar (never the
+        // bare node), so it answers false, matching Python (the T is
+        // non-Any). This documents the non-deferring substitution path.
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 8,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tvar_type],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&target).expect("target must encode"),
+                alias_tvars: vec![tv],
+                python_3_12_type_alias: false,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_instance("int", vec![])],
+        };
+        assert_eq!(
+            has_any_type_inner(&alias_app, false, &resolver),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_alias_union_typevar_target() {
+        // A[T] = Union[T, str], A[Any]: substitution must fire inside a
+        // union item. Rust's expand_type_inner returns a simplified
+        // UnionType; has_any_type then finds the Any -> true.
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 7,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let union = Type::UnionType {
+            items: vec![tvar_type, make_instance("str", vec![])],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&union).expect("target must encode"),
+                alias_tvars: vec![tv],
+                python_3_12_type_alias: false,
+                ..Default::default()
+            },
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![make_any(2)],
+        };
+        assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
+    }
+
+    #[test]
+    fn test_has_any_type_alias_chain() {
+        // B = A, A = List[Any]: the chain loop must follow B -> A and
+        // answer true (no typevars involved, so no args needed).
+        let mut resolver = empty_alias_resolver();
+        resolver.insert(
+            "mod.A".to_string(),
+            crate::aliases::TypeAliasSnapshot {
+                fullname: "mod.A".to_string(),
+                target: encode_type(&make_instance("list", vec![make_any(2)]))
+                    .expect("target must encode"),
+                ..Default::default()
+            },
+        );
+        insert_chain_edges(
+            &mut resolver,
+            alias_resolver_with_alias_targets(&[("mod.B", "mod.A".to_string())]),
+        );
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.B".to_string(),
+            args: vec![],
+        };
+        // B's target is a TypeAliasType to A with no args; the chain
+        // loop rewrites current = target until a non-alias target.
+        assert_eq!(has_any_type_inner(&alias_app, false, &resolver), Some(true));
+    }
+
+    #[test]
+    fn test_has_any_type_typevar_no_default_false() {
+        // `T = TypeVar('T')`: default is the from_omitted_generics
+        // sentinel (type_of_any=4), which is NOT a real Any. Python's
+        // HasAnyType.visit_type_var only visits the default when
+        // has_default() is true. The sentinel must be skipped (B3b
+        // regression: it was treated as a real Any -> spurious true).
+        for default in [
+            make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS),
+            Type::UninhabitedType { ambiguous: false },
+        ] {
+            let tv = Type::TypeVarType {
+                name: "T".to_string(),
+                fullname: "mod.T".to_string(),
+                raw_id: 1,
+                namespace: Default::default(),
+                values: vec![],
+                upper_bound: Box::new(make_instance("object", vec![])),
+                default: Box::new(default),
+                variance: 0,
+                meta_level: 0,
+            };
+            assert_eq!(
+                has_any_type_inner(&tv, false, &empty_alias_resolver()),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_has_any_type_typevar_real_default_any_true() {
+        // `T = TypeVar('T', default=Any)`: a genuine Any default IS a
+        // real Any and must make has_any_type true.
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(make_any(TYPE_OF_ANY_UNANNOTATED)),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            has_any_type_inner(&tv, false, &empty_alias_resolver()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_typevar_bound_any_true() {
+        // `T = TypeVar('T', bound=Any)`: the upper bound being Any must
+        // be counted (Python visits the upper_bound unconditionally).
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_any(TYPE_OF_ANY_UNANNOTATED)),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            has_any_type_inner(&tv, false, &empty_alias_resolver()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_paramspec_no_default_false() {
+        // ParamSpec with sentinel default: no real Any.
+        let ps = Type::ParamSpecType {
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 1,
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            flavor: 0,
+            upper_bound: Box::new(make_instance("object", vec![])),
+            namespace: Default::default(),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+        };
+        assert_eq!(
+            has_any_type_inner(&ps, false, &empty_alias_resolver()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_typevar_tuple_no_default_false() {
+        // TypeVarTuple's tuple_fallback is NOT visited by Python
+        // (visit_type_var_tuple visits upper_bound + default only). An
+        // Any in tuple_fallback must not trigger a hit, and the sentinel
+        // default must be skipped. Both directions of that bug are here.
+        let tvt = Type::TypeVarTupleType {
+            name: "Ts".to_string(),
+            fullname: "mod.Ts".to_string(),
+            raw_id: 1,
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            tuple_fallback: Box::new(make_any(TYPE_OF_ANY_UNANNOTATED)),
+            min_len: 0,
+            namespace: Default::default(),
+        };
+        assert_eq!(
+            has_any_type_inner(&tvt, false, &empty_alias_resolver()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_any_type_typevar_tuple_bound_any_true() {
+        // TypeVarTuple upper_bound Any -> true (Python always visits it).
+        let tvt = Type::TypeVarTupleType {
+            name: "Ts".to_string(),
+            fullname: "mod.Ts".to_string(),
+            raw_id: 1,
+            upper_bound: Box::new(make_any(TYPE_OF_ANY_UNANNOTATED)),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            tuple_fallback: Box::new(make_instance("tuple", vec![])),
+            min_len: 0,
+            namespace: Default::default(),
+        };
+        assert_eq!(
+            has_any_type_inner(&tvt, false, &empty_alias_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2291,6 +3006,45 @@ mod tests {
             has_uninhabited_component_inner(&make_instance("int", vec![])),
             Some(false)
         );
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_typevar_real_default_true() {
+        // A TypeVar with a genuine UninhabitedType default must be
+        // detected through all_children (children() covers TypeVarType;
+        // the sentinel filter only drops the no-default Any, never an
+        // UninhabitedType default).
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(has_uninhabited_component_inner(&tv), Some(true));
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_typevar_sentinel_default_false() {
+        // The from_omitted_generics sentinel (an AnyType) is not an
+        // UninhabitedType, so skipping it changes nothing; the answer
+        // stays false. Guards all_children against double-visits.
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(has_uninhabited_component_inner(&tv), Some(false));
     }
 
     #[test]
@@ -2947,6 +3701,10 @@ mod tests {
         TypeResolver::new()
     }
 
+    fn empty_alias_resolver() -> crate::aliases::TypeAliasResolver {
+        crate::aliases::TypeAliasResolver::new()
+    }
+
     fn containing_resolver() -> TypeResolver {
         // A -> (B defines "foo"), C -> B; "foo" sits on B.
         let mut r = TypeResolver::new();
@@ -3136,7 +3894,10 @@ mod tests {
 
     #[test]
     fn test_combined_context_no_items_defers() {
-        assert_eq!(combined_context_inner(None, None, &empty_resolver()), None);
+        assert_eq!(
+            combined_context_inner(None, None, &empty_resolver(), &empty_alias_resolver()),
+            None
+        );
     }
 
     #[test]
@@ -3145,7 +3906,12 @@ mod tests {
         // is returned verbatim (never unioned with the known context).
         let any = make_any(TYPE_OF_ANY_UNANNOTATED);
         let known = make_instance("builtins.str", vec![]);
-        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver());
+        let out = combined_context_inner(
+            Some(&any),
+            Some(&known),
+            &empty_resolver(),
+            &empty_alias_resolver(),
+        );
         let decoded = decode_type(&out.unwrap()).unwrap();
         assert_eq!(decoded, any);
     }
@@ -3155,7 +3921,13 @@ mod tests {
         // AnyType with type_of_any == special form is not "any" here.
         let any = make_any(TYPE_OF_ANY_SPECIAL_FORM);
         let known = make_instance("builtins.str", vec![]);
-        let out = combined_context_inner(Some(&any), Some(&known), &empty_resolver()).unwrap();
+        let out = combined_context_inner(
+            Some(&any),
+            Some(&known),
+            &empty_resolver(),
+            &empty_alias_resolver(),
+        )
+        .unwrap();
         // make_simplified_union([special-any, str]): proper-subtype dedup
         // decides both directions (str <: Any is False under proper, Any <:
         // str is False), so both items survive as a 2-item union. The
@@ -3173,7 +3945,8 @@ mod tests {
     #[test]
     fn test_combined_context_single_branch_fast_path() {
         let int = make_instance("builtins.int", vec![]);
-        let out = combined_context_inner(Some(&int), None, &empty_resolver());
+        let out =
+            combined_context_inner(Some(&int), None, &empty_resolver(), &empty_alias_resolver());
         let decoded = decode_type(&out.unwrap()).unwrap();
         assert_eq!(decoded, int);
     }
@@ -3181,7 +3954,12 @@ mod tests {
     #[test]
     fn test_combined_context_known_only_fast_path() {
         let str_inst = make_instance("builtins.str", vec![]);
-        let out = combined_context_inner(Some(&str_inst), None, &empty_resolver());
+        let out = combined_context_inner(
+            Some(&str_inst),
+            None,
+            &empty_resolver(),
+            &empty_alias_resolver(),
+        );
         let decoded = decode_type(&out.unwrap()).unwrap();
         assert_eq!(decoded, str_inst);
     }
@@ -3194,7 +3972,12 @@ mod tests {
         };
         // has_any_type_inner(alias) returns None -> defer to Python.
         assert_eq!(
-            combined_context_inner(Some(&alias), None, &empty_resolver()),
+            combined_context_inner(
+                Some(&alias),
+                None,
+                &empty_resolver(),
+                &empty_alias_resolver(),
+            ),
             None
         );
     }

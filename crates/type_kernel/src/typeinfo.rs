@@ -1052,10 +1052,15 @@ pub(crate) fn build_native_resolver(
             },
             None => continue,
         };
-        let alias_tvars = read_alias_tvar_names_pub(item);
+        let alias_tvars = read_alias_tvars_pub(item);
         let tvar_tuple_index = read_tvar_tuple_index_pub(item);
         let no_args: bool = item
             .getattr("no_args")
+            .ok()
+            .and_then(|v| v.extract().ok())
+            .unwrap_or(false);
+        let python_3_12_type_alias: bool = item
+            .getattr("python_3_12_type_alias")
             .ok()
             .and_then(|v| v.extract().ok())
             .unwrap_or(false);
@@ -1065,6 +1070,7 @@ pub(crate) fn build_native_resolver(
             alias_tvars,
             tvar_tuple_index,
             no_args,
+            python_3_12_type_alias,
         };
         alias_resolver.insert(fullname, snap);
     }
@@ -1073,10 +1079,15 @@ pub(crate) fn build_native_resolver(
     Py::new(py, native)
 }
 
-/// Read `TypeAlias.alias_tvars` as a Vec of names. Mirrors the private
-/// helper in `aliases.rs` but `pub(crate)` so `build_native_resolver`
-/// can reuse it without exposing the alias-iter logic.
-fn read_alias_tvar_names_pub(obj: &PyAny) -> Vec<String> {
+/// Read `TypeAlias.alias_tvars` as declaration-ordered identities.
+/// Mirrors the private helper in `aliases.rs` but `pub(crate)` so
+/// `build_native_resolver` reuses it without exposing the alias-iter
+/// logic. Each declared tvar contributes its `TypeVarId` identity
+/// (`(raw_id, meta_level, namespace)`, types.py:574-576) plus whether it
+/// is a `TypeVarTupleType`. This is the data `expanded_alias_target` needs to
+/// build the substitution env mirroring `TypeAliasType._expand_once`.
+fn read_alias_tvars_pub(obj: &PyAny) -> Vec<crate::aliases::AliasTvar> {
+    use crate::aliases::AliasTvar;
     let tvars = match obj.getattr("alias_tvars") {
         Ok(t) => match t.downcast::<PyList>() {
             Ok(l) => l,
@@ -1086,9 +1097,37 @@ fn read_alias_tvar_names_pub(obj: &PyAny) -> Vec<String> {
     };
     let mut out = Vec::with_capacity(tvars.len());
     for item in tvars.iter() {
-        if let Ok(n) = item.getattr("name").and_then(|n| n.extract::<String>()) {
-            out.push(n);
-        }
+        let name: String = match item.getattr("name").and_then(|n| n.extract()) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let id = match item.getattr("id") {
+            Ok(i) => i,
+            Err(_) => continue,
+        };
+        let raw_id: i64 = id.getattr("raw_id").and_then(|v| v.extract()).unwrap_or(0);
+        // meta_level / namespace sit on the id as attributes or defaults.
+        let meta_level: i64 = id
+            .getattr("meta_level")
+            .and_then(|v| v.extract())
+            .unwrap_or(0);
+        let namespace: String = id
+            .getattr("namespace")
+            .and_then(|v| v.extract())
+            .unwrap_or_default();
+        let is_type_var_tuple = item
+            .getattr("__class__")
+            .and_then(|c| c.getattr("__name__").and_then(|n| n.extract::<String>()))
+            .ok()
+            .map(|n| n == "TypeVarTupleType" || n == "TypeVarTupleDef")
+            .unwrap_or(false);
+        out.push(AliasTvar {
+            name,
+            raw_id,
+            meta_level,
+            namespace,
+            is_type_var_tuple,
+        });
     }
     out
 }

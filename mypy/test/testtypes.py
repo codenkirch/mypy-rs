@@ -3036,6 +3036,321 @@ class NativeTypeTypeContextSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeHasAnyTypeSuite(Suite):
+    """Parity suite for the Rust `has_any_type` port with alias type-arg
+    substitution (Phase B3b, #591).
+
+    The B3b core: `has_any_type` must expand a `TypeAliasType` to its
+    substituted target (like `_expand_once`) and answer correctly, not
+    merely defer on every alias. Covers typevar aliases applied with Any
+    (true), plain targets (false), chains, no_args aliases, cycles
+    (defer), and new-style (PEP 695) arg visiting. Requires
+    TEST_NATIVE_TYPE_KERNEL=1.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self.resolver = self._build_resolver([])
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.bi,
+                self.fx.str_type_info,
+                self.fx.type_typei,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+            ],
+            aliases,
+        )
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        self.resolver = self._build_resolver(aliases)
+        _set_native_checkexpr_resolver(self.resolver)
+
+    def assert_rust_decides(self, t: Type, expected: bool) -> None:
+        """Assert the Rust kernel answers `expected` without deferring."""
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_any_type(
+            self.resolver, _serialize_type_for_checkexpr(t), False
+        )
+        assert rusted is not None, f"Rust deferred on {t!r}"
+        assert rusted is expected
+
+    def assert_rust_defers(self, t: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_any_type(
+            self.resolver, _serialize_type_for_checkexpr(t), False
+        )
+        assert rusted is None, f"Rust should defer on {t!r}, got {rusted}"
+
+    def _make_tvar(self, name: str, raw_id: int) -> TypeVarType:
+        return TypeVarType(
+            name,
+            f"mod.{name}",
+            TypeVarId(raw_id),
+            [],
+            self.fx.str_type,
+            self.fx.nonet,
+            0,
+        )
+
+    def _make_alias(
+        self,
+        fullname: str,
+        target: Type,
+        *,
+        alias_tvars: list[TypeVarType] | None = None,
+        no_args: bool = False,
+    ) -> TypeAlias:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],
+            no_args=no_args,
+        )
+
+    def test_plain_any(self) -> None:
+        self.assert_rust_decides(AnyType(TypeOfAny.unannotated), True)
+
+    def test_plain_instance_with_any(self) -> None:
+        self.assert_rust_decides(
+            Instance(self.fx.std_listi, [AnyType(TypeOfAny.unannotated)]), True
+        )
+
+    def test_plain_instance_clean(self) -> None:
+        self.assert_rust_decides(Instance(self.fx.std_listi, [self.fx.str_type]), False)
+
+    def test_special_form_any_not_contagious(self) -> None:
+        self.assert_rust_decides(AnyType(TypeOfAny.special_form), False)
+
+    def test_alias_without_typevars_no_any(self) -> None:
+        # A = List[int]: target has no Any, old-style alias, no args to
+        # visit → false.
+        alias = self._make_alias("mod.A", Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(TypeAliasType(alias, []), False)
+
+    def test_alias_without_typevars_with_any_in_target(self) -> None:
+        # A = List[Any]: target contains Any → true.
+        alias = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [AnyType(TypeOfAny.unannotated)])
+        )
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(TypeAliasType(alias, []), True)
+
+    def test_alias_typevar_any_substitution_true(self) -> None:
+        # A[T] = List[T], applied A[Any]: substitution must turn the
+        # target into List[Any] → true. This is the B3b core case that
+        # shape-only expansion answered incorrectly (false).
+        tv = self._make_tvar("T", 1)
+        alias = self._make_alias(
+            "mod.A",
+            Instance(self.fx.std_listi, [tv]),
+            alias_tvars=[tv],
+        )
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(
+            TypeAliasType(alias, [AnyType(TypeOfAny.unannotated)]), True
+        )
+
+    def test_alias_typevar_int_substitution_false(self) -> None:
+        # A[T] = List[T], applied A[int]: substituted target List[int]
+        # has no Any → false.
+        tv = self._make_tvar("T", 2)
+        alias = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [tv]), alias_tvars=[tv]
+        )
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(TypeAliasType(alias, [self.fx.a]), False)
+
+    def test_alias_typevar_unused_arg_oldstyle_skipped(self) -> None:
+        # Old-style generic alias with a dead typevar: A[T] = int,
+        # applied A[Any]. Python's visit_type_alias_type visits only the
+        # proper target (int) for old-style aliases, ignoring the args →
+        # false. The Rust path must match (python_3_12 == False skips
+        # args).
+        tv = self._make_tvar("T", 3)
+        alias = self._make_alias("mod.A", self.fx.str_type, alias_tvars=[tv])
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(
+            TypeAliasType(alias, [AnyType(TypeOfAny.unannotated)]), False
+        )
+
+    def test_alias_typevar_unused_arg_python312_visits_args(self) -> None:
+        # Same dead typevar but new-style (PEP 695): Python visits *both*
+        # the proper target and (for python_3_12 aliases) the args, so
+        # A[Any] → true. The fixture must fabricate a PEP 695 alias via
+        # `python_3_12_type_alias=True`.
+        tv = self._make_tvar("T", 4)
+        alias = self._make_alias("mod.A", self.fx.str_type, alias_tvars=[tv])
+        alias.python_3_12_type_alias = True
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(
+            TypeAliasType(alias, [AnyType(TypeOfAny.unannotated)]), True
+        )
+
+    def test_alias_chain_typevar_any(self) -> None:
+        # B = A[int], A[T] = List[T]: the chain loop must pass B's args
+        # through A's substitution. B's target is a nested TypeAliasType
+        # to A; A substitutes List[int]; no Any → false.
+        tv = self._make_tvar("T", 5)
+        alias_a = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [tv]), alias_tvars=[tv]
+        )
+        inner = TypeAliasType(alias_a, [self.fx.a])
+        alias_b = self._make_alias("mod.B", inner, alias_tvars=[])
+        self._rebuild_with_aliases([alias_a, alias_b])
+        self.assert_rust_decides(TypeAliasType(alias_b, []), False)
+
+    def test_alias_chain_to_any(self) -> None:
+        # B = A, A = List[Any]: chain with no typevars, target carries
+        # Any → true.
+        alias_a = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [AnyType(TypeOfAny.unannotated)])
+        )
+        alias_b = self._make_alias(
+            "mod.B", TypeAliasType(alias_a, []), alias_tvars=[]
+        )
+        self._rebuild_with_aliases([alias_a, alias_b])
+        self.assert_rust_decides(TypeAliasType(alias_b, []), True)
+
+    def test_alias_no_args(self) -> None:
+        # L = List (no_args, production strips typevars at use sites).
+        # Target List without args → no Any → false.
+        alias = self._make_alias("mod.L", Instance(self.fx.std_listi, []), no_args=True)
+        self._rebuild_with_aliases([alias])
+        self.assert_rust_decides(TypeAliasType(alias, []), False)
+
+    def test_alias_self_referential_cycle_defers(self) -> None:
+        # A = List[A]: get_proper_type cannot terminate on the recursive
+        # alias; the Rust path must not loop. The seen-set short-circuits
+        # (mirroring BoolTypeQuery.seen_aliases) to the ANY_STRATEGY
+        # default, which is False, the same answer Python's
+        # visit_type_alias_type gives for a repeated alias.
+        tv = self._make_tvar("T", 9)
+        alias_a = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [tv]), alias_tvars=[tv]
+        )
+        # A's target references A itself (recursive): List[A].
+        alias_a.target = Instance(self.fx.std_listi, [TypeAliasType(alias_a, [])])
+        self._rebuild_with_aliases([alias_a])
+        self.assert_rust_decides(TypeAliasType(alias_a, []), False)
+
+    def test_alias_missing_snapshot_defers(self) -> None:
+        # An alias whose fullname is not in the resolver snapshot: Rust
+        # cannot expand → defer to Python.
+        from mypy.nodes import TypeAlias
+        from mypy.types import TypeVarType as _TVT
+
+        tv = TypeVarType(
+            "U", "mod.U", TypeVarId(70), [], self.fx.str_type, self.fx.nonet, 0
+        )
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [tv]),
+            "mod.Unresolved",
+            "mod",
+            -1,
+            -1,
+            alias_tvars=[tv],
+        )
+        # Do NOT rebuild the resolver with this alias; it's missing.
+        self.assert_rust_defers(TypeAliasType(alias, []))
+
+    def test_union_with_alias_any(self) -> None:
+        # Union[int, A] where A = List[Any]: the union arm behind the
+        # alias carries Any → true.
+        alias = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [AnyType(TypeOfAny.unannotated)])
+        )
+        self._rebuild_with_aliases([alias])
+        u = UnionType.make_union([self.fx.a, TypeAliasType(alias, [])])
+        self.assert_rust_decides(u, True)
+
+    def test_bare_typevar_no_default_false(self) -> None:
+        # Plain `T = TypeVar('T')`: the default is the
+        # from_omitted_generics sentinel, which is not a real Any.
+        # Python's HasAnyType.visit_type_var only visits the default when
+        # has_default() is true (B3b regression: the sentinel was treated
+        # as a real Any, so plain typevars spuriously reported Any).
+        tv = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [],
+            self.fx.str_type,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self.assert_rust_decides(tv, False)
+
+    def test_bare_typevar_real_default_any_true(self) -> None:
+        # `T = TypeVar('T', default=Any)`: a genuine Any default is a
+        # real Any and must be detected.
+        tv = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [],
+            self.fx.str_type,
+            AnyType(TypeOfAny.unannotated),
+        )
+        self.assert_rust_decides(tv, True)
+
+    def test_bare_typevar_bound_any_true(self) -> None:
+        # `T = TypeVar('T', bound=Any)`: the upper bound is visited
+        # unconditionally by Python.
+        tv = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [],
+            AnyType(TypeOfAny.unannotated),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self.assert_rust_decides(tv, True)
+
+    def test_bare_typevar_any_value_true(self) -> None:
+        # `T = TypeVar('T', 'A', Any)`: a value restriction containing
+        # Any is visited by Python (values are always queried).
+        tv = TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [AnyType(TypeOfAny.unannotated)],
+            self.fx.str_type,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self.assert_rust_decides(tv, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstanceWithArgsSuite(Suite):
     """Parity suite for the Rust `visit_instance` same-type-with-args join
     (Stage 3c M8g).
