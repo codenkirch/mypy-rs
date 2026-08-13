@@ -24,6 +24,19 @@ from mypy.nodes import (
 from mypy.options import Options
 from mypy.types import MYPYC_NATIVE_INT_NAMES, Instance, ProperType
 
+try:
+    from type_kernel import rust_calculate_class_abstract_status as _rust_calculate_class_abstract_status
+    from type_kernel import rust_check_protocol_status as _rust_check_protocol_status
+    from type_kernel import rust_calculate_class_vars as _rust_calculate_class_vars
+    from type_kernel import rust_add_type_promotion as _rust_add_type_promotion
+    _HAS_RUST_CLASSPROP = True
+except ImportError:
+    _rust_calculate_class_abstract_status = None  # type: ignore[assignment]
+    _rust_check_protocol_status = None  # type: ignore[assignment]
+    _rust_calculate_class_vars = None  # type: ignore[assignment]
+    _rust_add_type_promotion = None  # type: ignore[assignment]
+    _HAS_RUST_CLASSPROP = False
+
 # Hard coded type promotions (shared between all Python versions).
 # These add extra ad-hoc edges to the subtyping relation. For example,
 # int is considered a subtype of float, even though there is no
@@ -46,6 +59,12 @@ def calculate_class_abstract_status(typ: TypeInfo, is_stub_file: bool, errors: E
     abstract attribute.  Also compute a list of abstract attributes.
     Report error is required ABCMeta metaclass is missing.
     """
+    if _HAS_RUST_CLASSPROP:
+        try:
+            _rust_calculate_class_abstract_status(typ, is_stub_file, errors)
+            return
+        except Exception:
+            pass
     typ.is_abstract = False
     typ.abstract_attributes = []
     if typ.typeddict_type:
@@ -119,6 +138,12 @@ def calculate_class_abstract_status(typ: TypeInfo, is_stub_file: bool, errors: E
 
 def check_protocol_status(info: TypeInfo, errors: Errors) -> None:
     """Check that all classes in MRO of a protocol are protocols"""
+    if _HAS_RUST_CLASSPROP:
+        try:
+            _rust_check_protocol_status(info, errors)
+            return
+        except Exception:
+            pass
     if info.is_protocol:
         for type in info.bases:
             if not type.type.is_protocol and type.type.fullname != "builtins.object":
@@ -140,6 +165,12 @@ def calculate_class_vars(info: TypeInfo) -> None:
     This must happen after the main semantic analysis pass, since
     this depends on base class bodies having been fully analyzed.
     """
+    if _HAS_RUST_CLASSPROP:
+        try:
+            _rust_calculate_class_vars(info)
+            return
+        except Exception:
+            pass
     for name, sym in info.names.items():
         node = sym.node
         if isinstance(node, Var) and node.info and node.is_inferred and not node.is_classvar:
@@ -156,6 +187,12 @@ def add_type_promotion(
 
     This includes things like 'int' being compatible with 'float'.
     """
+    if _HAS_RUST_CLASSPROP:
+        try:
+            _rust_add_type_promotion(info, module_names, options, builtin_names)
+            return
+        except Exception:
+            pass
     defn = info.defn
     promote_targets: list[ProperType] = []
     for decorator in defn.decorators:
