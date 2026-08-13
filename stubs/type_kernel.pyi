@@ -132,6 +132,7 @@ __all__ = [
     "rust_is_string_literal",
     "rust_is_untyped_decorator",
     "rust_is_typeddict_type_context",
+    "rust_is_typevar_default_recursive",
     "rust_conditional_expr_join",
     "rust_container_type",
     "rust_tuple_context_matches",
@@ -140,6 +141,7 @@ __all__ = [
     "rust_resolve_plugin_hook",
     "rust_method_fullname",
     "rust_format_messages_default",
+    "rust_format_messages_default_pretty",
     "rust_infer_constraints",
     "rust_infer_constraints_full",
     "rust_select_trivial",
@@ -550,6 +552,9 @@ def rust_try_getting_literal(type_bytes: bytes) -> bytes | None: ...
 def rust_is_string_literal(type_bytes: bytes) -> bool | None: ...
 def rust_is_untyped_decorator(type_bytes: bytes) -> bool | None: ...
 def rust_is_typeddict_type_context(type_bytes: bytes) -> bool | None: ...
+def rust_is_typevar_default_recursive(
+    tv_fname: str, start: object
+) -> bool | None: ...
 def rust_conditional_expr_join(
     if_bytes: bytes, else_bytes: bytes, resolver: NativeTypeResolver
 ) -> bytes | None: ...
@@ -578,6 +583,14 @@ def rust_format_messages_default(
     show_column_numbers: bool,
     show_error_end: bool,
     hide_error_codes: bool,
+) -> list[str]: ...
+def rust_format_messages_default_pretty(
+    error_tuples: list[tuple[str | None, int, int, int, int, str, str, str | None]],
+    source_lines: list[str] | None,
+    show_column_numbers: bool,
+    show_error_end: bool,
+    hide_error_codes: bool,
+    pretty: bool,
 ) -> list[str]: ...
 def rust_infer_constraints(
     template_bytes: bytes, actual_bytes: bytes, direction: int

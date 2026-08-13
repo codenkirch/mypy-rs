@@ -2477,6 +2477,13 @@ def set_any_tvars(
 
 def is_typevar_default_recursive(tv_fname: str, start: TypeInfo | TypeAlias) -> bool:
     """Check if the type variable can lead to infinite recursion via defaults."""
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_is_typevar_default_recursive(tv_fname, start)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if tv_fname not in start.default_depends:
         return False
     todo = start.default_depends[tv_fname].copy()
@@ -2588,6 +2595,7 @@ try:
         rust_detect_diverging_alias as _rust_detect_diverging_alias,
         rust_find_self_type as _rust_find_self_type,
         rust_check_vec_type_args as _rust_check_vec_type_args,
+        rust_is_typevar_default_recursive as _rust_is_typevar_default_recursive,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -2605,6 +2613,7 @@ except ImportError:
     _rust_detect_diverging_alias = None  # type: ignore[assignment]
     _rust_find_self_type = None  # type: ignore[assignment]
     _rust_check_vec_type_args = None  # type: ignore[assignment]
+    _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
