@@ -159,8 +159,11 @@ pub fn rust_format_messages_default_pretty(
                     if (column as usize) < leading {
                         column = leading as i64;
                     }
-                    let col_expanded = expandtabs(&source_line[..(column as usize).min(source_line.len())]).len();
-                    let end_expanded = expandtabs(&source_line[..(end_column as usize).min(source_line.len())]).len();
+                    let col_expanded =
+                        expandtabs(&source_line[..(column as usize).min(source_line.len())]).len();
+                    let end_expanded =
+                        expandtabs(&source_line[..(end_column as usize).min(source_line.len())])
+                            .len();
                     a.push(format!(
                         "{}{}",
                         " ".repeat(DEFAULT_SOURCE_OFFSET),

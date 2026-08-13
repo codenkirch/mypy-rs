@@ -130,7 +130,13 @@ pub(crate) fn rust_calculate_class_abstract_status(
     abstract_attrs.sort();
     let abs_list = PyList::empty(py);
     for (name, status) in &abstract_attrs {
-        let tup = PyTuple::new(py, &[PyString::new(py, name) as &PyAny, (*status).into_py(py).into_ref(py) as &PyAny]);
+        let tup = PyTuple::new(
+            py,
+            &[
+                PyString::new(py, name) as &PyAny,
+                (*status).into_py(py).into_ref(py) as &PyAny,
+            ],
+        );
         abs_list.append(tup)?;
     }
     typ.setattr("abstract_attributes", abs_list)?;
