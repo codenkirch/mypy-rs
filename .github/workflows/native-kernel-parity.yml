@@ -116,16 +116,7 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
           MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
-        run: |
-          uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModified" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModifiedErrorFirst" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalThreeRuns" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testIncrementalWithDifferentKindsOfNestedTypesWithinMethod" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testGenericNamedTupleSerialization" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testTypingSelfCoarse" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeSelfType" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeNamedTuple"
+        run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
 
       - name: Parity solve_one (testinfer)
         env:
@@ -152,15 +143,7 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: |
-          uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModified" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModifiedErrorFirst" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalThreeRuns" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testIncrementalWithDifferentKindsOfNestedTypesWithinMethod" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testGenericNamedTupleSerialization" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testTypingSelfCoarse" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeSelfType" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeNamedTuple"
+          uv run python -m pytest mypy/test/testcheck.py mypy/test/testtypes.py -q -k "not slow" -n4 --timeout=30 --timeout-method=thread
 
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix
@@ -229,13 +212,4 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_RESOLVERS: "1"
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
-        run: |
-          uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModified" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalSubclassModifiedErrorFirst" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testAttrsIncrementalThreeRuns" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testIncrementalWithDifferentKindsOfNestedTypesWithinMethod" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testGenericNamedTupleSerialization" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-incremental.test::testTypingSelfCoarse" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeSelfType" \
-            --deselect "mypy/test/testcheck.py::TypeCheckSuite::check-serialize.test::testSerializeNamedTuple"
+        run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
