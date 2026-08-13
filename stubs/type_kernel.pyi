@@ -277,6 +277,12 @@ __all__ = [
     "rust_check_protocol_status",
     "rust_calculate_class_vars",
     "rust_add_type_promotion",
+    "rust_fixup_type",
+    "rust_fixup_type_info",
+    "rust_resolve_cross_ref",
+    "rust_fixup_symbol_table",
+    "rust_fixup_overloaded_func_def",
+    "rust_fixup_decorator",
     "IdMapper",
 ]
 
@@ -975,6 +981,26 @@ def rust_calculate_class_vars(info: TypeInfo) -> None: ...
 def rust_add_type_promotion(
     info: TypeInfo, module_names: SymbolTable, options: Any, builtin_names: SymbolTable
 ) -> None: ...
+
+# Issue #570: fixup functions (live PyO3 objects)
+def rust_fixup_type(
+    typ: Any, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
+def rust_fixup_type_info(
+    info: TypeInfo, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
+def rust_resolve_cross_ref(
+    value: SymbolTableNode, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
+def rust_fixup_symbol_table(
+    symtab: SymbolTable, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
+def rust_fixup_overloaded_func_def(
+    o: OverloadedFuncDef, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
+def rust_fixup_decorator(
+    d: Decorator, modules: dict[str, MypyFile], allow_missing: bool
+) -> bool: ...
 
 class IdMapper:
     def __init__(self) -> None: ...

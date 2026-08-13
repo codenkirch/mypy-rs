@@ -32,6 +32,7 @@ from mypy.types import (
     ParamSpecType,
     ProperType,
     TupleType,
+    Type,
     TypeAliasType,
     TypedDictType,
     TypeOfAny,
@@ -44,6 +45,25 @@ from mypy.types import (
     UnpackType,
 )
 from mypy.visitor import NodeVisitor
+
+try:
+    from type_kernel import rust_fixup_type as _rust_fixup_type
+    from type_kernel import rust_fixup_type_info as _rust_fixup_type_info
+    from type_kernel import rust_resolve_cross_ref as _rust_resolve_cross_ref
+    from type_kernel import rust_fixup_symbol_table as _rust_fixup_symbol_table
+    from type_kernel import (
+        rust_fixup_overloaded_func_def as _rust_fixup_overloaded_func_def,
+    )
+    from type_kernel import rust_fixup_decorator as _rust_fixup_decorator
+    _HAS_RUST_FIXUP = True
+except ImportError:
+    _rust_fixup_type = None  # type: ignore[assignment]
+    _rust_fixup_type_info = None  # type: ignore[assignment]
+    _rust_resolve_cross_ref = None  # type: ignore[assignment]
+    _rust_fixup_symbol_table = None  # type: ignore[assignment]
+    _rust_fixup_overloaded_func_def = None  # type: ignore[assignment]
+    _rust_fixup_decorator = None  # type: ignore[assignment]
+    _HAS_RUST_FIXUP = False
 
 
 class NodeFixer(NodeVisitor[None]):
@@ -59,6 +79,12 @@ class NodeFixer(NodeVisitor[None]):
 
     # NOTE: This method isn't (yet) part of the NodeVisitor API.
     def visit_type_info(self, info: TypeInfo) -> None:
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_fixup_type_info(info, self.modules, self.allow_missing):
+                    return
+            except Exception:
+                pass
         save_info = self.current_info
         try:
             self.current_info = info
@@ -68,12 +94,12 @@ class NodeFixer(NodeVisitor[None]):
                 self.visit_symbol_table(info.names)
             if info.bases:
                 for base in info.bases:
-                    base.accept(self.type_fixer)
+                    self.type_fixer.fixup(base)
             if info._promote:
                 for p in info._promote:
-                    p.accept(self.type_fixer)
+                    self.type_fixer.fixup(p)
             if info.tuple_type:
-                info.tuple_type.accept(self.type_fixer)
+                self.type_fixer.fixup(info.tuple_type)
                 info.update_tuple_type(info.tuple_type)
                 if info.special_alias:
                     info.special_alias.alias_tvars = list(info.defn.type_vars)
@@ -81,7 +107,7 @@ class NodeFixer(NodeVisitor[None]):
                         if isinstance(t, TypeVarTupleType):
                             info.special_alias.tvar_tuple_index = i
             if info.typeddict_type:
-                info.typeddict_type.accept(self.type_fixer)
+                self.type_fixer.fixup(info.typeddict_type)
                 info.update_typeddict_type(info.typeddict_type)
                 if info.special_alias:
                     info.special_alias.alias_tvars = list(info.defn.type_vars)
@@ -89,13 +115,13 @@ class NodeFixer(NodeVisitor[None]):
                         if isinstance(t, TypeVarTupleType):
                             info.special_alias.tvar_tuple_index = i
             if info.declared_metaclass:
-                info.declared_metaclass.accept(self.type_fixer)
+                self.type_fixer.fixup(info.declared_metaclass)
             if info.metaclass_type:
-                info.metaclass_type.accept(self.type_fixer)
+                self.type_fixer.fixup(info.metaclass_type)
             if info.self_type:
-                info.self_type.accept(self.type_fixer)
+                self.type_fixer.fixup(info.self_type)
             if info.alt_promote:
-                info.alt_promote.accept(self.type_fixer)
+                self.type_fixer.fixup(info.alt_promote)
                 instance = Instance(info, [])
                 # Hack: We may also need to add a backwards promotion (from int to native int),
                 # since it might not be serialized.
@@ -114,6 +140,14 @@ class NodeFixer(NodeVisitor[None]):
 
     # NOTE: This method *definitely* isn't part of the NodeVisitor API.
     def visit_symbol_table(self, symtab: SymbolTable) -> None:
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_fixup_symbol_table(
+                    symtab, self.modules, self.allow_missing
+                ):
+                    return
+            except Exception:
+                pass
         for key in symtab:
             value = symtab[key]
             cross_ref = value.cross_ref
@@ -134,6 +168,14 @@ class NodeFixer(NodeVisitor[None]):
 
     def resolve_cross_ref(self, value: SymbolTableNode) -> None:
         """Replace cross-reference with an actual referred node."""
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_resolve_cross_ref(
+                    value, self.modules, self.allow_missing
+                ):
+                    return
+            except Exception:
+                pass
         assert value.cross_ref is not None
         cross_ref = value.cross_ref
         value.cross_ref = None
@@ -168,13 +210,21 @@ class NodeFixer(NodeVisitor[None]):
 
     def visit_func_def(self, func: FuncDef) -> None:
         if func.type is not None:
-            func.type.accept(self.type_fixer)
+            self.type_fixer.fixup(func.type)
             if isinstance(func.type, CallableType):
                 func.type.definition = func
 
     def visit_overloaded_func_def(self, o: OverloadedFuncDef) -> None:
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_fixup_overloaded_func_def(
+                    o, self.modules, self.allow_missing
+                ):
+                    return
+            except Exception:
+                pass
         if o.type:
-            o.type.accept(self.type_fixer)
+            self.type_fixer.fixup(o.type)
         for item in o.items:
             item.accept(self)
         if o.impl:
@@ -185,6 +235,12 @@ class NodeFixer(NodeVisitor[None]):
                 typ.definition = item
 
     def visit_decorator(self, d: Decorator) -> None:
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_fixup_decorator(d, self.modules, self.allow_missing):
+                    return
+            except Exception:
+                pass
         if d.func:
             d.func.accept(self)
         if d.var:
@@ -195,39 +251,49 @@ class NodeFixer(NodeVisitor[None]):
 
     def visit_class_def(self, c: ClassDef) -> None:
         for v in c.type_vars:
-            v.accept(self.type_fixer)
+            self.type_fixer.fixup(v)
 
     def visit_type_var_expr(self, tv: TypeVarExpr) -> None:
         for value in tv.values:
-            value.accept(self.type_fixer)
-        tv.upper_bound.accept(self.type_fixer)
-        tv.default.accept(self.type_fixer)
+            self.type_fixer.fixup(value)
+        self.type_fixer.fixup(tv.upper_bound)
+        self.type_fixer.fixup(tv.default)
 
     def visit_paramspec_expr(self, p: ParamSpecExpr) -> None:
-        p.upper_bound.accept(self.type_fixer)
-        p.default.accept(self.type_fixer)
+        self.type_fixer.fixup(p.upper_bound)
+        self.type_fixer.fixup(p.default)
 
     def visit_type_var_tuple_expr(self, tv: TypeVarTupleExpr) -> None:
-        tv.upper_bound.accept(self.type_fixer)
-        tv.tuple_fallback.accept(self.type_fixer)
-        tv.default.accept(self.type_fixer)
+        self.type_fixer.fixup(tv.upper_bound)
+        self.type_fixer.fixup(tv.tuple_fallback)
+        self.type_fixer.fixup(tv.default)
 
     def visit_var(self, v: Var) -> None:
         if v.type is not None:
-            v.type.accept(self.type_fixer)
+            self.type_fixer.fixup(v.type)
         if v.setter_type is not None:
-            v.setter_type.accept(self.type_fixer)
+            self.type_fixer.fixup(v.setter_type)
 
     def visit_type_alias(self, a: TypeAlias) -> None:
-        a.target.accept(self.type_fixer)
+        self.type_fixer.fixup(a.target)
         for v in a.alias_tvars:
-            v.accept(self.type_fixer)
+            self.type_fixer.fixup(v)
 
 
 class TypeFixer(TypeVisitor[None]):
     def __init__(self, modules: dict[str, MypyFile], allow_missing: bool) -> None:
         self.modules = modules
         self.allow_missing = allow_missing
+
+    def fixup(self, typ: Type) -> None:
+        """Try Rust fixup first, fall back to Python visitor."""
+        if _HAS_RUST_FIXUP:
+            try:
+                if _rust_fixup_type(typ, self.modules, self.allow_missing):
+                    return
+            except Exception:
+                pass
+        typ.accept(self)
 
     def visit_instance(self, inst: Instance) -> None:
         type_ref = inst.type_ref
