@@ -387,9 +387,7 @@ pub(crate) fn is_subtype(
                 };
                 // subtypes.py:962-966: for builtins.tuple with Any iter
                 // type, always True (isinstance(x, tuple) special case).
-                if right_ref == "builtins.tuple"
-                    && matches!(iter_type, Type::AnyType { .. })
-                {
+                if right_ref == "builtins.tuple" && matches!(iter_type, Type::AnyType { .. }) {
                     return Some(true);
                 }
                 // subtypes.py:968-978: each left item must be a subtype of
@@ -440,10 +438,7 @@ pub(crate) fn is_subtype(
             // subtypes.py:983-994: protocol branch. is_protocol_implementation
             // is Python-only (member-wise protocol checks); defer those to
             // Python. For non-protocol Instance right we return False here.
-            if resolver
-                .get(right_ref)
-                .is_some_and(|s| s.is_protocol)
-            {
+            if resolver.get(right_ref).is_some_and(|s| s.is_protocol) {
                 return None;
             }
             return Some(false);
@@ -1912,10 +1907,7 @@ mod tests {
     fn tuple_left_defers_when_right_is_unrelated_instance() {
         // TupleType <: a.A: fallback (builtins.tuple) is not a subtype of
         // a.A, and a.A is not a protocol -> False (subtypes.py:983-996).
-        let r = make_resolver(vec![
-            snap("a.A", "A"),
-            snap("builtins.tuple", "tuple"),
-        ]);
+        let r = make_resolver(vec![snap("a.A", "A"), snap("builtins.tuple", "tuple")]);
         let tuple = tuple_type(vec![instance("a.A", vec![])]);
         let right = instance("a.A", vec![]);
         assert_eq!(is_subtype(&tuple, &right, &ctx_nominal(), &r), Some(false));
