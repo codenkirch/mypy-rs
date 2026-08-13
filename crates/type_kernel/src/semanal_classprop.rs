@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyString, PyType};
+use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
 // Hard-coded type promotions (shared between all Python versions).
 const TYPE_PROMOTIONS: &[(&str, &str)] = &[
@@ -129,8 +129,9 @@ pub(crate) fn rust_calculate_class_abstract_status(
     // typ.abstract_attributes = sorted(abstract)
     abstract_attrs.sort();
     let abs_list = PyList::empty(py);
-    for (name, _) in &abstract_attrs {
-        abs_list.append(PyString::new(py, name))?;
+    for (name, status) in &abstract_attrs {
+        let tup = PyTuple::new(py, &[PyString::new(py, name) as &PyAny, (*status).into_py(py).into_ref(py) as &PyAny]);
+        abs_list.append(tup)?;
     }
     typ.setattr("abstract_attributes", abs_list)?;
 

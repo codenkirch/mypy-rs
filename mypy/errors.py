@@ -1043,8 +1043,17 @@ class Errors:
         is True also append a relevant trimmed source code line (only for
         severity 'error').
         """
-        if _HAS_TYPE_KERNEL and _native_errors_active and not self.options.pretty:
+        if _HAS_TYPE_KERNEL and _native_errors_active:
             try:
+                if self.options.pretty:
+                    return _type_kernel.rust_format_messages_default_pretty(
+                        error_tuples,
+                        source_lines,
+                        self.options.show_column_numbers,
+                        self.options.show_error_end,
+                        self.hide_error_codes,
+                        True,
+                    )
                 return _type_kernel.rust_format_messages_default(
                     error_tuples,
                     self.options.show_column_numbers,
