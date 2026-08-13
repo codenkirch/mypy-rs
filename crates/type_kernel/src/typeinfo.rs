@@ -1046,7 +1046,7 @@ pub(crate) fn build_native_resolver(
             Err(_) => continue,
         };
         let target = match item.getattr("target").ok() {
-            Some(t) => match serialize_type_to_bytes(py, &t) {
+            Some(t) => match serialize_type_to_bytes(py, t) {
                 Some(b) => b,
                 None => continue,
             },
