@@ -39,6 +39,13 @@ from mypy.types import (
 )
 from mypy.typevars import fill_typevars_with_any
 
+try:
+    from type_kernel import rust_get_declaration as _rust_get_declaration
+    _HAS_RUST_BINDER = True
+except ImportError:
+    _rust_get_declaration = None  # type: ignore[assignment]
+    _HAS_RUST_BINDER = False
+
 BindableExpression: _TypeAlias = IndexExpr | MemberExpr | NameExpr
 
 
@@ -640,6 +647,11 @@ def get_declaration(expr: BindableExpression) -> Type | None:
     Return None if there is no type or the expression is not a RefExpr.
     This can return None if the type hasn't been inferred yet.
     """
+    if _HAS_RUST_BINDER:
+        try:
+            return _rust_get_declaration(expr)
+        except Exception:
+            pass
     if isinstance(expr, RefExpr):
         if isinstance(expr.node, Var):
             type = expr.node.type

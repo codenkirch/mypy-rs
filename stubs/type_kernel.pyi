@@ -283,6 +283,7 @@ __all__ = [
     "rust_fixup_symbol_table",
     "rust_fixup_overloaded_func_def",
     "rust_fixup_decorator",
+    "rust_get_declaration",
     "IdMapper",
 ]
 
@@ -1001,6 +1002,9 @@ def rust_fixup_overloaded_func_def(
 def rust_fixup_decorator(
     d: Decorator, modules: dict[str, MypyFile], allow_missing: bool
 ) -> bool: ...
+
+# Issue #572: binder.get_declaration (live PyO3 object)
+def rust_get_declaration(expr: Expression) -> Type | None: ...
 
 class IdMapper:
     def __init__(self) -> None: ...
