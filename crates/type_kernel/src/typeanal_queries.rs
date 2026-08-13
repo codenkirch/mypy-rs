@@ -719,7 +719,10 @@ fn validate_instance_inner(
         let min_tv_count = defn_list
             .iter()
             .filter(|tv| {
-                let has_def = tv.call_method0("has_default").map(|v| v.is_true().unwrap_or(true)).unwrap_or(true);
+                let has_def = tv
+                    .call_method0("has_default")
+                    .map(|v| v.is_true().unwrap_or(true))
+                    .unwrap_or(true);
                 !has_def
             })
             .count();
@@ -756,7 +759,10 @@ fn validate_instance_variadic(
     let min_tv_count = defn_list
         .iter()
         .filter(|tv| {
-            let has_def = tv.call_method0("has_default").map(|v| v.is_true().unwrap_or(true)).unwrap_or(true);
+            let has_def = tv
+                .call_method0("has_default")
+                .map(|v| v.is_true().unwrap_or(true))
+                .unwrap_or(true);
             let is_tvt = is_instance(tv, refs.type_var_tuple_type);
             !has_def && !is_tvt
         })
@@ -848,7 +854,11 @@ fn wrong_type_arg_count_msg(min: usize, max: usize, given: usize, type_name: &st
     } else {
         format!("between {min} and {max} type arguments")
     };
-    let given_str = if given == 0 { "none" } else { &given.to_string() };
+    let given_str = if given == 0 {
+        "none"
+    } else {
+        &given.to_string()
+    };
     format!("\"{type_name}\" expects {s}, but {given_str} given")
 }
 
@@ -950,7 +960,9 @@ fn check_vec_type_args_inner(
         }
     }
     if !ok {
-        let _ = api.getattr("fail").and_then(|f| f.call1(("Invalid item type for \"vec\"", ctx)));
+        let _ = api
+            .getattr("fail")
+            .and_then(|f| f.call1(("Invalid item type for \"vec\"", ctx)));
     }
     Ok(ok)
 }
