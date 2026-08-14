@@ -5470,15 +5470,24 @@ class NativePluginHookSuite(Suite):
         from mypy.checkexpr import (
             _set_native_plugin_hook_registry,
             plugin_call_hook_known_absent,
+            plugin_hook_known_absent,
         )
         from mypy.options import Options
-        from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES, DefaultPlugin
+        from mypy.plugins.default import (
+            DEFAULT_CALL_HOOK_FULLNAMES,
+            DEFAULT_HOOK_FULLNAMES_BY_KIND,
+            DefaultPlugin,
+        )
 
         self._set_native_plugin_hook_registry = _set_native_plugin_hook_registry
         self._plugin_call_hook_known_absent = plugin_call_hook_known_absent
+        self._plugin_hook_known_absent = plugin_hook_known_absent
         self._default_plugin = DefaultPlugin(Options())
         self._fullnames = DEFAULT_CALL_HOOK_FULLNAMES
-        self._registry = _type_kernel.PluginHookRegistry(list(DEFAULT_CALL_HOOK_FULLNAMES))
+        self._by_kind = DEFAULT_HOOK_FULLNAMES_BY_KIND
+        self._registry = _type_kernel.PluginHookRegistry(
+            {kind: list(names) for kind, names in DEFAULT_HOOK_FULLNAMES_BY_KIND.items()}
+        )
         _set_native_plugin_hook_registry(self._registry, has_user_plugins=False)
 
     def tearDown(self) -> None:
@@ -5531,6 +5540,57 @@ class NativePluginHookSuite(Suite):
             assert has_hook, (
                 f"{fullname!r} in DEFAULT_CALL_HOOK_FULLNAMES but no DefaultPlugin hook matches"
             )
+
+    def test_call_union_does_not_leak_non_call_kinds(self) -> None:
+        # C3 regression guard: a name owned by a non-call kind must not
+        # make plugin_call_hook_known_absent return False at a call site.
+        for kind, names in self._by_kind.items():
+            if kind in (
+                "get_function_hook",
+                "get_function_signature_hook",
+                "get_method_signature_hook",
+                "get_method_hook",
+            ):
+                continue
+            for fullname in names:
+                assert not self._registry.has_call_hook(fullname), (
+                    f"{fullname!r} (kind {kind}) widened the call union"
+                )
+                assert self._plugin_call_hook_known_absent(fullname), (
+                    f"{fullname!r} (kind {kind}) wrongly blocks the call gate"
+                )
+
+    def test_per_kind_known_absent(self) -> None:
+        # For each non-call kind, a name in its set is never known-absent
+        # for that kind, while an unrelated name is.
+        for kind, names in self._by_kind.items():
+            if kind in (
+                "get_function_hook",
+                "get_function_signature_hook",
+                "get_method_signature_hook",
+                "get_method_hook",
+            ):
+                continue
+            for fullname in names:
+                assert not self._plugin_hook_known_absent(kind, fullname), (
+                    f"{fullname!r} should not be known-absent for {kind}"
+                )
+            assert self._plugin_hook_known_absent(kind, "builtins.print"), (
+                f"builtins.print should be known-absent for {kind}"
+            )
+            assert not self._plugin_hook_known_absent(kind, None)
+
+    def test_per_kind_matches_default_plugin_surface(self) -> None:
+        # Cross-check the per-kind sets against the actual DefaultPlugin
+        # hook bodies for the non-call kinds.
+        for kind in ("get_attribute_hook", "get_class_decorator_hook", "get_class_decorator_hook_2"):
+            for fullname in self._by_kind[kind]:
+                assert getattr(self._default_plugin, kind)(fullname) is not None, (
+                    f"{fullname!r} in per-kind set for {kind} but hook resolves None"
+                )
+            assert not self._registry.has_call_hook(
+                next(iter(self._by_kind[kind]))
+            ), f"{kind} names must not widen the call union"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

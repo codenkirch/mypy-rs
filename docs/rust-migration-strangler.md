@@ -1295,10 +1295,14 @@ and parity is verified both ways.
     wired through the seam (the perf win).
 - **Stage 4**: `check_call` / `ExpressionChecker.visit_call_expr_inner`
   (the big one, highest value). The plugin-hook snapshot protocol
-  (first slice) is shipped: `PluginHookRegistry` holds the union of
-  `DefaultPlugin`'s ~46 call-hook fullnames; `checkexpr` short-circuits
-  the four `get_*_hook` lookups via `plugin_call_hook_known_absent`
-  (one Rust `HashSet::contains`). The full `check_callable_call`
+  (first slice) is shipped: `PluginHookRegistry` holds
+  `DefaultPlugin`'s hook fullnames keyed by hook-method kind;
+  `checkexpr` short-circuits the four `get_*_hook` lookups via
+  `plugin_call_hook_known_absent` (one Rust `HashSet::contains` over
+  the call union). Phase C3 (#610) widened the snapshot to the non-call
+  kinds (`get_attribute_hook`, `get_class_decorator_hook`,
+  `get_class_decorator_hook_2`) and gated the per-kind dispatch sites
+  via `plugin_hook_known_absent`. The full `check_callable_call`
   arg-binding port remains future work; see the Stage 4 design spike
   below.
 - **Stage 5**: Semantic analyzer kernel (`semanal_time`, 16% of build).
@@ -1826,8 +1830,9 @@ decide whether a hook exists and defer to Python to run it.
 
 ### Shipped slice: plugin-hook snapshot (first functional Stage 4 work)
 
-`PluginHookRegistry` (crates/type_kernel/src/plugin_hooks.rs) holds a
-`HashSet<String>` of `DefaultPlugin`'s call-hook fullnames (~46 distinct
+`PluginHookRegistry` (crates/type_kernel/src/plugin_hooks.rs) holds
+`DefaultPlugin`'s hook fullnames keyed by hook-method kind (per-kind
+`HashSet<String>` from `DEFAULT_HOOK_FULLNAMES_BY_KIND`, ~100 distinct
 dotted strings, all literal equality / finite-set membership in
 `mypy/plugins/default.py`). `BuildManager._build_plugin_hook_registry`
 builds the registry once in `__init__` from the live `ChainedPlugin`
@@ -1835,14 +1840,27 @@ builds the registry once in `__init__` from the live `ChainedPlugin`
 
 `checkexpr.plugin_call_hook_known_absent(callable_name)` returns
 `True` only when: the registry is installed, no user plugins are
-present, and `callable_name` is not in the `DefaultPlugin` set. The
-four `get_*_hook` lookup sites are gated so the Python plugin chain is
-skipped entirely when absence is proven:
+present, and `callable_name` is not in the `DefaultPlugin` call-hook
+set. The four `get_*_hook` lookup sites are gated so the Python plugin
+chain is skipped entirely when absence is proven:
 
 - `transform_callee_type` (signature hooks): skip both branches when
   known-absent.
 - `check_callable_call` (function/method hooks): skip the
   `apply_function_plugin` gate when known-absent.
+
+Phase C3 (issue #610) made the registry kind-keyed: `PluginHookRegistry`
+stores per-hook-method fullname sets, and `plugin_call_hook_known_absent`
+reads the call-union via `has_call_hook` (so a class-decorator name like
+`dataclasses.dataclass` cannot widen the call gate). The per-kind
+`plugin_hook_known_absent(hook_method_name, fullname)` gate drives the
+non-call dispatch sites: the attribute hook in `checkmember` (both
+`analyze_member_var_access` and `analyze_var`), the class-decorator hook
+in `semanal.apply_class_plugin_hooks`, the class-decorator-2 hook in
+`semanal_main.apply_hooks_to_class`, plus the metaclass/base-class hook
+sites (DefaultPlugin has no override, so those kinds carry empty sets and
+the gate skips the Python no-op chain for every metaclass/base when
+builtin-only).
 
 When user plugins are present (`len(self.plugin._plugins) > 1`),
 `has_user_plugins=True` is installed so all lookups defer to Python
@@ -1883,11 +1901,13 @@ inference is the remaining Stage 4 work. Open design questions:
    `infer_type_vars`, `applytype`). Note: `applytype` resolver is
    installed (Stage 6c) and `expand_type` is graduated to production
    (PR #220), so generic-substitution in Rust is parity-safe.
-4. **Scope of the snapshot.** `PluginHookRegistry` currently holds one
-   combined `HashSet<String>`. The 4 hooks are one set because
-   `plugin_call_hook_known_absent` only needs to prove absence across
-   all four. A future full port may split into four sets if per-hook
-   deferral granularity is needed.
+4. **Scope of the snapshot.** Phase C3 made `PluginHookRegistry`
+   kind-keyed: one `HashSet` per hook-method kind
+   (`DEFAULT_HOOK_FULLNAMES_BY_KIND`). The call gate
+   (`plugin_call_hook_known_absent`) reads the four call kinds via
+   `has_call_hook`; the non-call dispatch sites read their own kind via
+   `plugin_hook_known_absent`. A future full port can keep this
+   granularity for per-hook deferral.
 5. **`object_type` / `member` resolution.** `check_call_expr_with_callee_type`
    computes `callable_name = method_fullname(object_type, member)`,
    walking `TypeInfo.mro`. Rust has `mro` in `TypeInfoSnapshot`

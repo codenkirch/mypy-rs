@@ -910,7 +910,14 @@ def analyze_member_var_access(
 
                     # Call the attribute hook before returning.
                     fullname = f"{method.info.fullname}.{name}"
-                    hook = mx.chk.plugin.get_attribute_hook(fullname)
+                    # Stage 4/C3: skip the Python attribute-hook chain when
+                    # the registry proves no DefaultPlugin hook matches.
+                    from mypy.checkexpr import plugin_hook_known_absent
+
+                    if not plugin_hook_known_absent("get_attribute_hook", fullname):
+                        hook = mx.chk.plugin.get_attribute_hook(fullname)
+                    else:
+                        hook = None
                     if hook:
                         result = hook(
                             AttributeContext(
@@ -1282,7 +1289,14 @@ def analyze_var(
         # Implicit 'Any' type.
         result = AnyType(TypeOfAny.special_form)
     fullname = f"{var.info.fullname}.{name}"
-    hook = mx.chk.plugin.get_attribute_hook(fullname)
+    # Stage 4/C3: skip the Python attribute-hook chain when the registry
+    # proves no DefaultPlugin hook matches (per-attribute-access hot path).
+    from mypy.checkexpr import plugin_hook_known_absent
+
+    if not plugin_hook_known_absent("get_attribute_hook", fullname):
+        hook = mx.chk.plugin.get_attribute_hook(fullname)
+    else:
+        hook = None
 
     if var.info.is_enum and not mx.is_lvalue:
         if name in var.info.enum_members and name not in {"name", "value"}:

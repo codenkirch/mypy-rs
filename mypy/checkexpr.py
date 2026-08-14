@@ -338,7 +338,8 @@ def _set_native_checkexpr_resolver(resolver: Any) -> None:
 
 
 # Stage 4 plugin-hook snapshot: a Rust `PluginHookRegistry` holding
-# DefaultPlugin's call-hook fullnames. See `plugin_call_hook_known_absent`.
+# DefaultPlugin's hook fullnames, keyed by hook-method kind. See
+# `plugin_call_hook_known_absent` and `plugin_hook_known_absent`.
 # Installed per build by BuildManager (None when user plugins present).
 _native_plugin_hook_registry: Any = None
 _native_plugin_hook_has_user_plugins: bool = False
@@ -395,7 +396,13 @@ def plugin_call_hook_known_absent(callable_name: str | None) -> bool:
     - the registry is not installed (no native kernel), or
     - user plugins are present (their hooks are not enumerable), or
     - `callable_name` is None, or
-    - `callable_name` is in the DefaultPlugin hook set.
+    - `callable_name` is in the DefaultPlugin call-hook set.
+
+    The membership test is the *call* union only
+    (`PluginHookRegistry.has_call_hook`): names owned by non-call kinds
+    (attribute, class-decorator, ...) must not force the Python chain on
+    unrelated calls, so they stay out of this particular gate (use
+    `plugin_hook_known_absent` for per-kind checks).
 
     Correctness: only returns True when the registry is installed, no
     user plugins are present, and `callable_name` is not among the
@@ -407,7 +414,28 @@ def plugin_call_hook_known_absent(callable_name: str | None) -> bool:
         not _native_plugin_hook_has_user_plugins
         and _native_plugin_hook_registry is not None
         and callable_name is not None
-        and not _native_plugin_hook_registry.has_hook(callable_name)
+        and not _native_plugin_hook_registry.has_call_hook(callable_name)
+    ):
+        return True
+    return False
+
+
+def plugin_hook_known_absent(hook_method_name: str, fullname: str | None) -> bool:
+    """Per-kind fast-path for a plugin hook existence check at a dispatch site.
+
+    Like `plugin_call_hook_known_absent`, but scoped to a specific hook
+    method (e.g. ``"get_attribute_hook"``, ``"get_class_decorator_hook"``,
+    ``"get_class_decorator_hook_2"``) using
+    `PluginHookRegistry.has_hook_for`. Returns True only when the registry
+    is installed, no user plugins are present, `fullname` is not None, and
+    the name is absent from that kind's set; otherwise False so the Python
+    `Plugin.get_*_hook` chain runs (the source of truth).
+    """
+    if (
+        not _native_plugin_hook_has_user_plugins
+        and _native_plugin_hook_registry is not None
+        and fullname is not None
+        and not _native_plugin_hook_registry.has_hook_for(hook_method_name, fullname)
     ):
         return True
     return False
