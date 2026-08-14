@@ -218,17 +218,58 @@ The `AGENTS.md` already documents the stale-binary hazard and the
 `cargo rustc` + scratch-dir approach. Ensure the `remaining-migration-plan.md`
 references this for new contributors.
 
+Done as part of #596: new contributors should read the "Native parser build
+order", "Type kernel build order", and "Native resolver / dependency-records
+parity" sections at the repo root `AGENTS.md` before rebuilding any Rust
+extension. The cardinal rule: rebuild the `.so` into a scratch dir and put it
+on `PYTHONPATH` after any `.rs` change, and never use `maturin develop` (it
+picks up the repo-root `pyproject.toml` and installs a bogus `mypy-0.1.0`
+package that shadows the real mypy).
+
 **D3: Performance regression tracking**
 
 The M17 benchmark (52.4% build-time reduction) is the current baseline.
 After Phase B (deferral reduction), re-run the self-check benchmark to
 measure the improvement. Target: 60%+ total reduction.
 
+Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
+`.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
+`mypy_self_check.ini --no-incremental -p mypy`):
+
+- Native kernel on (`native_type_kernel`, default): `type_check_time`
+  50.3s, wall 58.6s, 117 self-check errors.
+- Kernel off (`--no-native-type-kernel`): `type_check_time` 15.6s,
+  wall 22.3s, 116 self-check errors.
+
+The type-check gap (~3.2x) is a regression vs the M17 baseline
+(2.3s native type_check). Root cause: `_build_native_resolvers()` is
+called once per SCC (394 SCCs in the self-check) and each call
+re-serializes the FULL loaded TypeInfo graph (~8490 TypeInfos) plus
+the alias graph through Rust getattr walks, charged into
+`type_check_time` (t3..t4 in `process_stale_scc`). Even
+`--no-native-type-kernel` leaves `native_resolver` / `native_parser`
+on, so the 116-error pure config is a different comparison axis; the
+117-vs-116 delta is a pre-existing self-check inference sensitivity at
+`checker.py:6676` (`_get_base_classes`), unchanged by Phase D.
+
+Fix direction (tracked, NOT shipped here): snapshot a TypeInfo only
+when its defining SCC is sealed (right after its `semantic_analysis_for_scc`
+runs), build/extend an incrementally-accumulating resolver instead of a
+full per-SCC rebuild, and track a seen-set reset by daemon recheck. The
+member-info / member-definer walks are functionally required (blanking
+them breaks parity: 135 errors), so they are not the fixable part. This
+is perf work for a dedicated phase, not Phase D scope.
+
 **D4: Rust % measurement**
 
 After Phase B + C, re-measure the GitHub languages API Rust %. The
 local tree is already ~32%; the GitHub API lags because it counts
 generated/stub files differently. Target: 30%+ on the GitHub API.
+
+Measured 2026-08-14 (after Phase C merged): GitHub languages API reports
+Rust 3,156,702 bytes of 9,453,609 total = **33.4%**, above the 30% target.
+This matches the committed `.rs` source (`crates/*/src`, ~3.2 MB) —
+GitHub's count tracks the real Rust tree.
 
 ### Phase E: Long-term architecture decisions
 

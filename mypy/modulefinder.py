@@ -1034,7 +1034,12 @@ def compute_search_paths(
     - installed package directories (which will later be split into stub-only and inline)
     - typeshed
     """
-    if _HAS_RUST_MODULEFINDER:
+    # Gate the Rust search-path computation on the same option the native
+    # resolver uses (_native_gate_active), so `--no-native-resolver` disables
+    # the native modulefinder here too. The Rust and Python implementations
+    # produce identical SearchPaths on the same inputs (verified in Phase D,
+    # #596), so this is a contract fix, not a behavior change.
+    if _HAS_RUST_MODULEFINDER and options.native_resolver:
         rust_sp = _rust_compute_search_paths(sources, options, data_dir, alt_lib_path)
         # Convert the Rust pyclass to the Python SearchPaths so downstream
         # type annotations (manager.search_paths: SearchPaths) hold.

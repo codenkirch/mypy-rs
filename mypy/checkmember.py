@@ -142,11 +142,11 @@ except ImportError:
 # CallableType.definition; wirefixup now re-links definition by name + arity
 # (issue #485), so they are active again via the inner try-block below.
 # Any kernels that fail to import fall back to Python (None gates).
-_rust_check_self_arg = None  # type: ignore[assignment]
-_rust_expand_without_binding = None  # type: ignore[assignment]
-_rust_expand_and_bind_callable = None  # type: ignore[assignment]
-_rust_add_class_tvars = None  # type: ignore[assignment]
-_rust_descriptor_has_get_set = None  # type: ignore[assignment]
+_rust_check_self_arg: Any = None
+_rust_expand_without_binding: Any = None
+_rust_expand_and_bind_callable: Any = None
+_rust_add_class_tvars: Any = None
+_rust_descriptor_has_get_set: Any = None
 if _HAS_TYPE_KERNEL:
     try:
         from type_kernel import (
