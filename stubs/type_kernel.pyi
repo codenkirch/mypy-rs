@@ -310,6 +310,9 @@ class NativeTypeResolver:
     len: int
     alias_len: int
     def render_dict(self) -> dict[str, object]: ...
+    def update(
+        self, type_infos: list[TypeInfo], aliases: list[TypeAlias]
+    ) -> tuple[int, int]: ...
 
 class PluginHookRegistry:
     def __init__(self, hooks: list[str]) -> None: ...

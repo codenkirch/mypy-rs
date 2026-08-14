@@ -900,6 +900,195 @@ impl NativeTypeResolver {
         self.cached_dict = Some(obj.clone_ref(py));
         Ok(obj)
     }
+
+    /// Incrementally extend the resolver with TypeInfos / TypeAliases from
+    /// the (growing) live TypeInfo graph (issue #599).
+    ///
+    /// Existing fullnames are kept (first seal wins): classes belong to
+    /// exactly one SCC, so a snapshot taken after its defining SCC was
+    /// semanalized is final; later SCCs must not overwrite it. The one
+    /// exception is `builtins.*` classes, whose `_promote` lists accumulate
+    /// promotions from later SCCs' `calculate_class_properties` (native
+    /// ints + TYPE_PROMOTIONS), so they are re-snapshotted on every call
+    /// (a small constant set). This makes `update` safe to call once per
+    /// SCC in `process_stale_scc` without re-serializing the full TypeInfo
+    /// graph (~8490 items) on every call. Returns `(added_infos,
+    /// added_aliases)` so the Python side can grow its accumulated
+    /// `typeinfo_map` in lockstep.
+    #[pyo3(signature = (type_infos, aliases))]
+    fn update(
+        &mut self,
+        py: Python<'_>,
+        type_infos: &PyAny,
+        aliases: &PyAny,
+    ) -> PyResult<(usize, usize)> {
+        let mut added_infos = 0usize;
+        for item in type_infos.iter()? {
+            let item = item?;
+            let fullname = match read_str_attr(item, "fullname") {
+                Some(f) => f,
+                None => continue,
+            };
+            // Promotion sinks (`builtins.int`, `builtins.float`,
+            // `builtins.bytearray`, `builtins.memoryview`) accumulate
+            // `_promote` entries from later SCCs' `calculate_class_properties`
+            // (native ints + TYPE_PROMOTIONS, semanal_classprop.py:205-223),
+            // so a first-seal-wins snapshot of them goes stale. Always
+            // re-snapshot `builtins.*` classes (a small constant set) so
+            // their promotion lists stay current; the remaining ~full graph
+            // keeps the first-seal semantics (a class's own SCC seals it
+            // once, then it does not change).
+            let re_snapshot = fullname.starts_with("builtins.");
+            if !re_snapshot && self.resolver.get(&fullname).is_some() {
+                continue;
+            }
+            let Some(snap) = snapshot_type_info(py, item, &fullname) else {
+                continue;
+            };
+            let fresh = self.resolver.get(&fullname).is_none();
+            self.resolver.insert(snap.fullname.clone(), snap);
+            if fresh {
+                added_infos += 1;
+            }
+        }
+        let mut added_aliases = 0usize;
+        for item in aliases.iter()? {
+            let item = item?;
+            let fullname: String = match item.getattr("fullname").and_then(|f| f.extract()) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if self.alias_resolver.get(&fullname).is_some() {
+                continue;
+            }
+            let Some(snap) = snapshot_type_alias(py, item, &fullname) else {
+                continue;
+            };
+            self.alias_resolver.insert(fullname, snap);
+            added_aliases += 1;
+        }
+        // The dict view is keyed by the full TypeInfo set; any growth
+        // invalidates it (rebuilt lazily on next render).
+        self.cached_dict = None;
+        let _ = py;
+        Ok((added_infos, added_aliases))
+    }
+}
+
+/// Snapshot one live `mypy.nodes.TypeInfo` object into a
+/// `TypeInfoSnapshot`. Returns `None` (caller skips the item) when the
+/// `fullname` attribute is unreadable. Shared by `build_native_resolver`
+/// (fresh full build) and `NativeTypeResolver::update` (per-SCC extend).
+fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<TypeInfoSnapshot> {
+    let name = read_str_attr(item, "name")
+        .unwrap_or_else(|| fullname.rsplit('.').next().unwrap_or(fullname).to_owned());
+    let is_protocol = read_bool_attr(item, "is_protocol").unwrap_or(false);
+    let is_enum = read_bool_attr(item, "is_enum").unwrap_or(false);
+    let enum_members = read_str_list_attr(item, "enum_members").unwrap_or_default();
+    let fallback_to_any = read_bool_attr(item, "fallback_to_any").unwrap_or(false);
+    let meta_fallback_to_any = read_bool_attr(item, "meta_fallback_to_any").unwrap_or(false);
+    let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
+    let has_type_var_tuple_type = read_bool_attr(item, "has_type_var_tuple_type").unwrap_or(false);
+    let is_abstract = read_bool_attr(item, "is_abstract").unwrap_or(false);
+    let type_vars = read_str_list_attr(item, "type_vars").unwrap_or_default();
+    let mro = read_mro_fullnames(item, "mro").unwrap_or_default();
+    let has_base: HashSet<String> = mro.iter().cloned().collect();
+    let protocol_members = item
+        .getattr("protocol_members")
+        .ok()
+        .and_then(|pm| pm.downcast::<PyList>().ok())
+        .map(|list| {
+            list.iter()
+                .filter_map(|x| x.extract::<String>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let promote_bytes = read_promote_bytes(py, item);
+    let alt_promote_fullname = read_opt_instance_fullname(item, "alt_promote");
+    let metaclass_fullname = read_opt_instance_fullname(item, "metaclass_type");
+    let bases = read_type_list_bytes(py, item, "bases");
+    let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
+    let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
+    let type_var_tuple_suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
+    let type_vars_with_variance_full = read_type_vars_with_variance(py, item);
+    let type_vars_with_variance: Vec<(String, i64, i64)> = type_vars_with_variance_full
+        .iter()
+        .map(|(n, v, k, _)| (n.clone(), *v, *k))
+        .collect();
+    let type_var_upper_bounds: Vec<Vec<u8>> = type_vars_with_variance_full
+        .into_iter()
+        .map(|(_, _, _, ub)| ub)
+        .collect();
+    let type_var_raw_ids = read_type_var_raw_ids(item);
+    let member_info = read_member_info(item);
+    let member_definers = read_member_definers(item);
+
+    Some(TypeInfoSnapshot {
+        fullname: fullname.to_owned(),
+        name,
+        is_protocol,
+        is_enum,
+        enum_members,
+        fallback_to_any,
+        meta_fallback_to_any,
+        is_named_tuple,
+        has_type_var_tuple_type,
+        is_abstract,
+        type_vars,
+        mro,
+        protocol_members,
+        has_base,
+        promote_bytes,
+        alt_promote_fullname,
+        metaclass_fullname,
+        bases,
+        tuple_type,
+        type_var_tuple_prefix,
+        type_var_tuple_suffix,
+        type_vars_with_variance,
+        type_var_upper_bounds,
+        type_var_raw_ids,
+        member_info,
+        member_definers,
+    })
+}
+
+/// Snapshot one live `mypy.nodes.TypeAlias` object into a
+/// `TypeAliasSnapshot`. Returns `None` when the alias has no serializable
+/// `target` (caller skips the item). Shared by `build_native_resolver`
+/// (fresh full build) and `NativeTypeResolver::update` (per-SCC extend).
+fn snapshot_type_alias(
+    py: Python<'_>,
+    item: &PyAny,
+    fullname: &str,
+) -> Option<crate::aliases::TypeAliasSnapshot> {
+    let target = match item.getattr("target").ok() {
+        Some(t) => match serialize_type_to_bytes(py, t) {
+            Some(b) => b,
+            None => return None,
+        },
+        None => return None,
+    };
+    let alias_tvars = read_alias_tvars_pub(item);
+    let tvar_tuple_index = read_tvar_tuple_index_pub(item);
+    let no_args: bool = item
+        .getattr("no_args")
+        .ok()
+        .and_then(|v| v.extract().ok())
+        .unwrap_or(false);
+    let python_3_12_type_alias: bool = item
+        .getattr("python_3_12_type_alias")
+        .ok()
+        .and_then(|v| v.extract().ok())
+        .unwrap_or(false);
+    Some(crate::aliases::TypeAliasSnapshot {
+        fullname: fullname.to_owned(),
+        target,
+        alias_tvars,
+        tvar_tuple_index,
+        no_args,
+        python_3_12_type_alias,
+    })
 }
 
 impl NativeTypeResolver {
@@ -961,79 +1150,8 @@ pub(crate) fn build_native_resolver(
             Some(f) => f,
             None => continue,
         };
-        let name = read_str_attr(item, "name")
-            .unwrap_or_else(|| fullname.rsplit('.').next().unwrap_or(&fullname).to_owned());
-        let is_protocol = read_bool_attr(item, "is_protocol").unwrap_or(false);
-        let is_enum = read_bool_attr(item, "is_enum").unwrap_or(false);
-        let enum_members = read_str_list_attr(item, "enum_members").unwrap_or_default();
-        let fallback_to_any = read_bool_attr(item, "fallback_to_any").unwrap_or(false);
-        let meta_fallback_to_any = read_bool_attr(item, "meta_fallback_to_any").unwrap_or(false);
-        let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
-        let has_type_var_tuple_type =
-            read_bool_attr(item, "has_type_var_tuple_type").unwrap_or(false);
-        let is_abstract = read_bool_attr(item, "is_abstract").unwrap_or(false);
-        let type_vars = read_str_list_attr(item, "type_vars").unwrap_or_default();
-        let mro = read_mro_fullnames(item, "mro").unwrap_or_default();
-        let has_base: HashSet<String> = mro.iter().cloned().collect();
-        let protocol_members = item
-            .getattr("protocol_members")
-            .ok()
-            .and_then(|pm| pm.downcast::<PyList>().ok())
-            .map(|list| {
-                list.iter()
-                    .filter_map(|x| x.extract::<String>().ok())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let promote_bytes = read_promote_bytes(py, item);
-        let alt_promote_fullname = read_opt_instance_fullname(item, "alt_promote");
-        let metaclass_fullname = read_opt_instance_fullname(item, "metaclass_type");
-        let bases = read_type_list_bytes(py, item, "bases");
-        let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
-        let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
-        let type_var_tuple_suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
-        let type_vars_with_variance_full = read_type_vars_with_variance(py, item);
-        let type_vars_with_variance: Vec<(String, i64, i64)> = type_vars_with_variance_full
-            .iter()
-            .map(|(n, v, k, _)| (n.clone(), *v, *k))
-            .collect();
-        let type_var_upper_bounds: Vec<Vec<u8>> = type_vars_with_variance_full
-            .into_iter()
-            .map(|(_, _, _, ub)| ub)
-            .collect();
-        // Read after `type_vars_with_variance_full` is consumed above.
-        // Duplicate `defn.type_vars` walk is confined to resolver build.
-        let type_var_raw_ids = read_type_var_raw_ids(item);
-        let member_info = read_member_info(item);
-        let member_definers = read_member_definers(item);
-
-        let snap = TypeInfoSnapshot {
-            fullname,
-            name,
-            is_protocol,
-            is_enum,
-            enum_members,
-            fallback_to_any,
-            meta_fallback_to_any,
-            is_named_tuple,
-            has_type_var_tuple_type,
-            is_abstract,
-            type_vars,
-            mro,
-            protocol_members,
-            has_base,
-            promote_bytes,
-            alt_promote_fullname,
-            metaclass_fullname,
-            bases,
-            tuple_type,
-            type_var_tuple_prefix,
-            type_var_tuple_suffix,
-            type_vars_with_variance,
-            type_var_upper_bounds,
-            type_var_raw_ids,
-            member_info,
-            member_definers,
+        let Some(snap) = snapshot_type_info(py, item, &fullname) else {
+            continue;
         };
         resolver.insert(snap.fullname.clone(), snap);
     }
@@ -1045,32 +1163,8 @@ pub(crate) fn build_native_resolver(
             Ok(f) => f,
             Err(_) => continue,
         };
-        let target = match item.getattr("target").ok() {
-            Some(t) => match serialize_type_to_bytes(py, t) {
-                Some(b) => b,
-                None => continue,
-            },
-            None => continue,
-        };
-        let alias_tvars = read_alias_tvars_pub(item);
-        let tvar_tuple_index = read_tvar_tuple_index_pub(item);
-        let no_args: bool = item
-            .getattr("no_args")
-            .ok()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(false);
-        let python_3_12_type_alias: bool = item
-            .getattr("python_3_12_type_alias")
-            .ok()
-            .and_then(|v| v.extract().ok())
-            .unwrap_or(false);
-        let snap = crate::aliases::TypeAliasSnapshot {
-            fullname: fullname.clone(),
-            target,
-            alias_tvars,
-            tvar_tuple_index,
-            no_args,
-            python_3_12_type_alias,
+        let Some(snap) = snapshot_type_alias(py, item, &fullname) else {
+            continue;
         };
         alias_resolver.insert(fullname, snap);
     }
