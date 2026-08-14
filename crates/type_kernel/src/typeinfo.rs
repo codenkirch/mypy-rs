@@ -1062,12 +1062,9 @@ fn snapshot_type_alias(
     item: &PyAny,
     fullname: &str,
 ) -> Option<crate::aliases::TypeAliasSnapshot> {
-    let target = match item.getattr("target").ok() {
-        Some(t) => match serialize_type_to_bytes(py, t) {
-            Some(b) => b,
-            None => return None,
-        },
-        None => return None,
+    let target = {
+        let t = item.getattr("target").ok()?;
+        serialize_type_to_bytes(py, t)?
     };
     let alias_tvars = read_alias_tvars_pub(item);
     let tvar_tuple_index = read_tvar_tuple_index_pub(item);
