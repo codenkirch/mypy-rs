@@ -171,6 +171,7 @@ __all__ = [
     "rust_type_requires_usage",
     "rust_with_exit_suppresses",
     "rust_try_handler_union",
+    "rust_classify_except_handler_tests",
     "rust_is_true_literal",
     "rust_is_false_literal",
     "rust_is_literal_none",
@@ -843,6 +844,9 @@ def rust_with_exit_suppresses(type_bytes: bytes, strict_optional: bool) -> bool:
 def rust_try_handler_union(
     type_bytes: bytes, strict_optional: bool
 ) -> list[bytes] | None: ...
+def rust_classify_except_handler_tests(
+    type_bytes_list: list[bytes], resolver: NativeTypeResolver
+) -> list[tuple[int, bytes | None]] | None: ...
 def rust_is_true_literal(node: Any) -> bool: ...
 def rust_is_false_literal(node: Any) -> bool: ...
 def rust_is_literal_none(node: Any) -> bool: ...

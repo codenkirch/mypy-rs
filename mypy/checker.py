@@ -316,6 +316,7 @@ try:
     from type_kernel import (
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
+        rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
@@ -363,6 +364,7 @@ except ImportError:
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
+    _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
@@ -637,6 +639,47 @@ def _try_native_try_handler_union(typ: Type) -> list[bytes] | None:
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
+
+
+def _try_native_except_handler_tests(
+    test_types: list[Type],
+) -> list[tuple[int, Type | None]] | None:
+    """Native fast path for the handler-test loop (Phase C2, #609, parity-only).
+
+    Mirrors checker.py:5941-5965 by classifying each handler test type. The
+    returned pairs carry a tag (0=Any, 1=Skip/Uninhabited, 2=Invalid,
+    3=valid ExcType) plus a deserialized type for tags 0/3. Python keeps the
+    `is_subtype(...builtins.BaseException)` fence, the `is_star`
+    reclassification (checker.py:5971-5978) and the error emission; returns
+    None to defer to the pure-Python path.
+    """
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_stmts_active
+        and _native_checker_resolver is not None
+    ):
+        return None
+    try:
+        blobs = _rust_classify_except_handler_tests(
+            [_serialize_type_for_checker(t) for t in test_types], _native_checker_resolver
+        )
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
+        return None
+    if blobs is None:
+        return None
+    pairs: list[tuple[int, Type | None]] = []
+    for tag, blob in blobs:
+        if blob is None:
+            pairs.append((tag, None))
+        else:
+            # fixup_wire_type can fail on an unresolvable type_ref and return
+            # None even though _deserialize_type_from_checker's signature says
+            # Type; annotation keeps the guard statically reachable.
+            t: Type | None = _deserialize_type_from_checker(bytes(blob))
+            if t is None:
+                return None
+            pairs.append((tag, t))
+    return pairs
 
 
 def _try_native_is_valid_inferred_type(
@@ -5942,6 +5985,40 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         all_types: list[Type] = []
         test_types = self.get_types_from_except_handler(typ, n)
+
+        # Phase C2 (#609): native classification of each handler test type.
+        # Rust returns (tag, blob) pairs preserving the Python dispatch; the
+        # is_subtype(...BaseException) fence and the is_star reclassification
+        # below stay in Python. Deserialized types need the same fixup as the
+        # sibling get_types_from_except_handler native path.
+        pairs = _try_native_except_handler_tests(test_types)
+        if pairs is not None:
+            for _, t in pairs:
+                if t is not None:
+                    t.accept(TypeFixer(self.modules, allow_missing=True))
+            from mypy.types import instance_cache
+
+            for attr in ("int_type", "str_type", "bool_type", "object_type", "function_type"):
+                s = getattr(instance_cache, attr)
+                if s is not None and s.type_ref is not None:
+                    setattr(instance_cache, attr, None)
+            for tag, exc_type in pairs:
+                if tag == 0:  # AnyType
+                    assert exc_type is not None
+                    all_types.append(exc_type)
+                    continue
+                if tag == 1:  # UninhabitedType
+                    continue
+                if tag == 3:  # valid exception type
+                    assert exc_type is not None
+                    if not is_subtype(exc_type, self.named_type("builtins.BaseException")):
+                        self.fail(message_registry.INVALID_EXCEPTION_TYPE, n)
+                        return self.default_exception_type(is_star)
+                    all_types.append(exc_type)
+                    continue
+                # tag 2: invalid exception type
+                self.fail(message_registry.INVALID_EXCEPTION_TYPE, n)
+                return self.default_exception_type(is_star)
 
         for ttype in get_proper_types(test_types):
             if isinstance(ttype, AnyType):
