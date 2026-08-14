@@ -133,6 +133,86 @@ DEFAULT_CALL_HOOK_FULLNAMES: Final[frozenset[str]] = frozenset(
     | TD_UPDATE_METHOD_NAMES
 )
 
+# The default plugin's complete hook surface, keyed by hook-method kind.
+# Each set must exactly over-approximate the names the corresponding
+# DefaultPlugin hook body matches, or the known-absent gate would be able
+# to skip a real hook. get_metaclass_hook / get_base_class_hook are NOT
+# overridden by DefaultPlugin (they inherit the base no-op), so they
+# contribute no names.
+DEFAULT_HOOK_FULLNAMES_BY_KIND: Final[dict[str, frozenset[str]]] = {
+    "get_function_hook": frozenset(
+        {
+            "_ctypes.Array",
+            "functools.singledispatch",
+            "functools.partial",
+            "enum.member",
+            "builtins.len",
+        }
+    ),
+    "get_function_signature_hook": frozenset(
+        {
+            "attr.evolve",
+            "attrs.evolve",
+            "attr.assoc",
+            "attrs.assoc",
+            "attr.fields",
+            "attrs.fields",
+            "dataclasses.replace",
+        }
+    ),
+    "get_method_signature_hook": frozenset(
+        {
+            "typing.Mapping.get",
+            "_ctypes.Array.__setitem__",
+            SINGLEDISPATCH_CALLABLE_CALL_METHOD,
+        }
+        | TD_SETDEFAULT_NAMES
+        | TD_POP_NAMES
+        | TD_UPDATE_METHOD_NAMES
+    ),
+    "get_method_hook": frozenset(
+        {
+            "typing.Mapping.get",
+            "builtins.int.__pow__",
+            "builtins.int.__neg__",
+            "builtins.int.__pos__",
+            "builtins.tuple.__mul__",
+            "builtins.tuple.__rmul__",
+            "_ctypes.Array.__getitem__",
+            "_ctypes.Array.__iter__",
+            SINGLEDISPATCH_REGISTER_METHOD,
+            SINGLEDISPATCH_REGISTER_CALLABLE_CALL_METHOD,
+            "functools.partial.__call__",
+        }
+        | TD_SETDEFAULT_NAMES
+        | TD_POP_NAMES
+        | TD_DELITEM_NAMES
+    ),
+    "get_attribute_hook": frozenset(
+        {
+            "_ctypes.Array.value",
+            "_ctypes.Array.raw",
+        }
+        | ENUM_NAME_ACCESS
+        | ENUM_VALUE_ACCESS
+    ),
+    "get_class_decorator_hook": frozenset(
+        dataclass_makers
+        | attr_class_makers
+        | attr_dataclass_makers
+        | attr_frozen_makers
+        | attr_define_makers
+    ),
+    "get_class_decorator_hook_2": frozenset(
+        dataclass_makers
+        | functools_total_ordering_makers
+        | attr_class_makers
+        | attr_dataclass_makers
+        | attr_frozen_makers
+        | attr_define_makers
+    ),
+}
+
 
 class DefaultPlugin(Plugin):
     """Type checker plugin that is enabled by default."""

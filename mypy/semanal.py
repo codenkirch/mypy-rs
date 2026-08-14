@@ -2448,7 +2448,16 @@ class SemanticAnalyzer(
         for decorator in defn.decorators:
             decorator_name = self.get_fullname_for_hook(decorator)
             if decorator_name:
-                hook = self.plugin.get_class_decorator_hook(decorator_name)
+                # Stage 4/C3: skip the Python class-decorator hook chain
+                # when the registry proves no DefaultPlugin hook matches.
+                from mypy.checkexpr import plugin_hook_known_absent
+
+                if not plugin_hook_known_absent(
+                    "get_class_decorator_hook", decorator_name
+                ):
+                    hook = self.plugin.get_class_decorator_hook(decorator_name)
+                else:
+                    hook = None
                 # Special case: if the decorator is itself decorated with
                 # typing.dataclass_transform, apply the hook for the dataclasses plugin
                 # TODO: remove special casing here
@@ -2460,14 +2469,30 @@ class SemanticAnalyzer(
         if defn.metaclass:
             metaclass_name = self.get_fullname_for_hook(defn.metaclass)
             if metaclass_name:
-                hook = self.plugin.get_metaclass_hook(metaclass_name)
+                # Stage 4/C3: get_metaclass_hook has no DefaultPlugin
+                # override (registry kind set is empty), so the gate skips
+                # the Python chain for every metaclass when builtin-only.
+                from mypy.checkexpr import plugin_hook_known_absent
+
+                if not plugin_hook_known_absent("get_metaclass_hook", metaclass_name):
+                    hook = self.plugin.get_metaclass_hook(metaclass_name)
+                else:
+                    hook = None
                 if hook:
                     hook(ClassDefContext(defn, defn.metaclass, self))
 
         for base_expr in defn.base_type_exprs:
             base_name = self.get_fullname_for_hook(base_expr)
             if base_name:
-                hook = self.plugin.get_base_class_hook(base_name)
+                # Stage 4/C3: get_base_class_hook has no DefaultPlugin
+                # override (registry kind set is empty), so the gate skips
+                # the Python chain for every base class when builtin-only.
+                from mypy.checkexpr import plugin_hook_known_absent
+
+                if not plugin_hook_known_absent("get_base_class_hook", base_name):
+                    hook = self.plugin.get_base_class_hook(base_name)
+                else:
+                    hook = None
                 if hook:
                     hook(ClassDefContext(defn, base_expr, self))
 

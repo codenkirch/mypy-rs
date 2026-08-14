@@ -494,7 +494,14 @@ def apply_hooks_to_class(
 
             decorator_name = self.get_fullname_for_hook(decorator)
             if decorator_name:
-                hook = self.plugin.get_class_decorator_hook_2(decorator_name)
+                # Stage 4/C3: skip the Python class-decorator-2 hook chain
+                # when the registry proves no DefaultPlugin hook matches.
+                from mypy.checkexpr import plugin_hook_known_absent
+
+                if not plugin_hook_known_absent(
+                    "get_class_decorator_hook_2", decorator_name
+                ):
+                    hook = self.plugin.get_class_decorator_hook_2(decorator_name)
             # Special case: if the decorator is itself decorated with
             # typing.dataclass_transform, apply the hook for the dataclasses plugin
             # TODO: remove special casing here

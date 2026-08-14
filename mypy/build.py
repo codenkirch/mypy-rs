@@ -1510,14 +1510,16 @@ class BuildManager:
                 ]) from None
             return
         from mypy.checkexpr import _set_native_plugin_hook_registry
-        from mypy.plugins.default import DEFAULT_CALL_HOOK_FULLNAMES
+        from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND
 
         # self.plugin is always a ChainedPlugin after __init__ (a bare
         # DefaultPlugin is wrapped in ChainedPlugin(options, [plugin])).
         # _plugins is ordered custom-plugins-first, DefaultPlugin last.
         plugins = self.plugin._plugins
         has_user_plugins = len(plugins) > 1
-        registry = _type_kernel.PluginHookRegistry(list(DEFAULT_CALL_HOOK_FULLNAMES))
+        registry = _type_kernel.PluginHookRegistry(
+            {kind: list(names) for kind, names in DEFAULT_HOOK_FULLNAMES_BY_KIND.items()}
+        )
         _set_native_plugin_hook_registry(registry, has_user_plugins, plugins)
 
     def dump_stats(self) -> None:
