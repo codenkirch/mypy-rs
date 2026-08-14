@@ -389,6 +389,7 @@ pub(crate) fn rust_make_simplified_union(
     keep_erased: bool,
     contract_literals: bool,
     handle_recursive: bool,
+    strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     // items_bytes is a LIST_GEN-tagged list of serialized types.
@@ -396,9 +397,12 @@ pub(crate) fn rust_make_simplified_union(
     let items = wire::read_type_list(&mut buf).ok()?;
     let _ = (line, column, keep_erased, handle_recursive);
     // Match Python's _remove_redundant_union_items which calls
-    // is_proper_subtype. proper_subtype=True prevents Any-absorption:
-    // Instance is NOT <: AnyType, so Any | C is preserved.
-    let ctx = SubtypeContext::new(false, false, false, true, true, true);
+    // is_proper_subtype, reading state.strict_optional live
+    // (subtypes.py:575 passes it to _is_subtype). proper_subtype=True
+    // prevents Any-absorption: Instance is NOT <: AnyType, so Any | C is
+    // preserved; strict_optional must flow from the caller so that
+    // --no-strict-optional drops NoneType items (None <: T is true then).
+    let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
     let result =
         setops::make_simplified_union(&items, &ctx, resolver.resolver(), contract_literals)?;
     encode_type(&result)

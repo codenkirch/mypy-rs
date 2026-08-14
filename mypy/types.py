@@ -59,7 +59,17 @@ from mypy.cache import (
     write_str_opt_list,
     write_tag,
 )
-from mypy.nodes import ARG_KINDS, ARG_POS, ARG_STAR, ARG_STAR2, INVARIANT, ArgKind, SymbolNode
+from mypy.nodes import (
+    ARG_KINDS,
+    ARG_POS,
+    ARG_STAR,
+    ARG_STAR2,
+    ARG_NAMED,
+    ARG_NAMED_OPT,
+    INVARIANT,
+    ArgKind,
+    SymbolNode,
+)
 from mypy.options import Options
 from mypy.state import state
 from mypy.util import IdMapper

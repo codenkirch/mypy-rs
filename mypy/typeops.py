@@ -814,6 +814,7 @@ def make_simplified_union(
                 keep_erased,
                 contract_literals,
                 handle_recursive,
+                state.strict_optional,
                 _native_typeops_resolver,
             )
             if result is not None:

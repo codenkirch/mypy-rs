@@ -717,8 +717,19 @@ fn meet_union(
                     type_ref,
                     arg_discs,
                 } => {
-                    // Build Instance(type_ref, reconstructed args)
-                    let args = reconstruct_args_from_discs(&arg_discs, s_item, t_item);
+                    // Build Instance(type_ref, reconstructed args). disc 0
+                    // -> s.args[i], disc 1 -> t.args[i], disc 4 -> Any.
+                    // The operands must be Instances to index args; defer
+                    // otherwise (mirrors join.py:422-423).
+                    let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) =
+                        (s_item, t_item)
+                    else {
+                        return None;
+                    };
+                    if arg_discs.len() != s_args.len() || arg_discs.len() != t_args.len() {
+                        return None;
+                    }
+                    let args = reconstruct_args_from_discs(&arg_discs, s_args, t_args);
                     Type::Instance {
                         type_ref,
                         args,
@@ -746,18 +757,21 @@ fn meet_union(
 }
 
 /// Reconstruct args from per-arg discriminators for SameTypeWithArgs.
-fn reconstruct_args_from_discs(arg_discs: &[i8], s_item: &Type, t_item: &Type) -> Vec<Type> {
+/// `disc 0` -> `s_args[i]`, `disc 1` -> `t_args[i]`, `disc 4` ->
+/// AnyType. Callers guarantee `arg_discs.len() == args.len()`.
+fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type]) -> Vec<Type> {
     arg_discs
         .iter()
-        .map(|d| match d {
-            0 => s_item.clone(),
-            1 => t_item.clone(),
+        .enumerate()
+        .map(|(i, d)| match d {
+            0 => s_args[i].clone(),
+            1 => t_args[i].clone(),
             4 => Type::AnyType {
                 type_of_any: 3,
                 source_any: None,
                 missing_import_name: None,
             },
-            _ => s_item.clone(),
+            _ => s_args[i].clone(),
         })
         .collect()
 }
@@ -3194,6 +3208,21 @@ fn visit_instance_with_args(
         let ta = &t_args[i]; // Python's t.args[i] (right arg).
         let sa = &s_args[i]; // Python's s.args[i] (left arg).
 
+        // Ambiguous-UninhabitedType args (join.py:126-130): `ambiguous`
+        // means the UninhabitedType came from an empty collection /
+        // unreachable inference, and the OTHER side's arg wins outright
+        // (no join, no is_equivalent, no upper-bound check).
+        // ta_ambiguous -> new_type = sa (disc 0); sa_ambiguous ->
+        // new_type = ta (disc 1).
+        if matches!(ta, Type::UninhabitedType { ambiguous: true }) {
+            arg_discs.push(0); // new_type = sa = s.args[i]
+            continue;
+        }
+        if matches!(sa, Type::UninhabitedType { ambiguous: true }) {
+            arg_discs.push(1); // new_type = ta = t.args[i]
+            continue;
+        }
+
         // join.py:131-135: AnyType arg -> AnyType(from_another_any).
         if matches!(ta, Type::AnyType { .. }) || matches!(sa, Type::AnyType { .. }) {
             arg_discs.push(4);
@@ -3211,15 +3240,6 @@ fn visit_instance_with_args(
             }
             _ => return None,
         }
-
-        // TypeVarType. values non-empty -> defer (needs values check,
-        // join.py:140-143).
-        // We can't read `values` from the snapshot (only name +
-        // variance + kind); defer if the tvar might have values.
-        // The snapshot doesn't carry `values`, so we conservatively
-        // defer only when the recursive join is non-trivial. For the
-        // invariant equivalent-same-type case, values are typically
-        // empty, so we proceed and let the recursive join decide.
 
         match *variance {
             v if v == COVARIANT || v == VARIANCE_NOT_READY => {
@@ -3277,13 +3297,11 @@ fn visit_instance_with_args(
             _ => return None,
         }
     }
-
     Some(SetOpResult::SameTypeWithArgs {
         type_ref: type_ref.to_string(),
         arg_discs,
     })
 }
-
 /// Outcome of the nominal Instance-Instance join, relative to the
 /// (left, right) args of the recursive call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4637,11 +4655,29 @@ mod tests {
     #[test]
     fn join_types_none_right_strict_s_is_instance_defers() {
         // visit_none_type, strict_optional, s is Instance ->
-        // make_simplified_union (deferred).
+        // make_simplified_union([Instance, None]) which now resolves to
+        // Union[Instance, None] (issue #591: Instance-vs-NoneType no
+        // longer defers; Python join.py:493-494 produces the same
+        // simplified union). Previously deferred while the
+        // Instance-vs-non-Instance subtype check fell through.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
         let t = Type::NoneType;
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(result.is_some(), "expected a concrete join, got None");
+        if let Some(SetOpResult::Encoded(bytes)) = &result {
+            let decoded = crate::wire::read_type(&mut ReadBuffer::new(bytes), None).unwrap();
+            match decoded {
+                Type::UnionType { items, .. } => {
+                    assert_eq!(items.len(), 2);
+                    assert!(matches!(items[0], Type::Instance { .. }));
+                    assert!(matches!(items[1], Type::NoneType));
+                }
+                other => panic!("expected UnionType, got {other:?}"),
+            }
+        } else {
+            panic!("expected Encoded, got {result:?}");
+        }
     }
 
     #[test]
@@ -5760,11 +5796,25 @@ mod tests {
     fn join_types_swaps_none_left_to_right() {
         // join.py:320-321: s is None, t is not -> swap. Post-swap:
         // visit_none_type, strict_optional, s=Instance, t=None ->
-        // make_simplified_union (deferred).
+        // make_simplified_union([Instance, None]) which now resolves to
+        // Union[Instance, None] (issue #591), then flip back (swapped)
+        // yielding the same union.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = Type::NoneType;
         let t = instance("a.A", vec![]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(result.is_some(), "expected a concrete join, got None");
+        if let Some(SetOpResult::Encoded(bytes)) = &result {
+            let decoded = crate::wire::read_type(&mut ReadBuffer::new(bytes), None).unwrap();
+            match decoded {
+                Type::UnionType { items, .. } => {
+                    assert_eq!(items.len(), 2);
+                }
+                other => panic!("expected UnionType, got {other:?}"),
+            }
+        } else {
+            panic!("expected Encoded, got {result:?}");
+        }
     }
 
     #[test]

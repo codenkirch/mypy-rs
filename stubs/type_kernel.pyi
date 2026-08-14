@@ -470,6 +470,7 @@ def rust_make_simplified_union(
     keep_erased: bool,
     contract_literals: bool,
     handle_recursive: bool,
+    strict_optional: bool,
     resolver: NativeTypeResolver,
 ) -> bytes | None: ...
 def rust_simple_literal_type(type_bytes: bytes) -> bytes | None: ...
