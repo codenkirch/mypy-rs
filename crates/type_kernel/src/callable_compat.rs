@@ -612,7 +612,7 @@ fn any_unpack_anywhere(t: &Type) -> bool {
 /// `has_base("builtins.type") or fullname == "abc.ABCMeta" or fallback_to_any`.
 /// We can only see the fallback as an `Instance` type_ref; when the resolver
 /// cannot resolve it, return `None` (unknown → defer).
-fn is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
+pub(crate) fn is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
     let Type::CallableType {
         fallback, ret_type, ..
     } = t

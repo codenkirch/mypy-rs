@@ -23,9 +23,11 @@
 //! it here with an empty resolver would always defer).
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyList};
+use pyo3::types::{PyBytes, PyList, PyTuple};
 
 use crate::astwire::{decode_node, AstNode};
+use crate::callable_compat::is_type_obj;
+use crate::erase_typevars::{erase_typevars_inner, make_any};
 use crate::meet::overlap;
 use crate::setops::{make_simplified_union, union_make_union};
 use crate::subtypes::{is_subtype, SubtypeContext};
@@ -861,6 +863,178 @@ pub(crate) fn rust_narrow_type_by_identity_equality(
 }
 
 // ---------------------------------------------------------------------------
+// rust_classify_except_handler_tests (Phase C2, issue #609)
+// ---------------------------------------------------------------------------
+
+/// One handler-test classification, mirroring the per-`ttype` dispatch in
+/// `mypy.checker.check_except_handler_test` (checker.py:5941-5965).
+///
+/// Python's loop appends a type for `AnyType` and for a valid exception
+/// type, skips `UninhabitedType`, and short-circuits with
+/// `INVALID_EXCEPTION_TYPE` for anything else. The classifier below
+/// reproduces exactly that dispatch on the wire type, deferring (`None`)
+/// only when the class of the result is genuinely unresolvable on the
+/// wire (a `TypeAliasType` test — Python `get_proper_types` would expand
+/// it — or a type-object whose metaclass is not in the resolver).
+#[derive(Debug)]
+enum HandlerTestClass {
+    /// `AnyType`: Python appends the type as-is (tag 0).
+    Any(Type),
+    /// `UninhabitedType`: Python continues without appending (tag 1).
+    Skip,
+    /// Not a valid exception type: Python fails + returns default (tag 2).
+    Invalid,
+    /// A valid exception type derived from `FunctionLike` / `TypeType`
+    /// (tag 3). Python still runs the `is_subtype(...BaseException)` fence.
+    Exc(Type),
+}
+
+/// Wire `get_proper_type`: a `TypeAliasType` has no alias target on the
+/// wire, so it defers. Every other type is already proper.
+fn wire_get_proper_type(t: &Type) -> Option<Type> {
+    match t {
+        Type::TypeAliasType { .. } => None,
+        _ => Some(t.clone()),
+    }
+}
+
+/// The `FunctionLike` exception-type branch (checker.py:5952-5964):
+/// `is_type_obj` on `items[0]`, then `exc_type = erase_typevars(
+/// item.get_instance_type())`.
+fn exception_type_of_type_obj(
+    callable: &Type,
+    resolver: &TypeResolver,
+) -> Option<HandlerTestClass> {
+    match callable {
+        Type::Overloaded { items } => match items.first() {
+            Some(first) => exception_type_of_callable(first, resolver),
+            None => Some(HandlerTestClass::Invalid),
+        },
+        Type::CallableType { .. } => exception_type_of_callable(callable, resolver),
+        _ => Some(HandlerTestClass::Invalid),
+    }
+}
+
+fn exception_type_of_callable(first: &Type, resolver: &TypeResolver) -> Option<HandlerTestClass> {
+    match is_type_obj(first, resolver) {
+        None => None,
+        Some(false) => Some(HandlerTestClass::Invalid),
+        Some(true) => {
+            let Type::CallableType {
+                instance_type,
+                ret_type,
+                ..
+            } = first
+            else {
+                return Some(HandlerTestClass::Invalid);
+            };
+            // Python `get_instance_type()` (force_fallback=False):
+            // `instance_type` if set, else `get_proper_type(ret_type)`.
+            let exc = match instance_type {
+                Some(it) => Some((**it).clone()),
+                None => wire_get_proper_type(ret_type),
+            }?;
+            let erased = erase_typevars_inner(&exc, None, &make_any())?;
+            Some(HandlerTestClass::Exc(erased))
+        }
+    }
+}
+
+/// Classify a single handler test type (checker.py:5941-5965), or `None`
+/// to defer the whole native call to the pure-Python path.
+fn classify_except_handler_test_inner(
+    t: &Type,
+    resolver: &TypeResolver,
+) -> Option<HandlerTestClass> {
+    match t {
+        Type::AnyType { .. } => Some(HandlerTestClass::Any(t.clone())),
+        Type::UninhabitedType { .. } => Some(HandlerTestClass::Skip),
+        // Python feeds `get_proper_types(test_types)` into the loop, which
+        // expands aliases; the wire cannot. Defer.
+        Type::TypeAliasType { .. } => None,
+        Type::CallableType { .. } | Type::Overloaded { .. } => {
+            exception_type_of_type_obj(t, resolver)
+        }
+        Type::TypeType { item, .. } => {
+            // Python uses `exc_type = ttype.item` directly (checker.py:5963),
+            // then the is_subtype fence. Item is rarely an alias, but
+            // `is_subtype` would expand it; defer when it is.
+            if matches!(**item, Type::TypeAliasType { .. }) {
+                return None;
+            }
+            Some(HandlerTestClass::Exc((**item).clone()))
+        }
+        _ => Some(HandlerTestClass::Invalid),
+    }
+}
+
+/// `mypy.checker.check_except_handler_test` handler classification.
+///
+/// Takes the serialized handler test types (the `test_types` list, before
+/// `get_proper_types`) and returns a list of `(tag, blob)` pairs, one per
+/// input, preserving order and the early-return-on-invalid semantics:
+///
+///   * tag 0 (`Any`)   — Python appends the deserialized type and continues.
+///   * tag 1 (`Skip`)  — Python continues without appending.
+///   * tag 2 (`Invalid`) — Python fails with INVALID_EXCEPTION_TYPE and
+///     returns `default_exception_type(is_star)` immediately.
+///   * tag 3 (`Exc`)   — Python runs the `is_subtype(...BaseException)`
+///     fence, appends on success, fails + returns on failure.
+///
+/// `None` defers the whole call to the pure-Python path. The `is_star`
+/// reclassification fence (checker.py:5971-5978) and the
+/// `is_subtype` fence stay in Python; this function only classifies the
+/// structural shape of each handler type.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_except_handler_tests<'py>(
+    py: Python<'py>,
+    type_bytes_list: Vec<Vec<u8>>,
+    resolver: &mut NativeTypeResolver,
+) -> PyResult<Option<&'py PyList>> {
+    let resolver = resolver.resolver();
+    let mut classes: Vec<HandlerTestClass> = Vec::with_capacity(type_bytes_list.len());
+    for bytes in &type_bytes_list {
+        let typ = match decode_type(bytes) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        match classify_except_handler_test_inner(&typ, resolver) {
+            Some(class) => classes.push(class),
+            None => return Ok(None),
+        }
+    }
+    let out = PyList::empty(py);
+    for class in &classes {
+        let (tag, blob): (i64, Option<Vec<u8>>) = match class {
+            HandlerTestClass::Any(t) => {
+                let blob = match encode_type_owned(t) {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                (0, Some(blob))
+            }
+            HandlerTestClass::Skip => (1, None),
+            HandlerTestClass::Invalid => (2, None),
+            HandlerTestClass::Exc(t) => {
+                let blob = match encode_type_owned(t) {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                (3, Some(blob))
+            }
+        };
+        let blob_obj: PyObject = match blob {
+            Some(b) => PyBytes::new(py, &b).into_py(py),
+            None => py.None(),
+        };
+        let tuple = PyTuple::new(py, [tag.into_py(py), blob_obj]);
+        out.append(tuple)?;
+    }
+    Ok(Some(out))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1493,6 +1667,262 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             assert!(rust_partial_type_inference(py).unwrap().is_none(py));
+        });
+    }
+
+    // -- rust_classify_except_handler_tests (Phase C2, issue #609) --
+
+    /// A `CallableType` whose fallback is the given metaclass + ret_type.
+    fn type_obj(meta_ref: &str, ret_instance: Type, instance_type: Option<Type>) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance(meta_ref)),
+            instance_type: instance_type.map(Box::new),
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(ret_instance.clone()),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    /// Resolver whose `builtins.type` snapshot reports a `builtins.type`
+    /// base, so `is_type_obj` commits to `Some(true)`.
+    fn meta_resolver() -> TypeResolver {
+        let mut r = TypeResolver::new();
+        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
+        snap.fullname = "builtins.type".to_string();
+        snap.has_base.insert("builtins.type".to_string());
+        r.insert("builtins.type".to_string(), snap);
+        r
+    }
+
+    #[test]
+    fn except_handler_test_any() {
+        let t = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        match classify_except_handler_test_inner(&t, &TypeResolver::new()) {
+            Some(HandlerTestClass::Any(_)) => {}
+            other => panic!("expected Any, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_uninhabited_is_skip() {
+        let t = Type::UninhabitedType { ambiguous: false };
+        match classify_except_handler_test_inner(&t, &TypeResolver::new()) {
+            Some(HandlerTestClass::Skip) => {}
+            other => panic!("expected Skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_plain_instance_is_invalid() {
+        // `except int:` is an invalid exception type; Python fails there.
+        let t = instance("builtins.int");
+        match classify_except_handler_test_inner(&t, &TypeResolver::new()) {
+            Some(HandlerTestClass::Invalid) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_alias_defers() {
+        let t = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert!(classify_except_handler_test_inner(&t, &TypeResolver::new()).is_none());
+    }
+
+    #[test]
+    fn except_handler_test_type_obj_erases_typevars() {
+        // `except type[Foo[T]]:` binds T to Foo[T]; erase_typevars -> Foo[Any].
+        let resolver = meta_resolver();
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "mod".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 12,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 1,
+            meta_level: 0,
+        };
+        let foo = Type::Instance {
+            type_ref: "mod.Foo".to_string(),
+            args: vec![tv.clone()],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let type_obj = type_obj("builtins.type", foo.clone(), None);
+        match classify_except_handler_test_inner(&type_obj, &resolver) {
+            Some(HandlerTestClass::Exc(exc)) => match exc {
+                Type::Instance { args, .. } => {
+                    assert_eq!(args.len(), 1);
+                    assert!(matches!(args[0], Type::AnyType { .. }));
+                }
+                other => panic!("expected Instance after erasure, got {other:?}"),
+            },
+            other => panic!("expected Exc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_type_obj_instance_type_wins() {
+        // get_instance_type prefers CallableType.instance_type over ret_type.
+        let resolver = meta_resolver();
+        let precise = instance("mod.SelfType");
+        let type_obj = type_obj(
+            "builtins.type",
+            instance("mod.RetType"),
+            Some(precise.clone()),
+        );
+        match classify_except_handler_test_inner(&type_obj, &resolver) {
+            Some(HandlerTestClass::Exc(exc)) => assert_eq!(exc, precise),
+            other => panic!("expected Exc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_type_obj_non_metaclass_invalid() {
+        // Callable whose fallback is `builtins.function` (not a metaclass):
+        // is_type_obj -> false -> Invalid. The resolver knows the fallback
+        // but it has no `builtins.type` base.
+        let mut r = TypeResolver::new();
+        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
+        snap.fullname = "builtins.function".to_string();
+        r.insert("builtins.function".to_string(), snap);
+        let type_obj = type_obj("builtins.function", instance("mod.Foo"), None);
+        match classify_except_handler_test_inner(&type_obj, &r) {
+            Some(HandlerTestClass::Invalid) => {}
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_type_obj_unknown_metaclass_defers() {
+        // Custom metaclass not in the resolver: is_type_obj -> None -> defer.
+        let type_obj = type_obj("mod.MyMeta", instance("mod.Foo"), None);
+        assert!(classify_except_handler_test_inner(&type_obj, &TypeResolver::new()).is_none());
+    }
+
+    #[test]
+    fn except_handler_test_overloaded_first_item() {
+        // Overloaded type obj: classification uses items[0] only.
+        let resolver = meta_resolver();
+        let first = type_obj("builtins.type", instance("mod.Foo"), None);
+        let t = Type::Overloaded {
+            items: vec![first.clone()],
+        };
+        match classify_except_handler_test_inner(&t, &resolver) {
+            Some(HandlerTestClass::Exc(exc)) => assert_eq!(exc, instance("mod.Foo")),
+            other => panic!("expected Exc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_type_type_item() {
+        let t = Type::TypeType {
+            item: Box::new(instance("mod.ValueError")),
+            is_type_form: true,
+        };
+        match classify_except_handler_test_inner(&t, &TypeResolver::new()) {
+            Some(HandlerTestClass::Exc(exc)) => assert_eq!(exc, instance("mod.ValueError")),
+            other => panic!("expected Exc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn except_handler_test_type_type_alias_item_defers() {
+        let t = Type::TypeType {
+            item: Box::new(Type::TypeAliasType {
+                type_ref: "mod.Aliased".to_string(),
+                args: vec![],
+            }),
+            is_type_form: true,
+        };
+        assert!(classify_except_handler_test_inner(&t, &TypeResolver::new()).is_none());
+    }
+
+    #[test]
+    fn classify_except_handler_tests_pyfunc_roundtrip() {
+        pyo3::prepare_freethreaded_python();
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let mut resolver = crate::typeinfo::NativeTypeResolver::new(
+            meta_resolver(),
+            crate::aliases::TypeAliasResolver::default(),
+        );
+        Python::with_gil(|py| {
+            let blobs = vec![encode_type(&any), encode_type(&instance("builtins.int"))];
+            let out = rust_classify_except_handler_tests(py, blobs, &mut resolver)
+                .unwrap()
+                .unwrap();
+            assert_eq!(out.len(), 2);
+            let first: &PyTuple = out[0].downcast().unwrap();
+            let tag: i64 = first[0].extract().unwrap();
+            assert_eq!(tag, 0); // Any
+            let second: &PyTuple = out[1].downcast().unwrap();
+            let tag: i64 = second[0].extract().unwrap();
+            assert_eq!(tag, 2); // Invalid
+            assert!(second[1].is_none());
+        });
+    }
+
+    #[test]
+    fn classify_except_handler_tests_pyfunc_overloaded_valid() {
+        pyo3::prepare_freethreaded_python();
+        // Type-object overload: classification uses items[0], emits Exc.
+        let first = type_obj("builtins.type", instance("mod.Foo"), None);
+        let overloaded = Type::Overloaded { items: vec![first] };
+        let mut resolver = crate::typeinfo::NativeTypeResolver::new(
+            meta_resolver(),
+            crate::aliases::TypeAliasResolver::default(),
+        );
+        Python::with_gil(|py| {
+            let blobs = vec![encode_type(&overloaded)];
+            let out = rust_classify_except_handler_tests(py, blobs, &mut resolver)
+                .unwrap()
+                .unwrap();
+            assert_eq!(out.len(), 1);
+            let tuple: &PyTuple = out[0].downcast().unwrap();
+            let tag: i64 = tuple[0].extract().unwrap();
+            assert_eq!(tag, 3); // Exc
+        });
+    }
+
+    #[test]
+    fn classify_except_handler_tests_pyfunc_garbage_defers() {
+        pyo3::prepare_freethreaded_python();
+        let mut resolver = crate::typeinfo::NativeTypeResolver::new(
+            TypeResolver::new(),
+            crate::aliases::TypeAliasResolver::default(),
+        );
+        Python::with_gil(|py| {
+            let out =
+                rust_classify_except_handler_tests(py, vec![b"\xff\xff".to_vec()], &mut resolver)
+                    .unwrap();
+            assert!(out.is_none());
         });
     }
 }
