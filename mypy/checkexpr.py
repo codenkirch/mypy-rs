@@ -8060,10 +8060,15 @@ class HasErasedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_uninhabited_component(t: Type | None) -> bool:
-    if t is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        t is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(t)
-            result = _rust_has_uninhabited_component(type_bytes)
+            result = _rust_has_uninhabited_component(type_bytes, _native_checkexpr_resolver)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):
@@ -8082,10 +8087,17 @@ class HasUninhabitedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_ambiguous_uninhabited_component(t: Type | None) -> bool:
-    if t is not None and _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        t is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(t)
-            result = _rust_has_ambiguous_uninhabited_component(type_bytes)
+            result = _rust_has_ambiguous_uninhabited_component(
+                type_bytes, _native_checkexpr_resolver
+            )
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

@@ -434,26 +434,73 @@ fn children(typ: &Type) -> Vec<&Type> {
 /// `mypy.checkexpr.has_uninhabited_component` — whether a type contains
 /// an UninhabitedType component.
 ///
-/// Mirrors `HasUninhabitedComponent` (checkexpr.py). Defers on TypeAliasType.
+/// Mirrors `HasUninhabitedComponent` (checkexpr.py). Expands TypeAliasType
+/// via the alias resolver (Phase C, #594), same shape as `has_any_type`
+/// (B3b #593): `BoolTypeQuery.visit_type_alias_type` visits the substituted
+/// target and args. Defers only when alias expansion defers (missing
+/// snapshot, undecodable target, cycle, or a substitution the kernel
+/// cannot perform exactly).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_has_uninhabited_component(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+pub(crate) fn rust_has_uninhabited_component(
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(has_uninhabited_component_inner(&typ))
+    Ok(has_uninhabited_component_inner(
+        &typ,
+        resolver.alias_resolver(),
+    ))
 }
 
-pub(crate) fn has_uninhabited_component_inner(typ: &Type) -> Option<bool> {
-    if let Type::TypeAliasType { .. } = typ {
-        return None;
+pub(crate) fn has_uninhabited_component_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let mut seen: Vec<String> = Vec::new();
+    has_uninhabited_component_inner_seen(typ, aliases, &mut seen)
+}
+
+/// `seen` holds alias fullnames already visited on this descent; a repeated
+/// alias short-circuits to the strategy default (false), which terminates
+/// recursive aliases across the recursion boundary. Passed through the whole
+/// walk, matching `has_any_type_inner_seen`, so nested aliases inside
+/// children (e.g. `A = List[A]`) do not restart the cycle detection.
+fn has_uninhabited_component_inner_seen(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    if let Type::TypeAliasType { type_ref, .. } = typ {
+        // Python's BoolTypeQuery.visit_type_alias_type (type_visitor.py:598)
+        // visits the substituted target and (for new-style aliases only)
+        // the args. When the substitution defers we defer the whole query
+        // (parity-safe).
+        if seen.contains(type_ref) {
+            return Some(false);
+        }
+        seen.push(type_ref.clone());
+        let (target, args, python_3_12) = expanded_alias_target(typ, aliases)?;
+        if has_uninhabited_component_inner_seen(&target, aliases, seen)? {
+            return Some(true);
+        }
+        if python_3_12 {
+            for arg in &args {
+                if has_uninhabited_component_inner_seen(arg, aliases, seen)? {
+                    return Some(true);
+                }
+            }
+        }
+        return Some(false);
     }
     if matches!(typ, Type::UninhabitedType { .. }) {
         return Some(true);
     }
     for child in all_children(typ) {
-        match has_uninhabited_component_inner(child) {
+        match has_uninhabited_component_inner_seen(child, aliases, seen) {
             Some(true) => return Some(true),
             None => return None,
             Some(false) => {}
@@ -472,28 +519,62 @@ pub(crate) fn has_uninhabited_component_inner(typ: &Type) -> Option<bool> {
 /// Mirrors `HasAmbiguousUninhabitedComponentsQuery` (checkexpr.py:
 /// 7007-7018). `ambiguous` is the flag on the UninhabitedType wire
 /// variant; False matches the plain has_uninhabited_component case.
-/// Defer on TypeAliasType (no alias target on the wire).
+/// Expands TypeAliasType via the alias resolver (Phase C, #594), same as
+/// `has_uninhabited_component`.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn rust_has_ambiguous_uninhabited_component(
     type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
 ) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(has_ambiguous_uninhabited_component_inner(&typ))
+    Ok(has_ambiguous_uninhabited_component_inner(
+        &typ,
+        resolver.alias_resolver(),
+    ))
 }
 
-pub(crate) fn has_ambiguous_uninhabited_component_inner(typ: &Type) -> Option<bool> {
-    if let Type::TypeAliasType { .. } = typ {
-        return None;
+pub(crate) fn has_ambiguous_uninhabited_component_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let mut seen: Vec<String> = Vec::new();
+    has_ambiguous_uninhabited_component_inner_seen(typ, aliases, &mut seen)
+}
+
+/// Same as `has_uninhabited_component_inner_seen` but for the ambiguous
+/// flag: True only when an UninhabitedType marked ambiguous is reached.
+fn has_ambiguous_uninhabited_component_inner_seen(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    if let Type::TypeAliasType { type_ref, .. } = typ {
+        if seen.contains(type_ref) {
+            return Some(false);
+        }
+        seen.push(type_ref.clone());
+        let (target, args, python_3_12) = expanded_alias_target(typ, aliases)?;
+        if has_ambiguous_uninhabited_component_inner_seen(&target, aliases, seen)? {
+            return Some(true);
+        }
+        if python_3_12 {
+            for arg in &args {
+                if has_ambiguous_uninhabited_component_inner_seen(arg, aliases, seen)? {
+                    return Some(true);
+                }
+            }
+        }
+        return Some(false);
     }
     if let Type::UninhabitedType { ambiguous } = typ {
         return Some(*ambiguous);
     }
     for child in all_children(typ) {
-        match has_ambiguous_uninhabited_component_inner(child) {
+        match has_ambiguous_uninhabited_component_inner_seen(child, aliases, seen) {
             Some(true) => return Some(true),
             None => return None,
             Some(false) => {}
@@ -2995,7 +3076,10 @@ mod tests {
     #[test]
     fn test_has_uninhabited_component_true() {
         assert_eq!(
-            has_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: false }),
+            has_uninhabited_component_inner(
+                &Type::UninhabitedType { ambiguous: false },
+                &empty_alias_resolver()
+            ),
             Some(true)
         );
     }
@@ -3003,7 +3087,7 @@ mod tests {
     #[test]
     fn test_has_uninhabited_component_false() {
         assert_eq!(
-            has_uninhabited_component_inner(&make_instance("int", vec![])),
+            has_uninhabited_component_inner(&make_instance("int", vec![]), &empty_alias_resolver()),
             Some(false)
         );
     }
@@ -3025,7 +3109,10 @@ mod tests {
             variance: 0,
             meta_level: 0,
         };
-        assert_eq!(has_uninhabited_component_inner(&tv), Some(true));
+        assert_eq!(
+            has_uninhabited_component_inner(&tv, &empty_alias_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -3044,13 +3131,19 @@ mod tests {
             variance: 0,
             meta_level: 0,
         };
-        assert_eq!(has_uninhabited_component_inner(&tv), Some(false));
+        assert_eq!(
+            has_uninhabited_component_inner(&tv, &empty_alias_resolver()),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_has_ambiguous_uninhabited_component_true() {
         assert_eq!(
-            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: true }),
+            has_ambiguous_uninhabited_component_inner(
+                &Type::UninhabitedType { ambiguous: true },
+                &empty_alias_resolver()
+            ),
             Some(true)
         );
     }
@@ -3058,7 +3151,10 @@ mod tests {
     #[test]
     fn test_has_ambiguous_uninhabited_component_false_flag() {
         assert_eq!(
-            has_ambiguous_uninhabited_component_inner(&Type::UninhabitedType { ambiguous: false }),
+            has_ambiguous_uninhabited_component_inner(
+                &Type::UninhabitedType { ambiguous: false },
+                &empty_alias_resolver()
+            ),
             Some(false)
         );
     }
@@ -3069,13 +3165,19 @@ mod tests {
             make_instance("int", vec![]),
             Type::UninhabitedType { ambiguous: true },
         ]);
-        assert_eq!(has_ambiguous_uninhabited_component_inner(&u), Some(true));
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&u, &empty_alias_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_has_ambiguous_uninhabited_component_clean_instance() {
         assert_eq!(
-            has_ambiguous_uninhabited_component_inner(&make_instance("int", vec![])),
+            has_ambiguous_uninhabited_component_inner(
+                &make_instance("int", vec![]),
+                &empty_alias_resolver()
+            ),
             Some(false)
         );
     }
@@ -3086,7 +3188,126 @@ mod tests {
             args: vec![],
             type_ref: "mod.A".to_string(),
         };
-        assert_eq!(has_ambiguous_uninhabited_component_inner(&alias), None);
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&alias, &empty_alias_resolver()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_alias_target_uninhabited_true() {
+        // An alias whose (no-arg) target is UninhabitedType must answer
+        // true via the alias resolver (Phase C, #594).
+        let aliases =
+            alias_resolver_with_targets(&[("mod.A", Type::UninhabitedType { ambiguous: false })]);
+        assert_eq!(
+            has_uninhabited_component_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_alias_target_clean_false() {
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.A",
+            make_instance("list", vec![make_instance("int", vec![])]),
+        )]);
+        assert_eq!(
+            has_uninhabited_component_inner(&make_type_alias("mod.A"), &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_alias_arg_uninhabited_true() {
+        // New-style alias A[T] = List[T] applied as A[Uninhabited]: the
+        // substitution must carry the uninhabited arg into the target and
+        // the args-visit must find it (Phase C core).
+        let mut resolver = empty_alias_resolver();
+        let tv = crate::aliases::AliasTvar {
+            name: "T".to_string(),
+            raw_id: 7,
+            meta_level: 0,
+            namespace: Default::default(),
+            is_type_var_tuple: false,
+        };
+        let tvar_type = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 7,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let target = Type::Instance {
+            type_ref: "builtins.list".to_string(),
+            args: vec![tvar_type],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let snap = crate::aliases::TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_type(&target).expect("target must encode"),
+            alias_tvars: vec![tv],
+            python_3_12_type_alias: true,
+            ..Default::default()
+        };
+        resolver.insert("mod.A".to_string(), snap);
+        let alias_app = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![Type::UninhabitedType { ambiguous: false }],
+        };
+        assert_eq!(
+            has_uninhabited_component_inner(&alias_app, &resolver),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_uninhabited_component_recursive_alias_defers() {
+        // A = List[A]. The target cannot encode (alias target cannot cross
+        // the wire), so build a self-referential chain by hand: A's
+        // snapshot target references A itself. expanded_alias_target's
+        // per-call chain detection trips first and defers (None), exactly
+        // like has_any_type's recursive-alias test: Python's
+        // get_proper_type cannot terminate recursive aliases either, and
+        // BoolTypeQuery's seen_aliases short-circuits to default, so defer
+        // is the parity-safe answer.
+        let mut resolver = empty_alias_resolver();
+        insert_chain_edges(
+            &mut resolver,
+            alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]),
+        );
+        assert_eq!(
+            has_uninhabited_component_inner(&make_type_alias("mod.A"), &resolver),
+            None
+        );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_alias_target_ambiguous_true() {
+        let aliases =
+            alias_resolver_with_targets(&[("mod.A", Type::UninhabitedType { ambiguous: true })]);
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_ambiguous_uninhabited_component_recursive_alias_defers() {
+        let mut resolver = empty_alias_resolver();
+        insert_chain_edges(
+            &mut resolver,
+            alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]),
+        );
+        assert_eq!(
+            has_ambiguous_uninhabited_component_inner(&make_type_alias("mod.A"), &resolver),
+            None
+        );
     }
 
     #[test]

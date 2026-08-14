@@ -3351,7 +3351,205 @@ class NativeHasAnyTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeJoinInstanceWithArgsSuite(Suite):
+class NativeUninhabitedSuite(Suite):
+    """Parity suite for the Rust `has_uninhabited_component` and
+    `has_ambiguous_uninhabited_component` ports with alias expansion
+    (Phase C, #594).
+
+    Phase C closes the same gap B3b (#593) closed for `has_any_type`: the
+    uninhabited-component queries must expand a `TypeAliasType` to its
+    substituted target and answer correctly instead of deferring on every
+    alias. Covers plain uninhabited types (true), clean instances (false),
+    aliases with an uninhabited target (true), typevar aliases applied with
+    an uninhabited arg (true), chains, and cycles (defer). Requires
+    TEST_NATIVE_TYPE_KERNEL=1.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self.resolver = self._build_resolver([])
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.bi,
+                self.fx.str_type_info,
+                self.fx.type_typei,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+            ],
+            aliases,
+        )
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        self.resolver = self._build_resolver(aliases)
+        _set_native_checkexpr_resolver(self.resolver)
+
+    def assert_uninhabited_decides(self, t: Type, expected: bool) -> None:
+        """Assert the Rust kernel answers `expected` for has_uninhabited_component."""
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_uninhabited_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is not None, f"Rust deferred on {t!r}"
+        assert rusted is expected
+
+    def assert_uninhabited_defers(self, t: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_uninhabited_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is None, f"Rust should defer on {t!r}, got {rusted}"
+
+    def assert_ambiguous_decides(self, t: Type, expected: bool) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_ambiguous_uninhabited_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is not None, f"Rust deferred on {t!r}"
+        assert rusted is expected
+
+    def assert_ambiguous_defers(self, t: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_ambiguous_uninhabited_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is None, f"Rust should defer on {t!r}, got {rusted}"
+
+    def _make_tvar(self, name: str, raw_id: int) -> TypeVarType:
+        return TypeVarType(
+            name,
+            f"mod.{name}",
+            TypeVarId(raw_id),
+            [],
+            self.fx.str_type,
+            self.fx.nonet,
+            0,
+        )
+
+    def _make_alias(
+        self,
+        fullname: str,
+        target: Type,
+        *,
+        alias_tvars: list[TypeVarType] | None = None,
+        no_args: bool = False,
+    ) -> TypeAlias:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],
+            no_args=no_args,
+        )
+
+    def _uninhabited(self, ambiguous: bool = False) -> UninhabitedType:
+        return UninhabitedType(ambiguous=ambiguous)
+
+    def test_plain_uninhabited_true(self) -> None:
+        self.assert_uninhabited_decides(self._uninhabited(), True)
+
+    def test_plain_uninhabited_ambiguous_true(self) -> None:
+        self.assert_ambiguous_decides(self._uninhabited(ambiguous=True), True)
+
+    def test_plain_uninhabited_not_ambiguous_false(self) -> None:
+        self.assert_ambiguous_decides(self._uninhabited(ambiguous=False), False)
+
+    def test_clean_instance_false(self) -> None:
+        self.assert_uninhabited_decides(Instance(self.fx.std_listi, [self.fx.str_type]), False)
+
+    def test_union_with_uninhabited_true(self) -> None:
+        u = UnionType.make_union([self.fx.a, self._uninhabited()])
+        self.assert_uninhabited_decides(u, True)
+
+    def test_alias_target_uninhabited_true(self) -> None:
+        # A = Uninhabited: expanding the alias finds the uninhabited
+        # target, where B3b-era Rust deferred.
+        alias = self._make_alias("mod.A", self._uninhabited())
+        self._rebuild_with_aliases([alias])
+        self.assert_uninhabited_decides(TypeAliasType(alias, []), True)
+        self.assert_ambiguous_decides(TypeAliasType(alias, []), False)
+
+    def test_alias_target_ambiguous_uninhabited_true(self) -> None:
+        alias = self._make_alias("mod.A", self._uninhabited(ambiguous=True))
+        self._rebuild_with_aliases([alias])
+        self.assert_ambiguous_decides(TypeAliasType(alias, []), True)
+
+    def test_alias_target_clean_false(self) -> None:
+        # A = List[int]: no uninhabited component.
+        alias = self._make_alias("mod.A", Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_with_aliases([alias])
+        self.assert_uninhabited_decides(TypeAliasType(alias, []), False)
+
+    def test_alias_typevar_uninhabited_arg_true(self) -> None:
+        # A[T] = List[T] applied A[Uninhabited]: substitution carries the
+        # uninhabited arg into the target (Phase C core). New-style alias
+        # so the args are visited too.
+        tv = self._make_tvar("T", 1)
+        alias = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [tv]), alias_tvars=[tv]
+        )
+        alias.python_3_12_type_alias = True
+        self._rebuild_with_aliases([alias])
+        self.assert_uninhabited_decides(
+            TypeAliasType(alias, [self._uninhabited()]), True
+        )
+
+    def test_alias_typevar_clean_arg_false(self) -> None:
+        # A[T] = List[T] applied A[int]: no uninhabited anywhere.
+        tv = self._make_tvar("T", 2)
+        alias = self._make_alias(
+            "mod.A", Instance(self.fx.std_listi, [tv]), alias_tvars=[tv]
+        )
+        self._rebuild_with_aliases([alias])
+        self.assert_uninhabited_decides(TypeAliasType(alias, [self.fx.a]), False)
+
+    def test_alias_chain_to_uninhabited_true(self) -> None:
+        # B = A, A = Uninhabited: chain resolves to the uninhabited target.
+        alias_a = self._make_alias("mod.A", self._uninhabited())
+        alias_b = self._make_alias(
+            "mod.B", TypeAliasType(alias_a, []), alias_tvars=[]
+        )
+        self._rebuild_with_aliases([alias_a, alias_b])
+        self.assert_uninhabited_decides(TypeAliasType(alias_b, []), True)
+
+    def test_alias_without_snapshot_defers(self) -> None:
+        # A TypeAliasType referencing a fullname with no snapshot in the
+        # resolver: expansion cannot proceed, defer.
+        alias = TypeAliasType(
+            self._make_alias("mod.Missing", self.fx.a),
+            [],
+        )
+        self.assert_uninhabited_defers(alias)
+        self.assert_ambiguous_defers(alias)
     """Parity suite for the Rust `visit_instance` same-type-with-args join
     (Stage 3c M8g).
 
