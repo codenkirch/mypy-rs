@@ -231,7 +231,6 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_argument_count as _rust_check_argument_count,
-        rust_check_arguments as _rust_check_arguments,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
@@ -302,7 +301,6 @@ except ImportError:
     _rust_build_tuple_type = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
-    _rust_check_arguments = None  # type: ignore[assignment]
     _rust_check_argument_count = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
     _rust_try_getting_int_literals = None  # type: ignore[assignment]
@@ -3426,6 +3424,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         self.msg.too_many_arguments(callee, context)
                     elif kind == 3:  # ERR_TOO_MANY_TD
                         actual_type = get_proper_type(actual_types[index])
+                        assert isinstance(actual_type, TypedDictType)
                         self.msg.too_many_arguments_from_typed_dict(
                             callee, actual_type, context
                         )
@@ -3617,49 +3616,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         self.check_var_args_kwargs(arg_types, arg_kinds, context)
 
         check_arg = check_arg or self.check_arg
-        # Rust seam (checkexpr_argcheck.rs): all-or-nothing per-call gate.
-        # Emits per-arg records (0=deleted, 1=abstract, 2=incompatible);
-        # Python mirrors messages. Any undecidable input defers all.
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _native_checkexpr_resolver is not None
-            and check_arg is None
-        ):
-            try:
-                records = _rust_check_arguments(
-                    _native_checkexpr_resolver,
-                    _serialize_type_for_checkexpr(callee),
-                    [_serialize_type_for_checkexpr(get_proper_type(t)) for t in arg_types],
-                    [int(k.value) for k in arg_kinds],
-                    formal_to_actual,
-                    self.chk.options.strict_optional,
-                    self.chk.allow_abstract_call,
-                )
-            except (AssertionError, NotImplementedError, ValueError):
-                records = None
-            if records is not None:
-                for kind, ai, fi in records:
-                    actual_type = get_proper_type(arg_types[ai])
-                    callee_type = get_proper_type(callee.arg_types[fi])
-                    if kind == 0:
-                        self.msg.deleted_as_rvalue(actual_type, args[ai])
-                    elif kind == 1:
-                        self.msg.concrete_only_call(callee_type, args[ai])
-                    else:
-                        error = self.msg.incompatible_argument(
-                            ai + 1, fi + 1, callee, actual_type, arg_kinds[ai],
-                            object_type=object_type, context=args[ai],
-                            outer_context=context,
-                        )
-                        self.msg.incompatible_argument_note(
-                            actual_type, callee_type, args[ai], parent_error=error
-                        )
-                        if not self.msg.prefer_simple_messages():
-                            self.chk.check_possible_missing_await(
-                                actual_type, callee_type, args[ai], error.code
-                            )
-                return
         # Keep track of consumed tuple *arg items.
         mapper = ArgTypeExpander(self.argument_infer_context())
 
@@ -4365,7 +4321,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkexpr_active
-            and _rust_combine_function_signatures is not None
             and _native_checkexpr_resolver is not None
         ):
             try:
@@ -4380,7 +4335,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             if res is not None:
                 next_raw_id, merged_bytes = res
                 TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
-                merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
+                merged = get_proper_type(_deserialize_type_from_checkexpr(bytes(merged_bytes)))
                 if isinstance(merged, CallableType):
                     # The wire format cannot carry line/column/definition/
                     # fallback/special_sig/from_type_type; restore from the
@@ -5762,7 +5717,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def visit_tuple_index_helper(self, left: TupleType, n: int) -> Type | None:
         if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
-                and _rust_visit_tuple_index_helper is not None
                 and find_unpack_in_list(left.items) is None):
             # Only take the Rust path for fixed (non-variadic) tuples.
             # Rust's variadic index result (middle + suffix unions) does
@@ -5831,7 +5785,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def visit_tuple_slice_helper(self, left_type: TupleType, slic: SliceExpr) -> Type:
         if (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active
-                and _rust_visit_tuple_slice_helper is not None
                 and left_type.partial_fallback.type.fullname == "builtins.tuple"):
             # Rust's tuple_slice output uses the tuple's own partial_fallback
             # as result fallback, while Python's TupleType.slice defaults to
