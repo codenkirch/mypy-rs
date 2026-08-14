@@ -1,16 +1,16 @@
 # Next Big Leap: Detailed Issue Plan + Rust Percentage Estimate
 
-## Current State (verified live, August 2026)
+## Current State (verified live, 2026-08-14)
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (GitHub) | 2,089,322 |
-| Python bytes (GitHub) | 6,058,670 |
-| Rust % (GitHub) | 25.57% |
-| Rust % (local tree, ex-typeshed+/test/) | 24.45% |
-| Total bytes | 8,172,202 |
+| Rust bytes (GitHub) | 3,156,702 |
+| Python bytes (GitHub) | 6,284,312 |
+| Rust % (GitHub) | 33.4% |
+| Total bytes | 9,441,014 |
 
-The 20% target is met and sustained. **The migration plan's module port
+The 20% target is met and sustained; 33.4% exceeds the 30% target (D4).
+**The migration plan's module port
 list is exhausted**: `maptype.py` landed as the final port (PR #427) and
 `infer.py` closed without a port (#426, its wrapper is glue over the
 already-native constraints + solve path). The checkexpr-family slice ports

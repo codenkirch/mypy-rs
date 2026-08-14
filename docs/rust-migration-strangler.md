@@ -567,25 +567,34 @@ Python callbacks. The `NativeResolver` `#[pyclass]` is owned by
   `use_typeshed`, `follow_untyped_imports`) cross the PyO3 boundary on each
   resolve.
 
-The dispatch gate in `FindModuleCache._resolve` routes only cold,
-real-filesystem runs to Rust. Daemon (`fine_grained_incremental`) and Bazel
-runs fall back to Python `_find_module` so the daemon VFS and Bazel
-fake-init synthesis remain Python-owned until they are ported or retired:
+The dispatch gate in `FindModuleCache._resolve` routes module resolution
+to Rust under the `native_resolver` option (default on). Daemon
+(`fine_grained_incremental`) mode is no longer excluded: the shared
+`FsCache` and `FileSystemCache.flush()` keep the resolver's derived
+caches consistent across fine-grained increments. Bazel still returns to
+Python `_find_module` by gate, because its fake-init synthesis is
+Python-owned and the native resolver reads the real FS through
+`FsCache`, which does not observe Bazel's virtual FS:
 
 ```python
-if (self.options.native_resolver
-        and not self.options.fine_grained_incremental
-        and not self.options.bazel):
-    # Rust owns the FS for cold runs.
+def _native_gate_active(self) -> bool:
+    if not self.options or not self.options.native_resolver or self.options.bazel:
+        # Bazel fake-init stats are Python-owned (FileSystemCache._fake_init_py)
+        # and the native resolver reads through the real FsCache, which does
+        # not observe Bazel's virtual FS.
+        return False
+    ...
 ```
 
 This is the direction the strangler-fig migration is heading: pure Rust,
 no Python runtime. The callback strategy (Rust calling back into Python's
 `FileSystemCache` for every `isfile`/`isdir`/`listdir`) was architecturally
 backwards for that goal — it made Rust depend on Python's VFS forever. The
-`StdFs` direct-read strategy makes Rust own the FS for cold runs, and the
-gate is the honest way to say "Rust owns the FS for cold runs; daemon mode
-uses Python until the VFS is ported or the daemon is retired."
+`StdFs` direct-read strategy makes Rust own the FS for cold runs and, via
+the Rust `FsCache` that the daemon reads through, for the daemon's
+transactional reads as well. The daemon's `FileSystemWatcher` stays in
+Python, a thin stat+hash diff layer over the already-Rust `FsCache`
+(see `docs/remaining-migration-plan.md` Phase E2).
 
 Case-sensitive matching on macOS/Windows is replicated in Rust via
 `read_dir` listing checks, mirroring `FileSystemCache.isfile_case` and
@@ -593,10 +602,11 @@ Case-sensitive matching on macOS/Windows is replicated in Rust via
 
 ### Wiring
 
-- `Options.native_resolver` (default `False`) gates the dispatch in
+- `Options.native_resolver` (default `True`) gates the dispatch in
   `FindModuleCache._resolve`.
 - `--native-resolver` CLI flag (invertible).
-- `TEST_NATIVE_RESOLVER=1` env var flips it in the testcheck harness.
+- `TEST_NATIVE_RESOLVER=1` env var drives the parity differential in the
+  testcheck harness (set *after* option parsing).
 - Force-on under parallel mode (`main.py`), same as `native_parser`.
 - `native_resolver` is in `OPTIONS_AFFECTING_CACHE`.
 
@@ -707,10 +717,10 @@ Local modulefinder, testcheck, fine-grained, daemon, cache, incremental,
 and self-check parity are all green. (The fine-grained / daemon / cache
 suites initially had 33 native-parser regressions — type-comment handling,
 error-message parity, and PEP 263 encoding — which were fixed; see
-`AGENTS.md` "Native-parser parity".) The native parser is now the
-default (`native_parser = True`); the native resolver remains opt-in
-(`native_resolver = False`) until the daemon VFS path is resolved or
-dmypy is retired. The direct `std::fs` read strategy with
+`AGENTS.md` "Native-parser parity".) The native parser and resolver are
+now both the defaults (`native_parser = True`, `native_resolver = True`);
+the type kernel is default-on too (`native_type_kernel = True`, #58).
+The direct `std::fs` read strategy with
 persistent caches brings the isolated microbench within 1.4x of pure
 Python (and faster than mypyc-compiled Python would be once the boundary
 overhead is eliminated by hoisting more work into Rust). End-to-end
@@ -1242,7 +1252,7 @@ visitor. This is the strangler-fig per-call gate.
 
 The Python side gates `erase_type()` in `mypy/erasetype.py` on a
 module-level flag set by the build manager from
-`Options.native_type_kernel` (default `False` — Stage 1 is opt-in).
+`Options.native_type_kernel` (default `True` since #58).
 Test harnesses flip it from `TEST_NATIVE_TYPE_KERNEL`, mirroring the
 `TEST_NATIVE_PARSER`/`TEST_NATIVE_RESOLVER` pattern.
 
@@ -1255,10 +1265,11 @@ Test harnesses flip it from `TEST_NATIVE_TYPE_KERNEL`, mirroring the
 | `testcheck.py` (`TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1 TEST_NATIVE_TYPE_KERNEL=1`) | 8144 passed, 69 skipped, 7 xfailed |
 | Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
 
-The default-off path is unchanged: `testtypes.py -k test_erase` without
-the env var passes identically. The gate is opt-in until parity is
-proven across the full suite, at which point a future stage can flip the
-default.
+The kernel graduated (`native_type_kernel = True` at
+`mypy/options.py:404`). The `TEST_NATIVE_TYPE_KERNEL=1` env var remains
+the parity differential: the test harness overrides the option after
+parsing, so the kernel runs head-to-head with the pure-Python visitors
+and parity is verified both ways.
 
 ### Staging roadmap
 
@@ -1363,18 +1374,19 @@ path accepts both before recursing or checking emptiness.
 | `testfinegrained.py` + `testdaemon.py` + `testfinegrainedcache.py` | 1333 passed, 256 skipped |
 | Self-check (`mypy_self_check.ini -p mypy`, 197 files) | 0 errors |
 
-The default-off path is unchanged. Stage 2 does not flip the default —
-`Options.native_type_kernel` remains `False` until the full staging
-roadmap proves out.
+The kernel is default-on in production (`native_type_kernel = True`,
+#58, `mypy/options.py:404`); `TEST_NATIVE_TYPE_KERNEL=1` is the parity
+differential the harness applies after option parsing. Stage 2 did not
+flip the default itself; the graduation was a later dedicated commit.
 
 
 ## Milestone 5 (Phase 4): Type Kernel — Stage 3a (`wire::read_type`)
 
-Stage 3a lays the foundation for the perf-winning Stage 3c
+Stage 3a lays the foundation for a possible perf Stage 3c
 (`is_subtype`) by introducing a Rust-owned `Type` enum and a binary
 wire-format reader for `mypy.types.Type`. It is parity-tested but **not
-wired into any production path** — no `Options.native_type_kernel` flip,
-no `mypy/subtypes.py` changes. The reader is exposed only as
+wired into any production path**; no `mypy/subtypes.py` changes. The
+reader is exposed only as
 `type_kernel.read_type_to_str(bytes) -> str` for parity verification.
 
 ### Why a reader first
