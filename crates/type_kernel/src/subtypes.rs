@@ -1976,6 +1976,65 @@ mod tests {
     }
 
     #[test]
+    fn instance_left_none_right_is_false() {
+        // Instance <: NoneType -> False (subtypes.py:683 else tail).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = instance("a.A", vec![]);
+        let right = Type::NoneType;
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
+    }
+
+    #[test]
+    fn fallback_to_any_left_none_right_is_false() {
+        // fallback_to_any=True vs NoneType: the short-circuit excludes
+        // NoneType (subtypes.py:638-643), so even a dynamic-base class is
+        // not a subtype of None -> False (subtypes.py:683 else tail).
+        let mut base = snap("a.AnyBase", "AnyBase");
+        base.fallback_to_any = true;
+        let r = make_resolver(vec![base]);
+        let left = instance("a.AnyBase", vec![]);
+        let right = Type::NoneType;
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
+    }
+
+    #[test]
+    fn instance_left_typevartuple_right_defers() {
+        // Instance <: TypeVarTupleType needs variadic-slice
+        // reconstruction, not ported -> defer (subtypes.py:617-620).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let left = instance("a.A", vec![]);
+        let right = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
+            name: "Ts".to_string(),
+            fullname: "a.Ts".to_string(),
+            raw_id: 0,
+            namespace: "a".to_string(),
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            min_len: 0,
+        };
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn instance_left_single_unpack_tuple_item_recurses() {
+        // Instance <: (Unpack[Other],) -> recurse against Other
+        // (subtypes.py:597-604). Other has no base relation to A, so the
+        // nominal recursion records a negative result -> False.
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("a.Other", "Other"),
+            snap("builtins.tuple", "tuple"),
+        ]);
+        let left = instance("a.A", vec![]);
+        let unpack = Type::UnpackType {
+            typ: Box::new(instance("a.Other", vec![])),
+        };
+        let right = tuple_type(vec![unpack]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
+    }
+
+    #[test]
     fn alt_promote_matches_right() {
         // left.alt_promote_fullname == right.type_ref -> True
         // (subtypes.py:546-547).
