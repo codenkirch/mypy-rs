@@ -110,7 +110,12 @@ pub(crate) fn is_subtype(
     // always True (unless left is UnpackType, which the wire format
     // doesn't produce in this recursive path). The Python shim handles
     // this at the top-level entry, but recursive calls from
-    // check_type_parameter bypass the shim, so we must mirror it here.
+    // check_type_parameter and the internal visit_* recursions
+    // (e.g. TypeType-vs-TypeType recursing on items, subtypes.py:1323)
+    // bypass the shim, so we must mirror it here. UnboundType right is
+    // produced by forward references ("A?") that survive get_proper_type;
+    // ErasedType has no wire representation (left/right args are never
+    // Erased after the shim filters them).
     if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
         // Python expands both operands with get_proper_type before every
         // comparison (subtypes.py:346-347); recursive check_type_parameter
@@ -120,7 +125,9 @@ pub(crate) fn is_subtype(
     // TupleType left: handled by the visit_tuple_type port below, which
     // returns None for the variadic cases (Unpack items, TypeVarTuple)
     // that still defer to Python's SubtypeVisitor (subtypes.py:950-1037).
-    if !ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
+    if !ctx.proper_subtype
+        && matches!(right, Type::AnyType { .. } | Type::UnboundType { .. })
+    {
         return Some(true);
     }
     // _is_subtype (subtypes.py:363-410): when right is UnionType and
@@ -211,11 +218,14 @@ pub(crate) fn is_subtype(
         return Some(left == right);
     }
     // visit_literal_type else-branch (subtypes.py:1072):
-    // is_subtype(LiteralType, Instance) = is_subtype(lit.fallback, right).
+    // is_subtype(LiteralType, right) = is_subtype(lit.fallback, right)
+    // for any non-LiteralType right. Python's SubtypeVisitor dispatches
+    // on left (LiteralType) and recurses into the fallback Instance for
+    // every right class except LiteralType (handled above by
+    // structural equality), so mirror the full else-branch, not just
+    // the Instance-right case.
     if let Type::LiteralType { fallback, .. } = left {
-        if let Type::Instance { .. } = right {
-            return is_subtype(fallback, right, ctx, resolver);
-        }
+        return is_subtype(fallback, right, ctx, resolver);
     }
     // visit_instance vs LiteralType right (subtypes.py:724-728): only
     // fires when left.last_known_value is Some, recursing into
@@ -694,11 +704,198 @@ pub(crate) fn is_subtype(
     }
     let (right_ref, right_args) = match right {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
+        // Python's `visit_instance` (subtypes.py:567-710) continues past
+        // the Instance-right case for several non-Instance right types,
+        // returning a definite `False` for most. Port that tail here so
+        // the huge Instance-left / non-Instance-right population stops
+        // deferring to Python (issue #591, ~124k deferrals on the
+        // self-check corpus). Cases needing Python-only helpers
+        // (find_member, is_metaclass, is_protocol_implementation,
+        // callable_compat) still defer.
+        _ => {
+            let r = visit_instance_noninstance_right(left, right, ctx, resolver, left_ref, left_args);
+            return r;
+        }
     };
     visit_instance_nominal(
         left_ref, left_args, right, right_ref, right_args, ctx, resolver,
     )
+}
+
+/// `SubtypeVisitor.visit_instance` tail (subtypes.py:680-710), Rust port:
+/// `left` is an Instance, `right` is NOT an Instance.
+///
+/// Python's decision table, in order:
+/// * TupleType right:
+///   - `right.partial_fallback.type.is_enum` -> `is_subtype(left,
+///     tuple_fallback(right))`.
+///   - single-item tuple whose item is an UnpackType wrapping an Instance
+///     -> `is_subtype(left, that Instance)`.
+///   - `left.type.has_base(right.partial_fallback.type.fullname)`:
+///     non-proper + `map_instance_to_supertype` erased -> True when the
+///     mapped target is `builtins.tuple` or variadic, else False.
+///   - otherwise False.
+/// * TypeVarTupleType right: needs variadic-slice reconstruction; rare
+///   for Instance-left on the self-check corpus -> defer to Python.
+/// * TypeType right: needs `left.type.is_metaclass()` (not in snapshot)
+///   -> defer to Python.
+/// * FunctionLike right (CallableType / Overloaded):
+///   `find_member("__call__", left, ...)` not ported -> defer to Python.
+/// * LiteralType right: handled earlier (last_known_value recursion);
+///   a LiteralType reaching here has `last_known_value` None on the left
+///   -> `False`.
+/// * All other right types (NoneType, UninhabitedType, DeletedType,
+///   TypedDictType, ParamSpecType, UnpackType): `else: return False`.
+fn visit_instance_noninstance_right(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    left_ref: &str,
+    left_args: &[Type],
+) -> Option<bool> {
+    // Left snapshot missing (synthesized instance, e.g. from isinstance
+    // narrowing): matching Python needs the live TypeInfo, which the
+    // nominal path also treats as missing-snapshot. Defer rather than
+    // risk a wrong result for FakeInfo / fallback_to_any left types.
+    let left_snap = resolver.get(left_ref)?;
+    // fallback_to_any short-circuit (subtypes.py:638-643): a class with
+    // dynamic bases is a subtype of everything except NoneType. Matches
+    // the nominal-path guard (subtypes.py:493-498 equivalent).
+    if left_snap.fallback_to_any && !ctx.proper_subtype {
+        return Some(!matches!(right, Type::NoneType { .. }));
+    }
+    // TupleType right (subtypes.py:595-616).
+    if let Type::TupleType {
+        partial_fallback, items, ..
+    } = right
+    {
+        let Type::Instance {
+            type_ref: pf_ref, ..
+        } = partial_fallback.as_ref()
+        else {
+            return Some(false);
+        };
+        // Snapshot missing (synthesized fallback): can't confirm the
+        // `is_enum` / `has_base` conditions, so defer like the nominal
+        // path does on a missing left snapshot rather than risk a wrong
+        // `False`.
+        let pf_snap = resolver.get(pf_ref)?;
+        // subtypes.py:595-596: partial_fallback.type.is_enum.
+        if pf_snap.is_enum {
+            return match crate::typeops::tuple_fallback(right, resolver) {
+                Some(fb) => is_subtype(left, &fb, ctx, resolver),
+                None => None,
+            };
+        }
+        // subtypes.py:597-604: single-item non-normalized tuple with an
+        // UnpackType item wrapping an Instance.
+        if items.len() == 1 {
+            if let Type::UnpackType { typ } = &items[0] {
+                let unpacked = get_proper_type_or_defer(typ.as_ref(), resolver)?;
+                if matches!(unpacked, Type::Instance { .. }) {
+                    return is_subtype(left, unpacked, ctx, resolver);
+                }
+            }
+        }
+        // subtypes.py:605-616: left has_base on the tuple's fallback.
+        match resolver.get(left_ref) {
+            None => return None,
+            Some(left_snap) if left_snap.has_base(pf_ref) => {
+                if !ctx.proper_subtype {
+                    let mapped =
+                        map_instance_to_supertype(left_ref, left_args, pf_ref, resolver)?;
+                    let mapped_instance = Type::Instance {
+                        type_ref: pf_ref.to_string(),
+                        args: mapped,
+                        last_known_value: None,
+                        extra_attrs: None,
+                    };
+                    if is_erased_instance(&mapped_instance)? {
+                        let mapped_is_tuple_or_variadic = pf_ref == "builtins.tuple"
+                            || pf_snap.has_type_var_tuple_type;
+                        if mapped_is_tuple_or_variadic {
+                            return Some(true);
+                        }
+                    }
+                }
+                return Some(false);
+            }
+            Some(_) => return Some(false),
+        }
+    }
+    // TypeVarTupleType right (subtypes.py:617-620) needs
+    // `map_instance_to_supertype` against the typevar's variadic
+    // tuple_fallback and a first-arg check; rare for Instance-left on
+    // production corpora and not exercised by the deferred ports' parity
+    // suite. Defer to Python.
+    if matches!(right, Type::TypeVarTupleType { .. }) {
+        return None;
+    }
+    // TypeType right (subtypes.py:784-795): when left is `builtins.type`
+    // (non-proper) recurse against Any; when left's type is a metaclass
+    // AND the right item is `builtins.object` (a class can accept any
+    // metaclass instance as its "object"-typed slot) return True.
+    // Otherwise fall through to the FunctionLike / literal / False tail
+    // below, matching Python exactly.
+    if let Type::TypeType { item, .. } = right {
+        // subtypes.py:788-793: item may be a TupleType -> tuple_fallback.
+        let item = if let Type::TupleType { .. } = item.as_ref() {
+            match crate::typeops::tuple_fallback(item.as_ref(), resolver) {
+                Some(fb) => fb,
+                None => return None,
+            }
+        } else {
+            (**item).clone()
+        };
+        if !ctx.proper_subtype {
+            // subtypes.py:789-792: `left` is `builtins.type`: recurse
+            // against `TypeType(Any)`. (TypeType is reached for
+            // `type[builtins.type]`, i.e. a `type` object passed where a
+            // class object is expected.)
+            if left_ref == "builtins.type" {
+                let special_any = Type::AnyType {
+                    type_of_any: 0, // TypeOfAny.special_form
+                    source_any: None,
+                    missing_import_name: None,
+                };
+                let wrapped = Type::TypeType {
+                    item: Box::new(special_any),
+                    // TypeType(AnyType(special_form)); not a metaclass
+                    // self-type. Python's `TypeType(AnyType(...))` has
+                    // `is_metaclass_self_type=False`.
+                    is_type_form: false,
+                };
+                return is_subtype(&wrapped, right, ctx, resolver);
+            }
+            if let Some(ls) = resolver.get(left_ref) {
+                // TypeInfo.is_metaclass (nodes.py:4192-4198), precise=false.
+                let is_metaclass =
+                    ls.has_base.contains("builtins.type")
+                        || ls.fullname == "abc.ABCMeta"
+                        || ls.fallback_to_any;
+                if is_metaclass {
+                    match item {
+                        Type::AnyType { .. } => return Some(true),
+                        Type::Instance { type_ref: r, .. } if r == "builtins.object" => {
+                            return Some(true)
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // Fall through to the FunctionLike/literal/False tail.
+    }
+    // FunctionLike right needs `find_member("__call__", ...)`
+    // (subtypes.py:678-682) -> defer.
+    if matches!(right, Type::CallableType { .. } | Type::Overloaded { .. }) {
+        return None;
+    }
+    // Anything else: Python's `else: return False` (subtypes.py:683).
+    // Includes NoneType, UninhabitedType, DeletedType, TypedDictType,
+    // ParamSpecType, UnpackType, LiteralType (no lkv).
+    Some(false)
 }
 
 /// `visit_typeddict_type` (subtypes.py:1039-1096), Rust port.
@@ -1231,7 +1428,22 @@ fn check_type_parameter(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
-    match variance {
+    // subtypes.py:522-526: an `ambiguous` UninhabitedType (empty
+    // collection literal / partial state) is safe to treat as COVARIANT
+    // even under INVARIANT, since such a type can't be stored in a
+    // variable. Without this, the invariant two-way check would demand
+    // `right <: Never` and reject empty literals against dict/list
+    // contexts. Mirrors `checker.is_valid_inferred_type()`.
+    let effective_variance = if variance == INVARIANT {
+        if matches!(left, Type::UninhabitedType { ambiguous: true }) {
+            COVARIANT
+        } else {
+            variance
+        }
+    } else {
+        variance
+    };
+    match effective_variance {
         COVARIANT | VARIANCE_NOT_READY => is_subtype(left, right, ctx, resolver),
         CONTRAVARIANT => is_subtype(right, left, ctx, resolver),
         _ => {

@@ -48,7 +48,15 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
             type_ref,
             arg_discs,
         } => {
-            let args = reconstruct_args_from_discs(&arg_discs, s, t);
+            let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) =
+                (s, t)
+            else {
+                return None;
+            };
+            if arg_discs.len() != s_args.len() || arg_discs.len() != t_args.len() {
+                return None;
+            }
+            let args = reconstruct_args_from_discs(&arg_discs, s_args, t_args);
             Some(Type::Instance {
                 type_ref,
                 args,
@@ -61,19 +69,20 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
 }
 
 /// Reconstruct per-arg types from discriminators. 0=left (s), 1=right (t),
-/// 4=AnyType(from_another_any). Mirrors `setops.rs:726`.
-fn reconstruct_args_from_discs(arg_discs: &[i8], s_item: &Type, t_item: &Type) -> Vec<Type> {
+/// 4=AnyType(from_another_any). Mirrors `setops.rs` (SameTypeWithArgs arm).
+fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type]) -> Vec<Type> {
     arg_discs
         .iter()
-        .map(|d| match d {
-            0 => s_item.clone(),
-            1 => t_item.clone(),
+        .enumerate()
+        .map(|(i, d)| match d {
+            0 => s_args[i].clone(),
+            1 => t_args[i].clone(),
             4 => Type::AnyType {
                 type_of_any: 3,
                 source_any: None,
                 missing_import_name: None,
             },
-            _ => s_item.clone(),
+            _ => s_args[i].clone(),
         })
         .collect()
 }

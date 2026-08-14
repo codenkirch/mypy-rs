@@ -1480,14 +1480,23 @@ fn conditional_join_inner(
             arg_discs,
         }) => {
             // Same-type Instance-Instance join with per-arg discriminators.
-            // For simplicity in the conditional expr context, we return
-            // the first branch's type with Any args where discriminators
-            // differ from both.
+            // Per-arg reconstruction: disc 0 -> if_type.args[i], disc 1
+            // -> else_type.args[i] (mirrors join.py:425-441). The
+            // operands must be Instances to index args; defer otherwise.
+            let (Type::Instance { args: if_args, .. }, Type::Instance { args: else_args, .. }) =
+                (if_type, else_type)
+            else {
+                return None;
+            };
+            if arg_discs.len() != if_args.len() || arg_discs.len() != else_args.len() {
+                return None;
+            }
             let final_args: Vec<Type> = arg_discs
                 .iter()
-                .map(|&d| match d {
-                    0 => if_type.clone(),   // use left arg
-                    1 => else_type.clone(), // use right arg
+                .enumerate()
+                .map(|(i, &d)| match d {
+                    0 => if_args[i].clone(),
+                    1 => else_args[i].clone(),
                     _ => Type::AnyType {
                         type_of_any: 0,
                         source_any: None,
@@ -1691,11 +1700,24 @@ fn join_type_list_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option
                 type_ref,
                 arg_discs,
             }) => {
+                // Per-arg reconstruction: disc 0 -> result.args[i],
+                // disc 1 -> item.args[i] (mirrors join.py:425-441).
+                // The operands must be Instances to index args;
+                // defer otherwise.
+                let (Type::Instance { args: r_args, .. }, Type::Instance { args: i_args, .. }) =
+                    (&result, &item)
+                else {
+                    return None;
+                };
+                if arg_discs.len() != r_args.len() || arg_discs.len() != i_args.len() {
+                    return None;
+                }
                 let final_args: Vec<Type> = arg_discs
                     .iter()
-                    .map(|&d| match d {
-                        0 => result.clone(),
-                        1 => item.clone(),
+                    .enumerate()
+                    .map(|(i, &d)| match d {
+                        0 => r_args[i].clone(),
+                        1 => i_args[i].clone(),
                         _ => Type::AnyType {
                             type_of_any: 0,
                             source_any: None,
