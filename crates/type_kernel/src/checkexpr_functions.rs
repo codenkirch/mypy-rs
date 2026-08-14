@@ -1483,8 +1483,12 @@ fn conditional_join_inner(
             // Per-arg reconstruction: disc 0 -> if_type.args[i], disc 1
             // -> else_type.args[i] (mirrors join.py:425-441). The
             // operands must be Instances to index args; defer otherwise.
-            let (Type::Instance { args: if_args, .. }, Type::Instance { args: else_args, .. }) =
-                (if_type, else_type)
+            let (
+                Type::Instance { args: if_args, .. },
+                Type::Instance {
+                    args: else_args, ..
+                },
+            ) = (if_type, else_type)
             else {
                 return None;
             };

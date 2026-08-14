@@ -48,8 +48,7 @@ fn meet_result_to_type(r: SetOpResult, s: &Type, t: &Type) -> Option<Type> {
             type_ref,
             arg_discs,
         } => {
-            let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) =
-                (s, t)
+            let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) = (s, t)
             else {
                 return None;
             };

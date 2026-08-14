@@ -726,9 +726,7 @@ fn meet_union(
                     else {
                         return None;
                     };
-                    if arg_discs.len() != s_args.len()
-                        || arg_discs.len() != t_args.len()
-                    {
+                    if arg_discs.len() != s_args.len() || arg_discs.len() != t_args.len() {
                         return None;
                     }
                     let args = reconstruct_args_from_discs(&arg_discs, s_args, t_args);

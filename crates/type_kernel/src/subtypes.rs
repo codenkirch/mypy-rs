@@ -125,9 +125,7 @@ pub(crate) fn is_subtype(
     // TupleType left: handled by the visit_tuple_type port below, which
     // returns None for the variadic cases (Unpack items, TypeVarTuple)
     // that still defer to Python's SubtypeVisitor (subtypes.py:950-1037).
-    if !ctx.proper_subtype
-        && matches!(right, Type::AnyType { .. } | Type::UnboundType { .. })
-    {
+    if !ctx.proper_subtype && matches!(right, Type::AnyType { .. } | Type::UnboundType { .. }) {
         return Some(true);
     }
     // _is_subtype (subtypes.py:363-410): when right is UnionType and
@@ -713,7 +711,8 @@ pub(crate) fn is_subtype(
         // (find_member, is_metaclass, is_protocol_implementation,
         // callable_compat) still defer.
         _ => {
-            let r = visit_instance_noninstance_right(left, right, ctx, resolver, left_ref, left_args);
+            let r =
+                visit_instance_noninstance_right(left, right, ctx, resolver, left_ref, left_args);
             return r;
         }
     };
@@ -767,7 +766,9 @@ fn visit_instance_noninstance_right(
     }
     // TupleType right (subtypes.py:595-616).
     if let Type::TupleType {
-        partial_fallback, items, ..
+        partial_fallback,
+        items,
+        ..
     } = right
     {
         let Type::Instance {
@@ -803,8 +804,7 @@ fn visit_instance_noninstance_right(
             None => return None,
             Some(left_snap) if left_snap.has_base(pf_ref) => {
                 if !ctx.proper_subtype {
-                    let mapped =
-                        map_instance_to_supertype(left_ref, left_args, pf_ref, resolver)?;
+                    let mapped = map_instance_to_supertype(left_ref, left_args, pf_ref, resolver)?;
                     let mapped_instance = Type::Instance {
                         type_ref: pf_ref.to_string(),
                         args: mapped,
@@ -812,8 +812,8 @@ fn visit_instance_noninstance_right(
                         extra_attrs: None,
                     };
                     if is_erased_instance(&mapped_instance)? {
-                        let mapped_is_tuple_or_variadic = pf_ref == "builtins.tuple"
-                            || pf_snap.has_type_var_tuple_type;
+                        let mapped_is_tuple_or_variadic =
+                            pf_ref == "builtins.tuple" || pf_snap.has_type_var_tuple_type;
                         if mapped_is_tuple_or_variadic {
                             return Some(true);
                         }
@@ -870,10 +870,9 @@ fn visit_instance_noninstance_right(
             }
             if let Some(ls) = resolver.get(left_ref) {
                 // TypeInfo.is_metaclass (nodes.py:4192-4198), precise=false.
-                let is_metaclass =
-                    ls.has_base.contains("builtins.type")
-                        || ls.fullname == "abc.ABCMeta"
-                        || ls.fallback_to_any;
+                let is_metaclass = ls.has_base.contains("builtins.type")
+                    || ls.fullname == "abc.ABCMeta"
+                    || ls.fallback_to_any;
                 if is_metaclass {
                     match item {
                         Type::AnyType { .. } => return Some(true),
