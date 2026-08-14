@@ -762,7 +762,7 @@ fn visit_instance_noninstance_right(
     // dynamic bases is a subtype of everything except NoneType. Matches
     // the nominal-path guard (subtypes.py:493-498 equivalent).
     if left_snap.fallback_to_any && !ctx.proper_subtype {
-        return Some(!matches!(right, Type::NoneType { .. }));
+        return Some(!matches!(right, Type::NoneType));
     }
     // TupleType right (subtypes.py:595-616).
     if let Type::TupleType {
@@ -841,10 +841,7 @@ fn visit_instance_noninstance_right(
     if let Type::TypeType { item, .. } = right {
         // subtypes.py:788-793: item may be a TupleType -> tuple_fallback.
         let item = if let Type::TupleType { .. } = item.as_ref() {
-            match crate::typeops::tuple_fallback(item.as_ref(), resolver) {
-                Some(fb) => fb,
-                None => return None,
-            }
+            crate::typeops::tuple_fallback(item.as_ref(), resolver)?
         } else {
             (**item).clone()
         };
