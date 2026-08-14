@@ -57,13 +57,14 @@ Follow a strangler-fig approach:
   are the second and third seams; both are ported behind the
   `native_resolver` dispatch gate and now default-on. The import-graph
   prepass and cache indexing/validation were both measured and dropped
-  (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`); the
-  type kernel is the active migration target, starting with `erase_type`
-  behind the `native_type_kernel` gate (Stage 1, opt-in). Stage 2 ports
-  `remove_instance_last_known_values` (`LastKnownValueEraser`) on the same
-  PyO3 seam, also opt-in. Stage 3a adds a Rust `Type` enum + binary
-  wire-format reader (`wire::read_type`), parity-tested but not yet wired
-  into production — foundation for Stage 3c (`is_subtype`).
+  (see "Phase 4 measurement" in `docs/rust-migration-strangler.md`). The
+  type kernel graduated to default-on (`Options.native_type_kernel = True`,
+  #58) and is the active migration target, starting with `erase_type`
+  (Stage 1). Stage 2 ports `remove_instance_last_known_values`
+  (`LastKnownValueEraser`) on the same PyO3 seam. Stage 3a adds a Rust
+  `Type` enum + binary wire-format reader (`wire::read_type_to_str`),
+  parity-tested but not wired into production; foundation for a possible
+  `is_subtype` port (see `docs/remaining-migration-plan.md` Phase E1).
 - Preserve daemon, cache, plugin, and incremental-mode semantics unless a change
   is explicitly called out and tested.
 
@@ -232,7 +233,7 @@ self-check (0 errors). Three parity fixes were applied:
 
 ### Type kernel build order
 
-The type kernel (`Options.native_type_kernel`, default off — opt-in) is
+The type kernel (`Options.native_type_kernel`, default-on since #58) is
 backed by the `type_kernel` Rust extension. It implements Rust ports of
 the kernel's hot-path functions that walk live Python `Type` objects,
 including:
@@ -294,12 +295,16 @@ PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-reso
   uv run python -m pytest mypy/test/testtypes.py mypy/test/testcheck.py -q
 ```
 
-The type-kernel gate is opt-in: without `TEST_NATIVE_TYPE_KERNEL=1`,
-both `erase_type` and `remove_instance_last_known_values` use the
-pure-Python visitors unchanged. The build manager propagates
-`Options.native_type_kernel` to a module-level flag in
-`mypy/erasetype.py` at the start of each build (`_set_native_erase_active`),
-so the hot path avoids an options lookup per call.
+The type-kernel gate is default-on in production (`native_type_kernel =
+True`). The `TEST_NATIVE_TYPE_KERNEL=1` env var is the parity
+differential: the test harnesses override the option *after* option
+parsing (`mypy/test/helpers.py`), so the kernel runs in direct
+comparison with the pure-Python visitors and parity is verified both
+ways. Without the env var the default-on option governs. The build
+manager propagates `Options.native_type_kernel` to module-level flags in
+each kernel module at the start of each build
+(`_set_native_erase_active` etc. in `mypy/build.py`), so the hot paths
+avoid an options lookup per call.
 
 ## Pull Requests
 

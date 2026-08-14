@@ -3,11 +3,11 @@
 ## Current State (verified live, August 2026)
 
 ### GitHub Language Stats
-- Python: 5,993,751 bytes (75.83%) *(last measured; local tree now ~6.6MB)*
-- Rust: 1,910,231 bytes (24.17%) *(last measured; local tree now ~2.07MB)*
-- Total: 7,903,982
-- **Target: 20%+ Rust: met and sustained; 23.88% on the merged `main`
-  tree (bytes, ex-typeshed + `/test/`)**
+- Python: 6,284,312 bytes (66.6%) *(GH API, 2026-08-14)*
+- Rust: 3,156,702 bytes (33.4%) *(GH API, 2026-08-14)*
+- Total: 9,441,014
+- **Target: 20%+ Rust: met and sustained; 33.4% on the GitHub languages
+  API (Phase D, 2026-08-14), above the 30% target (D4).**
 
 ### Native Gates Status
 
@@ -92,11 +92,12 @@ Order is smallest-cheapest first (#386, #385), then the medium region
 | plugin common/functools pure helpers | #394 | - | scoped; low portable surface |
 
 Each follows the same contract: Rust returns result or `None`, Python
-applies mutations, gate is off by default (`TEST_NATIVE_TYPE_KERNEL=1`
-differential), full parity suite green before merge.
+applies mutations, parity is verified as a `TEST_NATIVE_TYPE_KERNEL=1`
+differential (the kernel is default-on; the env var drives the
+head-to-head comparison), and the full parity suite is green before
+merge.
 
-## Sustaining 20%+ Rust
+## Rust %
 
-Current: 1,910,231 Rust bytes / 7,903,982 total = 24.17%. The 20%
-target rides on the existing ~60K Rust LOC. The checkexpr family and the
-parallel tracks push toward 30% as measured by the GitHub languages API.
+Current (2026-08-14, GitHub languages API): 3,156,702 Rust bytes /
+9,441,014 total = 33.4%, above the 30% target (Phase D, D4).

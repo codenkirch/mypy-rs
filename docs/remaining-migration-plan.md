@@ -273,11 +273,19 @@ GitHub's count tracks the real Rust tree.
 
 ### Phase E: Long-term architecture decisions
 
-**E1: nodes.py / types.py (explicitly out of scope)**
+Evaluated 2026-08-14 (after A-D complete). The three items are
+decision records against current reality; none requires a port today.
 
-`mypy/nodes.py` (5675 lines) and `mypy/types.py` (5221 lines) are the
-"widely shared mutable object graphs" the migration plan says NOT to
-port. They are plugin-visible, cache-serialized, and identity-sensitive.
+**E1: nodes.py / types.py (out of scope, confirmed)**
+
+`mypy/nodes.py` and `mypy/types.py` remain the "widely shared mutable
+object graphs" the migration plan says NOT to port. They are
+plugin-visible, cache-serialized, and identity-sensitive. Nothing in
+A-D changed that calculus. The Rust `Type` enum + binary wire reader
+(`wire::read_type_to_str`, `typeinfo::read_type_to_str_with_resolver`,
+Stage 3a) is parity-tested foundation for a possible `is_subtype`
+port, but enabling it in production would require the full cost list
+below; it stays off until the migration has proven stable over time.
 
 A future port would require:
 - A Rust-owned `Type` enum with Python proxy objects
@@ -285,22 +293,58 @@ A future port would require:
 - Cache format changes (Rust-owned serialization)
 - Daemon mode changes (identity preservation across incremental updates)
 
-This is a multi-quarter effort and should only start after Phases A-D
-are complete and the migration has proven stable in production.
+Multi-quarter effort. Do not start while the strangler-fig per-call
+gates (Rust returns a value or `None`, Python falls back) are still
+carrying the load; a wholesale `Type`/`Node` reimplementation removes
+that fallback safety net.
 
-**E2: Daemon VFS port (deferred)**
+**E2: Daemon FS ownership (already Rust-backed; no port warranted)**
 
-The daemon (`fine_grained_incremental`) uses native resolution (the
-`_native_gate_active` exclusion was dropped in Phase 2). But the daemon
-VFS (virtual filesystem for in-memory edits) is still Python-owned.
-Porting the VFS to Rust would eliminate the last Python-owned FS path.
+The daemon (`fine_grained_incremental`) reads the filesystem through
+`FileSystemCache` (`mypy/fscache.py`), which delegates every method to
+the Rust `module_resolver.FsCache` pyclass. That includes the
+transactional per-flush snapshot semantics and the Bazel fake
+`__init__.py` synthesis (`crates/module_resolver/src/fs_cache.rs`).
+`dmypy_server` passes the shared `self.fscache` into `build`,
+`update`, and snapshot paths, so the daemon VFS reads are Rust-owned.
 
-**E3: mypyc integration**
+The one remaining Python-owned FS-adjacent piece in the daemon is
+`FileSystemWatcher` (`mypy/fswatcher.py`, 106 lines): stat + hash
+change-detection over watched paths. It performs no direct OS calls;
+every read goes through the Rust-backed cache. Porting its diffing
+logic to Rust would remove a cache miss per watched path per
+`find_changed`, dwarfed by the hashing cost itself. Decision: keep the
+watcher in Python. It is a thin algorithmic layer over an already-Rust
+FS layer; a port is not a meaningful lever.
 
-mypyc compiles mypy to C extensions. The Rust extensions coexist with
-mypyc-compiled Python. A future milestone could compile the Python
-fallbacks with mypyc AND use the Rust extensions, getting both speeds.
-Current status: coexisting, no conflicts observed.
+Bazel stays on the Python `_find_module` resolver by gate
+(`_native_gate_active` excludes `options.bazel`); its fake-init
+synthesis remains Python-owned in the pure-Python fallback
+(`fscache.py`, `_fake_init_py`). This is deliberate: the native
+resolver reads the real FS through `FsCache`, which does not observe
+Bazel's virtual FS.
+
+**E3: mypyc coexistence (assessed, not exercised locally)**
+
+mypyc compiles mypy's Python to CPython C extensions
+(`setup.py --use-mypyc`); the Rust work is shipped as separate
+PyO3 cdylib extensions (ast_serialize, module_resolver, type_kernel)
+loaded by `PYTHONPATH` import. At the CPython ABI level the two
+coexist: mypyc C modules and PyO3 modules are independent extensions,
+so there is no symbol or GIL conflict in principle.
+
+Known coexistence hedge already in the tree: `FileSystemCache` is
+marked `@mypyc_attr(allow_interpreted_subclasses=True)` so a
+mypyc-compiled build can still spawn interpreted subclasses in tests.
+
+The local dev workflow does not compile mypy with mypyc (no
+`build/native`), so E3 is an assessment, not an exercised guarantee.
+A future milestone could compile the Python fallbacks with mypyc AND
+use the Rust extensions, getting both speeds; the two documented
+hazards to watch are mypyc-attr subclassing rules and the
+`PYTHONPATH`-overwrite behavior seen in the daemon test harness
+(prepends now, so Rust dirs survive). No conflicts have been
+observed; no work is scheduled.
 
 ## Execution Order
 
@@ -325,10 +369,10 @@ Phase D (infrastructure, parallel with B/C):
   D3: Performance regression tracking
   D4: Rust % measurement
 
-Phase E (long-term, after A-D complete):
-  E1: nodes.py / types.py evaluation
-  E2: Daemon VFS port
-  E3: mypyc integration
+Phase E (long-term, after A-D complete; decision records, no ports):
+  E1: nodes.py / types.py, confirmed out of scope
+  E2: Daemon FS ownership, confirmed Rust-backed (fscache); watcher stays Python
+  E3: mypyc coexistence, assessed but not exercised locally
 ```
 
 ## Contract for every change
