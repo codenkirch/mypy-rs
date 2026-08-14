@@ -867,6 +867,12 @@ class BuildManager:
         self.options = options
         self.version_id = version_id
         self.modules: dict[str, MypyFile] = {}
+        # Native type-kernel resolver state accumulated across SCCs
+        # (issue #599). `None` until the first `_build_native_resolvers(scc)`
+        # call; `_clear_native_resolvers` resets both so a fresh build
+        # starts from an empty resolver and an empty typeinfo map.
+        self._native_resolver: Any = None
+        self._native_typeinfo_map: dict[str, TypeInfo] = {}
         # Share same modules dictionary with the global fixer state.
         # We need to set allow_missing when doing a fine-grained cache
         # load because we need to gracefully handle missing modules.
@@ -1288,14 +1294,30 @@ class BuildManager:
         return aliases
 
     def _build_native_resolvers(self) -> None:
-        """Build the `NativeTypeResolver` snapshot from the live TypeInfo
-        graph and install it on the subtype/join shims.
+        """Build or incrementally extend the `NativeTypeResolver` snapshot
+        and install it on the subtype/join shims.
 
         No-op unless `Options.native_type_kernel` is set and the
         `type_kernel` extension is importable. Called per SCC in
         `process_stale_scc` after semantic analysis populates the TypeInfo
-        graph for that SCC. Each rebuild picks up newly-loaded modules so
-        the resolver sees the full graph by the time type checking runs.
+        graph for that SCC.
+
+        Incremental (issue #599): the resolver is created on the first
+        call from all loaded TypeInfos, then extended on later calls via
+        `NativeTypeResolver.update` with the (growing) `self.modules`
+        graph. `update` skips fullnames already snapshotted, so the
+        expensive per-`TypeInfo` attribute reads happen at most once per
+        TypeInfo across the whole build, instead of once per SCC (which
+        regressed self-check type_check ~3x). Fresh-cached dependency
+        modules are inside `self.modules` but never appear in a stale SCC,
+        so they can only be reached by walking the full module graph here.
+        A non-builtins class's first observation is after its own SCC's
+        semantic analysis sealed it (or it was fully materialized from
+        cache), so its snapshot is final; `builtins.*` classes are
+        re-snapshotted every call because their `_promote` lists grow from
+        later SCCs' native-int/TYPE_PROMOTION processing.
+        `_clear_native_resolvers` resets the held resolver and map so a
+        daemon recheck starts fresh.
 
         Stage 3c status: the subtype/join resolvers are now wired to
         production. The correctness gap (M8bb) was closed in PR #72:
@@ -1329,8 +1351,19 @@ class BuildManager:
 
         type_infos = self._collect_type_infos()
         aliases = self._collect_aliases()
-        resolver = _type_kernel.build_native_resolver(type_infos, aliases)
-        typeinfo_map = {info.fullname: info for info in type_infos}
+        if self._native_resolver is None:
+            resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        else:
+            resolver = self._native_resolver
+            resolver.update(type_infos, aliases)
+        # Grow the accumulated fullname -> TypeInfo map with this call's
+        # (already-seen + new) infos. Overwriting with the same stable
+        # TypeInfo objects is a no-op for the new entries; the deletions
+        # the daemon needs are handled by `_clear_native_resolvers`.
+        for info in type_infos:
+            self._native_typeinfo_map[info.fullname] = info
+        self._native_resolver = resolver
+        typeinfo_map = self._native_typeinfo_map
         # Stage 3c resolvers wired: the subtype/join kernels now defer
         # (return None) for all unsupported generic substitution edges,
         # so they cannot return wrong answers. See PR #72 for the
@@ -1407,10 +1440,15 @@ class BuildManager:
 
         Called before daemon semantic analysis on fine-grained recheck so that
         the stale per-build resolver snapshot is purged.  Mirrors the inline
-        clear block at ``process_stale_scc`` (lines 5193-5216).
+        clear block at ``process_stale_scc`` (lines 5193-5216). Also resets
+        the manager-held incremental resolver state (issue #599) so the next
+        build starts from an empty snapshot instead of accumulating into a
+        stale one.
         """
         if not self.options.native_type_kernel:
             return
+        self._native_resolver = None
+        self._native_typeinfo_map = {}
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
@@ -5334,9 +5372,12 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 
     t3 = time.time()
-    # Stage 3c/4 production wiring (M8bb): rebuild the NativeTypeResolver
-    # snapshot now that semantic analysis populated the TypeInfo graph
-    # for this SCC. See `_build_native_resolvers` for the kernel status.
+    # Stage 3c/4 production wiring (M8bb): build or extend the
+    # NativeTypeResolver snapshot now that semantic analysis populated the
+    # TypeInfo graph for this SCC. Incremental: `update` skips already-
+    # snapshotted fullnames so the expensive per-TypeInfo reads happen
+    # once per build, not once per SCC (issue #599). See
+    # `_build_native_resolvers` for the kernel status.
     manager._build_native_resolvers()
     # Track what modules aren't yet done, so we can finish them as soon
     # as possible, saving memory.
