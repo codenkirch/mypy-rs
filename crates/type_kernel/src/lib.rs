@@ -918,6 +918,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_defined_type_param,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_classify_setup_type_vars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_apply_semantic_analyzer_patches,
         module
     )?)?;

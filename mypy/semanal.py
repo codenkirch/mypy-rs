@@ -425,12 +425,14 @@ try:
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_imports as _rust_classify_imports,
         rust_classify_member_resolution as _rust_classify_member_resolution,
+        rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_erase_func_annotations as _rust_erase_func_annotations,
         rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
         rust_find_duplicate as _rust_find_duplicate,
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
         rust_get_typevarlike_declaration as _rust_get_typevarlike_declaration,
+        rust_is_defined_type_param as _rust_is_defined_type_param,
         rust_is_final_redefinition as _rust_is_final_redefinition,
         rust_is_init_only as _rust_is_init_only,
         rust_is_initial_mangled_global as _rust_is_initial_mangled_global,
@@ -466,12 +468,15 @@ except ImportError:
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
+    _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_lookup = None  # type: ignore[assignment]
     _rust_lookup_qualified = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
     _rust_erase_func_annotations = None  # type: ignore[assignment]
     _rust_get_deprecated = None  # type: ignore[assignment]
     _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
+    _rust_get_typevarlike_declaration = None  # type: ignore[assignment]
+    _rust_is_defined_type_param = None  # type: ignore[assignment]
     _rust_var_is_typing_special_form = None  # type: ignore[assignment]
     _rust_get_typevarlike_declaration = None  # type: ignore[assignment]
     _rust_parse_bool = None  # type: ignore[assignment]
@@ -2073,6 +2078,13 @@ class SemanticAnalyzer(
         return tvs
 
     def is_defined_type_param(self, name: str) -> bool:
+        # Phase C1 (#608): native pure-bool query. Rust walks self.locals and
+        # checks TypeVarLikeExpr isinstance; no fallback needed (plain bool).
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                return _rust_is_defined_type_param(self.locals, name)
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         for names in self.locals:
             if names is None:
                 continue
@@ -2292,6 +2304,39 @@ class SemanticAnalyzer(
                 )
 
     def setup_type_vars(self, defn: ClassDef, tvar_defs: list[TypeVarLikeType]) -> None:
+        # Phase C1 (#608): native pure classification of the invalid
+        # (default-after-typevartuple) entries. Python still emits the error,
+        # records the removal, and applies the valid/generated assignments.
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                invalid = _rust_classify_setup_type_vars(
+                    tvar_defs, [tv.has_default() for tv in tvar_defs]
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                invalid = None
+            if invalid is not None:
+                invalid_set = set(invalid)
+                valid_tvar_defs: list[TypeVarLikeType] = []
+                for i, tv in enumerate(tvar_defs):
+                    if i in invalid_set:
+                        self.fail(
+                            message_registry.NO_DEFAULT_AFTER_TYPEVAR_TUPLE,
+                            defn,
+                            code=codes.TYPE_VAR,
+                        )
+                        # Remove the ambiguous type variable, and record it, so that we can
+                        # replace all its uses with Any. The native classification only ever
+                        # marks TypeVarType-with-default entries invalid (default-after-
+                        # typevartuple), matching the pure branch.
+                        if isinstance(tv, TypeVarType):
+                            self.removed_type_vars[-1].append(tv)
+                    else:
+                        valid_tvar_defs.append(tv)
+                defn.type_vars = valid_tvar_defs
+                defn.info.type_vars = []
+                # we want to make sure any additional logic in add_type_vars gets run
+                defn.info.add_type_vars()
+                return
         seen_tvt = False
         valid_tvar_defs = []
         for tv in tvar_defs:

@@ -2045,6 +2045,135 @@ pub(crate) fn rust_extract_typevarlike_name(
     }
 }
 
+// ---------------------------------------------------------------------------
+// is_defined_type_param (Phase C1, issue #608)
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.SemanticAnalyzer.is_defined_type_param`
+///
+/// Mirrors semanal.py:2075-2082. Walks `self.locals` (a list of
+/// `SymbolTable | None`), returns true if `name` is bound to a
+/// `TypeVarLikeExpr` in any scope. Pure boolean query, no side effects:
+/// Python applies no mutation based on this result, so Rust returns a
+/// plain `bool` (no fallback needed).
+#[pyfunction]
+pub(crate) fn rust_is_defined_type_param(
+    py: Python<'_>,
+    locals: &PyAny,
+    name: &str,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let tve_cls: &PyType = nodes_mod.getattr("TypeVarLikeExpr")?.downcast()?;
+
+    let locals_list = match locals.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for names in locals_list.iter() {
+        if names.is_none() {
+            continue;
+        }
+        let names_dict = match names.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(false),
+        };
+        let entry = match names_dict.get_item(name)? {
+            Some(e) => e,
+            None => continue,
+        };
+        let node = entry.getattr("node")?;
+        if node.is_none() {
+            continue;
+        }
+        if node.is_instance(tve_cls)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// classify_setup_type_vars (Phase C1, issue #608)
+// ---------------------------------------------------------------------------
+
+/// Tag for the kind of a type-variable-like type in `setup_type_vars`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SvtKind {
+    TypeVar,
+    TypeVarTuple,
+    ParamSpec,
+}
+
+/// The pure decision core of `setup_type_vars` (semanal.py:2294-2310).
+///
+/// Given one tag per `tvar_defs` entry and a parallel `has_default` flag per
+/// entry, reproduces the `seen_tvt` state machine and returns the invalid
+/// indices: a `TypeVarType` with a default appearing after a
+/// `TypeVarTupleType` (NO_DEFAULT_AFTER_TYPEVAR_TUPLE). TypeVarTupleType
+/// entries set `seen_tvt`; ParamSpecType entries are always kept. PyO3-free,
+/// so the state machine is unit-tested directly.
+fn classify_setup_type_vars_inner(tags: &[SvtKind], has_defaults: &[bool]) -> Vec<usize> {
+    let mut seen_tvt = false;
+    let mut invalid: Vec<usize> = Vec::new();
+    for (i, (&kind, has_default)) in tags.iter().zip(has_defaults).enumerate() {
+        match kind {
+            SvtKind::TypeVarTuple => seen_tvt = true,
+            SvtKind::TypeVar if seen_tvt && *has_default => invalid.push(i),
+            _ => {}
+        }
+    }
+    invalid
+}
+
+/// The PyO3 seam for `setup_type_vars`: maps each `tvar_defs` entry to an
+/// `SvtKind` via isinstance checks (the `has_default` flags are computed by
+/// Python, since `has_default()` needs `get_proper_type` / `TypeOfAny`
+/// semantics that stay in Python), then delegates to the pure
+/// `classify_setup_type_vars_inner`.
+///
+/// Returns `Some(Vec<usize>)` of invalid indices (possibly empty), or `None`
+/// when the input is not a list / the two lists differ in length (a caller
+/// mismatch; Python would never hit that). Rust never mutates `self`; Python
+/// applies the removals and the `self.fail` call.
+#[pyfunction]
+pub(crate) fn rust_classify_setup_type_vars(
+    py: Python<'_>,
+    tvar_defs: &PyAny,
+    has_defaults: &PyAny,
+) -> PyResult<Option<Vec<usize>>> {
+    let defs_list = match tvar_defs.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let defaults_list = match has_defaults.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    if defaults_list.len() != defs_list.len() {
+        return Ok(None);
+    }
+
+    let types_mod = py.import("mypy.types")?;
+    let tv_cls: &PyType = types_mod.getattr("TypeVarType")?.downcast()?;
+    let tvt_cls: &PyType = types_mod.getattr("TypeVarTupleType")?.downcast()?;
+
+    let mut tags: Vec<SvtKind> = Vec::with_capacity(defs_list.len());
+    for tv in defs_list.iter() {
+        if tv.is_instance(tvt_cls)? {
+            tags.push(SvtKind::TypeVarTuple);
+        } else if tv.is_instance(tv_cls)? {
+            tags.push(SvtKind::TypeVar);
+        } else {
+            tags.push(SvtKind::ParamSpec);
+        }
+    }
+    let mut defaults: Vec<bool> = Vec::with_capacity(defaults_list.len());
+    for d in defaults_list.iter() {
+        defaults.push(d.extract()?);
+    }
+    Ok(Some(classify_setup_type_vars_inner(&tags, &defaults)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2151,6 +2280,63 @@ mod tests {
         assert!(is_typed_namedtuple_name("typing_extensions.NamedTuple"));
         assert!(!is_typed_namedtuple_name("typing.TypedDict"));
         assert!(!is_typed_namedtuple_name("typing.Any"));
+    }
+
+    // --- classify_setup_type_vars (Phase C1) ---
+
+    #[test]
+    fn test_classify_setup_type_vars_empty() {
+        let tags: [SvtKind; 0] = [];
+        assert!(classify_setup_type_vars_inner(&tags, &[]).is_empty());
+    }
+
+    #[test]
+    fn test_classify_setup_type_vars_tvt_sets_seen() {
+        let tags = [SvtKind::TypeVarTuple, SvtKind::TypeVar];
+        let has_defaults = [false, false];
+        // Non-defaulted TypeVar after a tuple stays valid.
+        assert!(classify_setup_type_vars_inner(&tags, &has_defaults).is_empty());
+    }
+
+    #[test]
+    fn test_classify_setup_type_vars_default_after_tvt_invalid() {
+        let tags = [SvtKind::TypeVarTuple, SvtKind::TypeVar];
+        let has_defaults = [false, true];
+        assert_eq!(
+            classify_setup_type_vars_inner(&tags, &has_defaults),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn test_classify_setup_type_vars_param_spec_after_tvt_kept() {
+        let tags = [SvtKind::TypeVarTuple, SvtKind::ParamSpec];
+        let has_defaults = [false, true];
+        // ParamSpec with a default after a tuple is never invalid.
+        assert!(classify_setup_type_vars_inner(&tags, &has_defaults).is_empty());
+    }
+
+    #[test]
+    fn test_classify_setup_type_vars_default_before_any_tvt_kept() {
+        let tags = [SvtKind::TypeVar, SvtKind::TypeVarTuple];
+        let has_defaults = [true, false];
+        assert!(classify_setup_type_vars_inner(&tags, &has_defaults).is_empty());
+    }
+
+    #[test]
+    fn test_classify_setup_type_vars_multiple_invalid() {
+        let tags = [
+            SvtKind::TypeVarTuple,
+            SvtKind::TypeVar,
+            SvtKind::TypeVar,
+            SvtKind::TypeVarTuple,
+            SvtKind::TypeVar,
+        ];
+        let has_defaults = [false, true, true, false, true];
+        assert_eq!(
+            classify_setup_type_vars_inner(&tags, &has_defaults),
+            vec![1, 2, 4]
+        );
     }
 
     // --- is_type_ref ---

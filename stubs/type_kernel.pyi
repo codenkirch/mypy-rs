@@ -43,7 +43,7 @@ from mypy.nodes import (
     TypeInfo,
 )
 from mypy.nodes import DataclassTransformSpec
-from mypy.types import ProperType, TupleType, Type
+from mypy.types import ProperType, TupleType, Type, TypeVarLikeType
 
 T = TypeVar("T")
 
@@ -203,6 +203,7 @@ __all__ = [
     "rust_apply_semantic_analyzer_patches",
     "rust_classify_decorators",
     "rust_classify_imports",
+    "rust_classify_setup_type_vars",
     "rust_lookup",
     "rust_stubgen_render",
     "rust_stubgen_render_type_args",
@@ -213,6 +214,7 @@ __all__ = [
     "rust_dataclass_transform",
     "rust_dataclass_post_init_transform",
     "rust_classify_member_resolution",
+    "rust_is_defined_type_param",
     "rust_var_is_typing_special_form",
     "rust_get_typevarlike_declaration",
     "rust_parse_bool",
@@ -1077,6 +1079,11 @@ def rust_extract_typevarlike_name(
     s: AssignmentStmt,
     call: CallExpr,
 ) -> str | None: ...
+def rust_is_defined_type_param(locals: list[SymbolTable | None], name: str) -> bool: ...
+def rust_classify_setup_type_vars(
+    tvar_defs: list[TypeVarLikeType],
+    has_defaults: list[bool],
+) -> list[int] | None: ...
 def rust_special_function_elide_names(name: str) -> bool: ...
 def rust_argument_elide_name(name: str | None) -> bool: ...
 def rust_set_callable_name(sig: Type, fdef: FuncDef) -> ProperType | None: ...
