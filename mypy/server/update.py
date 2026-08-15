@@ -1095,6 +1095,9 @@ def reprocess_nodes(
             merge_asts(file_node, old_symbols[name], file_node, new_symbols[name])
 
     # Type check.
+    from mypy.types import _set_type_wire_cache_enabled
+
+    _set_type_wire_cache_enabled(True)
     checker = graph[module_id].type_checker()
     checker.reset()
     # We seem to need additional passes in fine-grained incremental mode.

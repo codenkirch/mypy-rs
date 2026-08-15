@@ -63,3 +63,4 @@ test_capi
 
 # Rust build output
 /target/
+/mypyc/lib-rt/librt/

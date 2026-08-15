@@ -616,6 +616,37 @@ write_bytes(PyObject *self, PyObject *const *args, size_t nargs) {
     return Py_None;
 }
 
+// Write raw bytes without a length prefix (for wire-byte cache splicing).
+
+static char
+write_raw_bytes_internal(PyObject *data, PyObject *value) {
+    if (unlikely(!PyBytes_Check(value))) {
+        PyErr_SetString(PyExc_TypeError, "value must be a bytes object");
+        return CPY_NONE_ERROR;
+    }
+    Py_ssize_t size = PyBytes_GET_SIZE(value);
+    _CHECK_WRITE(data, size)
+    memcpy(((WriteBufferObject *)data)->ptr,
+           PyBytes_AS_STRING(value), size);
+    ((WriteBufferObject *)data)->ptr += size;
+    return CPY_NONE;
+}
+
+static PyObject*
+write_raw_bytes(PyObject *self, PyObject *const *args, size_t nargs) {
+    if (unlikely(nargs != 2)) {
+        PyErr_Format(PyExc_TypeError,
+                     "write_raw_bytes() takes exactly 2 arguments (%zu given)",
+                     nargs);
+        return NULL;
+    }
+    _CHECK_WRITE_BUFFER(args[0], NULL)
+    if (unlikely(write_raw_bytes_internal(args[0], args[1]) == CPY_NONE_ERROR))
+        return NULL;
+    Py_INCREF(Py_None);
+    return Py_None;
+}
+
 /*
 float format:
     stored using PyFloat helpers in little-endian format.
@@ -1215,6 +1246,7 @@ static PyMethodDef librt_internal_module_methods[] = {
     {"write_str", (PyCFunction)write_str, METH_FASTCALL, PyDoc_STR("write a string")},
     {"read_str", (PyCFunction)read_str, METH_FASTCALL, PyDoc_STR("read a string")},
     {"write_bytes", (PyCFunction)write_bytes, METH_FASTCALL, PyDoc_STR("write bytes")},
+    {"write_raw_bytes", (PyCFunction)write_raw_bytes, METH_FASTCALL, PyDoc_STR("write raw bytes")},
     {"read_bytes", (PyCFunction)read_bytes, METH_FASTCALL, PyDoc_STR("read bytes")},
     {"write_float", (PyCFunction)write_float, METH_FASTCALL, PyDoc_STR("write a float")},
     {"read_float", (PyCFunction)read_float, METH_FASTCALL, PyDoc_STR("read a float")},
@@ -1275,7 +1307,8 @@ librt_internal_module_exec(PyObject *m)
         (void *)ReadBuffer_type_internal,
         (void *)WriteBuffer_type_internal,
         (void *)NativeInternal_API_Version,
-        (void *)extract_symbol_internal
+        (void *)extract_symbol_internal,
+        (void *)write_raw_bytes_internal
     };
     PyObject *c_api_object = PyCapsule_New((void *)NativeInternal_API, "librt.internal._C_API", NULL);
     if (PyModule_Add(m, "_C_API", c_api_object) < 0) {

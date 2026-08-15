@@ -20,11 +20,19 @@ from typing import (
 from typing_extensions import Self
 
 from librt.internal import (
+    WriteBuffer,
     read_int as read_int_bare,
     read_str as read_str_bare,
     write_int as write_int_bare,
     write_str as write_str_bare,
 )
+
+# write_raw_bytes is new in the librt fork; fall back to plain
+# serialization when the installed librt predates it.
+try:
+    from librt.internal import write_raw_bytes
+except ImportError:
+    write_raw_bytes = None  # type: ignore[assignment]
 
 import mypy.nodes
 from mypy.bogus_type import Bogus
@@ -109,6 +117,41 @@ JsonDict: _TypeAlias = dict[str, Any]
 # Note: Float values are only used internally. They are not accepted within
 # Literal[...].
 LiteralValue: _TypeAlias = int | str | bool | float
+
+
+# Wire-byte cache: id(Type) -> (Type, serialized bytes).
+# Strong ref to the Type prevents id() reuse after GC.
+# Cleared at build start by _clear_type_wire_cache().
+_type_wire_cache: dict[int, tuple[Type, bytes]] = {}
+
+# Phase gate: only cache during type checking, when Type objects
+# are frozen.  Semanal/typeanal mutate Instance.args and friends
+# in-place; caching there would serve stale bytes.
+_type_wire_cache_enabled: bool = False
+
+# Taint tracking for the wire-byte cache.  TypeVarId.meta_level is
+# mutated in place by inference (applytype.py, typeops.py), so any
+# subtree containing a TypeVar-like type is not cacheable.  While
+# an outermost serialization is in progress, _type_wire_cache_saw_tvar
+# counts how many TypeVar-like types were encountered.  The outermost
+# call (depth 0) resets it, decides caching at exit; nested calls
+# (depth > 0) write directly to the shared buffer and only consult
+# the cache for lookups, never stores.
+_type_wire_cache_saw_tvar: int = 0
+_type_wire_cache_session_depth: int = 0
+
+
+def _clear_type_wire_cache() -> None:
+    _type_wire_cache.clear()
+
+
+def _set_type_wire_cache_enabled(on: bool) -> None:
+    global _type_wire_cache_enabled
+    _type_wire_cache_enabled = on
+
+
+def _wire_cache_enabled() -> bool:
+    return _type_wire_cache_enabled
 
 
 TUPLE_NAMES: Final = ("builtins.tuple", "typing.Tuple")
@@ -756,8 +799,8 @@ class TypeVarType(TypeVarLikeType):
         write_int(data, self.id.raw_id)
         write_str(data, self.id.namespace)
         write_type_list(data, self.values)
-        self.upper_bound.write(data)
-        self.default.write(data)
+        _write_type_cached(self.upper_bound, data)
+        _write_type_cached(self.default, data)
         write_int(data, self.variance)
         if self.id.meta_level:
             write_int(data, self.id.meta_level)
@@ -925,14 +968,14 @@ class ParamSpecType(TypeVarLikeType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, PARAM_SPEC_TYPE)
-        self.prefix.write(data)
+        _write_type_cached(self.prefix, data)
         write_str(data, self.name)
         write_str(data, self.fullname)
         write_int(data, self.id.raw_id)
         write_str(data, self.id.namespace)
         write_int(data, self.flavor)
-        self.upper_bound.write(data)
-        self.default.write(data)
+        _write_type_cached(self.upper_bound, data)
+        _write_type_cached(self.default, data)
         write_tag(data, END_TAG)
 
     @classmethod
@@ -1008,13 +1051,13 @@ class TypeVarTupleType(TypeVarLikeType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, TYPE_VAR_TUPLE_TYPE)
-        self.tuple_fallback.write(data)
+        _write_type_cached(self.tuple_fallback, data)
         write_str(data, self.name)
         write_str(data, self.fullname)
         write_int(data, self.id.raw_id)
         write_str(data, self.id.namespace)
-        self.upper_bound.write(data)
-        self.default.write(data)
+        _write_type_cached(self.upper_bound, data)
+        _write_type_cached(self.default, data)
         write_int(data, self.min_len)
         write_tag(data, END_TAG)
 
@@ -1283,7 +1326,7 @@ class UnpackType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, UNPACK_TYPE)
-        self.type.write(data)
+        _write_type_cached(self.type, data)
         write_tag(data, END_TAG)
 
     @classmethod
@@ -2788,7 +2831,7 @@ class CallableType(FunctionLike):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, CALLABLE_TYPE)
-        self.fallback.write(data)
+        _write_type_cached(self.fallback, data)
         write_type_opt(data, self.instance_type)
         write_flags(
             data,
@@ -2804,7 +2847,7 @@ class CallableType(FunctionLike):
         write_type_list(data, self.arg_types)
         write_int_list(data, [int(x.value) for x in self.arg_kinds])
         write_str_opt_list(data, self.arg_names)
-        self.ret_type.write(data)
+        _write_type_cached(self.ret_type, data)
         write_str_opt(data, self.name)
         write_type_list(data, self.variables)
         write_type_opt(data, self.type_guard)
@@ -3037,7 +3080,7 @@ class TupleType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, TUPLE_TYPE)
-        self.partial_fallback.write(data)
+        _write_type_cached(self.partial_fallback, data)
         write_type_list(data, self.items)
         write_bool(data, self.implicit)
         write_tag(data, END_TAG)
@@ -3262,7 +3305,7 @@ class TypedDictType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, TYPED_DICT_TYPE)
-        self.fallback.write(data)
+        _write_type_cached(self.fallback, data)
         write_type_map(data, self.items)
         write_str_list(data, sorted(self.required_keys))
         write_str_list(data, sorted(self.readonly_keys))
@@ -3565,7 +3608,7 @@ class LiteralType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, LITERAL_TYPE)
-        self.fallback.write(data)
+        _write_type_cached(self.fallback, data)
         write_literal(data, self.value)
         write_tag(data, END_TAG)
 
@@ -3866,7 +3909,7 @@ class TypeType(ProperType):
 
     def write(self, data: WriteBuffer) -> None:
         write_tag(data, TYPE_TYPE)
-        self.item.write(data)
+        _write_type_cached(self.item, data)
         write_bool(data, self.is_type_form)
         write_tag(data, END_TAG)
 
@@ -5178,9 +5221,80 @@ def read_type_opt(data: ReadBuffer) -> Type | None:
     return read_type(data, tag)
 
 
+def _write_type_cached(t: Type, data: WriteBuffer) -> None:
+    """Write a Type to buffer using the wire-byte cache.
+
+    First call serializes to a temp buffer and caches the bytes.
+    Subsequent calls splice cached bytes with a single write_raw_bytes call.
+    Instances with type_ref != None are wire-decoded (not yet fixed up)
+    and are NOT cached — their TypeInfo may change during fixup.
+
+    TypeVarType / ParamSpecType / TypeVarTupleType, and any composite type
+    that transitively contains one, are NOT cached: TypeVarId.meta_level
+    is mutated in place by inference (applytype.py, typeops.py), so cached
+    bytes would go stale mid-build.  The taint is tracked via
+    _type_wire_cache_saw_tvar across one outermost session; nested calls
+    write directly to the shared temp buffer and only consult the cache
+    for lookups, never stores.
+
+    No-op (plain t.write) while _type_wire_cache_enabled is False,
+    which covers semanal/typeanal where Type objects are still mutable.
+    Also falls back to plain t.write when librt predates write_raw_bytes.
+    """
+    if not _type_wire_cache_enabled or write_raw_bytes is None:
+        t.write(data)
+        return
+    key = id(t)
+    entry = _type_wire_cache.get(key)
+    if entry is not None and entry[0] is t:
+        write_raw_bytes(data, entry[1])
+        return
+    global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
+    if isinstance(t, (TypeVarType, ParamSpecType, TypeVarTupleType)):
+        _type_wire_cache_saw_tvar += 1
+        t.write(data)
+        return
+    if _type_wire_cache_session_depth > 0:
+        # Nested call within an outermost session: write directly to the
+        # shared parent buffer; do not cache this subtree independently.
+        t.write(data)
+        return
+    # Outermost: isolate bytes via temp buffer, track tvar taint, decide caching.
+    _type_wire_cache_session_depth += 1
+    _type_wire_cache_saw_tvar = 0
+    tmp = WriteBuffer()
+    t.write(tmp)
+    blob = tmp.getvalue()
+    saw_tvar = _type_wire_cache_saw_tvar
+    _type_wire_cache_session_depth -= 1
+    if not saw_tvar and (not isinstance(t, Instance) or t.type_ref is None):
+        _type_wire_cache[key] = (t, blob)
+    write_raw_bytes(data, blob)
+
+
+def _serialize_with_taint_check(t: Type, buf: WriteBuffer) -> tuple[bytes, bool]:
+    """Serialize `t` to `buf` and return (bytes, contains_typevar).
+
+    Wraps `t.write(buf)` in an outermost wire-cache session so that
+    nested `_write_type_cached` calls write directly to `buf` (no
+    individual caching) and the taint counter accumulates across the
+    entire subtree.  Callers use the boolean to decide whether the
+    result is safe to cache.
+    """
+    global _type_wire_cache_saw_tvar, _type_wire_cache_session_depth
+    _type_wire_cache_session_depth += 1
+    _type_wire_cache_saw_tvar = 0
+    t.write(buf)
+    saw_tvar = _type_wire_cache_saw_tvar > 0 or isinstance(
+        t, (TypeVarType, ParamSpecType, TypeVarTupleType)
+    )
+    _type_wire_cache_session_depth -= 1
+    return buf.getvalue(), saw_tvar
+
+
 def write_type_opt(data: WriteBuffer, value: Type | None) -> None:
     if value is not None:
-        value.write(data)
+        _write_type_cached(value, data)
     else:
         write_tag(data, LITERAL_NONE)
 
@@ -5195,7 +5309,7 @@ def write_type_list(data: WriteBuffer, value: Sequence[Type]) -> None:
     write_tag(data, LIST_GEN)
     write_int_bare(data, len(value))
     for item in value:
-        item.write(data)
+        _write_type_cached(item, data)
 
 
 def read_type_map(data: ReadBuffer) -> dict[str, Type]:
