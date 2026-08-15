@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Container
-from typing import cast
+from typing import Final, cast
 
 from mypy.nodes import ARG_STAR, ARG_STAR2
 from mypy.types import (
@@ -105,7 +105,25 @@ def _set_native_erase_typevars_active(active: bool) -> None:
     _native_erase_typevars_active = active
 
 
+_BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
+    "builtins.str": b"\x50\x53",
+    "builtins.function": b"\x50\x54",
+    "builtins.int": b"\x50\x55",
+    "builtins.bool": b"\x50\x56",
+    "builtins.object": b"\x50\x57",
+}
+
+
 def _serialize_type(t: Type) -> bytes:
+    if type(t) is Instance:
+        fn = t.type.fullname
+        if (
+            not t.args
+            and not t.last_known_value
+            and not t.extra_attrs
+            and fn in _BUILTIN_INSTANCE_BYTES
+        ):
+            return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
     t.write(buf)
     return buf.getvalue()

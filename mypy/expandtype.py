@@ -186,8 +186,26 @@ def _set_native_expand_type_typeinfo_map(typeinfo_map: dict[str, Any] | None) ->
     set_wire_typeinfo_map(typeinfo_map)
 
 
+_BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
+    "builtins.str": b"\x50\x53",
+    "builtins.function": b"\x50\x54",
+    "builtins.int": b"\x50\x55",
+    "builtins.bool": b"\x50\x56",
+    "builtins.object": b"\x50\x57",
+}
+
+
 def _serialize_type(t: Type) -> bytes:
     """Serialize a `Type` to its wire-format bytes for the Rust reader."""
+    if type(t) is Instance:
+        fn = t.type.fullname
+        if (
+            not t.args
+            and not t.last_known_value
+            and not t.extra_attrs
+            and fn in _BUILTIN_INSTANCE_BYTES
+        ):
+            return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
     t.write(buf)
     return buf.getvalue()
