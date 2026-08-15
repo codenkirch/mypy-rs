@@ -172,6 +172,9 @@ from mypy.types import (
     ExtraAttrs,
     FunctionLike,
     Instance,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     LiteralType,
     LiteralValue,
     NoneType,
@@ -509,6 +512,11 @@ _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
 
 
 def _serialize_type_for_checkexpr(t: Type) -> bytes:
+    key = id(t)
+    if _wire_cache_enabled():
+        entry = _type_wire_cache.get(key)
+        if entry is not None and entry[0] is t:
+            return entry[1]
     if type(t) is Instance:
         fn = t.type.fullname
         if (
@@ -519,8 +527,10 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
         ):
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _CheckExprWriteBuffer()
-    t.write(buf)
-    return buf.getvalue()
+    result, saw_tvar = _serialize_with_taint_check(t, buf)
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):
+        _type_wire_cache[key] = (t, result)
+    return result
 
 
 def _deserialize_type_from_checkexpr(b: bytes) -> Type | None:

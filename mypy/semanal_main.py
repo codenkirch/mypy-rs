@@ -84,6 +84,12 @@ def semantic_analysis_for_scc(graph: Graph, scc: list[str], errors: Errors) -> N
     The scc will be processed roughly in the order the modules are included
     in the list.
     """
+    from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+    # New Type objects may be created during semanal; drop any cached
+    # wire bytes from a previous SCC and guard against caching mutable ones.
+    _clear_type_wire_cache()
+    _set_type_wire_cache_enabled(False)
     patches: Patches = []
     # Note that functions can't define new module-level attributes
     # using 'global x', since module top levels are fully processed
@@ -136,6 +142,12 @@ def semantic_analysis_for_targets(
     except that we process only some targets. This is used in fine-grained
     incremental mode, when propagating an update.
     """
+    from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+    # Same cache discipline as semantic_analysis_for_scc: new Type objects
+    # created here must not be cached with stale or mutable state.
+    _clear_type_wire_cache()
+    _set_type_wire_cache_enabled(False)
     patches: Patches = []
     if any(isinstance(n.node, MypyFile) for n in nodes):
         # Process module top level first (if needed).

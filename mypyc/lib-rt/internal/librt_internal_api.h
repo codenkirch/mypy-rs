@@ -26,6 +26,7 @@ extern void *NativeInternal_API[LIBRT_INTERNAL_API_LEN];
 #define WriteBuffer_type_internal (*(PyTypeObject* (*)(void)) NativeInternal_API[18])
 #define NativeInternal_API_Version (*(int (*)(void)) NativeInternal_API[19])
 #define extract_symbol_internal (*(PyObject* (*)(PyObject *source)) NativeInternal_API[20])
+#define write_raw_bytes_internal (*(char (*)(PyObject *source, PyObject *value)) NativeInternal_API[21])
 
 int
 import_librt_internal(void);

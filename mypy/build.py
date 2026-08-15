@@ -896,6 +896,13 @@ class BuildManager:
         self.stats_enabled = self.options.dump_build_stats
         self.logging_enabled = self.options.verbosity >= 1
         self.tracing_enabled = self.options.verbosity >= 2
+        # Clear the wire-byte cache so stale entries from a previous build
+        # don't survive into the new type graph.  Reset the phase gate too,
+        # so semanal for this build starts with caching disabled.
+        from mypy.types import _clear_type_wire_cache, _set_type_wire_cache_enabled
+
+        _clear_type_wire_cache()
+        _set_type_wire_cache_enabled(False)
         # Propagate the type-kernel gate to the erasetype module flag, which
         # the hot-path `erase_type()` reads without an options lookup per call.
         from mypy.erasetype import _set_native_erase_active
@@ -3969,6 +3976,9 @@ class State:
     def type_check_first_pass(self, recurse_into_functions: bool = True) -> None:
         if self.options.semantic_analysis_only:
             return
+        from mypy.types import _set_type_wire_cache_enabled
+
+        _set_type_wire_cache_enabled(True)
         t0 = time_ref()
         with self.wrap_context():
             self.type_checker().check_first_pass(recurse_into_functions=recurse_into_functions)
