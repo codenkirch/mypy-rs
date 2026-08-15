@@ -98,7 +98,6 @@ mod semanal_lookup;
 mod semanal_shared;
 mod semanal_typeddict;
 mod semanal_visitor;
-mod serialize;
 mod serverdeps;
 mod setops;
 mod solve;
