@@ -451,6 +451,9 @@ try:
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
+        rust_visit_dict_expr as _rust_visit_dict_expr,
+        rust_visit_list_set_expr as _rust_visit_list_set_expr,
+        rust_visit_template_str_expr as _rust_visit_template_str_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -490,6 +493,9 @@ except ImportError:
     _rust_can_be_type_alias = None  # type: ignore[assignment]
     _rust_check_typevarlike_name = None  # type: ignore[assignment]
     _rust_extract_typevarlike_name = None  # type: ignore[assignment]
+    _rust_visit_dict_expr = None  # type: ignore[assignment]
+    _rust_visit_list_set_expr = None  # type: ignore[assignment]
+    _rust_visit_template_str_expr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6272,24 +6278,36 @@ class SemanticAnalyzer(
             item.accept(self)
 
     def visit_list_expr(self, expr: ListExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_list_set_expr(expr, self):
+                return
         for item in expr.items:
             if isinstance(item, StarExpr):
                 item.valid = True
             item.accept(self)
 
     def visit_set_expr(self, expr: SetExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_list_set_expr(expr, self):
+                return
         for item in expr.items:
             if isinstance(item, StarExpr):
                 item.valid = True
             item.accept(self)
 
     def visit_dict_expr(self, expr: DictExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_dict_expr(expr, self):
+                return
         for key, value in expr.items:
             if key is not None:
                 key.accept(self)
             value.accept(self)
 
     def visit_template_str_expr(self, expr: TemplateStrExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_template_str_expr(expr, self):
+                return
         for item in expr.items:
             if isinstance(item, tuple):
                 item[0].accept(self)

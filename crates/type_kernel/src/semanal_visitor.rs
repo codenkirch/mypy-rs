@@ -2174,6 +2174,106 @@ pub(crate) fn rust_classify_setup_type_vars(
     Ok(Some(classify_setup_type_vars_inner(&tags, &defaults)))
 }
 
+// ---------------------------------------------------------------------------
+// Slice 1: leaf-actions shard for visit_list_expr / visit_set_expr /
+// visit_dict_expr / visit_template_str_expr (semanal.py:6274-6299).
+//
+// Pattern: Rust walks the expr items and mutates `StarExpr.valid = True`
+// directly, then calls `item.accept(semanal_self)` to recurse into the
+// Python visitor. The four Python methods become a single gate dispatch
+// into one of these helpers; if the helper returns `true` the Python
+// body was fully handled, otherwise Python falls back.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_list_expr` / `visit_set_expr` body. Sets
+/// `item.valid = True` on StarExpr items and recurses via `accept`.
+/// Returns `false` if any required attribute/method is missing so
+/// Python falls back.
+#[pyfunction]
+pub(crate) fn rust_visit_list_set_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let star_cls = nodes_mod.getattr("StarExpr")?.downcast::<PyType>()?;
+    let items = expr.getattr("items")?;
+    let items_list = match items.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for item in items_list.iter() {
+        if item.is_instance(star_cls)? {
+            item.setattr("valid", true)?;
+        }
+        item.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_dict_expr` body. Recurses into key (when not None)
+/// and value via `accept`.
+#[pyfunction]
+pub(crate) fn rust_visit_dict_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let items = expr.getattr("items")?;
+    let items_list = match items.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for pair in items_list.iter() {
+        let pair_t = match pair.downcast::<PyTuple>() {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        if pair_t.len() != 2 {
+            return Ok(false);
+        }
+        let key = pair_t.get_item(0)?;
+        let value = pair_t.get_item(1)?;
+        if !key.is_none() {
+            key.call_method1("accept", (semanal,))?;
+        }
+        value.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_template_str_expr` body. Each item is either an
+/// `Expression` or a 4-tuple `(value_expr, source_text, conversion,
+/// format_spec_expr)`.
+#[pyfunction]
+pub(crate) fn rust_visit_template_str_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let items = expr.getattr("items")?;
+    let items_list = match items.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for item in items_list.iter() {
+        if let Ok(t) = item.downcast::<PyTuple>() {
+            if t.len() != 4 {
+                return Ok(false);
+            }
+            let value_expr = t.get_item(0)?;
+            let format_spec = t.get_item(3)?;
+            value_expr.call_method1("accept", (semanal,))?;
+            if !format_spec.is_none() {
+                format_spec.call_method1("accept", (semanal,))?;
+            }
+        } else {
+            item.call_method1("accept", (semanal,))?;
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
