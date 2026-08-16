@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Final, NamedTuple
+from typing import Final, NamedTuple, cast
 
 from mypy import message_registry
 from mypy.checker_shared import TypeCheckerSharedApi, TypeRange
@@ -93,7 +93,8 @@ def _deserialize_type_list(result: list[bytes] | list[list[int]]) -> list[Type] 
 
     out: list[Type] = []
     for b in result:
-        t = _deserialize_type(b)
+        blob = bytes(b) if isinstance(b, list) else b
+        t = _deserialize_type(blob)
         if t is None:
             return None
         out.append(t)
@@ -1011,8 +1012,13 @@ def get_type_range(typ: Type) -> TypeRange:
         try:
             result = _type_kernel.rust_get_type_range(_serialize_type(typ))
             if result is True:
-                # Rust says: the bool LKV should be unwrapped for the TypeRange.
-                return TypeRange(typ.last_known_value, is_upper_bound=False)
+                # Rust says: the bool LKV should be unwrapped for the
+                # TypeRange. Rust only returns True when typ is an Instance
+                # carrying a bool LKV, so the asserts below always hold.
+                assert isinstance(typ, Instance)
+                lkv = typ.last_known_value
+                assert lkv is not None
+                return TypeRange(lkv, is_upper_bound=False)
             if result is False:
                 return TypeRange(typ, is_upper_bound=False)
         except (AssertionError, NotImplementedError):

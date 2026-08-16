@@ -9193,17 +9193,6 @@ def is_trivial_body(block: Block) -> bool:
     )
 
 
-def is_init_only(node: Var) -> bool:
-    return (
-        isinstance(type := get_proper_type(node.type), Instance)
-        and type.type.fullname == "dataclasses.InitVar"
-    )
-
-
-def erase_func_annotations(func: FuncDef) -> None:
-    func.type_args = None
-    for arg in func.arguments:
-        arg.type_annotation = None
-        arg.variable.type = None
-    func.type = None
-    func.unanalyzed_type = None
+# Note: is_init_only() and erase_func_annotations() are defined above
+# (around lines 8872/8886) with native-type-kernel gating. They are not
+# duplicated here.

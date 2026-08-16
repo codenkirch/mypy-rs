@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from functools import reduce
 from typing import Final, Literal, cast
 
@@ -101,10 +101,10 @@ def _set_native_attrs_active(active: bool) -> None:
 
 
 # Lazy import of the native seam function.
-_rust_transform_attrs_fn = None
+_rust_transform_attrs_fn: Callable[..., bytes | None] | None = None
 
 
-def _get_rust_transform_attrs():
+def _get_rust_transform_attrs() -> Callable[..., bytes | None] | None:
     """Lazily import rust_transform_attrs from type_kernel."""
     global _rust_transform_attrs_fn
     if _rust_transform_attrs_fn is not None:
@@ -112,6 +112,7 @@ def _get_rust_transform_attrs():
     if _HAS_NATIVE_ATTRS:
         try:
             from type_kernel import rust_transform_attrs as _fn
+
             _rust_transform_attrs_fn = _fn
         except ImportError:
             pass
@@ -164,7 +165,7 @@ def _serialize_attrs_fields_for_rust(
 
         wb = WriteBuffer()
         typ.write(wb)
-        raw = wb.buf if hasattr(wb, "buf") else bytes(wb)
+        raw = wb.getvalue()
         buf.extend(raw)
         return len(raw)
 

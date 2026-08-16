@@ -32,10 +32,12 @@ from mypy.nodes import (
     Expression,
     FuncDef,
     Lvalue,
+    MemberExpr,
     MypyFile,
     NameExpr,
     Node,
     OverloadedFuncDef,
+    RefExpr,
     SymbolNode,
     SymbolTable,
     SymbolTableNode,
@@ -1019,11 +1021,11 @@ def rust_classify_imports(
 ) -> list[tuple[str, str, bool, int | None]] | None: ...
 def rust_classify_member_resolution(
     expr: Expression,
-    member_expr_cls: type[Expression],
-    ref_expr_cls: type[Expression],
-    mypy_file_cls: type[Expression],
-    type_info_cls: type[Expression],
-    type_alias_cls: type[Expression],
+    member_expr_cls: type[MemberExpr],
+    ref_expr_cls: type[RefExpr],
+    mypy_file_cls: type[MypyFile],
+    type_info_cls: type[TypeInfo],
+    type_alias_cls: type[TypeAlias],
 ) -> tuple[str | None, SymbolTableNode | None]: ...
 def rust_lookup(
     name: str,

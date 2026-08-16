@@ -261,12 +261,7 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
             new_items = []
             changed = False
             for orig, dec in zip(original.items, decoded.items):
-                if (
-                    isinstance(orig, CallableType)
-                    and isinstance(dec, CallableType)
-                    and orig.definition is not None
-                    and dec.definition is None
-                ):
+                if orig.definition is not None and dec.definition is None:
                     new_items.append(dec.copy_modified(definition=orig.definition))
                     changed = True
                 else:
@@ -279,8 +274,7 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
         # definition link.
         for orig in original.items:
             if (
-                isinstance(orig, CallableType)
-                and orig.definition is not None
+                orig.definition is not None
                 and len(orig.arg_types) == len(decoded.arg_types)
             ):
                 return decoded.copy_modified(definition=orig.definition)
@@ -2130,7 +2124,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
                 elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
                     if not method.items:
                         return method
-                    items: list[F] = []
+                    items: list[CallableType] = []
                     for c in method.items:
                         bound = bind_self_fast(c, original_type)
                         items.append(bound)

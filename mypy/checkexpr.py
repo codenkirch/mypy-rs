@@ -2605,11 +2605,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # otherwise be checked against the bare variable. Defer.
                     lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
                     callee_var_ids = {v.id for v in callee.variables}
-                    lam_typevar_ctx = any(
-                        arg_context[i] is not None
-                        and any(tv.id in callee_var_ids for tv in get_type_vars(arg_context[i]))
-                        for i in lam_idx
-                    )
+
+                    def _lam_ctx_has_callee_var(i: int) -> bool:
+                        ctx = arg_context[i]
+                        if ctx is None:
+                            return False
+                        return any(tv.id in callee_var_ids for tv in get_type_vars(ctx))
+
+                    lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
                     if not lam_typevar_ctx:
                         arg_types_bytes = [
                             _serialize_type_for_checkexpr(
