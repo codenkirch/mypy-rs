@@ -120,6 +120,7 @@ from mypy.types import (
 
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
+from mypy.checkstrformat import ConversionSpecifier  # noqa: F401  (re-export for tests)
 
 
 class TypesSuite(Suite):
@@ -2053,7 +2054,7 @@ class NativeBindSelfSuite(Suite):
         instance_cache.object_type = None
         instance_cache.function_type = None
         t = fixup_wire_type(decoded)
-        assert t is not None
+        assert isinstance(t, CallableType)  # type: ignore[misc]
         return t
 
     def _assert_stripped(self, c: CallableType) -> None:
@@ -6523,7 +6524,7 @@ class NativeStrFormatSuite(Suite):
         self._errors = Errors(Options())
         self._msg = MessageBuilder(self._errors, None)  # type: ignore[arg-type]
 
-    def _spec_tuples(self, specs: list[ConversionSpecifier]) -> list[tuple]:
+    def _spec_tuples(self, specs: list[ConversionSpecifier]) -> list[tuple]:  # type: ignore[type-arg]
         """Convert ConversionSpecifier list to comparable tuples."""
         return [
             (
