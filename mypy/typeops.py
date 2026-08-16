@@ -207,7 +207,7 @@ def tuple_fallback(typ: TupleType) -> Instance:
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if decoded is not None and isinstance(decoded, Instance):
+                if decoded is not None and isinstance(decoded, Instance):  # type: ignore[misc]
                     return decoded
         except (AssertionError, NotImplementedError, ValueError):
             pass
@@ -603,7 +603,7 @@ def bind_self(
             result = _type_kernel.rust_bind_self(_serialize_type(func))
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if decoded is not None and isinstance(decoded, CallableType):
+                if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
                     return cast(
                         F,
                         func.copy_modified(

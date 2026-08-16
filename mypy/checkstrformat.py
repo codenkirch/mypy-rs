@@ -144,12 +144,12 @@ try:
     _rust_analyze_conversion_specifiers = _type_kernel.rust_analyze_conversion_specifiers
     _HAS_TYPE_KERNEL_STRFORMAT = True
 except (ImportError, AttributeError):
-    _rust_is_numeric_format_type = None  # type: ignore[assignment]
-    _rust_parse_conversion_specifiers = None  # type: ignore[assignment]
-    _rust_find_non_escaped_targets = None  # type: ignore[assignment]
-    _rust_parse_format_value = None  # type: ignore[assignment]
-    _rust_parse_placeholder_format = None  # type: ignore[assignment]
-    _rust_analyze_conversion_specifiers = None  # type: ignore[assignment]
+    _rust_is_numeric_format_type = None
+    _rust_parse_conversion_specifiers = None
+    _rust_find_non_escaped_targets = None
+    _rust_parse_format_value = None
+    _rust_parse_placeholder_format = None
+    _rust_analyze_conversion_specifiers = None
     _HAS_TYPE_KERNEL_STRFORMAT = False
 
 # Module-level flag read by the gates below. Set by the build manager from
@@ -165,7 +165,7 @@ def _set_native_strformat_active(active: bool) -> None:
 
 def is_numeric_format_type(conv_type: str, is_new_style: bool) -> bool:
     if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
-        return _rust_is_numeric_format_type(conv_type, is_new_style)
+        return _rust_is_numeric_format_type(conv_type, is_new_style)  # type: ignore[misc]
     if is_new_style:
         return conv_type in NUMERIC_TYPES_NEW
     return conv_type in NUMERIC_TYPES_OLD
@@ -181,7 +181,7 @@ def parse_placeholder_format(
     format grammar.
     """
     if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
-        return _rust_parse_placeholder_format(format_spec)
+        return _rust_parse_placeholder_format(format_spec)  # type: ignore[misc]
     return _parse_placeholder_format_python(format_spec)
 
 
@@ -305,7 +305,7 @@ class ConversionSpecifier:
 def parse_conversion_specifiers(format_str: str) -> list[ConversionSpecifier]:
     """Parse c-printf-style format string into list of conversion specifiers."""
     if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
-        raw = _rust_parse_conversion_specifiers(format_str)
+        raw = _rust_parse_conversion_specifiers(format_str)  # type: ignore[misc]
         return [
             ConversionSpecifier.from_fields(whole, sp, key, ct, fl, w, pr)
             for (whole, sp, key, ct, fl, w, pr) in raw
@@ -325,7 +325,7 @@ def parse_format_value(
     '{0:{1}}, {2:{3}{4}}'. Return None in case of an error.
     """
     if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
-        err_code, raw_specs = _rust_parse_format_value(format_value)
+        err_code, raw_specs = _rust_parse_format_value(format_value)  # type: ignore[misc]
         if err_code == 1:
             msg.fail(
                 "Invalid conversion specifier in format string: unexpected }",
@@ -431,7 +431,7 @@ def find_non_escaped_targets(
     Return None in case of an error.
     """
     if _HAS_TYPE_KERNEL_STRFORMAT and _native_strformat_active:
-        err_code, targets = _rust_find_non_escaped_targets(format_value)
+        err_code, targets = _rust_find_non_escaped_targets(format_value)  # type: ignore[misc]
         if err_code == 1:
             msg.fail(
                 "Invalid conversion specifier in format string: unexpected }",
@@ -907,7 +907,7 @@ class StringFormatterChecker:
                 (spec.has_key(), spec.conv_type, spec.width, spec.precision)
                 for spec in specifiers
             ]
-            result = _rust_analyze_conversion_specifiers(spec_infos)
+            result = _rust_analyze_conversion_specifiers(spec_infos)  # type: ignore[misc]
             if result is None:
                 has_star = any(spec.has_star() for spec in specifiers)
                 has_key = any(spec.has_key() for spec in specifiers)

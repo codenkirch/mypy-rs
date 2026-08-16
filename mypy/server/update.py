@@ -816,7 +816,7 @@ def get_sources(
             ]
             result = _rust_get_sources(filtered, followed)
             if result is not None:
-                return list(result)  # type: ignore[return-value]
+                return list(result)
         except Exception:
             pass
     sources: list[BuildSource] = []

@@ -528,7 +528,7 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _CheckExprWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         _type_wire_cache[key] = (t, result)
     return result
 
@@ -746,7 +746,7 @@ def _try_native_check_callable_call(
         if raw is None:
             return None
         resolved = _deserialize_type_from_checkexpr(bytes(raw))
-        if not isinstance(resolved, CallableType):
+        if not isinstance(resolved, CallableType):  # type: ignore[misc]
             return None
         # The wire format has no line/column/special_sig/from_type_type;
         # restore from the pre-edit callee exactly like the calibration path.
@@ -2635,7 +2635,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             # be resolved to a live TypeInfo; in that case defer
                             # to Python's generic-call inference below. The
                             # isinstance also narrows None out of the union.
-                            if isinstance(resolved_callee, CallableType):
+                            if isinstance(resolved_callee, CallableType):  # type: ignore[misc]
                                 callee = resolved_callee
                                 # Native solve succeeded; skip Python's infer pass.
                                 native_solved = True
@@ -2757,7 +2757,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 )
                 if raw is not None:
                     resolved = _deserialize_type_from_checkexpr(bytes(raw))
-                    if isinstance(resolved, CallableType):
+                    if isinstance(resolved, CallableType):  # type: ignore[misc]
                         # The wire format has no line/column/special_sig/
                         # from_type_type; the Rust round-trip defaults them.
                         # Restore from the pre-edit callee to match
