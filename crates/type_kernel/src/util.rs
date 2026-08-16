@@ -233,13 +233,19 @@ fn check_line_for_coding(line: &[u8]) -> Option<(String, ())> {
 /// `mypy/util.py:bytes_to_human_readable_repr` — repr(b)[2:-1].
 #[pyfunction]
 pub fn rust_bytes_to_human_readable_repr(b: &[u8]) -> String {
-    // Python: repr(b)[2:-1]. repr(bytes) is b'...', so [2:-1]
-    // strips the b' prefix and trailing ' — content only, no quotes.
+    // Python's repr(bytes) wraps in single quotes by default; it wraps in
+    // double quotes only when the content has a ' but no ". Mirror that:
+    // escape ' only when the outer wrapper is single (i.e. not the
+    // has-single-and-not-double case), escape " only when outer is double.
+    let outer_double = b.contains(&b'\'') && !b.contains(&b'"');
     let mut out = String::new();
     for &byte in b {
         match byte {
             b'\\' => out.push_str("\\\\"),
-            b'\'' => out.push_str("\\'"),
+            b'\'' if !outer_double => out.push_str("\\'"),
+            b'\'' => out.push('\''),
+            b'"' if outer_double => out.push_str("\\\""),
+            b'"' => out.push('"'),
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
@@ -1008,6 +1014,22 @@ mod tests {
     fn test_bytes_to_human_readable_repr() {
         let b = vec![102, 111, 111, 10, 0];
         assert_eq!(rust_bytes_to_human_readable_repr(&b), "foo\\n\\x00");
+    }
+
+    #[test]
+    fn test_bytes_to_human_readable_repr_quote_choice() {
+        // content has ' only -> Python wraps in ", unescaped ' survives.
+        assert_eq!(
+            rust_bytes_to_human_readable_repr(b"Literal['foo']"),
+            "Literal['foo']"
+        );
+        // content has no ' -> Python wraps in ', ' would be escaped if present.
+        assert_eq!(rust_bytes_to_human_readable_repr(b"foo"), "foo");
+        // content has both ' and " -> outer is ', ' escaped.
+        assert_eq!(
+            rust_bytes_to_human_readable_repr(b"foo'\"bar"),
+            "foo\\'\"bar"
+        );
     }
 
     #[test]
