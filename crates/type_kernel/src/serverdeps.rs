@@ -742,6 +742,37 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// Find a module in a list that directly imports no other module in the list.
+///
+/// Mirrors `mypy.server.update:find_relative_leaf_module` (line 723).
+/// Takes a list of (module, path) tuples and a mapping module -> dependency
+/// module IDs. Returns the first (sorted) module with no intra-list deps,
+/// or the lexicographically first module if none qualifies.
+#[pyfunction]
+pub fn rust_find_relative_leaf_module(
+    modules: Vec<(String, String)>,
+    deps: std::collections::HashMap<String, Vec<String>>,
+) -> Option<(String, String)> {
+    if modules.is_empty() {
+        return None;
+    }
+    let mut sorted = modules;
+    sorted.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let module_set: std::collections::HashSet<&str> =
+        sorted.iter().map(|(m, _)| m.as_str()).collect();
+    for (module, path) in &sorted {
+        let state_deps = deps.get(module.as_str());
+        let has_intra = match state_deps {
+            Some(dlist) => dlist.iter().any(|d| module_set.contains(d.as_str())),
+            None => false,
+        };
+        if !has_intra {
+            return Some((module.clone(), path.clone()));
+        }
+    }
+    Some(sorted[0].clone())
+}
+
 // ====================================================================
 // Issue #389: dmypy_server pure helpers — plain-record shuffling
 // ====================================================================
