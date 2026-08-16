@@ -4914,6 +4914,326 @@ pub(crate) fn rust_visit_call_expr(
     Ok(true)
 }
 
+/// Native port of `SemanticAnalyzer.visit_type_alias_stmt` (semanal.py:6311).
+///
+/// Handles the full PEP 695 type alias statement analysis: pushes type args,
+/// analyzes the alias value, constructs the `TypeAlias` node, and handles
+/// placeholder/existing-node updates. Returns `true` if fully handled
+/// (including the `pop_type_args` cleanup), `false` on any error.
+#[pyfunction]
+pub(crate) fn rust_visit_type_alias_stmt(
+    py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let types_mod = py.import("mypy.types")?;
+    let semanal_mod = py.import("mypy.semanal")?;
+    let semanal_shared_mod = py.import("mypy.semanal_shared")?;
+    let typeanal_mod = py.import("mypy.typeanal")?;
+
+    let typealias_cls = nodes_mod.getattr("TypeAlias")?;
+    let placeholder_cls = nodes_mod.getattr("PlaceholderNode")?;
+    let proptype_cls = types_mod.getattr("ProperType")?;
+    let placeholder_type_cls = types_mod.getattr("PlaceholderType")?;
+    let instance_cls = types_mod.getattr("Instance")?;
+    let anytype_cls = types_mod.getattr("AnyType")?;
+    let typeofany = types_mod.getattr("TypeOfAny")?;
+    let from_error = typeofany.getattr("from_error")?;
+
+    let has_placeholder_fn = semanal_shared_mod.getattr("has_placeholder")?;
+    let check_for_explicit_any_fn = typeanal_mod.getattr("check_for_explicit_any")?;
+    let validate_instance_fn = typeanal_mod.getattr("validate_instance")?;
+    let fix_instance_fn = typeanal_mod.getattr("fix_instance")?;
+    let has_any_from_unimported_fn = typeanal_mod.getattr("has_any_from_unimported_type")?;
+    let make_any_non_explicit_fn = semanal_mod.getattr("make_any_non_explicit")?;
+    let make_any_non_unimported_fn = semanal_mod.getattr("make_any_non_unimported")?;
+
+    // Early return: invalid recursive alias
+    if s.getattr("invalid_recursive_alias")?.is_true()? {
+        return Ok(true);
+    }
+
+    // self.statement = s
+    semanal.setattr("statement", s)?;
+
+    // type_params = self.push_type_args(s.type_args, s)
+    let type_args = s.getattr("type_args")?;
+    let type_params = semanal.call_method1("push_type_args", (type_args, s))?;
+    if type_params.is_none() {
+        semanal.call_method1("defer", (s,))?;
+        return Ok(true);
+    }
+
+    // all_type_params_names = [p.name for p in s.type_args]
+    let all_type_params_names: Vec<String> = {
+        let ta_list = match type_args.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(false),
+        };
+        let mut names = Vec::new();
+        for p in ta_list.iter() {
+            let name: String = p.getattr("name")?.extract()?;
+            names.push(name);
+        }
+        names
+    };
+    let all_names_tuple = PyTuple::new(py, all_type_params_names.iter().map(|n| n.as_str()));
+
+    // Wrap the body in a closure so we always call pop_type_args in the finally.
+    let body_result = || -> PyResult<bool> {
+        // existing = self.current_symbol_table().get(s.name.name)
+        let sym_table = semanal.call_method1("current_symbol_table", ())?;
+        let name_obj = s.getattr("name")?;
+        let s_name: String = name_obj.getattr("name")?.extract()?;
+        let existing = sym_table.call_method1("get", (s_name.as_str(),))?;
+
+        if !existing.is_none() {
+            let existing_node = existing.getattr("node")?;
+            let is_typealias = existing_node.is_instance(typealias_cls)?;
+            let is_placeholder = existing_node.is_instance(placeholder_cls)?;
+            let placeholder_line_ok = if is_placeholder {
+                let pline: i64 = existing_node.getattr("line")?.extract()?;
+                let sline: i64 = s.getattr("line")?.extract()?;
+                pline == sline
+            } else {
+                false
+            };
+            if !(is_typealias || placeholder_line_ok) {
+                semanal.call_method1("already_defined", (s_name.as_str(), s, existing, "Name"))?;
+                return Ok(true);
+            }
+        }
+
+        // tag = self.track_incomplete_refs()
+        let tag = semanal.call_method1("track_incomplete_refs", ())?;
+
+        // res, alias_tvars, depends_on, indexed, default_depends = self.analyze_alias(...)
+        let value = s.getattr("value")?;
+        let rvalue = value.call_method1("expr", ())?;
+
+        let analyze_kwargs = pyo3::types::PyDict::new(py);
+        analyze_kwargs.set_item("allow_placeholder", true)?;
+        analyze_kwargs.set_item("declared_type_vars", type_params)?;
+        analyze_kwargs.set_item("all_declared_type_params_names", all_names_tuple)?;
+        analyze_kwargs.set_item("python_3_12_type_alias", true)?;
+
+        let analyze_result = semanal.call_method(
+            "analyze_alias",
+            (s_name.as_str(), rvalue),
+            Some(analyze_kwargs),
+        )?;
+
+        // Unpack 5-tuple
+        let result_tuple = match analyze_result.downcast::<PyTuple>() {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        if result_tuple.len() < 5 {
+            return Ok(false);
+        }
+        let mut res = result_tuple.get_item(0)?;
+        let alias_tvars = result_tuple.get_item(1)?;
+        let depends_on = result_tuple.get_item(2)?;
+        let indexed = result_tuple.get_item(3)?;
+        let default_depends = result_tuple.get_item(4)?;
+
+        // if not res: res = AnyType(TypeOfAny.from_error)
+        // Mypy Type objects are always truthy; `not res` means res is None.
+        if res.is_none() {
+            res = anytype_cls.call1((from_error,))?;
+        }
+
+        // incomplete_target computation
+        let is_func_scope = semanal.call_method1("is_func_scope", ())?.is_true()?;
+        let incomplete_target = if !is_func_scope {
+            let is_proper = res.is_instance(proptype_cls)?;
+            let is_placeholder = res.is_instance(placeholder_type_cls)?;
+            is_proper && is_placeholder
+        } else {
+            has_placeholder_fn.call1((res,))?.is_true()?
+        };
+
+        // if self.found_incomplete_ref(tag) or incomplete_target:
+        let found_incomplete = semanal
+            .call_method1("found_incomplete_ref", (tag,))?
+            .is_true()?;
+        if found_incomplete || incomplete_target {
+            semanal.call_method("mark_incomplete", (s_name.as_str(), value), {
+                let kw = pyo3::types::PyDict::new(py);
+                kw.set_item("becomes_typeinfo", true)?;
+                Some(kw)
+            })?;
+            return Ok(true);
+        }
+
+        // if any(has_placeholder(tv) for tv in alias_tvars):
+        let alias_tvars_list = match alias_tvars.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(false),
+        };
+        let any_has_placeholder = {
+            let mut found = false;
+            for tv in alias_tvars_list.iter() {
+                if has_placeholder_fn.call1((tv,))?.is_true()? {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if any_has_placeholder {
+            semanal.call_method1("defer", ())?;
+        }
+
+        // self.add_type_alias_deps(depends_on)
+        semanal.call_method1("add_type_alias_deps", (depends_on,))?;
+
+        // check_for_explicit_any(res, self.options, self.is_typeshed_stub_file, self.msg, s)
+        let options = semanal.getattr("options")?;
+        let is_typeshed_stub = semanal.getattr("is_typeshed_stub_file")?;
+        let msg = semanal.getattr("msg")?;
+        check_for_explicit_any_fn.call1((res, options, is_typeshed_stub, msg, s))?;
+
+        // res = make_any_non_explicit(res)
+        res = make_any_non_explicit_fn.call1((res,))?;
+
+        // if self.options.disallow_any_unimported and has_any_from_unimported_type(res):
+        let disallow_any_unimported: bool =
+            options.getattr("disallow_any_unimported")?.is_true()?;
+        if disallow_any_unimported {
+            let has_unimported = has_any_from_unimported_fn.call1((res,))?.is_true()?;
+            if has_unimported {
+                msg.call_method1("unimported_type_becomes_any", ("Type alias target", res, s))?;
+                res = make_any_non_unimported_fn.call1((res,))?;
+            }
+        }
+
+        // eager = self.is_func_scope()
+        let eager = is_func_scope;
+
+        // if isinstance(res, ProperType) and isinstance(res, Instance):
+        let is_proper_instance = res.is_instance(proptype_cls)? && res.is_instance(instance_cls)?;
+        if is_proper_instance {
+            let fail = semanal.getattr("fail")?;
+            let valid = validate_instance_fn
+                .call1((res, fail, indexed))?
+                .is_true()?;
+            if !valid {
+                let note = semanal.getattr("note")?;
+                let fix_kwargs = pyo3::types::PyDict::new(py);
+                fix_kwargs.set_item("disallow_any", false)?;
+                fix_kwargs.set_item("options", options)?;
+                fix_instance_fn.call((res, fail, note), Some(fix_kwargs))?;
+            }
+        }
+
+        // alias_node = TypeAlias(res, self.qualified_name(s.name.name), self.cur_mod_id,
+        //                        s.line, s.column, alias_tvars=..., no_args=False,
+        //                        eager=eager, python_3_12_type_alias=True)
+        let qualified_name = semanal.call_method1("qualified_name", (s_name.as_str(),))?;
+        let cur_mod_id = semanal.getattr("cur_mod_id")?;
+        let s_line = s.getattr("line")?;
+        let s_column = s.getattr("column")?;
+
+        let alias_kwargs = pyo3::types::PyDict::new(py);
+        alias_kwargs.set_item("alias_tvars", alias_tvars)?;
+        alias_kwargs.set_item("no_args", false)?;
+        alias_kwargs.set_item("eager", eager)?;
+        alias_kwargs.set_item("python_3_12_type_alias", true)?;
+
+        let alias_node = typealias_cls.call(
+            (res, qualified_name, cur_mod_id, s_line, s_column),
+            Some(alias_kwargs),
+        )?;
+
+        // alias_node.default_depends = default_depends
+        alias_node.setattr("default_depends", default_depends)?;
+
+        // s.alias_node = alias_node
+        s.setattr("alias_node", alias_node)?;
+
+        // Existing-node update logic
+        if !existing.is_none() {
+            let existing_node = existing.getattr("node")?;
+            let is_placeholder_or_typealias = existing_node.is_instance(placeholder_cls)?
+                || existing_node.is_instance(typealias_cls)?;
+            let existing_line: i64 = existing_node.getattr("line")?.extract()?;
+            let sline: i64 = s.getattr("line")?.extract()?;
+            if is_placeholder_or_typealias && existing_line == sline {
+                let is_existing_typealias = existing_node.is_instance(typealias_cls)?;
+                let mut updated = false;
+                if is_existing_typealias {
+                    // existing.node._is_recursive = None
+                    existing_node.setattr("_is_recursive", py.None())?;
+                    let existing_target = existing_node.getattr("target")?;
+                    let existing_alias_tvars = existing_node.getattr("alias_tvars")?;
+                    let new_alias_tvars = alias_node.getattr("alias_tvars")?;
+                    let target_ne = existing_target
+                        .rich_compare(res, CompareOp::Ne)?
+                        .is_true()?;
+                    let tvars_ne = existing_alias_tvars
+                        .rich_compare(new_alias_tvars, CompareOp::Ne)?
+                        .is_true()?;
+                    if target_ne || tvars_ne {
+                        existing_node.setattr("target", res)?;
+                        existing_node.setattr("default_depends", default_depends)?;
+                        existing_node.setattr("alias_tvars", alias_tvars)?;
+                        updated = true;
+                    }
+                } else {
+                    // existing._node = alias_node
+                    existing.setattr("_node", alias_node)?;
+                    updated = true;
+                }
+
+                if updated {
+                    let final_iteration: bool = semanal.getattr("final_iteration")?.is_true()?;
+                    if final_iteration {
+                        semanal
+                            .call_method1("cannot_resolve_name", (s_name.as_str(), "name", s))?;
+                        return Ok(true);
+                    } else {
+                        let defer_kwargs = pyo3::types::PyDict::new(py);
+                        defer_kwargs.set_item("force_progress", true)?;
+                        semanal.call_method("defer", (s,), Some(defer_kwargs))?;
+                    }
+                }
+            } else {
+                // self.add_symbol(s.name.name, alias_node, s)
+                semanal.call_method1("add_symbol", (s_name.as_str(), alias_node, s))?;
+            }
+        } else {
+            // self.add_symbol(s.name.name, alias_node, s)
+            semanal.call_method1("add_symbol", (s_name.as_str(), alias_node, s))?;
+        }
+
+        // current_node = existing.node if existing else alias_node
+        // assert isinstance(current_node, TypeAlias)
+        // self.disable_invalid_recursive_aliases(s, current_node, s.value)
+        let current_node = if !existing.is_none() {
+            existing.getattr("node")?
+        } else {
+            alias_node
+        };
+        semanal.call_method1(
+            "disable_invalid_recursive_aliases",
+            (s, current_node, value),
+        )?;
+
+        // s.name.accept(self)
+        name_obj.call_method1("accept", (semanal,))?;
+
+        Ok(true)
+    };
+
+    // Execute body with finally: self.pop_type_args(s.type_args)
+    let result = body_result();
+    // Always pop_type_args (the finally clause)
+    semanal.call_method1("pop_type_args", (type_args,))?;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

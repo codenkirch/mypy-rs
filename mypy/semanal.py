@@ -511,6 +511,7 @@ try:
         rust_visit_assignment_stmt as _rust_visit_assignment_stmt,
         rust_visit_import as _rust_visit_import,
         rust_visit_call_expr as _rust_visit_call_expr,
+        rust_visit_type_alias_stmt as _rust_visit_type_alias_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -610,6 +611,7 @@ except ImportError:
     _rust_visit_assignment_stmt = None  # type: ignore[assignment]
     _rust_visit_import = None  # type: ignore[assignment]
     _rust_visit_call_expr = None  # type: ignore[assignment]
+    _rust_visit_type_alias_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6309,6 +6311,9 @@ class SemanticAnalyzer(
             self.visit_block(s.bodies[i])
 
     def visit_type_alias_stmt(self, s: TypeAliasStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_type_alias_stmt(s, self):
+                return
         if s.invalid_recursive_alias:
             return
         self.statement = s
