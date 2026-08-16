@@ -222,13 +222,9 @@ fn binary_float_op(
 
 fn unary_op(py: Python<'_>, op: &str, value: &PyAny) -> PyResult<Option<PyObject>> {
     match op {
-        "-" if is_plain_int(value) || is_float(value) => {
-            Ok(Some(unary_dunder(py, value, "neg")?))
-        }
+        "-" if is_plain_int(value) || is_float(value) => Ok(Some(unary_dunder(py, value, "neg")?)),
         "~" if is_plain_int(value) => Ok(Some(unary_dunder(py, value, "invert")?)),
-        "+" if is_plain_int(value) || is_float(value) => {
-            Ok(Some(unary_dunder(py, value, "pos")?))
-        }
+        "+" if is_plain_int(value) || is_float(value) => Ok(Some(unary_dunder(py, value, "pos")?)),
         _ => Ok(None),
     }
 }
@@ -245,10 +241,7 @@ fn binary_op(py: Python<'_>, op: &str, left: &PyAny, right: &PyAny) -> PyResult<
     // float paths (float+float, float+int, int+float)
     let l_float = is_float(left);
     let r_float = is_float(right);
-    if (l_float && r_float)
-        || (l_float && is_plain_int(right))
-        || (is_plain_int(left) && r_float)
-    {
+    if (l_float && r_float) || (l_float && is_plain_int(right)) || (is_plain_int(left) && r_float) {
         return binary_float_op(py, op, left, right);
     }
     // string concat / multiply
