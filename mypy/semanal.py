@@ -459,6 +459,9 @@ try:
         rust_visit_slice_expr as _rust_visit_slice_expr,
         rust_visit_super_expr as _rust_visit_super_expr,
         rust_visit_unary_expr as _rust_visit_unary_expr,
+        rust_visit_assert_stmt as _rust_visit_assert_stmt,
+        rust_visit_operator_assignment_stmt as _rust_visit_operator_assignment_stmt,
+        rust_visit_raise_stmt as _rust_visit_raise_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -506,6 +509,9 @@ except ImportError:
     _rust_visit_slice_expr = None  # type: ignore[assignment]
     _rust_visit_super_expr = None  # type: ignore[assignment]
     _rust_visit_unary_expr = None  # type: ignore[assignment]
+    _rust_visit_assert_stmt = None  # type: ignore[assignment]
+    _rust_visit_operator_assignment_stmt = None  # type: ignore[assignment]
+    _rust_visit_raise_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -5916,6 +5922,9 @@ class SemanticAnalyzer(
         self.statement = old
 
     def visit_raise_stmt(self, s: RaiseStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_raise_stmt(s, self):
+                return
         self.statement = s
         if s.expr:
             s.expr.accept(self)
@@ -5923,6 +5932,9 @@ class SemanticAnalyzer(
             s.from_expr.accept(self)
 
     def visit_assert_stmt(self, s: AssertStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_assert_stmt(s, self):
+                return
         self.statement = s
         if s.expr:
             s.expr.accept(self)
@@ -5930,6 +5942,9 @@ class SemanticAnalyzer(
             s.msg.accept(self)
 
     def visit_operator_assignment_stmt(self, s: OperatorAssignmentStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_operator_assignment_stmt(s, self):
+                return
         self.statement = s
         s.lvalue.accept(self)
         s.rvalue.accept(self)
