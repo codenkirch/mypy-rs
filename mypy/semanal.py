@@ -501,6 +501,7 @@ try:
         rust_visit_lambda_expr as _rust_visit_lambda_expr,
         rust_visit_overloaded_func_def as _rust_visit_overloaded_func_def,
         rust_visit_class_def as _rust_visit_class_def,
+        rust_visit_func_def as _rust_visit_func_def,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -590,6 +591,7 @@ except ImportError:
     _rust_visit_lambda_expr = None  # type: ignore[assignment]
     _rust_visit_overloaded_func_def = None  # type: ignore[assignment]
     _rust_visit_class_def = None  # type: ignore[assignment]
+    _rust_visit_func_def = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -1201,6 +1203,9 @@ class SemanticAnalyzer(
     #
 
     def visit_func_def(self, defn: FuncDef) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_func_def(defn, self):
+                return
         self.statement = defn
 
         # Visit default values because they may contain assignment expressions.

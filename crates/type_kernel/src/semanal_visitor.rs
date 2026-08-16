@@ -3575,6 +3575,73 @@ pub(crate) fn rust_visit_class_def(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_func_def` body — set statement, visit arg
+/// initializers, set is_conditional, set _fullname, conditionally
+/// add_function_to_symbol_table, early-return, else triple-nested CM
+/// (function_scope + set_recurse_into_functions +
+/// inside_except_star_block_set) wrapping analyze_func_def.
+#[pyfunction]
+pub(crate) fn rust_visit_func_def(py: Python<'_>, defn: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", defn)?;
+    // Visit default values (may contain assignment expressions).
+    let arguments = defn.getattr("arguments")?;
+    if let Ok(args_list) = arguments.downcast::<PyList>() {
+        for arg in args_list.iter() {
+            let init = arg.getattr("initializer")?;
+            if !init.is_none() {
+                init.call_method1("accept", (semanal,))?;
+            }
+        }
+    }
+    // defn.is_conditional = self.block_depth[-1] > 0
+    let block_depth = semanal.getattr("block_depth")?;
+    let bd_list = block_depth.downcast::<PyList>()?;
+    let bd_last = bd_list.get_item(bd_list.len() - 1)?;
+    defn.setattr("is_conditional", bd_last.is_true()?)?;
+    // defn._fullname = self.qualified_name(defn.name)
+    let fullname = semanal.call_method1("qualified_name", (defn.getattr("name")?,))?;
+    defn.setattr("_fullname", fullname)?;
+    // Conditionally add to symbol table.
+    let recurse = semanal.getattr("recurse_into_functions")?.is_true()?;
+    let func_stack = semanal.getattr("function_stack")?;
+    let stack_len = func_stack.len()?;
+    if !recurse || stack_len > 0 {
+        let is_decorated = defn.getattr("is_decorated")?.is_true()?;
+        let is_overload = defn.getattr("is_overload")?.is_true()?;
+        if !is_decorated && !is_overload {
+            semanal.call_method1("add_function_to_symbol_table", (defn,))?;
+        }
+    }
+    // Early return.
+    let d_vars = defn.getattr("def_or_infer_vars")?.is_true()?;
+    if !recurse && !d_vars {
+        return Ok(true);
+    }
+    // Triple-nested CM: function_scope + set_recurse_into_functions +
+    // inside_except_star_block_set(value=False).
+    let scope = semanal.getattr("scope")?;
+    let cm1 = scope.call_method1("function_scope", (defn,))?;
+    let cm2 = semanal.call_method0("set_recurse_into_functions")?;
+    let cm3 = semanal.call_method1("inside_except_star_block_set", (false,))?;
+    cm1.call_method1("__enter__", ())?;
+    let enter2 = cm2.call_method1("__enter__", ());
+    match enter2 {
+        Ok(_) => {
+            cm3.call_method1("__enter__", ())?;
+            let inner = semanal.call_method1("analyze_func_def", (defn,));
+            let _ = cm3.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            let _ = cm2.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            let _ = cm1.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            inner?;
+        }
+        Err(err) => {
+            let _ = cm1.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            return Err(err);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
