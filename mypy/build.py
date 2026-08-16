@@ -1030,6 +1030,10 @@ class BuildManager:
         from mypy.copytype import _set_native_copy_active
 
         _set_native_copy_active(self.options.native_type_kernel)
+        # Constant folding: same per-call strangler gate.
+        from mypy.constant_fold import _set_native_constant_fold_active
+
+        _set_native_constant_fold_active(self.options.native_type_kernel)
         # Stage 9: gate standalone checker/checkexpr scalar-returning
         # and type-returning helpers. Parity verified 8198/0 with the
         # type-returning gate on since the truthiness wire fix (#201).
