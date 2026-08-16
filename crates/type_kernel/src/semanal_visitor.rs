@@ -2741,6 +2741,82 @@ pub(crate) fn rust_visit_match_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) 
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 6: leaf-actions shards for return / block-maybe / while bodies.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_return_stmt` body — save+set statement slot, run the
+/// scope/except*-block checks, recurse and try-parse the expression, then
+/// restore the previous statement. The Python body does `old = statement`
+/// then restores `statement = old` at the end; we mirror that exactly.
+#[pyfunction]
+pub(crate) fn rust_visit_return_stmt(
+    _py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let old = semanal.getattr("statement")?;
+    semanal.setattr("statement", s)?;
+    let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+    if !in_func {
+        semanal.call_method1("fail", ("\"return\" outside function", s))?;
+    }
+    let inside = semanal.getattr("return_stmt_inside_except_star_block")?;
+    if inside.is_true()? {
+        fail_serious(semanal, "\"return\" not allowed in except* block", s, false)?;
+    }
+    let expr = s.getattr("expr")?;
+    if !expr.is_none() && expr.is_true()? {
+        expr.call_method1("accept", (semanal,))?;
+        semanal.call_method1("try_parse_as_type_expression", (expr,))?;
+    }
+    semanal.setattr("statement", old)?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_block_maybe` body — visit a block when present.
+#[pyfunction]
+pub(crate) fn rust_visit_block_maybe(py: Python<'_>, b: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    if b.is_none() {
+        return Ok(true);
+    }
+    rust_visit_block(py, b, semanal)
+}
+
+/// `mypy.semanal.visit_while_stmt` body — set statement slot, recurse expr,
+/// bump loop_depth, run the except*-block scope, recurse body, restore
+/// loop_depth, then visit the optional else body.
+#[pyfunction]
+pub(crate) fn rust_visit_while_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    s.getattr("expr")?.call_method1("accept", (semanal,))?;
+
+    let loop_depth = semanal.getattr("loop_depth")?;
+    let last = loop_depth.len()? - 1;
+    let cur: i64 = loop_depth.get_item(last)?.extract()?;
+    loop_depth.set_item(last, cur + 1)?;
+
+    // Build the context manager: semanal.inside_except_star_block_set(
+    //     value=False, entering_loop=True
+    // )
+    let factory_kw = pyo3::types::PyDict::new(py);
+    factory_kw.set_item("value", false)?;
+    factory_kw.set_item("entering_loop", true)?;
+    let cm = semanal.call_method("inside_except_star_block_set", (), Some(factory_kw))?;
+    cm.call_method0("__enter__")?;
+    let result = s.getattr("body")?.call_method1("accept", (semanal,));
+    cm.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+    result?;
+
+    loop_depth.set_item(last, cur)?;
+
+    let else_body = s.getattr("else_body")?;
+    if !else_body.is_none() && !rust_visit_block_maybe(py, else_body, semanal)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

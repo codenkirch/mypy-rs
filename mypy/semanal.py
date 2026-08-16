@@ -471,6 +471,9 @@ try:
         rust_visit_global_decl as _rust_visit_global_decl,
         rust_visit_if_stmt as _rust_visit_if_stmt,
         rust_visit_match_stmt as _rust_visit_match_stmt,
+        rust_visit_block_maybe as _rust_visit_block_maybe,
+        rust_visit_return_stmt as _rust_visit_return_stmt,
+        rust_visit_while_stmt as _rust_visit_while_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -530,6 +533,9 @@ except ImportError:
     _rust_visit_global_decl = None  # type: ignore[assignment]
     _rust_visit_if_stmt = None  # type: ignore[assignment]
     _rust_visit_match_stmt = None  # type: ignore[assignment]
+    _rust_visit_block_maybe = None  # type: ignore[assignment]
+    _rust_visit_return_stmt = None  # type: ignore[assignment]
+    _rust_visit_while_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -5923,6 +5929,9 @@ class SemanticAnalyzer(
         self.block_depth[-1] -= 1
 
     def visit_block_maybe(self, b: Block | None) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_block_maybe(b, self):
+                return
         if b:
             self.visit_block(b)
 
@@ -5934,6 +5943,9 @@ class SemanticAnalyzer(
         s.expr.accept(self)
 
     def visit_return_stmt(self, s: ReturnStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_return_stmt(s, self):
+                return
         old = self.statement
         self.statement = s
         if not self.is_func_scope():
@@ -5981,6 +5993,9 @@ class SemanticAnalyzer(
             self.add_exports(s.rvalue.items)
 
     def visit_while_stmt(self, s: WhileStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_while_stmt(s, self):
+                return
         self.statement = s
         s.expr.accept(self)
         self.loop_depth[-1] += 1
