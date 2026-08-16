@@ -742,6 +742,29 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// Merge new dependency triggers into an existing deps map in place.
+///
+/// Mirrors `mypy.server.deps:merge_dependencies` (line 1208):
+/// `deps.trigger |= new_deps.trigger` for every key in new_deps.
+/// Mutates the passed dict directly.
+#[pyfunction]
+pub fn rust_merge_dependencies(new_deps: &PyDict, deps: &PyDict) -> PyResult<()> {
+    for (trigger, targets) in new_deps.iter() {
+        let trigger_str = trigger.downcast::<PyString>()?.to_str()?.to_string();
+        let target_set: std::collections::HashSet<String> = targets.extract()?;
+        if let Some(existing) = deps.get_item(&trigger_str)? {
+            let existing_set: &PySet = existing.downcast::<PySet>()?;
+            for t in target_set {
+                existing_set.add(PyString::new(trigger.py(), &t))?;
+            }
+        } else {
+            let py_set = PySet::new(trigger.py(), target_set.iter().collect::<Vec<_>>())?;
+            deps.set_item(&trigger_str, py_set)?;
+        }
+    }
+    Ok(())
+}
+
 /// Return the target name corresponding to a deferred node.
 ///
 /// Mirrors `mypy.server.update:target_from_node` (line 1301). For a
