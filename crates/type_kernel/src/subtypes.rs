@@ -282,18 +282,35 @@ pub(crate) fn is_subtype(
                 return is_subtype(l_ub.as_ref(), r_ub.as_ref(), ctx, resolver);
             }
             // Different id: Python checks `left.values` then falls back
-            // to `_is_subtype(left.upper_bound, right)`. The values
-            // branch needs a UnionType join; defer.
+            // to `_is_subtype(left.upper_bound, right)`. Convert values
+            // to a UnionType and try it; if that decides True, done.
+            // Otherwise fall through to the upper-bound comparison.
             if !l_values.is_empty() {
-                return None;
+                let union = Type::UnionType {
+                    items: l_values.clone(),
+                    uses_pep604_syntax: false,
+                    can_be_true: true,
+                    can_be_false: true,
+                };
+                if is_subtype(&union, right, ctx, resolver) == Some(true) {
+                    return Some(true);
+                }
             }
             return is_subtype(l_ub.as_ref(), right, ctx, resolver);
         }
         // right not TypeVarType: Python checks `left.values` then
-        // `_is_subtype(left.upper_bound, right)`. The values branch
-        // needs a UnionType; defer when non-empty.
+        // `_is_subtype(left.upper_bound, right)`. Same UnionType
+        // approach as the different-id branch above.
         if !l_values.is_empty() {
-            return None;
+            let union = Type::UnionType {
+                items: l_values.clone(),
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            };
+            if is_subtype(&union, right, ctx, resolver) == Some(true) {
+                return Some(true);
+            }
         }
         return is_subtype(l_ub.as_ref(), right, ctx, resolver);
     }
