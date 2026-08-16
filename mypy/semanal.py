@@ -474,6 +474,15 @@ try:
         rust_visit_block_maybe as _rust_visit_block_maybe,
         rust_visit_return_stmt as _rust_visit_return_stmt,
         rust_visit_while_stmt as _rust_visit_while_stmt,
+        rust_visit_name_expr as _rust_visit_name_expr,
+        rust_visit_star_expr as _rust_visit_star_expr,
+        rust_visit_as_pattern as _rust_visit_as_pattern,
+        rust_visit_or_pattern as _rust_visit_or_pattern,
+        rust_visit_value_pattern as _rust_visit_value_pattern,
+        rust_visit_sequence_pattern as _rust_visit_sequence_pattern,
+        rust_visit_starred_pattern as _rust_visit_starred_pattern,
+        rust_visit_mapping_pattern as _rust_visit_mapping_pattern,
+        rust_visit_class_pattern as _rust_visit_class_pattern,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -536,6 +545,15 @@ except ImportError:
     _rust_visit_block_maybe = None  # type: ignore[assignment]
     _rust_visit_return_stmt = None  # type: ignore[assignment]
     _rust_visit_while_stmt = None  # type: ignore[assignment]
+    _rust_visit_name_expr = None  # type: ignore[assignment]
+    _rust_visit_star_expr = None  # type: ignore[assignment]
+    _rust_visit_as_pattern = None  # type: ignore[assignment]
+    _rust_visit_or_pattern = None  # type: ignore[assignment]
+    _rust_visit_value_pattern = None  # type: ignore[assignment]
+    _rust_visit_sequence_pattern = None  # type: ignore[assignment]
+    _rust_visit_starred_pattern = None  # type: ignore[assignment]
+    _rust_visit_mapping_pattern = None  # type: ignore[assignment]
+    _rust_visit_class_pattern = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6326,6 +6344,9 @@ class SemanticAnalyzer(
     #
 
     def visit_name_expr(self, expr: NameExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_name_expr(expr, self):
+                return
         n = self.lookup(expr.name, expr)
         if n:
             self.bind_name_expr(expr, n)
@@ -6402,6 +6423,9 @@ class SemanticAnalyzer(
                 item.accept(self)
 
     def visit_star_expr(self, expr: StarExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_star_expr(expr, self):
+                return
         if not expr.valid:
             self.fail("can't use starred expression here", expr, blocker=True)
         else:
@@ -7027,27 +7051,45 @@ class SemanticAnalyzer(
     #
 
     def visit_as_pattern(self, p: AsPattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_as_pattern(p, self):
+                return
         if p.pattern is not None:
             p.pattern.accept(self)
         if p.name is not None:
             self.analyze_lvalue(p.name)
 
     def visit_or_pattern(self, p: OrPattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_or_pattern(p, self):
+                return
         for pattern in p.patterns:
             pattern.accept(self)
 
     def visit_value_pattern(self, p: ValuePattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_value_pattern(p, self):
+                return
         p.expr.accept(self)
 
     def visit_sequence_pattern(self, p: SequencePattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_sequence_pattern(p, self):
+                return
         for pattern in p.patterns:
             pattern.accept(self)
 
     def visit_starred_pattern(self, p: StarredPattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_starred_pattern(p, self):
+                return
         if p.capture is not None:
             self.analyze_lvalue(p.capture)
 
     def visit_mapping_pattern(self, p: MappingPattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_mapping_pattern(p, self):
+                return
         for key in p.keys:
             key.accept(self)
         for value in p.values:
@@ -7056,6 +7098,9 @@ class SemanticAnalyzer(
             self.analyze_lvalue(p.rest)
 
     def visit_class_pattern(self, p: ClassPattern) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_class_pattern(p, self):
+                return
         p.class_ref.accept(self)
         for pos in p.positionals:
             pos.accept(self)
