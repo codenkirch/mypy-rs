@@ -2398,11 +2398,7 @@ pub(crate) fn rust_visit_super_expr(
 /// `mypy.semanal.visit_raise_stmt` body — set statement slot, recurse
 /// into expr / from_expr if present.
 #[pyfunction]
-pub(crate) fn rust_visit_raise_stmt(
-    _py: Python<'_>,
-    s: &PyAny,
-    semanal: &PyAny,
-) -> PyResult<bool> {
+pub(crate) fn rust_visit_raise_stmt(_py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
     semanal.setattr("statement", s)?;
     let expr = s.getattr("expr")?;
     if !expr.is_none() && expr.is_true()? {
