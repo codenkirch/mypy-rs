@@ -332,6 +332,7 @@ try:
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
+        rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_method as _rust_is_method,
         rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
@@ -382,6 +383,7 @@ except ImportError:
     _rust_is_false_literal = None  # type: ignore[assignment]
     _rust_is_literal_none = None  # type: ignore[assignment]
     _rust_is_literal_not_implemented = None  # type: ignore[assignment]
+    _rust_is_empty_generator_function = None  # type: ignore[assignment]
     _rust_is_static = None  # type: ignore[assignment]
     _rust_is_method = None  # type: ignore[assignment]
     _rust_is_property = None  # type: ignore[assignment]
@@ -9421,6 +9423,11 @@ def _is_empty_generator_function(func: FuncItem) -> bool:
     Checks whether a function's body is 'return; yield' (the yield being added only
     to promote the function into a generator function).
     """
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_empty_generator_function(func)
+        except (AssertionError, NotImplementedError):
+            pass
     body = func.body.body
     return (
         len(body) == 2
