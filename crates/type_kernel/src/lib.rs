@@ -614,6 +614,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(checker_visitor::rust_is_static, module)?)?;
     module.add_function(wrap_pyfunction!(checker_visitor::rust_is_property, module)?)?;
+    module.add_function(wrap_pyfunction!(checker_visitor::rust_is_method, module)?)?;
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_is_settable_property,
         module

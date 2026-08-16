@@ -332,6 +332,7 @@ try:
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
+        rust_is_method as _rust_is_method,
         rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
         rust_is_settable_property as _rust_is_settable_property,
@@ -382,6 +383,7 @@ except ImportError:
     _rust_is_literal_none = None  # type: ignore[assignment]
     _rust_is_literal_not_implemented = None  # type: ignore[assignment]
     _rust_is_static = None  # type: ignore[assignment]
+    _rust_is_method = None  # type: ignore[assignment]
     _rust_is_property = None  # type: ignore[assignment]
     _rust_is_settable_property = None  # type: ignore[assignment]
     _rust_is_custom_settable_property = None  # type: ignore[assignment]
@@ -10728,6 +10730,11 @@ def is_typeddict_type_context(lvalue_type: Type) -> bool:
 
 
 def is_method(node: SymbolNode | None) -> bool:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return _rust_is_method(node)
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(node, OverloadedFuncDef):
         return not node.is_property
     if isinstance(node, Decorator):

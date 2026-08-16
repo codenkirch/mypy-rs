@@ -241,6 +241,25 @@ pub(crate) fn rust_is_property(py: Python<'_>, defn: &PyAny) -> PyResult<bool> {
     Ok(false)
 }
 
+/// `mypy.checker.is_method` — structural predicate over a SymbolNode.
+///
+/// Mirrors checker.py:10730-10735. An OverloadedFuncDef is a method when
+/// it is not a property; a Decorator is a method when its var is not a
+/// property; a FuncDef is always a method; anything else is not.
+#[pyfunction]
+pub(crate) fn rust_is_method(py: Python<'_>, node: &PyAny) -> PyResult<bool> {
+    let overloaded_cls = nodes_class(py, "OverloadedFuncDef")?;
+    if node.is_instance(overloaded_cls)? {
+        return Ok(!node.getattr("is_property")?.is_true()?);
+    }
+    let decorator_cls = nodes_class(py, "Decorator")?;
+    if node.is_instance(decorator_cls)? {
+        return Ok(!node.getattr("var")?.getattr("is_property")?.is_true()?);
+    }
+    let func_def_cls = nodes_class(py, "FuncDef")?;
+    node.is_instance(func_def_cls)
+}
+
 /// `mypy.checker.is_settable_property` — does an `OverloadedFuncDef` define
 /// a property with a setter?
 ///
