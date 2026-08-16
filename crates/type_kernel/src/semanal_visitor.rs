@@ -2585,6 +2585,162 @@ pub(crate) fn rust_visit_del_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) ->
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 5: leaf-actions shards for expression-stmt, break/continue,
+// global-decl, and match-stmt bodies.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_expression_stmt` body — set statement slot, recurse
+/// into the expression.
+#[pyfunction]
+pub(crate) fn rust_visit_expression_stmt(
+    _py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let expr = s.getattr("expr")?;
+    expr.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
+/// Shared helper for `visit_break_stmt` / `visit_continue_stmt` — forward a
+/// `self.fail` call with `serious=True` (and optionally `blocker=True`), so
+/// error plumbing (codes, location) stays identical to Python.
+fn fail_serious(semanal: &PyAny, msg: &str, s: &PyAny, blocker: bool) -> PyResult<()> {
+    let kwargs = pyo3::types::PyDict::new(semanal.py());
+    kwargs.set_item("serious", true)?;
+    if blocker {
+        kwargs.set_item("blocker", true)?;
+    }
+    semanal.call_method("fail", (msg, s), Some(kwargs))?;
+    Ok(())
+}
+
+/// `mypy.semanal.visit_break_stmt` body — set statement slot, emit
+/// 'break outside loop' when not in a loop, and 'break not allowed in
+/// except* block'.
+#[pyfunction]
+pub(crate) fn rust_visit_break_stmt(_py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let loop_depth = semanal.getattr("loop_depth")?;
+    let last = loop_depth.len()? - 1;
+    let cur: i64 = loop_depth.get_item(last)?.extract()?;
+    if cur == 0 {
+        fail_serious(semanal, "\"break\" outside loop", s, true)?;
+    }
+    let inside = semanal.getattr("inside_except_star_block")?;
+    if inside.is_true()? {
+        fail_serious(semanal, "\"break\" not allowed in except* block", s, false)?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_continue_stmt` body — same shape as break.
+#[pyfunction]
+pub(crate) fn rust_visit_continue_stmt(
+    _py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let loop_depth = semanal.getattr("loop_depth")?;
+    let last = loop_depth.len()? - 1;
+    let cur: i64 = loop_depth.get_item(last)?.extract()?;
+    if cur == 0 {
+        fail_serious(semanal, "\"continue\" outside loop", s, true)?;
+    }
+    let inside = semanal.getattr("inside_except_star_block")?;
+    if inside.is_true()? {
+        fail_serious(
+            semanal,
+            "\"continue\" not allowed in except* block",
+            s,
+            false,
+        )?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_global_decl` body — set statement slot, fail on
+/// names already declared nonlocal, then add each name to the current
+/// global-decls set.
+#[pyfunction]
+pub(crate) fn rust_visit_global_decl(
+    _py: Python<'_>,
+    g: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", g)?;
+    let names = g.getattr("names")?;
+    let names_l = match names.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let nonlocal_decls = semanal.getattr("nonlocal_decls")?;
+    let nonlocal_decls_l = match nonlocal_decls.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let nonlocal_top = nonlocal_decls_l.get_item(nonlocal_decls_l.len() - 1)?;
+    let global_decls = semanal.getattr("global_decls")?;
+    let global_decls_l = match global_decls.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let global_top = global_decls_l.get_item(global_decls_l.len() - 1)?;
+    for name in names_l.iter() {
+        if nonlocal_top
+            .call_method1("__contains__", (name,))?
+            .is_true()?
+        {
+            let msg = format!("Name \"{}\" is nonlocal and global", name.str()?);
+            semanal.call_method1("fail", (msg.as_str(), g))?;
+        }
+        global_top.call_method1("add", (name,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_match_stmt` body — set statement slot, recurse into
+/// subject, patterns, guards, then visit each body block. The reachability
+/// inference (`infer_reachability_of_match_statement`) runs in Python first,
+/// matching the `visit_if_stmt` split.
+#[pyfunction]
+pub(crate) fn rust_visit_match_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    s.getattr("subject")?.call_method1("accept", (semanal,))?;
+    let patterns = s.getattr("patterns")?;
+    let guards = s.getattr("guards")?;
+    let bodies = s.getattr("bodies")?;
+    let patterns_l = match patterns.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let guards_l = match guards.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let bodies_l = match bodies.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    if patterns_l.len() != guards_l.len() || patterns_l.len() != bodies_l.len() {
+        return Ok(false);
+    }
+    for i in 0..patterns_l.len() {
+        patterns_l.get_item(i)?.call_method1("accept", (semanal,))?;
+        let guard = guards_l.get_item(i)?;
+        if !guard.is_none() {
+            guard.call_method1("accept", (semanal,))?;
+        }
+        if !rust_visit_block(py, bodies_l.get_item(i)?, semanal)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

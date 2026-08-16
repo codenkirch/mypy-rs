@@ -994,6 +994,26 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_expression_stmt,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_break_stmt,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_continue_stmt,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_global_decl,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_match_stmt,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_apply_semantic_analyzer_patches,
         module
     )?)?;
