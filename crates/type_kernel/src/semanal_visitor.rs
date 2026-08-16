@@ -3814,6 +3814,133 @@ pub(crate) fn rust_visit_for_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) ->
     Ok(true)
 }
 
+/// `mypy.semanal.visit_with_stmt` body — async-with check,
+/// unanalyzed_type handling (ProperType/TupleType isinstance checks,
+/// target count logic), zip(expr, target) iteration with types.pop(0),
+/// analyze_lvalue, is_classvar, anal_type, store_declared_types,
+/// analyzed_types assignment, visit_block.
+#[pyfunction]
+pub(crate) fn rust_visit_with_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let nodes_mod = py.import("mypy.nodes")?;
+    let types_mod = py.import("mypy.types")?;
+    let proper_cls = types_mod.getattr("ProperType")?.downcast::<PyType>()?;
+    let tuple_cls = types_mod.getattr("TupleType")?.downcast::<PyType>()?;
+    let tupleexpr_cls = nodes_mod.getattr("TupleExpr")?.downcast::<PyType>()?;
+
+    // async-with check
+    if s.getattr("is_async")?.is_true()? {
+        let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+        let func_stack = semanal.getattr("function_stack")?;
+        let ok = in_func
+            && func_stack.len()? > 0
+            && func_stack
+                .get_item(func_stack.len()? - 1)?
+                .getattr("is_coroutine")?
+                .is_true()?;
+        if !ok {
+            let msg_mod = py.import("mypy.message_registry")?;
+            let msg: String = msg_mod.getattr("ASYNC_WITH_OUTSIDE_COROUTINE")?.extract()?;
+            let codes_mod = py.import("mypy.errorcodes")?;
+            let syntax = codes_mod.getattr("SYNTAX")?;
+            let kw = pyo3::types::PyDict::new(py);
+            kw.set_item("code", syntax)?;
+            semanal.call_method("fail", (msg.as_str(), s), Some(kw))?;
+        }
+    }
+
+    // Build the `types` list from unanalyzed_type
+    let unanalyzed = s.getattr("unanalyzed_type")?;
+    let mut types: Vec<&PyAny> = Vec::new();
+    if !unanalyzed.is_none() {
+        // assert isinstance(unanalyzed, ProperType)
+        if !unanalyzed.is_instance(proper_cls)? {
+            return Ok(false);
+        }
+        // actual_targets = [t for t in s.target if t is not None]
+        let target = s.getattr("target")?;
+        let target_list = match target.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(false),
+        };
+        let actual_count = target_list.iter().filter(|t| !t.is_none()).count();
+        if actual_count == 0 {
+            semanal.call_method(
+                "fail",
+                ("Invalid type comment: \"with\" statement has no targets", s),
+                None,
+            )?;
+        } else if actual_count == 1 {
+            types.push(unanalyzed);
+        } else if unanalyzed.is_instance(tuple_cls)? {
+            let items = unanalyzed.getattr("items")?;
+            let items_list = match items.downcast::<PyList>() {
+                Ok(l) => l,
+                Err(_) => return Ok(false),
+            };
+            if actual_count == items_list.len() {
+                for item in items_list.iter() {
+                    types.push(item);
+                }
+            } else {
+                semanal.call_method(
+                    "fail",
+                    ("Incompatible number of types for \"with\" targets", s),
+                    None,
+                )?;
+            }
+        } else {
+            semanal.call_method(
+                "fail",
+                ("Multiple types expected for multiple \"with\" targets", s),
+                None,
+            )?;
+        }
+    }
+
+    // new_types: list[Type] = []
+    let new_types = PyList::empty(py);
+    let has_unanalyzed = !unanalyzed.is_none();
+
+    // for e, n in zip(s.expr, s.target):
+    let expr_list = s
+        .getattr("expr")?
+        .downcast::<PyList>()
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("s.expr is not a list"))?;
+    let target_list = s.getattr("target")?;
+    let target_list = target_list.downcast::<PyList>()?;
+    let min_len = expr_list.len().min(target_list.len());
+    for i in 0..min_len {
+        let e = expr_list.get_item(i)?;
+        let n = target_list.get_item(i)?;
+        e.call_method1("accept", (semanal,))?;
+        if !n.is_none() {
+            let kwargs_al = pyo3::types::PyDict::new(py);
+            kwargs_al.set_item("explicit_type", has_unanalyzed)?;
+            semanal.call_method("analyze_lvalue", (n,), Some(kwargs_al))?;
+            if !types.is_empty() {
+                let t = types.remove(0);
+                let is_cv = semanal.call_method1("is_classvar", (t,))?.is_true()?;
+                if is_cv {
+                    semanal.call_method1("fail_invalid_classvar", (n,))?;
+                }
+                let allow_tuple = n.is_instance(tupleexpr_cls)?;
+                let kwargs_at = pyo3::types::PyDict::new(py);
+                kwargs_at.set_item("allow_tuple_literal", allow_tuple)?;
+                let analyzed = semanal.call_method("anal_type", (t,), Some(kwargs_at))?;
+                if !analyzed.is_none() {
+                    new_types.append(analyzed)?;
+                    semanal.call_method1("store_declared_types", (n, analyzed))?;
+                }
+            }
+        }
+    }
+
+    s.setattr("analyzed_types", new_types)?;
+    semanal.call_method1("visit_block", (s.getattr("body")?,))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
