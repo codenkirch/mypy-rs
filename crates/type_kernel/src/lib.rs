@@ -980,6 +980,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_visitor::rust_visit_operator_assignment_stmt,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(semanal_visitor::rust_visit_block, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_if_stmt,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_is_valid_del_target,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_del_stmt,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_apply_semantic_analyzer_patches,
         module

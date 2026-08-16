@@ -2475,6 +2475,116 @@ pub(crate) fn rust_visit_operator_assignment_stmt(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 4: leaf-actions shards for block / if-stmt / del-stmt bodies.
+// Pattern: Rust adjusts the analyzer's block_depth list in place, marks
+// the statement slot, and recurses through `semanal.accept` /
+// `expression.accept`. Python keeps the reachability pre-pass (its own
+// options call) and the `fail` call-forward passes through PyO3.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_block` body. Skips unreachable blocks, bumps
+/// block_depth[-1], then `semanal.accept`s each statement.
+#[pyfunction]
+pub(crate) fn rust_visit_block(_py: Python<'_>, b: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    let unreachable = b.getattr("is_unreachable")?;
+    if unreachable.is_true()? {
+        return Ok(true);
+    }
+    let depth = semanal.getattr("block_depth")?;
+    let last = depth.len()? - 1;
+    let cur: i64 = depth.get_item(last)?.extract()?;
+    depth.set_item(last, cur + 1)?;
+    let body = b.getattr("body")?;
+    let stmts = match body.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for s in stmts.iter() {
+        semanal.call_method1("accept", (s,))?;
+    }
+    depth.set_item(last, cur)?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_if_stmt` body. Recurse into each (expr, body)
+/// pair, then the optional else body. The reachability inference on the
+/// statement happens in Python before this is called.
+#[pyfunction]
+pub(crate) fn rust_visit_if_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let exprs = s.getattr("expr")?;
+    let bodies = s.getattr("body")?;
+    let exprs_l = match exprs.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let bodies_l = match bodies.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    if exprs_l.len() != bodies_l.len() {
+        return Ok(false);
+    }
+    for i in 0..exprs_l.len() {
+        let expr = exprs_l.get_item(i)?;
+        let body = bodies_l.get_item(i)?;
+        expr.call_method1("accept", (semanal,))?;
+        if !rust_visit_block(py, body, semanal)? {
+            return Ok(false);
+        }
+    }
+    let else_body = s.getattr("else_body")?;
+    if !else_body.is_none() && else_body.is_true()? && !rust_visit_block(py, else_body, semanal)? {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.is_valid_del_target` — pure shape check predicting
+/// whether `s` is a legal `del` target.
+#[pyfunction]
+pub(crate) fn rust_is_valid_del_target(py: Python<'_>, s: &PyAny) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let simple = ["IndexExpr", "NameExpr", "MemberExpr"];
+    let seq = ["TupleExpr", "ListExpr"];
+    for name in simple {
+        if s.is_instance(nodes_mod.getattr(name)?)? {
+            return Ok(true);
+        }
+    }
+    for name in seq {
+        if s.is_instance(nodes_mod.getattr(name)?)? {
+            let items = s.getattr("items")?;
+            let list = match items.downcast::<PyList>() {
+                Ok(l) => l,
+                Err(_) => return Ok(false),
+            };
+            for item in list.iter() {
+                if !rust_is_valid_del_target(py, item)? {
+                    return Ok(false);
+                }
+            }
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `mypy.semanal.visit_del_stmt` body. Set statement slot, recurse into
+/// expr, then fail if the target is invalid (forwarded to Python's
+/// `self.fail` so the code/location plumbing is unchanged).
+#[pyfunction]
+pub(crate) fn rust_visit_del_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let expr = s.getattr("expr")?;
+    expr.call_method1("accept", (semanal,))?;
+    if !rust_is_valid_del_target(py, expr)? {
+        semanal.call_method1("fail", ("Invalid delete target", s))?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
