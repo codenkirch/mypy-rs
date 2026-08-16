@@ -1181,7 +1181,7 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
             and join._native_join_resolver is not None
         ):
             try:
-                result = join._type_kernel.rust_meet_tuples(
+                result = join._type_kernel.rust_meet_tuples(  # type: ignore[attr-defined]
                     join._serialize_type(s),
                     join._serialize_type(t),
                     state.strict_optional,
@@ -1195,7 +1195,7 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
                     from mypy.types import read_type_list
                     from mypy.wirefixup import fixup_wire_type
 
-                    decoded = read_type_list(join._ReadBuffer(bytes(result)))
+                    decoded = read_type_list(join._ReadBuffer(bytes(result)))  # type: ignore[attr-defined]
                     # Rust re-serializes each met item as a wire Type
                     # carrying only a type_ref string; decode to live
                     # TypeInfo via the join_tuples fixup idiom. A missing

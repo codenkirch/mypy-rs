@@ -302,7 +302,7 @@ class _TypeRefFixer(TypeTranslator):
                 return sym.func
             return None
         if isinstance(sym, FuncDef):
-            ctyp = get_proper_type(sym.type) if sym.type else None
+            ctyp = sym.type
             if isinstance(ctyp, CallableType) and len(ctyp.arg_types) == len(t.arg_types):
                 return sym
             return None

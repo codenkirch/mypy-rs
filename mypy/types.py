@@ -32,7 +32,7 @@ from librt.internal import (
 try:
     from librt.internal import write_raw_bytes
 except ImportError:
-    write_raw_bytes = None
+    write_raw_bytes = None  # type: ignore[assignment]
 
 import mypy.nodes
 from mypy.bogus_type import Bogus
@@ -1906,7 +1906,7 @@ class Instance(ProperType):
             # type is unchanged, so the effective flags stay the same).
             native.can_be_true = self.can_be_true
             native.can_be_false = self.can_be_false
-            return native
+            return cast(Instance, native)
         new = Instance(
             typ=self.type,
             args=args if args is not _dummy else self.args,
@@ -3107,7 +3107,7 @@ class TupleType(ProperType):
             # to False, but the wire round-trip preserves the original
             # value; reset it to match Python's behavior.
             native.implicit = False  # type: ignore[attr-defined]
-            return native
+            return cast(TupleType, native)
         if fallback is None:
             fallback = self.partial_fallback
         if items is None:
@@ -3365,7 +3365,7 @@ class TypedDictType(ProperType):
                 changes["is_closed"] = is_closed
             native = _native_copy_modified(self, changes)
             if native is not None:
-                return native
+                return cast(TypedDictType, native)
         if fallback is None:
             fallback = self.fallback
         if item_types is None:
