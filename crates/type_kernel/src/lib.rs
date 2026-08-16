@@ -1430,6 +1430,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(serverdeps::rust_target_from_node, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_merge_dependencies,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
     module.add_function(wrap_pyfunction!(
         stubgen::rust_stubgen_render_type_args,

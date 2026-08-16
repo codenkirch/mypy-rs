@@ -94,12 +94,14 @@ try:
         rust_compute_wildcard_triggers as _rust_compute_wildcard_triggers,
     )
     from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
+    from type_kernel import rust_merge_dependencies as _rust_merge_dependencies
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _rust_compute_target_modules = None  # type: ignore[assignment]
     _rust_compute_wildcard_triggers = None  # type: ignore[assignment]
     _rust_get_type_triggers = None  # type: ignore[assignment]
+    _rust_merge_dependencies = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag read by the gate below; set by the build manager from
@@ -1206,6 +1208,13 @@ class TypeTriggersVisitor(TypeVisitor[list[str]]):
 
 
 def merge_dependencies(new_deps: dict[str, set[str]], deps: dict[str, set[str]]) -> None:
+    # Issue #388: native gate for merge_dependencies (Phase F).
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        try:
+            _rust_merge_dependencies(new_deps, deps)
+            return
+        except Exception:
+            pass
     for trigger, targets in new_deps.items():
         deps.setdefault(trigger, set()).update(targets)
 
