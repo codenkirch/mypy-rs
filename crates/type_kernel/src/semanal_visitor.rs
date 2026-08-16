@@ -2274,6 +2274,119 @@ pub(crate) fn rust_visit_template_str_expr(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 2: leaf-actions shards for additional simple recurse-only visit_*
+// bodies (semanal.py). Same pattern as slice 1: Rust walks, Python falls
+// back on unexpected shapes.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_unary_expr` body — recurse into expr.expr.
+#[pyfunction]
+pub(crate) fn rust_visit_unary_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    match expr.getattr("expr") {
+        Ok(inner) => {
+            inner.call_method1("accept", (semanal,))?;
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// `mypy.semanal.visit_comparison_expr` body — recurse into each operand.
+#[pyfunction]
+pub(crate) fn rust_visit_comparison_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let operands = match expr.getattr("operands") {
+        Ok(o) => o,
+        Err(_) => return Ok(false),
+    };
+    let list = match operands.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for op in list.iter() {
+        op.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_slice_expr` body — recurse into begin/end/stride
+/// when not None.
+#[pyfunction]
+pub(crate) fn rust_visit_slice_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    // Python pre-checks are `if expr.begin_index:` etc. — truthiness, not
+    // is-not-None. Mirror exactly via is_true() to match the fallback loop.
+    let begin = expr.getattr("begin_index")?;
+    if !begin.is_none() && begin.is_true()? {
+        begin.call_method1("accept", (semanal,))?;
+    }
+    let end = expr.getattr("end_index")?;
+    if !end.is_none() && end.is_true()? {
+        end.call_method1("accept", (semanal,))?;
+    }
+    let stride = expr.getattr("stride")?;
+    if !stride.is_none() && stride.is_true()? {
+        stride.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_conditional_expr` body — recurse into if_expr,
+/// cond, else_expr in order.
+#[pyfunction]
+pub(crate) fn rust_visit_conditional_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    for name in ["if_expr", "cond", "else_expr"] {
+        let v = expr.getattr(name)?;
+        v.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_super_expr` body. Python side is responsible for
+/// the `self.fail` pre-check (it has access to self.type and self.fail);
+/// it passes `self.type` (may be None) here. Rust sets `expr.info` to
+/// the type and recurses into `expr.call.args`.
+#[pyfunction]
+pub(crate) fn rust_visit_super_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+    the_type: &PyAny,
+) -> PyResult<bool> {
+    expr.setattr("info", the_type)?;
+    let call = match expr.getattr("call") {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    let args = match call.getattr("args") {
+        Ok(a) => a,
+        Err(_) => return Ok(false),
+    };
+    let list = match args.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for arg in list.iter() {
+        arg.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
