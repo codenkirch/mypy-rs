@@ -6780,7 +6780,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 self.check_multiple_inheritance(info)
             if local_errors.has_new_errors():
                 # "class A(B, C)" unsafe, now check "class A(C, B)":
-                reversed_pair = cast("tuple[Instance, Instance]", instances[::-1])
+                reversed_pair = instances[::-1]
                 base_classes = _get_base_classes(reversed_pair)
                 info, full_name = _make_fake_typeinfo_and_full_name(
                     base_classes, curr_module, self.options
