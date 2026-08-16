@@ -464,8 +464,13 @@ try:
         rust_visit_raise_stmt as _rust_visit_raise_stmt,
         rust_is_valid_del_target as _rust_is_valid_del_target,
         rust_visit_block as _rust_visit_block,
+        rust_visit_break_stmt as _rust_visit_break_stmt,
+        rust_visit_continue_stmt as _rust_visit_continue_stmt,
         rust_visit_del_stmt as _rust_visit_del_stmt,
+        rust_visit_expression_stmt as _rust_visit_expression_stmt,
+        rust_visit_global_decl as _rust_visit_global_decl,
         rust_visit_if_stmt as _rust_visit_if_stmt,
+        rust_visit_match_stmt as _rust_visit_match_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -518,8 +523,13 @@ except ImportError:
     _rust_visit_raise_stmt = None  # type: ignore[assignment]
     _rust_is_valid_del_target = None  # type: ignore[assignment]
     _rust_visit_block = None  # type: ignore[assignment]
+    _rust_visit_break_stmt = None  # type: ignore[assignment]
+    _rust_visit_continue_stmt = None  # type: ignore[assignment]
     _rust_visit_del_stmt = None  # type: ignore[assignment]
+    _rust_visit_expression_stmt = None  # type: ignore[assignment]
+    _rust_visit_global_decl = None  # type: ignore[assignment]
     _rust_visit_if_stmt = None  # type: ignore[assignment]
+    _rust_visit_match_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -5917,6 +5927,9 @@ class SemanticAnalyzer(
             self.visit_block(b)
 
     def visit_expression_stmt(self, s: ExpressionStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_expression_stmt(s, self):
+                return
         self.statement = s
         s.expr.accept(self)
 
@@ -6002,6 +6015,9 @@ class SemanticAnalyzer(
         self.visit_block_maybe(s.else_body)
 
     def visit_break_stmt(self, s: BreakStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_break_stmt(s, self):
+                return
         self.statement = s
         if self.loop_depth[-1] == 0:
             self.fail('"break" outside loop', s, serious=True, blocker=True)
@@ -6009,6 +6025,9 @@ class SemanticAnalyzer(
             self.fail('"break" not allowed in except* block', s, serious=True)
 
     def visit_continue_stmt(self, s: ContinueStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_continue_stmt(s, self):
+                return
         self.statement = s
         if self.loop_depth[-1] == 0:
             self.fail('"continue" outside loop', s, serious=True, blocker=True)
@@ -6112,6 +6131,9 @@ class SemanticAnalyzer(
             return False
 
     def visit_global_decl(self, g: GlobalDecl) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_global_decl(g, self):
+                return
         self.statement = g
         for name in g.names:
             if name in self.nonlocal_decls[-1]:
@@ -6150,6 +6172,9 @@ class SemanticAnalyzer(
     def visit_match_stmt(self, s: MatchStmt) -> None:
         self.statement = s
         infer_reachability_of_match_statement(s, self.options)
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_match_stmt(s, self):
+                return
         s.subject.accept(self)
         for i in range(len(s.patterns)):
             s.patterns[i].accept(self)
