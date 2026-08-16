@@ -3333,6 +3333,87 @@ pub(crate) fn rust_visit_type_application(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 10: leaf-actions shards for the list/set comprehension visitors
+// (async-for-outside-coroutine check + generator recurse).
+// ---------------------------------------------------------------------------
+
+/// Shared check for `any(expr.generator.is_async)` outside a coroutine,
+/// emitting the ASYNC_FOR_OUTSIDE_COROUTINE syntax code. Mirrors the
+/// Python prelude of the list/set comprehension visitors.
+fn check_async_comp_for(semanal: &PyAny, generator: &PyAny, ctx: &PyAny) -> PyResult<bool> {
+    // any(is_async) over the generator's index/unpacked is_async flags.
+    // The GeneratorExpr/DictionaryComprehension node stores is_async as a
+    // list-of-bool aligned with the for clauses; mirror `any(...)` by
+    // scanning the `is_async` attribute on either the expr (dict comp)
+    // or expr.generator (list/set comp) — callers pass the node whose
+    // `.is_async` is a list.
+    let is_async_attr = generator.getattr("is_async")?;
+    let has_async = match is_async_attr.downcast::<PyList>() {
+        Ok(list) => {
+            let mut any = false;
+            for flag in list.iter() {
+                if flag.is_true()? {
+                    any = true;
+                    break;
+                }
+            }
+            any
+        }
+        Err(_) => is_async_attr.is_true()?,
+    };
+    if !has_async {
+        // Short-circuit: no async for clause, no check needed.
+        return Ok(false);
+    }
+    let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+    let function_stack = semanal.getattr("function_stack")?;
+    let ok = in_func
+        && function_stack.len()? > 0
+        && function_stack
+            .get_item(function_stack.len()? - 1)?
+            .getattr("is_coroutine")?
+            .is_true()?;
+    if !ok {
+        let py = semanal.py();
+        let codes_mod = py.import("mypy.errorcodes")?;
+        let syntax = codes_mod.getattr("SYNTAX")?;
+        let msg_mod = py.import("mypy.message_registry")?;
+        let msg: String = msg_mod.getattr("ASYNC_FOR_OUTSIDE_COROUTINE")?.extract()?;
+        let kw = pyo3::types::PyDict::new(py);
+        kw.set_item("code", syntax)?;
+        semanal.call_method("fail", (msg.as_str(), ctx), Some(kw))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_list_comprehension` body — async-for check on the
+/// generator, then recurse the generator.
+#[pyfunction]
+pub(crate) fn rust_visit_list_comprehension(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let generator = expr.getattr("generator")?;
+    check_async_comp_for(semanal, generator, expr)?;
+    generator.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_set_comprehension` body — same shape.
+#[pyfunction]
+pub(crate) fn rust_visit_set_comprehension(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let generator = expr.getattr("generator")?;
+    check_async_comp_for(semanal, generator, expr)?;
+    generator.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
