@@ -502,6 +502,7 @@ try:
         rust_visit_overloaded_func_def as _rust_visit_overloaded_func_def,
         rust_visit_class_def as _rust_visit_class_def,
         rust_visit_func_def as _rust_visit_func_def,
+        rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -592,6 +593,7 @@ except ImportError:
     _rust_visit_overloaded_func_def = None  # type: ignore[assignment]
     _rust_visit_class_def = None  # type: ignore[assignment]
     _rust_visit_func_def = None  # type: ignore[assignment]
+    _rust_visit_nonlocal_decl = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6224,6 +6226,9 @@ class SemanticAnalyzer(
             self.global_decls[-1].add(name)
 
     def visit_nonlocal_decl(self, d: NonlocalDecl) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_nonlocal_decl(d, self):
+                return
         self.statement = d
         if self.is_module_scope():
             self.fail("nonlocal declaration not allowed at module level", d)
