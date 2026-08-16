@@ -3414,6 +3414,81 @@ pub(crate) fn rust_visit_set_comprehension(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 11: leaf-actions shards for dictionary comprehension,
+// generator expression, and lambda visitors. These use `self.enter(expr)`
+// and `self.inside_except_star_block_set(False, entering_loop=False)`
+// context managers, mirrored here via `__enter__` / `__exit__`.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_dictionary_comprehension` body — async-for
+/// check (is_async lives on the expr itself, not a nested generator),
+/// then `enter(expr)` CM wrapping `analyze_comp_for` + key/value
+/// accept, then `analyze_comp_for_2`.
+#[pyfunction]
+pub(crate) fn rust_visit_dictionary_comprehension(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    check_async_comp_for(semanal, expr, expr)?;
+    let cm = semanal.call_method1("enter", (expr,))?;
+    cm.call_method1("__enter__", ())?;
+    let inner = (|| -> PyResult<()> {
+        semanal.call_method1("analyze_comp_for", (expr,))?;
+        expr.getattr("key")?.call_method1("accept", (semanal,))?;
+        expr.getattr("value")?.call_method1("accept", (semanal,))?;
+        Ok(())
+    })();
+    cm.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+    inner?;
+    semanal.call_method1("analyze_comp_for_2", (expr,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_generator_expr` body — `enter(expr)` CM
+/// wrapping `analyze_comp_for` + left_expr accept, then
+/// `analyze_comp_for_2`.
+#[pyfunction]
+pub(crate) fn rust_visit_generator_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let cm = semanal.call_method1("enter", (expr,))?;
+    cm.call_method1("__enter__", ())?;
+    let inner = (|| -> PyResult<()> {
+        semanal.call_method1("analyze_comp_for", (expr,))?;
+        expr.getattr("left_expr")?
+            .call_method1("accept", (semanal,))?;
+        Ok(())
+    })();
+    cm.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+    inner?;
+    semanal.call_method1("analyze_comp_for_2", (expr,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_lambda_expr` body — analyze arg initializers,
+/// then `inside_except_star_block_set(False, entering_loop=False)` CM
+/// wrapping `analyze_function_body`.
+#[pyfunction]
+pub(crate) fn rust_visit_lambda_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.call_method1("analyze_arg_initializers", (expr,))?;
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("entering_loop", false)?;
+    let cm = semanal.call_method("inside_except_star_block_set", (false,), Some(kwargs))?;
+    cm.call_method1("__enter__", ())?;
+    let inner = semanal.call_method1("analyze_function_body", (expr,));
+    cm.call_method1("__exit__", (py.None(), py.None(), py.None()))?;
+    inner?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

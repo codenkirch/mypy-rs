@@ -496,6 +496,9 @@ try:
         rust_visit_type_application as _rust_visit_type_application,
         rust_visit_list_comprehension as _rust_visit_list_comprehension,
         rust_visit_set_comprehension as _rust_visit_set_comprehension,
+        rust_visit_dictionary_comprehension as _rust_visit_dictionary_comprehension,
+        rust_visit_generator_expr as _rust_visit_generator_expr,
+        rust_visit_lambda_expr as _rust_visit_lambda_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -580,6 +583,9 @@ except ImportError:
     _rust_visit_type_application = None  # type: ignore[assignment]
     _rust_visit_list_comprehension = None  # type: ignore[assignment]
     _rust_visit_set_comprehension = None  # type: ignore[assignment]
+    _rust_visit_dictionary_comprehension = None  # type: ignore[assignment]
+    _rust_visit_generator_expr = None  # type: ignore[assignment]
+    _rust_visit_lambda_expr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -7009,6 +7015,9 @@ class SemanticAnalyzer(
         expr.generator.accept(self)
 
     def visit_dictionary_comprehension(self, expr: DictionaryComprehension) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_dictionary_comprehension(expr, self):
+                return
         if any(expr.is_async):
             if (
                 not self.is_func_scope()
@@ -7024,6 +7033,9 @@ class SemanticAnalyzer(
         self.analyze_comp_for_2(expr)
 
     def visit_generator_expr(self, expr: GeneratorExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_generator_expr(expr, self):
+                return
         with self.enter(expr):
             self.analyze_comp_for(expr)
             expr.left_expr.accept(self)
@@ -7054,6 +7066,9 @@ class SemanticAnalyzer(
         expr.sequences[0].accept(self)
 
     def visit_lambda_expr(self, expr: LambdaExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_lambda_expr(expr, self):
+                return
         self.analyze_arg_initializers(expr)
         with self.inside_except_star_block_set(False, entering_loop=False):
             self.analyze_function_body(expr)
