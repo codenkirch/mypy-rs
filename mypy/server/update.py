@@ -168,6 +168,7 @@ try:
         rust_dedupe_modules as _rust_dedupe_modules,
         rust_extract_fnam_from_message as _rust_extract_fnam_from_message,
         rust_extract_possible_fnam_from_message as _rust_extract_possible_fnam_from_message,
+        rust_find_relative_leaf_module as _rust_find_relative_leaf_module,
         rust_get_module_to_path_map as _rust_get_module_to_path_map,
         rust_get_sources as _rust_get_sources,
         rust_sort_messages_preserving_file_order as _rust_sort_messages_preserving_file_order,
@@ -181,6 +182,7 @@ except ImportError:
     _rust_extract_fnam_from_message = None  # type: ignore[assignment]
     _rust_extract_possible_fnam_from_message = None  # type: ignore[assignment]
     _rust_sort_messages_preserving_file_order = None  # type: ignore[assignment]
+    _rust_find_relative_leaf_module = None  # type: ignore[assignment]
     _HAS_NATIVE_UPDATE = False
 
 _native_update_active: bool = False
@@ -735,6 +737,15 @@ def find_relative_leaf_module(modules: list[tuple[str, str]], graph: Graph) -> t
         graph: Program import graph that contains all modules in the module list
     """
     assert modules
+    # Issue #388: native gate for find_relative_leaf_module (Phase F).
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            deps = {module: list(graph[module].dependencies) for module, _ in modules}
+            result = _rust_find_relative_leaf_module(modules, deps)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     # Sort for repeatable results.
     modules = sorted(modules)
     module_set = {module for module, _ in modules}
