@@ -1058,7 +1058,7 @@ class NameAndMemberCollector(TraverserVisitor):
 
 
 def all_name_and_member_expressions(
-    node: Expression,
+    node: MypyFile | Expression,
 ) -> tuple[list[NameExpr], list[MemberExpr]]:
     if _TRAVERSER_HAS_KERNEL:
         try:
@@ -1082,7 +1082,7 @@ class StringSeeker(TraverserVisitor):
         self.found = True
 
 
-def has_str_expression(node: Expression) -> bool:
+def has_str_expression(node: MypyFile | Expression) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_str_expression(_serialize_ast_node(node))
@@ -1153,7 +1153,7 @@ class AwaitSeeker(TraverserVisitor):
         self.found = True
 
 
-def has_await_expression(expr: Expression) -> bool:
+def has_await_expression(expr: MypyFile | FuncDef | Expression) -> bool:
     if _TRAVERSER_HAS_KERNEL:
         try:
             return _rust_has_await_expression(_serialize_ast_node(expr))
