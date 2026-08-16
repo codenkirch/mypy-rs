@@ -27,7 +27,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
+use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
 
 use crate::refs::{is_instance, TypeRefs};
 
@@ -740,6 +740,39 @@ pub fn rust_sort_messages_preserving_file_order(
     // Phase 3: sort groups by file order, then flatten
     groups.sort_by_key(|g| g.0.unwrap_or(n));
     groups.into_iter().flat_map(|(_, g)| g).collect()
+}
+
+/// Return the target name corresponding to a deferred node.
+///
+/// Mirrors `mypy.server.update:target_from_node` (line 1301). For a
+/// MypyFile, returns the module iff node.fullname matches; else None.
+/// For FuncDef/OverloadedFuncDef, returns info.fullname.name or
+/// module.name. Returns None when the node is not a valid target.
+#[pyfunction]
+pub fn rust_target_from_node(
+    py: Python<'_>,
+    module: &str,
+    node: &PyAny,
+) -> PyResult<Option<String>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let mypy_file_cls = nodes_mod.getattr("MypyFile")?.downcast::<PyType>()?;
+    let node_fullname = node.getattr("fullname")?.extract::<String>()?;
+
+    if node.is_instance(mypy_file_cls)? {
+        if module == node_fullname {
+            return Ok(Some(module.to_string()));
+        }
+        return Ok(None);
+    }
+
+    // OverloadedFuncDef or FuncDef
+    let info = node.getattr("info")?;
+    let node_name = node.getattr("name")?.extract::<String>()?;
+    if !info.is_none() {
+        let info_fullname = info.getattr("fullname")?.extract::<String>()?;
+        return Ok(Some(format!("{}.{}", info_fullname, node_name)));
+    }
+    Ok(Some(format!("{}.{}", module, node_name)))
 }
 
 /// Find all deps of initial modules that have not had their tree loaded.

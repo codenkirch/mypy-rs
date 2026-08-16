@@ -173,6 +173,7 @@ try:
         rust_get_module_to_path_map as _rust_get_module_to_path_map,
         rust_get_sources as _rust_get_sources,
         rust_sort_messages_preserving_file_order as _rust_sort_messages_preserving_file_order,
+        rust_target_from_node as _rust_target_from_node,
     )
 
     _HAS_NATIVE_UPDATE = True
@@ -185,6 +186,7 @@ except ImportError:
     _rust_sort_messages_preserving_file_order = None  # type: ignore[assignment]
     _rust_find_relative_leaf_module = None  # type: ignore[assignment]
     _rust_find_unloaded_deps = None  # type: ignore[assignment]
+    _rust_target_from_node = None  # type: ignore[assignment]
     _HAS_NATIVE_UPDATE = False
 
 _native_update_active: bool = False
@@ -1307,6 +1309,12 @@ def target_from_node(module: str, node: FuncDef | MypyFile | OverloadedFuncDef) 
     Returns the target name, or None if the node is not a valid target in the given
     module (for example, if it's actually defined in another module).
     """
+    # Issue #388: native gate for target_from_node.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            return _rust_target_from_node(module, node)
+        except Exception:
+            pass
     if isinstance(node, MypyFile):
         if module != node.fullname:
             # Actually a reference to another module -- likely a stale dependency.
