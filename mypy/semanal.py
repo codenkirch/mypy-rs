@@ -494,6 +494,8 @@ try:
         rust_visit_assert_type_expr as _rust_visit_assert_type_expr,
         rust_visit_reveal_expr as _rust_visit_reveal_expr,
         rust_visit_type_application as _rust_visit_type_application,
+        rust_visit_list_comprehension as _rust_visit_list_comprehension,
+        rust_visit_set_comprehension as _rust_visit_set_comprehension,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -576,6 +578,8 @@ except ImportError:
     _rust_visit_assert_type_expr = None  # type: ignore[assignment]
     _rust_visit_reveal_expr = None  # type: ignore[assignment]
     _rust_visit_type_application = None  # type: ignore[assignment]
+    _rust_visit_list_comprehension = None  # type: ignore[assignment]
+    _rust_visit_set_comprehension = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6977,6 +6981,9 @@ class SemanticAnalyzer(
                 expr.types[i] = analyzed
 
     def visit_list_comprehension(self, expr: ListComprehension) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_list_comprehension(expr, self):
+                return
         if any(expr.generator.is_async):
             if (
                 not self.is_func_scope()
@@ -6988,6 +6995,9 @@ class SemanticAnalyzer(
         expr.generator.accept(self)
 
     def visit_set_comprehension(self, expr: SetComprehension) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_set_comprehension(expr, self):
+                return
         if any(expr.generator.is_async):
             if (
                 not self.is_func_scope()

@@ -1106,6 +1106,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_list_comprehension,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_visit_set_comprehension,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_apply_semantic_analyzer_patches,
         module
     )?)?;
