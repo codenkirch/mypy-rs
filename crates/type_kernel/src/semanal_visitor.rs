@@ -4268,6 +4268,181 @@ pub(crate) fn rust_visit_import_from(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_assignment_stmt` body — identity check, track
+/// incomplete refs, conditional rvalue visit with allow_unbound_tvars
+/// and basic_type_applications, special form dispatch, normal path
+/// (unwrap_final, analyze_lvalues, process_type_annotation, etc).
+#[pyfunction]
+pub(crate) fn rust_visit_assignment_stmt(
+    py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+
+    // Special case 'X = X' in global scope.
+    let is_identity = semanal
+        .call_method1("analyze_identity_global_assignment", (s,))?
+        .is_true()?;
+    if is_identity {
+        return Ok(true);
+    }
+
+    let tag = semanal.call_method1("track_incomplete_refs", ())?;
+
+    // Rvalue visit, conditional on type form / typevar-like.
+    let can_be_type_form = semanal
+        .call_method1("can_possibly_be_type_form", (s,))?
+        .is_true()?;
+    let can_be_typevarlike = semanal
+        .call_method1("can_possibly_be_typevarlike_declaration", (s,))?
+        .is_true()?;
+
+    let rvalue = s.getattr("rvalue")?;
+
+    // Save/restore allow_unbound_tvars and basic_type_applications
+    let old_allow_unbound = semanal.getattr("allow_unbound_tvars")?;
+    semanal.setattr("allow_unbound_tvars", true)?;
+
+    if can_be_type_form {
+        let old_basic = semanal.getattr("basic_type_applications")?;
+        semanal.setattr("basic_type_applications", true)?;
+        rvalue.call_method1("accept", (semanal,))?;
+        semanal.setattr("basic_type_applications", old_basic)?;
+    } else if can_be_typevarlike {
+        rvalue.call_method1("accept", (semanal,))?;
+    } else {
+        semanal.setattr("allow_unbound_tvars", old_allow_unbound)?;
+        rvalue.call_method1("accept", (semanal,))?;
+    }
+    semanal.setattr("allow_unbound_tvars", old_allow_unbound)?;
+
+    // Check incomplete refs or should_wait_rhs.
+    let found_incomplete = semanal
+        .call_method1("found_incomplete_ref", (tag,))?
+        .is_true()?;
+    let should_wait = semanal
+        .call_method1("should_wait_rhs", (rvalue,))?
+        .is_true()?;
+
+    if found_incomplete || should_wait {
+        // Mark incomplete for each modified name.
+        let semanal_mod = py.import("mypy.semanal")?;
+        let names_mod_fn = semanal_mod.getattr("names_modified_by_assignment")?;
+        let names_list = names_mod_fn.call1((s,))?;
+        let names_pylist = match names_list.downcast::<PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(false),
+        };
+        for expr in names_pylist.iter() {
+            let name: String = expr.getattr("name")?.extract()?;
+            semanal.call_method1("mark_incomplete", (name.as_str(), expr))?;
+        }
+        return Ok(true);
+    }
+
+    if can_be_type_form {
+        semanal.setattr("allow_unbound_tvars", true)?;
+        rvalue.call_method1("accept", (semanal,))?;
+        semanal.setattr("allow_unbound_tvars", old_allow_unbound)?;
+    }
+
+    // Special form dispatch
+    let mut special_form = false;
+
+    let is_alias = semanal
+        .call_method1("check_and_set_up_type_alias", (s,))?
+        .is_true()?;
+    if is_alias {
+        s.setattr("is_alias_def", true)?;
+        special_form = true;
+    } else {
+        let callexpr_type = py.import("mypy.nodes")?.getattr("CallExpr")?;
+        if rvalue.is_instance(callexpr_type)? {
+            let process_typevar = semanal
+                .call_method1("process_typevar_declaration", (s,))?
+                .is_true()?;
+            if process_typevar {
+                special_form = true;
+            } else {
+                let process_paramspec = semanal
+                    .call_method1("process_paramspec_declaration", (s,))?
+                    .is_true()?;
+                if process_paramspec {
+                    special_form = true;
+                } else {
+                    let process_typevartuple = semanal
+                        .call_method1("process_typevartuple_declaration", (s,))?
+                        .is_true()?;
+                    if process_typevartuple {
+                        special_form = true;
+                    } else {
+                        let namedtuple = semanal
+                            .call_method1("analyze_namedtuple_assign", (s,))?
+                            .is_true()?;
+                        if namedtuple {
+                            special_form = true;
+                        } else {
+                            let typeddict = semanal
+                                .call_method1("analyze_typeddict_assign", (s,))?
+                                .is_true()?;
+                            if typeddict {
+                                special_form = true;
+                            } else {
+                                let newtype_analyzer = semanal.getattr("newtype_analyzer")?;
+                                let newtype = newtype_analyzer
+                                    .call_method1("process_newtype_declaration", (s,))?
+                                    .is_true()?;
+                                if newtype {
+                                    special_form = true;
+                                } else {
+                                    let enum_assign = semanal
+                                        .call_method1("analyze_enum_assign", (s,))?
+                                        .is_true()?;
+                                    if enum_assign {
+                                        special_form = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if special_form {
+        semanal.call_method1("record_special_form_lvalue", (s,))?;
+        return Ok(true);
+    }
+
+    // Clear alias flag
+    s.setattr("is_alias_def", false)?;
+
+    // Normal assignment analysis
+    let is_final_def = semanal.call_method1("unwrap_final", (s,))?;
+    s.setattr("is_final_def", is_final_def)?;
+    semanal.call_method1("analyze_lvalues", (s,))?;
+    semanal.call_method1("check_final_implicit_def", (s,))?;
+    semanal.call_method1("store_final_status", (s,))?;
+    semanal.call_method1("check_classvar", (s,))?;
+    semanal.call_method1("process_type_annotation", (s,))?;
+    semanal.call_method1("analyze_rvalue_as_type_form", (s,))?;
+    semanal.call_method1("apply_dynamic_class_hook", (s,))?;
+
+    let s_type = s.getattr("type")?;
+    if s_type.is_none() {
+        let lvalues = s.getattr("lvalues")?;
+        semanal.call_method1("process_module_assignment", (lvalues, rvalue, s))?;
+    }
+
+    semanal.call_method1("process__all__", (s,))?;
+    semanal.call_method1("process__deletable__", (s,))?;
+    semanal.call_method1("process__slots__", (s,))?;
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
