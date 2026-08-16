@@ -63,6 +63,7 @@ mod checkoperator;
 mod checkpattern;
 mod checkstrformat;
 mod condmaps;
+mod constant_fold;
 mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
@@ -133,6 +134,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta, module)?)?;
     module.add_function(wrap_pyfunction!(cache::rust_read_cache_meta_ex, module)?)?;
     module.add_function(wrap_pyfunction!(wire::read_type_to_str, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        constant_fold::rust_constant_fold_expr,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(typeinfo::build_resolver, module)?)?;
     module.add_function(wrap_pyfunction!(
         typeinfo::read_type_to_str_with_resolver,

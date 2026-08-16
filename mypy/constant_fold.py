@@ -23,6 +23,27 @@ from mypy.nodes import (
 ConstantValue = int | bool | float | complex | str
 CONST_TYPES: Final = (int, bool, float, complex, str)
 
+# Native type-kernel seam: when the `type_kernel` Rust extension is
+# importable and the build manager has enabled it, `constant_fold_expr`
+# dispatches through Rust. The Rust path returns None for any node it
+# does not handle, so Python falls back to the pure-Python walk. Same
+# strangler-fig per-call gate as the eraser/kernel ports.
+try:
+    from type_kernel import rust_constant_fold_expr as _rust_constant_fold_expr
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_constant_fold_expr = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_constant_fold_active: bool = False
+
+
+def _set_native_constant_fold_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_constant_fold_active
+    _native_constant_fold_active = active
+
 
 def constant_fold_expr(expr: Expression, cur_mod_id: str) -> ConstantValue | None:
     """Return the constant value of an expression for supported operations.
@@ -42,6 +63,10 @@ def constant_fold_expr(expr: Expression, cur_mod_id: str) -> ConstantValue | Non
 
     Return None if unsuccessful.
     """
+    if _HAS_TYPE_KERNEL and _native_constant_fold_active:
+        result = _rust_constant_fold_expr(expr, cur_mod_id)
+        if result is not None:
+            return result
     if isinstance(expr, IntExpr):
         return expr.value
     if isinstance(expr, StrExpr):
