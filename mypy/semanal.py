@@ -504,6 +504,7 @@ try:
         rust_visit_func_def as _rust_visit_func_def,
         rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
         rust_visit_for_stmt as _rust_visit_for_stmt,
+        rust_visit_with_stmt as _rust_visit_with_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -596,6 +597,7 @@ except ImportError:
     _rust_visit_func_def = None  # type: ignore[assignment]
     _rust_visit_nonlocal_decl = None  # type: ignore[assignment]
     _rust_visit_for_stmt = None  # type: ignore[assignment]
+    _rust_visit_with_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6154,6 +6156,9 @@ class SemanticAnalyzer(
             s.finally_body.accept(visitor)
 
     def visit_with_stmt(self, s: WithStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_with_stmt(s, self):
+                return
         self.statement = s
         types: list[Type] = []
 
