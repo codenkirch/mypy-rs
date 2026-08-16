@@ -742,6 +742,46 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// True when an IndexExpr is a `Literal[...]` reference, or a NameExpr
+/// bound to a TypeAlias whose target resolves to a LiteralType.
+///
+/// Mirrors `mypy.checkexpr:is_expr_literal_type` (line 8335). Reads
+/// live AST nodes via FFI. Returns None when the shape doesn't fit the
+/// fast path so Python keeps its own branch behaviour.
+#[pyfunction]
+pub fn rust_is_expr_literal_type(py: Python<'_>, node: &PyAny) -> PyResult<Option<bool>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let index_expr_cls = nodes_mod.getattr("IndexExpr")?.downcast::<PyType>()?;
+    let name_expr_cls = nodes_mod.getattr("NameExpr")?.downcast::<PyType>()?;
+    let ref_expr_cls = nodes_mod.getattr("RefExpr")?.downcast::<PyType>()?;
+    let type_alias_cls = nodes_mod.getattr("TypeAlias")?.downcast::<PyType>()?;
+    let types_mod = py.import("mypy.types")?;
+    let literal_type_cls = types_mod.getattr("LiteralType")?.downcast::<PyType>()?;
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+
+    if node.is_instance(index_expr_cls)? {
+        let base = node.getattr("base")?;
+        if base.is_instance(ref_expr_cls)? {
+            let fullname: String = base.getattr("fullname")?.extract()?;
+            return Ok(Some(matches!(
+                fullname.as_str(),
+                "typing.Literal" | "typing_extensions.Literal" | "mypy_extensions.Literal"
+            )));
+        }
+        return Ok(Some(false));
+    }
+    if node.is_instance(name_expr_cls)? {
+        let underlying = node.getattr("node")?;
+        if !underlying.is_none() && underlying.is_instance(type_alias_cls)? {
+            let target = underlying.getattr("target")?;
+            let pt = get_proper_type.call1((target,))?;
+            return Ok(Some(pt.is_instance(literal_type_cls)?));
+        }
+        return Ok(Some(false));
+    }
+    Ok(Some(false))
+}
+
 /// Compare two symbol-table snapshots and return fully-qualified diff names.
 ///
 /// Mirrors `mypy.server.astdiff:compare_symbol_table_snapshots` (line 123).

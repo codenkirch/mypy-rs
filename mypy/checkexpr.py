@@ -249,6 +249,7 @@ try:
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
         rust_is_duplicate_mapping as _rust_is_duplicate_mapping,
+        rust_is_expr_literal_type as _rust_is_expr_literal_type,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
@@ -287,6 +288,7 @@ except ImportError:
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
     _rust_is_duplicate_mapping = None  # type: ignore[assignment]
+    _rust_is_expr_literal_type = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
@@ -8334,6 +8336,13 @@ def try_getting_literal(typ: Type) -> ProperType:
 
 def is_expr_literal_type(node: Expression) -> bool:
     """Returns 'true' if the given node is a Literal"""
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            result = _rust_is_expr_literal_type(node)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     if isinstance(node, IndexExpr):
         base = node.base
         return isinstance(base, RefExpr) and base.fullname in LITERAL_TYPE_NAMES
