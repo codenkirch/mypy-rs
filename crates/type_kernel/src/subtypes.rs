@@ -274,11 +274,12 @@ pub(crate) fn is_subtype(
                 if l_ub == r_ub {
                     return Some(true);
                 }
-                // Different upper_bound: Python recurses into
-                // _is_subtype(left.upper_bound, right.upper_bound) or
-                // returns True for self-types. Defer (no is_self on the
-                // wire; the recursive call may hit unsupported variants).
-                return None;
+                // is_self (raw_id == 0, typing.Self): subtypes.py:858.
+                if *l_raw == 0 {
+                    return Some(true);
+                }
+                // Recurse on upper bounds (subtypes.py:860).
+                return is_subtype(l_ub.as_ref(), r_ub.as_ref(), ctx, resolver);
             }
             // Different id: Python checks `left.values` then falls back
             // to `_is_subtype(left.upper_bound, right)`. The values
