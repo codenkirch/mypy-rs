@@ -3941,6 +3941,31 @@ pub(crate) fn rust_visit_with_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -
     Ok(true)
 }
 
+/// `mypy.semanal.visit_assignment_expr` body — accept value,
+/// if func_scope: check_valid_comprehension (early return if False),
+/// analyze_lvalue with kwargs.
+#[pyfunction]
+pub(crate) fn rust_visit_assignment_expr(
+    py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    s.getattr("value")?.call_method1("accept", (semanal,))?;
+    if semanal.call_method0("is_func_scope")?.is_true()? {
+        let ok = semanal
+            .call_method1("check_valid_comprehension", (s,))?
+            .is_true()?;
+        if !ok {
+            return Ok(true);
+        }
+    }
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("escape_comprehensions", true)?;
+    kwargs.set_item("has_explicit_value", true)?;
+    semanal.call_method("analyze_lvalue", (s.getattr("target")?,), Some(kwargs))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
