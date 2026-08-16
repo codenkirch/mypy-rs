@@ -6413,6 +6413,9 @@ class SemanticAnalyzer(
             arg.accept(self)
 
     def visit_tuple_expr(self, expr: TupleExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_list_set_expr(expr, self):
+                return
         for item in expr.items:
             if isinstance(item, StarExpr):
                 item.valid = True
