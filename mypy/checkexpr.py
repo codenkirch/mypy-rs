@@ -241,6 +241,7 @@ try:
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
+        rust_get_partial_instance_type as _rust_get_partial_instance_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -289,6 +290,7 @@ except ImportError:
     _rust_is_async_def = None  # type: ignore[assignment]
     _rust_is_duplicate_mapping = None  # type: ignore[assignment]
     _rust_is_expr_literal_type = None  # type: ignore[assignment]
+    _rust_get_partial_instance_type = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
@@ -8409,6 +8411,18 @@ def is_operator_method(fullname: str | None) -> bool:
 
 
 def get_partial_instance_type(t: Type | None) -> PartialType | None:
+    if (
+        t is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _rust_get_partial_instance_type is not None
+    ):
+        try:
+            result = cast(PartialType | None, _rust_get_partial_instance_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if t is None or not isinstance(t, PartialType) or t.type is None:
         return None
     return t

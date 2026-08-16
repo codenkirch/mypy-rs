@@ -782,6 +782,24 @@ pub fn rust_is_expr_literal_type(py: Python<'_>, node: &PyAny) -> PyResult<Optio
     Ok(Some(false))
 }
 
+/// Mirrors `mypy.checkexpr.get_partial_instance_type` (checkexpr.py:8411).
+/// Returns the node itself when it is a `mypy.types.PartialType` with a
+/// non-None `type` attribute; returns None otherwise. Live-object seam.
+#[pyfunction]
+pub fn rust_get_partial_instance_type<'py>(
+    py: Python<'py>,
+    node: &'py PyAny,
+) -> PyResult<Option<&'py PyAny>> {
+    let partial_cls = py
+        .import("mypy.types")?
+        .getattr("PartialType")?
+        .downcast::<PyType>()?;
+    if node.is_instance(partial_cls)? && !node.getattr("type")?.is_none() {
+        return Ok(Some(node));
+    }
+    Ok(None)
+}
+
 /// Compare two symbol-table snapshots and return fully-qualified diff names.
 ///
 /// Mirrors `mypy.server.astdiff:compare_symbol_table_snapshots` (line 123).
