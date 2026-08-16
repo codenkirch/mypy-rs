@@ -3737,6 +3737,83 @@ pub(crate) fn rust_visit_nonlocal_decl(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_for_stmt` body — async-for check, set statement,
+/// accept expr, analyze_lvalue, conditional index_type handling,
+/// loop_depth increment, CM (entering_loop=True) wrapping visit_block,
+/// loop_depth decrement, visit_block_maybe.
+#[pyfunction]
+pub(crate) fn rust_visit_for_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    // async-for check
+    if s.getattr("is_async")?.is_true()? {
+        let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+        let func_stack = semanal.getattr("function_stack")?;
+        let ok = in_func
+            && func_stack.len()? > 0
+            && func_stack
+                .get_item(func_stack.len()? - 1)?
+                .getattr("is_coroutine")?
+                .is_true()?;
+        if !ok {
+            let msg_mod = py.import("mypy.message_registry")?;
+            let msg: String = msg_mod.getattr("ASYNC_FOR_OUTSIDE_COROUTINE")?.extract()?;
+            let codes_mod = py.import("mypy.errorcodes")?;
+            let syntax = codes_mod.getattr("SYNTAX")?;
+            let kw = pyo3::types::PyDict::new(py);
+            kw.set_item("code", syntax)?;
+            semanal.call_method("fail", (msg.as_str(), s), Some(kw))?;
+        }
+    }
+    semanal.setattr("statement", s)?;
+    s.getattr("expr")?.call_method1("accept", (semanal,))?;
+    // analyze_lvalue with kwargs
+    let index_type = s.getattr("index_type")?;
+    let has_index_type = !index_type.is_none();
+    let kwargs_al = pyo3::types::PyDict::new(py);
+    kwargs_al.set_item("explicit_type", has_index_type)?;
+    kwargs_al.set_item("is_index_var", true)?;
+    semanal.call_method("analyze_lvalue", (s.getattr("index")?,), Some(kwargs_al))?;
+    if has_index_type {
+        // is_classvar check
+        let is_cv = semanal
+            .call_method1("is_classvar", (index_type,))?
+            .is_true()?;
+        if is_cv {
+            semanal.call_method1("fail_invalid_classvar", (s.getattr("index")?,))?;
+        }
+        // allow_tuple_literal = isinstance(s.index, TupleExpr)
+        let nodes_mod = py.import("mypy.nodes")?;
+        let tuple_cls = nodes_mod.getattr("TupleExpr")?.downcast::<PyType>()?;
+        let allow_tuple = s.getattr("index")?.is_instance(tuple_cls)?;
+        let kwargs_at = pyo3::types::PyDict::new(py);
+        kwargs_at.set_item("allow_tuple_literal", allow_tuple)?;
+        let analyzed = semanal.call_method("anal_type", (index_type,), Some(kwargs_at))?;
+        if !analyzed.is_none() {
+            semanal.call_method1("store_declared_types", (s.getattr("index")?, analyzed))?;
+            s.setattr("index_type", analyzed)?;
+        }
+    }
+    // loop_depth[-1] += 1
+    let loop_depth = semanal.getattr("loop_depth")?;
+    let ld_list = loop_depth.downcast::<PyList>()?;
+    let ld_idx = ld_list.len() - 1;
+    let cur: i64 = ld_list.get_item(ld_idx)?.extract()?;
+    ld_list.set_item(ld_idx, cur + 1)?;
+    // CM: inside_except_star_block_set(value=False, entering_loop=True)
+    let kwargs = pyo3::types::PyDict::new(py);
+    kwargs.set_item("entering_loop", true)?;
+    let cm = semanal.call_method("inside_except_star_block_set", (false,), Some(kwargs))?;
+    cm.call_method1("__enter__", ())?;
+    let inner = semanal.call_method1("visit_block", (s.getattr("body")?,));
+    let _ = cm.call_method1("__exit__", (py.None(), py.None(), py.None()));
+    inner?;
+    // loop_depth[-1] -= 1
+    let cur: i64 = ld_list.get_item(ld_idx)?.extract()?;
+    ld_list.set_item(ld_idx, cur - 1)?;
+    // visit_block_maybe(s.else_body)
+    semanal.call_method1("visit_block_maybe", (s.getattr("else_body")?,))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

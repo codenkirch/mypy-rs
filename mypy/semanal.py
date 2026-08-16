@@ -503,6 +503,7 @@ try:
         rust_visit_class_def as _rust_visit_class_def,
         rust_visit_func_def as _rust_visit_func_def,
         rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
+        rust_visit_for_stmt as _rust_visit_for_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -594,6 +595,7 @@ except ImportError:
     _rust_visit_class_def = None  # type: ignore[assignment]
     _rust_visit_func_def = None  # type: ignore[assignment]
     _rust_visit_nonlocal_decl = None  # type: ignore[assignment]
+    _rust_visit_for_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6072,6 +6074,9 @@ class SemanticAnalyzer(
         self.visit_block_maybe(s.else_body)
 
     def visit_for_stmt(self, s: ForStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_for_stmt(s, self):
+                return
         if s.is_async:
             if not self.is_func_scope() or not self.function_stack[-1].is_coroutine:
                 self.fail(message_registry.ASYNC_FOR_OUTSIDE_COROUTINE, s, code=codes.SYNTAX)
