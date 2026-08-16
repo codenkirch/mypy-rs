@@ -1545,6 +1545,11 @@ def rust_sort_messages_preserving_file_order(
 def rust_find_relative_leaf_module(
     modules: list[tuple[str, str]], deps: dict[str, list[str]]
 ) -> tuple[str, str] | None: ...
+def rust_find_unloaded_deps(
+    initial: list[str],
+    graph: dict[str, tuple[list[str], list[str]]],
+    loaded: set[str],
+) -> list[str] | None: ...
 
 # mypy/dmypy_server.py — daemon server helpers.
 def rust_ignore_suppressed_imports(module: str) -> bool | None: ...

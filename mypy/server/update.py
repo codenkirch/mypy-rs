@@ -169,6 +169,7 @@ try:
         rust_extract_fnam_from_message as _rust_extract_fnam_from_message,
         rust_extract_possible_fnam_from_message as _rust_extract_possible_fnam_from_message,
         rust_find_relative_leaf_module as _rust_find_relative_leaf_module,
+        rust_find_unloaded_deps as _rust_find_unloaded_deps,
         rust_get_module_to_path_map as _rust_get_module_to_path_map,
         rust_get_sources as _rust_get_sources,
         rust_sort_messages_preserving_file_order as _rust_sort_messages_preserving_file_order,
@@ -183,6 +184,7 @@ except ImportError:
     _rust_extract_possible_fnam_from_message = None  # type: ignore[assignment]
     _rust_sort_messages_preserving_file_order = None  # type: ignore[assignment]
     _rust_find_relative_leaf_module = None  # type: ignore[assignment]
+    _rust_find_unloaded_deps = None  # type: ignore[assignment]
     _HAS_NATIVE_UPDATE = False
 
 _native_update_active: bool = False
@@ -513,6 +515,19 @@ def find_unloaded_deps(
     can be handled by calling find_unloaded_deps directly on the new
     dependencies.)
     """
+    # Issue #388: native gate for find_unloaded_deps.
+    if _HAS_NATIVE_UPDATE and _native_update_active:
+        try:
+            loaded = set(manager.modules)
+            graph_map = {
+                node: (list(state.dependencies), list(state.ancestors or []))
+                for node, state in graph.items()
+            }
+            result = _rust_find_unloaded_deps(list(initial), graph_map, loaded)
+            if result is not None:
+                return result
+        except Exception:
+            pass
     worklist = list(initial)
     seen: set[str] = set()
     unloaded = []

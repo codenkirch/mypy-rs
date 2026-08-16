@@ -742,6 +742,41 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// Find all deps of initial modules that have not had their tree loaded.
+///
+/// Mirrors `mypy.server.update:find_unloaded_deps` (line 504). Walks a
+/// LIFO worklist of module IDs; a module is unloaded iff it is in the
+/// graph but not in `loaded`. Preserves the push/pop traversal order.
+/// Returns None if any initial module is missing from the graph.
+#[pyfunction]
+pub fn rust_find_unloaded_deps(
+    initial: Vec<String>,
+    graph: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+    loaded: std::collections::HashSet<String>,
+) -> Option<Vec<String>> {
+    let mut worklist: Vec<String> = initial;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut unloaded: Vec<String> = Vec::new();
+    while let Some(node) = worklist.pop() {
+        if seen.contains(&node) {
+            continue;
+        }
+        let entry = match graph.get(&node) {
+            Some(e) => e,
+            None => continue,
+        };
+        seen.insert(node.clone());
+        if !loaded.contains(&node) {
+            // worklist.extend(dependencies + ancestors)
+            for dep in entry.0.iter().chain(entry.1.iter()) {
+                worklist.push(dep.clone());
+            }
+            unloaded.push(node);
+        }
+    }
+    Some(unloaded)
+}
+
 /// Find a module in a list that directly imports no other module in the list.
 ///
 /// Mirrors `mypy.server.update:find_relative_leaf_module` (line 723).
