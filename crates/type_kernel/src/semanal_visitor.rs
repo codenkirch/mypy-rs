@@ -2387,6 +2387,98 @@ pub(crate) fn rust_visit_super_expr(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 3: leaf-actions shards for the simple statement-visit bodies.
+// Pattern: Rust sets the analyzer's `statement` slot (the same way the
+// Python body does `self.statement = s`), recurses via `accept`, and
+// returns true on the common path. The __all__-style branches stay in
+// Python by falling back (return false) when they would fire.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_raise_stmt` body — set statement slot, recurse
+/// into expr / from_expr if present.
+#[pyfunction]
+pub(crate) fn rust_visit_raise_stmt(
+    _py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let expr = s.getattr("expr")?;
+    if !expr.is_none() && expr.is_true()? {
+        expr.call_method1("accept", (semanal,))?;
+    }
+    let from_expr = s.getattr("from_expr")?;
+    if !from_expr.is_none() && from_expr.is_true()? {
+        from_expr.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_assert_stmt` body — set statement slot, recurse
+/// into expr / msg if present.
+#[pyfunction]
+pub(crate) fn rust_visit_assert_stmt(
+    _py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let expr = s.getattr("expr")?;
+    if !expr.is_none() && expr.is_true()? {
+        expr.call_method1("accept", (semanal,))?;
+    }
+    let msg = s.getattr("msg")?;
+    if !msg.is_none() && msg.is_true()? {
+        msg.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_operator_assignment_stmt` body (semanal.py:5932-5942).
+/// Recurse into lvalue and rvalue, then handle the `__all__` export branch
+/// in place via `semanal.add_exports`. The kind check must happen AFTER
+/// the recursion because the lvalue's `kind` is assigned during accept.
+#[pyfunction]
+pub(crate) fn rust_visit_operator_assignment_stmt(
+    py: Python<'_>,
+    s: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    let lvalue = s.getattr("lvalue")?;
+    let rvalue = s.getattr("rvalue")?;
+    lvalue.call_method1("accept", (semanal,))?;
+    rvalue.call_method1("accept", (semanal,))?;
+
+    // __all__ export branch (semanal.py:5953): the Python body visits lvalue
+    // first, then checks `lvalue.kind == GDEF` — the kind is resolved during
+    // the accept call, so the check must run AFTER the recursion. Handle
+    // the branch here instead of deferring; add_exports is a plain Python
+    // method call and cheap to forward.
+    let nodes_mod = py.import("mypy.nodes")?;
+    let name_expr_cls = nodes_mod.getattr("NameExpr")?;
+    if lvalue.is_instance(name_expr_cls)? {
+        let name: String = lvalue.getattr("name")?.extract()?;
+        if name == "__all__" {
+            let kind_obj = lvalue.getattr("kind")?;
+            if !kind_obj.is_none() {
+                let kind: i64 = kind_obj.extract()?;
+                let gdef: i64 = nodes_mod.getattr("GDEF")?.extract()?;
+                if kind == gdef {
+                    let list_cls = nodes_mod.getattr("ListExpr")?;
+                    let tuple_cls = nodes_mod.getattr("TupleExpr")?;
+                    if rvalue.is_instance(list_cls)? || rvalue.is_instance(tuple_cls)? {
+                        let items = rvalue.getattr("items")?;
+                        semanal.call_method1("add_exports", (items,))?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
