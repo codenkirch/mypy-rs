@@ -509,6 +509,7 @@ try:
         rust_visit_import_all as _rust_visit_import_all,
         rust_visit_import_from as _rust_visit_import_from,
         rust_visit_assignment_stmt as _rust_visit_assignment_stmt,
+        rust_visit_import as _rust_visit_import,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -606,6 +607,7 @@ except ImportError:
     _rust_visit_import_all = None  # type: ignore[assignment]
     _rust_visit_import_from = None  # type: ignore[assignment]
     _rust_visit_assignment_stmt = None  # type: ignore[assignment]
+    _rust_visit_import = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -3343,6 +3345,9 @@ class SemanticAnalyzer(
     #
 
     def visit_import(self, i: Import) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_import(i, self):
+                return
         self.statement = i
         use_implicit_reexport = not self.is_stub_file and self.options.implicit_reexport
         # Issue #444: native import classification (strangler-fig). Rust

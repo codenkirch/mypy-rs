@@ -4443,6 +4443,105 @@ pub(crate) fn rust_visit_assignment_stmt(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_import` body — set statement, compute
+/// use_implicit_reexport, iterate i.ids, classify each import,
+/// construct SymbolTableNode, dispatch add_imported_symbol /
+/// add_unknown_imported_symbol.
+#[pyfunction]
+pub(crate) fn rust_visit_import(py: Python<'_>, i: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", i)?;
+
+    let is_stub_file = semanal.getattr("is_stub_file")?.is_true()?;
+    let opts = semanal.getattr("options")?;
+    let implicit_reexport = opts.getattr("implicit_reexport")?.is_true()?;
+    let use_implicit_reexport = !is_stub_file && implicit_reexport;
+
+    let modules = semanal.getattr("modules")?;
+    let modules_dict = match modules.downcast::<PyDict>() {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+
+    let ids = i.getattr("ids")?;
+    let ids_list = match ids.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let symboltable_cls = nodes_mod.getattr("SymbolTableNode")?;
+    let semanal_mod = py.import("mypy.semanal")?;
+
+    let is_func_scope = semanal.call_method1("is_func_scope", ())?.is_true()?;
+    let semanal_type = semanal.getattr("type")?;
+
+    for item in ids_list.iter() {
+        let pair = match item.downcast::<PyTuple>() {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        if pair.len() != 2 {
+            return Ok(false);
+        }
+        let id: String = pair.get_item(0)?.extract()?;
+        let as_id_obj = pair.get_item(1)?;
+        let as_id: Option<String> = if as_id_obj.is_none() {
+            None
+        } else {
+            Some(as_id_obj.extract()?)
+        };
+
+        let (base_id, imported_id, module_public) = if let Some(as_id) = &as_id {
+            (
+                id.clone(),
+                as_id.clone(),
+                use_implicit_reexport || id == *as_id,
+            )
+        } else {
+            let base = id.split('.').next().unwrap_or(&id).to_string();
+            (base.clone(), base, use_implicit_reexport)
+        };
+
+        if modules_dict.contains(&base_id)? {
+            let node = modules_dict.get_item(&base_id)?.unwrap();
+            let kind = if is_func_scope {
+                semanal_mod.getattr("LDEF")?
+            } else if !semanal_type.is_none() {
+                semanal_mod.getattr("MDEF")?
+            } else {
+                semanal_mod.getattr("GDEF")?
+            };
+            let kw = pyo3::types::PyDict::new(py);
+            kw.set_item("module_public", module_public)?;
+            kw.set_item("module_hidden", !module_public)?;
+            let symbol = symboltable_cls.call((kind, node), Some(kw))?;
+            let kw2 = pyo3::types::PyDict::new(py);
+            kw2.set_item("context", i)?;
+            kw2.set_item("module_public", module_public)?;
+            kw2.set_item("module_hidden", !module_public)?;
+            semanal.call_method(
+                "add_imported_symbol",
+                (imported_id.as_str(), symbol),
+                Some(kw2),
+            )?;
+        } else {
+            semanal.call_method(
+                "add_unknown_imported_symbol",
+                (
+                    imported_id.as_str(),
+                    i,
+                    base_id.as_str(),
+                    module_public,
+                    !module_public,
+                ),
+                None,
+            )?;
+        }
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
