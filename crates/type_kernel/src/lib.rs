@@ -149,6 +149,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype, module)?)?;
+    module.add_function(wrap_pyfunction!(subtypes::rust_all_same_types, module)?)?;
     // Issue #465: pure-computation helpers from subtypes.py.
     module.add_function(wrap_pyfunction!(
         subtypes::rust_has_underscore_prefix,
@@ -614,6 +615,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(checker_visitor::rust_is_static, module)?)?;
     module.add_function(wrap_pyfunction!(checker_visitor::rust_is_property, module)?)?;
+    module.add_function(wrap_pyfunction!(checker_visitor::rust_is_method, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_visitor::rust_is_empty_generator_function,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_is_settable_property,
         module
@@ -1445,6 +1451,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         serverdeps::rust_is_expr_literal_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_get_partial_instance_type,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;

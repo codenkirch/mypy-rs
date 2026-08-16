@@ -229,6 +229,7 @@ try:
     )
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
+        rust_all_same_types as _rust_all_same_types,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
@@ -241,6 +242,7 @@ try:
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
+        rust_get_partial_instance_type as _rust_get_partial_instance_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -279,6 +281,7 @@ except ImportError:
     _rust_conditional_expr_join = None  # type: ignore[assignment]
     _rust_analyze_cond_branch = None  # type: ignore[assignment]
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
+    _rust_all_same_types = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_infer_function_type_arguments = None  # type: ignore[assignment]
@@ -289,6 +292,7 @@ except ImportError:
     _rust_is_async_def = None  # type: ignore[assignment]
     _rust_is_duplicate_mapping = None  # type: ignore[assignment]
     _rust_is_expr_literal_type = None  # type: ignore[assignment]
+    _rust_get_partial_instance_type = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
@@ -8274,6 +8278,20 @@ def any_causes_overload_ambiguity(
 
 
 def all_same_types(types: list[Type]) -> bool:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            type_bytes = [_serialize_type_for_checkexpr(t) for t in types]
+            result = _rust_all_same_types(
+                type_bytes, True, state.strict_optional, _native_checkexpr_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if not types:
         return True
     return all(is_same_type(t, types[0]) for t in types[1:])
@@ -8409,6 +8427,18 @@ def is_operator_method(fullname: str | None) -> bool:
 
 
 def get_partial_instance_type(t: Type | None) -> PartialType | None:
+    if (
+        t is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _rust_get_partial_instance_type is not None
+    ):
+        try:
+            result = cast(PartialType | None, _rust_get_partial_instance_type(t))
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if t is None or not isinstance(t, PartialType) or t.type is None:
         return None
     return t
