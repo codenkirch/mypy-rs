@@ -1011,6 +1011,12 @@ def rust_is_same_type(
     strict_optional: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
+def rust_all_same_types(
+    items_bytes: list[bytes],
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
 def rust_is_more_precise(
     left_bytes: bytes,
     right_bytes: bytes,

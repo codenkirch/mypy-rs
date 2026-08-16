@@ -149,6 +149,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype, module)?)?;
+    module.add_function(wrap_pyfunction!(subtypes::rust_all_same_types, module)?)?;
     // Issue #465: pure-computation helpers from subtypes.py.
     module.add_function(wrap_pyfunction!(
         subtypes::rust_has_underscore_prefix,

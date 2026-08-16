@@ -229,6 +229,7 @@ try:
     )
     from type_kernel import (
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
+        rust_all_same_types as _rust_all_same_types,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
@@ -280,6 +281,7 @@ except ImportError:
     _rust_conditional_expr_join = None  # type: ignore[assignment]
     _rust_analyze_cond_branch = None  # type: ignore[assignment]
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
+    _rust_all_same_types = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_infer_function_type_arguments = None  # type: ignore[assignment]
@@ -8276,6 +8278,20 @@ def any_causes_overload_ambiguity(
 
 
 def all_same_types(types: list[Type]) -> bool:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            type_bytes = [_serialize_type_for_checkexpr(t) for t in types]
+            result = _rust_all_same_types(
+                type_bytes, True, state.strict_optional, _native_checkexpr_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if not types:
         return True
     return all(is_same_type(t, types[0]) for t in types[1:])

@@ -1794,6 +1794,40 @@ fn is_same_type(
     Some(fwd && bwd)
 }
 
+/// `#[pyfunction]` entry for `mypy.checkexpr.all_same_types`.
+///
+/// Mirrors checkexpr.py:8278-8281: empty list yields True; otherwise every
+/// item after the first must be `is_same_type` against the first. Defer
+/// (return `Option::None`) on any decoding or subtype-resolution defer,
+/// matching `rust_is_same_type` per-pair so the Python fallback can run.
+#[pyfunction]
+pub(crate) fn rust_all_same_types(
+    items_bytes: Vec<&[u8]>,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    if items_bytes.is_empty() {
+        return Some(true);
+    }
+    let first = decode_type(items_bytes[0])?;
+    for b_bytes in items_bytes.iter().skip(1) {
+        let b = decode_type(b_bytes)?;
+        match is_same_type(
+            &first,
+            &b,
+            ignore_promotions,
+            strict_optional,
+            resolver.resolver(),
+        ) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
+}
+
 /// `#[pyfunction]` entry for `is_same_type`.
 #[pyfunction]
 pub(crate) fn rust_is_same_type(
