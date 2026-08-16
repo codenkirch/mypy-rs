@@ -57,7 +57,7 @@ fn is_nonneg_int(v: &PyAny) -> PyResult<bool> {
     }
     let zero = v.py().import("builtins")?.getattr("int")?.call1((0,))?;
     let cmp = v.rich_compare(zero, pyo3::basic::CompareOp::Ge)?;
-    Ok(cmp.is_true()?)
+    cmp.is_true()
 }
 
 /// Call `left.__op__(right)` falling back to `right.__rop__(left)` on
