@@ -499,6 +499,7 @@ try:
         rust_visit_dictionary_comprehension as _rust_visit_dictionary_comprehension,
         rust_visit_generator_expr as _rust_visit_generator_expr,
         rust_visit_lambda_expr as _rust_visit_lambda_expr,
+        rust_visit_overloaded_func_def as _rust_visit_overloaded_func_def,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -586,6 +587,7 @@ except ImportError:
     _rust_visit_dictionary_comprehension = None  # type: ignore[assignment]
     _rust_visit_generator_expr = None  # type: ignore[assignment]
     _rust_visit_lambda_expr = None  # type: ignore[assignment]
+    _rust_visit_overloaded_func_def = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -1507,6 +1509,9 @@ class SemanticAnalyzer(
         )
 
     def visit_overloaded_func_def(self, defn: OverloadedFuncDef) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_overloaded_func_def(defn, self):
+                return
         self.statement = defn
         self.add_function_to_symbol_table(defn)
 

@@ -3489,6 +3489,43 @@ pub(crate) fn rust_visit_lambda_expr(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_overloaded_func_def` body — set statement, add to
+/// symbol table, early-return if `not recurse_into_functions` and no
+/// `def_or_infer_vars`, else `function_scope(defn)` +
+/// `set_recurse_into_functions()` CMs wrapping `analyze_overloaded_func_def`.
+#[pyfunction]
+pub(crate) fn rust_visit_overloaded_func_def(
+    py: Python<'_>,
+    defn: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", defn)?;
+    semanal.call_method1("add_function_to_symbol_table", (defn,))?;
+    let recurse = semanal.getattr("recurse_into_functions")?.is_true()?;
+    let d_vars = defn.getattr("def_or_infer_vars")?.is_true()?;
+    if !recurse && !d_vars {
+        return Ok(true);
+    }
+    let scope = semanal.getattr("scope")?;
+    let cm1 = scope.call_method1("function_scope", (defn,))?;
+    let cm2 = semanal.call_method0("set_recurse_into_functions")?;
+    cm1.call_method1("__enter__", ())?;
+    let enter2 = cm2.call_method1("__enter__", ());
+    match enter2 {
+        Ok(_) => {
+            let inner = semanal.call_method1("analyze_overloaded_func_def", (defn,));
+            let _ = cm2.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            let _ = cm1.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            inner?;
+        }
+        Err(err) => {
+            let _ = cm1.call_method1("__exit__", (py.None(), py.None(), py.None()));
+            return Err(err);
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
