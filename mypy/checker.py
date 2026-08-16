@@ -504,7 +504,7 @@ def _try_native_generator_return_type_helpers(
         return None
     if blob is None:
         return None
-    dec = _deserialize_type_from_checker(bytes(blob))
+    dec = _deserialize_type_from_checker(cast(bytes, blob))
     # fixup_wire_type returns None when a type_ref cannot resolve to a live
     # TypeInfo; defer rather than fabricate a type.
     return dec
@@ -748,7 +748,9 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     """
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
+    t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
+    assert t is not None, "checker wire decode produced unresolvable type_ref"
+    return t
 
 
 T = TypeVar("T")
@@ -6778,7 +6780,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 self.check_multiple_inheritance(info)
             if local_errors.has_new_errors():
                 # "class A(B, C)" unsafe, now check "class A(C, B)":
-                base_classes = _get_base_classes(instances[::-1])
+                reversed_pair = cast("tuple[Instance, Instance]", instances[::-1])
+                base_classes = _get_base_classes(reversed_pair)
                 info, full_name = _make_fake_typeinfo_and_full_name(
                     base_classes, curr_module, self.options
                 )

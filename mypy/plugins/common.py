@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+from collections.abc import Callable as _Cb
 
 from mypy.argmap import map_actuals_to_formals
 from mypy.modules_state import modules_state
@@ -10,6 +11,10 @@ from mypy.modules_state import modules_state
 # is True, the Rust path runs; otherwise the pure-Python implementation below
 # is used. Rust returns None for unsupported cases (star actuals), falling
 # through to the Python path.
+
+if TYPE_CHECKING:
+    _rust_fmo: _Cb[..., int | None] | None
+
 try:
     from type_kernel import rust_find_shallow_matching_overload_item as _rust_fmo
 
@@ -137,7 +142,7 @@ def find_shallow_matching_overload_item(overload: Overloaded, call: CallExpr) ->
     Return the first matching overload item, or the last one if nothing matches.
     """
     # Native type-kernel gate: try Rust first; None → fall through to Python.
-    if _HAS_TYPE_KERNEL and _native_plugin_helpers_active:
+    if _HAS_TYPE_KERNEL and _native_plugin_helpers_active and _rust_fmo is not None:
         idx = _rust_fmo(overload, call)
         if idx is not None:
             return overload.items[idx]
