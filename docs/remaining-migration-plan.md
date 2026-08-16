@@ -8,12 +8,52 @@ Date: 2026-08-13
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.1M |
-| Python bytes (mypy + mypyc, ex test/) | ~6.6M |
-| Rust % (local) | ~32% |
+| Rust bytes (local, .rs) | ~3.2M |
+| Python bytes (mypy + mypyc, ex test/) | ~7.7M |
+| Rust % (local) | ~29.4% |
 | Rust % (GitHub languages API) | ~25.6% |
 | Rust LOC (crates/) | ~86K |
 | Rust source files | 81 (type_kernel) + ast_serialize + module_resolver + fs_probe |
+| Gap to 50% | ~4.5M bytes Python->Rust |
+
+## Honest assessment: path to 50%
+
+The user-facing goal is 50% Rust. That requires moving ~2.24M bytes of
+Python to Rust (so Rust = 4.48M = Python = 4.48M out of a 8.96M total).
+
+The **biggest Python files cannot be ported** without breaking the
+migration plan's Phase E1 constraints:
+
+- `mypy/nodes.py` (191K) and `mypy/types.py` (196K) are plugin-visible
+  mutable object graphs. Phase E1 confirms these stay in Python until a
+  multi-quarter Rust-owned Type/Node redesign lands.
+
+That leaves **checker.py (484K), checkexpr.py (371K), semanal.py (400K),
+build.py (253K)** as the weighted candidates (1.5M combined). Each of
+them contains visitor methods that mutate the symbol table, emit errors,
+drive daemon-cache invalidation, and interact with plugin hooks. Porting
+those visit_* methods to Rust means either:
+
+1. A Rust-native visitor engine that holds live TypeInfo/TypeAlias
+   graph references across the GIL (violates Phase E1), or
+2. Continuing the strangler-fig per-call gate and porting one visit_*
+   method at a time, which yields ~10-30K Rust bytes per PR for parity
+   + rebuild cost (100+ PRs to close the gap).
+
+The realistic near-term lever is **deferral reduction** (Phase B), not
+#line-adds. That improves performance but adds few Rust bytes. Reaching
+50% is therefore a multi-week release line, not a bounded goal-turn
+task. The execution sequence that gets there:
+
+1. Merge Phase A fixes (pre-existing bugs).
+2. Land Phase B deferral reduction (setops/subtypes/checkexpr) for
+   ~50 selected deferral sites; expected ~50-100K new Rust bytes.
+3. Land Phase C depth ports for semanal/checker/plugins; expected
+   ~150K new Rust bytes per release cycle.
+4. Continue until 50% is reached, tracking via Phase D4.
+
+This document itself was updated to keep the honest number close to the
+plan rather than let "no progress" silently compound.
 
 ### Performance (M17 graduation, cold self-check)
 
