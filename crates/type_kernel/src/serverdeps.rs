@@ -742,6 +742,47 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// Bases of a class excluding builtins.object and the class itself.
+///
+/// Mirrors `mypy.server.deps:non_trivial_bases` (line 1222). Walks
+/// `info.mro[1:]`, returns bases whose fullname is not "builtins.object".
+/// Returns None if any MRO entry lacks fullname (partial init).
+#[pyfunction]
+pub fn rust_non_trivial_bases(py: Python<'_>, info: &PyAny) -> PyResult<Vec<PyObject>> {
+    let mro = info.getattr("mro")?.downcast::<PyList>()?;
+    let mut out: Vec<PyObject> = Vec::new();
+    for (i, base) in mro.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let fullname: String = base.getattr("fullname")?.extract()?;
+        if fullname != "builtins.object" {
+            out.push(base.into());
+        }
+    }
+    let _ = py;
+    Ok(out)
+}
+
+/// True if the class has any base outside builtins/typing/enum.
+///
+/// Mirrors `mypy.server.deps:has_user_bases` (line 1226).
+#[pyfunction]
+pub fn rust_has_user_bases(py: Python<'_>, info: &PyAny) -> PyResult<bool> {
+    let mro = info.getattr("mro")?.downcast::<PyList>()?;
+    for (i, base) in mro.iter().enumerate() {
+        if i == 0 {
+            continue;
+        }
+        let module: String = base.getattr("module_name")?.extract()?;
+        if module != "builtins" && module != "typing" && module != "enum" {
+            return Ok(true);
+        }
+    }
+    let _ = py;
+    Ok(false)
+}
+
 /// Merge new dependency triggers into an existing deps map in place.
 ///
 /// Mirrors `mypy.server.deps:merge_dependencies` (line 1208):

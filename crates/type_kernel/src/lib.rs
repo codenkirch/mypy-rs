@@ -1434,6 +1434,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         serverdeps::rust_merge_dependencies,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_non_trivial_bases,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(serverdeps::rust_has_user_bases, module)?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
     module.add_function(wrap_pyfunction!(
         stubgen::rust_stubgen_render_type_args,
