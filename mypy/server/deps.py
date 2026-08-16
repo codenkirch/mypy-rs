@@ -95,6 +95,8 @@ try:
     )
     from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
     from type_kernel import rust_merge_dependencies as _rust_merge_dependencies
+    from type_kernel import rust_non_trivial_bases as _rust_non_trivial_bases
+    from type_kernel import rust_has_user_bases as _rust_has_user_bases
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -102,6 +104,8 @@ except ImportError:
     _rust_compute_wildcard_triggers = None  # type: ignore[assignment]
     _rust_get_type_triggers = None  # type: ignore[assignment]
     _rust_merge_dependencies = None  # type: ignore[assignment]
+    _rust_non_trivial_bases = None  # type: ignore[assignment]
+    _rust_has_user_bases = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag read by the gate below; set by the build manager from
@@ -1220,10 +1224,22 @@ def merge_dependencies(new_deps: dict[str, set[str]], deps: dict[str, set[str]])
 
 
 def non_trivial_bases(info: TypeInfo) -> list[TypeInfo]:
+    # Issue #388: native gate for non_trivial_bases.
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        try:
+            return _rust_non_trivial_bases(info)
+        except Exception:
+            pass
     return [base for base in info.mro[1:] if base.fullname != "builtins.object"]
 
 
 def has_user_bases(info: TypeInfo) -> bool:
+    # Issue #388: native gate for has_user_bases.
+    if _HAS_TYPE_KERNEL and _native_server_deps_active:
+        try:
+            return _rust_has_user_bases(info)
+        except Exception:
+            pass
     return any(base.module_name not in ("builtins", "typing", "enum") for base in info.mro[1:])
 
 
