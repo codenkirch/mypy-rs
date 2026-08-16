@@ -4542,6 +4542,378 @@ pub(crate) fn rust_visit_import(py: Python<'_>, i: &PyAny, semanal: &PyAny) -> P
     Ok(true)
 }
 
+/// `mypy.semanal.visit_call_expr` body — accept callee, dispatch
+/// special forms (cast, assert_type, reveal_type, reveal_locals,
+/// Any, _promote, dict, divmod, TypeAliasType, TypeForm), normal call
+/// with __all__ mutation handling.
+#[pyfunction]
+pub(crate) fn rust_visit_call_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let callee = expr.getattr("callee")?;
+    callee.call_method1("accept", (semanal,))?;
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let types_mod = py.import("mypy.types")?;
+    let castexpr_cls = nodes_mod.getattr("CastExpr")?;
+    let asserttype_cls = nodes_mod.getattr("AssertTypeExpr")?;
+    let revealexpr_cls = nodes_mod.getattr("RevealExpr")?;
+    let promoteexpr_cls = nodes_mod.getattr("PromoteExpr")?;
+    let typeform_cls = nodes_mod.getattr("TypeFormExpr")?;
+    let opexpr_cls = nodes_mod.getattr("OpExpr")?;
+    let refexpr_cls = nodes_mod.getattr("RefExpr")?;
+    let memberexpr_cls = nodes_mod.getattr("MemberExpr")?;
+    let nameexpr_cls = nodes_mod.getattr("NameExpr")?;
+    let listexpr_cls = nodes_mod.getattr("ListExpr")?;
+    let tupleexpr_cls = nodes_mod.getattr("TupleExpr")?;
+    let strexpr_cls = nodes_mod.getattr("StrExpr")?;
+    let typealias_cls = nodes_mod.getattr("TypeAlias")?;
+    let symbol_funcbase_types = nodes_mod.getattr("SYMBOL_FUNCBASE_TYPES")?;
+    let anytype_cls = types_mod.getattr("AnyType")?;
+    let typeofany = types_mod.getattr("TypeOfAny")?;
+    let from_error = typeofany.getattr("from_error")?;
+    let semanal_mod = py.import("mypy.semanal")?;
+    let refers_to_fullname_fn = semanal_mod.getattr("refers_to_fullname")?;
+    let gdef = semanal_mod.getattr("GDEF")?;
+    let reveal_type = semanal_mod.getattr("REVEAL_TYPE")?;
+    let reveal_locals = semanal_mod.getattr("REVEAL_LOCALS")?;
+    let assert_type_names = semanal_mod.getattr("ASSERT_TYPE_NAMES")?;
+    let reveal_type_names = semanal_mod.getattr("REVEAL_TYPE_NAMES")?;
+    let imported_reveal_type_names = semanal_mod.getattr("IMPORTED_REVEAL_TYPE_NAMES")?;
+
+    let expr_line = expr.getattr("line")?;
+    let expr_column = expr.getattr("column")?;
+    let args = expr.getattr("args")?;
+    let args_list = match args.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+
+    // Helper: refers_to_fullname(callee, name)
+    let refers =
+        |name: &str| -> PyResult<bool> { refers_to_fullname_fn.call1((callee, name))?.is_true() };
+
+    // Helper: refers_to_fullname with tuple of names
+    let refers_any = |names: &PyAny| -> PyResult<bool> {
+        refers_to_fullname_fn.call1((callee, names))?.is_true()
+    };
+
+    // Helper: check_fixed_args
+    let check_fixed_args = |numargs: i64, name: &str| -> PyResult<bool> {
+        semanal
+            .call_method1("check_fixed_args", (expr, numargs, name))?
+            .is_true()
+    };
+
+    // Helper: set analyzed line/column and accept
+    let set_analyzed = |analyzed: &PyAny| -> PyResult<()> {
+        analyzed.setattr("line", expr_line)?;
+        let has_col = analyzed.hasattr("column")?;
+        if has_col {
+            analyzed.setattr("column", expr_column)?;
+        }
+        analyzed.call_method1("accept", (semanal,))?;
+        Ok(())
+    };
+
+    // cast(...)
+    if refers("typing.cast")? {
+        if !check_fixed_args(2, "cast")? {
+            return Ok(true);
+        }
+        let target =
+            match semanal.call_method1("expr_to_unanalyzed_type", (args_list.get_item(0)?,)) {
+                Ok(t) => t,
+                Err(_) => {
+                    semanal.call_method1("fail", ("Cast target is not a type", expr))?;
+                    return Ok(true);
+                }
+            };
+        let analyzed = castexpr_cls.call1((args_list.get_item(1)?, target))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // assert_type(...)
+    if refers_any(assert_type_names)? {
+        if !check_fixed_args(2, "assert_type")? {
+            return Ok(true);
+        }
+        let target =
+            match semanal.call_method1("expr_to_unanalyzed_type", (args_list.get_item(1)?,)) {
+                Ok(t) => t,
+                Err(_) => {
+                    semanal.call_method1("fail", ("assert_type() type is not a type", expr))?;
+                    return Ok(true);
+                }
+            };
+        let analyzed = asserttype_cls.call1((args_list.get_item(0)?, target))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // reveal_type(...)
+    if refers_any(reveal_type_names)? {
+        if !check_fixed_args(1, "reveal_type")? {
+            return Ok(true);
+        }
+        let reveal_imported = {
+            let reveal_type_node = semanal.call_method("lookup", ("reveal_type", expr), {
+                let kw = pyo3::types::PyDict::new(py);
+                kw.set_item("suppress_errors", true)?;
+                Some(kw)
+            })?;
+            if reveal_type_node.is_none() {
+                false
+            } else {
+                let node = reveal_type_node.getattr("node")?;
+                let is_symbol_funcbase = node.is_instance(symbol_funcbase_types)?;
+                let fullname: String = reveal_type_node.getattr("fullname")?.extract()?;
+                is_symbol_funcbase && imported_reveal_type_names.contains(&fullname)?
+            }
+        };
+        let kw = pyo3::types::PyDict::new(py);
+        kw.set_item("kind", reveal_type)?;
+        kw.set_item("expr", args_list.get_item(0)?)?;
+        kw.set_item("is_imported", reveal_imported)?;
+        let analyzed = revealexpr_cls.call((), Some(kw))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // reveal_locals(...)
+    if refers("builtins.reveal_locals")? {
+        let local_nodes = pyo3::types::PyList::empty(py);
+        let is_module_scope = semanal.call_method1("is_module_scope", ())?.is_true()?;
+        let is_class_scope = semanal.call_method1("is_class_scope", ())?.is_true()?;
+        let is_func_scope = semanal.call_method1("is_func_scope", ())?.is_true()?;
+        if is_module_scope {
+            let globals = semanal.getattr("globals")?;
+            let globals_dict = match globals.downcast::<PyDict>() {
+                Ok(d) => d,
+                Err(_) => return Ok(false),
+            };
+            for (_, n) in globals_dict.iter() {
+                let node = n.getattr("node")?;
+                let is_inferred = node
+                    .getattr("is_inferred")
+                    .map(|v| v.is_true().unwrap_or(false))
+                    .unwrap_or(false);
+                let is_var = node.is_instance(nodes_mod.getattr("Var")?)?;
+                if is_inferred && is_var {
+                    local_nodes.append(node)?;
+                }
+            }
+        } else if is_class_scope {
+            let semanal_type = semanal.getattr("type")?;
+            if !semanal_type.is_none() {
+                let names = semanal_type.getattr("names")?;
+                let names_dict = match names.downcast::<PyDict>() {
+                    Ok(d) => d,
+                    Err(_) => return Ok(false),
+                };
+                for (_, st) in names_dict.iter() {
+                    let node = st.getattr("node")?;
+                    let is_var = node.is_instance(nodes_mod.getattr("Var")?)?;
+                    if is_var {
+                        local_nodes.append(node)?;
+                    }
+                }
+            }
+        } else if is_func_scope {
+            let locals = semanal.getattr("locals")?;
+            if !locals.is_none() {
+                let locals_list = match locals.downcast::<PyList>() {
+                    Ok(l) => l,
+                    Err(_) => return Ok(false),
+                };
+                if !locals_list.is_empty() {
+                    let sym_table = locals_list.get_item(locals_list.len() - 1)?;
+                    if !sym_table.is_none() {
+                        let sym_table_dict = match sym_table.downcast::<PyDict>() {
+                            Ok(d) => d,
+                            Err(_) => return Ok(false),
+                        };
+                        for (_, st) in sym_table_dict.iter() {
+                            let node = st.getattr("node")?;
+                            let is_var = node.is_instance(nodes_mod.getattr("Var")?)?;
+                            if is_var {
+                                local_nodes.append(node)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let kw = pyo3::types::PyDict::new(py);
+        kw.set_item("kind", reveal_locals)?;
+        kw.set_item("local_nodes", local_nodes)?;
+        let analyzed = revealexpr_cls.call((), Some(kw))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // Any(...)
+    if refers("typing.Any")? {
+        semanal.call_method1(
+            "fail",
+            (
+                "Any(...) is no longer supported. Use cast(Any, ...) instead",
+                expr,
+            ),
+        )?;
+        return Ok(true);
+    }
+
+    // _promote(...)
+    if refers("typing._promote")? {
+        if !check_fixed_args(1, "_promote")? {
+            return Ok(true);
+        }
+        let target =
+            match semanal.call_method1("expr_to_unanalyzed_type", (args_list.get_item(0)?,)) {
+                Ok(t) => t,
+                Err(_) => {
+                    semanal.call_method1("fail", ("Argument 1 to _promote is not a type", expr))?;
+                    return Ok(true);
+                }
+            };
+        let analyzed = promoteexpr_cls.call1((target,))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // dict(...)
+    if refers("builtins.dict")? {
+        // Check if callee is a RefExpr with TypeAlias node and no_args=False
+        let skip = if callee.is_instance(refexpr_cls)? {
+            let callee_node = callee.getattr("node")?;
+            if callee_node.is_instance(typealias_cls)? {
+                let no_args = callee_node.getattr("no_args")?.is_true()?;
+                !no_args
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !skip {
+            let analyzed = semanal.call_method1("translate_dict_call", (expr,))?;
+            expr.setattr("analyzed", analyzed)?;
+            return Ok(true);
+        }
+    }
+
+    // divmod(...)
+    if refers("builtins.divmod")? {
+        if !check_fixed_args(2, "divmod")? {
+            return Ok(true);
+        }
+        let analyzed =
+            opexpr_cls.call1(("divmod", args_list.get_item(0)?, args_list.get_item(1)?))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // TypeAliasType(...)
+    if refers_any(PyTuple::new(
+        py,
+        ["typing.TypeAliasType", "typing_extensions.TypeAliasType"],
+    ))? {
+        // allow_unbound_tvars_set context
+        let old_allow = semanal.getattr("allow_unbound_tvars")?;
+        semanal.setattr("allow_unbound_tvars", true)?;
+        for a in args_list.iter() {
+            a.call_method1("accept", (semanal,))?;
+        }
+        semanal.setattr("allow_unbound_tvars", old_allow)?;
+        return Ok(true);
+    }
+
+    // TypeForm(...)
+    if refers_any(PyTuple::new(
+        py,
+        ["typing.TypeForm", "typing_extensions.TypeForm"],
+    ))? {
+        if !check_fixed_args(1, "TypeForm")? {
+            return Ok(true);
+        }
+        let typ = match semanal.call_method1("expr_to_unanalyzed_type", (args_list.get_item(0)?,)) {
+            Ok(t) => t,
+            Err(_) => {
+                semanal.call_method1("fail", ("TypeForm argument is not a type", expr))?;
+                let any_type = anytype_cls.call1((from_error,))?;
+                let analyzed = castexpr_cls.call1((args_list.get_item(0)?, any_type))?;
+                expr.setattr("analyzed", analyzed)?;
+                return Ok(true);
+            }
+        };
+        let analyzed = typeform_cls.call1((typ,))?;
+        expr.setattr("analyzed", analyzed)?;
+        set_analyzed(analyzed)?;
+        return Ok(true);
+    }
+
+    // Normal call expression
+    for a in args_list.iter() {
+        a.call_method1("accept", (semanal,))?;
+        semanal.call_method1("try_parse_as_type_expression", (a,))?;
+    }
+
+    // __all__ mutation handling
+    if callee.is_instance(memberexpr_cls)? {
+        let callee_expr = callee.getattr("expr")?;
+        if callee_expr.is_instance(nameexpr_cls)? {
+            let callee_expr_name: String = callee_expr.getattr("name")?.extract()?;
+            let callee_expr_kind = callee_expr.getattr("kind")?;
+            let callee_name: String = callee.getattr("name")?.extract()?;
+            if callee_expr_name == "__all__"
+                && callee_expr_kind
+                    .rich_compare(gdef, pyo3::basic::CompareOp::Eq)?
+                    .is_true()?
+                && matches!(callee_name.as_str(), "append" | "extend" | "remove")
+            {
+                if callee_name == "append" && !args_list.is_empty() {
+                    semanal.call_method1("add_exports", (args_list.get_item(0)?,))?;
+                } else if callee_name == "extend" && !args_list.is_empty() {
+                    let arg0 = args_list.get_item(0)?;
+                    if arg0.is_instance(listexpr_cls)? || arg0.is_instance(tupleexpr_cls)? {
+                        let items = arg0.getattr("items")?;
+                        semanal.call_method1("add_exports", (items,))?;
+                    }
+                } else if callee_name == "remove" && !args_list.is_empty() {
+                    let arg0 = args_list.get_item(0)?;
+                    if arg0.is_instance(strexpr_cls)? {
+                        let val: String = arg0.getattr("value")?.extract()?;
+                        let all_exports = semanal.getattr("all_exports")?;
+                        let all_exports_list = match all_exports.downcast::<PyList>() {
+                            Ok(l) => l,
+                            Err(_) => return Ok(false),
+                        };
+                        let new_exports: Vec<PyObject> = all_exports_list
+                            .iter()
+                            .filter(|n| n.extract::<String>().map(|s| s != val).unwrap_or(true))
+                            .map(|n| n.into())
+                            .collect();
+                        all_exports_list.call_method1("clear", ())?;
+                        all_exports_list.call_method1("extend", (new_exports,))?;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -510,6 +510,7 @@ try:
         rust_visit_import_from as _rust_visit_import_from,
         rust_visit_assignment_stmt as _rust_visit_assignment_stmt,
         rust_visit_import as _rust_visit_import,
+        rust_visit_call_expr as _rust_visit_call_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -608,6 +609,7 @@ except ImportError:
     _rust_visit_import_from = None  # type: ignore[assignment]
     _rust_visit_assignment_stmt = None  # type: ignore[assignment]
     _rust_visit_import = None  # type: ignore[assignment]
+    _rust_visit_call_expr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6550,6 +6552,9 @@ class SemanticAnalyzer(
         Some call expressions are recognized as special forms, including
         cast(...).
         """
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_call_expr(expr, self):
+                return
         expr.callee.accept(self)
         if refers_to_fullname(expr.callee, "typing.cast"):
             # Special form cast(...).
