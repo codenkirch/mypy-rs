@@ -8,18 +8,24 @@ Date: 2026-08-13
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.2M |
-| Python bytes (mypy + mypyc, ex test/) | ~7.7M |
-| Rust % (local) | ~29.4% |
+| Rust bytes (local, .rs) | ~3.25M |
+| Python bytes (mypy + mypyc, ex test/) | ~6.6M |
+| Rust % (local) | ~32.97% |
 | Rust % (GitHub languages API) | ~25.6% |
 | Rust LOC (crates/) | ~86K |
 | Rust source files | 81 (type_kernel) + ast_serialize + module_resolver + fs_probe |
-| Gap to 50% | ~4.5M bytes Python->Rust |
+| Gap to 50% | ~3.34M bytes Python->Rust |
+
+Updated 2026-08-16 after the leaf-action shard sequence (#625-#630): the
+gap narrowed from ~4.5M to ~3.34M, mostly via inline `visit_*` sharding
+in `semanal.py`. Each shard PR nets only a few KB, so reaching 50% via
+this pattern alone is multi-month; the wider levers in Phase B/C (deferral
+reduction, depth ports) remain the realistic path.
 
 ## Honest assessment: path to 50%
 
-The user-facing goal is 50% Rust. That requires moving ~2.24M bytes of
-Python to Rust (so Rust = 4.48M = Python = 4.48M out of a 8.96M total).
+The user-facing goal is 50% Rust. That requires moving ~1.67M bytes of
+Python to Rust (so Rust = 4.92M = Python = 4.92M out of a 9.84M total).
 
 The **biggest Python files cannot be ported** without breaking the
 migration plan's Phase E1 constraints:
