@@ -3642,6 +3642,101 @@ pub(crate) fn rust_visit_func_def(py: Python<'_>, defn: &PyAny, semanal: &PyAny)
     Ok(true)
 }
 
+/// `mypy.semanal.visit_nonlocal_decl` body — set statement,
+/// check is_module_scope, else for each name: scan locals/scope_stack
+/// for a matching table (for...else), check annotation scope, check
+/// local redefinition, check global conflict, add to nonlocal_decls.
+#[pyfunction]
+pub(crate) fn rust_visit_nonlocal_decl(
+    py: Python<'_>,
+    d: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", d)?;
+    if semanal.call_method0("is_module_scope")?.is_true()? {
+        semanal.call_method(
+            "fail",
+            ("nonlocal declaration not allowed at module level", d),
+            None,
+        )?;
+        return Ok(true);
+    }
+    // SCOPE_ANNOTATION constant from semanal module.
+    let scope_annotation = py
+        .import("mypy.semanal")?
+        .getattr("SCOPE_ANNOTATION")?
+        .extract::<i64>()?;
+    let names = d.getattr("names")?;
+    let names_list = match names.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    let locals = semanal.getattr("locals")?;
+    let locals_list = locals.downcast::<PyList>()?;
+    let scope_stack = semanal.getattr("scope_stack")?;
+    let scope_list = scope_stack.downcast::<PyList>()?;
+    // self.locals[:-1] and self.scope_stack[:-1] — all but last.
+    let n = locals_list.len();
+    // zip(reversed(locals[:-1]), reversed(scope_stack[:-1]))
+    let global_decls = semanal.getattr("global_decls")?;
+    let global_list = global_decls.downcast::<PyList>()?;
+    let nonlocal_decls = semanal.getattr("nonlocal_decls")?;
+    let nonlocal_list = nonlocal_decls.downcast::<PyList>()?;
+    let local_last = locals_list.get_item(n - 1)?;
+    let global_last = global_list.get_item(global_list.len() - 1)?;
+    let nonlocal_last = nonlocal_list.get_item(nonlocal_list.len() - 1)?;
+    for name in names_list.iter() {
+        // for table, scope_type in zip(reversed(...), reversed(...)):
+        let mut found = false;
+        for i in (0..(n - 1)).rev() {
+            let table = locals_list.get_item(i)?;
+            let scope_type = scope_list.get_item(i)?;
+            if !table.is_none() {
+                // name in table (dict membership)
+                if table.contains(name)? {
+                    let st = scope_type.extract::<i64>()?;
+                    if st == scope_annotation {
+                        let msg = format!(
+                            "nonlocal binding not allowed for type parameter \"{}\"",
+                            name.extract::<String>()?
+                        );
+                        semanal.call_method("fail", (msg.as_str(), d), None)?;
+                    }
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            let msg = format!(
+                "No binding for nonlocal \"{}\" found",
+                name.extract::<String>()?
+            );
+            semanal.call_method("fail", (msg.as_str(), d), None)?;
+        }
+        // self.locals[-1] is not None and name in self.locals[-1]
+        if !local_last.is_none() && local_last.contains(name)? {
+            let name_str = name.extract::<String>()?;
+            let msg = format!(
+                "Name \"{}\" is already defined in local scope before nonlocal declaration",
+                name_str
+            );
+            semanal.call_method("fail", (msg.as_str(), d), None)?;
+        }
+        // name in self.global_decls[-1]
+        if global_last.contains(name)? {
+            let msg = format!(
+                "Name \"{}\" is nonlocal and global",
+                name.extract::<String>()?
+            );
+            semanal.call_method("fail", (msg.as_str(), d), None)?;
+        }
+        // self.nonlocal_decls[-1].add(name)
+        nonlocal_last.call_method1("add", (name,))?;
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
