@@ -462,6 +462,10 @@ try:
         rust_visit_assert_stmt as _rust_visit_assert_stmt,
         rust_visit_operator_assignment_stmt as _rust_visit_operator_assignment_stmt,
         rust_visit_raise_stmt as _rust_visit_raise_stmt,
+        rust_is_valid_del_target as _rust_is_valid_del_target,
+        rust_visit_block as _rust_visit_block,
+        rust_visit_del_stmt as _rust_visit_del_stmt,
+        rust_visit_if_stmt as _rust_visit_if_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -512,6 +516,10 @@ except ImportError:
     _rust_visit_assert_stmt = None  # type: ignore[assignment]
     _rust_visit_operator_assignment_stmt = None  # type: ignore[assignment]
     _rust_visit_raise_stmt = None  # type: ignore[assignment]
+    _rust_is_valid_del_target = None  # type: ignore[assignment]
+    _rust_visit_block = None  # type: ignore[assignment]
+    _rust_visit_del_stmt = None  # type: ignore[assignment]
+    _rust_visit_if_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -5894,6 +5902,9 @@ class SemanticAnalyzer(
     #
 
     def visit_block(self, b: Block) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_block(b, self):
+                return
         if b.is_unreachable:
             return
         self.block_depth[-1] += 1
@@ -6007,6 +6018,9 @@ class SemanticAnalyzer(
     def visit_if_stmt(self, s: IfStmt) -> None:
         self.statement = s
         infer_reachability_of_if_statement(s, self.options)
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_if_stmt(s, self):
+                return
         for i in range(len(s.expr)):
             s.expr[i].accept(self)
             self.visit_block(s.body[i])
@@ -6081,6 +6095,9 @@ class SemanticAnalyzer(
         self.visit_block(s.body)
 
     def visit_del_stmt(self, s: DelStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_del_stmt(s, self):
+                return
         self.statement = s
         s.expr.accept(self)
         if not self.is_valid_del_target(s.expr):
