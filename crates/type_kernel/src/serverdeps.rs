@@ -742,6 +742,82 @@ pub fn rust_sort_messages_preserving_file_order(
     groups.into_iter().flat_map(|(_, g)| g).collect()
 }
 
+/// Compare two symbol-table snapshots and return fully-qualified diff names.
+///
+/// Mirrors `mypy.server.astdiff:compare_symbol_table_snapshots` (line 123).
+/// Pure over the plain snapshot representation (tuples, dicts, primitives):
+/// for each name in symmetric difference, emit `prefix.name`. For names in
+/// both, compare tuples; kind-mismatch emits the name; kind "TypeInfo"
+/// compares everything except the trailing dict, then recurses into the
+/// nested dict with the extended prefix.
+#[pyfunction]
+pub fn rust_compare_symbol_table_snapshots(
+    name_prefix: &str,
+    snapshot1: &PyDict,
+    snapshot2: &PyDict,
+) -> PyResult<HashSet<String>> {
+    let mut triggers: HashSet<String> = HashSet::new();
+    let prefix_dot = format!("{}.", name_prefix);
+
+    let mut names1: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in snapshot1.keys().iter() {
+        names1.insert(k.extract::<String>()?);
+    }
+    let mut names2: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in snapshot2.keys().iter() {
+        names2.insert(k.extract::<String>()?);
+    }
+
+    for n in names1.symmetric_difference(&names2) {
+        triggers.insert(format!("{}{}", prefix_dot, n));
+    }
+
+    for name in names1.intersection(&names2) {
+        let item1 = snapshot1.get_item(name)?.unwrap();
+        let item2 = snapshot2.get_item(name)?.unwrap();
+        let item_name = format!("{}{}", prefix_dot, name);
+        let tuple1 = item1.downcast::<PyTuple>()?;
+        let tuple2 = item2.downcast::<PyTuple>()?;
+        let len1 = tuple1.len();
+        let len2 = tuple2.len();
+        if len1 == 0 || len2 == 0 {
+            triggers.insert(item_name);
+            continue;
+        }
+        let kind1: String = tuple1.get_item(0)?.extract()?;
+        let kind2: String = tuple2.get_item(0)?.extract()?;
+        if kind1 != kind2 {
+            triggers.insert(item_name);
+            continue;
+        }
+        if kind1 == "TypeInfo" {
+            let mut all_equal = true;
+            // Mirrors item1[:-1] != item2[:-1]: compare the trailing-excluded
+            // head — indices 1..len-1 (skip kind tag and nested-dict tail).
+            let head_len = len1.min(len2).saturating_sub(2);
+            for i in 0..head_len {
+                if !tuple1.get_item(i + 1)?.eq(tuple2.get_item(i + 1)?)? {
+                    all_equal = false;
+                    break;
+                }
+            }
+            if !all_equal || len1 != len2 {
+                triggers.insert(item_name.clone());
+            }
+            let nested1 = tuple1.get_item(len1 - 1)?.downcast::<PyDict>()?;
+            let nested2 = tuple2.get_item(len2 - 1)?.downcast::<PyDict>()?;
+            let sub = rust_compare_symbol_table_snapshots(&item_name, nested1, nested2)?;
+            triggers.extend(sub);
+        } else {
+            if !tuple1.eq(tuple2)? {
+                triggers.insert(item_name);
+            }
+        }
+    }
+
+    Ok(triggers)
+}
+
 /// Bases of a class excluding builtins.object and the class itself.
 ///
 /// Mirrors `mypy.server.deps:non_trivial_bases` (line 1222). Walks

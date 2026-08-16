@@ -1439,6 +1439,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(serverdeps::rust_has_user_bases, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_compare_symbol_table_snapshots,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stubgen::rust_stubgen_render, module)?)?;
     module.add_function(wrap_pyfunction!(
         stubgen::rust_stubgen_render_type_args,

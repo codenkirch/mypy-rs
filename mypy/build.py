@@ -1135,6 +1135,10 @@ class BuildManager:
         from mypy.server.update import _set_native_update_active
 
         _set_native_update_active(self.options.native_type_kernel)
+        # M388: gate the astdiff snapshot comparator (same seam family).
+        from mypy.server.astdiff import _set_native_astdiff_active
+
+        _set_native_astdiff_active(self.options.native_type_kernel)
         # Stage 30: gate the dataclasses plugin transform seam. The Rust
         # path computes real `__init__`/`__post_init__` signatures; Python
         # validates each result before applying, else falls back to Python.
