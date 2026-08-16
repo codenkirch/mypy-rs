@@ -3526,6 +3526,55 @@ pub(crate) fn rust_visit_overloaded_func_def(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_class_def` body — set statement, push to
+/// `incomplete_type_stack`, compute qualified_name, enter
+/// `tvar_scope_frame(tvar_scope.class_frame(namespace))` CM, then
+/// either mark_incomplete + return (when push_type_args returns None),
+/// or push/pop `removed_type_vars` around `analyze_class` +
+/// `pop_type_args`. `incomplete_type_stack` pop happens after the CM.
+#[pyfunction]
+pub(crate) fn rust_visit_class_def(
+    py: Python<'_>,
+    defn: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", defn)?;
+    let info = defn.getattr("info")?;
+    // Python: `not defn.info` — truthy check, not just None check.
+    semanal
+        .getattr("incomplete_type_stack")?
+        .call_method1("append", (!info.is_true()?,))?;
+    let namespace = semanal.call_method1("qualified_name", (defn.getattr("name")?,))?;
+    let tvar_scope = semanal.getattr("tvar_scope")?;
+    let frame = tvar_scope.call_method1("class_frame", (namespace,))?;
+    let cm = semanal.call_method1("tvar_scope_frame", (frame,))?;
+    cm.call_method1("__enter__", ())?;
+    // push_type_args returns None on error: mark_incomplete + skip rest.
+    let pushed = semanal.call_method1("push_type_args", (defn.getattr("type_args")?, defn))?;
+    let ok = !pushed.is_none();
+    if !ok {
+        let _ = semanal.call_method1("mark_incomplete", (defn.getattr("name")?, defn));
+    }
+    let body_err: Option<pyo3::PyErr> = if ok {
+        let removed = semanal.getattr("removed_type_vars")?;
+        let _ = removed.call_method1("append", (PyList::empty(py),));
+        let analyze_result = semanal.call_method1("analyze_class", (defn,));
+        let _ = removed.call_method1("pop", ());
+        let _ = semanal.call_method1("pop_type_args", (defn.getattr("type_args")?,));
+        analyze_result.err()
+    } else {
+        None
+    };
+    let _ = cm.call_method1("__exit__", (py.None(), py.None(), py.None()));
+    let _ = semanal
+        .getattr("incomplete_type_stack")?
+        .call_method1("pop", ());
+    if let Some(err) = body_err {
+        return Err(err);
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
