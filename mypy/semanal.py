@@ -487,6 +487,13 @@ try:
         rust_visit_yield_from_expr as _rust_visit_yield_from_expr,
         rust_visit_await_expr as _rust_visit_await_expr,
         rust_visit_try_stmt as _rust_visit_try_stmt,
+        rust_visit_op_expr as _rust_visit_op_expr,
+        rust_visit_index_expr as _rust_visit_index_expr,
+        rust_visit_cast_expr as _rust_visit_cast_expr,
+        rust_visit_type_form_expr as _rust_visit_type_form_expr,
+        rust_visit_assert_type_expr as _rust_visit_assert_type_expr,
+        rust_visit_reveal_expr as _rust_visit_reveal_expr,
+        rust_visit_type_application as _rust_visit_type_application,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -562,6 +569,13 @@ except ImportError:
     _rust_visit_yield_from_expr = None  # type: ignore[assignment]
     _rust_visit_await_expr = None  # type: ignore[assignment]
     _rust_visit_try_stmt = None  # type: ignore[assignment]
+    _rust_visit_op_expr = None  # type: ignore[assignment]
+    _rust_visit_index_expr = None  # type: ignore[assignment]
+    _rust_visit_cast_expr = None  # type: ignore[assignment]
+    _rust_visit_type_form_expr = None  # type: ignore[assignment]
+    _rust_visit_assert_type_expr = None  # type: ignore[assignment]
+    _rust_visit_reveal_expr = None  # type: ignore[assignment]
+    _rust_visit_type_application = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6759,6 +6773,9 @@ class SemanticAnalyzer(
         expr.node = sym.node
 
     def visit_op_expr(self, expr: OpExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_op_expr(expr, self):
+                return
         expr.left.accept(self)
 
         if expr.op in ("and", "or"):
@@ -6789,6 +6806,9 @@ class SemanticAnalyzer(
         expr.expr.accept(self)
 
     def visit_index_expr(self, expr: IndexExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_index_expr(expr, self):
+                return
         base = expr.base
         base.accept(self)
         if (
@@ -6909,23 +6929,35 @@ class SemanticAnalyzer(
             expr.stride.accept(self)
 
     def visit_cast_expr(self, expr: CastExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_cast_expr(expr, self):
+                return
         expr.expr.accept(self)
         analyzed = self.anal_type(expr.type)
         if analyzed is not None:
             expr.type = analyzed
 
     def visit_type_form_expr(self, expr: TypeFormExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_type_form_expr(expr, self):
+                return
         analyzed = self.anal_type(expr.type)
         if analyzed is not None:
             expr.type = analyzed
 
     def visit_assert_type_expr(self, expr: AssertTypeExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_assert_type_expr(expr, self):
+                return
         expr.expr.accept(self)
         analyzed = self.anal_type(expr.type)
         if analyzed is not None:
             expr.type = analyzed
 
     def visit_reveal_expr(self, expr: RevealExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_reveal_expr(expr, self):
+                return
         if expr.kind == REVEAL_TYPE:
             if expr.expr is not None:
                 expr.expr.accept(self)
@@ -6935,6 +6967,9 @@ class SemanticAnalyzer(
             pass
 
     def visit_type_application(self, expr: TypeApplication) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_type_application(expr, self):
+                return
         expr.expr.accept(self)
         for i in range(len(expr.types)):
             analyzed = self.anal_type(expr.types[i])

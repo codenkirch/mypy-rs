@@ -3156,6 +3156,183 @@ pub(crate) fn rust_visit_try_stmt(_py: Python<'_>, s: &PyAny, semanal: &PyAny) -
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 9: leaf-actions shards for op / index / cast / type_form /
+// assert_type / reveal / type_application. These drive expr recursion and
+// a single `self.anal_type` call per type slot, mirroring the Python
+// bodies; the `anal_type` machinery (with its full placeholder/deferral
+// flow) stays in Python.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_op_expr` body — recurse left, then for `and`/`or`
+/// ask `infer_condition_value` for the left condition, set the
+/// right_unreachable/right_always flags as appropriate, then recurse
+/// right (skipped when unreachable).
+#[pyfunction]
+pub(crate) fn rust_visit_op_expr(py: Python<'_>, expr: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    expr.getattr("left")?.call_method1("accept", (semanal,))?;
+    let op: String = expr.getattr("op")?.extract()?;
+    if op == "and" || op == "or" {
+        let reach_mod = py.import("mypy.reachability")?;
+        let options = semanal.getattr("options")?;
+        let inferred: i64 = reach_mod
+            .getattr("infer_condition_value")?
+            .call1((expr.getattr("left")?, options))?
+            .extract()?;
+        let always_false: i64 = reach_mod.getattr("ALWAYS_FALSE")?.extract()?;
+        let mypy_false: i64 = reach_mod.getattr("MYPY_FALSE")?.extract()?;
+        let always_true: i64 = reach_mod.getattr("ALWAYS_TRUE")?.extract()?;
+        let mypy_true: i64 = reach_mod.getattr("MYPY_TRUE")?.extract()?;
+        let unreachable = (op == "and" && (inferred == always_false || inferred == mypy_false))
+            || (op == "or" && (inferred == always_true || inferred == mypy_true));
+        let always = (op == "and" && (inferred == always_true || inferred == mypy_true))
+            || (op == "or" && (inferred == always_false || inferred == mypy_false));
+        if unreachable {
+            expr.setattr("right_unreachable", true)?;
+            return Ok(true);
+        } else if always {
+            expr.setattr("right_always", true)?;
+        }
+    }
+    expr.getattr("right")?.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_index_expr` body — recurse base, then dispatch
+/// among three branches: (TypeInfo non-generic) recurse index;
+/// (TypeAlias or class/function ref) call `analyze_type_application`;
+/// otherwise recurse index.
+#[pyfunction]
+pub(crate) fn rust_visit_index_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let base = expr.getattr("base")?;
+    base.call_method1("accept", (semanal,))?;
+    let ref_expr_cls = nodes_mod.getattr("RefExpr")?;
+    let type_info_cls = nodes_mod.getattr("TypeInfo")?;
+    let type_alias_cls = nodes_mod.getattr("TypeAlias")?;
+    let is_ref = base.is_instance(ref_expr_cls)?;
+    if is_ref {
+        let node = base.getattr("node")?;
+        if !node.is_none() {
+            if node.is_instance(type_info_cls)? {
+                let is_generic = node.call_method0("is_generic")?.is_true()?;
+                if !is_generic {
+                    expr.getattr("index")?.call_method1("accept", (semanal,))?;
+                    return Ok(true);
+                }
+            }
+            if node.is_instance(type_alias_cls)? {
+                semanal.call_method1("analyze_type_application", (expr,))?;
+                return Ok(true);
+            }
+        }
+    }
+    // refers_to_class_or_function(base) OR the else-branch both recurse
+    // the index; the type-application branch is the only deviation and
+    // we already handled it above. Use the existing helper to detect the
+    // class/function case so we can call analyze_type_application.
+    let refers_class_fn = rust_refers_to_class_or_function(py, base)?;
+    if refers_class_fn {
+        semanal.call_method1("analyze_type_application", (expr,))?;
+    } else {
+        expr.getattr("index")?.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// Shared helper for the trivial "recurse + anal_type + assign back" bodies
+/// used by cast/type_form/assert_type/type_application.
+fn anal_type_assign(semanal: &PyAny, expr: &PyAny, attr: &str) -> PyResult<()> {
+    let analyzed = semanal.call_method1("anal_type", (expr.getattr(attr)?,))?;
+    if !analyzed.is_none() {
+        expr.setattr(attr, analyzed)?;
+    }
+    Ok(())
+}
+
+/// `mypy.semanal.visit_cast_expr` — recurse inner expr, anal_type(type).
+#[pyfunction]
+pub(crate) fn rust_visit_cast_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    expr.getattr("expr")?.call_method1("accept", (semanal,))?;
+    anal_type_assign(semanal, expr, "type")?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_type_form_expr` — anal_type(type).
+#[pyfunction]
+pub(crate) fn rust_visit_type_form_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    anal_type_assign(semanal, expr, "type")?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_assert_type_expr` — recurse inner expr + anal_type.
+#[pyfunction]
+pub(crate) fn rust_visit_assert_type_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    expr.getattr("expr")?.call_method1("accept", (semanal,))?;
+    anal_type_assign(semanal, expr, "type")?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_reveal_expr` — if REVEAL_TYPE, recurse the expr.
+#[pyfunction]
+pub(crate) fn rust_visit_reveal_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    // REVEAL_TYPE is a module constant in mypy.semanal; this shard
+    // mirrors the Python branch only when kind == REVEAL_TYPE.
+    let semanal_mod = py.import("mypy.semanal")?;
+    let reveal_type: i64 = semanal_mod.getattr("REVEAL_TYPE")?.extract()?;
+    let kind: i64 = expr.getattr("kind")?.extract()?;
+    if kind == reveal_type {
+        let inner = expr.getattr("expr")?;
+        if !inner.is_none() {
+            inner.call_method1("accept", (semanal,))?;
+        }
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_type_application` — recurse expr, then anal_type
+/// each entry of the `types` list and assign back in place.
+#[pyfunction]
+pub(crate) fn rust_visit_type_application(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    expr.getattr("expr")?.call_method1("accept", (semanal,))?;
+    let types = expr.getattr("types")?;
+    let list = match types.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for i in 0..list.len() {
+        let analyzed = semanal.call_method1("anal_type", (list.get_item(i)?,))?;
+        if !analyzed.is_none() {
+            list.set_item(i, analyzed)?;
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
