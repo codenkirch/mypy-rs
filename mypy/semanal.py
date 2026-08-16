@@ -507,6 +507,7 @@ try:
         rust_visit_with_stmt as _rust_visit_with_stmt,
         rust_visit_assignment_expr as _rust_visit_assignment_expr,
         rust_visit_import_all as _rust_visit_import_all,
+        rust_visit_import_from as _rust_visit_import_from,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -602,6 +603,7 @@ except ImportError:
     _rust_visit_with_stmt = None  # type: ignore[assignment]
     _rust_visit_assignment_expr = None  # type: ignore[assignment]
     _rust_visit_import_all = None  # type: ignore[assignment]
+    _rust_visit_import_from = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -3422,6 +3424,9 @@ class SemanticAnalyzer(
                 )
 
     def visit_import_from(self, imp: ImportFrom) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_import_from(imp, self):
+                return
         self.statement = imp
         module_id = self.correct_relative_import(imp)
         module = self.modules.get(module_id)

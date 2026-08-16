@@ -4034,6 +4034,240 @@ pub(crate) fn rust_visit_import_all(py: Python<'_>, i: &PyAny, semanal: &PyAny) 
     Ok(true)
 }
 
+/// `mypy.semanal.visit_import_from` body — correct relative import,
+/// iterate imported names, resolve each against the module symbol table
+/// or self.modules, handle __getattr__, process/missing/unknown symbols.
+#[pyfunction]
+pub(crate) fn rust_visit_import_from(
+    py: Python<'_>,
+    imp: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    semanal.setattr("statement", imp)?;
+    let module_id = semanal.call_method1("correct_relative_import", (imp,))?;
+    let module_id_str: String = module_id.extract()?;
+    let modules = semanal.getattr("modules")?;
+    let modules_dict = match modules.downcast::<PyDict>() {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+    let module = modules_dict.get_item(&module_id_str)?;
+    let cur_mod_id = semanal.getattr("cur_mod_id")?;
+    let cur_mod_id_str: String = cur_mod_id.extract()?;
+    let missing_modules = semanal.getattr("missing_modules")?;
+    let missing_set = match missing_modules.downcast::<PySet>() {
+        Ok(s) => s,
+        Err(_) => return Ok(false),
+    };
+    let is_stub_file = semanal.getattr("is_stub_file")?.is_true()?;
+    let opts = semanal.getattr("options")?;
+    let implicit_reexport = opts.getattr("implicit_reexport")?.is_true()?;
+    let use_implicit_reexport = !is_stub_file && implicit_reexport;
+    let all_exports = semanal.getattr("all_exports")?;
+
+    let imp_names = imp.getattr("names")?;
+    let names_list = match imp_names.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let symboltable_cls = nodes_mod.getattr("SymbolTableNode")?;
+    let semanal_mod = py.import("mypy.semanal")?;
+    let gdef = semanal_mod.getattr("GDEF")?;
+
+    for item in names_list.iter() {
+        let pair = match item.downcast::<PyTuple>() {
+            Ok(t) => t,
+            Err(_) => return Ok(false),
+        };
+        if pair.len() != 2 {
+            return Ok(false);
+        }
+        let id: String = pair.get_item(0)?.extract()?;
+        let as_id_obj = pair.get_item(1)?;
+        let as_id: Option<String> = if as_id_obj.is_none() {
+            None
+        } else {
+            Some(as_id_obj.extract()?)
+        };
+
+        let fullname = format!("{}.{}", module_id_str, id);
+        semanal.call_method1("set_future_import_flags", (fullname.as_str(),))?;
+
+        // Resolve node
+        let mut node: Option<PyObject> = if let Some(m) = module {
+            if module_id_str == cur_mod_id_str && modules_dict.contains(&fullname)? {
+                let mod_entry = modules_dict.get_item(&fullname)?;
+                let stn = symboltable_cls.call1((gdef, mod_entry.unwrap()))?;
+                Some(stn.into())
+            } else {
+                // __all__ recovery
+                if id == "__all__" && as_id.as_deref() == Some("__all__") {
+                    let m_names = m.getattr("names")?;
+                    let m_names_dict = match m_names.downcast::<PyDict>() {
+                        Ok(d) => d,
+                        Err(_) => return Ok(false),
+                    };
+                    all_exports.call_method1("clear", ())?;
+                    let public_names: Vec<PyObject> = m_names_dict
+                        .iter()
+                        .filter(|(_, sym)| {
+                            sym.getattr("module_public")
+                                .map(|v| v.is_true().unwrap_or(false))
+                                .unwrap_or(false)
+                        })
+                        .map(|(name, _)| name.into())
+                        .collect();
+                    all_exports.call_method1("extend", (public_names,))?;
+                }
+                let m_names = m.getattr("names")?;
+                let m_names_dict = match m_names.downcast::<PyDict>() {
+                    Ok(d) => d,
+                    Err(_) => return Ok(false),
+                };
+                m_names_dict.get_item(&id)?.map(|v| v.into())
+            }
+        } else {
+            None
+        };
+
+        let mut missing_submodule = false;
+        let imported_id = match &as_id {
+            Some(a) => a.clone(),
+            None => id.clone(),
+        };
+
+        let module_public =
+            use_implicit_reexport || (as_id.is_some() && as_id.as_deref() == Some(id.as_str()));
+
+        // If node is None, try module lookup
+        if node.is_none() {
+            if let Some(mod2) = modules_dict.get_item(&fullname)? {
+                let kind = semanal.call_method1("current_symbol_kind", ())?;
+                let stn = symboltable_cls.call1((kind, mod2))?;
+                node = Some(stn.into());
+            } else if missing_set.contains(&fullname)? {
+                missing_submodule = true;
+            }
+        }
+
+        // __getattr__ handling
+        if let Some(m) = module {
+            if node.is_none() {
+                let m_names = m.getattr("names")?;
+                let m_names_dict = match m_names.downcast::<PyDict>() {
+                    Ok(d) => d,
+                    Err(_) => return Ok(false),
+                };
+                if m_names_dict.contains("__getattr__")? {
+                    let getattr_defn = m_names_dict.get_item("__getattr__")?.unwrap();
+                    let fullname2 = format!("{}.{}", module_id_str, id);
+                    let gvar = semanal.call_method1(
+                        "create_getattr_var",
+                        (getattr_defn, imported_id.as_str(), fullname2.as_str()),
+                    )?;
+                    if gvar.is_true()? {
+                        let kw = pyo3::types::PyDict::new(py);
+                        kw.set_item("module_public", module_public)?;
+                        kw.set_item("module_hidden", !module_public)?;
+                        semanal.call_method(
+                            "add_symbol",
+                            (imported_id.as_str(), gvar, imp),
+                            Some(kw),
+                        )?;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Some(n) = &node {
+            let n_ref = n.as_ref(py);
+            semanal.call_method(
+                "process_imported_symbol",
+                (
+                    n_ref,
+                    module_id_str.as_str(),
+                    id.as_str(),
+                    imported_id.as_str(),
+                    fullname.as_str(),
+                    module_public,
+                ),
+                {
+                    let kw = pyo3::types::PyDict::new(py);
+                    kw.set_item("context", imp)?;
+                    Some(kw)
+                },
+            )?;
+            if n_ref.getattr("module_hidden")?.is_true()? {
+                let kw = pyo3::types::PyDict::new(py);
+                kw.set_item("module_public", module_public)?;
+                kw.set_item("module_hidden", !module_public)?;
+                kw.set_item("context", imp)?;
+                kw.set_item("add_unknown_imported_symbol", false)?;
+                semanal.call_method(
+                    "report_missing_module_attribute",
+                    (
+                        module_id_str.as_str(),
+                        id.as_str(),
+                        imported_id.as_str(),
+                        module_public,
+                        !module_public,
+                        imp,
+                    ),
+                    Some(kw),
+                )?;
+            }
+        } else if module.is_some() {
+            if !missing_submodule {
+                let kw = pyo3::types::PyDict::new(py);
+                kw.set_item("module_public", module_public)?;
+                kw.set_item("module_hidden", !module_public)?;
+                kw.set_item("context", imp)?;
+                semanal.call_method(
+                    "report_missing_module_attribute",
+                    (
+                        module_id_str.as_str(),
+                        id.as_str(),
+                        imported_id.as_str(),
+                        module_public,
+                        !module_public,
+                        imp,
+                    ),
+                    Some(kw),
+                )?;
+            } else {
+                semanal.call_method(
+                    "add_unknown_imported_symbol",
+                    (
+                        imported_id.as_str(),
+                        imp,
+                        fullname.as_str(),
+                        module_public,
+                        !module_public,
+                    ),
+                    None,
+                )?;
+            }
+        } else {
+            semanal.call_method(
+                "add_unknown_imported_symbol",
+                (
+                    imported_id.as_str(),
+                    imp,
+                    fullname.as_str(),
+                    module_public,
+                    !module_public,
+                ),
+                None,
+            )?;
+        }
+    }
+
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
