@@ -2965,6 +2965,197 @@ pub(crate) fn rust_visit_class_pattern(
     accept_list_attr("keyword_values", p, semanal)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 8: leaf-actions shards for yield / yield-from / await / try. The
+// yield/await bodies check scope, flip the enclosing FuncDef's generator
+// flags, and recurse. Errors carry serious/blocker and sometimes a code.
+// ---------------------------------------------------------------------------
+
+/// Shared helper that forwards a `self.fail` call with `serious` /
+/// `blocker` / optional `code` kwargs, mirroring the Python call surface.
+fn fail_with_kwargs(
+    semanal: &PyAny,
+    msg: &str,
+    ctx: &PyAny,
+    serious: bool,
+    blocker: bool,
+    code: Option<&PyAny>,
+) -> PyResult<()> {
+    let py = semanal.py();
+    let kw = pyo3::types::PyDict::new(py);
+    if serious {
+        kw.set_item("serious", true)?;
+    }
+    if blocker {
+        kw.set_item("blocker", true)?;
+    }
+    if let Some(c) = code {
+        kw.set_item("code", c)?;
+    }
+    semanal.call_method("fail", (msg, ctx), Some(kw))?;
+    Ok(())
+}
+
+/// Fetch an error-code attribute from `mypy.errorcodes` (e.g. TOP_LEVEL_AWAIT).
+fn error_code(py: Python<'_>, name: &str) -> PyResult<pyo3::Py<PyAny>> {
+    let codes_mod = py.import("mypy.errorcodes")?;
+    Ok(codes_mod.getattr(name)?.into())
+}
+
+/// `mypy.semanal.visit_yield_expr` body — scope + comprehension + async
+/// checks, flip the generator/async-generator flag on the enclosing
+/// FuncDef, recurse the expr.
+#[pyfunction]
+pub(crate) fn rust_visit_yield_expr(py: Python<'_>, e: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+    if !in_func {
+        fail_with_kwargs(semanal, "\"yield\" outside function", e, true, true, None)?;
+    } else {
+        let scope_stack = semanal.getattr("scope_stack")?;
+        let last = scope_stack.len()? - 1;
+        let cur_scope: i64 = scope_stack.get_item(last)?.extract()?;
+        // SCOPE_COMPREHENSION is a module-level int in mypy.semanal.
+        let comp_scope: i64 = py
+            .import("mypy.semanal")?
+            .getattr("SCOPE_COMPREHENSION")?
+            .extract()?;
+        if cur_scope == comp_scope {
+            fail_with_kwargs(
+                semanal,
+                "\"yield\" inside comprehension or generator expression",
+                e,
+                true,
+                true,
+                None,
+            )?;
+        } else {
+            let function_stack = semanal.getattr("function_stack")?;
+            let func = function_stack.get_item(function_stack.len()? - 1)?;
+            let is_coro = func.getattr("is_coroutine")?.is_true()?;
+            if is_coro {
+                func.setattr("is_generator", true)?;
+                func.setattr("is_async_generator", true)?;
+            } else {
+                func.setattr("is_generator", true)?;
+            }
+        }
+    }
+    let expr = e.getattr("expr")?;
+    if !expr.is_none() && expr.is_true()? {
+        expr.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_yield_from_expr` body — scope + comprehension +
+/// async checks (fail-only, no generator flag flip), then recurse.
+#[pyfunction]
+pub(crate) fn rust_visit_yield_from_expr(
+    py: Python<'_>,
+    e: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+    if !in_func {
+        fail_with_kwargs(
+            semanal,
+            "\"yield from\" outside function",
+            e,
+            true,
+            true,
+            None,
+        )?;
+    } else {
+        let scope_stack = semanal.getattr("scope_stack")?;
+        let last = scope_stack.len()? - 1;
+        let cur_scope: i64 = scope_stack.get_item(last)?.extract()?;
+        let comp_scope: i64 = py
+            .import("mypy.semanal")?
+            .getattr("SCOPE_COMPREHENSION")?
+            .extract()?;
+        if cur_scope == comp_scope {
+            fail_with_kwargs(
+                semanal,
+                "\"yield from\" inside comprehension or generator expression",
+                e,
+                true,
+                true,
+                None,
+            )?;
+        } else {
+            let function_stack = semanal.getattr("function_stack")?;
+            let func = function_stack.get_item(function_stack.len()? - 1)?;
+            let is_coro = func.getattr("is_coroutine")?.is_true()?;
+            if is_coro {
+                fail_with_kwargs(
+                    semanal,
+                    "\"yield from\" in async function",
+                    e,
+                    true,
+                    true,
+                    None,
+                )?;
+            } else {
+                func.setattr("is_generator", true)?;
+            }
+        }
+    }
+    let expr = e.getattr("expr")?;
+    if !expr.is_none() && expr.is_true()? {
+        expr.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_await_expr` body — scope + async checks with
+/// error codes, then recurse the expr.
+#[pyfunction]
+pub(crate) fn rust_visit_await_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let in_func = semanal.call_method0("is_func_scope")?.is_true()?;
+    let function_stack = semanal.getattr("function_stack")?;
+    if !in_func || function_stack.len()? == 0 {
+        let code = error_code(py, "TOP_LEVEL_AWAIT")?;
+        fail_with_kwargs(
+            semanal,
+            "\"await\" outside function",
+            expr,
+            true,
+            false,
+            Some(code.as_ref(py)),
+        )?;
+    } else {
+        let func = function_stack.get_item(function_stack.len()? - 1)?;
+        let is_coro = func.getattr("is_coroutine")?.is_true()?;
+        if !is_coro {
+            let code = error_code(py, "AWAIT_NOT_ASYNC")?;
+            fail_with_kwargs(
+                semanal,
+                "\"await\" outside coroutine (\"async def\")",
+                expr,
+                true,
+                false,
+                Some(code.as_ref(py)),
+            )?;
+        }
+    }
+    expr.getattr("expr")?.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_try_stmt` body — set statement slot, delegate to
+/// the analyzer's own `analyze_try_stmt` (which still owns the handler
+/// scope-stack / context-manager interactions).
+#[pyfunction]
+pub(crate) fn rust_visit_try_stmt(_py: Python<'_>, s: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    semanal.setattr("statement", s)?;
+    semanal.call_method1("analyze_try_stmt", (s, semanal))?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

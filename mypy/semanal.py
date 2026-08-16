@@ -483,6 +483,10 @@ try:
         rust_visit_starred_pattern as _rust_visit_starred_pattern,
         rust_visit_mapping_pattern as _rust_visit_mapping_pattern,
         rust_visit_class_pattern as _rust_visit_class_pattern,
+        rust_visit_yield_expr as _rust_visit_yield_expr,
+        rust_visit_yield_from_expr as _rust_visit_yield_from_expr,
+        rust_visit_await_expr as _rust_visit_await_expr,
+        rust_visit_try_stmt as _rust_visit_try_stmt,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -554,6 +558,10 @@ except ImportError:
     _rust_visit_starred_pattern = None  # type: ignore[assignment]
     _rust_visit_mapping_pattern = None  # type: ignore[assignment]
     _rust_visit_class_pattern = None  # type: ignore[assignment]
+    _rust_visit_yield_expr = None  # type: ignore[assignment]
+    _rust_visit_yield_from_expr = None  # type: ignore[assignment]
+    _rust_visit_await_expr = None  # type: ignore[assignment]
+    _rust_visit_try_stmt = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6079,6 +6087,9 @@ class SemanticAnalyzer(
         self.visit_block_maybe(s.else_body)
 
     def visit_try_stmt(self, s: TryStmt) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_try_stmt(s, self):
+                return
         self.statement = s
         self.analyze_try_stmt(s, self)
 
@@ -6432,6 +6443,9 @@ class SemanticAnalyzer(
             expr.expr.accept(self)
 
     def visit_yield_from_expr(self, e: YieldFromExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_yield_from_expr(e, self):
+                return
         if not self.is_func_scope():
             self.fail('"yield from" outside function', e, serious=True, blocker=True)
         elif self.scope_stack[-1] == SCOPE_COMPREHENSION:
@@ -7014,6 +7028,9 @@ class SemanticAnalyzer(
             expr.type = analyzed
 
     def visit_yield_expr(self, e: YieldExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_yield_expr(e, self):
+                return
         if not self.is_func_scope():
             self.fail('"yield" outside function', e, serious=True, blocker=True)
         elif self.scope_stack[-1] == SCOPE_COMPREHENSION:
@@ -7032,6 +7049,9 @@ class SemanticAnalyzer(
             e.expr.accept(self)
 
     def visit_await_expr(self, expr: AwaitExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_await_expr(expr, self):
+                return
         if not self.is_func_scope() or not self.function_stack:
             # We check both because is_function_scope() returns True inside comprehensions.
             # This is not a blocker, because some environments (like ipython)
