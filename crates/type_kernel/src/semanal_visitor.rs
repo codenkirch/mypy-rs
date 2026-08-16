@@ -3966,6 +3966,74 @@ pub(crate) fn rust_visit_assignment_expr(
     Ok(true)
 }
 
+/// `mypy.semanal.visit_import_all` body — correct relative import,
+/// module lookup, incomplete-namespace mark, iterate module symbol names
+/// (skip no_serialize), set future import flags, reexport logic with
+/// MypyFile / PlaceholderNode handling.
+#[pyfunction]
+pub(crate) fn rust_visit_import_all(py: Python<'_>, i: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    let i_id = semanal.call_method1("correct_relative_import", (i,))?;
+    let i_id_str: String = i_id.extract()?;
+    let modules = semanal.getattr("modules")?;
+    let modules_dict = match modules.downcast::<PyDict>() {
+        Ok(d) => d,
+        Err(_) => return Ok(false),
+    };
+    if let Some(m) = modules_dict.get_item(&i_id_str)? {
+        let incomplete = semanal
+            .call_method1("is_incomplete_namespace", (i_id_str.as_str(),))?
+            .is_true()?;
+        if incomplete {
+            semanal.call_method1("mark_incomplete", ("*", i))?;
+        }
+        let names = m.getattr("names")?;
+        let names_dict = match names.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(false),
+        };
+        let nodes_mod = py.import("mypy.nodes")?;
+        let mypyfile_cls = nodes_mod.getattr("MypyFile")?.downcast::<PyType>()?;
+        let placeholder_cls = nodes_mod.getattr("PlaceholderNode")?.downcast::<PyType>()?;
+        let imports = semanal.getattr("imports")?;
+        for (name, node) in names_dict.iter() {
+            let name_str: String = name.extract()?;
+            let no_serialize = node.getattr("no_serialize")?.is_true()?;
+            if no_serialize {
+                continue;
+            }
+            let fullname = format!("{}.{}", i_id_str, name_str);
+            semanal.call_method1("set_future_import_flags", (fullname.as_str(),))?;
+            let module_public = node.getattr("module_public")?.is_true()?;
+            let has_all = names_dict.contains("__all__")?;
+            let name_ok = !name_str.starts_with('_') || has_all;
+            if module_public && name_ok {
+                let node_node = node.getattr("node")?;
+                if node_node.is_instance(mypyfile_cls)? {
+                    let fullname2 = node_node.getattr("fullname")?;
+                    imports.call_method1("add", (fullname2,))?;
+                }
+                let kw2 = pyo3::types::PyDict::new(py);
+                kw2.set_item("context", i)?;
+                kw2.set_item("module_public", true)?;
+                kw2.set_item("module_hidden", false)?;
+                semanal.call_method("add_imported_symbol", (name_str.as_str(), node), Some(kw2))?;
+                let final_it = semanal.getattr("final_iteration")?.is_true()?;
+                if node_node.is_instance(placeholder_cls)? && final_it {
+                    let kw3 = pyo3::types::PyDict::new(py);
+                    kw3.set_item("module_public", true)?;
+                    kw3.set_item("module_hidden", false)?;
+                    semanal.call_method(
+                        "add_unknown_imported_symbol",
+                        (name_str.as_str(), i, py.None()),
+                        Some(kw3),
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
