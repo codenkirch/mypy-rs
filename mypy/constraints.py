@@ -273,9 +273,9 @@ def _try_native_unwrap_type_type(tp: ProperType) -> ProperType | None:
     """
     if isinstance(tp, TypeType):
         return tp.item
-    for o in tp.items:  # type: ignore[union-attr]
+    for o in tp.items:  # type: ignore[attr-defined]
         it = get_proper_type(o)
-        assert isinstance(it, TypeType)
+        assert isinstance(it, TypeType)  # type: ignore[misc]
         if isinstance(it.item, (TypeVarType, ParamSpecType, TypeVarTupleType)):
             # Wire round-trip would rebuild these as fresh objects,
             # losing identity. Defer to Python.

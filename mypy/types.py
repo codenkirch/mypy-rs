@@ -32,7 +32,7 @@ from librt.internal import (
 try:
     from librt.internal import write_raw_bytes
 except ImportError:
-    write_raw_bytes = None  # type: ignore[assignment]
+    write_raw_bytes = None
 
 import mypy.nodes
 from mypy.bogus_type import Bogus
@@ -5267,7 +5267,7 @@ def _write_type_cached(t: Type, data: WriteBuffer) -> None:
     blob = tmp.getvalue()
     saw_tvar = _type_wire_cache_saw_tvar
     _type_wire_cache_session_depth -= 1
-    if not saw_tvar and (not isinstance(t, Instance) or t.type_ref is None):
+    if not saw_tvar and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         _type_wire_cache[key] = (t, blob)
     write_raw_bytes(data, blob)
 

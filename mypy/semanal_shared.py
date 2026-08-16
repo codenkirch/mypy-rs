@@ -292,7 +292,7 @@ def set_callable_name(sig: Type, fdef: FuncDef) -> ProperType:
         try:
             result = _rust_set_callable_name(sig, fdef)
             if result is not None:
-                return result  # type: ignore[return-value]
+                return result
         except (AssertionError, NotImplementedError):
             pass
     sig = get_proper_type(sig)
@@ -328,7 +328,7 @@ def calculate_tuple_fallback(typ: TupleType) -> None:
         try:
             result = _rust_calculate_tuple_fallback(typ)
             if result is not None:
-                typ.partial_fallback.args = (result,)  # type: ignore[assignment]
+                typ.partial_fallback.args = (result,)
                 return
         except (AssertionError, NotImplementedError):
             pass
@@ -439,7 +439,7 @@ def find_dataclass_transform_spec(node: Node | None) -> DataclassTransformSpec |
         try:
             result = _rust_find_dataclass_transform_spec(node)
             if result is not None:
-                return result  # type: ignore[return-value]
+                return result
         except (AssertionError, NotImplementedError):
             pass
 

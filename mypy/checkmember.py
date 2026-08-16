@@ -211,7 +211,7 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _CheckMemberWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         _type_wire_cache[key] = (t, result)
     return result
 
@@ -253,10 +253,10 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
     """
     from mypy.types import CallableType, Overloaded
 
-    if isinstance(original, CallableType) and isinstance(decoded, CallableType):
+    if isinstance(original, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
         if original.definition is not None and decoded.definition is None:
             return decoded.copy_modified(definition=original.definition)
-    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):
+    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
         if len(original.items) == len(decoded.items):
             new_items = []
             changed = False
@@ -273,7 +273,7 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
                     new_items.append(dec)
             if changed:
                 return Overloaded(new_items)
-    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):
+    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):  # type: ignore[misc]
         # check_self_arg filters an Overloaded to a single CallableType;
         # find the matching item by arg-type signature to restore its
         # definition link.
@@ -2115,7 +2115,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
         if result is not None:
             decoded = _deserialize_type_for_checkmember(bytes(result))
             if decoded is not None:
-                if isinstance(method, CallableType) and isinstance(decoded, CallableType):
+                if isinstance(method, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
                     if not method.arg_types or method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
                         return method
                     return cast(
@@ -2127,7 +2127,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
                             is_bound=True,
                         ),
                     )
-                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):
+                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
                     if not method.items:
                         return method
                     items: list[F] = []
@@ -2213,7 +2213,7 @@ def instance_fallback(typ: ProperType) -> Instance:
                 # Rust mirrors Python: Literal/TypedDict return their fallback
                 # (always an Instance); a TupleType whose partial fallback is
                 # not an Instance already deferred. Only trust an Instance.
-                if decoded is not None and isinstance(decoded, Instance):
+                if decoded is not None and isinstance(decoded, Instance):  # type: ignore[misc]
                     return decoded
         except (AssertionError, NotImplementedError):
             pass

@@ -163,7 +163,7 @@ def _serialize_attrs_fields_for_rust(
         from mypy.cache import WriteBuffer
 
         wb = WriteBuffer()
-        typ.write(wb)  # type: ignore[attr-defined]
+        typ.write(wb)
         raw = wb.buf if hasattr(wb, "buf") else bytes(wb)
         buf.extend(raw)
         return len(raw)

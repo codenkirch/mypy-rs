@@ -737,7 +737,7 @@ def _serialize_type_for_checker(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _CheckerWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
         _type_wire_cache[key] = (t, result)
     return result
 
