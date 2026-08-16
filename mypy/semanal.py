@@ -454,6 +454,11 @@ try:
         rust_visit_dict_expr as _rust_visit_dict_expr,
         rust_visit_list_set_expr as _rust_visit_list_set_expr,
         rust_visit_template_str_expr as _rust_visit_template_str_expr,
+        rust_visit_comparison_expr as _rust_visit_comparison_expr,
+        rust_visit_conditional_expr as _rust_visit_conditional_expr,
+        rust_visit_slice_expr as _rust_visit_slice_expr,
+        rust_visit_super_expr as _rust_visit_super_expr,
+        rust_visit_unary_expr as _rust_visit_unary_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -496,6 +501,11 @@ except ImportError:
     _rust_visit_dict_expr = None  # type: ignore[assignment]
     _rust_visit_list_set_expr = None  # type: ignore[assignment]
     _rust_visit_template_str_expr = None  # type: ignore[assignment]
+    _rust_visit_comparison_expr = None  # type: ignore[assignment]
+    _rust_visit_conditional_expr = None  # type: ignore[assignment]
+    _rust_visit_slice_expr = None  # type: ignore[assignment]
+    _rust_visit_super_expr = None  # type: ignore[assignment]
+    _rust_visit_unary_expr = None  # type: ignore[assignment]
     _SEMANAL_VISITOR_HAS_KERNEL = False
 
 _native_semanal_visitor_active: bool = False
@@ -6267,6 +6277,9 @@ class SemanticAnalyzer(
         if not self.type and not expr.call.args:
             self.fail('"super" used outside class', expr)
             return
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_super_expr(expr, self, self.type):
+                return
         expr.info = self.type
         for arg in expr.call.args:
             arg.accept(self)
@@ -6653,10 +6666,16 @@ class SemanticAnalyzer(
         expr.right.accept(self)
 
     def visit_comparison_expr(self, expr: ComparisonExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_comparison_expr(expr, self):
+                return
         for operand in expr.operands:
             operand.accept(self)
 
     def visit_unary_expr(self, expr: UnaryExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_unary_expr(expr, self):
+                return
         expr.expr.accept(self)
 
     def visit_index_expr(self, expr: IndexExpr) -> None:
@@ -6769,6 +6788,9 @@ class SemanticAnalyzer(
         return types
 
     def visit_slice_expr(self, expr: SliceExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_slice_expr(expr, self):
+                return
         if expr.begin_index:
             expr.begin_index.accept(self)
         if expr.end_index:
@@ -6882,6 +6904,9 @@ class SemanticAnalyzer(
             self.analyze_function_body(expr)
 
     def visit_conditional_expr(self, expr: ConditionalExpr) -> None:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            if _rust_visit_conditional_expr(expr, self):
+                return
         expr.if_expr.accept(self)
         expr.cond.accept(self)
         expr.else_expr.accept(self)
