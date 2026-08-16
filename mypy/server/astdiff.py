@@ -104,6 +104,26 @@ from mypy.types import (
 )
 from mypy.util import get_prefix
 
+# M388: native snapshot comparator seam (mirrors the deps.py/update.py gate).
+try:
+    from type_kernel import (
+        rust_compare_symbol_table_snapshots as _rust_compare_symbol_table_snapshots,
+    )
+
+    _HAS_TYPE_KERNEL = True
+except ImportError:
+    _rust_compare_symbol_table_snapshots = None  # type: ignore[assignment]
+    _HAS_TYPE_KERNEL = False
+
+_native_astdiff_active: bool = False
+
+
+def _set_native_astdiff_active(active: bool) -> None:
+    """Called by the build manager to enable/disable the Rust path."""
+    global _native_astdiff_active
+    _native_astdiff_active = active
+
+
 # Snapshot representation of a symbol table node or type. The representation is
 # opaque -- the only supported operations are comparing for equality and
 # hashing (latter for type snapshots only). Snapshots can contain primitive
@@ -132,6 +152,12 @@ def compare_symbol_table_snapshots(
 
     Return a set of fully-qualified names (e.g., 'mod.func' or 'mod.Class.method').
     """
+    # M388: native gate for compare_symbol_table_snapshots.
+    if _HAS_TYPE_KERNEL and _native_astdiff_active:
+        try:
+            return _rust_compare_symbol_table_snapshots(name_prefix, snapshot1, snapshot2)
+        except Exception:
+            pass
     # Find names only defined only in one version.
     names1 = {f"{name_prefix}.{name}" for name in snapshot1}
     names2 = {f"{name_prefix}.{name}" for name in snapshot2}
