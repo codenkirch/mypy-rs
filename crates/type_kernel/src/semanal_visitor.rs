@@ -2817,6 +2817,154 @@ pub(crate) fn rust_visit_while_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) 
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// Slice 7: leaf-actions shards for name-expr, star-expr, and the seven
+// pattern visitors. These are pure recursion + self.analyze_lvalue calls.
+// ---------------------------------------------------------------------------
+
+/// `mypy.semanal.visit_name_expr` body — lookup the name and, when found,
+/// bind it through the analyzer's own bind_name_expr (which mutates the
+/// live NameExpr and emits type-variable/placeholder diagnostics).
+#[pyfunction]
+pub(crate) fn rust_visit_name_expr(
+    _py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let name = expr.getattr("name")?;
+    let n = semanal.call_method1("lookup", (name, expr))?;
+    if !n.is_none() {
+        semanal.call_method1("bind_name_expr", (expr, n))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_star_expr` body — fail on invalid star, else recurse.
+#[pyfunction]
+pub(crate) fn rust_visit_star_expr(
+    py: Python<'_>,
+    expr: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let valid = expr.getattr("valid")?.is_true()?;
+    if !valid {
+        let kw = pyo3::types::PyDict::new(py);
+        kw.set_item("blocker", true)?;
+        semanal.call_method(
+            "fail",
+            ("can't use starred expression here", expr),
+            Some(kw),
+        )?;
+    } else {
+        expr.getattr("expr")?.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// Shared helper: iterate a Python list attribute of `p` and accept each.
+fn accept_list_attr(attr: &str, p: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    let items = p.getattr(attr)?;
+    let list = match items.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(false),
+    };
+    for item in list.iter() {
+        item.call_method1("accept", (semanal,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_as_pattern` — recurse pattern + analyze_lvalue(name).
+#[pyfunction]
+pub(crate) fn rust_visit_as_pattern(_py: Python<'_>, p: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    let pattern = p.getattr("pattern")?;
+    if !pattern.is_none() {
+        pattern.call_method1("accept", (semanal,))?;
+    }
+    let name = p.getattr("name")?;
+    if !name.is_none() {
+        semanal.call_method1("analyze_lvalue", (name,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_or_pattern` — recurse over patterns.
+#[pyfunction]
+pub(crate) fn rust_visit_or_pattern(_py: Python<'_>, p: &PyAny, semanal: &PyAny) -> PyResult<bool> {
+    accept_list_attr("patterns", p, semanal)
+}
+
+/// `mypy.semanal.visit_value_pattern` — recurse expr.
+#[pyfunction]
+pub(crate) fn rust_visit_value_pattern(
+    _py: Python<'_>,
+    p: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    p.getattr("expr")?.call_method1("accept", (semanal,))?;
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_sequence_pattern` — recurse patterns.
+#[pyfunction]
+pub(crate) fn rust_visit_sequence_pattern(
+    _py: Python<'_>,
+    p: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    accept_list_attr("patterns", p, semanal)
+}
+
+/// `mypy.semanal.visit_starred_pattern` — analyze_lvalue(capture) if present.
+#[pyfunction]
+pub(crate) fn rust_visit_starred_pattern(
+    _py: Python<'_>,
+    p: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    let capture = p.getattr("capture")?;
+    if !capture.is_none() {
+        semanal.call_method1("analyze_lvalue", (capture,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_mapping_pattern` — recurse keys + values, then
+/// analyze_lvalue(rest) if present.
+#[pyfunction]
+pub(crate) fn rust_visit_mapping_pattern(
+    _py: Python<'_>,
+    p: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    if !accept_list_attr("keys", p, semanal)? {
+        return Ok(false);
+    }
+    if !accept_list_attr("values", p, semanal)? {
+        return Ok(false);
+    }
+    let rest = p.getattr("rest")?;
+    if !rest.is_none() {
+        semanal.call_method1("analyze_lvalue", (rest,))?;
+    }
+    Ok(true)
+}
+
+/// `mypy.semanal.visit_class_pattern` — recurse class_ref, positionals,
+/// and keyword_values.
+#[pyfunction]
+pub(crate) fn rust_visit_class_pattern(
+    _py: Python<'_>,
+    p: &PyAny,
+    semanal: &PyAny,
+) -> PyResult<bool> {
+    p.getattr("class_ref")?.call_method1("accept", (semanal,))?;
+    if !accept_list_attr("positionals", p, semanal)? {
+        return Ok(false);
+    }
+    accept_list_attr("keyword_values", p, semanal)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
