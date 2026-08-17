@@ -119,6 +119,7 @@ __all__ = [
     "rust_has_any_type",
     "rust_has_uninhabited_component",
     "rust_has_ambiguous_uninhabited_component",
+    "rust_has_erased_component",
     "rust_allow_fast_container_literal",
     "rust_analyze_cond_branch",
     "rust_has_bytes_component",
@@ -614,6 +615,9 @@ def rust_has_uninhabited_component(
     type_bytes: bytes, resolver: NativeTypeResolver
 ) -> bool | None: ...
 def rust_has_ambiguous_uninhabited_component(
+    type_bytes: bytes, resolver: NativeTypeResolver
+) -> bool | None: ...
+def rust_has_erased_component(
     type_bytes: bytes, resolver: NativeTypeResolver
 ) -> bool | None: ...
 def rust_allow_fast_container_literal(type_bytes: bytes) -> bool | None: ...

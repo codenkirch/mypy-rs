@@ -142,12 +142,104 @@ fn is_type_obj(fallback: &Type, ret_type: &Type, resolver: &TypeResolver) -> boo
 /// The `original_type` parameter from Python is unused here: `bind_self_fast`
 /// only strips the first arg and sets `is_bound`; it does NOT substitute
 /// type variables (that's `bind_self` in typeops.py).
+///
+/// Deferral guard: returns true when `typ` contains an ErasedType anywhere.
+/// Before ErasedType gained a wire tag, `decode_type` could not reconstruct
+/// an ErasedType, so `rust_bind_self_fast` returned `None` (deferred to
+/// Python) for any ErasedType-carrying signature. That implicit deferral is
+/// now made explicit so inference semantics stay identical: binding a
+/// self/arg from a method whose signature still holds an ErasedType
+/// placeholder must go through the pure-Python `copy_modified` path.
+fn contains_erased(typ: &Type) -> bool {
+    match typ {
+        Type::ErasedType => true,
+        Type::Instance {
+            args,
+            last_known_value,
+            ..
+        } => {
+            args.iter().any(contains_erased)
+                || last_known_value.as_deref().is_some_and(contains_erased)
+        }
+        Type::TypeAliasType { args, .. } => args.iter().any(contains_erased),
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            values.iter().any(contains_erased)
+                || contains_erased(upper_bound)
+                || contains_erased(default)
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            // `prefix` is a boxed `Parameters`; only its arg_types carry types.
+            prefix.arg_types.iter().any(contains_erased)
+                || contains_erased(upper_bound)
+                || contains_erased(default)
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            contains_erased(tuple_fallback)
+                || contains_erased(upper_bound)
+                || contains_erased(default)
+        }
+        Type::UnboundType { args, .. } => args.iter().any(contains_erased),
+        Type::UnpackType { typ } => contains_erased(typ),
+        Type::AnyType { source_any, .. } => source_any.as_deref().is_some_and(contains_erased),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            contains_erased(fallback)
+                || instance_type.as_deref().is_some_and(contains_erased)
+                || arg_types.iter().any(contains_erased)
+                || contains_erased(ret_type)
+                || variables.iter().any(contains_erased)
+                || type_guard.as_deref().is_some_and(contains_erased)
+                || type_is.as_deref().is_some_and(contains_erased)
+        }
+        Type::Overloaded { items } => items.iter().any(contains_erased),
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => items.iter().any(contains_erased) || contains_erased(partial_fallback),
+        Type::TypedDictType {
+            fallback, items, ..
+        } => contains_erased(fallback) || items.iter().any(|(_, v)| contains_erased(v)),
+        Type::LiteralType { fallback, .. } => contains_erased(fallback),
+        Type::UnionType { items, .. } => items.iter().any(contains_erased),
+        Type::TypeType { item, .. } => contains_erased(item),
+        Type::Parameters(parameters) => parameters.arg_types.iter().any(contains_erased),
+        Type::NoneType | Type::UninhabitedType { .. } | Type::DeletedType { .. } => false,
+    }
+}
+
 #[pyfunction]
 pub(crate) fn rust_bind_self_fast(method_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
     let typ = match decode_type(method_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
+    if contains_erased(&typ) {
+        return Ok(None);
+    }
     match bind_self_fast_inner(&typ) {
         Some(bound) => Ok(encode_type(&bound)),
         None => Ok(None),

@@ -94,6 +94,7 @@ const LITERAL_TYPE: u8 = 114;
 const UNION_TYPE: u8 = 115;
 const TYPE_TYPE: u8 = 116;
 const PARAMETERS: u8 = 117;
+pub(crate) const ERASED_TYPE: u8 = 122;
 
 // ---------------------------------------------------------------------------
 // ReadBuffer + error type
@@ -533,6 +534,7 @@ pub(crate) enum Type {
         ambiguous: bool,
     },
     NoneType,
+    ErasedType,
     DeletedType {
         source: Option<String>,
     },
@@ -905,6 +907,12 @@ fn read_none_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     Ok(Type::NoneType)
 }
 
+/// Read an `ErasedType` (tag already consumed) — just the END_TAG.
+fn read_erased_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
+    expect_end_tag(buf)?;
+    Ok(Type::ErasedType)
+}
+
 /// Read an `UninhabitedType` (tag already consumed): the ambiguous flag
 /// bool, then END_TAG. Older writers omit the bool (END_TAG follows the
 /// tag directly); that reads back as ambiguous=false.
@@ -1147,6 +1155,7 @@ pub(crate) fn read_type(buf: &mut ReadBuffer<'_>, tag: Option<u8>) -> Result<Typ
         UNPACK_TYPE => read_unpack_type(buf),
         PARAMETERS => Ok(Type::Parameters(read_parameters(buf)?)),
         UNINHABITED_TYPE => read_uninhabited_type(buf),
+        ERASED_TYPE => read_erased_type(buf),
         UNBOUND_TYPE => read_unbound_type(buf),
         DELETED_TYPE => read_deleted_type(buf),
         _ => Err(WireError::invalid(format!("unknown type tag {tag}"))),
@@ -1256,6 +1265,7 @@ impl fmt::Display for Type {
         match self {
             Type::AnyType { .. } => write!(f, "Any"),
             Type::NoneType => write!(f, "None"),
+            Type::ErasedType => write!(f, "<Erased>"),
             Type::UninhabitedType { .. } => write!(f, "Never"),
             Type::DeletedType { source } => match source {
                 None => write!(f, "<Deleted>"),
@@ -2003,6 +2013,11 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             write_tag(buf, END_TAG);
             Ok(())
         }
+        Type::ErasedType => {
+            write_tag(buf, ERASED_TYPE);
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
         Type::UninhabitedType { ambiguous } => {
             write_tag(buf, UNINHABITED_TYPE);
             write_bool(buf, *ambiguous);
@@ -2291,6 +2306,7 @@ impl Type {
             Type::AnyType { .. } => "AnyType",
             Type::UninhabitedType { .. } => "UninhabitedType",
             Type::NoneType => "NoneType",
+            Type::ErasedType => "ErasedType",
             Type::DeletedType { .. } => "DeletedType",
             Type::CallableType { .. } => "CallableType",
             Type::Overloaded { .. } => "Overloaded",

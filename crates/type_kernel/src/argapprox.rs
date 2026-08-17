@@ -241,6 +241,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
         Type::UnboundType { .. } => Some(any_type(ANY_FROM_ERROR)),
         Type::AnyType { .. }
         | Type::NoneType
+        | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::LiteralType { .. } => Some(t.clone()),

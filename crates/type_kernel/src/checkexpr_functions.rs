@@ -584,6 +584,81 @@ fn has_ambiguous_uninhabited_component_inner_seen(
 }
 
 // ---------------------------------------------------------------------------
+// has_erased_component
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.has_erased_component` — whether a type contains an
+/// ErasedType component (checkexpr.py:8060-8071).
+///
+/// Mirrors `HasErasedComponentsQuery`, a `BoolTypeQuery(ANY_STRATEGY)` whose
+/// only override is `visit_erased_type -> True`; every other node returns the
+/// default (false), so this is the same ANY walk as
+/// `has_uninhabited_component` with a different leaf predicate. Type aliases
+/// expand via the alias resolver exactly as the uninhabited query does
+/// (`visit_type_alias_type` targets true when the substituted target or a
+/// new-style alias arg contains an ErasedType). Defer only when alias
+/// expansion defers.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_has_erased_component(
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(has_erased_component_inner(&typ, resolver.alias_resolver()))
+}
+
+pub(crate) fn has_erased_component_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let mut seen: Vec<String> = Vec::new();
+    has_erased_component_inner_seen(typ, aliases, &mut seen)
+}
+
+/// ANY walk over `all_children` with `ErasedType` as the terminal predicate,
+/// matching `HasErasedComponentsQuery` (checkexpr.py:8064-8071). Alias
+/// expansion and cycle handling are identical to the uninhabited query.
+fn has_erased_component_inner_seen(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    if let Type::TypeAliasType { type_ref, .. } = typ {
+        if seen.contains(type_ref) {
+            return Some(false);
+        }
+        seen.push(type_ref.clone());
+        let (target, args, python_3_12) = expanded_alias_target(typ, aliases)?;
+        if has_erased_component_inner_seen(&target, aliases, seen)? {
+            return Some(true);
+        }
+        if python_3_12 {
+            for arg in &args {
+                if has_erased_component_inner_seen(arg, aliases, seen)? {
+                    return Some(true);
+                }
+            }
+        }
+        return Some(false);
+    }
+    if matches!(typ, Type::ErasedType) {
+        return Some(true);
+    }
+    for child in all_children(typ) {
+        match has_erased_component_inner_seen(child, aliases, seen) {
+            Some(true) => return Some(true),
+            None => return None,
+            Some(false) => {}
+        }
+    }
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
 // has_bytes_component
 // ---------------------------------------------------------------------------
 
@@ -3320,6 +3395,99 @@ mod tests {
         assert_eq!(
             has_ambiguous_uninhabited_component_inner(&make_type_alias("mod.A"), &aliases),
             Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_true() {
+        assert_eq!(
+            has_erased_component_inner(&Type::ErasedType, &empty_alias_resolver()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_in_union() {
+        let u = make_union(vec![make_instance("int", vec![]), Type::ErasedType]);
+        assert_eq!(
+            has_erased_component_inner(&u, &empty_alias_resolver()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_clean_instance_false() {
+        assert_eq!(
+            has_erased_component_inner(&make_instance("int", vec![]), &empty_alias_resolver()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_never_false() {
+        // ErasedType is a distinct leaf: UninhabitedType does NOT trigger it
+        // (the two queries answer independently).
+        assert_eq!(
+            has_erased_component_inner(
+                &Type::UninhabitedType { ambiguous: false },
+                &empty_alias_resolver()
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_typevar_default_true() {
+        // A TypeVar with a genuine ErasedType default must be found through
+        // all_children (children() covers TypeVarType).
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: Default::default(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("object", vec![])),
+            default: Box::new(Type::ErasedType),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(
+            has_erased_component_inner(&tv, &empty_alias_resolver()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_alias_target_erased_true() {
+        let aliases = alias_resolver_with_targets(&[("mod.A", Type::ErasedType)]);
+        assert_eq!(
+            has_erased_component_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_alias_target_clean_false() {
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.A",
+            make_instance("list", vec![make_instance("int", vec![])]),
+        )]);
+        assert_eq!(
+            has_erased_component_inner(&make_type_alias("mod.A"), &aliases),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_has_erased_component_recursive_alias_defers() {
+        let mut resolver = empty_alias_resolver();
+        insert_chain_edges(
+            &mut resolver,
+            alias_resolver_with_alias_targets(&[("mod.A", "mod.A".to_string())]),
+        );
+        assert_eq!(
+            has_erased_component_inner(&make_type_alias("mod.A"), &resolver),
+            None
         );
     }
 

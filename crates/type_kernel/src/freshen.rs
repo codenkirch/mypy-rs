@@ -66,6 +66,7 @@ pub(crate) fn freshen_type(
         // erased, deleted, type_var, param_spec, type_var_tuple, partial.)
         Type::AnyType { .. }
         | Type::NoneType
+        | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. }

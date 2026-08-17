@@ -104,6 +104,7 @@ from mypy.types import (
     AnyType,
     CallableType,
     DeletedType,
+    ErasedType,
     Instance,
     LiteralType,
     NoneType,
@@ -4244,6 +4245,128 @@ class NativeUninhabitedSuite(Suite):
         )
         self.assert_uninhabited_defers(alias)
         self.assert_ambiguous_defers(alias)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeHasErasedComponentSuite(Suite):
+    """Parity suite for the Rust `has_erased_component` port (slice 48).
+
+    `has_erased_component` mirrors `HasErasedComponentsQuery`, a
+    `BoolTypeQuery(ANY_STRATEGY)` whose only override is
+    `visit_erased_type -> True` (checkexpr.py:8060-8071). The Rust wire
+    walk delegates to the same alias expansion as the uninhabited query, so
+    this suite covers the erased leaf directly, unions, clean instances,
+    alias targets (true/false), and recursive aliases (defer).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self.resolver = self._build_resolver([])
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.bi,
+                self.fx.str_type_info,
+                self.fx.type_typei,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+            ],
+            aliases,
+        )
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        self.resolver = self._build_resolver(aliases)
+        _set_native_checkexpr_resolver(self.resolver)
+
+    def assert_erased_decides(self, t: Type, expected: bool) -> None:
+        """Assert the Rust kernel answers `expected` for has_erased_component."""
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_erased_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is not None, f"Rust deferred on {t!r}"
+        assert rusted is expected
+
+    def assert_erased_defers(self, t: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        rusted = _type_kernel.rust_has_erased_component(
+            _serialize_type_for_checkexpr(t), self.resolver
+        )
+        assert rusted is None, f"Rust should defer on {t!r}, got {rusted}"
+
+    def _make_alias(
+        self,
+        fullname: str,
+        target: Type,
+        *,
+        alias_tvars: list[TypeVarType] | None = None,
+        no_args: bool = False,
+    ) -> TypeAlias:  # type: ignore[name-defined]
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],  # type: ignore[arg-type]
+            no_args=no_args,
+        )
+
+    def test_plain_erased_true(self) -> None:
+        self.assert_erased_decides(ErasedType(), True)
+
+    def test_clean_instance_false(self) -> None:
+        self.assert_erased_decides(Instance(self.fx.std_listi, [self.fx.str_type]), False)
+
+    def test_uninhabited_not_erased_false(self) -> None:
+        self.assert_erased_decides(UninhabitedType(), False)
+
+    def test_union_with_erased_true(self) -> None:
+        u = UnionType.make_union([self.fx.str_type, ErasedType()])
+        self.assert_erased_decides(u, True)
+
+    def test_alias_target_erased_true(self) -> None:
+        # A = Erased: expanding the alias finds the erased target.
+        alias = self._make_alias("mod.A", ErasedType())
+        self._rebuild_with_aliases([alias])
+        self.assert_erased_decides(TypeAliasType(alias, []), True)
+
+    def test_alias_target_clean_false(self) -> None:
+        # A = List[int]: no erased component.
+        alias = self._make_alias("mod.A", Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_with_aliases([alias])
+        self.assert_erased_decides(TypeAliasType(alias, []), False)
+
+    def test_alias_without_snapshot_defers(self) -> None:
+        # A TypeAliasType referencing a fullname with no snapshot in the
+        # resolver: expansion cannot proceed, defer.
+        alias = TypeAliasType(self._make_alias("mod.Missing", self.fx.a), [])
+        self.assert_erased_defers(alias)
 
 
 # (Removed: orphan M8g visit_instance parity block — class header was never

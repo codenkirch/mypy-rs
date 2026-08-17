@@ -457,6 +457,7 @@ fn transform_children<F: Fn(Type) -> Type>(t: Type, f: F) -> Type {
         Type::DeletedType { source } => Type::DeletedType { source },
         Type::UninhabitedType { .. } => Type::UninhabitedType { ambiguous: false },
         Type::NoneType => Type::NoneType,
+        Type::ErasedType => Type::ErasedType,
         Type::Parameters(_) => t,
     }
 }

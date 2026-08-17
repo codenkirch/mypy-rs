@@ -247,6 +247,7 @@ try:
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
+        rust_has_erased_component as _rust_has_erased_component,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
@@ -284,6 +285,7 @@ except ImportError:
     _rust_all_same_types = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
+    _rust_has_erased_component = None  # type: ignore[assignment]
     _rust_infer_function_type_arguments = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
     _rust_check_operator = None  # type: ignore[assignment]
@@ -8058,6 +8060,19 @@ class ArgInferSecondPassQuery(types.BoolTypeQuery):
 
 
 def has_erased_component(t: Type | None) -> bool:
+    if (
+        t is not None
+        and _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            type_bytes = _serialize_type_for_checkexpr(t)
+            result = _rust_has_erased_component(type_bytes, _native_checkexpr_resolver)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     return t is not None and t.accept(HasErasedComponentsQuery())
 
 

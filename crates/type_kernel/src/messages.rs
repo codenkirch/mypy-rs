@@ -728,6 +728,10 @@ fn format_type_inner(
 
         Type::UninhabitedType { .. } => Some("Never".to_string()),
 
+        // ErasedType has no dedicated branch in messages.py format_type_inner;
+        // it falls through to the `else` default of "object".
+        Type::ErasedType => Some("object".to_string()),
+
         Type::TypeType { item, is_type_form } => {
             let inner = format_type_inner(
                 py,
