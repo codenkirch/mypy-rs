@@ -70,6 +70,7 @@ mod constraints_filter;
 mod constraints_helpers;
 mod copymodified;
 mod dataclasses;
+mod detach_callable;
 mod erase;
 mod erase_typevars;
 mod errors;
@@ -2453,6 +2454,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
 
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_get_property_type,
+        module
+    )?)?;
+
+    // detach_callable: extend a callable's variables with the class type
+    // variables it uses (mypy.checker).
+    module.add_function(wrap_pyfunction!(
+        detach_callable::rust_detach_callable,
         module
     )?)?;
 

@@ -3794,6 +3794,122 @@ class NativeGetPropertyTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDetachCallableSuite(Suite):
+    """Parity for the Rust `detach_callable` port (mypy.checker).
+
+    `detach_callable` ensures a callable's `variables` include the class type
+    variables it uses. The Rust port reads the callable's `variables` and the
+    incoming `class_type_vars` list off the wire and returns the concatenated
+    per-variable blobs; the Python shim decodes them and rebuilds the
+    callable via `copy_modified` on the live object. Toggling the checker
+    gate off (pure Python) and on (Rust seam) must produce identical results
+    (`str` and `len(variables)`), and a direct seam call proves the Rust
+    function engages rather than silently deferring. The empty-`class_type_vars`
+    fast path never reaches Rust.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _callable(self, variables: list[TypeVarType]) -> CallableType:
+        return CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.anyt,
+            self.fx.function,
+            variables=variables,
+        )
+
+    def _assert_par(self, typ: CallableType, class_type_vars: list[TypeVarType]) -> None:
+        from mypy.checker import detach_callable
+
+        off = self._with_gate(False, lambda: detach_callable(typ, class_type_vars))
+        assert isinstance(off, CallableType)  # type: ignore[misc]
+        on = self._with_gate(True, lambda: detach_callable(typ, class_type_vars))
+        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert_equal(str(on), str(off), f"detach_callable str parity {typ}")
+        assert_equal(
+            len(on.variables),
+            len(off.variables),
+            f"detach_callable len(variables) parity {typ}",
+        )
+
+    def _assert_engages(self, typ: CallableType, class_type_vars: list[TypeVarType]) -> None:
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_list
+
+        result = _type_kernel.rust_detach_callable(
+            _serialize_type_for_checker(typ), _serialize_type_list(class_type_vars)
+        )
+        assert result is not None, "Rust detach_callable did not engage"
+
+    def test_non_generic_empty_class_vars(self) -> None:
+        from mypy.checker import detach_callable
+
+        # Fast path: empty class_type_vars returns typ unchanged, no Rust call.
+        c = self._callable([])
+        result = self._with_gate(True, lambda: detach_callable(c, []))
+        assert isinstance(result, CallableType)  # type: ignore[misc]
+        assert result is c, "empty class_type_vars must return typ unchanged"
+
+    def test_non_generic_class_vars_extended(self) -> None:
+        from mypy.checker import detach_callable
+
+        c = self._callable([])
+        self._assert_par(c, [self.fx.t])
+        on = self._with_gate(True, lambda: detach_callable(c, [self.fx.t]))
+        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert_equal(len(on.variables), 1)
+        self._assert_engages(c, [self.fx.t])
+
+    def test_generic_class_extended(self) -> None:
+        from mypy.checker import detach_callable
+
+        c = self._callable([self.fx.t])
+        self._assert_par(c, [self.fx.s])
+        on = self._with_gate(True, lambda: detach_callable(c, [self.fx.s]))
+        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert_equal(len(on.variables), 2)
+        self._assert_engages(c, [self.fx.s])
+
+    def test_multiple_class_vars(self) -> None:
+        from mypy.checker import detach_callable
+
+        c = self._callable([self.fx.t])
+        self._assert_par(c, [self.fx.s, self.fx.u])
+        on = self._with_gate(True, lambda: detach_callable(c, [self.fx.s, self.fx.u]))
+        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert_equal(len(on.variables), 3)
+        self._assert_engages(c, [self.fx.s, self.fx.u])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAnyTypeSuite(Suite):
     """Parity suite for the Rust `has_any_type` port with alias type-arg
     substitution (Phase B3b, #591).
