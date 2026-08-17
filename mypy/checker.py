@@ -328,6 +328,7 @@ try:
         rust_has_bool_item as _rust_has_bool_item,
         rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
+        rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
         rust_is_false_literal as _rust_is_false_literal,
         rust_is_generator_return_type as _rust_is_generator_return_type,
@@ -335,6 +336,7 @@ try:
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
         rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_method as _rust_is_method,
+        rust_is_node_static as _rust_is_node_static,
         rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
         rust_is_settable_property as _rust_is_settable_property,
@@ -387,9 +389,11 @@ except ImportError:
     _rust_is_empty_generator_function = None  # type: ignore[assignment]
     _rust_is_static = None  # type: ignore[assignment]
     _rust_is_method = None  # type: ignore[assignment]
+    _rust_is_node_static = None  # type: ignore[assignment]
     _rust_is_property = None  # type: ignore[assignment]
     _rust_is_settable_property = None  # type: ignore[assignment]
     _rust_is_custom_settable_property = None  # type: ignore[assignment]
+    _rust_is_classmethod_node = None  # type: ignore[assignment]
     _rust_get_coroutine_return_type = None  # type: ignore[assignment]
     _rust_get_generator_receive_type = None  # type: ignore[assignment]
     _rust_get_generator_return_type = None  # type: ignore[assignment]
@@ -10099,6 +10103,13 @@ class SetNothingToAny(TypeTranslator):
 
 def is_classmethod_node(node: SymbolNode | None) -> bool | None:
     """Find out if a node describes a classmethod."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            res = _rust_is_classmethod_node(node)
+            if res is not None:
+                return res
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(node, Decorator):
         node = node.func
     if isinstance(node, FuncDef):
@@ -10110,6 +10121,13 @@ def is_classmethod_node(node: SymbolNode | None) -> bool | None:
 
 def is_node_static(node: SymbolNode | None) -> bool | None:
     """Find out if a node describes a static function method."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            res = _rust_is_node_static(node)
+            if res is not None:
+                return res
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(node, Decorator):
         node = node.func
     if isinstance(node, FuncDef):

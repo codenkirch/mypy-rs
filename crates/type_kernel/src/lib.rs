@@ -62,6 +62,7 @@ mod checkmember;
 mod checkoperator;
 mod checkpattern;
 mod checkstrformat;
+mod classmethod_static;
 mod condmaps;
 mod constant_fold;
 mod constraints;
@@ -2441,6 +2442,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
 
     // Issue #527: binder.py pure helper (get_declaration).
     module.add_function(wrap_pyfunction!(binder::rust_get_declaration, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        classmethod_static::rust_is_classmethod_node,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        classmethod_static::rust_is_node_static,
+        module
+    )?)?;
 
     module.add_function(wrap_pyfunction!(
         checker_visitor::rust_get_property_type,
