@@ -8,19 +8,20 @@ Date: 2026-08-13
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.41M |
+| Rust bytes (local, .rs) | ~3.43M |
 | Python bytes (mypy + mypyc, ex test/) | ~6.63M |
-| Rust % (local) | ~33.96% |
+| Rust % (local) | ~34.09% |
 | Rust % (GitHub languages API) | ~34.78% |
 | Rust LOC (crates/) | ~86K |
-| Rust source files | 81 (type_kernel) + ast_serialize + module_resolver + fs_probe |
+| Rust source files | 85 (type_kernel) + ast_serialize + module_resolver + fs_probe |
 | Gap to 50% | ~1.61M bytes Python->Rust |
 
-Updated 2026-08-16 after the leaf-action shard sequence (#625-#630): the
-gap narrowed from ~4.5M to ~3.34M, mostly via inline `visit_*` sharding
-in `semanal.py`. Each shard PR nets only a few KB, so reaching 50% via
-this pattern alone is multi-month; the wider levers in Phase B/C (deferral
-reduction, depth ports) remain the realistic path.
+Updated 2026-08-17 after the 6-port swarm (#675-#680: get_property_type,
+classmethod_static, detach_callable, contract-literals, equality_value_info,
+supported_self_type). Local share moved 33.96% -> 34.09%; GitHub metric
+~34.75% -> ~34.78%. Each port nets only ~5-8KB, so leaf ports alone cannot
+reach 50%: the wider levers in Phase B/C (deferral reduction, depth ports)
+remain the realistic path.
 
 ## Honest assessment: path to 50%
 
@@ -314,7 +315,7 @@ generated/stub files differently. Target: 30%+ on the GitHub API.
 
 Measured 2026-08-14 (after Phase C merged): GitHub languages API reports
 Rust 3,156,702 bytes of 9,453,609 total = **33.4%**, above the 30% target.
-This matches the committed `.rs` source (`crates/*/src`, ~3.2 MB) —
+This matches the committed `.rs` source (`crates/*/src`, ~3.2 MB):
 GitHub's count tracks the real Rust tree.
 
 ### Phase E: Long-term architecture decisions
