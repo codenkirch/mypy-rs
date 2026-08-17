@@ -320,6 +320,7 @@ try:
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
+        rust_detach_callable as _rust_detach_callable,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
@@ -373,6 +374,7 @@ except ImportError:
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
+    _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
@@ -761,6 +763,15 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
     assert t is not None, "checker wire decode produced unresolvable type_ref"
     return t
+
+
+def _serialize_type_list(items: Sequence[Type]) -> bytes:
+    """Serialize a list of types to the wire-format type-list blob."""
+    from mypy.types import write_type_list
+
+    buf = _CheckerWriteBuffer()
+    write_type_list(buf, items)
+    return buf.getvalue()
 
 
 T = TypeVar("T")
@@ -9945,6 +9956,17 @@ def detach_callable(typ: CallableType, class_type_vars: list[TypeVarLikeType]) -
     if not class_type_vars:
         # Fast path, nothing to update.
         return typ
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            raw = _rust_detach_callable(
+                _serialize_type_for_checker(typ), _serialize_type_list(class_type_vars)
+            )
+            if raw is not None:
+                new_vars = [_deserialize_type_from_checker(bytes(b)) for b in raw]
+                if None not in new_vars:
+                    return typ.copy_modified(variables=new_vars)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     return typ.copy_modified(variables=list(typ.variables) + class_type_vars)
 
 
