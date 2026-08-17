@@ -2456,6 +2456,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_visitor::rust_get_property_type,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        setops::rust_try_contracting_literals_in_union,
+        module
+    )?)?;
 
     // detach_callable: extend a callable's variables with the class type
     // variables it uses (mypy.checker).

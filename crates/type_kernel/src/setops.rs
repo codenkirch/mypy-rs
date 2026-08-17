@@ -2753,6 +2753,32 @@ fn try_contracting_literals_in_union(
     Some(result)
 }
 
+/// `#[pyfunction]` entry for `try_contracting_literals_in_union`
+/// (typeops.py:1612-1652).
+///
+/// Reads the wire-encoded item list, runs the contraction (bool + enum
+/// cases only), and returns each resulting item as its own wire blob.
+/// Returns `None` (defer to Python) when the list cannot be read, or when
+/// the contraction needs a snapshot lookup for a literal fallback whose
+/// fullname is absent. The Python shim deserializes each blob and falls
+/// through to the pure-Python body on any failure.
+#[pyfunction]
+pub(crate) fn rust_try_contracting_literals_in_union(
+    type_list_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<Vec<u8>>> {
+    let mut buf = ReadBuffer::new(type_list_bytes);
+    let items = wire::read_type_list(&mut buf).ok()?;
+    let result = try_contracting_literals_in_union(items, resolver.resolver())?;
+    let mut out = Vec::with_capacity(result.len());
+    for item in result {
+        let mut item_buf = WriteBuffer::new();
+        wire::write_type(&mut item_buf, &item).ok()?;
+        out.push(item_buf.into_bytes());
+    }
+    Some(out)
+}
+
 /// `try_getting_instance_fallback` (typeops.py:1271-1288): return the
 /// `Instance` fallback for a type, if any. Mirrors the Python dispatch:
 /// Instance -> self, LiteralType -> fallback, FunctionLike -> fallback

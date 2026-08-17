@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 from unittest import TestCase, skipIf, skipUnless
 
@@ -100,6 +100,7 @@ from mypy.typeops import (
     is_singleton_identity_type,
     make_simplified_union,
     true_only,
+    try_contracting_literals_in_union,
 )
 from mypy.types import (
     AnyType,
@@ -3633,6 +3634,139 @@ class NativeCoerceLiteralSingletonSuite(Suite):
             _serialize_type(self.enum_inst), self._resolver
         )
         assert eq_r is True, "Rust singleton equality did not engage"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeContractLiteralsSuite(Suite):
+    """Parity for the Rust `try_contracting_literals_in_union` port
+    (mypy.typeops.try_contracting_literals_in_union, #492 family).
+
+    The Python body contracts literal types sharing a fallback back into
+    the sum type when all values of the sum are present: `Literal[True,
+    False]` becomes `bool`, and a union covering every member of an enum
+    becomes the enum Instance. The Rust port implements the bool case and
+    the enum case (reading `enum_members` from the resolver snapshot).
+    Toggling the typeops gate off (pure Python) and on (Rust seam) must
+    produce identical results, and a direct seam call proves the Rust
+    function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # `builtins.bool` is required for the bool contraction: the Rust
+        # helper looks up the fallback snapshot for the Literal[True] /
+        # Literal[False] items. The fixture scan above skips it because
+        # `bool_type_info` does not end in "i", so add it explicitly
+        # (mirrors production, where builtins.bool is always snapshotted).
+        type_infos.append(self.fx.bool_type_info)
+        # A three-member enum: `enum_members` (a names-walk property)
+        # needs explicitly-valued Var members to yield the member names.
+        self.enum_info = self.fx.make_type_info("mod.Color")
+        self.enum_info.is_enum = True
+        for name in ("RED", "GREEN", "BLUE"):
+            v = Var(name)
+            v.has_explicit_value = True
+            v.type = self.fx.o
+            self.enum_info.names[name] = SymbolTableNode(MDEF, v)
+        type_infos.append(self.enum_info)
+        self.enum_inst = Instance(self.enum_info, [])
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._live_map = {info.fullname: info for info in type_infos}
+        self._resolver.set_live_typeinfo_map(dict(self._live_map))
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _strs(self, items: Sequence[Type]) -> list[str]:
+        return [str(x) for x in try_contracting_literals_in_union(items)]
+
+    def _assert_par(self, items: Sequence[Type], label: str) -> None:
+        off = self._with_gate(False, lambda: self._strs(items))
+        on = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(on, off, f"try_contracting_literals_in_union parity {label}")
+
+    def _enum_literal(self, name: str) -> LiteralType:
+        return LiteralType(name, self.enum_inst)
+
+    def test_parity_bool_complete(self) -> None:
+        # Literal[True, False] contracts to builtins.bool.
+        items = [self.fx.lit_true, self.fx.lit_false]
+        self._assert_par(items, "bool complete")
+        result = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(result, ["builtins.bool"])
+
+    def test_parity_bool_single(self) -> None:
+        # A single bool literal must not contract (indices.len() < 2).
+        items = [self.fx.lit_true, self.fx.a]
+        self._assert_par(items, "bool single")
+        result = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(result, ["Literal[True]", "A"])
+
+    def test_parity_enum_complete(self) -> None:
+        # A union covering every enum member contracts to the enum.
+        items = [self._enum_literal(n) for n in ("RED", "GREEN", "BLUE")]
+        self._assert_par(items, "enum complete")
+        result = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(result, ["mod.Color"])
+
+    def test_parity_enum_partial(self) -> None:
+        # Not every member present: no contraction.
+        items = [self._enum_literal("RED"), self._enum_literal("GREEN")]
+        self._assert_par(items, "enum partial")
+        result = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(result, ["Literal[mod.Color.RED]", "Literal[mod.Color.GREEN]"])
+
+    def test_parity_non_literal_mixed(self) -> None:
+        # Mixed literals and non-literals, no shared full value set.
+        items = [self.fx.lit_true, self.fx.lit1]
+        self._assert_par(items, "mixed")
+        result = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(result, ["Literal[True]", "Literal[1]"])
+
+    def test_seam_engages_direct(self) -> None:
+        # Call the Rust seam directly on a complete bool union and confirm
+        # it returns blobs (engages) rather than None (deferral).
+        from mypy.typeops import _serialize_type_list
+
+        r = _type_kernel.rust_try_contracting_literals_in_union(
+            _serialize_type_list([self.fx.lit_true, self.fx.lit_false]),
+            self._resolver,
+        )
+        assert r is not None, "Rust try_contracting_literals_in_union did not engage"
+        e = _type_kernel.rust_try_contracting_literals_in_union(
+            _serialize_type_list(
+                [self._enum_literal(n) for n in ("RED", "GREEN", "BLUE")]
+            ),
+            self._resolver,
+        )
+        assert e is not None, "Rust enum contraction did not engage"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

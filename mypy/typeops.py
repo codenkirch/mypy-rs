@@ -1622,6 +1622,22 @@ def try_contracting_literals_in_union(types: Sequence[Type]) -> list[ProperType]
 
     We also treat `Literal[True, False]` as `bool`.
     """
+    # Native seam: bool + enum contraction runs in Rust, mirroring the
+    # pure-Python body below. Reads `enum_members` from the resolver
+    # snapshot; defers (None) when the fallback fullname has no snapshot or
+    # an item cannot be serialized (e.g. TypeAliasType). Callers flatten
+    # nested unions before invoking, so item types are all proper.
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+        try:
+            raw = _type_kernel.rust_try_contracting_literals_in_union(
+                _serialize_type_list(list(types)), _native_typeops_resolver
+            )
+            if raw is not None:
+                out = [_deserialize_type(bytes(b)) for b in raw]
+                if None not in out:
+                    return out  # type: ignore[return-value]  # list[ProperType]
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     proper_types = [get_proper_type(typ) for typ in types]
     sum_types: dict[str, tuple[set[Any], list[int]]] = {}
     marked_for_deletion = set()
