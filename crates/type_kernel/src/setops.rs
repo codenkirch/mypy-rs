@@ -1392,8 +1392,9 @@ fn encode_overloaded(items: Vec<SetOpResult>) -> Option<SetOpResult> {
 
 /// Whether a CallableType is a type object (types.py:2323-2326).
 /// `is_type_obj` = fallback is a metaclass AND ret_type is not
-/// UninhabitedType. The wire format cannot transmit `from_type_type`
-/// (only 6 flags), so callers defer when either input is a type obj.
+/// UninhabitedType. The join_similar_callables caller (join.py:631-635)
+/// sets `from_type_type=True` on the result, which the Rust port does not
+/// replicate, so the non-equivalent join path defers on type objects.
 pub(crate) fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
     let Type::CallableType {
         fallback, ret_type, ..
@@ -1561,18 +1562,6 @@ fn visit_join(
                 if identical {
                     return Some(SetOpResult::SameS);
                 }
-                // join.py:657-663: join_similar_callables sets
-                // `from_type_type = True` on the result to suppress the
-                // abstract-instantiation error when a collection of
-                // concrete class objects gets inferred as their common
-                // abstract superclass. The wire format does not transmit
-                // `from_type_type` (only 6 flags), so any Rust-encoded
-                // CallableType decodes with `from_type_type = False`.
-                // Defer when either side is a type object to let Python
-                // set the flag correctly.
-                if is_type_obj_callable(t, resolver) || is_type_obj_callable(s, resolver) {
-                    return None;
-                }
                 // join.py:620: is_similar_callables(t, self.s).
                 if !is_similar_callables(arg_types, arg_kinds, s_arg_types, s_arg_kinds) {
                     // Not similar: the var-arg / subtype fallback
@@ -1614,6 +1603,10 @@ fn visit_join(
                     return None;
                 }
                 if equivalent {
+                    // `from_type_type` rides the wire now (issue #388),
+                    // so combine_similar_callables preserves it via
+                    // extract_callable_invariants. The equivalent path
+                    // no longer needs the type-object deferral.
                     return combine_similar_callables(
                         s,
                         t,
@@ -1634,8 +1627,13 @@ fn visit_join(
                     );
                 }
                 // Non-equivalent similar callables need `join_similar_callables`
-                // which sets `from_type_type=True` (join.py:668) and interacts
-                // with the constraint solver in subtle ways. Defer to Python.
+                // (join.py:622) whose caller (join.py:631-635) sets
+                // `from_type_type=True` on the result to suppress the
+                // abstract-instantiation error when concrete class objects
+                // infer as their common abstract superclass. The Rust
+                // port does not replicate that logic, and the
+                // join_similar_callables path also uses safe_meet (not
+                // safe_join) for arg types, which is not yet ported. Defer.
                 return None;
             }
             visit_callable_fallback(s, fallback, ctx, resolver)
