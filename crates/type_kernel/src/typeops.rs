@@ -7,6 +7,9 @@
 //! * `rust_true_only` / `rust_false_only` / `rust_true_or_false` — truthiness
 //!   narrowing via discriminators (Python shim performs the `copy_type` +
 //!   flag mutation on live objects).
+//! * `rust_fill_typevars` — `mypy.typevars.fill_typevars` on a live
+//!   `TypeInfo`: rebuilds the class type parameters at line=-1 and returns
+//!   the encoded `Instance` (or `TupleType` for named tuples).
 //!
 //! Parity-only, default-off. The Python shim in `mypy/typeops.py` gates each
 //! call behind `Options.native_type_kernel`. `None` means "Rust doesn't handle
@@ -15,7 +18,7 @@
 use pyo3::prelude::*;
 use pyo3::IntoPy;
 
-use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 use crate::setops;
@@ -1045,6 +1048,76 @@ pub(crate) fn rust_tuple_fallback(
     let t = decode_type(t_bytes)?;
     let result = tuple_fallback(&t, resolver.resolver())?;
     encode_type(&result)
+}
+
+/// `mypy.typevars.fill_typevars` (typevars.py:43-85): for a non-generic type
+/// return the instance type; for a generic G with parameters T1..Tn return
+/// G[T1, ..., Tn]. Each class type parameter is rebuilt at line=-1,
+/// column=-1 (the wire format carries no line/column, so the Python
+/// `read_type` reconstruction defaults match). A `TypeVarTupleType` is
+/// wrapped in an `UnpackType`, mirroring the Python body.
+///
+/// Reads the live `TypeInfo` (fullname, defn.type_vars, tuple_type) and
+/// defers (`None`) when any tvar kind is not one of the three expected,
+/// or when `tuple_type` decodes to something other than a `TupleType`.
+fn fill_typevars_inner(py: Python<'_>, typ: &PyAny) -> Option<Type> {
+    let type_ref: String = typ.getattr("fullname").ok()?.extract().ok()?;
+    let defn = typ.getattr("defn").ok()?;
+    let tvars = defn
+        .getattr("type_vars")
+        .ok()?
+        .downcast::<pyo3::types::PyList>()
+        .ok()?;
+    let mut args = Vec::with_capacity(tvars.len());
+    for item in tvars.iter() {
+        let bytes = serialize_type_to_bytes(py, item)?;
+        let t = decode_type(&bytes)?;
+        match t {
+            // TypeVarType / ParamSpecType pass through unchanged: the wire
+            // round-trip already drops line/column the same way
+            // copy_modified(line=-1, column=-1) does.
+            Type::TypeVarType { .. } | Type::ParamSpecType { .. } => args.push(t),
+            Type::TypeVarTupleType { .. } => {
+                args.push(Type::UnpackType { typ: Box::new(t) });
+            }
+            // A stored UnpackType or any other kind would trip Python's
+            // `assert isinstance(tv, ParamSpecType)`; defer instead.
+            _ => return None,
+        }
+    }
+    let inst = Type::Instance {
+        type_ref,
+        args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    // `typ.tuple_type.copy_modified(fallback=inst)` for named tuples:
+    // keep items + implicit, swap the partial fallback.
+    let tt = typ.getattr("tuple_type").ok()?;
+    if tt.is_none() {
+        return Some(inst);
+    }
+    let bytes = serialize_type_to_bytes(py, tt)?;
+    let Type::TupleType {
+        items, implicit, ..
+    } = decode_type(&bytes)?
+    else {
+        return None;
+    };
+    Some(Type::TupleType {
+        partial_fallback: Box::new(inst),
+        items,
+        implicit,
+    })
+}
+
+/// `#[pyfunction]` entry for `fill_typevars` (typevars.py:43-85). Takes the
+/// live `TypeInfo`, returns encoded `Instance`/`TupleType` bytes or `None`
+/// (defer to Python).
+#[pyfunction]
+pub(crate) fn rust_fill_typevars(py: Python<'_>, typ: &PyAny) -> Option<Vec<u8>> {
+    let t = fill_typevars_inner(py, typ)?;
+    encode_type(&t)
 }
 
 /// `#[pyfunction]` entry for `bind_self` (typeops.py:540-641): strip the

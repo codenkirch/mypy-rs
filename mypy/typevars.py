@@ -18,8 +18,8 @@ from mypy.types import (
 from mypy.typevartuples import erased_vars
 
 # Stage 6c type-kernel seam: when type_kernel is importable and the gate
-# is active, has_no_typevars routes through Rust. Rust returns None for
-# unsupported cases (TypeAliasType, UnboundType); we fall back to Python.
+# is active, has_no_typevars and fill_typevars route through Rust. Rust
+# returns None for unsupported cases; we fall back to Python.
 try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer
@@ -40,11 +40,52 @@ def _set_native_typevars_active(active: bool) -> None:
     _native_typevars_active = active
 
 
+def _native_decode_well_formed(data: bytes) -> Type | None:
+    """Decode wire bytes for the fill_typevars seam.
+
+    Mirrors mypy/typeops.py::_deserialize_type plus a check_no_fake_info
+    guard: the global wire typeinfo map can hold stale or fake entries
+    across fine-grained refreshes, so a decoded tree with any residual
+    fake TypeInfo defers to Python.
+    """
+    from mypy.types import instance_cache
+    from mypy.wirefixup import check_no_fake_info, fixup_wire_type
+
+    decoded = read_type(_ReadBuffer(data))
+    # Clear instance_cache primitives after read_type so NOT_READY
+    # singletons cannot leak into later builds (mirrors _typeanal_decode).
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    fixed = fixup_wire_type(decoded)
+    if fixed is None or not check_no_fake_info(fixed):
+        return None
+    return fixed
+
+
 def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
     """For a non-generic type, return instance type representing the type.
 
     For a generic G type with parameters T1, .., Tn, return G[T1, ..., Tn].
     """
+    # Native seam: Rust yields only the rebuilt tvar-arg list via the
+    # wire round-trip; the root Instance (and named-tuple wrapper) are
+    # rebuilt on the live `typ` so a stale wire-map entry cannot leak.
+    if _HAS_TYPE_KERNEL and _native_typevars_active:
+        try:
+            result = _type_kernel.rust_fill_typevars(typ)
+            if result is not None:
+                decoded = _native_decode_well_formed(bytes(result))
+                if decoded is not None and isinstance(decoded, (Instance, TupleType)):  # type: ignore[misc]
+                    root = decoded if isinstance(decoded, Instance) else decoded.partial_fallback
+                    inst = Instance(typ, root.args)
+                    if typ.tuple_type is None:
+                        return inst
+                    return typ.tuple_type.copy_modified(fallback=inst)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     tvs: list[Type] = []
     # TODO: why do we need to keep both typ.type_vars and typ.defn.type_vars?
     for i in range(len(typ.defn.type_vars)):

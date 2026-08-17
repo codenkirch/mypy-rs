@@ -267,7 +267,18 @@ including:
   result as a "handled" signal and builds the final object through
   `copy_modified` on the live object so non-wire fields survive. Covered
   by `NativeBindSelfSuite` in `mypy/test/testtypes.py`. `class_callable`
-  and `fill_typevars` are deferred (issue #492 follow-up).
+  is deferred (issue #492 follow-up).
+- `rust_fill_typevars` (issue #492) — mirrors
+  `mypy.typevars.fill_typevars` (typevars.py:43-85) on a live `TypeInfo`:
+  Rust reads `fullname`, `defn.type_vars`, and `tuple_type`, serializes
+  each type parameter to the wire format (line/column drop to -1 in the
+  round-trip), and wraps `TypeVarTupleType` in `UnpackType`. The Python
+  shim uses the decoded tvar-arg list only; the root `Instance` and the
+  named-tuple wrapper are rebuilt on the live `typ` so a stale wire-map
+  entry cannot substitute a different `TypeInfo` (fine-grained
+  regression guard). Gated by `_native_typevars_active` (wired from
+  `mypy/build.py`) and covered by `NativeFillTypevarsSuite` in
+  `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

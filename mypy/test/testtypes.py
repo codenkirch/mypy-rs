@@ -2112,6 +2112,159 @@ class NativeBindSelfSuite(Suite):
         assert self._bind(c) is None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFillTypevarsSuite(Suite):
+    """Parity tests for `rust_fill_typevars` (mypy.typevars.fill_typevars).
+
+    Rust reads the live `TypeInfo` (fullname, defn.type_vars,
+    tuple_type) and rebuilds each class type parameter at line=-1 via the
+    wire round-trip; TypeVarTupleType entries are wrapped in UnpackType;
+    a named-tuple `tuple_type` is returned with the rebuilt Instance as
+    fallback. Each test decodes the encoded result and compares it
+    against the pure-Python `fill_typevars` call (gate off).
+    """
+
+    def setUp(self) -> None:
+        from librt.internal import ReadBuffer as _RB
+
+        from mypy.typevars import _set_native_typevars_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_native_typevars_active = _set_native_typevars_active
+        self._RB = _RB
+        self._type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.di,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.std_tuplei,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        self._set_native_typevars_active(True)
+
+    def _register(self, info: TypeInfo) -> None:
+        # Newly created TypeInfos must be in the map so the decoded
+        # outer Instance resolves to the same live object.
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._type_infos.append(info)
+        set_wire_typeinfo_map({i.fullname: i for i in self._type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_native_typevars_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _decode(self, result: bytes) -> Type | None:
+        from mypy.types import instance_cache, read_type as _read_type
+        from mypy.wirefixup import fixup_wire_type
+
+        decoded = _read_type(self._RB(bytes(result)))
+        # Clear instance_cache primitives so NOT_READY singletons cannot
+        # leak into later tests (mirrors typeops.py).
+        instance_cache.int_type = None
+        instance_cache.str_type = None
+        instance_cache.bool_type = None
+        instance_cache.object_type = None
+        instance_cache.function_type = None
+        return fixup_wire_type(decoded)
+
+    def _pure_python(self, info: TypeInfo) -> Instance | TupleType:
+        from mypy.typevars import fill_typevars
+
+        self._set_native_typevars_active(False)
+        try:
+            return fill_typevars(info)
+        finally:
+            self._set_native_typevars_active(True)
+
+    def _assert_par(self, info: TypeInfo) -> None:
+        from mypy.typevars import fill_typevars
+
+        expected = self._pure_python(info)
+        result = _type_kernel.rust_fill_typevars(info)
+        assert result is not None, f"rust_fill_typevars deferred for {info.fullname}"
+        decoded = self._decode(result)
+        assert decoded is not None, f"decode failed for {info.fullname}"
+        assert_equal(decoded, expected, f"fill_typevars parity for {info.fullname}")
+        # Gated shim: with the flag on the same result must come back.
+        assert_equal(fill_typevars(info), expected)
+
+    def test_non_generic(self) -> None:
+        self._assert_par(self.fx.ai)
+
+    def test_single_typevar(self) -> None:
+        self._assert_par(self.fx.gi)
+
+    def test_two_typevars(self) -> None:
+        self._assert_par(self.fx.hi)
+
+    def test_named_tuple(self) -> None:
+        info = self.fx.make_type_info(
+            "NT",
+            mro=[self.fx.oi, self.fx.std_tuplei],
+            bases=[Instance(self.fx.std_tuplei, [self.fx.a])],
+        )
+        info.tuple_type = TupleType(
+            [self.fx.a, self.fx.b], Instance(self.fx.std_tuplei, [self.fx.o])
+        )
+        self._register(info)
+        self._assert_par(info)
+
+    def test_typevar_tuple(self) -> None:
+        info = self.fx.make_type_info(
+            "V", mro=[self.fx.oi], typevars=["T", "Ts"], typevar_tuple_index=1
+        )
+        self._register(info)
+        self._assert_par(info)
+
+    def test_paramspec(self) -> None:
+        info = self.fx.make_type_info("P", mro=[self.fx.oi])
+        info.defn.type_vars = [
+            ParamSpecType(
+                "P",
+                "P",
+                TypeVarId(1),
+                ParamSpecFlavor.BARE,
+                Instance(self.fx.oi, [], -1),
+                NoneType(),
+            )
+        ]
+        self._register(info)
+        self._assert_par(info)
+
+    def test_unresolvable_type_ref_defers(self) -> None:
+        # "GS" is not in the wire typeinfo map, so fixup_wire_type fails
+        # and the gated shim must fall back to pure Python.
+        from mypy.typevars import fill_typevars
+
+        info = self.fx.gsi
+        result = _type_kernel.rust_fill_typevars(info)
+        assert result is not None
+        assert self._decode(result) is None
+        assert_equal(fill_typevars(info), self._pure_python(info))
+
+    def test_stale_map_entry_keeps_live_typ(self) -> None:
+        # Regression guard: the wire map can hold a stale object for the
+        # fullname across fine-grained refreshes. The shim must still
+        # return an Instance rooted at the live `typ`, never the stale
+        # map entry (fine-grained.test::testConstructorSignatureChanged3).
+        from mypy.typevars import fill_typevars
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        info = self.fx.gi
+        stale = self.fx.make_type_info("G", mro=[self.fx.oi])
+        set_wire_typeinfo_map({i.fullname: i for i in self._type_infos + [stale]})
+        result = fill_typevars(info)
+        assert isinstance(result, Instance)
+        assert result.type is info, "stale wire-map entry leaked into the result"
+
+
 # Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader, with a TypeInfo resolver
 # built from the live Python TypeInfo graph, produces the same `str(t)` as

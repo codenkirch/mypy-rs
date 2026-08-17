@@ -1110,8 +1110,8 @@ class BuildManager:
 
         _set_native_plugin_hook_registry(None, False)
         self._build_plugin_hook_registry()
-        # Stage 6c: gate apply_generic_arguments + has_no_typevars.
-        # Resolver installed in _build_native_resolvers.
+        # Stage 6c: gate apply_generic_arguments + has_no_typevars +
+        # fill_typevars. Resolver installed in _build_native_resolvers.
         from mypy.applytype import _set_native_applytype_active
         from mypy.typevars import _set_native_typevars_active
 
