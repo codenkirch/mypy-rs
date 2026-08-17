@@ -546,6 +546,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![any_type(); arg_kinds.len()],
             arg_kinds: arg_kinds.to_vec(),
             arg_names: arg_names.iter().map(|s| s.map(String::from)).collect(),

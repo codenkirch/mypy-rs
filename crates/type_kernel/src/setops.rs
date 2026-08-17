@@ -915,6 +915,7 @@ fn meet_similar_callables_impl(
         from_concatenate: false,
         imprecise_arg_kinds: t_imprecise_arg_kinds,
         unpack_kwargs: false,
+        from_type_type: false,
         arg_types: new_arg_types,
         arg_kinds: t_arg_kinds.to_vec(),
         arg_names: t_arg_names.to_vec(),
@@ -1281,6 +1282,7 @@ fn combine_similar_callables(
         from_concatenate,
         imprecise_arg_kinds,
         unpack_kwargs,
+        from_type_type,
         type_guard,
         type_is,
     ) = extract_callable_invariants(t);
@@ -1293,6 +1295,7 @@ fn combine_similar_callables(
         from_concatenate,
         imprecise_arg_kinds,
         unpack_kwargs,
+        from_type_type,
         arg_types: new_arg_types,
         arg_kinds,
         arg_names: new_arg_names,
@@ -1321,6 +1324,7 @@ fn extract_callable_invariants(
     bool,
     bool,
     bool,
+    bool,
     Option<Box<Type>>,
     Option<Box<Type>>,
 ) {
@@ -1333,6 +1337,7 @@ fn extract_callable_invariants(
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
+            from_type_type,
             type_guard,
             type_is,
             ..
@@ -1344,6 +1349,7 @@ fn extract_callable_invariants(
             *from_concatenate,
             *imprecise_arg_kinds,
             *unpack_kwargs,
+            *from_type_type,
             type_guard.clone(),
             type_is.clone(),
         ),
@@ -1493,6 +1499,7 @@ fn visit_join(
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
+            from_type_type,
             name,
             type_guard,
             type_is,
@@ -1511,6 +1518,7 @@ fn visit_join(
                 from_concatenate: s_from_concatenate,
                 imprecise_arg_kinds: s_imprecise_arg_kinds,
                 unpack_kwargs: s_unpack_kwargs,
+                from_type_type: s_from_type_type,
                 name: s_name,
                 type_guard: s_type_guard,
                 type_is: s_type_is,
@@ -1545,6 +1553,7 @@ fn visit_join(
                     && from_concatenate == s_from_concatenate
                     && imprecise_arg_kinds == s_imprecise_arg_kinds
                     && unpack_kwargs == s_unpack_kwargs
+                    && from_type_type == s_from_type_type
                     && name == s_name
                     && type_guard == s_type_guard
                     && type_is == s_type_is
@@ -4344,6 +4353,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types,
             arg_kinds,
             arg_names,
@@ -4376,6 +4386,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types,
             arg_kinds,
             arg_names,

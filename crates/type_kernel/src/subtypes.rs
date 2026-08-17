@@ -1931,6 +1931,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types,
             arg_kinds: vec![],
             arg_names: vec![],
