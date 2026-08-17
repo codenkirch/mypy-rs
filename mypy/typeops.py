@@ -435,6 +435,69 @@ def class_callable(
     orig_self_type: Type | None = None,
 ) -> CallableType:
     """Create a type object type based on the signature of __init__."""
+    # #492 follow-up native seam: Rust makes the ret_type decision and
+    # combines the type variables (pure once the two resolver-backed subtype
+    # booleans are known). Python computes those booleans (already native)
+    # and rebuilds the live CallableType so non-wire fields survive.
+    # instance_type MUST stay the live fill_typevars(info) result.
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        init_ret_type = get_proper_type(init_type.ret_type)
+        orig_self_proper = (
+            get_proper_type(orig_self_type) if orig_self_type is not None else None
+        )
+        explicit_type = init_ret_type if is_new else orig_self_proper
+        default_ret_type = fill_typevars(info)
+        from mypy.subtypes import is_equivalent, is_subtype
+
+        is_eq = False
+        if is_new and explicit_type is not None:
+            # Default return type in the class where the constructor method
+            # was defined.
+            default_def_ret_type = (
+                fill_typevars(def_info) if def_info is not None else default_ret_type
+            )
+            is_eq = is_equivalent(default_def_ret_type, explicit_type, ignore_type_params=True)
+        is_st = False
+        if (
+            isinstance(explicit_type, (Instance, TupleType, UninhabitedType, LiteralType))
+            and isinstance(default_ret_type, Instance)
+            and not default_ret_type.type.is_protocol
+        ):
+            is_st = is_subtype(explicit_type, default_ret_type, ignore_type_params=True)
+        try:
+            result = _type_kernel.rust_class_callable(
+                _serialize_type(init_type),
+                _serialize_type(explicit_type) if explicit_type is not None else None,
+                _serialize_type(default_ret_type),
+                is_new,
+                is_eq,
+                is_st,
+                info,
+            )
+            if result is not None:
+                ret_type_blob, var_blobs = result
+                ret_type = _deserialize_type(bytes(ret_type_blob))
+                if ret_type is not None:
+                    rust_variables: list[TypeVarLikeType] = []
+                    deferred = False
+                    for blob in var_blobs:
+                        decoded_var = _deserialize_type(bytes(blob))
+                        if decoded_var is None:
+                            deferred = True
+                            break
+                        rust_variables.append(cast(TypeVarLikeType, decoded_var))
+                    if not deferred:
+                        return init_type.copy_modified(
+                            ret_type=ret_type,
+                            fallback=type_type,
+                            name=info.name,
+                            variables=rust_variables,
+                            special_sig=special_sig,
+                            instance_type=default_ret_type,
+                        )
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
+
     variables: list[TypeVarLikeType] = []
     variables.extend(info.defn.type_vars)
     variables.extend(init_type.variables)

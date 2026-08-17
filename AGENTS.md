@@ -266,8 +266,8 @@ including:
   so the typevar path stays in Python. The Python shim uses the Rust
   result as a "handled" signal and builds the final object through
   `copy_modified` on the live object so non-wire fields survive. Covered
-  by `NativeBindSelfSuite` in `mypy/test/testtypes.py`. `class_callable`
-  is deferred (issue #492 follow-up).
+  by `NativeBindSelfSuite` in `mypy/test/testtypes.py`. Its
+  `class_callable` follow-up is `rust_class_callable` (below).
 - `rust_fill_typevars` (issue #492) — mirrors
   `mypy.typevars.fill_typevars` (typevars.py:43-85) on a live `TypeInfo`:
   Rust reads `fullname`, `defn.type_vars`, and `tuple_type`, serializes
@@ -279,6 +279,21 @@ including:
   regression guard). Gated by `_native_typevars_active` (wired from
   `mypy/build.py`) and covered by `NativeFillTypevarsSuite` in
   `mypy/test/testtypes.py`.
+- `rust_class_callable` (issue #492 follow-up) — mirrors the `ret_type`
+  decision + type-variable combination in `mypy.typeops.class_callable`
+  (typeops.py:428-486). Rust picks `ret_type` (the explicit `__new__` /
+  `__init__` return vs. `fill_typevars(info)`) and combines
+  `info.defn.type_vars + init.variables`, reading the live `info`
+  (`defn.type_vars`, `is_protocol`) via PyO3. The two resolver-backed
+  subtype checks (`is_equivalent` / `is_subtype`, both
+  `ignore_type_params=True`) run on the Python side (already native via
+  the subtype resolver) and are passed in as booleans, avoiding a resolver
+  seam. The Python shim rebuilds the live `CallableType` via
+  `copy_modified` so non-wire fields survive, and `instance_type` MUST
+  stay the live `fill_typevars(info)` result. Gated by
+  `_native_typeops_active` (wired from `mypy/build.py`) and covered by
+  `NativeClassCallableSuite` in `mypy/test/testtypes.py`, plus 10 pure
+  decision unit tests in `typeops.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
