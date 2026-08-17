@@ -3331,6 +3331,130 @@ class NativeClassCallableSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMapTypeFromSupertypeSuite(Suite):
+    """Parity for the Rust `map_type_from_supertype` composite
+    (mypy.typeops.map_type_from_supertype, #492 family).
+
+    The Python body composes fill_typevars(sub_info) -> tuple_fallback ->
+    map_instance_to_supertype -> expand_type_by_instance. All four
+    primitives are native, so the whole body is one consolidated Rust call
+    (rust_map_type_from_supertype). Toggling the typeops gate off (pure
+    Python) and on (Rust composite) must produce an identical result for a
+    mapped type. A direct seam call proves the composite engages for the
+    generic supertype case rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _map(
+        self, typ: Type, sub_info: TypeInfo, super_info: TypeInfo
+    ) -> Type:
+        from mypy.typeops import map_type_from_supertype
+
+        return map_type_from_supertype(typ, sub_info, super_info)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(
+        self, typ: Type, sub_info: TypeInfo, super_info: TypeInfo
+    ) -> None:
+        off = self._with_gate(False, lambda: self._map(typ, sub_info, super_info))
+        on = self._with_gate(True, lambda: self._map(typ, sub_info, super_info))
+        assert_equal(on, off, f"map_type_from_supertype parity {typ}")
+
+    def test_baseline_gate_off(self) -> None:
+        # Non-generic B <: A: a type in A's frame is unchanged in B's frame.
+        typ = Instance(self.fx.ai, [])
+        result = self._with_gate(False, lambda: self._map(typ, self.fx.bi, self.fx.ai))
+        assert result == Instance(self.fx.ai, [])
+
+    def test_parity_non_generic(self) -> None:
+        # B <: A, no typevars on either side: identity mapping.
+        self._assert_par(Instance(self.fx.ai, []), self.fx.bi, self.fx.ai)
+        self._assert_par(Instance(self.fx.oi, []), self.fx.bi, self.fx.oi)
+
+    def test_parity_same_class(self) -> None:
+        # sub_info == super_info: pure identity (map fast path).
+        self._assert_par(Instance(self.fx.gi, [self.fx.t]), self.fx.gi, self.fx.gi)
+
+    def test_parity_generic_supertype(self) -> None:
+        # GS2[S] <: G[S]. A G-frame type (its typevar T, raw id 1 per the
+        # fixture) maps to S (raw id 1) in GS2's frame.
+        self._assert_par(self.fx.t, self.fx.gs2i, self.fx.gi)
+
+    def test_parity_generic_instance_arg(self) -> None:
+        # G[T] maps through the substitution: G[T] in G's frame -> the
+        # concrete arg frame of GS2.
+        self._assert_par(
+            Instance(self.fx.gi, [self.fx.t]), self.fx.gs2i, self.fx.gi
+        )
+
+    def test_parity_callable(self) -> None:
+        # A callable (like an __init__ signature) in G's frame maps with its
+        # arg/ret types substituted.
+        callable = CallableType(
+            [self.fx.o, self.fx.t],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            Instance(self.fx.gi, [self.fx.t]),
+            self.fx.function,
+            name="<init>",
+        )
+        self._assert_par(callable, self.fx.gs2i, self.fx.gi)
+
+    def test_seam_engages_direct(self) -> None:
+        # Call the Rust seam directly on the typevar-free hot path (B->A
+        # frame mapping an object-typed type) and confirm it returns bytes,
+        # i.e. the composite engages rather than deferring. The engine ships
+        # only typevar-free expansions, so a generic-frame mapping would
+        # legitimately defer (None).
+        import type_kernel as _tk
+
+        from mypy.typeops import _serialize_type
+
+        info = self.fx.bi
+        result = _tk.rust_map_type_from_supertype(
+            self._resolver,
+            info,
+            self.fx.ai,
+            _serialize_type(Instance(self.fx.oi, [])),
+            True,
+        )
+        assert result is not None, "Rust map_type_from_supertype did not engage"
+        assert isinstance(bytes(result), bytes)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAnyTypeSuite(Suite):
     """Parity suite for the Rust `has_any_type` port with alias type-arg
     substitution (Phase B3b, #591).

@@ -1122,6 +1122,89 @@ pub(crate) fn rust_fill_typevars(py: Python<'_>, typ: &PyAny) -> Option<Vec<u8>>
     encode_type(&t)
 }
 
+/// `#[pyfunction]` entry for `map_type_from_supertype` (typeops.py:552-578):
+/// map a type defined in a supertype context (`super_info`) to be valid in a
+/// subtype context (`sub_info`).
+///
+/// Mirrors the Python body as one consolidated native call:
+///   1. `inst_type = fill_typevars(sub_info)` (typeops.py:558).
+///   2. If `inst_type` is a `TupleType`, `inst_type = tuple_fallback(inst_type)`
+///      (typeops.py:559-561) — an element-preserving Instance for builtins.tuple
+///      fallbacks, the namedtuple class otherwise.
+///   3. `inst_type = map_instance_to_supertype(inst_type, super_info)`
+///      (typeops.py:564) — map up the derivation path to `super_info`'s frame.
+///   4. `return expand_type_by_instance(typ, inst_type)` (typeops.py:572) —
+///      bind `super_info`'s class typevars in `typ`.
+///
+/// Defers (`None`) when any step hits an unsupported edge: a TypeVarTuple
+/// anywhere, an arg-count mismatch in `expand_type_by_instance`, a TypeAlias in
+/// `typ`, or a `fill_typevars` value of an unexpected tvar kind. The Python shim
+/// guards against `typ` carrying a FuncDef/Decorator definition node (which the
+/// wire cannot carry) before calling.
+#[pyfunction]
+pub(crate) fn rust_map_type_from_supertype(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    sub_info: &PyAny,
+    super_info: &PyAny,
+    type_bytes: &[u8],
+    strict_optional: bool,
+) -> Option<Vec<u8>> {
+    let typ = decode_type(type_bytes)?;
+    let mut inst = fill_typevars_inner(py, sub_info)?;
+    // Step 2: named tuples and plain tuples get an element-preserving
+    // fallback so the subsequent map/expand see a real Instance frame.
+    if let Type::TupleType { .. } = inst {
+        inst = tuple_fallback(&inst, resolver.resolver())?;
+    }
+    // Steps 3-4. `inst` is now an Instance; read its frame.
+    let Type::Instance {
+        type_ref: sub_ref,
+        args: sub_args,
+        ..
+    } = inst
+    else {
+        return None;
+    };
+    let sup_ref: String = super_info.getattr("fullname").ok()?.extract().ok()?;
+    // Mapping to builtins.tuple defers: the element-preserving tuple
+    // fallback (maptype.py:226-239) is not ported, so Rust would return
+    // tuple[Any, ...] instead. Mirror the maptype.py seam guard.
+    if sup_ref == "builtins.tuple" && sub_ref != sup_ref {
+        return None;
+    }
+    // Map step fast paths mirroring maptype.map_instance_to_supertype
+    // (maptype.py:15-21) that the subtypes primitive does not encode:
+    //   * same class -> keep args (already the frame we want).
+    //   * target has no type vars -> empty args.
+    let sup_snap = resolver.resolver().get(&sup_ref)?;
+    let mapped_args = if sub_ref == sup_ref {
+        sub_args
+    } else if sup_snap.type_vars.is_empty() {
+        Vec::new()
+    } else {
+        crate::subtypes::map_instance_to_supertype(
+            &sub_ref,
+            &sub_args,
+            &sup_ref,
+            resolver.resolver(),
+        )?
+    };
+    let inst = Type::Instance {
+        type_ref: sup_ref,
+        args: mapped_args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &typ,
+        &inst,
+        resolver.resolver(),
+        strict_optional,
+    )?;
+    encode_type(&expanded)
+}
+
 /// `#[pyfunction]` entry for `bind_self` (typeops.py:540-641): strip the
 /// first parameter of a `CallableType` and set `is_bound=True`.
 ///
