@@ -38,6 +38,7 @@ from mypy.nodes import (
     ArgKind,
     BytesExpr,
     CallExpr,
+    Decorator,
     DictExpr,
     EllipsisExpr,
     Expression,
@@ -10271,3 +10272,163 @@ class NativeBinderSuite(Suite):
         e = NameExpr("f")
         e.node = fn
         self._check(e, "FuncDef node")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassmethodStaticSuite(Suite):
+    """Parity for the Rust `is_classmethod_node`/`is_node_static` ports.
+
+    Both predicates unwrap a `Decorator` to its `func`, read `is_class` /
+    `is_static` on `FuncDef` or `is_classmethod` / `is_staticmethod` on
+    `Var`, and return `None` for any other node (including `None`). The
+    Rust ports mirror the Python bodies in checker.py using live PyO3
+    object reads. Toggling the checker-stmts gate off (pure Python) and on
+    (Rust seam) must produce identical results, and direct seam calls prove
+    both Rust functions engage rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_stmts_active
+
+        self._set_active = _set_native_checker_stmts_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, node: object) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        off_cm = self._with_gate(False, lambda: is_classmethod_node(node))
+        on_cm = self._with_gate(True, lambda: is_classmethod_node(node))
+        assert_equal(on_cm, off_cm, f"is_classmethod_node parity {node!r}")
+        off_st = self._with_gate(False, lambda: is_node_static(node))
+        on_st = self._with_gate(True, lambda: is_node_static(node))
+        assert_equal(on_st, off_st, f"is_node_static parity {node!r}")
+
+    def _assert_engages(self, node: object) -> None:
+        assert _type_kernel.rust_is_classmethod_node(node) is not None, (
+            f"Rust is_classmethod_node did not engage for {node!r}"
+        )
+        assert _type_kernel.rust_is_node_static(node) is not None, (
+            f"Rust is_node_static did not engage for {node!r}"
+        )
+
+    def _func_def(self, name: str) -> FuncDef:
+        return FuncDef(name)
+
+    def _var(self, name: str) -> Var:
+        return Var(name)
+
+    def test_func_def_class(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        fd = self._func_def("f_class")
+        fd.is_class = True
+        self._assert_par(fd)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(fd)), True
+        )
+        assert_equal(self._with_gate(True, lambda: is_node_static(fd)), False)
+        self._assert_engages(fd)
+
+    def test_func_def_static(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        fd = self._func_def("f_static")
+        fd.is_static = True
+        self._assert_par(fd)
+        assert_equal(self._with_gate(True, lambda: is_node_static(fd)), True)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(fd)), False
+        )
+        self._assert_engages(fd)
+
+    def test_func_def_plain(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        fd = self._func_def("f_plain")
+        self._assert_par(fd)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(fd)), False
+        )
+        assert_equal(self._with_gate(True, lambda: is_node_static(fd)), False)
+        self._assert_engages(fd)
+
+    def test_var_classmethod(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        v = self._var("v_class")
+        v.is_classmethod = True
+        self._assert_par(v)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(v)), True
+        )
+        assert_equal(self._with_gate(True, lambda: is_node_static(v)), False)
+        self._assert_engages(v)
+
+    def test_var_staticmethod(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        v = self._var("v_static")
+        v.is_staticmethod = True
+        self._assert_par(v)
+        assert_equal(self._with_gate(True, lambda: is_node_static(v)), True)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(v)), False
+        )
+        self._assert_engages(v)
+
+    def test_decorator_wraps_func_def(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        fd = self._func_def("f_dec")
+        fd.is_class = True
+        v = self._var("f_dec_var")
+        dec = Decorator(fd, [], v)
+        self._assert_par(dec)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(dec)), True
+        )
+        assert_equal(self._with_gate(True, lambda: is_node_static(dec)), False)
+        self._assert_engages(dec)
+
+    def test_decorator_wraps_static_func_def(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        fd = self._func_def("f_dec_static")
+        fd.is_static = True
+        v = self._var("f_dec_static_var")
+        dec = Decorator(fd, [], v)
+        self._assert_par(dec)
+        assert_equal(self._with_gate(True, lambda: is_node_static(dec)), True)
+        assert_equal(
+            self._with_gate(True, lambda: is_classmethod_node(dec)), False
+        )
+        self._assert_engages(dec)
+
+    def test_foreign_node_defers(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        # A non-FuncDef/Var/Decorator node yields None from both predicates
+        # (real path), so Rust defers and Python runs the pure body.
+        e = IntExpr(42)
+        self._assert_par(e)
+        assert_equal(self._with_gate(True, lambda: is_classmethod_node(e)), None)
+        assert_equal(self._with_gate(True, lambda: is_node_static(e)), None)
+
+    def test_none_input_defers(self) -> None:
+        from mypy.checker import is_classmethod_node, is_node_static
+
+        # None input yields None from both predicates (real path); Rust
+        # defers and Python runs the pure body.
+        self._assert_par(None)
+        assert_equal(self._with_gate(True, lambda: is_classmethod_node(None)), None)
+        assert_equal(self._with_gate(True, lambda: is_node_static(None)), None)
