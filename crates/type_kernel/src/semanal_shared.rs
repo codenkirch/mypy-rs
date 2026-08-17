@@ -315,10 +315,7 @@ pub(crate) fn rust_has_placeholder(py: Python<'_>, typ: &PyAny) -> PyResult<Opti
 
 /// `mypy.types.get_proper_type(typ)`; `Ok(None)` defers to Python when the
 /// call raised (e.g. an unfixed alias asserting on `alias is None`).
-fn get_proper_type_of<'a>(
-    types_mod: &'a PyModule,
-    typ: &'a PyAny,
-) -> PyResult<Option<&'a PyAny>> {
+fn get_proper_type_of<'a>(types_mod: &'a PyModule, typ: &'a PyAny) -> PyResult<Option<&'a PyAny>> {
     let get_proper_type = types_mod.getattr("get_proper_type")?;
     match get_proper_type.call1((typ,)) {
         Ok(r) => Ok(Some(r)),
