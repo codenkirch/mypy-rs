@@ -294,6 +294,14 @@ including:
   `_native_typeops_active` (wired from `mypy/build.py`) and covered by
   `NativeClassCallableSuite` in `mypy/test/testtypes.py`, plus 10 pure
   decision unit tests in `typeops.rs`.
+- `try_getting_literal` (mypy.checkexpr) — mirrors
+  `mypy.checkexpr.try_getting_literal` (checkexpr.py:8339): unwraps an
+  `Instance`'s `last_known_value` to the precise LiteralType, or returns
+  `get_proper_type(typ)` unchanged. Pure wire call (no resolver); the
+  round-trip carries the `last_known_value` field and fixup resolves
+  type_refs to live TypeInfo. Gated by `_native_checkexpr_active`
+  (wired from `mypy/build.py`) and covered by
+  `NativeTryGettingLiteralSuite` in `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
