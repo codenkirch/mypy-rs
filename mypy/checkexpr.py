@@ -8338,8 +8338,19 @@ def merge_typevars_in_callables_by_name(
 
 def try_getting_literal(typ: Type) -> ProperType:
     """If possible, get a more precise literal type for a given type."""
-    # NOTE: try_getting_literal returns a ProperType. Wire round-trip loses
-    # live TypeInfo references, so the Rust path is not production-wired.
+    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        try:
+            type_bytes = _serialize_type_for_checkexpr(typ)
+            result = _rust_try_getting_literal(type_bytes)
+            if result is not None:
+                decoded = _deserialize_type_from_checkexpr(bytes(result))
+                if decoded is not None:
+                    # Rust always returns a ProperType here (Instance w/o
+                    # lkv or a LiteralType); fixup never reintroduces an
+                    # alias, so the cast satisfies `-> ProperType`.
+                    return cast(ProperType, decoded)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     typ = get_proper_type(typ)
     if isinstance(typ, Instance) and typ.last_known_value is not None:
         return typ.last_known_value

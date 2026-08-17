@@ -3634,6 +3634,102 @@ class NativeCoerceLiteralSingletonSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTryGettingLiteralSuite(Suite):
+    """Parity for the Rust `try_getting_literal` port (mypy.checkexpr).
+
+    `try_getting_literal` unwraps an Instance's last_known_value to the
+    precise LiteralType, or returns the type proper. The Rust port
+    implements the same get_proper_type + lkv unwrap; the wire round-trip
+    carries the `last_known_value` field, and fixup resolves type_refs to
+    live TypeInfo via the installed wire map. Toggling the checkexpr gate
+    off (pure Python) and on (Rust seam) must produce identical results, and
+    a direct seam call proves the Rust function engages rather than
+    silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._type_infos = type_infos
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, typ: Type) -> None:
+        from mypy.checkexpr import try_getting_literal
+
+        off = self._with_gate(False, lambda: try_getting_literal(typ))
+        on = self._with_gate(True, lambda: try_getting_literal(typ))
+        assert_equal(str(on), str(off), f"try_getting_literal parity {typ}")
+
+    def _assert_engages(self, typ: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        result = _type_kernel.rust_try_getting_literal(
+            _serialize_type_for_checkexpr(typ)
+        )
+        assert result is not None, f"Rust try_getting_literal did not engage for {typ}"
+
+    def test_unwraps_last_known_value(self) -> None:
+        from mypy.checkexpr import try_getting_literal
+
+        self._assert_par(self.fx.lit_str1_inst)
+        result = self._with_gate(True, lambda: try_getting_literal(self.fx.lit_str1_inst))
+        assert_equal(str(result), "Literal['x']")
+        self._assert_engages(self.fx.lit_str1_inst)
+
+    def test_plain_instance_unchanged(self) -> None:
+        from mypy.checkexpr import try_getting_literal
+
+        plain = Instance(self.fx.ai, [])
+        self._assert_par(plain)
+        result = self._with_gate(True, lambda: try_getting_literal(plain))
+        assert_equal(str(result), "A")
+        self._assert_engages(plain)
+
+    def test_none(self) -> None:
+        self._assert_par(self.fx.nonet)
+        self._assert_engages(self.fx.nonet)
+
+    def test_any(self) -> None:
+        self._assert_par(self.fx.anyt)
+        self._assert_engages(self.fx.anyt)
+
+    def test_union(self) -> None:
+        # `get_proper_type` on a Union is a no-op; the Instance-with-lkv
+        # item is not unwrapped (only the root is checked). Parity holds.
+        u = UnionType([self.fx.lit_str1_inst, self.fx.a])
+        self._assert_par(u)
+        self._assert_engages(u)
+
+    def test_uninhabited(self) -> None:
+        self._assert_par(self.fx.uninhabited)
+        self._assert_engages(self.fx.uninhabited)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAnyTypeSuite(Suite):
     """Parity suite for the Rust `has_any_type` port with alias type-arg
     substitution (Phase B3b, #591).
