@@ -659,6 +659,15 @@ def supported_self_type(
     Currently, this means an X or Type[X], where X is an instance or
     a type variable with an instance upper bound.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+        try:
+            result = _type_kernel.rust_supported_self_type(
+                _serialize_type(typ), _native_typeops_resolver, allow_callable, allow_instances
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if isinstance(typ, TypeType):
         return supported_self_type(typ.item)
     if allow_callable and isinstance(typ, CallableType):

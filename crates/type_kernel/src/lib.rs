@@ -108,6 +108,7 @@ mod solve;
 mod stubgen;
 mod subtypes;
 mod suggestions;
+mod supported_self_type;
 mod traverser;
 mod treetransform;
 mod typeanal_queries;
@@ -2470,6 +2471,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // variables it uses (mypy.checker).
     module.add_function(wrap_pyfunction!(
         detach_callable::rust_detach_callable,
+        module
+    )?)?;
+
+    // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
+    module.add_function(wrap_pyfunction!(
+        supported_self_type::rust_supported_self_type,
         module
     )?)?;
 
