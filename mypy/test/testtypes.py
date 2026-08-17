@@ -3866,6 +3866,181 @@ class NativeTryGettingLiteralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEqualityValueInfoSuite(Suite):
+    """Parity for the Rust `equality_value_info` port (mypy.checker).
+
+    `equality_value_info` collects the value-equality domains a type
+    participates in; `is_equality_ambiguous_for_narrowing` uses it to
+    detect cross-domain equality (IntEnum vs int, StrEnum vs str). The
+    Rust port folds `combine_equality_value_info` into the recursion and
+    reads the resolver-required metadata (mro, is_enum) from the TypeInfo
+    snapshot. Toggling the checker gate off (pure Python) and on (Rust)
+    must produce identical results, and a direct seam call proves the Rust
+    function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        self.fx = TypeFixture()
+        self.int_info = self.fx.make_type_info("builtins.int")
+        # An IntEnum: is_enum set, mro through builtins.int -> numeric domain.
+        self.enum_info = self.fx.make_type_info(
+            "mod.Color", mro=[self.int_info, self.fx.oi]
+        )
+        self.enum_info.is_enum = True
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # Make sure the str/object TypeInfos are snapshotted: the `dir(fx)`
+        # scan above only picks `*i` attrs and `str_type_info` /
+        # `bool_type_info` do not end in "i".
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        type_infos.extend([self.int_info, self.enum_info])
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _normalize(
+        self, info: object
+    ) -> tuple[bool, frozenset[tuple[str, frozenset[str], frozenset[str]]]]:
+        from mypy.checker import EqualityDomainInfo, EqualityValueInfo
+
+        assert isinstance(info, EqualityValueInfo)
+        return (
+            info.is_top,
+            frozenset(
+                (
+                    domain,
+                    frozenset(domain_info.type_names),
+                    frozenset(domain_info.enum_type_names),
+                )
+                for domain, domain_info in info.domains.items()
+                if isinstance(domain_info, EqualityDomainInfo)
+            ),
+        )
+
+    def _assert_par(self, typ: Type) -> None:
+        from mypy.checker import equality_value_info
+
+        off = self._normalize(self._with_gate(False, lambda: equality_value_info(typ)))
+        on = self._normalize(self._with_gate(True, lambda: equality_value_info(typ)))
+        assert_equal(on, off, f"equality_value_info parity {typ}")
+
+    def _assert_engages(self, typ: Type) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_equality_value_info(
+            _serialize_type_for_checker(typ), self.resolver
+        )
+        assert result is not None, f"Rust equality_value_info did not engage for {typ}"
+
+    def test_str_instance(self) -> None:
+        # Instance of builtins.str -> open str domain, no enum type names.
+        from mypy.checker import equality_value_info
+
+        s = Instance(self.fx.str_type_info, [])
+        self._assert_par(s)
+        result = self._normalize(equality_value_info(s))
+        assert_equal(
+            result,
+            (False, frozenset({("builtins.str", frozenset({"builtins.str"}), frozenset())})),
+        )
+        self._assert_engages(s)
+
+    def test_int_enum_literal(self) -> None:
+        # An IntEnum literal's fallback is the enum Instance; the enum's mro
+        # hits builtins.int -> numeric domain with the enum name in both sets.
+        from mypy.checker import equality_value_info
+
+        enum_inst = Instance(self.enum_info, [])
+        lit = LiteralType(1, enum_inst)
+        self._assert_par(lit)
+        result = self._normalize(equality_value_info(lit))
+        assert_equal(
+            result,
+            (
+                False,
+                frozenset(
+                    {
+                        (
+                            "builtins.numeric",
+                            frozenset({"mod.Color"}),
+                            frozenset({"mod.Color"}),
+                        )
+                    }
+                ),
+            ),
+        )
+        self._assert_engages(lit)
+
+    def test_union(self) -> None:
+        # combine over the member infos: str + plain non-enum A.
+        u = UnionType([Instance(self.fx.str_type_info, []), self.fx.a])
+        self._assert_par(u)
+        self._assert_engages(u)
+
+    def test_typevar_with_values(self) -> None:
+        # TypeVar.values non-empty: combine over the values.
+        tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [Instance(self.fx.str_type_info, [])],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self._assert_par(tv)
+        self._assert_engages(tv)
+
+    def test_typevar_upper_bound(self) -> None:
+        # TypeVar.values empty: recurse on the upper_bound (object -> top).
+        tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self._assert_par(tv)
+        self._assert_engages(tv)
+
+    def test_any(self) -> None:
+        self._assert_par(self.fx.anyt)
+        self._assert_engages(self.fx.anyt)
+
+    def test_object_instance(self) -> None:
+        # builtins.object is a top-like value info.
+        self._assert_par(self.fx.o)
+        self._assert_engages(self.fx.o)
+
+    def test_plain_instance(self) -> None:
+        # A has no value-equality domain members in its mro: no domains.
+        self._assert_par(self.fx.a)
+        self._assert_engages(self.fx.a)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGetPropertyTypeSuite(Suite):
     """Parity for the Rust `get_property_type` port (mypy.checker).
 
