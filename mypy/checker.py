@@ -321,6 +321,7 @@ try:
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_detach_callable as _rust_detach_callable,
+        rust_equality_value_info as _rust_equality_value_info,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
@@ -10741,6 +10742,26 @@ def is_equality_ambiguous_for_narrowing(left: Type, right: Type) -> bool:
 
 
 def equality_value_info(t: Type) -> EqualityValueInfo:
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            raw = _rust_equality_value_info(
+                _serialize_type_for_checker(t), _native_checker_resolver
+            )
+            if raw is not None:
+                is_top, domains = raw
+                return EqualityValueInfo(
+                    {
+                        domain: EqualityDomainInfo(set(type_names), set(enum_type_names))
+                        for domain, type_names, enum_type_names in domains
+                    },
+                    is_top,
+                )
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     t = get_proper_type(t)
     if isinstance(t, UnionType):
         return combine_equality_value_info(equality_value_info(item) for item in t.items)
