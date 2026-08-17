@@ -1421,6 +1421,12 @@ class BuildManager:
         from mypy.typeops import _set_native_typeops_resolver
 
         _set_native_typeops_resolver(resolver)
+        # Live TypeInfo map for typeops' live-enum/final reads
+        # (coerce_to_literal, singleton identity/equality). The snapshot's
+        # enum_members can go stale (members resolving after the class's
+        # SCC sealed), and is_final is not snapshotted, so these reads go
+        # through the live map, not the resolver wire map.
+        resolver.set_live_typeinfo_map(self._native_typeinfo_map)
         # Stage 6c: applytype shares the subtype/expand resolvers.
         from mypy.applytype import (
             _set_native_applytype_resolver,

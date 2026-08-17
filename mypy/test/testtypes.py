@@ -34,6 +34,7 @@ from mypy.nodes import (
     CONTRAVARIANT,
     COVARIANT,
     INVARIANT,
+    MDEF,
     ArgKind,
     BytesExpr,
     CallExpr,
@@ -52,6 +53,7 @@ from mypy.nodes import (
     SliceExpr,
     StarExpr,
     StrExpr,
+    SymbolTableNode,
     TemplateStrExpr,
     TupleExpr,
     TypeInfo,
@@ -90,7 +92,14 @@ from mypy.typeanal import (
     make_optional_type,
     native_analyze_type,
 )
-from mypy.typeops import false_only, make_simplified_union, true_only
+from mypy.typeops import (
+    coerce_to_literal,
+    false_only,
+    is_singleton_equality_type,
+    is_singleton_identity_type,
+    make_simplified_union,
+    true_only,
+)
 from mypy.types import (
     AnyType,
     CallableType,
@@ -3452,6 +3461,176 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         )
         assert result is not None, "Rust map_type_from_supertype did not engage"
         assert isinstance(bytes(result), bytes)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCoerceLiteralSingletonSuite(Suite):
+    """Parity for the Rust `coerce_to_literal` + singleton pair
+    (mypy.typeops.coerce_to_literal / is_singleton_identity_type /
+    is_singleton_equality_type, issue #492 family).
+
+    The Python body turns Instances carrying a last-known value, or a
+    single-member enum, into the corresponding LiteralType. The Rust port
+    reads the single-member-enum decision live from the resolver-installed
+    live TypeInfo map (the snapshot's `enum_members` can go stale), and the
+    singleton identity/equality predicates likewise read `is_enum` /
+    `enum_members` / `is_final` live. Toggling the typeops gate off (pure
+    Python) and on (Rust) must produce identical results. Direct seam calls
+    prove the Rust functions engage rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # A single-member enum: `enum_members` (a names-walk property)
+        # needs an explicitly-valued Var member to yield ['RED'].
+        self.enum_info = self.fx.make_type_info("mod.Color")
+        self.enum_info.is_enum = True
+        v = Var("RED")
+        v.has_explicit_value = True
+        v.type = self.fx.o
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, v)
+        type_infos.append(self.enum_info)
+        self.enum_inst = Instance(self.enum_info, [])
+        # A final class for the TypeType branch.
+        self.final_info = self.fx.make_type_info("mod.Final")
+        self.final_info.is_final = True
+        type_infos.append(self.final_info)
+        self.final_inst = Instance(self.final_info, [])
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._live_map = {info.fullname: info for info in type_infos}
+        self._resolver.set_live_typeinfo_map(dict(self._live_map))
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(
+        self, active: bool, fn: Callable[[], object]
+    ) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_coerce_par(self, typ: Type) -> None:
+        off = self._with_gate(False, lambda: coerce_to_literal(typ))
+        on = self._with_gate(True, lambda: coerce_to_literal(typ))
+        assert_equal(str(on), str(off), f"coerce_to_literal parity {typ}")
+
+    def _assert_singleton_par(self, typ: ProperType) -> None:
+        id_off = self._with_gate(
+            False, lambda: is_singleton_identity_type(typ)
+        )
+        id_on = self._with_gate(True, lambda: is_singleton_identity_type(typ))
+        eq_off = self._with_gate(
+            False, lambda: is_singleton_equality_type(typ)
+        )
+        eq_on = self._with_gate(True, lambda: is_singleton_equality_type(typ))
+        assert id_on == id_off, f"identity parity {typ}"
+        assert eq_on == eq_off, f"equality parity {typ}"
+
+    def test_coerce_single_enum(self) -> None:
+        # The headline new coverage: a single-member enum Instance becomes
+        # Literal[Color.RED]. Both gates must agree and the value must round
+        # trip through the live enum-member read.
+        self._assert_coerce_par(self.enum_inst)
+        result = self._with_gate(
+            True, lambda: coerce_to_literal(self.enum_inst)
+        )
+        assert_equal(str(result), "Literal[mod.Color.RED]")
+
+    def test_coerce_last_known_value(self) -> None:
+        # An Instance whose last_known_value is set unwraps to the literal.
+        lkv = self.fx.lit_str1_inst
+        self._assert_coerce_par(lkv)
+        result = self._with_gate(True, lambda: coerce_to_literal(lkv))
+        assert_equal(str(result), "Literal['x']")
+
+    def test_coerce_plain_instance_unchanged(self) -> None:
+        # No lkv, non-enum: returned untouched.
+        plain = Instance(self.fx.ai, [])
+        self._assert_coerce_par(plain)
+
+    def test_coerce_union(self) -> None:
+        # Union items coerced recursively and recombined.
+        u = UnionType([self.enum_inst, Instance(self.fx.ai, [])])
+        self._assert_coerce_par(u)
+        result = self._with_gate(True, lambda: coerce_to_literal(u))
+        assert_equal(str(result), "Literal[mod.Color.RED] | A")
+
+    def test_coerce_alias_defers(self) -> None:
+        # A TypeAliasType carries no wire target, so the native path defers
+        # and Python produces the (known) literal result. Parity must hold.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(Instance(self.enum_info, []), "mod.RGB", "mod", -1, -1)
+        self._assert_coerce_par(TypeAliasType(alias, []))
+
+    def test_singleton_none(self) -> None:
+        self._assert_singleton_par(self.fx.nonet)
+
+    def test_singleton_single_enum(self) -> None:
+        self._assert_singleton_par(self.enum_inst)
+        assert self._with_gate(True, lambda: is_singleton_identity_type(self.enum_inst))
+
+    def test_singleton_plain_instance(self) -> None:
+        self._assert_singleton_par(Instance(self.fx.ai, []))
+
+    def test_singleton_literal_bool(self) -> None:
+        self._assert_singleton_par(self.fx.lit_true)
+        self._assert_singleton_par(self.fx.lit_false)
+        assert self._with_gate(True, lambda: is_singleton_identity_type(self.fx.lit_true))
+
+    def test_singleton_literal_int_not_identity(self) -> None:
+        # Literal[1] is equality-singleton but not identity-singleton.
+        self._assert_singleton_par(self.fx.lit1)
+        assert not self._with_gate(True, lambda: is_singleton_identity_type(self.fx.lit1))
+        assert self._with_gate(True, lambda: is_singleton_equality_type(self.fx.lit1))
+
+    def test_singleton_typetype_final(self) -> None:
+        self._assert_singleton_par(TypeType(self.final_inst))
+        assert self._with_gate(True, lambda: is_singleton_identity_type(TypeType(self.final_inst)))
+
+    def test_singleton_typetype_nonfinal(self) -> None:
+        self._assert_singleton_par(TypeType(Instance(self.fx.ai, [])))
+        assert not self._with_gate(True, lambda: is_singleton_identity_type(TypeType(Instance(self.fx.ai, []))))
+
+    def test_seams_engage_direct(self) -> None:
+        # Call the Rust seams directly and confirm they return non-None.
+        from mypy.typeops import _serialize_type
+
+        r = _type_kernel.rust_coerce_to_literal(
+            _serialize_type(self.enum_inst), self._resolver
+        )
+        assert r is not None, "Rust coerce_to_literal did not engage"
+        id_r = _type_kernel.rust_is_singleton_identity_type(
+            _serialize_type(self.enum_inst), self._resolver
+        )
+        assert id_r is True, "Rust singleton identity did not engage"
+        eq_r = _type_kernel.rust_is_singleton_equality_type(
+            _serialize_type(self.enum_inst), self._resolver
+        )
+        assert eq_r is True, "Rust singleton equality did not engage"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

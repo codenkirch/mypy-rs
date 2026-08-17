@@ -18,7 +18,9 @@
 use pyo3::prelude::*;
 use pyo3::IntoPy;
 
-use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
+use crate::typeinfo::{
+    read_bool_attr, read_str_list_attr, serialize_type_to_bytes, NativeTypeResolver, TypeResolver,
+};
 use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
 use crate::setops;
@@ -1203,6 +1205,169 @@ pub(crate) fn rust_map_type_from_supertype(
         strict_optional,
     )?;
     encode_type(&expanded)
+}
+
+/// `mypy.typeops.coerce_to_literal` (typeops.py:1629-1645): recursively
+/// turn any Instance with a last-known value or a single-value enum into
+/// the corresponding LiteralType.
+///
+/// Live-enum reads: the snapshot's `enum_members` is captured when the
+/// class's own SCC sealed it and can go stale (members resolving later,
+/// e.g. nonmember members), so the single-member-enum decision reads
+/// `is_enum` / `enum_members` live from the resolver-installed live
+/// TypeInfo map. Defers (`None`) when that map is absent, when the enum
+/// has zero members (Python returns the original type), or on a recursive
+/// TypeAliasType (no alias target on the wire). Union items are coerced
+/// recursively and rebuilt with `make_union`, exactly like the Python body.
+#[pyfunction]
+#[pyo3(signature = (type_bytes, resolver))]
+pub(crate) fn rust_coerce_to_literal(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let typ = decode_type(type_bytes)?;
+    let result = coerce_to_literal_inner(py, &typ, resolver)?;
+    encode_type(&result)
+}
+
+fn coerce_to_literal_inner(
+    py: Python<'_>,
+    typ: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<Type> {
+    match typ {
+        // get_proper_type for TypeAliasType is not expressible on the wire.
+        Type::TypeAliasType { .. } => None,
+        Type::UnionType { items, .. } => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(coerce_to_literal_inner(py, item, resolver)?);
+            }
+            Some(make_union(out))
+        }
+        Type::Instance {
+            last_known_value: Some(lkv),
+            ..
+        } => Some((**lkv).clone()),
+        Type::Instance { type_ref, .. } => {
+            // Two live-enum reads, so the decision never uses a stale
+            // snapshot: `is_enum` and `enum_members` come from the live
+            // TypeInfo keyed by fullname.
+            let info = resolver.live_typeinfo(py, type_ref)?;
+            let is_enum = read_bool_attr(info, "is_enum").unwrap_or(false);
+            if !is_enum {
+                return Some(typ.clone());
+            }
+            let members = read_str_list_attr(info, "enum_members").unwrap_or_default();
+            match members.len() {
+                // Python: len(enum_values) == 1 -> LiteralType(value, typ).
+                1 => Some(Type::LiteralType {
+                    fallback: Box::new(typ.clone()),
+                    value: LiteralValue::Str(members.into_iter().next().unwrap()),
+                }),
+                // Python: a zero-member enum returns the original type
+                // (early `if not items: return typ` in the expand path is
+                // separate; here coerce_to_literal checks `len == 1` only,
+                // so 0 members falls through to `return original_type`).
+                _ => Some(typ.clone()),
+            }
+        }
+        _ => Some(typ.clone()),
+    }
+}
+
+/// `mypy.typeops.is_singleton_identity_type` (typeops.py:1493-1514): true
+/// if every value of the type is `is`-identical to every other, plus
+/// `is_singleton_equality_type` (typeops.py:1517-1518) which adds plain
+/// LiteralTypes.
+///
+/// Live-enum/final reads via the resolver-installed live TypeInfo map
+/// (snapshot `enum_members` can go stale; `is_final` is not snapshotted).
+/// Defers (`None`) when the target span needs a live read the map cannot
+/// satisfy, or on the rare FunctionLike type-object branch (needs
+/// `CallableType.type_object()` force_fallback Instance resolution, not
+/// wire-portable).
+#[pyfunction]
+#[pyo3(signature = (type_bytes, resolver))]
+pub(crate) fn rust_is_singleton_identity_type(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    let typ = decode_type(type_bytes)?;
+    is_singleton_identity_inner(py, &typ, resolver)
+}
+
+/// `mypy.typeops.is_singleton_equality_type` (typeops.py:1517-1518).
+#[pyfunction]
+#[pyo3(signature = (type_bytes, resolver))]
+pub(crate) fn rust_is_singleton_equality_type(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    let typ = decode_type(type_bytes)?;
+    Some(
+        matches!(typ, Type::LiteralType { .. }) || is_singleton_identity_inner(py, &typ, resolver)?,
+    )
+}
+// `ellipsis` / `NotImplemented` identity names (types.py:257-260).
+const ELLIPSIS_TYPE_NAMES: [&str; 2] = ["builtins.ellipsis", "types.EllipsisType"];
+const NOT_IMPLEMENTED_TYPE_NAMES: [&str; 2] =
+    ["builtins._NotImplementedType", "types.NotImplementedType"];
+
+fn is_singleton_identity_inner(
+    py: Python<'_>,
+    typ: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    match typ {
+        Type::NoneType => Some(true),
+        Type::Instance { type_ref, .. } => {
+            let info = resolver.live_typeinfo(py, type_ref)?;
+            let is_enum = read_bool_attr(info, "is_enum").unwrap_or(false);
+            let members = read_str_list_attr(info, "enum_members").unwrap_or_default();
+            if is_enum && members.len() == 1 {
+                return Some(true);
+            }
+            if ELLIPSIS_TYPE_NAMES.contains(&type_ref.as_str())
+                || NOT_IMPLEMENTED_TYPE_NAMES.contains(&type_ref.as_str())
+            {
+                return Some(true);
+            }
+            Some(false)
+        }
+        Type::LiteralType { value, .. } => {
+            // is_enum_literal() == fallback.type.is_enum (live), or a bool
+            // value. non-bool/non-enum literals like Literal[100001] are not
+            // identity-singletons.
+            let is_enum = match typ {
+                Type::LiteralType { fallback, .. } => match fallback.as_ref() {
+                    Type::Instance { type_ref, .. } => {
+                        let info = resolver.live_typeinfo(py, type_ref)?;
+                        read_bool_attr(info, "is_enum").unwrap_or(false)
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            Some(matches!(value, LiteralValue::Bool(_)) || is_enum)
+        }
+        Type::TypeType { item, .. } => match item.as_ref() {
+            Type::Instance { type_ref, .. } => {
+                let info = resolver.live_typeinfo(py, type_ref)?;
+                Some(read_bool_attr(info, "is_final").unwrap_or(false))
+            }
+            _ => Some(false),
+        },
+        // FunctionLike type-object branch needs
+        // `CallableType.type_object()` force_fallback Instance resolution
+        // (get_instance_type over instance_type/ret_type chains), which the
+        // wire does not carry; defer to Python.
+        Type::CallableType { .. } | Type::Overloaded { .. } => None,
+        _ => Some(false),
+    }
 }
 
 /// `#[pyfunction]` entry for `bind_self` (typeops.py:540-641): strip the
