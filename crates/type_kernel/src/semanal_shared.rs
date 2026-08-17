@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyList, PyModule, PyString, PyTuple, PyType};
 
 // ---------------------------------------------------------------------------
 // Magic-method constant sets (from mypy/sharedparse.py)
@@ -293,32 +293,121 @@ pub(crate) fn rust_set_callable_name(
 /// `mypy.semanal_shared.has_placeholder` — does `typ` contain a
 /// `PlaceholderType` recursively?
 ///
-/// Mirrors semanal_shared.py:379. Walks the type tree manually checking for
-/// `PlaceholderType`. Handles the common recursive type containers:
-/// `UnionType`, `Instance`, `TupleType`, `CallableType`, `TypeVarType`.
+/// Mirrors `HasPlaceholders` (semanal_shared.py) on top of
+/// `BoolTypeQuery` (type_visitor.py, ANY_STRATEGY with `default=False`):
+/// `visit_placeholder_type` returns True and every other visit method
+/// follows the BoolTypeQuery table. `TypeAliasType` gets the same
+/// identity-based `seen_aliases` cycle detection as the Python visitor,
+/// and new-style (PEP 695) aliases also query their type arguments even
+/// when the alias expansion finds nothing (unused type variables).
 ///
-/// Returns `Some(true)` when a placeholder is found, `Some(false)` when the
-/// type tree is fully understood and contains no placeholder, and `None`
-/// when Rust encounters a type it cannot fully traverse (so Python should
-/// run the `HasPlaceholders` visitor instead).
+/// Returns `Some(true)` when a placeholder is found, `Some(false)` when
+/// the type tree is fully understood and contains no placeholder, and
+/// `None` when Rust encounters a type class it cannot fully traverse
+/// (so Python should run the `HasPlaceholders` visitor instead).
 #[pyfunction]
 pub(crate) fn rust_has_placeholder(py: Python<'_>, typ: &PyAny) -> PyResult<Option<bool>> {
-    has_placeholder_walk(py, typ, 0)
+    // A fresh visitor per call, matching `HasPlaceholders()` in
+    // has_placeholder(); seen_aliases is not reset mid-walk.
+    let mut seen_aliases: HashSet<*mut pyo3::ffi::PyObject> = HashSet::new();
+    has_placeholder_walk(py, typ, 0, &mut seen_aliases)
 }
 
-/// Recursive walk for `has_placeholder`. Returns `None` for unsupported type
-/// shapes so Python's `HasPlaceholders` visitor handles them. A depth limit
-/// prevents stack overflow on recursive (self-referential) types, returning
-/// `None` to defer to Python's visitor which handles cycles.
-fn has_placeholder_walk(py: Python<'_>, typ: &PyAny, depth: u32) -> PyResult<Option<bool>> {
+/// `mypy.types.get_proper_type(typ)`; `Ok(None)` defers to Python when the
+/// call raised (e.g. an unfixed alias asserting on `alias is None`).
+fn get_proper_type_of<'a>(types_mod: &'a PyModule, typ: &'a PyAny) -> PyResult<Option<&'a PyAny>> {
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+    match get_proper_type.call1((typ,)) {
+        Ok(r) => Ok(Some(r)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// ANY-strategy query over a `list`/`tuple` of types, mirroring
+/// `BoolTypeQuery.query_types`. `Ok(None)` defers when the attribute is
+/// neither a list nor a tuple.
+fn query_type_items(
+    py: Python<'_>,
+    depth: u32,
+    seen_aliases: &mut HashSet<*mut pyo3::ffi::PyObject>,
+    items: &PyAny,
+) -> PyResult<Option<bool>> {
+    let vals: Option<Vec<&PyAny>> = if let Ok(l) = items.downcast::<PyList>() {
+        Some(l.iter().collect())
+    } else if let Ok(t) = items.downcast::<PyTuple>() {
+        Some(t.iter().collect())
+    } else {
+        None
+    };
+    let vals = match vals {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    for v in vals {
+        match has_placeholder_walk(py, v, depth + 1, seen_aliases)? {
+            Some(true) => return Ok(Some(true)),
+            None => return Ok(None),
+            Some(false) => {}
+        }
+    }
+    Ok(Some(false))
+}
+
+/// Recursive walk for `has_placeholder`. Returns `None` for unsupported
+/// type shapes so Python's `HasPlaceholders` visitor handles them. The
+/// identity set tracks visited `TypeAliasType` objects (cycle detection,
+/// mirroring `seen_aliases`); a depth limit additionally guards against
+/// non-alias self-reference, deferring to Python's visitor.
+fn has_placeholder_walk(
+    py: Python<'_>,
+    typ: &PyAny,
+    depth: u32,
+    seen_aliases: &mut HashSet<*mut pyo3::ffi::PyObject>,
+) -> PyResult<Option<bool>> {
     if depth > 64 {
         return Ok(None);
     }
     let types_mod = py.import("mypy.types")?;
-    let get_proper_type = types_mod.getattr("get_proper_type")?;
-    let proper = match get_proper_type.call1((typ,)) {
-        Ok(r) => r,
-        Err(_) => return Ok(None),
+
+    // TypeAliasType must be visited *before* get_proper_type(): expansion
+    // discards the alias object, which the Python visitor still needs for
+    // cycle detection and for querying t.args on new-style aliases.
+    let alias_type_cls: &PyType = types_mod.getattr("TypeAliasType")?.downcast()?;
+    if typ.is_instance(alias_type_cls)? {
+        // Identity-based: TypeAliasType does not override __eq__/__hash__,
+        // so Python's seen_aliases set also keys on object identity.
+        let key = typ.as_ptr();
+        if seen_aliases.contains(&key) {
+            return Ok(Some(false));
+        }
+        seen_aliases.insert(key);
+        let alias = typ.getattr("alias")?;
+        if alias.is_none() {
+            return Ok(None);
+        }
+        let proper = match get_proper_type_of(types_mod, typ)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let res = match has_placeholder_walk(py, proper, depth + 1, seen_aliases)? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if res {
+            return Ok(Some(true));
+        }
+        // visit_type_alias_type: res or (python_3_12_type_alias and
+        // query_types(t.args)).
+        let new_style = alias.getattr("python_3_12_type_alias")?.is_true()?;
+        if new_style {
+            return query_type_items(py, depth, seen_aliases, typ.getattr("args")?);
+        }
+        return Ok(Some(false));
+    }
+
+    let proper = match get_proper_type_of(types_mod, typ)? {
+        Some(p) => p,
+        None => return Ok(None),
     };
 
     let placeholder_cls: &PyType = types_mod.getattr("PlaceholderType")?.downcast()?;
@@ -326,85 +415,172 @@ fn has_placeholder_walk(py: Python<'_>, typ: &PyAny, depth: u32) -> PyResult<Opt
         return Ok(Some(true));
     }
 
-    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
-    if proper.is_instance(union_cls)? {
-        let items = proper.getattr("items")?;
-        let items_list = match items.downcast::<PyList>() {
-            Ok(l) => l,
-            Err(_) => return Ok(None),
-        };
-        for item in items_list.iter() {
-            match has_placeholder_walk(py, item, depth + 1)? {
-                Some(true) => return Ok(Some(true)),
-                None => return Ok(None),
-                Some(false) => {}
-            }
-        }
-        return Ok(Some(false));
-    }
-
     let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
     if proper.is_instance(instance_cls)? {
-        let args = proper.getattr("args")?;
-        let args_list = match args.downcast::<PyList>() {
-            Ok(l) => l,
-            Err(_) => return Ok(None),
-        };
-        for arg in args_list.iter() {
-            match has_placeholder_walk(py, arg, depth + 1)? {
-                Some(true) => return Ok(Some(true)),
-                None => return Ok(None),
-                Some(false) => {}
-            }
-        }
-        return Ok(Some(false));
+        return query_type_items(py, depth, seen_aliases, proper.getattr("args")?);
+    }
+
+    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
+    if proper.is_instance(union_cls)? {
+        return query_type_items(py, depth, seen_aliases, proper.getattr("items")?);
     }
 
     let tuple_cls: &PyType = types_mod.getattr("TupleType")?.downcast()?;
     if proper.is_instance(tuple_cls)? {
-        let items = proper.getattr("items")?;
-        let items_list = match items.downcast::<PyList>() {
-            Ok(l) => l,
-            Err(_) => return Ok(None),
-        };
-        for item in items_list.iter() {
-            match has_placeholder_walk(py, item, depth + 1)? {
-                Some(true) => return Ok(Some(true)),
-                None => return Ok(None),
-                Some(false) => {}
-            }
-        }
-        return Ok(Some(false));
-    }
-
-    let callable_cls: &PyType = types_mod.getattr("CallableType")?.downcast()?;
-    if proper.is_instance(callable_cls)? {
-        // Check arg_types and ret_type.
-        let arg_types = proper.getattr("arg_types")?;
-        let arg_types_list = match arg_types.downcast::<PyList>() {
-            Ok(l) => l,
-            Err(_) => return Ok(None),
-        };
-        for at in arg_types_list.iter() {
-            match has_placeholder_walk(py, at, depth + 1)? {
-                Some(true) => return Ok(Some(true)),
-                None => return Ok(None),
-                Some(false) => {}
-            }
-        }
-        let ret_type = proper.getattr("ret_type")?;
-        match has_placeholder_walk(py, ret_type, depth + 1)? {
+        // query_types([partial_fallback] + items).
+        match has_placeholder_walk(
+            py,
+            proper.getattr("partial_fallback")?,
+            depth + 1,
+            seen_aliases,
+        )? {
             Some(true) => return Ok(Some(true)),
             None => return Ok(None),
             Some(false) => {}
         }
+        return query_type_items(py, depth, seen_aliases, proper.getattr("items")?);
+    }
+
+    let callable_cls: &PyType = types_mod.getattr("CallableType")?.downcast()?;
+    if proper.is_instance(callable_cls)? {
+        // query_types(arg_types) or ret_type or instance_type.
+        match query_type_items(py, depth, seen_aliases, proper.getattr("arg_types")?)? {
+            Some(true) => return Ok(Some(true)),
+            None => return Ok(None),
+            Some(false) => {}
+        }
+        match has_placeholder_walk(py, proper.getattr("ret_type")?, depth + 1, seen_aliases)? {
+            Some(true) => return Ok(Some(true)),
+            None => return Ok(None),
+            Some(false) => {}
+        }
+        let instance_type = proper.getattr("instance_type")?;
+        if !instance_type.is_none() {
+            match has_placeholder_walk(py, instance_type, depth + 1, seen_aliases)? {
+                Some(true) => return Ok(Some(true)),
+                None => return Ok(None),
+                Some(false) => {}
+            }
+        }
         return Ok(Some(false));
+    }
+
+    // BoolTypeQuery leaves all return self.default (False for ANY).
+    for leaf in [
+        "AnyType",
+        "NoneType",
+        "UninhabitedType",
+        "ErasedType",
+        "DeletedType",
+        "PartialType",
+        "RawExpressionType",
+        "LiteralType",
+        "EllipsisType",
+    ] {
+        let cls: &PyType = types_mod.getattr(leaf)?.downcast()?;
+        if proper.is_instance(cls)? {
+            return Ok(Some(false));
+        }
     }
 
     let typevar_cls: &PyType = types_mod.getattr("TypeVarType")?.downcast()?;
     if proper.is_instance(typevar_cls)? {
-        let upper_bound = proper.getattr("upper_bound")?;
-        return has_placeholder_walk(py, upper_bound, depth + 1);
+        // query_types([upper_bound, default] + values). Crucial for
+        // recursive generic aliases: the TypeVar's default may be the
+        // alias itself, whose target is a PlaceholderType.
+        for sub in [proper.getattr("upper_bound")?, proper.getattr("default")?] {
+            match has_placeholder_walk(py, sub, depth + 1, seen_aliases)? {
+                Some(true) => return Ok(Some(true)),
+                None => return Ok(None),
+                Some(false) => {}
+            }
+        }
+        return query_type_items(py, depth, seen_aliases, proper.getattr("values")?);
+    }
+
+    let paramspec_cls: &PyType = types_mod.getattr("ParamSpecType")?.downcast()?;
+    if proper.is_instance(paramspec_cls)? {
+        // query_types([upper_bound, default, prefix]).
+        for sub in [
+            proper.getattr("upper_bound")?,
+            proper.getattr("default")?,
+            proper.getattr("prefix")?,
+        ] {
+            match has_placeholder_walk(py, sub, depth + 1, seen_aliases)? {
+                Some(true) => return Ok(Some(true)),
+                None => return Ok(None),
+                Some(false) => {}
+            }
+        }
+        return Ok(Some(false));
+    }
+
+    let tvtuple_cls: &PyType = types_mod.getattr("TypeVarTupleType")?.downcast()?;
+    if proper.is_instance(tvtuple_cls)? {
+        // query_types([upper_bound, default]).
+        for sub in [proper.getattr("upper_bound")?, proper.getattr("default")?] {
+            match has_placeholder_walk(py, sub, depth + 1, seen_aliases)? {
+                Some(true) => return Ok(Some(true)),
+                None => return Ok(None),
+                Some(false) => {}
+            }
+        }
+        return Ok(Some(false));
+    }
+
+    let unpack_cls: &PyType = types_mod.getattr("UnpackType")?.downcast()?;
+    if proper.is_instance(unpack_cls)? {
+        // query_types([t.type]).
+        return has_placeholder_walk(py, proper.getattr("type")?, depth + 1, seen_aliases);
+    }
+
+    let parameters_cls: &PyType = types_mod.getattr("Parameters")?.downcast()?;
+    if proper.is_instance(parameters_cls)? {
+        return query_type_items(py, depth, seen_aliases, proper.getattr("arg_types")?);
+    }
+
+    let overloaded_cls: &PyType = types_mod.getattr("Overloaded")?.downcast()?;
+    if proper.is_instance(overloaded_cls)? {
+        return query_type_items(py, depth, seen_aliases, proper.getattr("items")?);
+    }
+
+    let typeddict_cls: &PyType = types_mod.getattr("TypedDictType")?.downcast()?;
+    if proper.is_instance(typeddict_cls)? {
+        let items = match proper.getattr("items")?.downcast::<PyDict>() {
+            Ok(d) => d,
+            Err(_) => return Ok(None),
+        };
+        for value in items.values() {
+            match has_placeholder_walk(py, value, depth + 1, seen_aliases)? {
+                Some(true) => return Ok(Some(true)),
+                None => return Ok(None),
+                Some(false) => {}
+            }
+        }
+        return Ok(Some(false));
+    }
+
+    let type_type_cls: &PyType = types_mod.getattr("TypeType")?.downcast()?;
+    if proper.is_instance(type_type_cls)? {
+        // t.item.accept(self).
+        return has_placeholder_walk(py, proper.getattr("item")?, depth + 1, seen_aliases);
+    }
+
+    let unbound_cls: &PyType = types_mod.getattr("UnboundType")?.downcast()?;
+    if proper.is_instance(unbound_cls)? {
+        // query_types(t.args); entries may be PartialType (leaf False).
+        return query_type_items(py, depth, seen_aliases, proper.getattr("args")?);
+    }
+
+    let typelist_cls: &PyType = types_mod.getattr("TypeList")?.downcast()?;
+    if proper.is_instance(typelist_cls)? {
+        return query_type_items(py, depth, seen_aliases, proper.getattr("items")?);
+    }
+
+    let callable_arg_cls: &PyType = types_mod.getattr("CallableArgument")?.downcast()?;
+    if proper.is_instance(callable_arg_cls)? {
+        // t.typ.accept(self).
+        return has_placeholder_walk(py, proper.getattr("typ")?, depth + 1, seen_aliases);
     }
 
     // Any other type: defer to Python. Returning Some(false) would be
