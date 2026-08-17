@@ -8,13 +8,13 @@ Date: 2026-08-13
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.25M |
-| Python bytes (mypy + mypyc, ex test/) | ~6.6M |
-| Rust % (local) | ~32.97% |
-| Rust % (GitHub languages API) | ~25.6% |
+| Rust bytes (local, .rs) | ~3.41M |
+| Python bytes (mypy + mypyc, ex test/) | ~6.63M |
+| Rust % (local) | ~33.96% |
+| Rust % (GitHub languages API) | ~34.78% |
 | Rust LOC (crates/) | ~86K |
 | Rust source files | 81 (type_kernel) + ast_serialize + module_resolver + fs_probe |
-| Gap to 50% | ~3.34M bytes Python->Rust |
+| Gap to 50% | ~1.61M bytes Python->Rust |
 
 Updated 2026-08-16 after the leaf-action shard sequence (#625-#630): the
 gap narrowed from ~4.5M to ~3.34M, mostly via inline `visit_*` sharding
