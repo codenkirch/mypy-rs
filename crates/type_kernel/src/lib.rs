@@ -261,6 +261,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeops::rust_map_type_from_supertype,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_coerce_to_literal, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_is_singleton_identity_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeops::rust_is_singleton_equality_type,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(operators::rust_operator_tables, module)?)?;
     module.add_function(wrap_pyfunction!(
         erase_typevars::rust_erase_typevars,

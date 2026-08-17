@@ -184,7 +184,7 @@ impl Default for TypeResolver {
 /// Read a `bool` attribute from a Python `TypeInfo` object, or `None` on
 /// any read failure (so a partially-constructed TypeInfo does not fail the
 /// whole resolver build).
-fn read_bool_attr(obj: &PyAny, attr: &str) -> Option<bool> {
+pub(crate) fn read_bool_attr(obj: &PyAny, attr: &str) -> Option<bool> {
     obj.getattr(attr)
         .and_then(|v| {
             if let Ok(b) = v.extract::<bool>() {
@@ -234,7 +234,7 @@ fn read_mro_fullnames(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
 }
 
 /// Read a `list[str]` attribute (e.g. `type_vars`, `protocol_members`).
-fn read_str_list_attr(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
+pub(crate) fn read_str_list_attr(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
     let value = obj.getattr(attr).ok()?;
     let list = value.downcast::<PyList>().ok()?;
     let mut out = Vec::with_capacity(list.len());
@@ -857,6 +857,15 @@ pub(crate) struct NativeTypeResolver {
     /// `None` until first `render_dict()` call. Kept on the Python heap
     /// because `render_type` takes `&PyDict`.
     cached_dict: Option<PyObject>,
+    /// Live `fullname -> TypeInfo` map for enum-member reads that the frozen
+    /// snapshot can go stale on (issue-tracking the maptype/expandtype enum
+    /// deferrals). Snapshot `enum_members` is captured when the class's own
+    /// SCC sealed it; members that resolve later (e.g. nonmember members)
+    /// would leave stale entries, so `coerce_to_literal` and the singleton
+    /// helpers read `is_enum` / `enum_members` live from here instead.
+    /// Populated from `BuildManager._native_typeinfo_map` (live TypeInfos)
+    /// at each `_build_native_resolvers` call. `None` until set.
+    live_info_map: Option<PyObject>,
 }
 
 #[pymethods]
@@ -972,6 +981,18 @@ impl NativeTypeResolver {
         self.cached_dict = None;
         let _ = py;
         Ok((added_infos, added_aliases))
+    }
+
+    /// Install the live `fullname -> TypeInfo` map for enum-member reads
+    /// that the frozen snapshot can go stale on. Held as `PyObject` on the
+    /// Python heap; `None` clears it. Populated from the build manager's
+    /// `_native_typeinfo_map` (live TypeInfo objects) at each
+    /// `_build_native_resolvers` call, so member lists read through it are
+    /// always current (coerce_to_literal / singleton helpers).
+    fn set_live_typeinfo_map(&mut self, py: Python<'_>, map: Option<PyObject>) -> PyResult<()> {
+        self.live_info_map = map;
+        let _ = py;
+        Ok(())
     }
 }
 
@@ -1097,6 +1118,7 @@ impl NativeTypeResolver {
             resolver,
             alias_resolver,
             cached_dict: None,
+            live_info_map: None,
         }
     }
 
@@ -1104,6 +1126,20 @@ impl NativeTypeResolver {
     /// up `TypeInfoSnapshot`s without FFI. Used by `subtypes::rust_is_subtype`.
     pub(crate) fn resolver(&self) -> &TypeResolver {
         &self.resolver
+    }
+
+    /// Look up a live `TypeInfo` (as `&PyAny`) by fullname from the
+    /// `live_info_map` installed by `set_live_typeinfo_map`. `None` when no
+    /// map is installed or the fullname is absent. Used by enum-member reads
+    /// that need current (non-snapshot) data.
+    pub(crate) fn live_typeinfo<'py>(
+        &'py self,
+        py: Python<'py>,
+        fullname: &str,
+    ) -> Option<&'py PyAny> {
+        let map = self.live_info_map.as_ref()?;
+        let dict = map.as_ref(py).downcast::<PyDict>().ok()?;
+        dict.get_item(fullname).ok()?
     }
 
     /// Borrow the `TypeAliasResolver` so checkexpr helpers can expand

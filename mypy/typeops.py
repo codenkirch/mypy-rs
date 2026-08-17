@@ -1497,6 +1497,19 @@ def is_singleton_identity_type(typ: ProperType) -> bool:
 
     Note that this is not true of certain LiteralType, such as Literal[100001] or Literal["string"]
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_is_singleton_identity_type(
+                _serialize_type(typ), _native_typeops_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if isinstance(typ, NoneType):
         return True
     if isinstance(typ, Instance):
@@ -1519,6 +1532,19 @@ def is_singleton_equality_type(typ: ProperType) -> bool:
     Returns True if every value of this type compares equal to every other value of this type,
     as judged by the `==` operator.
     """
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_is_singleton_equality_type(
+                _serialize_type(typ), _native_typeops_resolver
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     return isinstance(typ, LiteralType) or is_singleton_identity_type(typ)
 
 
@@ -1630,6 +1656,26 @@ def coerce_to_literal(typ: Type) -> Type:
     """Recursively converts any Instances that have a last_known_value or are
     instances of enum types with a single value into the corresponding LiteralType.
     """
+    # Native seam: union mapping, last-known-value extraction, and the
+    # single-member-enum -> LiteralType conversion all run in Rust. Enum
+    # members are read live (resolver-installed live TypeInfo map), so the
+    # native path never uses a stale snapshot. Defers when the live info map
+    # is unavailable, or on a TypeAliasType (no wire target).
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_coerce_to_literal(
+                _serialize_type(typ), _native_typeops_resolver
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     original_type = typ
     typ = get_proper_type(typ)
     if isinstance(typ, UnionType):
