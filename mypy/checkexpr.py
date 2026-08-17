@@ -754,13 +754,13 @@ def _try_native_check_callable_call(
         resolved = _deserialize_type_from_checkexpr(bytes(raw))
         if not isinstance(resolved, CallableType):  # type: ignore[misc]
             return None
-        # The wire format has no line/column/special_sig/from_type_type;
-        # restore from the pre-edit callee exactly like the calibration path.
+        # The wire format has no line/column/special_sig; restore from
+        # the pre-edit callee exactly like the calibration path.
+        # (from_type_type rides the wire since issue #388.)
         resolved.line = callee.line
         resolved.column = callee.column
         resolved.fallback.line = resolved.line
         resolved.special_sig = callee.special_sig
-        resolved.from_type_type = callee.from_type_type
         return resolved
     except (AssertionError, NotImplementedError, ValueError, TypeError):
         return None
@@ -795,13 +795,8 @@ def _try_native_build_tuple_type(
     if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
         return None
     try:
-        # The binary wire format cannot carry `from_type_type`: a round-trip
-        # would reset it, mis-flagging concrete subclasses as abstract.
-        # Defer whenever a type-object callable item is present.
-        for it in items:
-            it_proper = get_proper_type(it)
-            if isinstance(it_proper, CallableType) and it_proper.is_type_obj():
-                return None
+        # `from_type_type` rides the wire (issue #388), so a type-object
+        # callable item round-trips with its flag intact.
         items_bytes = [_serialize_type_for_checkexpr(it) for it in items]
         rust_bytes = _rust_build_tuple_type(items_bytes, 1 if seen_unpack else 0)
         if rust_bytes is None:
@@ -2767,17 +2762,16 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 if raw is not None:
                     resolved = _deserialize_type_from_checkexpr(bytes(raw))
                     if isinstance(resolved, CallableType):  # type: ignore[misc]
-                        # The wire format has no line/column/special_sig/
-                        # from_type_type; the Rust round-trip defaults them.
-                        # Restore from the pre-edit callee to match
-                        # copy_modified(ret_type=...) exactly (freshen-seam
-                        # style, plus special_sig/from_type_type which affect
+                        # The wire format has no line/column/special_sig;
+                        # the Rust round-trip defaults them. Restore from
+                        # the pre-edit callee to match copy_modified
+                        # (freshen-seam style; special_sig affects
                         # downstream protocol/tuple error paths).
+                        # from_type_type rides the wire (issue #388).
                         resolved.line = callee.line
                         resolved.column = callee.column
                         resolved.fallback.line = resolved.line
                         resolved.special_sig = callee.special_sig
-                        resolved.from_type_type = callee.from_type_type
                         callee = resolved
                         native_calibrated = True
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -4403,15 +4397,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 merged = get_proper_type(_deserialize_type_from_checkexpr(bytes(merged_bytes)))
                 if isinstance(merged, CallableType):
                     # The wire format cannot carry line/column/definition/
-                    # fallback/special_sig/from_type_type; restore from the
-                    # pre-merge first callable like the check_callable_call
-                    # calibration path.
+                    # fallback/special_sig; restore from the pre-merge
+                    # first callable like the check_callable_call
+                    # calibration path. from_type_type rides the wire
+                    # (issue #388).
                     first = callables[0]
                     merged.line = first.line
                     merged.column = first.column
                     merged.definition = first.definition
                     merged.special_sig = first.special_sig
-                    merged.from_type_type = first.from_type_type
                     merged.fallback = first.fallback
                     return merged
 

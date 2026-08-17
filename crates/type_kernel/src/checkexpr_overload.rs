@@ -9,8 +9,9 @@
 //! Rust computes the merged callable directly (arg kinds, per-column unions,
 //! return union, merged variables) and returns it as an encoded `Type`. The
 //! Python caller decodes it and restores the live-only fields the wire format
-//! cannot carry (`definition`, `fallback`, `special_sig`, `from_type_type`,
-//! line/column), mirroring the `rust_check_callable_call` seam.
+//! cannot carry (`definition`, `fallback`, `special_sig`, line/column),
+//! mirroring the `rust_check_callable_call` seam. `from_type_type` rides the
+//! wire since issue #388.
 //!
 //! Also ports `merge_typevars_in_callables_by_name` (checkexpr.py:8138-8197)
 //! via the freshen+expand machinery in `freshen.rs`/`expandtype.rs`:
