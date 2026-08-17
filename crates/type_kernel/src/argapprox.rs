@@ -264,6 +264,7 @@ pub(crate) fn erase_type(t: &Type, strict_optional: bool, res: &TypeResolver) ->
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![any_type(ANY_SPECIAL_FORM), any_type(ANY_SPECIAL_FORM)],
             arg_kinds: vec![ARG_STAR, ARG_STAR2],
             arg_names: vec![None, None],

@@ -109,18 +109,9 @@ fn infer_constraints_inner(template: &Type, actual: &Type, direction: i64) -> Op
     }
     match template {
         Type::TypeVarType { .. } => {
-            // The CallableType wire format carries only 6 flags
-            // (wire.rs:539) and drops `from_type_type`; any CallableType
-            // target reconstructed on the Python side decodes with
-            // `from_type_type = False`. That would spuriously trigger
-            // abstract-class instantiation errors (checkexpr's
-            // `cannot_instantiate_abstract_class` is gated on
-            // `from_type_type`). Defer so Python's `_infer_constraints`
-            // emits the constraint against the original object.
-            // Mirrors the documented setops.rs join limitation.
-            if matches!(actual, Type::CallableType { .. } | Type::Overloaded { .. }) {
-                return None;
-            }
+            // `from_type_type` now rides the CallableType wire flags
+            // (wire.rs), so a CallableType/Overloaded target round-trips
+            // without flipping abstract-class checks (issue #388).
             Some(Constraint {
                 origin_type_var: template.clone(),
                 op: direction,
@@ -213,12 +204,8 @@ pub(crate) fn infer_constraints_full_inner(
     }
     // Template is a TypeVar -> single constraint (direction + target).
     if let Type::TypeVarType { .. } = template {
-        // Same `from_type_type` wire loss as `infer_constraints_inner`:
-        // CallableType/Overloaded targets round-trip flagless, which would
-        // spuriously flip abstract-class checks. Defer to Python's visitor.
-        if matches!(actual, Type::CallableType { .. } | Type::Overloaded { .. }) {
-            return None;
-        }
+        // `from_type_type` rides the wire now, so CallableType/Overloaded
+        // targets no longer round-trip flagless (see infer_constraints_inner).
         return Some(vec![Constraint {
             origin_type_var: template.clone(),
             op: direction,
@@ -1180,6 +1167,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![type_var(1, "T")],
             arg_kinds: vec![0], // ARG_POS
             arg_names: vec![None],
@@ -1218,6 +1206,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![ps.clone(), ps],
             arg_kinds: vec![2, 4], // ARG_STAR, ARG_STAR2
             arg_names: vec![None, None],
@@ -1320,6 +1309,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![unpack],
             arg_kinds: vec![0],
             arg_names: vec![None],
@@ -1345,6 +1335,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: vec![type_var(1, "T")],
             arg_kinds: vec![0],
             arg_names: vec![None],

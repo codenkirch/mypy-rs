@@ -467,6 +467,7 @@ pub(crate) fn callable_with_ellipsis_inner(
         from_concatenate: false,
         imprecise_arg_kinds: false,
         unpack_kwargs: false,
+        from_type_type: false,
         arg_types: vec![any_type.clone(), any_type.clone()],
         arg_kinds: vec![ARG_STAR, ARG_STAR2],
         arg_names: vec![None, None],

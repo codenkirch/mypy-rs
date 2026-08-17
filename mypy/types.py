@@ -2842,6 +2842,7 @@ class CallableType(FunctionLike):
                 self.from_concatenate,
                 self.imprecise_arg_kinds,
                 self.unpack_kwargs,
+                self.from_type_type,
             ],
         )
         write_type_list(data, self.arg_types)
@@ -2867,7 +2868,8 @@ class CallableType(FunctionLike):
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
-        ) = read_flags(data, num_flags=6)
+            from_type_type,
+        ) = read_flags(data, num_flags=7)
         ret = CallableType(
             read_type_list(data),
             [ARG_KINDS[ak] for ak in read_int_list(data)],
@@ -2884,6 +2886,7 @@ class CallableType(FunctionLike):
             from_concatenate=from_concatenate,
             imprecise_arg_kinds=imprecise_arg_kinds,
             unpack_kwargs=unpack_kwargs,
+            from_type_type=from_type_type,
             instance_type=instance_type,
         )
         assert read_tag(data) == END_TAG

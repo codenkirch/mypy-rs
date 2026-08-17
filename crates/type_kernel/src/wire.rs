@@ -539,14 +539,15 @@ pub(crate) enum Type {
     CallableType {
         fallback: Box<Type>,
         instance_type: Option<Box<Type>>,
-        // 6 flags, in write order: is_ellipsis_args, implicit, is_bound,
-        // from_concatenate, imprecise_arg_kinds, unpack_kwargs.
+        // 7 flags, in write order: is_ellipsis_args, implicit, is_bound,
+        // from_concatenate, imprecise_arg_kinds, unpack_kwargs, from_type_type.
         is_ellipsis_args: bool,
         implicit: bool,
         is_bound: bool,
         from_concatenate: bool,
         imprecise_arg_kinds: bool,
         unpack_kwargs: bool,
+        from_type_type: bool,
         arg_types: Vec<Type>,
         arg_kinds: Vec<i64>,
         arg_names: Vec<Option<String>>,
@@ -943,7 +944,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     }
     let fallback = read_instance(buf)?;
     let instance_type = read_type_opt(buf)?;
-    let flags = read_flags(buf, 6)?;
+    let flags = read_flags(buf, 7)?;
     let mut flags_iter = flags.into_iter();
     let mut next_flag = || -> bool { flags_iter.next().unwrap_or(false) };
     let is_ellipsis_args = next_flag();
@@ -952,6 +953,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
     let from_concatenate = next_flag();
     let imprecise_arg_kinds = next_flag();
     let unpack_kwargs = next_flag();
+    let from_type_type = next_flag();
     let arg_types = read_type_list(buf)?;
     let arg_kinds = read_int_list(buf)?;
     let arg_names = read_str_opt_list(buf)?;
@@ -970,6 +972,7 @@ fn read_callable_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
         from_concatenate,
         imprecise_arg_kinds,
         unpack_kwargs,
+        from_type_type,
         arg_types,
         arg_kinds,
         arg_names,
@@ -2059,6 +2062,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
+            from_type_type,
             arg_types,
             arg_kinds,
             arg_names,
@@ -2081,6 +2085,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
                     *from_concatenate,
                     *imprecise_arg_kinds,
                     *unpack_kwargs,
+                    *from_type_type,
                 ],
             )?;
             write_type_list(buf, arg_types)?;
@@ -2738,6 +2743,7 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            from_type_type: false,
             arg_types: Vec::new(),
             arg_kinds: Vec::new(),
             arg_names: Vec::new(),
@@ -2767,6 +2773,10 @@ mod tests {
             from_concatenate: false,
             imprecise_arg_kinds: false,
             unpack_kwargs: false,
+            // `true` here (unlike every other fixture) so the round-trip
+            // assert exercises the 7th flag's bit position, not just
+            // all-false symmetry.
+            from_type_type: true,
             arg_types: vec![
                 Type::Instance {
                     type_ref: "builtins.int".to_string(),
