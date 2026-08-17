@@ -71,7 +71,7 @@ fn supported_self_type_inner(
             py,
             type_ref,
             args,
-            last_known_value.as_ref(),
+            last_known_value.as_deref(),
             extra_attrs.as_ref(),
             resolver,
         ),
@@ -88,13 +88,14 @@ fn supported_self_type_inner(
 ///     (supported) under `Instance.__eq__` (types.py:1787-1795);
 ///   * otherwise the args must each be the class's own `TypeVarType` (full
 ///     `TypeVarId` identity) for the instance to equal the generic form.
+///
 /// Defers (`None`) when the live TypeInfo map cannot supply the class's
 /// declared tvar identities.
 fn instance_supported(
     py: Python<'_>,
     type_ref: &str,
     args: &[Type],
-    last_known_value: Option<&Box<Type>>,
+    last_known_value: Option<&Type>,
     extra_attrs: Option<&crate::wire::ExtraAttrs>,
     resolver: &NativeTypeResolver,
 ) -> Option<bool> {
