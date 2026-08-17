@@ -4040,6 +4040,165 @@ class NativeEqualityValueInfoSuite(Suite):
         self._assert_engages(self.fx.a)
 
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSupportedSelfTypeSuite(Suite):
+    """Parity for the Rust `supported_self_type` port (mypy.typeops).
+
+    `supported_self_type` decides whether a self annotation is a supported
+    kind: an `X` or `Type[X]` where `X` is an instance other than its fully
+    generic form, or a type variable; a callable is allowed only when
+    `allow_callable`. The Rust port mirrors the Python body: `TypeType`
+    recurses with the default flags, a callable answers true only when
+    allowed, and the Instance branch compares its args against the class's
+    declared type parameters (read live so the namespaced `TypeVarId`
+    identity is exact). Toggling the typeops gate off (pure Python) and on
+    (Rust seam) must produce identical booleans, and a direct seam call
+    proves the Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._live_map = {info.fullname: info for info in type_infos}
+        self._resolver.set_live_typeinfo_map(dict(self._live_map))
+        set_wire_typeinfo_map(self._live_map)
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _call(
+        self, typ: ProperType, allow_callable: bool = True, allow_instances: bool = True
+    ) -> bool:
+        from mypy.typeops import supported_self_type
+
+        return supported_self_type(
+            typ, allow_callable=allow_callable, allow_instances=allow_instances
+        )
+
+    def _with_gate(self, active: bool, fn: Callable[[], bool]) -> bool:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(
+        self,
+        typ: ProperType,
+        allow_callable: bool = True,
+        allow_instances: bool = True,
+    ) -> None:
+        off = self._with_gate(False, lambda: self._call(typ, allow_callable, allow_instances))
+        on = self._with_gate(True, lambda: self._call(typ, allow_callable, allow_instances))
+        assert_equal(on, off, f"supported_self_type parity {typ}")
+
+    def _assert_engages(self, typ: ProperType) -> None:
+        from mypy.typeops import _serialize_type
+
+        result = _type_kernel.rust_supported_self_type(
+            _serialize_type(typ), self._resolver, True, True
+        )
+        assert result is not None, f"Rust supported_self_type did not engage for {typ}"
+
+    def test_nongeneric_instance(self) -> None:
+        # A == fill_typevars(A): the default self, unsupported.
+        self._assert_par(self.fx.a)
+        assert self._with_gate(True, lambda: self._call(self.fx.a)) is False
+        self._assert_engages(self.fx.a)
+
+    def test_fully_generic_instance(self) -> None:
+        # G[T] == fill_typevars(G): the default self, unsupported.
+        gt = Instance(self.fx.gi, [self.fx.t])
+        self._assert_par(gt)
+        assert self._with_gate(True, lambda: self._call(gt)) is False
+        self._assert_engages(gt)
+
+    def test_instance_with_arg(self) -> None:
+        # G[A] != G[T]: a supported concrete self.
+        ga = Instance(self.fx.gi, [self.fx.a])
+        self._assert_par(ga)
+        assert self._with_gate(True, lambda: self._call(ga)) is True
+        self._assert_engages(ga)
+
+    def test_typevar(self) -> None:
+        self._assert_par(self.fx.t)
+        assert self._with_gate(True, lambda: self._call(self.fx.t)) is True
+        self._assert_engages(self.fx.t)
+
+    def test_callable(self) -> None:
+        ct = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.a, Instance(self.fx.oi, []), name="<init>"
+        )
+        self._assert_par(ct)
+        assert self._with_gate(True, lambda: self._call(ct)) is True
+        self._assert_engages(ct)
+
+    def test_typetype(self) -> None:
+        # Type[A] recurses to the non-generic A -> unsupported.
+        self._assert_par(TypeType(self.fx.a))
+        assert self._with_gate(True, lambda: self._call(TypeType(self.fx.a))) is False
+        self._assert_engages(TypeType(self.fx.a))
+
+    def test_typetype_generic_arg(self) -> None:
+        # Type[G[A]] -> supported; Type[G[T]] -> unsupported.
+        ga = Instance(self.fx.gi, [self.fx.a])
+        gt = Instance(self.fx.gi, [self.fx.t])
+        self._assert_par(TypeType(ga))
+        self._assert_par(TypeType(gt))
+        assert self._with_gate(True, lambda: self._call(TypeType(ga))) is True
+        assert self._with_gate(True, lambda: self._call(TypeType(gt))) is False
+        self._assert_engages(TypeType(ga))
+        self._assert_engages(TypeType(gt))
+
+    def test_flags(self) -> None:
+        # allow_instances=False rejects a plain Instance...
+        ga = Instance(self.fx.gi, [self.fx.a])
+        self._assert_par(ga, allow_instances=False)
+        assert self._with_gate(True, lambda: self._call(ga, allow_instances=False)) is False
+        # ...but Type[A] still recurses with the default flags, so the
+        # (unsupported) non-generic A decision survives.
+        self._assert_par(TypeType(self.fx.a), allow_instances=False)
+        assert (
+            self._with_gate(
+                True, lambda: self._call(TypeType(self.fx.a), allow_instances=False)
+            )
+            is False
+        )
+
+    def test_callable_flag(self) -> None:
+        # allow_callable=False rejects a bare callable...
+        ct = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.a, Instance(self.fx.oi, []), name="<init>"
+        )
+        self._assert_par(ct, allow_callable=False)
+        assert self._with_gate(True, lambda: self._call(ct, allow_callable=False)) is False
+        # ...but Type[callable] recurses with default flags, so it is allowed.
+        self._assert_par(TypeType(ct), allow_callable=False)
+        assert (
+            self._with_gate(True, lambda: self._call(TypeType(ct), allow_callable=False)) is True
+        )
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeGetPropertyTypeSuite(Suite):
     """Parity for the Rust `get_property_type` port (mypy.checker).
