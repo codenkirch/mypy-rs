@@ -324,6 +324,7 @@ try:
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
         rust_get_generator_yield_type as _rust_get_generator_yield_type,
+        rust_get_property_type as _rust_get_property_type,
         rust_has_bool_item as _rust_has_bool_item,
         rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
@@ -393,6 +394,7 @@ except ImportError:
     _rust_get_generator_receive_type = None  # type: ignore[assignment]
     _rust_get_generator_return_type = None  # type: ignore[assignment]
     _rust_get_generator_yield_type = None  # type: ignore[assignment]
+    _rust_get_property_type = None  # type: ignore[assignment]
     _rust_is_async_generator_return_type = None  # type: ignore[assignment]
     _rust_is_generator_return_type = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
@@ -10438,6 +10440,11 @@ def is_custom_settable_property(defn: SymbolNode | None) -> bool:
 
 
 def get_property_type(t: ProperType) -> ProperType:
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active:
+        try:
+            return cast(ProperType, _rust_get_property_type(t))
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(t, CallableType):
         return get_proper_type(t.ret_type)
     if isinstance(t, Overloaded):

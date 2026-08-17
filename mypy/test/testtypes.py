@@ -3731,6 +3731,68 @@ class NativeTryGettingLiteralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeGetPropertyTypeSuite(Suite):
+    """Parity for the Rust `get_property_type` port (mypy.checker).
+
+    `get_property_type` maps a `CallableType` to the proper type of its
+    `ret_type`, an `Overloaded` to the proper `items[0].ret_type`, and any
+    other `ProperType` to itself. The Rust port reads the live object graph
+    (no wire round-trip) and returns the live `ProperType`. Toggling the
+    checker-stmts gate off (pure Python) and on (Rust seam) must produce
+    identical `str(...)` output, and a direct seam call proves the Rust
+    function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_stmts_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_stmts_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, t: ProperType, expected: str) -> None:
+        from mypy.checker import get_property_type
+
+        off = self._with_gate(False, lambda: get_property_type(t))
+        on = self._with_gate(True, lambda: get_property_type(t))
+        assert_equal(str(on), str(off), f"get_property_type parity {t}")
+        result = self._with_gate(True, lambda: get_property_type(t))
+        assert_equal(str(result), expected)
+        assert isinstance(result, ProperType)
+
+    def _assert_engages(self, t: ProperType) -> None:
+        result = _type_kernel.rust_get_property_type(t)
+        assert result is not None, f"Rust get_property_type did not engage for {t}"
+
+    def test_callable_returns_ret_type(self) -> None:
+        callable_t = self.fx.callable(self.fx.str_type, self.fx.a)
+        self._assert_par(callable_t, "A")
+        self._assert_engages(callable_t)
+
+    def test_overloaded_returns_first_ret_type(self) -> None:
+        overloaded = Overloaded(
+            [self.fx.callable(self.fx.str_type, self.fx.a), self.fx.callable(self.fx.b, self.fx.b)]
+        )
+        self._assert_par(overloaded, "A")
+        self._assert_engages(overloaded)
+
+    def test_plain_instance_unchanged(self) -> None:
+        plain = self.fx.a
+        self._assert_par(plain, "A")
+        self._assert_engages(plain)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeHasAnyTypeSuite(Suite):
     """Parity suite for the Rust `has_any_type` port with alias type-arg
     substitution (Phase B3b, #591).
