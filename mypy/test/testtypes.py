@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+from collections.abc import Callable
 from typing import Any
 from unittest import TestCase, skipIf, skipUnless
 
@@ -3193,6 +3194,140 @@ class NativeTypeTypeContextSuite(Suite):
         alias_b = TypeAlias(TypeAliasType(alias_a, []), "mod.TB", "mod", -1, -1)
         self._rebuild_with_aliases([alias_a, alias_b])
         self.assert_par(TypeAliasType(alias_b, []), True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassCallableSuite(Suite):
+    """Parity for the Rust `class_callable` port (mypy.typeops, #492 follow-up).
+
+    The Python shim in mypy/typeops.py::class_callable makes the ret_type
+    decision in Rust once the two resolver-backed subtype booleans (is_eq,
+    is_st) are known; Python then rebuilds the live CallableType so non-wire
+    fields survive. Toggling the typeops gate off (pure-Python fallback) and
+    on (Rust seam) must produce an equal ret_type and equal variables. The
+    direct `rust_class_callable` call proves the seam actually engages for a
+    default __init__ rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        infos = [self.fx.oi, self.fx.ai, self.fx.bi, self.fx.di, self.fx.gi]
+        set_wire_typeinfo_map({i.fullname: i for i in infos})
+        _set_native_typeops_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        set_wire_typeinfo_map({})
+
+    def _init_callable(self, info: TypeInfo, ret: Type | None = None) -> CallableType:
+        # A minimal `<init>` signature: one positional self, the given ret.
+        return CallableType(
+            [Instance(info, [])],
+            [ARG_POS],
+            [None],
+            ret if ret is not None else UninhabitedType(),
+            Instance(self.fx.oi, []),
+            name="<init>",
+        )
+
+    def _construct(
+        self,
+        init_type: CallableType,
+        info: TypeInfo,
+        is_new: bool,
+        orig_self_type: Type | None,
+    ) -> CallableType:
+        from mypy.typeops import class_callable
+
+        # type_type (4th arg) is the copy_modified fallback; Instance(object)
+        # is a valid stand-in and identical under both gate settings.
+        return class_callable(
+            init_type, info, None, Instance(self.fx.oi, []), None, is_new, orig_self_type
+        )
+
+    def _with_gate(self, active: bool, fn: Callable[[], CallableType]) -> CallableType:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def test_baseline_gate_off(self) -> None:
+        info = self.fx.ai
+        init_type = self._init_callable(info)
+        result = self._with_gate(False, lambda: self._construct(init_type, info, False, None))
+        assert result.ret_type == Instance(info, [])
+        assert list(result.variables) == []
+
+    def test_parity_init_default(self) -> None:
+        info = self.fx.ai
+        init_type = self._init_callable(info)
+        off = self._with_gate(False, lambda: self._construct(init_type, info, False, None))
+        on = self._with_gate(True, lambda: self._construct(init_type, info, False, None))
+        assert on.ret_type == off.ret_type
+        assert list(on.variables) == list(off.variables)
+
+    def test_parity_new_returns_object(self) -> None:
+        # __new__ (is_new=True) whose explicit ret (object) differs from the
+        # default (A): the equivalence/subtype decision must match.
+        info = self.fx.ai
+        init_type = self._init_callable(info, ret=Instance(self.fx.oi, []))
+        off = self._with_gate(False, lambda: self._construct(init_type, info, True, None))
+        on = self._with_gate(True, lambda: self._construct(init_type, info, True, None))
+        assert on.ret_type == off.ret_type
+        assert list(on.variables) == list(off.variables)
+
+    def test_parity_generic_variables(self) -> None:
+        # A generic class (G, one typevar): variables = defn.type_vars +
+        # init.variables must combine identically through the wire round-trip.
+        info = self.fx.gi
+        init_type = self._init_callable(info)
+        off = self._with_gate(False, lambda: self._construct(init_type, info, False, None))
+        on = self._with_gate(True, lambda: self._construct(init_type, info, False, None))
+        assert on.ret_type == off.ret_type
+        assert list(on.variables) == list(off.variables)
+
+    def test_parity_declared_self(self) -> None:
+        # is_new=False with a declared self type: the subtype branch must
+        # pick the same ret_type.
+        info = self.fx.ai
+        init_type = self._init_callable(info)
+        off = self._with_gate(False, lambda: self._construct(init_type, info, False, Instance(info, [])))
+        on = self._with_gate(True, lambda: self._construct(init_type, info, False, Instance(info, [])))
+        assert on.ret_type == off.ret_type
+        assert list(on.variables) == list(off.variables)
+
+    def test_seam_engages_direct(self) -> None:
+        # Call the Rust seam directly (no Python shim) and confirm it returns
+        # (ret_blob, var_blobs) rather than None for a default __init__.
+        import type_kernel as _tk
+
+        from mypy.typeops import _serialize_type
+        from mypy.typevars import fill_typevars
+
+        info = self.fx.ai
+        init_type = self._init_callable(info)
+        result = _tk.rust_class_callable(
+            _serialize_type(init_type),
+            None,
+            _serialize_type(fill_typevars(info)),
+            False,
+            False,
+            False,
+            info,
+        )
+        assert result is not None, "Rust class_callable seam did not engage"
+        ret_blob, var_blobs = result
+        assert isinstance(bytes(ret_blob), bytes)
+        assert isinstance(var_blobs, list)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

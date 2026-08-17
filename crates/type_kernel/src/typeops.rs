@@ -28,6 +28,8 @@ use crate::subtypes::SubtypeContext;
 const ARG_STAR: i64 = 2;
 /// `ArgKind.ARG_STAR2` = 4 (checkmember.rs:54).
 const ARG_STAR2: i64 = 4;
+/// `TypeOfAny.unannotated` = 1 (types.py:276).
+const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
 
 // ---------------------------------------------------------------------------
 // Wire codec helpers
@@ -1192,6 +1194,146 @@ pub(crate) fn rust_bind_self(method_bytes: &[u8]) -> Option<Vec<u8>> {
     let t = decode_type(method_bytes)?;
     let result = bind_self_inner(&t)?;
     encode_type(&result)
+}
+
+/// `mypy.typeops.class_callable` (typeops.py:428-486) — pick the return
+/// type for a type-object callable and combine the type variables.
+///
+/// The two resolver-backed subtype checks (`is_equivalent` / `is_subtype`)
+/// run on the Python side (already native via the subtype resolver) and are
+/// passed in as `is_eq` / `is_st`. Everything else is pure on wire types and
+/// the live `info`, so Rust makes the exact same decision:
+///
+///   `ret_type = explicit` when `is_new and explicit is not None and
+///   (explicit is a non-unannotated Any or not is_eq)`, or when `explicit`
+///   is Instance/Tuple/Uninhabited/Literal, `default_ret` is a non-protocol
+///   Instance, and `is_st`. Otherwise `ret_type = default_ret`.
+///
+/// `variables = info.defn.type_vars + init.variables` (defn vars first,
+/// mirroring the Python `extend` order). Returns `(ret_type, variables)` as
+/// wire blobs, or `None` to defer to Python.
+#[allow(clippy::too_many_arguments)]
+fn class_callable_inner(
+    py: Python<'_>,
+    init_wire: &[u8],
+    explicit_wire: Option<&[u8]>,
+    default_ret_wire: &[u8],
+    is_new: bool,
+    is_eq: bool,
+    is_st: bool,
+    info: &PyAny,
+) -> Option<(Type, Vec<Type>)> {
+    let init = decode_type(init_wire)?;
+    let default_ret = decode_type(default_ret_wire)?;
+
+    // Combined variables = info.defn.type_vars + init.variables. Read the
+    // live type vars exactly like fill_typevars_inner does (serialize each
+    // through mypy's WriteBuffer, decode to the wire Type).
+    let init_variables = match &init {
+        Type::CallableType { variables, .. } => variables.clone(),
+        _ => return None,
+    };
+    let defn = info.getattr("defn").ok()?;
+    let tvars = defn
+        .getattr("type_vars")
+        .ok()?
+        .downcast::<pyo3::types::PyList>()
+        .ok()?;
+    let mut variables = Vec::with_capacity(tvars.len() + init_variables.len());
+    for item in tvars.iter() {
+        let bytes = serialize_type_to_bytes(py, item)?;
+        variables.push(decode_type(&bytes)?);
+    }
+    variables.extend(init_variables);
+
+    let explicit = explicit_wire.and_then(decode_type);
+
+    // default_ret = fill_typevars(info) is Instance(info) (or a TupleType
+    // for a named tuple), so `default_ret.type.is_protocol == info.is_protocol`.
+    let is_protocol = info.getattr("is_protocol").ok()?.extract::<bool>().ok()?;
+
+    let ret_type = class_callable_ret(
+        explicit.as_ref(),
+        &default_ret,
+        is_protocol,
+        is_new,
+        is_eq,
+        is_st,
+    )?;
+    Some((ret_type, variables))
+}
+
+/// Pure `ret_type` decision for `class_callable` (typeops.py:450-477). No
+/// live-Python reads, so it is directly unit-testable. Precedence matters:
+/// `and` binds tighter than `or` in the first branch.
+fn class_callable_ret(
+    explicit: Option<&Type>,
+    default_ret: &Type,
+    is_protocol: bool,
+    is_new: bool,
+    is_eq: bool,
+    is_st: bool,
+) -> Option<Type> {
+    let default_is_instance = matches!(default_ret, Type::Instance { .. });
+    let explicit_is_some = explicit.is_some();
+    let explicit_non_unannotated_any = matches!(
+        explicit,
+        Some(Type::AnyType { type_of_any, .. }) if *type_of_any != TYPE_OF_ANY_UNANNOTATED
+    );
+    let explicit_is_subtypable = matches!(
+        explicit,
+        Some(
+            Type::Instance { .. }
+                | Type::TupleType { .. }
+                | Type::UninhabitedType { .. }
+                | Type::LiteralType { .. },
+        )
+    );
+    // Equivalent to Python's if/elif/else: use the explicit return type when
+    // the is_new branch or the subtype branch fires, else the default.
+    let use_explicit = (is_new && explicit_is_some && (explicit_non_unannotated_any || !is_eq))
+        || (explicit_is_subtypable && default_is_instance && !is_protocol && is_st);
+    if use_explicit {
+        explicit.cloned()
+    } else {
+        Some(default_ret.clone())
+    }
+}
+
+/// `#[pyfunction]` entry for `class_callable` (typeops.py:428-486). Takes the
+/// wire `init_type`, wire explicit type (or `None`), wire
+/// `default_ret_type`, the two Python-computed subtype booleans, and the live
+/// `info`. Returns `(ret_type_bytes, [variable_bytes, ...])` or `None`
+/// (defer to Python).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+#[pyo3(signature = (init_wire, explicit_wire, default_ret_wire, is_new, is_eq, is_st, info))]
+pub(crate) fn rust_class_callable(
+    py: Python<'_>,
+    init_wire: &[u8],
+    explicit_wire: Option<&[u8]>,
+    default_ret_wire: &[u8],
+    is_new: bool,
+    is_eq: bool,
+    is_st: bool,
+    info: &PyAny,
+) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    let (ret_type, variables) = class_callable_inner(
+        py,
+        init_wire,
+        explicit_wire,
+        default_ret_wire,
+        is_new,
+        is_eq,
+        is_st,
+        info,
+    )?;
+    let ret_bytes = encode_type(&ret_type)?;
+    let mut var_bytes = Vec::with_capacity(variables.len());
+    for v in &variables {
+        var_bytes.push(encode_type(v)?);
+    }
+    Some((ret_bytes, var_bytes))
 }
 
 /// Return `None` when any shape needs alias expansion or is not handled,
@@ -2441,5 +2583,150 @@ mod tests {
         let resolver = crate::typeinfo::TypeResolver::new();
         let result = super::tuple_fallback(&inst, &resolver);
         assert!(result.is_none());
+    }
+
+    // ---- class_callable_ret (pure ret_type decision) ----
+
+    fn any_type_of(kind: i64) -> Type {
+        Type::AnyType {
+            type_of_any: kind,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+    const DEFAULT_OBJ: &str = "builtins.object";
+
+    #[test]
+    fn class_callable_new_non_unannotated_any_uses_explicit() {
+        let explicit = any_type_of(2); // TypeOfAny.explicit != unannotated
+        let ret = class_callable_ret(
+            Some(&explicit),
+            &plain_instance(DEFAULT_OBJ),
+            false,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ret, explicit);
+    }
+
+    #[test]
+    fn class_callable_new_not_equivalent_uses_explicit() {
+        // is_new, explicit Instance, is_eq=false -> first branch via `!is_eq`.
+        let explicit = plain_instance("A");
+        let ret = class_callable_ret(
+            Some(&explicit),
+            &plain_instance(DEFAULT_OBJ),
+            false,
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ret, explicit);
+    }
+
+    #[test]
+    fn class_callable_new_unannotated_any_equivalent_falls_to_default() {
+        // Precedence: (unannotated-any OR !is_eq) = (false OR false) -> first
+        // branch skipped; AnyType is not in the elif class list -> default.
+        let explicit = any_type_of(1); // unannotated
+        let default = plain_instance(DEFAULT_OBJ);
+        let ret = class_callable_ret(Some(&explicit), &default, false, true, true, false).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_new_explicit_none_uses_default() {
+        let default = plain_instance(DEFAULT_OBJ);
+        let ret = class_callable_ret(None, &default, false, true, false, false).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_init_subtype_uses_explicit() {
+        // Not is_new: explicit is a subtype of the non-protocol Instance
+        // default -> use explicit.
+        let explicit = plain_instance("A");
+        let ret = class_callable_ret(
+            Some(&explicit),
+            &plain_instance(DEFAULT_OBJ),
+            false,
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ret, explicit);
+    }
+
+    #[test]
+    fn class_callable_init_not_subtype_uses_default() {
+        let explicit = plain_instance("A");
+        let default = plain_instance(DEFAULT_OBJ);
+        let ret =
+            class_callable_ret(Some(&explicit), &default, false, false, false, false).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_init_protocol_default_uses_default() {
+        // default_ret is a protocol -> elif guarded out, use default.
+        let explicit = plain_instance("A");
+        let default = plain_instance(DEFAULT_OBJ);
+        let ret = class_callable_ret(Some(&explicit), &default, true, false, false, true).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_init_tuple_default_uses_default() {
+        // default_ret is a TupleType (named tuple) -> not an Instance, use
+        // default even when is_st is true.
+        let explicit = plain_instance("A");
+        let default = Type::TupleType {
+            partial_fallback: Box::new(plain_instance("builtins.tuple")),
+            items: vec![],
+            implicit: false,
+        };
+        let ret = class_callable_ret(Some(&explicit), &default, false, false, false, true).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_init_union_explicit_uses_default() {
+        // UnionType explicit is not in (Instance, Tuple, Uninhabited,
+        // Literal) -> elif skipped, use default.
+        let explicit = Type::UnionType {
+            items: vec![plain_instance("A"), plain_instance("B")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let default = plain_instance(DEFAULT_OBJ);
+        let ret = class_callable_ret(Some(&explicit), &default, false, false, false, true).unwrap();
+        assert_eq!(ret, default);
+    }
+
+    #[test]
+    fn class_callable_uninhabited_literal_explicit_uses_explicit() {
+        for explicit in [
+            Type::UninhabitedType { ambiguous: false },
+            Type::LiteralType {
+                fallback: Box::new(plain_instance("builtins.int")),
+                value: LiteralValue::Int(1),
+            },
+        ] {
+            let ret = class_callable_ret(
+                Some(&explicit),
+                &plain_instance(DEFAULT_OBJ),
+                false,
+                false,
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(ret, explicit);
+        }
     }
 }
