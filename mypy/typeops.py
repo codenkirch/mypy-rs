@@ -94,6 +94,41 @@ _native_typeops_active: bool = False
 _native_typeops_resolver: Any = None
 
 
+def _needs_python(typ: Type) -> bool:
+    """True if `typ` nests a node a kernel round-trip cannot carry.
+
+    Mirrors `mypy.expandtype._needs_python`: named callables lose their
+    FuncDef/Decorator definition node (breaking error formatting that names
+    the function), and recursive TypeAliasType would loop while decoding.
+    Both must defer to the pure-Python path.
+    """
+    stack: list[Type] = [typ]
+    visited: set[int] = set()
+    while stack:
+        t = stack.pop()
+        p = get_proper_type(t)
+        if id(p) in visited:
+            continue
+        visited.add(id(p))
+        if isinstance(p, CallableType):
+            if p.definition is not None:
+                return True
+            stack.append(p.ret_type)
+            stack.extend(p.arg_types)
+            stack.append(p.fallback)
+        elif isinstance(p, TypeAliasType):
+            return True
+        elif isinstance(p, Instance):
+            stack.extend(p.args)
+        elif isinstance(p, UnionType):
+            stack.extend(p.items)
+        elif isinstance(p, TupleType):
+            stack.extend(p.items)
+        elif isinstance(p, TypeType):
+            stack.append(p.item)
+    return False
+
+
 def _set_native_typeops_active(active: bool) -> None:
     global _native_typeops_active
     _native_typeops_active = active
@@ -561,6 +596,44 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
 
     Now S in the context of D would be mapped to E[T] in the context of C.
     """
+    # Native composite seam (#492 family): the whole body below is one Rust
+    # call — fill_typevars(sub_info), the TupleType fallback, the maptype
+    # up-promotion, and the final expand_type_by_instance. Defer to Python
+    # when `typ` cannot cross the wire (definition-bearing callables,
+    # recursive aliases) or when the resolver is unavailable.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+        and not _needs_python(typ)
+    ):
+        try:
+            result = _type_kernel.rust_map_type_from_supertype(
+                _native_typeops_resolver,
+                sub_info,
+                super_info,
+                _serialize_type(typ),
+                state.strict_optional,
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    # The wire format does not carry line/column; decoded
+                    # types default to line -1. Preserve the input type's
+                    # location so derived contexts report errors at the
+                    # call site instead of a phantom line 0/-1 (mirrors the
+                    # expand_type_by_instance seam).
+                    if isinstance(decoded, ProperType):
+                        decoded.line = typ.line
+                        decoded.column = typ.column
+                        if isinstance(decoded, CallableType):
+                            decoded.fallback.line = decoded.line
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError):
+            # AssertionError: TypeInfo not yet fixed during semanal.
+            # NotImplementedError: unserializable variant.
+            # ValueError: decode/read failure.
+            pass
     # Create the type of self in subtype, of form t[a1, ...].
     inst_type = fill_typevars(sub_info)
     if isinstance(inst_type, TupleType):
