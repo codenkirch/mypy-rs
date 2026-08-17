@@ -59,6 +59,15 @@ pub(crate) fn rust_erase_typevars(type_bytes: &[u8], ids_bytes: &[u8]) -> Option
 pub(crate) fn rust_replace_meta_vars(type_bytes: &[u8], target_bytes: &[u8]) -> Option<Vec<u8>> {
     let typ = decode_type(type_bytes)?;
     let target = decode_type(target_bytes)?;
+    // Before ErasedType gained a wire tag, serializing an ErasedType target
+    // raised NotImplementedError, so replace_meta_vars always deferred to
+    // the pure-Python TypeVarEraser. Nothing in the type kernel's
+    // TypeVarEraser port exercised an ErasedType replacement, so keep that
+    // behavior: defer when the target is ErasedType so inference semantics
+    // do not change (parity-safe strangler).
+    if matches!(target, Type::ErasedType) {
+        return None;
+    }
     let result = replace_meta_vars_inner(&typ, &target)?;
     encode_type(&result)
 }
@@ -137,6 +146,7 @@ pub(crate) fn erase_typevars_inner(
         // Leaf types with no TypeVars: return as-is.
         Type::AnyType { .. }
         | Type::NoneType
+        | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
 
@@ -721,6 +731,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         // Leaf types: return as-is.
         Type::AnyType { .. }
         | Type::NoneType
+        | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
         // Deferred.

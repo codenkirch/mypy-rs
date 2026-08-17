@@ -994,7 +994,10 @@ fn contains_type_obj_callable(t: &Type, resolver: &crate::typeinfo::TypeResolver
             .arg_types
             .iter()
             .any(|a| contains_type_obj_callable(a, resolver)),
-        Type::NoneType | Type::UninhabitedType { .. } | Type::DeletedType { .. } => false,
+        Type::NoneType
+        | Type::ErasedType
+        | Type::UninhabitedType { .. }
+        | Type::DeletedType { .. } => false,
     }
 }
 

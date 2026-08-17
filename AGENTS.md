@@ -302,6 +302,37 @@ including:
   type_refs to live TypeInfo. Gated by `_native_checkexpr_active`
   (wired from `mypy/build.py`) and covered by
   `NativeTryGettingLiteralSuite` in `mypy/test/testtypes.py`.
+- `has_erased_component` (mypy.checkexpr) — mirrors
+  `mypy.checkexpr.has_erased_component` (checkexpr.py:8060): a
+  `BoolTypeQuery(ANY_STRATEGY)` whose only true leaf is `ErasedType`.
+  Requires the `ErasedType` wire tag (`ERASED_TYPE = 122` in
+  `mypy/types.py` + the Rust `Type::ErasedType` variant); `ErasedType`
+  was previously un-serializable, which also kept `replace_meta_vars`
+  absent an ErasedType replacement. That kernel path now defers on an
+  `ErasedType` target (`rust_replace_meta_vars` guard) so inference
+  semantics stay identical. **Invariant:** the Python `read_type` in
+  `mypy/types.py` deliberately does NOT decode tag 122 (there is no
+  `ERASED_TYPE` branch in `read_type`), so any Rust wire seam that
+  emits `ErasedType`-carrying bytes fails to round-trip through
+  `read_type` and its `AssertionError`/`NotImplementedError` guard
+  defers to the pure-Python fallback. `has_erased_component` itself is
+  exempt: its Python seam passes bytes into the kernel and reads back a
+  bare `bool`, never decoding `ErasedType` into Python. Removing this
+  invariant causes a deep `is_protocol_implementation` ↔
+  `is_callable_compatible` ↔ `is_subtype` recursion (mypy #21445
+  fragility) on `ziplike`/`f0-overload`. Covered by
+  `NativeHasErasedComponentSuite` in `mypy/test/testtypes.py`.
+- Wire-cache placeholder guard (mypy.checker) — a wire seam's
+  `read_type` can populate `instance_cache` with a `NOT_READY`
+  placeholder (`type_ref` set, `.type` = `FakeInfo`) whose fixup is
+  re-raced away by a concurrent clear+re-create (`_fix_wire_type`,
+  `_native_decode_well_formed`). `TypeChecker.named_type` now routes
+  all five cache primitives through `_validated_named_type`, which
+  rebuilds from the live `TypeInfo` when the cached entry is absent or
+  still carries a `FakeInfo`. Without this, a poisoned `str_type`
+  leaked into `infer_literal_expr_type` → `copy_modified` → Python
+  fallback → `AssertionError: De-serialization failure: TypeInfo not
+  fixed` inside `_is_subtype` (`testSpecialSignatureForSubclassOfDict2`).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

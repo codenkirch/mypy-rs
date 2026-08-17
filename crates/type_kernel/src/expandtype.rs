@@ -235,6 +235,7 @@ pub(crate) fn expand_type_inner(
         // (expandtype.py:189-211)
         Type::AnyType { .. }
         | Type::NoneType
+        | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. }
         | Type::UnboundType { .. } => Some(typ.clone()),

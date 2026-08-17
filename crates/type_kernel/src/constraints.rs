@@ -247,6 +247,7 @@ pub(crate) fn infer_constraints_full_inner(
         Type::UnionType { .. } => Some(vec![]),
         // Unsupported template shapes: defer to Python.
         Type::TypeVarTupleType { .. } | Type::UnpackType { .. } | Type::Parameters(..) => None,
+        Type::ErasedType => Some(vec![]),
     }
 }
 

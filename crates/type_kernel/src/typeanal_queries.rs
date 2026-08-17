@@ -2176,6 +2176,8 @@ fn analyze_type_inner(
 
         Type::NoneType => Some(Type::NoneType),
 
+        Type::ErasedType => Some(Type::ErasedType),
+
         Type::UninhabitedType { ambiguous } => Some(Type::UninhabitedType {
             ambiguous: *ambiguous,
         }),

@@ -1574,6 +1574,23 @@ class ErasedType(ProperType):
     def accept(self, visitor: TypeVisitor[T]) -> T:
         return visitor.visit_erased_type(self)
 
+    def serialize(self) -> JsonDict:
+        return {".class": "ErasedType"}
+
+    @classmethod
+    def deserialize(cls, data: JsonDict) -> ErasedType:
+        assert data[".class"] == "ErasedType"
+        return ErasedType()
+
+    def write(self, data: WriteBuffer) -> None:
+        write_tag(data, ERASED_TYPE)
+        write_tag(data, END_TAG)
+
+    @classmethod
+    def read(cls, data: ReadBuffer) -> ErasedType:
+        assert read_tag(data) == END_TAG
+        return ErasedType()
+
 
 class DeletedType(ProperType):
     """Type of deleted variables.
@@ -5145,6 +5162,7 @@ LIST_TYPE: Final[Tag] = 118  # Only valid in serialized ASTs
 ELLIPSIS_TYPE: Final[Tag] = 119  # Only valid in serialized ASTs
 RAW_EXPRESSION_TYPE: Final[Tag] = 120  # Only valid in serialized ASTs
 CALL_TYPE: Final[Tag] = 121  # Only valid in serialized ASTs
+ERASED_TYPE: Final[Tag] = 122  # First free tag after the AST-only range.
 
 
 def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
@@ -5185,6 +5203,11 @@ def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
         return Parameters.read(data)
     if tag == UNINHABITED_TYPE:
         return UninhabitedType.read(data)
+    # NOTE: ERASED_TYPE (tag 122) is intentionally NOT decodable here. ErasedType
+    # exists only transiently during semantic analysis and is never stored in
+    # caches or exchanged across wire seams; letting tag-122 bytes fail to decode
+    # makes any Rust wire seam that emits an ErasedType defer to the pure-Python
+    # fallback, preserving main's behavior.
     if tag == UNBOUND_TYPE:
         return UnboundType.read(data)
     if tag == DELETED_TYPE:

@@ -8404,26 +8404,47 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         For example, named_type('builtins.object') produces the 'object' type.
         """
         if name == "builtins.str":
-            if instance_cache.str_type is None:
-                instance_cache.str_type = self._named_type(name)
+            instance_cache.str_type = self._validated_named_type(
+                instance_cache.str_type, name
+            )
             return instance_cache.str_type
         if name == "builtins.function":
-            if instance_cache.function_type is None:
-                instance_cache.function_type = self._named_type(name)
+            instance_cache.function_type = self._validated_named_type(
+                instance_cache.function_type, name
+            )
             return instance_cache.function_type
         if name == "builtins.int":
-            if instance_cache.int_type is None:
-                instance_cache.int_type = self._named_type(name)
+            instance_cache.int_type = self._validated_named_type(
+                instance_cache.int_type, name
+            )
             return instance_cache.int_type
         if name == "builtins.bool":
-            if instance_cache.bool_type is None:
-                instance_cache.bool_type = self._named_type(name)
+            instance_cache.bool_type = self._validated_named_type(
+                instance_cache.bool_type, name
+            )
             return instance_cache.bool_type
         if name == "builtins.object":
-            if instance_cache.object_type is None:
-                instance_cache.object_type = self._named_type(name)
+            instance_cache.object_type = self._validated_named_type(
+                instance_cache.object_type, name
+            )
             return instance_cache.object_type
         return self._named_type(name)
+
+    def _validated_named_type(self, cached: Instance | None, name: str) -> Instance:
+        """Return a live named instance, discarding a poisoned cache entry.
+
+        A wire seam's read_type can populate instance_cache with a NOT_READY
+        placeholder (type_ref set, .type = FakeInfo) whose fixup is re-raced
+        away by a concurrent clear+re-create. Handing that placeholder to a
+        caller poisons the type graph (AssertionError on .type.fullname), so
+        rebuild from the live TypeInfo whenever the cached entry is absent or
+        still carries a FakeInfo.
+        """
+        from mypy.nodes import FakeInfo
+
+        if cached is None or type(cached.type) is FakeInfo:
+            return self._named_type(name)
+        return cached
 
     def _named_type(self, name: str) -> Instance:
         # Assume that the name refers to a type.
