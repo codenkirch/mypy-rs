@@ -425,6 +425,20 @@ fn get_property_type(py: Python<'_>, get_proper_type: &PyAny, t: &PyAny) -> PyRe
     Ok(t.into())
 }
 
+/// `mypy.checker.get_property_type` — the getter type of a callable or
+/// overloaded node, falling back to the type itself.
+///
+/// This is the exposed `#[pyfunction]` entry point for the private
+/// `get_property_type` helper above. It imports `mypy.types.get_proper_type`
+/// and hands back the live `ProperType` object (no wire round-trip), exactly
+/// like `rust_is_static` at the top of this file.
+#[pyfunction]
+pub(crate) fn rust_get_property_type(py: Python<'_>, t: &PyAny) -> PyResult<PyObject> {
+    let types_mod = py.import("mypy.types")?;
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+    get_property_type(py, get_proper_type, t)
+}
+
 // ---------------------------------------------------------------------------
 // can_have_shared_disjoint_base (from mypy/typeops.py)
 // ---------------------------------------------------------------------------
