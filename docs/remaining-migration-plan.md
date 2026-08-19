@@ -8,20 +8,20 @@ Date: 2026-08-13
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.43M |
-| Python bytes (mypy + mypyc, ex test/) | ~6.63M |
-| Rust % (local) | ~34.09% |
-| Rust % (GitHub languages API) | ~34.78% |
+| Rust bytes (local, .rs) | ~3.52M |
+| Python bytes (mypy + mypyc, ex test/) | ~6.16M |
+| Rust % (local) | ~36.4% |
+| Rust % (GitHub languages API) | ~35.06% |
 | Rust LOC (crates/) | ~86K |
-| Rust source files | 85 (type_kernel) + ast_serialize + module_resolver + fs_probe |
-| Gap to 50% | ~1.61M bytes Python->Rust |
+| Rust source files | 88 (type_kernel) + ast_serialize + module_resolver + fs_probe |
+| Gap to 50% | ~1.34M bytes Python->Rust |
 
-Updated 2026-08-17 after the 6-port swarm (#675-#680: get_property_type,
-classmethod_static, detach_callable, contract-literals, equality_value_info,
-supported_self_type). Local share moved 33.96% -> 34.09%; GitHub metric
-~34.75% -> ~34.78%. Each port nets only ~5-8KB, so leaf ports alone cannot
-reach 50%: the wider levers in Phase B/C (deferral reduction, depth ports)
-remain the realistic path.
+Updated 2026-08-19 after the 3-port swarm (#688: overlap_unsafe,
+#691: conditional_types, #692: equality_ambiguity). Local share ~36.4%;
+GitHub metric ~35.06%. These were the last un-ported leaf candidates in
+`docs/swarm-candidates-2026-08-19.md`: leaf ports (each nets only
+~5-33K bytes) surface is now exhausted. Reaching the target requires the
+wider levers in Phase B/C (deferral reduction, depth ports).
 
 ## Honest assessment: path to 50%
 
