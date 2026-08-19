@@ -12019,3 +12019,235 @@ class NativeBuiltinItemTypeSuite(Suite):
         result = self._with_gate(True, lambda: builtin_item_type(t))
         assert_equal(str(result), "builtins.str")
         self._assert_engages(t)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUnsafeOverlappingOverloadSuite(Suite):
+    """Parity for the Rust `is_unsafe_overlapping_overload_signatures` port.
+
+    The Rust entry (mypy.checker) detaches both callables, expands all
+    type-variable combinations, and judges subset / overlap / callable
+    compatibility on wire types in one call. Toggling the checker gate off
+    (pure Python) and on (Rust seam) must produce identical booleans, and a
+    direct seam call proves the Rust function engages rather than silently
+    deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _callable(self, args: list[Type], ret: Type) -> CallableType:
+        return CallableType(
+            args,
+            [ARG_POS] * len(args),
+            [None] * len(args),
+            ret,
+            self.fx.function,
+        )
+
+    def _assert_par(
+        self,
+        sig: CallableType,
+        oth: CallableType,
+        class_type_vars: list[TypeVarType],
+        partial_only: bool = True,
+    ) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        off = self._with_gate(
+            False,
+            lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, class_type_vars, partial_only
+            ),
+        )
+        on = self._with_gate(
+            True,
+            lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, class_type_vars, partial_only
+            ),
+        )
+        assert_equal(
+            on, off,
+            f"is_unsafe_overlapping_overload_signatures parity {sig} / {oth}",
+        )
+
+    def _assert_engages(
+        self,
+        sig: CallableType,
+        oth: CallableType,
+        class_type_vars: list[TypeVarType],
+        partial_only: bool = True,
+    ) -> None:
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_list
+        from mypy.state import state
+
+        result = _type_kernel.rust_is_unsafe_overlapping_overload_signatures(
+            _serialize_type_for_checker(sig),
+            _serialize_type_for_checker(oth),
+            _serialize_type_list(class_type_vars),
+            partial_only,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, (
+            "Rust is_unsafe_overlapping_overload_signatures did not engage"
+        )
+
+    def test_disjoint_params_false(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # A and D are disjoint siblings; neither call direction overlaps, and
+        # the returns are not subsets. No expanded pair is reported -> False.
+        sig = self._callable([self.fx.a], self.fx.a)
+        oth = self._callable([self.fx.d], self.fx.b)
+        self._assert_par(sig, oth, [])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [])), False)
+        self._assert_engages(sig, oth, [])
+
+    def test_subset_return_continue(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # B <: A, so sig's return is a subset of oth's return: the pair is
+        # skipped before the compatibility checks -> False.
+        sig = self._callable([self.fx.a], self.fx.b)
+        oth = self._callable([self.fx.a], self.fx.a)
+        self._assert_par(sig, oth, [])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [])), False)
+        self._assert_engages(sig, oth, [])
+
+    def test_overlapping_params_partial_guard(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # Params are equal (both A) and returns are non-subset, so A/B hold,
+        # but the partial_only guard (subset A<:A) passes: not reported -> False.
+        sig = self._callable([self.fx.a], self.fx.c)
+        oth = self._callable([self.fx.a], self.fx.b)
+        self._assert_par(sig, oth, [])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [])), False)
+        self._assert_engages(sig, oth, [])
+
+    def test_unsafe_overlap_true(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # sig is more specific (A), oth is a catch-all (object). Returns C/D
+        # are not subsets and oth's args are not a subset of sig's (object<:A
+        # fails the covariant subset check), so the guard trips -> True.
+        sig = self._callable([self.fx.a], self.fx.c)
+        oth = self._callable([self.fx.o], self.fx.d)
+        self._assert_par(sig, oth, [])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [])), True)
+        self._assert_engages(sig, oth, [])
+
+    def test_typevar_values_expand(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # T has declared values [A, B]; expanding sig yields (x:A)->C and
+        # (x:B)->C. The A variant overlaps the object catch-all and trips the
+        # guard -> True.
+        t = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [self.fx.a, self.fx.b],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+            INVARIANT,
+        )
+        sig = self._callable([t], self.fx.c)
+        oth = self._callable([self.fx.o], self.fx.d)
+        self._assert_par(sig, oth, [])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [])), True)
+        self._assert_engages(sig, oth, [])
+
+    def test_class_type_vars_detach(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # K is a class variable bound to A: detach pushes it onto
+        # sig.variables, expansion binds it to A -> (x:A)->C. Against the
+        # object catch-all the partial guard fails -> True.
+        k = TypeVarType(
+            "K",
+            "K",
+            TypeVarId(5),
+            [],
+            self.fx.a,
+            AnyType(TypeOfAny.from_omitted_generics),
+            INVARIANT,
+        )
+        sig = self._callable([k], self.fx.c)
+        oth = self._callable([self.fx.o], self.fx.d)
+        self._assert_par(sig, oth, [k])
+        assert_equal(
+            self._with_gate(True, lambda: is_unsafe_overlapping_overload_signatures(
+                sig, oth, [k])), True)
+        self._assert_engages(sig, oth, [k])
+
+    def test_partial_only_false(self) -> None:
+        from mypy.checker import is_unsafe_overlapping_overload_signatures
+
+        # partial_only=False returns True as soon as any expanded pair
+        # overlaps with non-subset returns, skipping the partial guard. oth
+        # (B) is more specific than sig (A) so the guard would suppress it.
+        sig = self._callable([self.fx.a], self.fx.a)
+        oth = self._callable([self.fx.b], self.fx.b)
+        self._assert_par(sig, oth, [], partial_only=False)
+        assert_equal(
+            self._with_gate(
+                True,
+                lambda: is_unsafe_overlapping_overload_signatures(sig, oth, [], False),
+            ),
+            True,
+        )
+        self._assert_engages(sig, oth, [], partial_only=False)
+
+    def test_non_callable_defers(self) -> None:
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_list
+        from mypy.state import state
+
+        # A non-CallableType signature yields None from the Rust entry, so the
+        # Python seam defers and runs the pure body unchanged.
+        result = _type_kernel.rust_is_unsafe_overlapping_overload_signatures(
+            _serialize_type_for_checker(self.fx.a),
+            _serialize_type_for_checker(self._callable([self.fx.o], self.fx.d)),
+            _serialize_type_list([]),
+            True,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is None, "Rust should defer on a non-callable signature"
