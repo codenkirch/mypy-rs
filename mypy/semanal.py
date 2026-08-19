@@ -426,6 +426,7 @@ try:
         rust_classify_imports as _rust_classify_imports,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
+        rust_classify_type_expression as _rust_classify_type_expression,
         rust_erase_func_annotations as _rust_erase_func_annotations,
         rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
         rust_find_duplicate as _rust_find_duplicate,
@@ -441,6 +442,7 @@ try:
         rust_is_same_var_from_getattr as _rust_is_same_var_from_getattr,
         rust_is_trivial_body as _rust_is_trivial_body,
         rust_is_type_ref as _rust_is_type_ref,
+        rust_is_valid_del_target as _rust_is_valid_del_target,
         rust_is_valid_replacement as _rust_is_valid_replacement,
         rust_lookup as _rust_lookup,
         rust_lookup_qualified as _rust_lookup_qualified,
@@ -451,67 +453,66 @@ try:
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
-        rust_visit_dict_expr as _rust_visit_dict_expr,
-        rust_visit_list_set_expr as _rust_visit_list_set_expr,
-        rust_visit_template_str_expr as _rust_visit_template_str_expr,
+        rust_visit_as_pattern as _rust_visit_as_pattern,
+        rust_visit_assert_stmt as _rust_visit_assert_stmt,
+        rust_visit_assert_type_expr as _rust_visit_assert_type_expr,
+        rust_visit_assignment_expr as _rust_visit_assignment_expr,
+        rust_visit_assignment_stmt as _rust_visit_assignment_stmt,
+        rust_visit_await_expr as _rust_visit_await_expr,
+        rust_visit_block as _rust_visit_block,
+        rust_visit_block_maybe as _rust_visit_block_maybe,
+        rust_visit_break_stmt as _rust_visit_break_stmt,
+        rust_visit_call_expr as _rust_visit_call_expr,
+        rust_visit_cast_expr as _rust_visit_cast_expr,
+        rust_visit_class_def as _rust_visit_class_def,
+        rust_visit_class_pattern as _rust_visit_class_pattern,
         rust_visit_comparison_expr as _rust_visit_comparison_expr,
         rust_visit_conditional_expr as _rust_visit_conditional_expr,
-        rust_visit_slice_expr as _rust_visit_slice_expr,
-        rust_visit_super_expr as _rust_visit_super_expr,
-        rust_visit_unary_expr as _rust_visit_unary_expr,
-        rust_visit_assert_stmt as _rust_visit_assert_stmt,
-        rust_visit_operator_assignment_stmt as _rust_visit_operator_assignment_stmt,
-        rust_visit_raise_stmt as _rust_visit_raise_stmt,
-        rust_is_valid_del_target as _rust_is_valid_del_target,
-        rust_visit_block as _rust_visit_block,
-        rust_visit_break_stmt as _rust_visit_break_stmt,
         rust_visit_continue_stmt as _rust_visit_continue_stmt,
         rust_visit_del_stmt as _rust_visit_del_stmt,
+        rust_visit_dict_expr as _rust_visit_dict_expr,
+        rust_visit_dictionary_comprehension as _rust_visit_dictionary_comprehension,
         rust_visit_expression_stmt as _rust_visit_expression_stmt,
+        rust_visit_for_stmt as _rust_visit_for_stmt,
+        rust_visit_func_def as _rust_visit_func_def,
+        rust_visit_generator_expr as _rust_visit_generator_expr,
         rust_visit_global_decl as _rust_visit_global_decl,
         rust_visit_if_stmt as _rust_visit_if_stmt,
-        rust_visit_match_stmt as _rust_visit_match_stmt,
-        rust_visit_block_maybe as _rust_visit_block_maybe,
-        rust_visit_return_stmt as _rust_visit_return_stmt,
-        rust_visit_while_stmt as _rust_visit_while_stmt,
-        rust_visit_name_expr as _rust_visit_name_expr,
-        rust_visit_star_expr as _rust_visit_star_expr,
-        rust_visit_as_pattern as _rust_visit_as_pattern,
-        rust_visit_or_pattern as _rust_visit_or_pattern,
-        rust_visit_value_pattern as _rust_visit_value_pattern,
-        rust_visit_sequence_pattern as _rust_visit_sequence_pattern,
-        rust_visit_starred_pattern as _rust_visit_starred_pattern,
-        rust_visit_mapping_pattern as _rust_visit_mapping_pattern,
-        rust_visit_class_pattern as _rust_visit_class_pattern,
-        rust_visit_yield_expr as _rust_visit_yield_expr,
-        rust_visit_yield_from_expr as _rust_visit_yield_from_expr,
-        rust_visit_await_expr as _rust_visit_await_expr,
-        rust_visit_try_stmt as _rust_visit_try_stmt,
-        rust_visit_op_expr as _rust_visit_op_expr,
-        rust_visit_index_expr as _rust_visit_index_expr,
-        rust_visit_cast_expr as _rust_visit_cast_expr,
-        rust_visit_type_form_expr as _rust_visit_type_form_expr,
-        rust_visit_assert_type_expr as _rust_visit_assert_type_expr,
-        rust_visit_reveal_expr as _rust_visit_reveal_expr,
-        rust_visit_type_application as _rust_visit_type_application,
-        rust_visit_list_comprehension as _rust_visit_list_comprehension,
-        rust_visit_set_comprehension as _rust_visit_set_comprehension,
-        rust_visit_dictionary_comprehension as _rust_visit_dictionary_comprehension,
-        rust_visit_generator_expr as _rust_visit_generator_expr,
-        rust_visit_lambda_expr as _rust_visit_lambda_expr,
-        rust_visit_overloaded_func_def as _rust_visit_overloaded_func_def,
-        rust_visit_class_def as _rust_visit_class_def,
-        rust_visit_func_def as _rust_visit_func_def,
-        rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
-        rust_visit_for_stmt as _rust_visit_for_stmt,
-        rust_visit_with_stmt as _rust_visit_with_stmt,
-        rust_visit_assignment_expr as _rust_visit_assignment_expr,
+        rust_visit_import as _rust_visit_import,
         rust_visit_import_all as _rust_visit_import_all,
         rust_visit_import_from as _rust_visit_import_from,
-        rust_visit_assignment_stmt as _rust_visit_assignment_stmt,
-        rust_visit_import as _rust_visit_import,
-        rust_visit_call_expr as _rust_visit_call_expr,
+        rust_visit_index_expr as _rust_visit_index_expr,
+        rust_visit_lambda_expr as _rust_visit_lambda_expr,
+        rust_visit_list_comprehension as _rust_visit_list_comprehension,
+        rust_visit_list_set_expr as _rust_visit_list_set_expr,
+        rust_visit_mapping_pattern as _rust_visit_mapping_pattern,
+        rust_visit_match_stmt as _rust_visit_match_stmt,
+        rust_visit_name_expr as _rust_visit_name_expr,
+        rust_visit_nonlocal_decl as _rust_visit_nonlocal_decl,
+        rust_visit_op_expr as _rust_visit_op_expr,
+        rust_visit_operator_assignment_stmt as _rust_visit_operator_assignment_stmt,
+        rust_visit_or_pattern as _rust_visit_or_pattern,
+        rust_visit_overloaded_func_def as _rust_visit_overloaded_func_def,
+        rust_visit_raise_stmt as _rust_visit_raise_stmt,
+        rust_visit_return_stmt as _rust_visit_return_stmt,
+        rust_visit_reveal_expr as _rust_visit_reveal_expr,
+        rust_visit_sequence_pattern as _rust_visit_sequence_pattern,
+        rust_visit_set_comprehension as _rust_visit_set_comprehension,
+        rust_visit_slice_expr as _rust_visit_slice_expr,
+        rust_visit_star_expr as _rust_visit_star_expr,
+        rust_visit_starred_pattern as _rust_visit_starred_pattern,
+        rust_visit_super_expr as _rust_visit_super_expr,
+        rust_visit_template_str_expr as _rust_visit_template_str_expr,
+        rust_visit_try_stmt as _rust_visit_try_stmt,
         rust_visit_type_alias_stmt as _rust_visit_type_alias_stmt,
+        rust_visit_type_application as _rust_visit_type_application,
+        rust_visit_type_form_expr as _rust_visit_type_form_expr,
+        rust_visit_unary_expr as _rust_visit_unary_expr,
+        rust_visit_value_pattern as _rust_visit_value_pattern,
+        rust_visit_while_stmt as _rust_visit_while_stmt,
+        rust_visit_with_stmt as _rust_visit_with_stmt,
+        rust_visit_yield_expr as _rust_visit_yield_expr,
+        rust_visit_yield_from_expr as _rust_visit_yield_from_expr,
     )
 
     _SEMANAL_VISITOR_HAS_KERNEL = True
@@ -530,6 +531,7 @@ except ImportError:
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
+    _rust_classify_type_expression = None  # type: ignore[assignment]
     _rust_lookup = None  # type: ignore[assignment]
     _rust_lookup_qualified = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
@@ -8935,7 +8937,25 @@ class SemanticAnalyzer(
             # Defer parsing to the later TypeChecker pass,
             # and only lazily in contexts where a TypeForm is expected
             return
-        elif isinstance(maybe_type_expr, StrExpr):
+
+        # Native seam: the bail-out decision tree below runs in Rust on
+        # scalar facts. Some(0) sets as_type=None and returns; Some(1) means
+        # "maybe" and falls into the pure front, and None defers to Python.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_type_expression is not None
+        ):
+            try:
+                classification = self._classify_type_expression_native(maybe_type_expr)
+            except (AssertionError, NotImplementedError, ValueError):
+                classification = None
+            if classification == 0:
+                # Definitely not a type expression; mirror the bail-outs below.
+                maybe_type_expr.as_type = None
+                return
+
+        if isinstance(maybe_type_expr, StrExpr):
             str_value = maybe_type_expr.value  # cache
             # Filter out string literals which look like an identifier but
             # cannot be a type expression, for a few common reasons
@@ -9047,6 +9067,93 @@ class SemanticAnalyzer(
             self.type_expression_full_parse_failure_count += 1
 
         maybe_type_expr.as_type = t
+
+    def _classify_type_expression_native(self, maybe_type_expr: Expression) -> int | None:
+        """Rust bail-out classifier: 0 = not a type, 1 = maybe, None = defer.
+
+        Gathers scalar structural facts from the live AST node (node-kind
+        tag, string value, string flags, the `_MULTIPLE_WORDS_NONTYPE_RE`
+        result, and the `IndexExpr` leftmost-component resolution) and
+        delegates the bail-out decision to `rust_classify_type_expression`.
+        Identifier strings defer (`None`) because classifying them needs
+        `self.lookup`.
+        """
+        if isinstance(maybe_type_expr, StrExpr):
+            str_value = maybe_type_expr.value
+            is_identifier = str_value.isidentifier()
+            return _rust_classify_type_expression(
+                (0,),  # node kind: StrExpr
+                str_value,
+                is_identifier,
+                '"' in str_value or "'" in str_value,
+                "[" in str_value,
+                False if is_identifier else str_value.isspace(),
+                False if is_identifier else bool(_MULTIPLE_WORDS_NONTYPE_RE.match(str_value)),
+                0,
+                False,
+                False,
+                False,
+                False,
+            )
+        if isinstance(maybe_type_expr, IndexExpr):
+            base = maybe_type_expr.base
+            if isinstance(base, NameExpr):
+                index_base_kind = 0
+                leftmost_is_name = True
+                node = base.node
+                node_is_var = isinstance(node, Var)
+                var_special = node_is_var and self.var_is_typing_special_form(node)
+            elif isinstance(base, MemberExpr):
+                index_base_kind = 1
+                next_leftmost = base
+                while True:
+                    leftmost = next_leftmost.expr
+                    if not isinstance(leftmost, MemberExpr):
+                        break
+                    next_leftmost = leftmost
+                leftmost_is_name = isinstance(leftmost, NameExpr)
+                if leftmost_is_name:
+                    node = leftmost.node
+                    node_is_var = isinstance(node, Var)
+                    var_special = node_is_var and self.var_is_typing_special_form(node)
+                else:
+                    node_is_var = False
+                    var_special = False
+            else:
+                index_base_kind = 2
+                leftmost_is_name = False
+                node_is_var = False
+                var_special = False
+            return _rust_classify_type_expression(
+                (1,),  # node kind: IndexExpr
+                None,
+                False,
+                False,
+                False,
+                False,
+                False,
+                index_base_kind,
+                leftmost_is_name,
+                node_is_var,
+                var_special,
+                False,
+            )
+        if isinstance(maybe_type_expr, OpExpr):
+            return _rust_classify_type_expression(
+                (2,),  # node kind: OpExpr
+                None,
+                False,
+                False,
+                False,
+                False,
+                False,
+                0,
+                False,
+                False,
+                False,
+                maybe_type_expr.op == "|",
+            )
+        return None
 
     @staticmethod
     def var_is_typing_special_form(var: Var) -> bool:

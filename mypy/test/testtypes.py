@@ -64,8 +64,8 @@ from mypy.nodes import (
     UnaryExpr,
     Var,
 )
-from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.options import Options
+from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
@@ -3975,7 +3975,7 @@ class NativeInstantiateTypeAliasSuite(Suite):
 
     def test_non_generic_alias(self) -> None:
         # S = str; used bare -> TypeAliasType(S, []), normalization deferred.
-        from mypy.nodes import TypeAlias, Context
+        from mypy.nodes import TypeAlias
 
         node = TypeAlias(Instance(self.fx.str_type_info, []), "mod.S", "mod", -1, -1)
         self._assert_par(node, [], False)
@@ -4031,8 +4031,6 @@ class NativeInstantiateTypeAliasSuite(Suite):
 
     def test_flexible_alias_unwrap(self) -> None:
         # FlexibleAlias[T, typ] expands to typ (last argument).
-        from mypy.bogus_type import FlexibleAlias
-        from mypy.nodes import TypeAlias
 
         flex_info = self.fx.make_type_info("mypy_extensions.FlexibleAlias")
         target = Instance(flex_info, [self.fx.t, self.fx.a])
@@ -11217,6 +11215,250 @@ class NativeStubgenRenderSuite(Suite):
 
     def test_template_str(self) -> None:
         self._assert_render(self._tmpl("test"))
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeExpressionClassifySuite(Suite):
+    """Parity for the Rust `try_parse_as_type_expression` classifier port.
+
+    The bail-out front (which StrExpr/IndexExpr/OpExpr values cannot
+    possibly be type expressions, semanal.py:8945-9021) runs in Rust:
+    Python gathers scalar structural facts from the live AST node and
+    Rust branches on them. `Some(0)` sets `as_type = None` and returns;
+    `Some(1)` and `None` fall into the pure front, which then cannot
+    bail. Toggling the semanal-visitor gate off (pure Python) and on
+    (Rust) must produce identical `as_type` and full-parse counters on
+    both engaged and deferred paths, and direct seam calls prove the
+    Rust classifier engages. Identifier-string StrExprs defer because
+    classifying them needs `self.lookup`.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self) -> object:
+        from contextlib import nullcontext
+
+        from mypy.errors import Errors
+        from mypy.semanal import SemanticAnalyzer
+
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        sa.type_expression_parse_count = 0
+        sa.type_expression_full_parse_success_count = 0
+        sa.type_expression_full_parse_failure_count = 0
+        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign]
+        sa.tvar_scope = None  # type: ignore[assignment]
+        sa.errors = Errors(Options())
+        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign]
+        sa.expr_to_analyzed_type = lambda expr: self.fx.o  # type: ignore[method-assign]
+        return sa
+
+    def _run(
+        self, node_factory: Callable[[], Expression]
+    ) -> tuple[str, int, int]:
+        sa = self._analyser()
+        expr = node_factory()
+        sa.try_parse_as_type_expression(expr)
+        # NameExpr/MemberExpr never receive `as_type` (the method returns
+        # before assigning it); represent that as a fixed sentinel so both
+        # gates compare equal.
+        as_type = str(expr.as_type) if hasattr(expr, "as_type") else "NO_AS_TYPE_ATTR"
+        return (
+            as_type,
+            sa.type_expression_full_parse_success_count,
+            sa.type_expression_full_parse_failure_count,
+        )
+
+    def _assert_par(self, node_factory: Callable[[], Expression]) -> None:
+        off = self._with_gate(False, lambda: self._run(node_factory))
+        on = self._with_gate(True, lambda: self._run(node_factory))
+        assert_equal(on, off, "try_parse_as_type_expression parity")
+
+    def _assert_engages(
+        self, args: tuple[object, ...], expected: int | None
+    ) -> None:
+        result = self._tk.rust_classify_type_expression(*args)
+        assert_equal(result, expected, "rust_classify_type_expression")
+
+    # --- NameExpr / MemberExpr: never reach Rust (defer to TypeChecker) ---
+
+    def test_name_expr_defers(self) -> None:
+        self._assert_par(lambda: NameExpr("x"))
+
+    def test_member_expr_defers(self) -> None:
+        self._assert_par(lambda: MemberExpr(NameExpr("m"), "attr"))
+
+    # --- StrExpr bail-outs ---
+
+    def test_sentence_nontype(self) -> None:
+        # A sentence-like string matches _MULTIPLE_WORDS_NONTYPE_RE.
+        self._assert_par(lambda: StrExpr("sentence like this"))
+
+    def test_identifier_string_unresolved(self) -> None:
+        # 'a' is an identifier that refers to nothing; Rust defers, the
+        # Python lookup returns None, both gates bail with as_type=None.
+        self._assert_par(lambda: StrExpr("a"))
+
+    def test_two_words_nontype(self) -> None:
+        self._assert_par(lambda: StrExpr("foo bar"))
+
+    def test_quote_no_bracket_nontype(self) -> None:
+        # Quoted strings are valid only inside Literal[...]/Annotated[...].
+        self._assert_par(lambda: StrExpr("'a'"))
+
+    def test_quote_with_bracket_maybe(self) -> None:
+        self._assert_par(lambda: StrExpr("Literal['a']"))
+
+    def test_whitespace_nontype(self) -> None:
+        self._assert_par(lambda: StrExpr("   "))
+
+    def test_short_nontype(self) -> None:
+        self._assert_par(lambda: StrExpr("?"))
+
+    # --- IndexExpr bail-outs ---
+
+    def test_index_var_base_nontype(self) -> None:
+        def make() -> IndexExpr:
+            n = NameExpr("x")
+            v = Var("x")
+            v._fullname = "mod.x"
+            n.node = v
+            return IndexExpr(n, StrExpr("int"))
+
+        self._assert_par(make)
+
+    def test_index_typeinfo_base_maybe(self) -> None:
+        # A TypeInfo base is not a Var: the IndexExpr proceeds to the tail.
+        def make() -> IndexExpr:
+            n = NameExpr("C")
+            n.node = self.fx.oi
+            return IndexExpr(n, StrExpr("int"))
+
+        self._assert_par(make)
+
+    # --- OpExpr bail-outs ---
+
+    def test_op_union_maybe(self) -> None:
+        # '|' proceeds to the tail; the expr_to_analyzed_type stub yields Any.
+        self._assert_par(lambda: OpExpr("|", NameExpr("X"), NameExpr("Y")))
+
+    def test_op_minus_nontype(self) -> None:
+        self._assert_par(lambda: OpExpr("-", NameExpr("X"), NameExpr("Y")))
+
+    # --- Direct Rust seam calls ---
+
+    def test_engages_sentence(self) -> None:
+        self._assert_engages(
+            ((0,), "sentence like this", False, False, False, False, True,
+             0, False, False, False, False),
+            0,
+        )
+
+    def test_engages_identifier_defers(self) -> None:
+        self._assert_engages(
+            ((0,), "a", True, False, False, False, False,
+             0, False, False, False, False),
+            None,
+        )
+
+    def test_engages_two_words(self) -> None:
+        self._assert_engages(
+            ((0,), "foo bar", False, False, False, False, True,
+             0, False, False, False, False),
+            0,
+        )
+
+    def test_engages_quote_bracket(self) -> None:
+        self._assert_engages(
+            ((0,), "Literal[1]", False, True, True, False, False,
+             0, False, False, False, False),
+            1,
+        )
+
+    def test_engages_whitespace(self) -> None:
+        self._assert_engages(
+            ((0,), " ", False, False, False, True, False,
+             0, False, False, False, False),
+            0,
+        )
+
+    def test_engages_short(self) -> None:
+        self._assert_engages(
+            ((0,), "?", False, False, False, False, False,
+             0, False, False, False, False),
+            0,
+        )
+
+    def test_engages_op_pipe(self) -> None:
+        self._assert_engages(
+            ((2,), None, False, False, False, False, False,
+             0, False, False, False, True),
+            1,
+        )
+
+    def test_engages_op_minus(self) -> None:
+        self._assert_engages(
+            ((2,), None, False, False, False, False, False,
+             0, False, False, False, False),
+            0,
+        )
+
+    def test_engages_index_var(self) -> None:
+        self._assert_engages(
+            ((1,), None, False, False, False, False, False,
+             0, True, True, False, False),
+            0,
+        )
+
+    def test_engages_index_member_leftmost_not_name(self) -> None:
+        self._assert_engages(
+            ((1,), None, False, False, False, False, False,
+             1, False, False, False, False),
+            0,
+        )
+
+    def test_engages_index_other(self) -> None:
+        self._assert_engages(
+            ((1,), None, False, False, False, False, False,
+             2, False, False, False, False),
+            0,
+        )
+
+    def test_engages_index_non_var_maybe(self) -> None:
+        self._assert_engages(
+            ((1,), None, False, False, False, False, False,
+             0, True, False, False, False),
+            1,
+        )
+
+    def test_engages_bad_tags_defers(self) -> None:
+        self._assert_engages(
+            ((0, 0), None, False, False, False, False, False,
+             0, False, False, False, False),
+            None,
+        )
+        self._assert_engages(
+            ((), None, False, False, False, False, False,
+             0, False, False, False, False),
+            None,
+        )
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeDecoratorClassifySuite(Suite):
