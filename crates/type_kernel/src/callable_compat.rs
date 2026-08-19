@@ -697,6 +697,8 @@ pub(crate) fn rust_callables_compatible(
         is_proper_subtype,
         ignore_pos_arg_names,
         strict_concatenate,
+        false, // ignore_return
+        false, // check_args_covariantly
         res,
     )
 }
@@ -708,17 +710,27 @@ fn left_variables(t: &Type) -> Option<&[Type]> {
     }
 }
 
-/// `mypy.subtypes.is_callable_compatible` (subtypes.py:1732-1885), the subset
-/// the wire format + resolver can answer, with `ignore_return=False`,
-/// `check_args_covariantly=False`, `allow_partial_overlap=False`, and
-/// `is_compat_return = is_compat`. Returns `None` to defer.
-fn is_callable_compatible(
+/// `mypy.subtypes.is_callable_compatible` (subtypes.py:1883-2036), the subset
+/// the wire format + resolver can answer. The caller supplies the `is_compat`
+/// closure (e.g. `is_subtype` / `is_proper_subtype` / `is_more_precise` /
+/// `is_same_type`), `ignore_return` (skip the return-type check), and
+/// `check_args_covariantly` (flip `is_compat` for the argument path, keeping
+/// the return path unflipped). `allow_partial_overlap` is always `False` here
+/// and `is_compat_return = is_compat`. Returns `None` to defer.
+///
+/// The caller is responsible for the `left.variables` unify gate (Python
+/// unifies a generic `left` via `unify_generic_callable` before this check);
+/// this function assumes `left` is non-generic.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn is_callable_compatible(
     left: &Type,
     right: &Type,
     is_compat: &dyn Fn(&Type, &Type) -> Option<bool>,
     is_proper_subtype: bool,
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
+    ignore_return: bool,
+    check_args_covariantly: bool,
     resolver: &TypeResolver,
 ) -> Option<bool> {
     let lf = callable_fields(left)?;
@@ -739,12 +751,19 @@ fn is_callable_compatible(
     }
 
     // Check return types (subtypes.py:1866-1867), covariant:
-    // is_compat(left.ret_type, right.ret_type).
-    if !is_compat(lf.ret_type(), rf.ret_type())? {
+    // is_compat_return(left.ret_type, right.ret_type); skipped when
+    // ignore_return, and always uses the unflipped is_compat.
+    if !ignore_return && !is_compat(lf.ret_type(), rf.ret_type())? {
         return Some(false);
     }
 
-    // check_args_covariantly=False, so is_compat stays contravariant.
+    // check_args_covariantly flips is_compat for the argument path
+    // (subtypes.py:1949-1951), leaving the return path untouched.
+    let eff_is_compat: &dyn Fn(&Type, &Type) -> Option<bool> = if check_args_covariantly {
+        &|l, r| is_compat(r, l)
+    } else {
+        is_compat
+    };
 
     // strict_concatenate_check (subtypes.py:1872-1875).
     let strict_concatenate_check =
@@ -761,7 +780,7 @@ fn is_callable_compatible(
         rf.arg_names,
         rf.imprecise_arg_kinds,
         rf.is_ellipsis_args,
-        is_compat,
+        eff_is_compat,
         is_proper_subtype,
         ignore_pos_arg_names,
         false, // allow_partial_overlap
