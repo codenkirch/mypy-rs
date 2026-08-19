@@ -118,6 +118,7 @@ mod suggestions;
 mod supported_self_type;
 mod traverser;
 mod treetransform;
+mod typealias_instantiate;
 mod typeanal_queries;
 mod typeinfo;
 mod typeops;
@@ -1371,6 +1372,16 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_detect_diverging_alias,
+        module
+    )?)?;
+    // instantiate_type_alias: normalize a TypeAlias node + type args.
+    // Deferral-based seam: any path that would emit an error or call
+    // set_any_tvars returns None and the Python shim falls back. The
+    // no_args / max_tv_count==0 success paths (eager Instance) and the
+    // plain TypeAliasType success path are returned as a branch tag +
+    // argument wire blobs for the shim to rebuild live objects.
+    module.add_function(wrap_pyfunction!(
+        typealias_instantiate::rust_instantiate_type_alias,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types

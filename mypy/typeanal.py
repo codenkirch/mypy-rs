@@ -2248,6 +2248,47 @@ def instantiate_type_alias(
     args = flatten_nested_tuples(args)
     if old_args and not args:
         empty_tuple_index = True
+    # Native seam: Rust decides the non-error success paths (bare
+    # generic eager expansion, non-generic alias, correct generic
+    # instantiation) and returns a branch tag; Python rebuilds the live
+    # result object exactly as the pure-Python body below would. Every
+    # path that would emit an error or rewrite to Any (set_any_tvars)
+    # returns None and the pure-Python body takes over, keeping message
+    # side effects single-sourced.
+    if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        try:
+            result = _rust_instantiate_type_alias(
+                node, [_serialize_typeanal_type(a) for a in args], no_args, empty_tuple_index
+            )
+            if result == 0:
+                # non-generic alias, no args, no_args: eager expansion.
+                assert isinstance(node.target, Instance)  # type: ignore[misc]
+                return (
+                    Instance(node.target.type, [], line=ctx.line, column=ctx.column),
+                    False,
+                )
+            if result == 1:
+                # non-generic alias with args targeting a bare generic.
+                tp = Instance(node.target.type, args)
+                tp.line = ctx.line
+                tp.column = ctx.column
+                tp.end_line = ctx.end_line
+                tp.end_column = ctx.end_column
+                return tp, False
+            if result == 2:
+                # Plain success: TypeAliasType(node, args, line, column),
+                # including the FlexibleAlias[T, typ] -> typ unwrap.
+                typ = TypeAliasType(node, args, ctx.line, ctx.column)
+                if (
+                    isinstance(typ.alias.target, Instance)  # type: ignore[misc]
+                    and typ.alias.target.type.fullname == "mypy_extensions.FlexibleAlias"
+                ):
+                    exp = get_proper_type(typ)
+                    assert isinstance(exp, Instance)
+                    return exp.args[-1], False
+                return typ, False
+        except (AssertionError, NotImplementedError):
+            pass
     if any(unknown_unpack(a) for a in args):
         # This type is not ready to be validated, because of unknown total count.
         # Note that we keep the kind of Any for consistency.
@@ -2596,6 +2637,7 @@ try:
         rust_find_self_type as _rust_find_self_type,
         rust_check_vec_type_args as _rust_check_vec_type_args,
         rust_is_typevar_default_recursive as _rust_is_typevar_default_recursive,
+        rust_instantiate_type_alias as _rust_instantiate_type_alias,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -2614,6 +2656,7 @@ except ImportError:
     _rust_find_self_type = None  # type: ignore[assignment]
     _rust_check_vec_type_args = None  # type: ignore[assignment]
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
+    _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
