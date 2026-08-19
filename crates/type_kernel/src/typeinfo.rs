@@ -51,6 +51,9 @@ pub(crate) struct TypeInfoSnapshot {
     pub meta_fallback_to_any: bool,
     /// `TypeInfo.is_named_tuple` (nodes.py:3800). subtypes.py:559.
     pub is_named_tuple: bool,
+    /// `TypeInfo.is_newtype` (nodes.py:3806). checker.py conditional_types
+    /// unwraps NewTypes to `type.bases[0]` before narrowing.
+    pub is_newtype: bool,
     /// `TypeInfo.has_type_var_tuple_type` (nodes.py:3921). Display `[()]`.
     pub has_type_var_tuple_type: bool,
     /// `TypeInfo.is_abstract` (nodes.py:3704). checkexpr hot path.
@@ -1009,6 +1012,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
     let fallback_to_any = read_bool_attr(item, "fallback_to_any").unwrap_or(false);
     let meta_fallback_to_any = read_bool_attr(item, "meta_fallback_to_any").unwrap_or(false);
     let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
+    let is_newtype = read_bool_attr(item, "is_newtype").unwrap_or(false);
     let has_type_var_tuple_type = read_bool_attr(item, "has_type_var_tuple_type").unwrap_or(false);
     let is_abstract = read_bool_attr(item, "is_abstract").unwrap_or(false);
     let type_vars = read_str_list_attr(item, "type_vars").unwrap_or_default();
@@ -1053,6 +1057,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
         fallback_to_any,
         meta_fallback_to_any,
         is_named_tuple,
+        is_newtype,
         has_type_var_tuple_type,
         is_abstract,
         type_vars,

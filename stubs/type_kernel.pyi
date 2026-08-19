@@ -176,6 +176,7 @@ __all__ = [
     "rust_with_exit_suppresses",
     "rust_try_handler_union",
     "rust_classify_except_handler_tests",
+    "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
     "rust_is_literal_none",
@@ -661,6 +662,15 @@ def rust_is_typevar_default_recursive(
 def rust_conditional_expr_join(
     if_bytes: bytes, else_bytes: bytes, resolver: NativeTypeResolver
 ) -> bytes | None: ...
+def rust_conditional_types(
+    current: bytes,
+    ranges: bytes | None,
+    default: bytes | None,
+    consider_runtime_isinstance: bool,
+    from_equality: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[bytes | None, bytes | None] | None: ...
 def rust_container_type(
     resolver: NativeTypeResolver,
     tag: str,
