@@ -11374,3 +11374,160 @@ class NativeGroupComparisonOperandsSuite(Suite):
             ["=="],
         )
         assert_equal(result, [("==", [0, 1, 2, 3]), ("<", [1, 2])])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandCallableVariantsSuite(Suite):
+    """Parity for the Rust `expand_callable_variants` port (mypy.checker).
+
+    `expand_callable_variants` expands a generic callable over every
+    combination of its type variables' values (or upper bound). The Rust
+    port reads the callable off the wire, substitutes each combination via
+    `expand_type_inner`, and returns the variant list as a wire type-list;
+    the Python shim rebuilds each variant on the live callable so non-wire
+    fields survive. Toggling the checker gate off (pure Python) and on
+    (Rust seam) must produce identical results (`str` and `len`), and a
+    direct seam call proves the Rust function engages rather than silently
+    deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tvar(self, raw_id: int, values: list[Type]) -> TypeVarType:
+        return TypeVarType(
+            "V",
+            "__main__.V",
+            TypeVarId(raw_id),
+            values,
+            self.fx.o,
+            self.fx.o,
+        )
+
+    def _callable(
+        self,
+        variables: list[TypeVarType],
+        arg_types: list[Type] | None = None,
+        ret_type: Type | None = None,
+    ) -> CallableType:
+        args = arg_types if arg_types is not None else [self.fx.a, self.fx.b]
+        kinds = [ARG_POS] * len(args)
+        return CallableType(
+            args,
+            kinds,
+            [None] * len(args),
+            ret_type if ret_type is not None else self.fx.anyt,
+            self.fx.function,
+            variables=variables,
+        )
+
+    def _assert_par(self, c: CallableType) -> None:
+        from mypy.checker import expand_callable_variants
+
+        off = self._with_gate(False, lambda: expand_callable_variants(c))
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), len(off), f"expand_callable_variants len parity {c}")
+        assert_equal(
+            [str(v) for v in on],
+            [str(v) for v in off],
+            f"expand_callable_variants str parity {c}",
+        )
+
+    def _assert_engages(self, c: CallableType) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_expand_callable_variants(
+            _serialize_type_for_checker(c), state.strict_optional
+        )
+        assert result is not None, "Rust expand_callable_variants did not engage"
+
+    def test_non_generic_fast_path(self) -> None:
+        from mypy.checker import expand_callable_variants
+
+        c = self._callable([])
+        self._assert_par(c)
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), 1)
+        self._assert_engages(c)
+
+    def test_plain_generic_two_vars(self) -> None:
+        from mypy.checker import expand_callable_variants
+
+        # Both vars are value-less, so each substitutes its upper bound (o).
+        c = self._callable(
+            [self.fx.t, self.fx.s],
+            arg_types=[self.fx.gt, self.fx.t],
+            ret_type=self.fx.t,
+        )
+        self._assert_par(c)
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), 1)
+        self._assert_engages(c)
+
+    def test_single_tvar_with_values(self) -> None:
+        from mypy.checker import expand_callable_variants
+
+        # V in {A, B} yields two variants.
+        v = self._tvar(10, [self.fx.a, self.fx.b])
+        c = self._callable([v], arg_types=[v], ret_type=self.fx.a)
+        self._assert_par(c)
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), 2)
+        self._assert_engages(c)
+
+    def test_two_tvars_product(self) -> None:
+        from mypy.checker import expand_callable_variants
+
+        # U in {C}, V in {A, B}: two variants over the cartesian product.
+        u = self._tvar(11, [self.fx.c])
+        v = self._tvar(12, [self.fx.a, self.fx.b])
+        c = self._callable(
+            [u, v], arg_types=[u, v], ret_type=self.fx.a
+        )
+        self._assert_par(c)
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), 2)
+        self._assert_engages(c)
+
+    def test_self_type_with_other_var(self) -> None:
+        from mypy.checker import expand_callable_variants
+
+        # Self (raw_id 0) expands to its upper bound A, plus T substitutes o.
+        self_var = TypeVarType(
+            "Self", "__main__.Self", TypeVarId(0), [], self.fx.a, self.fx.o
+        )
+        c = self._callable(
+            [self_var, self.fx.t],
+            arg_types=[self_var, self.fx.gt],
+            ret_type=self.fx.a,
+        )
+        self._assert_par(c)
+        on = self._with_gate(True, lambda: expand_callable_variants(c))
+        assert_equal(len(on), 1)
+        self._assert_engages(c)

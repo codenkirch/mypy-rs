@@ -78,6 +78,7 @@ mod erase_typevars;
 mod errors;
 mod errors_helpers;
 mod expand;
+mod expand_variants;
 mod expandtype;
 mod fixup;
 mod freshen;
@@ -800,6 +801,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(checkpattern::rust_get_type_range, module)?)?;
     module.add_function(wrap_pyfunction!(
         equality_info::rust_equality_value_info,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        expand_variants::rust_expand_callable_variants,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
