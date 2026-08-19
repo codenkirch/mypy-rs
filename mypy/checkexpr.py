@@ -231,6 +231,7 @@ try:
         rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_all_same_types as _rust_all_same_types,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
+        rust_any_causes_overload_ambiguity as _rust_any_causes_overload_ambiguity,
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
@@ -282,6 +283,7 @@ except ImportError:
     _rust_has_any_type = None  # type: ignore[assignment]
     _rust_conditional_expr_join = None  # type: ignore[assignment]
     _rust_analyze_cond_branch = None  # type: ignore[assignment]
+    _rust_any_causes_overload_ambiguity = None  # type: ignore[assignment]
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
     _rust_all_same_types = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
@@ -8249,6 +8251,28 @@ def any_causes_overload_ambiguity(
         arg_kinds: Actual argument kinds
         arg_names: Actual argument names
     """
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            items_bytes = [_serialize_type_for_checkexpr(item) for item in items]
+            return_types_bytes = [_serialize_type_for_checkexpr(t) for t in return_types]
+            arg_types_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
+            result = _rust_any_causes_overload_ambiguity(
+                _native_checkexpr_resolver,
+                items_bytes,
+                return_types_bytes,
+                arg_types_bytes,
+                [int(k.value) for k in arg_kinds],
+                list(arg_names) if arg_names is not None else None,
+                state.strict_optional,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if all_same_types(return_types):
         return False
 

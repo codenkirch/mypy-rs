@@ -10244,6 +10244,157 @@ class NativeMergeTypevarsSuite(Suite):
         assert res is None
 
 
+# NativeAnyCausesOverloadAmbiguitySuite: differential parity for the Rust
+# port of `any_causes_overload_ambiguity` (checkexpr.py:8233-8308).
+# Mirrors NativeCombineSignaturesSuite: toggle the checkexpr gate on/off and
+# assert the native and pure-Python paths agree on the same items/actuals.
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeAnyCausesOverloadAmbiguitySuite(Suite):
+    """Parity tests for `rust_any_causes_overload_ambiguity`.
+
+    Runs the `checkexpr.any_causes_overload_ambiguity` seam with the native
+    gate on (Rust kernel) and off (pure Python), asserting identical results.
+    The pure-Python oracle is the untouched Python body; the native path
+    serializes items/return_types/arg_types on the wire and delegates the
+    whole decision to Rust.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.test.typefixture import TypeFixture
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._tk = _tk
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._wire_map = set_wire_typeinfo_map
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.std_tuplei,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._wire_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        ret: Type,
+        fallback: Instance | None = None,
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            ret,
+            fallback if fallback is not None else self.fx.function,
+        )
+
+    def _any(self) -> AnyType:
+        return AnyType(TypeOfAny.explicit)
+
+    def assert_par(
+        self,
+        items: list[CallableType],
+        return_types: list[Type],
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: Sequence[str | None] | None,
+    ) -> None:
+        """Assert the native seam matches the pure-Python oracle."""
+        from mypy.checkexpr import any_causes_overload_ambiguity
+
+        # Pure-Python oracle: gate off, so the seam falls through to the
+        # Python body and every internal helper routes to Python.
+        self._set_active(False)
+        try:
+            expected = any_causes_overload_ambiguity(
+                items, return_types, arg_types, arg_kinds, arg_names
+            )
+        finally:
+            self._set_active(True)
+        actual = any_causes_overload_ambiguity(
+            items, return_types, arg_types, arg_kinds, arg_names
+        )
+        assert actual == expected, f"rust {actual!r} != py {expected!r}"
+
+    def test_same_returns_false(self) -> None:
+        # Items with identical return types: `all_same_types(return_types)`
+        # short-circuits to False before the Any scan.
+        item1 = self._callable([self.fx.a], self.fx.a)
+        item2 = self._callable([self.fx.b], self.fx.a)
+        self.assert_par(
+            [item1, item2], [self.fx.a, self.fx.a], [self._any()], [ARG_POS], None
+        )
+
+    def test_differing_returns_with_any_true(self) -> None:
+        # An explicit Any actual maps to differing formals (A vs B) and the
+        # items return differing types (A vs B): ambiguity -> True.
+        item1 = self._callable([self.fx.a], self.fx.a)
+        item2 = self._callable([self.fx.b], self.fx.b)
+        self.assert_par(
+            [item1, item2], [self.fx.a, self.fx.b], [self._any()], [ARG_POS], None
+        )
+
+    def test_differing_returns_same_formal_false(self) -> None:
+        # Any maps to the same formal type (A) in both items even though the
+        # returns differ (A vs B): matching_formals all same -> False.
+        item1 = self._callable([self.fx.a], self.fx.a)
+        item2 = self._callable([self.fx.a], self.fx.b)
+        self.assert_par(
+            [item1, item2], [self.fx.a, self.fx.b], [self._any()], [ARG_POS], None
+        )
+
+    def test_no_any_false(self) -> None:
+        # No actual contains Any: the scan finds nothing -> False.
+        item1 = self._callable([self.fx.a], self.fx.a)
+        item2 = self._callable([self.fx.b], self.fx.b)
+        self.assert_par(
+            [item1, item2], [self.fx.a, self.fx.b], [self.fx.a], [ARG_POS], None
+        )
+
+    def test_type_obj_edge_false(self) -> None:
+        # An Any-bearing type-object actual is ignored (`ignore_in_type_obj`),
+        # so no ambiguity is claimed between Type and Callable overloads.
+        type_obj = CallableType([], [], [], self._any(), self.fx.type_type)
+        item1 = self._callable([self.fx.a], self.fx.a)
+        item2 = self._callable([self.fx.b], self.fx.b)
+        self.assert_par(
+            [item1, item2], [self.fx.a, self.fx.b], [type_obj], [ARG_POS], None
+        )
+
+
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
