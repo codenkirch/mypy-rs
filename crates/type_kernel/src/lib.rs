@@ -57,6 +57,7 @@ mod checker_stmts;
 mod checker_visitor;
 mod checkexpr_argcheck;
 mod checkexpr_argcount;
+mod checkexpr_argtypes;
 mod checkexpr_functions;
 mod checkexpr_overload;
 mod checkmember;
@@ -317,6 +318,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(visitor::rust_copy_type, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_argtypes::rust_check_argument_types_plan,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         applytype::rust_apply_generic_arguments,
         module

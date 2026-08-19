@@ -4212,6 +4212,280 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         v.type = self.fx.o
         sym = SymbolTableNode(MDEF, v)
         self._assert_par(t, sym, False)
+class NativeCheckArgumentTypesPlanSuite(Suite):
+    """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
+
+    `ExpressionChecker.check_argument_types` expands each formal's actual
+    arguments against the callee signature: per formal it derives the
+    effective `callee_arg_types`/`callee_arg_kinds` and
+    `actual_types`/`actual_kinds` (or a too-many/too-few decision), then
+    runs the `ArgTypeExpander` + `check_arg` loop. The Rust port derives
+    those per-formal plans; the shim reports count errors and drives the
+    stateful loop. Toggling the checkexpr gate off (pure Python) and on
+    (Rust seam) must record identical message and `check_arg` calls, and a
+    direct seam call proves the Rust planner engages rather than silently
+    deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        # Clear placeholder primitives so wire fixup maps type_refs to the
+        # fixture instances (mirrors the bind_self suite).
+        from mypy.types import instance_cache
+
+        instance_cache.int_type = None
+        instance_cache.str_type = None
+        instance_cache.bool_type = None
+        instance_cache.object_type = None
+        instance_cache.function_type = None
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _stub_checker(self) -> tuple[object, list[str]]:
+        """Minimal `ExpressionChecker` that records its effects.
+
+        `check_argument_types` needs `self.chk.named_type` (var-arg
+        validity and the `ArgumentInferContext`), `self.chk.msg` (error
+        recording), and `self.check_arg`. The msg recorder and the passed
+        `check_arg` both append to the shared log so gate-off and gate-on
+        runs can be compared.
+        """
+        from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker
+        from mypy.infer import ArgumentInferContext
+
+        fx = self.fx
+        log: list[str] = []
+
+        def named_type(name: str) -> Instance:
+            if "[" in name:
+                raise AssertionError(f"named_type got parameterized {name}")
+            return Instance(fx.make_type_info(name), [])
+
+        def named_generic_type(name: str, args: list[Type]) -> Instance:
+            return Instance(fx.make_type_info(name), args)
+
+        class _Msg:
+            def too_many_arguments(
+                self, callee: CallableType, context: Context
+            ) -> None:
+                del callee, context
+                log.append("too_many")
+
+            def too_few_arguments(
+                self,
+                callee: CallableType,
+                context: Context,
+                argument_names: Sequence[str | None] | None,
+            ) -> None:
+                del callee, context, argument_names
+                log.append("too_few")
+
+            def invalid_var_arg(self, typ: Type, context: Context) -> None:
+                del typ, context
+                log.append("invalid_var_arg")
+
+            def invalid_keyword_var_arg(
+                self, typ: Type, is_mapping: bool, context: Context
+            ) -> None:
+                del typ, context
+                log.append(f"invalid_keyword_var_arg(mapping={is_mapping})")
+
+        chk = TypeChecker.__new__(TypeChecker)
+        chk.named_type = named_type  # type: ignore[method-assign]
+        chk.named_generic_type = named_generic_type  # type: ignore[method-assign]
+        chk.msg = _Msg()  # type: ignore[assignment]
+
+        checker = ExpressionChecker.__new__(ExpressionChecker)
+        checker.chk = chk  # type: ignore[attr-defined]
+        checker._arg_infer_context_cache = ArgumentInferContext(
+            named_type("typing.Mapping"), named_type("typing.Iterable")
+        )
+        return checker, log
+
+    def _exprs(self, n: int) -> list[Expression]:
+        from mypy.nodes import TempNode
+        from mypy.types import AnyType, TypeOfAny
+
+        return [TempNode(AnyType(TypeOfAny.special_form)) for _ in range(n)]
+
+    def _ctx(self) -> Context:
+        ctx = Context(5, 5)
+        ctx.end_line = 6
+        ctx.end_column = 7
+        return ctx
+
+    def _callee(self, arg_types: list[Type], arg_kinds: list[ArgKind]) -> CallableType:
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            [None] * len(arg_types),
+            self.fx.nonet,
+            self.fx.function,
+        )
+
+    def _run(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        callee: CallableType,
+        f2a: list[list[int]],
+        *,
+        assert_engages: bool = True,
+    ) -> None:
+        from mypy.checkexpr import ExpressionChecker
+
+        def run_once() -> tuple[list[str], list[str]]:
+            checker, log = self._stub_checker()
+            check_calls: list[str] = []
+
+            def check_arg(
+                caller_type: Type,
+                original_caller_type: Type,
+                caller_kind: ArgKind,
+                callee_type: Type,
+                n: int,
+                m: int,
+                callee: CallableType,
+                object_type: Type | None,
+                context: Context,
+                outer_context: Context,
+            ) -> None:
+                del callee, object_type, context, outer_context
+                check_calls.append(
+                    f"check_arg({caller_type}, {original_caller_type}, "
+                    f"{caller_kind}, {callee_type}, actual{n}, formal{m})"
+                )
+
+            ExpressionChecker.check_argument_types(  # type: ignore[call-arg]
+                checker,
+                arg_types,
+                arg_kinds,
+                self._exprs(len(arg_types)),
+                callee,
+                f2a,
+                self._ctx(),
+                check_arg=check_arg,
+            )
+            return log, check_calls
+
+        self._set_active(False)
+        off_msgs, off_calls = run_once()
+        self._set_active(True)
+        on_msgs, on_calls = run_once()
+        assert_equal(on_msgs, off_msgs, f"message parity {callee}")
+        assert_equal(on_calls, off_calls, f"check_arg parity {callee}")
+        if assert_engages:
+            self._assert_engages(arg_types, arg_kinds, callee, f2a)
+
+    def _assert_engages(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        callee: CallableType,
+        f2a: list[list[int]],
+    ) -> None:
+        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr
+
+        assert _rust_check_argument_types_plan is not None
+        result = _rust_check_argument_types_plan(
+            [_serialize_type_for_checkexpr(t) for t in arg_types],
+            [int(k.value) for k in arg_kinds],
+            f2a,
+            _serialize_type_for_checkexpr(callee),
+        )
+        assert result is not None, "Rust check_argument_types did not engage"
+
+    def test_simple_args(self) -> None:
+        # def f(a: A, b: B); f(x, y) -> one check_arg per formal.
+        fx = self.fx
+        callee = self._callee([fx.a, fx.b], [ARG_POS, ARG_POS])
+        self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]])
+
+    def test_vararg_match(self) -> None:
+        # def f(*args: A); f(A, B, A) -> all three actuals to formal 0.
+        fx = self.fx
+        callee = self._callee([fx.a], [ARG_STAR])
+        self._run([fx.a, fx.b, fx.a], [ARG_POS, ARG_POS, ARG_POS], callee, [[0, 1, 2]])
+
+    def test_too_many_arguments(self) -> None:
+        # def f(x: tuple[A, B]); caller passes 3 positional actuals.
+        fx = self.fx
+        callee = self._callee(
+            [UnpackType(TupleType([fx.a, fx.b], self.fx.std_tuple, False))], [ARG_POS]
+        )
+        self._run([fx.a, fx.b, fx.c], [ARG_POS, ARG_POS, ARG_POS], callee, [[0, 1, 2]])
+
+    def test_too_few_arguments(self) -> None:
+        # def f(x: tuple[A, B]); caller passes 1 positional actual.
+        fx = self.fx
+        callee = self._callee(
+            [UnpackType(TupleType([fx.a, fx.b], self.fx.std_tuple, False))], [ARG_POS]
+        )
+        self._run([fx.a], [ARG_POS], callee, [[0]])
+
+    def test_unpacked_tuple_reunify(self) -> None:
+        # def f(x: Tuple[Unpack[Ts], A]); caller passes a one-item unpacked
+        # tuple whose Unpack target is the same shape, plus a suffix B, so
+        # formal_to_actual is [[0, 1]]. The first actual is the one-item
+        # unpacked tuple reunified with the suffix; Rust expands callee to
+        # [Unpack[Ts], A] with kinds [ARG_STAR, ARG_POS].
+        fx = self.fx
+        inner_unpack = UnpackType(fx.ts)
+        inner_tuple = TupleType([inner_unpack, fx.a], self.fx.std_tuple, False)
+        callee = self._callee([UnpackType(inner_tuple)], [ARG_POS])
+        caller_tuple = TupleType(
+            [UnpackType(inner_tuple), fx.b], self.fx.std_tuple, False
+        )
+        self._run([caller_tuple, fx.b], [ARG_STAR, ARG_POS], callee, [[0, 1]])
+
+    def test_plain_tuple_unpack_target(self) -> None:
+        # def f(x: tuple[A, ...]); call with two actuals.
+        fx = self.fx
+        callee = self._callee([UnpackType(Instance(fx.std_tuplei, [fx.a]))], [ARG_POS])
+        self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0, 1]])
+
+    def test_type_alias_defers_whole_call(self) -> None:
+        # A TypeAliasType in a callee formal cannot be reproduced by Rust
+        # (no alias target on the wire), so `plan_for_formal` returns None
+        # for the whole call and Python runs the pure body. Both paths
+        # produce the same check_arg for the non-alias formal.
+        from mypy.nodes import TypeAlias as TypeAliasNode
+        from mypy.types import TypeAliasType as TypeAliasTypeCls
+
+        fx = self.fx
+        alias_node = TypeAliasNode(fx.a, "mod.AL", "mod", -1, -1)
+        alias = TypeAliasTypeCls(alias_node, [])
+        callee = self._callee([alias, fx.b], [ARG_POS, ARG_POS])
+        self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]], assert_engages=False)
+        # The seam must actively refuse the alias (prove the seal, not a
+        # silent pass-through).
+        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr
+
+        result = _rust_check_argument_types_plan(
+            [_serialize_type_for_checkexpr(t) for t in [fx.a, fx.b]],
+            [int(k.value) for k in [ARG_POS, ARG_POS]],
+            [[0], [1]],
+            _serialize_type_for_checkexpr(callee),
+        )
+        assert result is None, "expected Rust to defer on a TypeAliasType formal"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
