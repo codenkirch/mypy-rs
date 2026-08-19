@@ -206,6 +206,7 @@ from mypy.types import (
     has_recursive_types,
     has_type_vars,
     is_named_instance,
+    read_type_list,
     split_with_prefix_and_suffix,
 )
 from mypy.types_utils import (
@@ -236,6 +237,7 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_argument_count as _rust_check_argument_count,
+        rust_check_argument_types_plan as _rust_check_argument_types_plan,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
@@ -319,6 +321,7 @@ except ImportError:
     _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_dangerous_comparison = None  # type: ignore[assignment]
     _rust_check_argument_count = None  # type: ignore[assignment]
+    _rust_check_argument_types_plan = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
     _rust_try_getting_int_literals = None  # type: ignore[assignment]
     _rust_visit_tuple_index_helper = None  # type: ignore[assignment]
@@ -581,6 +584,53 @@ def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
             else:
                 return None
         return result
+    except (AssertionError, ValueError, NotImplementedError):
+        return None
+
+
+def _decode_argtypes_plan(
+    raw: bytes,
+) -> tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None:
+    """Decode a per-formal argument-expansion plan blob from the kernel.
+
+    Mirrors `checkexpr_argtypes.rs encode_plan`: a bare-int tag (0 =
+    success plan; 1/2 = too-many/too-few decision carrying no lists)
+    followed, for a success plan, by `write_type_list`
+    (callee_arg_types), `write_int_list` (callee_arg_kinds),
+    `write_type_list` (actual_types), `write_int_list` (actual_kinds).
+    The integer kinds are mapped back to `ArgKind` so the caller sees the
+    same enum values the pure-Python body operates on.
+
+    Returns `(tag, callee_arg_types, callee_arg_kinds, actual_types,
+    actual_kinds)`; the lists are empty for a too-many/too-few
+    decision (tag 1/2). Returns None on decode/fixup failure so the
+    caller can fall back to the pure-Python body. Resolves type_refs to
+    live TypeInfo via wirefixup, matching `_deserialize_type_from_checkexpr`.
+    """
+    try:
+        from mypy.cache import read_int_bare, read_int_list
+        from mypy.nodes import ArgKind
+        from mypy.wirefixup import fixup_wire_type
+
+        buf = _CheckExprReadBuffer(raw)
+        tag = read_int_bare(buf)
+        if tag != 0:
+            return (tag, [], [], [], [])
+        callee_arg_types = read_type_list(buf)
+        callee_arg_kinds = [ArgKind(k) for k in read_int_list(buf)]
+        actual_types = read_type_list(buf)
+        actual_kinds = [ArgKind(k) for k in read_int_list(buf)]
+        fixed_callee = [fixup_wire_type(t) for t in callee_arg_types]
+        fixed_actual = [fixup_wire_type(t) for t in actual_types]
+        if any(t is None for t in fixed_callee + fixed_actual):
+            return None
+        return (
+            tag,
+            [t for t in fixed_callee if t is not None],
+            callee_arg_kinds,
+            [t for t in fixed_actual if t is not None],
+            actual_kinds,
+        )
     except (AssertionError, ValueError, NotImplementedError):
         return None
 
@@ -3685,6 +3735,73 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         check_arg = check_arg or self.check_arg
         # Keep track of consumed tuple *arg items.
         mapper = ArgTypeExpander(self.argument_infer_context())
+
+        # Native seam: Rust derives the per-formal argument-expansion
+        # plan (callee_arg_types/kinds and actual_types/kinds, or a
+        # too-many/too-few decision) from the wire data; the shim
+        # reports the count errors and drives the ArgTypeExpander +
+        # check_arg loop exactly as the pure-Python body below. Rust
+        # returns None (or the decoder fails) on a case it cannot
+        # reproduce (TypeAliasType, non-tuple unpack target, wire
+        # decode failure), falling back to the pure-Python body.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_check_argument_types_plan is not None
+        ):
+            try:
+                plans = _rust_check_argument_types_plan(
+                    [_serialize_type_for_checkexpr(t) for t in arg_types],
+                    [int(k.value) for k in arg_kinds],
+                    formal_to_actual,
+                    _serialize_type_for_checkexpr(callee),
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                plans = None
+            if plans is not None:
+                decoded = [_decode_argtypes_plan(blob) for blob in plans]
+                if all(p is not None for p in decoded):
+                    for i, actuals in enumerate(formal_to_actual):
+                        tag, callee_arg_types, callee_arg_kinds, actual_types, actual_kinds = (
+                            decoded[i]  # type: ignore[misc]
+                        )
+                        if tag == 1:  # too many actuals for the formal
+                            self.chk.msg.too_many_arguments(callee, context)
+                            continue
+                        if tag == 2:  # too few actuals for the formal
+                            self.chk.msg.too_few_arguments(callee, context, None)
+                            continue
+                        assert len(actual_types) == len(actuals) == len(actual_kinds)
+                        assert len(callee_arg_types) == len(actual_types)
+                        assert len(callee_arg_types) == len(callee_arg_kinds)
+                        for actual, actual_type, actual_kind, callee_arg_type, callee_arg_kind in zip(
+                            actuals,
+                            actual_types,
+                            actual_kinds,
+                            callee_arg_types,
+                            callee_arg_kinds,
+                        ):
+                            # Check that a *arg is valid as varargs.
+                            expanded_actual = mapper.expand_actual_type(
+                                actual_type,
+                                actual_kind,
+                                callee.arg_names[i],
+                                callee_arg_kind,
+                                allow_unpack=isinstance(callee_arg_type, UnpackType),
+                            )
+                            check_arg(
+                                expanded_actual,
+                                actual_type,
+                                actual_kind,
+                                callee_arg_type,
+                                actual + 1,
+                                i + 1,
+                                callee,
+                                object_type,
+                                args[actual],
+                                context,
+                            )
+                    return
 
         for i, actuals in enumerate(formal_to_actual):
             orig_callee_arg_type = get_proper_type(callee.arg_types[i])
