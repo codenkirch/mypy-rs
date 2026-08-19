@@ -109,6 +109,7 @@ mod semanal_classprop;
 mod semanal_lookup;
 mod semanal_shared;
 mod semanal_typeddict;
+mod semanal_typeexpr;
 mod semanal_visitor;
 mod serverdeps;
 mod setops;
@@ -1270,6 +1271,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_var_is_typing_special_form,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_typeexpr::rust_classify_type_expression,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
