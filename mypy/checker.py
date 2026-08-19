@@ -322,6 +322,7 @@ try:
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
+        rust_expand_callable_variants as _rust_expand_callable_variants,
         rust_get_coroutine_return_type as _rust_get_coroutine_return_type,
         rust_get_generator_receive_type as _rust_get_generator_receive_type,
         rust_get_generator_return_type as _rust_get_generator_return_type,
@@ -770,6 +771,21 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
     assert t is not None, "checker wire decode produced unresolvable type_ref"
     return t
+
+
+def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
+    """Decode a wire-format type list from the checker kernel, resolving
+    type_ref to live TypeInfo via wirefixup.
+    """
+    from mypy.types import read_type_list
+    from mypy.wirefixup import fixup_wire_type
+
+    out: list[Type] = []
+    for decoded in read_type_list(_CheckerReadBuffer(b)):
+        t = fixup_wire_type(decoded)
+        assert t is not None, "checker wire list decode produced unresolvable type_ref"
+        out.append(t)
+    return out
 
 
 def _serialize_type_list(items: Sequence[Type]) -> bytes:
@@ -9846,6 +9862,28 @@ def are_argument_counts_overlapping(t: CallableType, s: CallableType) -> bool:
 
 def expand_callable_variants(c: CallableType) -> list[CallableType]:
     """Expand a generic callable using all combinations of type variables' values/bounds."""
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active:
+        try:
+            raw = _rust_expand_callable_variants(
+                _serialize_type_for_checker(c), state.strict_optional
+            )
+            if raw is not None:
+                variants: list[CallableType] = []
+                for v in _deserialize_type_list_from_checker(bytes(raw)):
+                    assert isinstance(v, CallableType)
+                    variants.append(
+                        c.copy_modified(
+                            arg_types=v.arg_types,
+                            ret_type=v.ret_type,
+                            type_guard=v.type_guard,
+                            type_is=v.type_is,
+                            instance_type=v.instance_type,
+                            variables=[],
+                        )
+                    )
+                return variants
+        except (AssertionError, NotImplementedError):
+            pass
     for tv in c.variables:
         # We need to expand self-type before other variables, because this is the only
         # type variable that can have other type variables in the upper bound.
