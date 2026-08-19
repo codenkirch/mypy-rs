@@ -12505,3 +12505,236 @@ class NativeConditionalTypesSuite(Suite):
             ranges,
             None,
         )
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEqualityAmbiguitySuite(Suite):
+    """Parity for `partition_equality_ambiguous_types` and
+    `is_equality_ambiguous_for_narrowing` (mypy.checker).
+
+    These narrow enum/unions that compare equal through a value domain
+    broader than their nominal type (IntEnum vs int, StrEnum vs str). The
+    Rust port reuses `equality_value_info_inner` (the #679 port) for the
+    per-type domain collection and implements the shared-domain comparison
+    loop + union partition. Toggling the checker gate off (pure Python) and
+    on (Rust seam) must produce identical narrowable/ambiguous splits, and a
+    direct seam call proves the Rust function engages rather than silently
+    deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.int_info = self.fx.make_type_info("builtins.int")
+        self.bytes_info = self.fx.make_type_info("builtins.bytes")
+        # A StrEnum: mro through builtins.str -> str domain.
+        self.mystrenum_info = self.fx.make_type_info(
+            "mod.MyStrEnum", mro=[self.fx.str_type_info, self.fx.oi]
+        )
+        self.mystrenum_info.is_enum = True
+        # Two IntEnums: mro through builtins.int -> numeric domain.
+        self.myintenum_info = self.fx.make_type_info(
+            "mod.MyIntEnum", mro=[self.int_info, self.fx.oi]
+        )
+        self.myintenum_info.is_enum = True
+        self.otherenum_info = self.fx.make_type_info(
+            "mod.OtherEnum", mro=[self.int_info, self.fx.oi]
+        )
+        self.otherenum_info.is_enum = True
+        # A closed-domain enum: mro through builtins.bytes -> bytes domain.
+        self.bytese_info = self.fx.make_type_info(
+            "mod.BytesE", mro=[self.bytes_info, self.fx.oi]
+        )
+        self.bytese_info.is_enum = True
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # str_type_info / bool_type_info do not end in "i".
+        type_infos.extend(
+            [
+                self.fx.str_type_info,
+                self.fx.bool_type_info,
+                self.int_info,
+                self.bytes_info,
+            ]
+        )
+        type_infos.extend(
+            [
+                self.mystrenum_info,
+                self.myintenum_info,
+                self.otherenum_info,
+                self.bytese_info,
+            ]
+        )
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _normalize(self, pair: tuple[object, object]) -> tuple[object, object]:
+        narrowable, ambiguous = pair
+        return (
+            str(narrowable) if narrowable is not None else None,
+            str(ambiguous) if ambiguous is not None else None,
+        )
+
+    def _assert_par(
+        self, current: Type, target: Type, *, is_identity: bool = False
+    ) -> tuple[object, object]:
+        from mypy.checker import partition_equality_ambiguous_types
+
+        off = self._with_gate(
+            False,
+            lambda: partition_equality_ambiguous_types(
+                current, target, is_identity=is_identity
+            ),
+        )
+        on = self._with_gate(
+            True,
+            lambda: partition_equality_ambiguous_types(
+                current, target, is_identity=is_identity
+            ),
+        )
+        offn, offa = self._normalize(off)
+        onn, ona = self._normalize(on)
+        assert_equal(
+            (onn, ona), (offn, offa), f"partition parity {current} vs {target}"
+        )
+        return onn, ona
+
+    def _assert_ambiguity_par(self, left: Type, right: Type) -> bool:
+        from mypy.checker import is_equality_ambiguous_for_narrowing
+
+        off = self._with_gate(
+            False, lambda: is_equality_ambiguous_for_narrowing(left, right)
+        )
+        on = self._with_gate(
+            True, lambda: is_equality_ambiguous_for_narrowing(left, right)
+        )
+        assert_equal(on, off, f"ambiguity parity {left} vs {right}")
+        return bool(on)
+
+    def _assert_engages(
+        self, current: Type, target: Type, *, is_identity: bool = False
+    ) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_partition_equality_ambiguous_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_for_checker(target),
+            is_identity,
+            True,
+            self.resolver,
+        )
+        assert result is not None, (
+            f"Rust partition did not engage for {current} vs {target}"
+        )
+        amb_result = _type_kernel.rust_is_equality_ambiguous_for_narrowing(
+            _serialize_type_for_checker(current),
+            _serialize_type_for_checker(target),
+            self.resolver,
+        )
+        assert amb_result is not None, (
+            f"Rust ambiguity did not engage for {current} vs {target}"
+        )
+
+    def test_strenum_union_vs_member(self) -> None:
+        # MyStrEnum | str vs MyStrEnum.MEMBER: the enum portion narrows, the
+        # str portion is equality-ambiguous and must stay in both branches.
+        enum_inst = Instance(self.mystrenum_info, [])
+        member = LiteralType("red", enum_inst)
+        current = UnionType([enum_inst, Instance(self.fx.str_type_info, [])])
+        narrowable, ambiguous = self._assert_par(current, member)
+        assert_equal(ambiguous, "builtins.str")
+        assert_equal(narrowable, "mod.MyStrEnum")
+        self._assert_engages(current, member)
+
+    def test_intenum_vs_int_is_ambiguous(self) -> None:
+        # An IntEnum can compare equal to its underlying int.
+        enum_inst = Instance(self.myintenum_info, [])
+        target = Instance(self.int_info, [])
+        self._assert_ambiguity_par(enum_inst, target)
+        self._assert_par(enum_inst, target)
+        self._assert_engages(enum_inst, target)
+
+    def test_two_different_enums_are_ambiguous(self) -> None:
+        # Distinct enum types share the numeric domain but differ in names.
+        left = Instance(self.myintenum_info, [])
+        right = Instance(self.otherenum_info, [])
+        self._assert_ambiguity_par(left, right)
+        self._assert_engages(left, right)
+
+    def test_identity_narrowing_no_partition(self) -> None:
+        # Identity narrowing returns (current_type, None) with no ambiguous
+        # side from either branch.
+        enum_inst = Instance(self.mystrenum_info, [])
+        member = LiteralType("red", enum_inst)
+        current = UnionType([enum_inst, Instance(self.fx.str_type_info, [])])
+        narrowable, ambiguous = self._assert_par(current, member, is_identity=True)
+        assert_equal(ambiguous, None)
+        assert_equal(narrowable, str(current))
+        self._assert_engages(current, member, is_identity=True)
+
+    def test_closed_domain_same_enum_not_ambiguous(self) -> None:
+        # Equality between two values of the same enum can narrow by literal
+        # member even in a closed domain (bytes).
+        b = Instance(self.bytese_info, [])
+        self._assert_ambiguity_par(b, b)
+        # A full partition over a closed-domain enum vs itself stays
+        # narrowable (no ambiguous side).
+        narrowable, ambiguous = self._assert_par(b, b)
+        assert_equal(ambiguous, None)
+        assert_equal(narrowable, "mod.BytesE")
+        self._assert_engages(b, b)
+
+    def test_closed_domain_enum_vs_plain_bytes_is_ambiguous(self) -> None:
+        # A closed-domain enum's value may compare equal to its underlying
+        # bytes, so narrowing against a plain bytes target is ambiguous.
+        b = Instance(self.bytese_info, [])
+        target = Instance(self.bytes_info, [])
+        self._assert_ambiguity_par(b, target)
+        self._assert_par(b, target)
+        self._assert_engages(b, target)
+
+    def test_top_object_vs_open_domain_enum_is_ambiguous(self) -> None:
+        # A top-like info (builtins.object) is ambiguous against an enum in
+        # an OPEN domain (str): the open domain cannot be exhausted.
+        enum_inst = Instance(self.mystrenum_info, [])
+        self._assert_ambiguity_par(self.fx.o, enum_inst)
+        self._assert_engages(self.fx.o, enum_inst)
+
+    def test_top_object_vs_closed_domain_enum_is_not_ambiguous(self) -> None:
+        # A top-like info against a CLOSED domain (bytes) narrows to the
+        # complete known set, so it is not equality-ambiguous.
+        b = Instance(self.bytese_info, [])
+        self._assert_ambiguity_par(self.fx.o, b)
+        self._assert_engages(self.fx.o, b)
+

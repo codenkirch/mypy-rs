@@ -341,6 +341,7 @@ try:
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
+        rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
         rust_is_false_literal as _rust_is_false_literal,
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
@@ -366,6 +367,7 @@ try:
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
         rust_overload_can_never_match as _rust_overload_can_never_match,
+        rust_partition_equality_ambiguous_types as _rust_partition_equality_ambiguous_types,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
         rust_type_requires_usage as _rust_type_requires_usage,
@@ -398,6 +400,8 @@ except ImportError:
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
     _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
     _rust_overload_can_never_match = None  # type: ignore[assignment]
+    _rust_is_equality_ambiguous_for_narrowing = None  # type: ignore[assignment]
+    _rust_partition_equality_ambiguous_types = None  # type: ignore[assignment]
     _rust_type_requires_usage = None  # type: ignore[assignment]
     _rust_is_unreachable_map = None  # type: ignore[assignment]
     _rust_stmt_outcome = None  # type: ignore[assignment]
@@ -807,6 +811,22 @@ def _serialize_type_list(items: Sequence[Type]) -> bytes:
     buf = _CheckerWriteBuffer()
     write_type_list(buf, items)
     return buf.getvalue()
+
+
+def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
+    """Decode a wire type-list blob from the checker kernel, resolving each
+    item's type_ref to live TypeInfo via wirefixup. An unresolvable item
+    asserts so the caller defers to the pure-Python path.
+    """
+    from mypy.types import read_type_list
+    from mypy.wirefixup import fixup_wire_type
+
+    result: list[Type] = []
+    for item in read_type_list(_CheckerReadBuffer(b)):
+        fixed = fixup_wire_type(item)
+        assert fixed is not None, "native partition produced unresolvable type_ref"
+        result.append(fixed)
+    return result
 
 
 T = TypeVar("T")
@@ -10873,6 +10893,40 @@ def partition_equality_ambiguous_types(
     still narrow the enum portion of the union, but we must keep the str portion in both
     branches.
     """
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            raw = _rust_partition_equality_ambiguous_types(
+                _serialize_type_for_checker(current_type),
+                _serialize_type_for_checker(target_type),
+                is_identity,
+                state.strict_optional,
+                _native_checker_resolver,
+            )
+            if raw is not None:
+                narrowable_blob, ambiguous_blob = raw
+                narrowable = (
+                    _deserialize_type_list_from_checker(bytes(narrowable_blob))
+                    if narrowable_blob is not None
+                    else []
+                )
+                ambiguous = (
+                    _deserialize_type_list_from_checker(bytes(ambiguous_blob))
+                    if ambiguous_blob is not None
+                    else []
+                )
+                # Same make_union calls as the pure-Python body: len > 1 folds
+                # into a fresh UnionType, len == 1 collapses to the bare item.
+                return (
+                    UnionType.make_union(narrowable) if narrowable else None,
+                    UnionType.make_union(ambiguous) if ambiguous else None,
+                )
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            pass
+
     if is_identity:
         return current_type, None
 
@@ -10893,6 +10947,22 @@ def partition_equality_ambiguous_types(
 
 def is_equality_ambiguous_for_narrowing(left: Type, right: Type) -> bool:
     """Can left compare equal to right through a value domain outside nominal overlap?"""
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            result = _rust_is_equality_ambiguous_for_narrowing(
+                _serialize_type_for_checker(left),
+                _serialize_type_for_checker(right),
+                _native_checker_resolver,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
+
     left_info = equality_value_info(left)
     right_info = equality_value_info(right)
 

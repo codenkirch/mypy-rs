@@ -74,6 +74,7 @@ mod constraints_helpers;
 mod copymodified;
 mod dataclasses;
 mod detach_callable;
+mod equality_ambiguity;
 mod equality_info;
 mod erase;
 mod erase_typevars;
@@ -815,6 +816,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(checkpattern::rust_get_type_range, module)?)?;
     module.add_function(wrap_pyfunction!(
         equality_info::rust_equality_value_info,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        equality_ambiguity::rust_is_equality_ambiguous_for_narrowing,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        equality_ambiguity::rust_partition_equality_ambiguous_types,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
