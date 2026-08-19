@@ -12019,6 +12019,7 @@ class NativeBuiltinItemTypeSuite(Suite):
         result = self._with_gate(True, lambda: builtin_item_type(t))
         assert_equal(str(result), "builtins.str")
         self._assert_engages(t)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUnsafeOverlappingOverloadSuite(Suite):
     """Parity for the Rust `is_unsafe_overlapping_overload_signatures` port.
 
