@@ -32,6 +32,7 @@ from mypy.nodes import (
     ARG_STAR2,
     MISSING_FALLBACK,
     SYMBOL_FUNCBASE_TYPES,
+    VAR_NO_INFO,
     ArgKind,
     Context,
     Decorator,
@@ -990,6 +991,53 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
 
         This is something unusual. We try our best to find out what it is.
         """
+        # Native seam: Rust applies the ordered classification table over the
+        # raw node facts below; Python rebuilds the result objects and
+        # keeps the message tail. None (defer) falls back to Python.
+        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+            try:
+                node = sym.node
+                var_typ = None
+                if isinstance(node, Var):
+                    var_typ = get_proper_type(node.type)
+                is_var_any = isinstance(var_typ, AnyType)
+                result = _rust_analyze_unbound_without_info(
+                    is_var_any,
+                    self.allow_type_any,
+                    not is_var_any
+                    and isinstance(var_typ, Instance)
+                    and var_typ.type.fullname == "builtins.type",
+                    not is_var_any
+                    and isinstance(var_typ, TypeType)
+                    and isinstance(var_typ.item, AnyType),
+                    isinstance(node, (TypeVarExpr, TypeVarTupleExpr))
+                    and self.tvar_scope.get_binding(sym) is None,
+                    self.allow_unbound_tvars,
+                    isinstance(node, Var)
+                    and node.info is not VAR_NO_INFO
+                    and node.info.is_enum
+                    and node.name in node.info.enum_members,
+                    defining_literal,
+                )
+                if result == 1 and var_typ is not None:
+                    return AnyType(
+                        TypeOfAny.from_unimported_type,
+                        missing_import_name=var_typ.missing_import_name,  # type: ignore[union-attr]
+                    )
+                if result == 2:
+                    return AnyType(TypeOfAny.special_form)
+                if result == 3:
+                    return t
+                if result == 4:
+                    assert isinstance(node, Var)
+                    return LiteralType(
+                        value=node.name,
+                        fallback=Instance(node.info, [], line=t.line, column=t.column),
+                        line=t.line,
+                        column=t.column,
+                    )
+            except (AssertionError, NotImplementedError):
+                pass
         name = sym.fullname
         if name is None:
             assert sym.node is not None
@@ -2626,6 +2674,7 @@ try:
         WriteBuffer as _TypeanalWriteBuffer,
     )
     from type_kernel import (
+        rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_explicit_any as _rust_has_explicit_any,
@@ -2657,6 +2706,7 @@ except ImportError:
     _rust_check_vec_type_args = None  # type: ignore[assignment]
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
+    _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
