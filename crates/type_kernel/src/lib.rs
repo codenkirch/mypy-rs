@@ -120,6 +120,7 @@ mod traverser;
 mod treetransform;
 mod typealias_instantiate;
 mod typeanal_queries;
+mod typeanal_unbound;
 mod typeinfo;
 mod typeops;
 mod types_impl;
@@ -1382,6 +1383,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // argument wire blobs for the shim to rebuild live objects.
     module.add_function(wrap_pyfunction!(
         typealias_instantiate::rust_instantiate_type_alias,
+        module
+    )?)?;
+    // analyze_unbound_type_without_type_info: the pure classification
+    // front (Any-typed Var, allow_type_any special forms, unbound type
+    // variable, enum member Literal). None defers to pure Python.
+    module.add_function(wrap_pyfunction!(
+        typeanal_unbound::rust_analyze_unbound_without_info,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types

@@ -4040,6 +4040,180 @@ class NativeInstantiateTypeAliasSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUnboundWithoutTypeInfoSuite(Suite):
+    """Parity for the Rust `analyze_unbound_type_without_type_info` port.
+
+    The classification front (which unbound non-TypeInfo symbol a type
+    expression refers to) runs in Rust: an Any-typed Var alias, the
+    `type` special form under allow_type_any, an allowed unbound type
+    variable, and an enum member inside Literal[...]. The Python shim
+    rebuilds the result object from the live node; every error path
+    (raw enum value, invalid reference) defers to the pure-Python body.
+    Toggling the typeanal gate off (pure Python) and on (Rust) must
+    produce identical `str(result)` on both engaged and deferred paths,
+    and a direct seam call proves the Rust classifier engages.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, *, allow_type_any: bool = False, allow_unbound_tvars: bool = False) -> object:
+        from mypy.tvar_scope import TypeVarLikeScope
+        from mypy.typeanal import TypeAnalyser
+
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.tvar_scope = TypeVarLikeScope()
+        ta.allow_type_any = allow_type_any
+        ta.allow_unbound_tvars = allow_unbound_tvars
+        ta.allow_param_spec_literals = False
+        ta.fail = lambda *a, **k: None
+        ta.note = lambda *a, **k: None
+        return ta
+
+    def _var_sym(self, info: TypeInfo | None, type: AnyType | Instance | TypeType | None, name: str = "mod.x") -> SymbolTableNode:
+        v = Var(name.rsplit(".", 1)[-1])
+        v._fullname = name
+        v.type = type
+        if info is not None:
+            v.info = info
+        return SymbolTableNode(MDEF, v)
+
+    def _tvar_expr_sym(self, name: str = "T") -> SymbolTableNode:
+        from mypy.nodes import SymbolTableNode, TypeVarExpr
+
+        tv = TypeVarExpr(name, name, -1, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
+        return SymbolTableNode(MDEF, tv)
+
+    def _call(
+        self,
+        t: UnboundType,
+        sym: SymbolTableNode,
+        defining_literal: bool,
+        *,
+        allow_type_any: bool = False,
+        allow_unbound_tvars: bool = False,
+    ) -> Type:
+        ta = self._analyser(allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars)
+        return ta.analyze_unbound_type_without_type_info(t, sym, defining_literal)
+
+    def _assert_par(
+        self,
+        t: UnboundType,
+        sym: SymbolTableNode,
+        defining_literal: bool,
+        *,
+        allow_type_any: bool = False,
+        allow_unbound_tvars: bool = False,
+    ) -> None:
+        off = self._with_gate(
+            False,
+            lambda: self._call(t, sym, defining_literal, allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars),
+        )
+        on = self._with_gate(
+            True,
+            lambda: self._call(t, sym, defining_literal, allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars),
+        )
+        assert_equal(str(on), str(off), f"analyze_unbound_type_without_type_info parity {sym.fullname}")
+
+    def _assert_engages(self, *, is_var_any: bool = False, allow_type_any: bool = False,
+                        is_type_instance: bool = False, is_type_type_any: bool = False,
+                        unbound_tvar: bool = False, allow_unbound_tvars: bool = False,
+                        is_enum_member: bool = False, defining_literal: bool = False) -> None:
+        from mypy.typeanal import _rust_analyze_unbound_without_info
+
+        result = _rust_analyze_unbound_without_info(
+            is_var_any, allow_type_any, is_type_instance, is_type_type_any,
+            unbound_tvar, allow_unbound_tvars, is_enum_member, defining_literal,
+        )
+        assert result is not None, "Rust analyze_unbound_type_without_type_info did not engage"
+
+    def test_var_any_from_unimported(self) -> None:
+        # `x: Any` in a type context -> Any(from_unimported_type).
+        t = UnboundType("mod.x")
+        sym = self._var_sym(None, AnyType(TypeOfAny.from_unimported_type))
+        self._assert_par(t, sym, False)
+        self._assert_engages(is_var_any=True)
+
+    def test_var_special_any_under_allow_type_any(self) -> None:
+        # `x: type` under allow_type_any -> Any(special_form).
+        t = UnboundType("mod.x")
+        type_info = self.fx.make_type_info("mod.type_holder")
+        sym = self._var_sym(type_info, Instance(self.fx.type_typei, []))
+        self._assert_par(t, sym, False, allow_type_any=True)
+        self._assert_engages(is_type_instance=True, allow_type_any=True)
+
+    def test_var_type_any_without_flag_defers(self) -> None:
+        # `x: type` without allow_type_any -> falls through to the message tail.
+        t = UnboundType("mod.x")
+        type_info = self.fx.make_type_info("mod.type_holder")
+        sym = self._var_sym(type_info, Instance(self.fx.type_typei, []))
+        self._assert_par(t, sym, False)
+
+    def test_unbound_tvar_allowed(self) -> None:
+        # Unbound Tv in an allowed context -> returns t unchanged.
+        t = UnboundType("mod.T")
+        sym = self._tvar_expr_sym()
+        self._assert_par(t, sym, False, allow_unbound_tvars=True)
+        self._assert_engages(unbound_tvar=True, allow_unbound_tvars=True)
+
+    def test_unbound_tvar_not_allowed_defers(self) -> None:
+        # Unbound Tv when not allowed -> error tail.
+        t = UnboundType("mod.T")
+        sym = self._tvar_expr_sym()
+        self._assert_par(t, sym, False)
+
+    def test_enum_member_literal(self) -> None:
+        # Color.RED inside Literal[...] -> LiteralType.
+        t = UnboundType("mod.Color.RED")
+        enum_info = self.fx.make_type_info("mod.Color")
+        enum_info.is_enum = True
+        v = Var("RED")
+        v.has_explicit_value = True
+        v.type = self.fx.o
+        v.info = enum_info
+        enum_info.names["RED"] = SymbolTableNode(MDEF, v)
+        sym = SymbolTableNode(MDEF, v)
+        self._assert_par(t, sym, True)
+        self._assert_engages(is_enum_member=True, defining_literal=True)
+
+    def test_enum_member_outside_literal_defers(self) -> None:
+        # Color.RED outside Literal[...] -> raw-enum error, defer.
+        t = UnboundType("mod.Color.RED")
+        enum_info = self.fx.make_type_info("mod.Color")
+        enum_info.is_enum = True
+        v = Var("RED")
+        v.has_explicit_value = True
+        v.type = self.fx.o
+        v.info = enum_info
+        enum_info.names["RED"] = SymbolTableNode(MDEF, v)
+        sym = SymbolTableNode(MDEF, v)
+        self._assert_par(t, sym, False)
+
+    def test_plain_reference_defers(self) -> None:
+        # An unresolvable name (symbol with a mismatched node kind) ->
+        # message tail.
+        t = UnboundType("mod.not_a_type")
+        v = Var("not_a_type")
+        v.type = self.fx.o
+        sym = SymbolTableNode(MDEF, v)
+        self._assert_par(t, sym, False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEqualityValueInfoSuite(Suite):
     """Parity for the Rust `equality_value_info` port (mypy.checker).
 
