@@ -351,9 +351,11 @@ try:
         rust_is_unreachable_map as _rust_is_unreachable_map,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
+        rust_is_more_general_arg_prefix as _rust_is_more_general_arg_prefix,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
+        rust_overload_can_never_match as _rust_overload_can_never_match,
         rust_stmt_outcome as _rust_stmt_outcome,
         rust_try_handler_union as _rust_try_handler_union,
         rust_type_requires_usage as _rust_type_requires_usage,
@@ -381,6 +383,8 @@ except ImportError:
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
+    _rust_is_more_general_arg_prefix = None  # type: ignore[assignment]
+    _rust_overload_can_never_match = None  # type: ignore[assignment]
     _rust_type_requires_usage = None  # type: ignore[assignment]
     _rust_is_unreachable_map = None  # type: ignore[assignment]
     _rust_stmt_outcome = None  # type: ignore[assignment]
@@ -9988,6 +9992,25 @@ def overload_can_never_match(signature: CallableType, other: CallableType) -> bo
     # the below subtype check and (surprisingly?) `is_proper_subtype(Any, Any)`
     # returns `True`.
     # TODO: find a cleaner solution instead of this ad-hoc erasure.
+    # Native type_kernel seam: the non-generic Callable-vs-Callable fast path
+    # (the erase+expand is a no-op when there are no variables). Generic or
+    # non-callable operands defer to the pure-Python path below.
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            res = _rust_overload_can_never_match(
+                _serialize_type_for_checker(signature),
+                _serialize_type_for_checker(other),
+                state.strict_optional,
+                _native_checker_resolver,
+            )
+            if res is not None:
+                return res
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     exp_signature = expand_type(
         signature, {tvar.id: erase_def_to_union_or_bound(tvar) for tvar in signature.variables}
     )
@@ -10002,6 +10025,24 @@ def is_more_general_arg_prefix(t: FunctionLike, s: FunctionLike) -> bool:
     #      general than one with fewer items (or just one item)?
     if isinstance(t, CallableType):
         if isinstance(s, CallableType):
+            # Native type_kernel seam: Callable-vs-Callable fast path.
+            # Generic operands or the Overloaded branch defer to Python.
+            if (
+                _CHECKER_HAS_TYPE_KERNEL
+                and _native_checker_active
+                and _native_checker_resolver is not None
+            ):
+                try:
+                    res = _rust_is_more_general_arg_prefix(
+                        _serialize_type_for_checker(t),
+                        _serialize_type_for_checker(s),
+                        state.strict_optional,
+                        _native_checker_resolver,
+                    )
+                    if res is not None:
+                        return res
+                except (AssertionError, NotImplementedError, ValueError):
+                    pass
             return is_callable_compatible(
                 t, s, is_compat=is_proper_subtype, is_proper_subtype=True, ignore_return=True
             )

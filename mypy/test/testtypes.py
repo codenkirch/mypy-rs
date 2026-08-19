@@ -121,6 +121,7 @@ from mypy.types import (
     TypeOfAny,
     TypeType,
     TypeVarId,
+    TypeVarLikeType,
     TypeVarTupleType,
     TypeVarType,
     UnboundType,
@@ -4375,6 +4376,208 @@ class NativeDetachCallableSuite(Suite):
         assert isinstance(on, CallableType)  # type: ignore[misc]
         assert_equal(len(on.variables), 3)
         self._assert_engages(c, [self.fx.s, self.fx.u])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeOverloadNeverSuite(Suite):
+    """Parity for the Rust overload argument-prefix ports (mypy.checker).
+
+    `overload_can_never_match`, `is_more_general_arg_prefix` and
+    `is_same_arg_prefix` rest on the native `is_callable_compatible` engine
+    with the `is_more_precise` / `is_proper_subtype` / `is_same_type`
+    predicates. The Rust fast path covers the non-generic
+    Callable-vs-Callable branch only: a generic (non-empty `variables`)
+    operand defers, because Python unifies a generic left via
+    `unify_generic_callable` before the parameter check, and
+    `is_more_general_arg_prefix`'s Overloaded branch defers because the
+    FunctionLike zip stays in Python. Toggling the checker gate off (pure
+    Python) and on (Rust seam) must produce identical booleans, and a direct
+    seam call proves the Rust function engages rather than silently deferring
+    on the fast path.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_checker_active
+        self._set_resolver = _set_native_checker_resolver
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _callable(
+        self,
+        args: list[Type],
+        arg_kinds: list[ArgKind],
+        ret: Type,
+        variables: list[TypeVarLikeType] | None = None,
+    ) -> CallableType:
+        return CallableType(
+            args,
+            arg_kinds,
+            [None] * len(args),
+            ret,
+            self.fx.function,
+            variables=variables or [],
+        )
+
+    def _par_bool(self, fn: Callable[[], bool], label: str) -> bool:
+        off = self._with_gate(False, fn)
+        assert isinstance(off, bool)
+        on = self._with_gate(True, fn)
+        assert isinstance(on, bool)
+        assert_equal(on, off, f"{label} parity")
+        return on
+
+    def test_overload_never_match_broader(self) -> None:
+        from mypy.checker import overload_can_never_match
+
+        broader = self._callable([self.fx.o], [ARG_POS], self.fx.o)
+        narrower = self._callable([self.fx.b], [ARG_POS], self.fx.o)
+        result = self._par_bool(
+            lambda: overload_can_never_match(broader, narrower), "overload_can_never_match"
+        )
+        # (object) is strictly broader than (B): the (B) overload can never
+        # be matched.
+        assert_equal(result, True)
+        self._assert_overload_engages(broader, narrower)
+
+    def test_overload_never_match_not_broader(self) -> None:
+        from mypy.checker import overload_can_never_match
+
+        narrower = self._callable([self.fx.b], [ARG_POS], self.fx.o)
+        broader = self._callable([self.fx.o], [ARG_POS], self.fx.o)
+        result = self._par_bool(
+            lambda: overload_can_never_match(narrower, broader), "overload_can_never_match"
+        )
+        assert_equal(result, False)
+
+    def test_overload_never_match_generic_defers(self) -> None:
+        from mypy.checker import overload_can_never_match
+
+        # signature carries a type var: the erase+expand / unify path defers
+        # to Python, but on==off must still hold.
+        sig = self._callable([self.fx.t], [ARG_POS], self.fx.o, variables=[self.fx.t])
+        other = self._callable([self.fx.o], [ARG_POS], self.fx.o)
+        self._par_bool(lambda: overload_can_never_match(sig, other), "overload_can_never_match")
+        # The raw seam must defer (return None) on the generic operand.
+        from mypy.checker import _serialize_type_for_checker
+
+        raw = _type_kernel.rust_overload_can_never_match(
+            _serialize_type_for_checker(sig),
+            _serialize_type_for_checker(other),
+            state.strict_optional,
+            self.resolver,
+        )
+        assert raw is None, "Rust overload_can_never_match should defer on generic signature"
+
+    def test_is_more_general_arg_prefix_wider(self) -> None:
+        from mypy.checker import is_more_general_arg_prefix
+
+        wider = self._callable([self.fx.o, self.fx.o], [ARG_POS, ARG_POS], self.fx.o)
+        narrower = self._callable([self.fx.b, self.fx.a], [ARG_POS, ARG_POS], self.fx.o)
+        result = self._par_bool(
+            lambda: is_more_general_arg_prefix(wider, narrower), "is_more_general_arg_prefix"
+        )
+        assert_equal(result, True)
+        self._assert_prefix_engages(wider, narrower)
+
+    def test_is_more_general_arg_prefix_narrower(self) -> None:
+        from mypy.checker import is_more_general_arg_prefix
+
+        wider = self._callable([self.fx.o, self.fx.o], [ARG_POS, ARG_POS], self.fx.o)
+        narrower = self._callable([self.fx.b, self.fx.a], [ARG_POS, ARG_POS], self.fx.o)
+        result = self._par_bool(
+            lambda: is_more_general_arg_prefix(narrower, wider), "is_more_general_arg_prefix"
+        )
+        assert_equal(result, False)
+
+    def test_is_more_general_arg_prefix_overloaded_defers(self) -> None:
+        from mypy.checker import is_more_general_arg_prefix
+
+        t_items = [
+            self._callable([self.fx.o], [ARG_POS], self.fx.o),
+            self._callable([self.fx.a], [ARG_POS], self.fx.o),
+        ]
+        s_items = [
+            self._callable([self.fx.b], [ARG_POS], self.fx.o),
+            self._callable([self.fx.a], [ARG_POS], self.fx.o),
+        ]
+        t = Overloaded(t_items)
+        s = Overloaded(s_items)
+        # The Overloaded (FunctionLike) branch stays in Python; on==off holds
+        # and the raw Callable-vs-Callable seam defers on an Overloaded.
+        result = self._par_bool(
+            lambda: is_more_general_arg_prefix(t, s), "is_more_general_arg_prefix"
+        )
+        assert isinstance(result, bool)
+
+    def test_is_same_arg_prefix_parity(self) -> None:
+        from mypy.checker import _serialize_type_for_checker, is_same_arg_prefix
+
+        same = self._callable([self.fx.b], [ARG_POS], self.fx.o)
+        other = self._callable([self.fx.o], [ARG_POS], self.fx.o)
+
+        def raw(t: CallableType, s: CallableType) -> bool | None:
+            return _type_kernel.rust_is_same_arg_prefix(
+                _serialize_type_for_checker(t),
+                _serialize_type_for_checker(s),
+                state.strict_optional,
+                self.resolver,
+            )
+
+        def via_fn(t: CallableType, s: CallableType) -> bool:
+            return is_same_arg_prefix(t, s)
+
+        # Equal args -> True, with the covariant is_same_type check.
+        assert_equal(self._par_bool(lambda: via_fn(same, same), "is_same_arg_prefix"), True)
+        assert raw(same, same) is not None, "Rust is_same_arg_prefix did not engage"
+        # Different args -> False.
+        assert_equal(self._par_bool(lambda: via_fn(same, other), "is_same_arg_prefix"), False)
+        assert raw(same, other) is not None, "Rust is_same_arg_prefix did not engage"
+
+    def _assert_overload_engages(self, sig: CallableType, other: CallableType) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_overload_can_never_match(
+            _serialize_type_for_checker(sig),
+            _serialize_type_for_checker(other),
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, "Rust overload_can_never_match did not engage"
+
+    def _assert_prefix_engages(self, t: CallableType, s: CallableType) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_is_more_general_arg_prefix(
+            _serialize_type_for_checker(t),
+            _serialize_type_for_checker(s),
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, "Rust is_more_general_arg_prefix did not engage"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

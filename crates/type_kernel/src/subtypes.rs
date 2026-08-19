@@ -1627,7 +1627,7 @@ pub(crate) fn rust_try_restrict_literal_union(
 /// The `get_proper_type` expansion is handled by the wire format (the
 /// Python shim serializes after expansion). `ignore_promotions` flows
 /// into the `SubtypeContext`.
-fn is_more_precise(
+pub(crate) fn is_more_precise(
     left: &Type,
     right: &Type,
     ignore_promotions: bool,
@@ -1724,7 +1724,7 @@ pub(crate) fn rust_is_equivalent(
 /// Fast path 2 (TypeVarType): same `raw_id`+`namespace` and same
 /// `upper_bound` -> True.
 /// General: `is_proper_subtype(a, b) and is_proper_subtype(b, a)`.
-fn is_same_type(
+pub(crate) fn is_same_type(
     a: &Type,
     b: &Type,
     ignore_promotions: bool,

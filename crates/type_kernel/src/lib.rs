@@ -92,6 +92,7 @@ mod modulefinder;
 mod mro;
 mod operators;
 mod overload;
+mod overload_never;
 mod partially_defined;
 mod plugin_helpers;
 mod plugin_hooks;
@@ -2472,6 +2473,22 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // variables it uses (mypy.checker).
     module.add_function(wrap_pyfunction!(
         detach_callable::rust_detach_callable,
+        module
+    )?)?;
+
+    // overload_never: overload argument-prefix compatibility per the
+    // Callable-vs-Callable fast paths (mypy.checker). Generic/Overloaded
+    // operands defer to Python.
+    module.add_function(wrap_pyfunction!(
+        overload_never::rust_overload_can_never_match,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        overload_never::rust_is_more_general_arg_prefix,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        overload_never::rust_is_same_arg_prefix,
         module
     )?)?;
 
