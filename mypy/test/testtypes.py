@@ -110,6 +110,7 @@ from mypy.types import (
     CallableType,
     DeletedType,
     ErasedType,
+    FunctionLike,
     Instance,
     LiteralType,
     NoneType,
@@ -3469,6 +3470,163 @@ class NativeMapTypeFromSupertypeSuite(Suite):
             True,
         )
         assert result is not None, "Rust map_type_from_supertype did not engage"
+        assert isinstance(bytes(result), bytes)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeObjectTypeSuite(Suite):
+    """Parity for the Rust `type_object_type_from_function` composite seam
+    (mypy.typeops.type_object_type_from_function, issue #492 family).
+
+    The Python body composes (in order): the non-generic `bind_self` strip,
+    `map_type_from_supertype` from `def_info`'s frame into `info`'s frame,
+    and the per-item `class_callable` assembly. Rust mirrors the whole path
+    in one call returning the wire `FunctionLike`; the Python shim rebuilds
+    each callable through `copy_modified` so non-wire fields (special_sig,
+    instance_type, definition, line/column) survive. Toggling the typeops
+    gate off (pure Python) and on (Rust composite) must produce an
+    identical result (`str` and structure) for signatures that engage, and
+    a direct seam call proves the seam actually engages rather than
+    silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                self._type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _init_sig(
+        self, info: TypeInfo, def_info: TypeInfo, is_new: bool = False
+    ) -> CallableType:
+        # A minimal __init__/__new__ signature: one positional self (bound
+        # instance) and a `None` return. `info` may differ from `def_info`
+        # (supertype __init__), matching production.
+        self_param = Instance(def_info, [])
+        fallback = self.fx.type_type if is_new else self.fx.function
+        ret = self.fx.o if is_new else NoneType()
+        return CallableType(
+            [self_param],
+            [ARG_POS],
+            [None],
+            ret,
+            fallback,
+            name="<init>",
+        )
+
+    def _type_object(self, sig: CallableType, info: TypeInfo, is_new: bool) -> FunctionLike:
+        from mypy.typeops import type_object_type_from_function
+
+        return type_object_type_from_function(sig, info, info, self.fx.type_type, is_new)
+
+    def _with_gate(self, active: bool, fn: Callable[[], FunctionLike]) -> FunctionLike:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(self, sig: CallableType, info: TypeInfo, is_new: bool = False) -> None:
+        off = self._with_gate(False, lambda: self._type_object(sig, info, is_new))
+        on = self._with_gate(True, lambda: self._type_object(sig, info, is_new))
+        assert_equal(str(on), str(off), f"type_object_type parity {sig}")
+
+    def test_baseline_gate_off(self) -> None:
+        # Non-generic class: the bound result is (Instance(A)) -> A with the
+        # type-object fallback and empty variables.
+        result = self._with_gate(
+            False, lambda: self._type_object(self._init_sig(self.fx.ai, self.fx.ai), self.fx.ai, False)
+        )
+        assert result.ret_type == Instance(self.fx.ai, [])
+        assert list(result.variables) == []
+
+    def test_parity_non_generic_init(self) -> None:
+        # class A: def __init__(self) -> None
+        self._assert_par(self._init_sig(self.fx.ai, self.fx.ai), self.fx.ai)
+
+    def test_parity_generic_class_var(self) -> None:
+        # class G(Generic[T]): def __init__(self, x: T) -> None. The bound
+        # callable carries G's type variable; the seam must not defer on the
+        # generic def. (bind_self strip happens before the wire, so the
+        # signature passed in is already bound.)
+        sig = CallableType(
+            [self.fx.gt, self.fx.t],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            NoneType(),
+            self.fx.function,
+            name="<init>",
+        )
+        self._assert_par(sig, self.fx.gi)
+
+    def test_parity_classmethod_new(self) -> None:
+        # A classmethod `__new__`: the self param is dropped and the ret is
+        # the instance type.
+        self._assert_par(
+            self._init_sig(self.fx.ai, self.fx.ai, is_new=True), self.fx.ai, is_new=True
+        )
+
+    def test_parity_supertype_init(self) -> None:
+        # class B(A): __init__ inherited from A. def_info=A, info=B: the
+        # supertype mapping must map A's frame to B.
+        sig = CallableType(
+            [Instance(self.fx.ai, [])],
+            [ARG_POS],
+            [None],
+            NoneType(),
+            self.fx.function,
+            name="<init>",
+        )
+        self._assert_par(sig, self.fx.bi)
+
+    def test_parity_definition_defers(self) -> None:
+        # An __init__ signature carrying a FuncDef `definition` node: the wire
+        # round-trip drops it, breaking error formatting that names the function.
+        # The `_needs_python` guard defers to pure Python, so gate on/off agree.
+        sig = self._init_sig(self.fx.ai, self.fx.ai)
+        sig = sig.copy_modified(definition=FuncDef("__init__"))
+        self._assert_par(sig, self.fx.ai)
+
+    def test_seam_engages_direct(self) -> None:
+        # Call the Rust seam directly (no Python shim) and confirm it returns
+        # a wire type (not None) for a default __init__.
+        import type_kernel as _tk
+
+        from mypy.typeops import _serialize_type
+
+        info = self.fx.ai
+        sig = self._init_sig(info, info)
+        result = _tk.rust_type_object_type_from_function(
+            _serialize_type(sig),
+            info,
+            info,
+            _serialize_type(self.fx.type_type),
+            False,
+            True,
+            self._resolver,
+        )
+        assert result is not None, "Rust type_object_type_from_function did not engage"
         assert isinstance(bytes(result), bytes)
 
 

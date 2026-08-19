@@ -1673,7 +1673,7 @@ pub(crate) fn rust_is_more_precise(
 /// `is_equivalent` (subtypes.py:277-300): a <: b AND b <: a (non-proper
 /// subtype both ways). The Python shim handles `get_proper_type` and
 /// the `left == right` fast path before calling Rust.
-fn is_equivalent(
+pub(crate) fn is_equivalent(
     a: &Type,
     b: &Type,
     ignore_type_params: bool,

@@ -410,6 +410,48 @@ def is_valid_constructor(n: SymbolNode | None) -> bool:
 def type_object_type_from_function(
     signature: FunctionLike, info: TypeInfo, def_info: TypeInfo, fallback: Instance, is_new: bool
 ) -> FunctionLike:
+    # #492 composite seam: Rust mirrors the whole body on the wire signature.
+    # Unhandled shapes defer (None); the final object is rebuilt via copy_modified
+    # so non-wire fields (special_sig, def, line/col) survive.
+    special_sig_seam: str | None = "dict" if def_info.fullname == "builtins.dict" else None
+    default_ret_seam = fill_typevars(info)
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+        and not _needs_python(signature)
+    ):
+        try:
+            result = _type_kernel.rust_type_object_type_from_function(
+                _serialize_type(signature),
+                info,
+                def_info,
+                _serialize_type(fallback),
+                is_new,
+                state.strict_optional,
+                _native_typeops_resolver,
+            )
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None and isinstance(decoded, FunctionLike):
+                    if isinstance(decoded, CallableType):
+                        return decoded.copy_modified(
+                            special_sig=special_sig_seam,
+                            instance_type=default_ret_seam,
+                        )
+                    items = []
+                    for item in decoded.items:
+                        assert isinstance(item, CallableType)
+                        items.append(
+                            item.copy_modified(
+                                special_sig=special_sig_seam,
+                                instance_type=default_ret_seam,
+                            )
+                        )
+                    return Overloaded(items)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
+
     # We first need to record all non-trivial (explicit) self types in __init__,
     # since they will not be available after we bind them. Note, we use explicit
     # self-types only in the defining class, similar to __new__ (but not exactly the same,

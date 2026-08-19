@@ -26,6 +26,8 @@ use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 use crate::setops;
 use crate::subtypes::SubtypeContext;
 
+/// `ArgKind.ARG_POS` = 0 (nodes.py).
+const ARG_POS: i64 = 0;
 /// `ArgKind.ARG_STAR` = 2 (checkmember.rs:52).
 const ARG_STAR: i64 = 2;
 /// `ArgKind.ARG_STAR2` = 4 (checkmember.rs:54).
@@ -1153,6 +1155,27 @@ pub(crate) fn rust_map_type_from_supertype(
     strict_optional: bool,
 ) -> Option<Vec<u8>> {
     let typ = decode_type(type_bytes)?;
+    let mapped =
+        map_type_from_supertype_inner(py, resolver, &typ, sub_info, super_info, strict_optional)?;
+    encode_type(&mapped)
+}
+
+/// Shared body of `rust_map_type_from_supertype` (typeops.py:552-578).
+///
+/// Extracted so the `type_object_type_from_function` composite seam can map
+/// a bound `__init__`/`__new__` signature from `sub_info`'s frame into
+/// `super_info`'s frame without a second decode/encode round-trip. The
+/// `is_new` generic fallback (a `bool` passed by Python) is
+/// `type_object_type_from_function`-specific and does not affect the map
+/// body itself.
+fn map_type_from_supertype_inner(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    typ: &Type,
+    sub_info: &PyAny,
+    super_info: &PyAny,
+    strict_optional: bool,
+) -> Option<Type> {
     let mut inst = fill_typevars_inner(py, sub_info)?;
     // Step 2: named tuples and plain tuples get an element-preserving
     // fallback so the subsequent map/expand see a real Instance frame.
@@ -1198,13 +1221,12 @@ pub(crate) fn rust_map_type_from_supertype(
         last_known_value: None,
         extra_attrs: None,
     };
-    let expanded = crate::expandtype::expand_type_by_instance_core(
-        &typ,
+    crate::expandtype::expand_type_by_instance_core(
+        typ,
         &inst,
         resolver.resolver(),
         strict_optional,
-    )?;
-    encode_type(&expanded)
+    )
 }
 
 /// `mypy.typeops.coerce_to_literal` (typeops.py:1629-1645): recursively
@@ -1582,6 +1604,302 @@ pub(crate) fn rust_class_callable(
         var_bytes.push(encode_type(v)?);
     }
     Some((ret_bytes, var_bytes))
+}
+
+// ---------------------------------------------------------------------------
+// type_object_type / type_object_type_from_function (typeops.py:283-394, 410-460)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeops.get_self_type` (typeops.py:273-281): the explicit self type
+/// of `func` in `def_info`, or `None` when the signature has no explicit
+/// self annotation.
+///
+/// Mirrors the Python body exactly:
+///   default_self = fill_typevars(def_info)
+///   if isinstance(get_proper_type(func.ret_type), UninhabitedType):
+///       return func.ret_type
+///   elif func.arg_types and func.arg_types[0] != default_self
+///        and func.arg_kinds[0] == ARG_POS:
+///       return func.arg_types[0]
+///   else:
+///       return None
+///
+/// The `arg_types[0] != default_self` inequality is the wire-format
+/// structural equality of `Type` — `Type.__eq__` on Instance compares
+/// `type == type` (TypeInfo identity), which the wire `type_ref` string
+/// round-trips as equal fullnames.
+///
+/// Returns the outer `Some` with:
+///   * `Some(typ)` — an explicit self type (Python returns `func.arg_types[0]`
+///     or `func.ret_type`).
+///   * `None` — no explicit self (Python returns `None`).
+///
+/// The outer `None` means Rust could not decide and the whole composite
+/// defers to Python.
+fn get_self_type(py: Python<'_>, func: &Type, def_info: &PyAny) -> Option<Option<Type>> {
+    let Type::CallableType {
+        arg_types,
+        arg_kinds,
+        ret_type,
+        ..
+    } = func
+    else {
+        return None;
+    };
+    let default_self = fill_typevars_inner(py, def_info)?;
+    if matches!(ret_type.as_ref(), Type::UninhabitedType { .. }) {
+        // `isinstance(get_proper_type(func.ret_type), UninhabitedType)`:
+        // the wire ret_type is already the proper type (an alias would be a
+        // TypeAliasType, which the wire format carries as, well, alias).
+        return Some(Some((**ret_type).clone()));
+    }
+    if !arg_types.is_empty() && arg_types[0] != default_self && arg_kinds.first() == Some(&ARG_POS)
+    {
+        return Some(Some(arg_types[0].clone()));
+    }
+    Some(None)
+}
+
+/// `mypy.typeops.type_object_type_from_function` (typeops.py:410-460).
+///
+/// Composite seam mirroring the whole Python body:
+///   1. `orig_self_types = [get_self_type(it, def_info) for it in
+///      signature.items]` unless `is_new or info.is_newtype` (then all
+///      `None`).
+///   2. `signature = bind_self(signature, original_type=fill_typevars(info),
+///      is_classmethod=is_new, ignore_instances=True)` — the non-generic
+///      fast path (`bind_self_inner`); generic signatures with type
+///      variables defer.
+///   3. `signature = map_type_from_supertype(signature, info, def_info)`.
+///   4. `special_sig = "dict"` when `def_info.fullname == "builtins.dict"`.
+///   5. For each callable item, `class_callable(item, info, def_info,
+///      fallback, special_sig, is_new, orig_self)` — assembling the wire
+///      CallableType (ret_type/variables decided by `class_callable_inner`,
+///      instance_type = fill_typevars(info), name = info.name).
+///
+/// The MRO walk that selects `__init__` vs `__new__` and the
+/// `is_valid_constructor` checks stay in Python (`type_object_type`); this
+/// seam takes the `is_new` decision and the already-selected `signature`.
+/// Returns the fully-assembled wire `FunctionLike` (CallableType or
+/// Overloaded), or `None` to defer to the pure-Python body.
+#[pyfunction]
+#[pyo3(signature = (signature_bytes, info, def_info, fallback_bytes, is_new, strict_optional, resolver))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_type_object_type_from_function(
+    py: Python<'_>,
+    signature_bytes: &[u8],
+    info: &PyAny,
+    def_info: &PyAny,
+    fallback_bytes: &[u8],
+    is_new: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let signature = decode_type(signature_bytes)?;
+    let fallback = decode_type(fallback_bytes)?;
+    // 1. orig_self_types
+    let is_newtype = read_bool_attr(info, "is_newtype").unwrap_or(false);
+    let orig_self_types: Vec<Option<Type>> = if is_new || is_newtype {
+        match &signature {
+            Type::CallableType { .. } => vec![None],
+            Type::Overloaded { items } => vec![None; items.len()],
+            _ => return None,
+        }
+    } else {
+        match &signature {
+            Type::CallableType { .. } => vec![get_self_type(py, &signature, def_info)?],
+            Type::Overloaded { items } => items
+                .iter()
+                .map(|it| get_self_type(py, it, def_info))
+                .collect::<Option<Vec<_>>>()?,
+            _ => return None,
+        }
+    };
+    // 2. bind_self non-generic fast path. Python's bind_self with
+    // `ignore_instances=True` takes the strip path for signature without
+    // type variables; generic signatures (needing infer_type_arguments)
+    // defer.
+    let bound = bind_self_overloaded(&signature)?;
+    // 3. map the bound signature from def_info's frame into info's frame.
+    let mapped =
+        map_type_from_supertype_inner(py, resolver, &bound, info, def_info, strict_optional)?;
+    // instance_type = fill_typevars(info) for the class_callable assembly.
+    let default_ret = fill_typevars_inner(py, info)?;
+    // 5. class_callable per item.
+    let result = match &mapped {
+        Type::CallableType { .. } => class_callable_item_wire(
+            py,
+            &mapped,
+            &orig_self_types[0],
+            info,
+            def_info,
+            &default_ret,
+            &fallback,
+            is_new,
+            strict_optional,
+            resolver,
+        )?,
+        Type::Overloaded { items } => {
+            let mut built = Vec::with_capacity(items.len());
+            for (item, orig_self) in items.iter().zip(orig_self_types.iter()) {
+                built.push(class_callable_item_wire(
+                    py,
+                    item,
+                    orig_self,
+                    info,
+                    def_info,
+                    &default_ret,
+                    &fallback,
+                    is_new,
+                    strict_optional,
+                    resolver,
+                )?);
+            }
+            Type::Overloaded { items: built }
+        }
+        _ => return None,
+    };
+    encode_type(&result)
+}
+
+/// Apply `bind_self` to a `FunctionLike`, recursing into `Overloaded` items
+/// exactly like the Python body does.
+fn bind_self_overloaded(method: &Type) -> Option<Type> {
+    match method {
+        Type::CallableType { .. } => bind_self_inner(method),
+        Type::Overloaded { items } => {
+            let mut bound = Vec::with_capacity(items.len());
+            for item in items {
+                bound.push(bind_self_inner(item)?);
+            }
+            Some(Type::Overloaded { items: bound })
+        }
+        _ => None,
+    }
+}
+
+/// Assemble one wire `CallableType` for `class_callable` (typeops.py:448-459):
+/// pick `ret_type` + `variables` via `class_callable_inner`, then rebuild the
+/// callable with `fallback`, `name`, `special_sig`, and `instance_type` set.
+#[allow(clippy::too_many_arguments)]
+fn class_callable_item_wire(
+    py: Python<'_>,
+    item: &Type,
+    orig_self: &Option<Type>,
+    info: &PyAny,
+    def_info: &PyAny,
+    default_ret: &Type,
+    fallback: &Type,
+    is_new: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Type> {
+    let Type::CallableType { ret_type, .. } = item else {
+        return None;
+    };
+    // class_callable (typeops.py:478-501): explicit_type is the __init__
+    // ret_type for __new__, else the declared self type. Both are resolved
+    // through get_proper_type before the subtype checks; the wire format is
+    // already proper except for TypeAliasType, which defers.
+    let orig_self_proper = match orig_self {
+        Some(t) if !matches!(t, Type::TypeAliasType { .. }) => Some(t.clone()),
+        Some(_) => return None,
+        None => None,
+    };
+    let explicit = if is_new {
+        match ret_type.as_ref() {
+            Type::TypeAliasType { .. } => return None,
+            t => Some(t.clone()),
+        }
+    } else {
+        orig_self_proper
+    };
+    let is_eq = if is_new {
+        match &explicit {
+            Some(explicit) => crate::subtypes::is_equivalent(
+                &fill_typevars_inner(py, def_info)?,
+                explicit,
+                true,
+                strict_optional,
+                resolver.resolver(),
+            )?,
+            None => false,
+        }
+    } else {
+        false
+    };
+    let is_st = match &explicit {
+        Some(explicit)
+            if matches!(
+                explicit,
+                Type::Instance { .. }
+                    | Type::TupleType { .. }
+                    | Type::UninhabitedType { .. }
+                    | Type::LiteralType { .. }
+            ) && matches!(default_ret, Type::Instance { .. }) =>
+        {
+            let is_protocol = info.getattr("is_protocol").ok()?.extract::<bool>().ok()?;
+            if is_protocol {
+                false
+            } else {
+                crate::subtypes::is_subtype(
+                    explicit,
+                    default_ret,
+                    &SubtypeContext::new(true, false, false, false, false, strict_optional),
+                    resolver.resolver(),
+                )?
+            }
+        }
+        _ => false,
+    };
+    let (ret_type, variables) = class_callable_inner(
+        py,
+        &encode_type(item)?,
+        explicit.as_ref().and_then(encode_type).as_deref(),
+        &encode_type(default_ret)?,
+        is_new,
+        is_eq,
+        is_st,
+        info,
+    )?;
+    let name = info.getattr("name").ok()?.extract::<String>().ok()?;
+    let Type::CallableType {
+        arg_types,
+        arg_kinds,
+        arg_names,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type,
+        type_guard,
+        type_is,
+        ..
+    } = item
+    else {
+        return None;
+    };
+    Some(Type::CallableType {
+        fallback: Box::new(fallback.clone()),
+        instance_type: Some(Box::new(default_ret.clone())),
+        is_ellipsis_args: *is_ellipsis_args,
+        implicit: *implicit,
+        is_bound: *is_bound,
+        from_concatenate: *from_concatenate,
+        imprecise_arg_kinds: *imprecise_arg_kinds,
+        unpack_kwargs: *unpack_kwargs,
+        from_type_type: *from_type_type,
+        arg_types: arg_types.clone(),
+        arg_kinds: arg_kinds.clone(),
+        arg_names: arg_names.clone(),
+        ret_type: Box::new(ret_type),
+        name: Some(name),
+        variables,
+        type_guard: type_guard.clone(),
+        type_is: type_is.clone(),
+    })
 }
 
 /// Return `None` when any shape needs alias expansion or is not handled,
