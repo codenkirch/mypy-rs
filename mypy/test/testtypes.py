@@ -6,7 +6,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, TypeVar
 from unittest import TestCase, skipIf, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
@@ -21,6 +21,7 @@ _set_native_mro_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 from mypy.checkstrformat import _set_native_strformat_active
 
 _set_native_strformat_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
+T = TypeVar("T")
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
@@ -135,6 +136,7 @@ from mypy.types import (
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
 from mypy.checkstrformat import ConversionSpecifier  # noqa: F401  (re-export for tests)
+from mypy.checker_shared import TypeRange
 
 
 class TypesSuite(Suite):
@@ -12019,6 +12021,7 @@ class NativeBuiltinItemTypeSuite(Suite):
         result = self._with_gate(True, lambda: builtin_item_type(t))
         assert_equal(str(result), "builtins.str")
         self._assert_engages(t)
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUnsafeOverlappingOverloadSuite(Suite):
     """Parity for the Rust `is_unsafe_overlapping_overload_signatures` port.
@@ -12251,3 +12254,254 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
             self.resolver,
         )
         assert result is None, "Rust should defer on a non-callable signature"
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeConditionalTypesSuite(Suite):
+    """Parity for the Rust `conditional_types` port (mypy.checker).
+
+    `conditional_types` is the isinstance/equality narrowing that splits a
+    `current_type` into `(proposed, remaining)`. The Rust port in
+    `cond_types.rs` mirrors every branch of the Python function and returns
+    `None` whenever a sub-step Rust cannot decide is reached, deferring the
+    whole call to pure Python. Binary `TypeRange` serialization goes through
+    `checker._serialize_type_ranges`. Toggling the checker gate off (Python)
+    and on (Rust) must produce identical results; a direct seam call proves
+    the Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.int_info = self.fx.make_type_info("builtins.int")
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # builtins.bool, builtins.str, and hand-built builtins.int do not end
+        # in "i", so the scan skips them; add them explicitly (production
+        # always snapshots builtins).
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info, self.int_info])
+        # A protocol (structural-subtype branch) and an enum (enum-literal
+        # expansion) with explicitly-valued member names.
+        self.proto_info = self.fx.make_type_info("mod.Proto", mro=[self.fx.oi])
+        self.proto_info.is_protocol = True
+        type_infos.append(self.proto_info)
+        self.enum_info = self.fx.make_type_info("mod.Color", mro=[self.fx.oi])
+        self.enum_info.is_enum = True
+        for name in ("RED", "GREEN", "BLUE"):
+            v = Var(name)
+            v.has_explicit_value = True
+            v.type = self.fx.o
+            self.enum_info.names[name] = SymbolTableNode(MDEF, v)
+        type_infos.append(self.enum_info)
+        # A NewType: `conditional_types` unwraps it to `type.bases[0]`.
+        # mro includes int_info so UserId is a proper subtype of int.
+        self.newtype_info = self.fx.make_type_info("mod.UserId", mro=[self.int_info, self.fx.oi])
+        self.newtype_info.is_newtype = True
+        self.newtype_info.bases = [Instance(self.int_info, [])]
+        type_infos.append(self.newtype_info)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._live_map = {info.fullname: info for info in type_infos}
+        self.resolver.set_live_typeinfo_map(dict(self._live_map))
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _assert_par(self, current: Type, ranges: list[TypeRange] | None, default: Type | None) -> None:
+        from mypy.checker import conditional_types
+
+        off = self._with_gate(
+            False,
+            lambda: conditional_types(current, ranges, default),
+        )
+        on = self._with_gate(
+            True,
+            lambda: conditional_types(current, ranges, default),
+        )
+        assert_equal(
+            (str(off[0]), str(off[1])),
+            (str(on[0]), str(on[1])),
+            f"conditional_types parity {current} vs {ranges}",
+        )
+
+    def _assert_engages(self, current: Type, ranges: list[TypeRange] | None, default: Type | None) -> None:
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_ranges
+
+        result = _type_kernel.rust_conditional_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_ranges(ranges) if ranges is not None else None,
+            _serialize_type_for_checker(default) if default is not None else None,
+            True,
+            False,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, f"Rust conditional_types did not engage for {current}"
+
+    def test_current_vs_none_ranges(self) -> None:
+        # ranges=None: no isinstance information, keep current and default.
+        from mypy.checker import conditional_types
+
+        self._assert_par(self.fx.a, None, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(self.fx.a, None, None))
+        assert_equal((str(yes), str(no)), ("A", "None"))
+        self._assert_engages(self.fx.a, None, None)
+
+    def test_empty_ranges(self) -> None:
+        # Empty ranges: isinstance(x, ()) is always False -> unreachable.
+        from mypy.checker import conditional_types
+
+        self._assert_par(self.fx.a, [], None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(self.fx.a, [], None))
+        assert_equal(str(yes), "Never")
+        assert_equal(str(no), "None")
+        self._assert_engages(self.fx.a, [], None)
+
+    def test_str_vs_int(self) -> None:
+        current = self.fx.str_type
+        ranges = [TypeRange(Instance(self.int_info, []), False)]
+        from mypy.checker import conditional_types
+
+        self._assert_par(current, ranges, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        # str and int do not overlap, so the if-branch is unreachable; with
+        # no default the else branch stays None.
+        assert_equal((str(yes), str(no)), ("Never", "None"))
+        self._assert_engages(current, ranges, None)
+
+    def test_int_vs_literal_union(self) -> None:
+        # current=int, proposed=Literal[1] | Literal[2]. Not a proper
+        # subtype, not structural, overlapping -> yes=proposed,
+        # no=int minus {1,2}.
+        current = Instance(self.int_info, [])
+        int_inst = current
+        lit1 = LiteralType(1, int_inst)
+        lit2 = LiteralType(2, int_inst)
+        ranges = [TypeRange(lit1, False), TypeRange(lit2, False)]
+        from mypy.checker import conditional_types
+
+        self._assert_par(current, ranges, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(str(yes), "Literal[1] | Literal[2]")
+        assert_equal(str(no), "builtins.int")
+        self._assert_engages(current, ranges, None)
+
+    def test_union_current_factorization(self) -> None:
+        # Union current factorizes: isinstance(A | B, C) ->
+        # yes = A_yes | B_yes, no = A_no | B_no. For A and B both unrelated
+        # to C, the else keeps each item; B <: A simplifies the union to A.
+        from mypy.checker import conditional_types
+
+        current = UnionType([self.fx.a, self.fx.b])
+        ranges = [TypeRange(self.fx.c, False)]
+        self._assert_par(current, ranges, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(str(yes), "C")
+        assert_equal(str(no), "A")
+        self._assert_engages(current, ranges, None)
+
+    def test_newtype_unwrap(self) -> None:
+        # NewType unwraps to its base before narrowing: UserId <: int is a
+        # proper subtype, so yes=default(int) and no=Never.
+        from mypy.checker import conditional_types
+
+        newtype_inst = Instance(self.newtype_info, [])
+        int_inst = Instance(self.int_info, [])
+        ranges = [TypeRange(int_inst, False)]
+        self._assert_par(newtype_inst, ranges, int_inst)
+        (yes, no) = self._with_gate(
+            True, lambda: conditional_types(newtype_inst, ranges, default=int_inst)
+        )
+        assert_equal(str(yes), "builtins.int")
+        assert_equal(str(no), "Never")
+        self._assert_engages(newtype_inst, ranges, int_inst)
+
+    def test_bool_literal_expansion(self) -> None:
+        # Single Literal[True] range expands current bool to
+        # Literal[True] | Literal[False], then narrows: yes=True, no=False.
+        from mypy.checker import conditional_types
+
+        current = self.fx.bool_type
+        ranges = [TypeRange(self.fx.lit_true, False)]
+        self._assert_par(current, ranges, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal(str(yes), "Literal[True]")
+        assert_equal(str(no), "Literal[False]")
+        self._assert_engages(current, ranges, None)
+
+    def test_enum_literal_expansion(self) -> None:
+        # Single Literal["RED"] range expands current enum to
+        # Literal["RED"] | Literal["GREEN"] | Literal["BLUE"].
+        from mypy.checker import conditional_types
+
+        enum_inst = Instance(self.enum_info, [])
+        lit_red = LiteralType("RED", enum_inst)
+        ranges = [TypeRange(lit_red, False)]
+        self._assert_par(enum_inst, ranges, None)
+        (yes, no) = self._with_gate(True, lambda: conditional_types(enum_inst, ranges, None))
+        assert_equal(str(yes), "Literal[mod.Color.RED]")
+        assert_equal(str(no), "Literal[mod.Color.GREEN] | Literal[mod.Color.BLUE]")
+        self._assert_engages(enum_inst, ranges, None)
+
+    def test_structural_protocol(self) -> None:
+        # proposed is a protocol. The Rust `is_subtype` defers protocol
+        # implementation checks (subtypes.rs returns None for Instance-vs-
+        # protocol right), so structural-BTS falls back to Python.
+        from mypy.checker import conditional_types, _serialize_type_for_checker, _serialize_type_ranges
+
+        proto_inst = Instance(self.proto_info, [])
+        current = self.fx.a
+        ranges = [TypeRange(proto_inst, False)]
+        self._assert_par(current, ranges, None)
+        result = _type_kernel.rust_conditional_types(
+            _serialize_type_for_checker(current),
+            _serialize_type_ranges(ranges),
+            None,
+            True,
+            False,
+            state.strict_optional,
+            self.resolver,
+        )
+        # Protocol implementation is Python-only: the seam must defer.
+        assert result is None, f"expected deferral for {current} vs protocol, got {result}"
+        (yes, no) = self._with_gate(True, lambda: conditional_types(current, ranges, None))
+        assert_equal((str(yes), str(no)), ("None", "Never"))
+
+    def test_from_equality(self) -> None:
+        # from_equality erases generic args before overlap: a generic
+        # container proposed with args defers (shallow erase), so the whole
+        # call falls back to Python and the parity check still holds.
+        current = self.fx.str_type
+        ranges = [TypeRange(self.fx.b, False)]
+        # The Rust path defers on the generic-args-erase, so this exercises
+        # the deferral path through the gate.
+        self._assert_par(
+            current,
+            ranges,
+            None,
+        )

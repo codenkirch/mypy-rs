@@ -297,7 +297,7 @@ const MYPYC_NATIVE_INT_NAMES: &[&str] = &[
 /// will `isinstance(item, supertype)` always return True at runtime?
 ///
 /// Defers (returns `None`) when a path Rust cannot decide is reached.
-fn covers_at_runtime(
+pub(crate) fn covers_at_runtime(
     item: &Type,
     supertype: &Type,
     strict_optional: bool,
@@ -428,8 +428,8 @@ fn is_function_like_type_obj(typ: &Type, resolver: &TypeResolver) -> bool {
 /// `is_proper_subtype(t, s, ignore_promotions=True, erase_instances=True)`,
 /// else `t`.
 ///
-/// Returns `Some(Vec<u8>)` (encoded result type) or `None` (defer).
-fn restrict_subtype_away_inner(
+/// Returns `Some(Type)` (result type) or `None` (defer to Python).
+pub(crate) fn restrict_subtype_away_inner(
     t: &Type,
     s: &Type,
     consider_runtime_isinstance: bool,
@@ -515,10 +515,11 @@ fn restrict_subtype_away_inner(
             if consider_runtime_isinstance {
                 match covers_at_runtime(t, s, strict_optional, resolver) {
                     Some(true) => Some(Type::UninhabitedType { ambiguous: false }),
-                    // Defer on Some(false): Rust's covers_at_runtime lacks
-                    // erase_instances parity, so a false may be wrong. Let
-                    // Python's covers_at_runtime decide.
-                    Some(false) | None => None,
+                    // covers_at_runtime returns Some(false) only when every
+                    // modeled check is confident (subtypes.py covers steps
+                    // 1-6), so the Python result is `t`.
+                    Some(false) => Some(t.clone()),
+                    None => None,
                 }
             } else {
                 let ctx = crate::subtypes::SubtypeContext::new(

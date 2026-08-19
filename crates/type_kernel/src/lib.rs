@@ -65,6 +65,7 @@ mod checkpattern;
 mod checkstrformat;
 mod classmethod_static;
 mod comparison_group;
+mod cond_types;
 mod condmaps;
 mod constant_fold;
 mod constraints;
@@ -2534,6 +2535,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // element type, optional narrow).
     module.add_function(wrap_pyfunction!(
         builtin_item::rust_builtin_item_type,
+        module
+    )?)?;
+
+    // checker.conditional_types (the isinstance/equality narrowing split).
+    module.add_function(wrap_pyfunction!(
+        cond_types::rust_conditional_types,
         module
     )?)?;
 

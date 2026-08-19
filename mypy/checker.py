@@ -315,12 +315,18 @@ from mypy.visitor import NodeVisitor
 # _types_active type-returning. Rust returns None for TypeAliasType (no alias
 # target on the wire); Python falls back to get_proper_type + pure-Python.
 try:
-    from librt.internal import ReadBuffer as _CheckerReadBuffer, WriteBuffer as _CheckerWriteBuffer
+    from librt.internal import (
+        ReadBuffer as _CheckerReadBuffer,
+        WriteBuffer as _CheckerWriteBuffer,
+        write_bool as _checker_write_bool,
+        write_int as _checker_write_int,
+    )
     from type_kernel import (
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
+        rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
         rust_expand_callable_variants as _rust_expand_callable_variants,
@@ -383,6 +389,7 @@ except ImportError:
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
     _rust_builtin_item_type = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
+    _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
     _rust_is_unsafe_overlapping_overload_signatures = None  # type: ignore[assignment]
@@ -9280,6 +9287,22 @@ class CollectArgTypeVarTypes(TypeTraverserVisitor):
         self.arg_types.add(t)
 
 
+def _serialize_type_ranges(ranges: list[TypeRange]) -> bytes:
+    """Serialize `TypeRange` list for the native `conditional_types` seam.
+
+    Layout mirrors the `librt` tagged primitives: a bare count, then per
+    range the item's wire `Type` bytes followed by the `is_upper_bound`
+    flag, matching `_serialize_type_for_checker`'s use of `Item`-type
+    `.write(buf)`.
+    """
+    buf = _CheckerWriteBuffer()
+    _checker_write_int(buf, len(ranges))
+    for r in ranges:
+        r.item.write(buf)
+        _checker_write_bool(buf, r.is_upper_bound)
+    return buf.getvalue()
+
+
 @overload
 def conditional_types(
     current_type: Type,
@@ -9321,6 +9344,28 @@ def conditional_types(
         UninhabitedType means unreachable.
         None means no new information can be inferred.
     """
+    # Native fast path: the Rust port mirrors every branch below and defers
+    # (returns None) whenever a sub-step Rust cannot decide is reached.
+    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
+        try:
+            raw = _rust_conditional_types(
+                _serialize_type_for_checker(current_type),
+                _serialize_type_ranges(proposed_type_ranges)
+                if proposed_type_ranges is not None
+                else None,
+                _serialize_type_for_checker(default) if default is not None else None,
+                consider_runtime_isinstance,
+                from_equality,
+                state.strict_optional,
+                _native_checker_resolver,
+            )
+            if raw is not None:
+                yes, no = raw
+                yes_typ = _deserialize_type_from_checker(bytes(yes)) if yes is not None else None
+                no_typ = _deserialize_type_from_checker(bytes(no)) if no is not None else None
+                return yes_typ, no_typ
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if proposed_type_ranges is None:
         # An isinstance check, but we don't understand the type
         return current_type, default
