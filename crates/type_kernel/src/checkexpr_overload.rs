@@ -13,13 +13,15 @@
 //! mirroring the `rust_check_callable_call` seam. `from_type_type` rides the
 //! wire since issue #388.
 //!
-//! Also ports `merge_typevars_in_callables_by_name` (checkexpr.py:8138-8197)
+//! Also ports `merge_typevars_in_callables_by_name` (checkexpr.py:8309-8351)
 //! via the freshen+expand machinery in `freshen.rs`/`expandtype.rs`:
 //! each generic callable's declared `TypeVarType`s are freshened to fresh
 //! unification variables (id >= `start_raw_id`, meta_level 1), the first
 //! per-`fullname` fresh var becomes the exemplar, and all other same-named
 //! vars are renamed to it by expanding with a `(raw_id, meta_level,
-//! namespace) -> Type` env.
+//! namespace) -> Type` env. The same machinery backs the standalone
+//! `rust_merge_typevars_in_callables_by_name` seam used by the caller before
+//! the union logic below.
 //!
 //! Deferred (return None): not all items CallableType, `len(types) == 1`,
 //! a generic callable whose declared variables include a non-`TypeVarType`
@@ -537,4 +539,78 @@ pub(crate) fn rust_combine_function_signatures(
         return Ok(None);
     };
     Ok(Some((next_id, encoded)))
+}
+
+// ---------------------------------------------------------------------------
+// rust_merge_typevars_in_callables_by_name (checkexpr.py:8309-8351)
+// ---------------------------------------------------------------------------
+
+/// Result blob for `rust_merge_typevars_in_callables_by_name`:
+/// `(next_raw_id, merged callables bytes, distinct typevar exemplar bytes)`.
+type MergeTypevarsResult = (i64, Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+/// `#[pyfunction]` entry for `merge_typevars_in_callables_by_name`
+/// (checkexpr.py:8309-8351). For each generic callable, freshens its declared
+/// type vars to fresh unification variables, collapses same-named
+/// `TypeVarType`s across callables to a shared exemplar, and renames to it.
+/// Non-generic callables pass through unchanged.
+///
+/// Inputs:
+///   * `types_bytes` — serialized `list[CallableType]`.
+///   * `start_raw_id` — `TypeVarId.next_raw_id` at call time; freshened vars
+///     get ids >= this. Python advances the global to at least `next_raw_id`.
+///   * `strict_optional` — forwarded to `expand_type_inner`.
+///
+/// Returns `Some(MergeTypevarsResult)` or `None` to defer to Python
+/// (non-CallableType input, ParamSpec/TypeVarTuple appearance, or any
+/// `expand_type_inner` deferral).
+#[pyfunction]
+pub(crate) fn rust_merge_typevars_in_callables_by_name(
+    types_bytes: Vec<Vec<u8>>,
+    start_raw_id: i64,
+    strict_optional: bool,
+) -> PyResult<Option<MergeTypevarsResult>> {
+    let mut callables: Vec<Type> = Vec::with_capacity(types_bytes.len());
+    for bytes in &types_bytes {
+        let Some(t) = decode_type(bytes) else {
+            return Ok(None);
+        };
+        if !matches!(t, Type::CallableType { .. }) {
+            return Ok(None);
+        }
+        callables.push(t);
+    }
+
+    let mut unique_typevars: HashMap<String, Type> = HashMap::new();
+    let mut variables: Vec<Type> = Vec::new();
+    let mut next_id = start_raw_id;
+    let mut merged: Vec<Type> = Vec::with_capacity(callables.len());
+    for target in &callables {
+        let Some(m) = merge_freshen_and_rename(
+            target,
+            &mut unique_typevars,
+            &mut variables,
+            &mut next_id,
+            strict_optional,
+        ) else {
+            return Ok(None);
+        };
+        merged.push(m);
+    }
+
+    let mut callables_out: Vec<Vec<u8>> = Vec::with_capacity(merged.len());
+    for m in &merged {
+        let Some(b) = encode_type(m) else {
+            return Ok(None);
+        };
+        callables_out.push(b);
+    }
+    let mut typevars_out: Vec<Vec<u8>> = Vec::with_capacity(variables.len());
+    for v in &variables {
+        let Some(b) = encode_type(v) else {
+            return Ok(None);
+        };
+        typevars_out.push(b);
+    }
+    Ok(Some((next_id, callables_out, typevars_out)))
 }

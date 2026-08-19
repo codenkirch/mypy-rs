@@ -9850,6 +9850,197 @@ class NativeCombineSignaturesSuite(Suite):
         assert res is None
 
 
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeMergeTypevarsSuite(Suite):
+    """Differential parity for `merge_typevars_in_callables_by_name`.
+
+    The Rust seam `rust_merge_typevars_in_callables_by_name` freshens each
+    generic callable's declared type vars and collapses same-named
+    TypeVarType across callables to a shared exemplar. We call the Rust
+    kernel directly, decode via `_deserialize_type_from_checkexpr`, and
+    compare against the pure-Python `merge_typevars_in_callables_by_name`
+    run with the checkexpr and expandtype gates off (the Python oracle).
+    Rust defers (None) on ParamSpec/TypeVarTuple appearance, so those
+    inputs assert deferral.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.test.typefixture import TypeFixture
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._tk = _tk
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        ret: Type,
+        variables: list[Type] | None = None,
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            ret,
+            self.fx.function,
+            variables=variables or [],  # type: ignore[arg-type]
+        )
+
+    def _tvar(self, name: str, raw_id: int) -> TypeVarType:
+        default = AnyType(TypeOfAny.from_omitted_generics)
+        return TypeVarType(name, f"mod.{name}", TypeVarId(raw_id), [], self.fx.o, default)
+
+    def _py_oracle(
+        self, callables: list[CallableType]
+    ) -> tuple[list[CallableType], list[TypeVarType]]:
+        from mypy.checkexpr import merge_typevars_in_callables_by_name
+
+        self._set_active(False)
+        old_expand = mypy.expandtype._native_expand_type_active
+        try:
+            mypy.expandtype._set_native_expand_type_active(False)
+            return merge_typevars_in_callables_by_name(callables)
+        finally:
+            mypy.expandtype._set_native_expand_type_active(old_expand)
+            self._set_active(True)
+
+    def _assert_par(self, callables: list[CallableType]) -> None:
+        expected_output, expected_vars = self._py_oracle(callables)
+        res = self._tk.rust_merge_typevars_in_callables_by_name(
+            [self._bytes_of(c) for c in callables],
+            TypeVarId.next_raw_id,
+            True,
+        )
+        assert res is not None, f"rust merge deferred for {callables!r}"
+        next_raw_id, callables_bytes, typevars_bytes = res
+        TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
+        from mypy.checkexpr import _deserialize_type_from_checkexpr
+
+        output = [_deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes]
+        variables = [_deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes]
+        assert all(isinstance(c, CallableType) for c in output)  # type: ignore[misc]
+        assert all(isinstance(v, TypeVarType) for v in variables)  # type: ignore[misc]
+        # str() renders the signature including typevar names, so equality is
+        # a full oracle check per callable and per distinct typevar.
+        assert len(output) == len(expected_output)
+        for got, want in zip(output, expected_output):
+            assert str(got) == str(want), f"rust {got!r} != py {want!r}"
+        assert len(variables) == len(expected_vars)
+        for got, want in zip(variables, expected_vars):
+            assert str(got) == str(want), f"rust var {got!r} != py var {want!r}"
+
+    def test_two_callables_sharing_typevar(self) -> None:
+        # Both use `T` with different ids; merge must collapse to one exemplar.
+        t1 = self._tvar("T", 1)
+        t2 = self._tvar("T", 2)
+        call1 = self._callable([t1], t1, variables=[t1])
+        call2 = self._callable([t2], t2, variables=[t2])
+        self._assert_par([call1, call2])
+
+    def test_disjoint_typevars(self) -> None:
+        # T and S are unrelated names; both survive as distinct exemplars.
+        t1 = self._tvar("T", 1)
+        s1 = self._tvar("S", 2)
+        call1 = self._callable([t1], t1, variables=[t1])
+        call2 = self._callable([s1], s1, variables=[s1])
+        self._assert_par([call1, call2])
+
+    def test_two_typevars_shared_across_callables(self) -> None:
+        # Both callables declare T and S; both pairs collapse to exemplars.
+        t1, s1 = self._tvar("T", 1), self._tvar("S", 2)
+        t2, s2 = self._tvar("T", 3), self._tvar("S", 4)
+        call1 = self._callable([t1, s1], t1, variables=[t1, s1])
+        call2 = self._callable([t2, s2], t2, variables=[t2, s2])
+        self._assert_par([call1, call2])
+
+    def test_mixed_generic_and_non_generic(self) -> None:
+        t1 = self._tvar("T", 1)
+        t2 = self._tvar("T", 2)
+        call1 = self._callable([t1], t1, variables=[t1])
+        call2 = self._callable([self.fx.a], self.fx.b)
+        call3 = self._callable([t2], t2, variables=[t2])
+        self._assert_par([call1, call2, call3])
+
+    def test_single_generic_callable(self) -> None:
+        t1 = self._tvar("T", 1)
+        self._assert_par([self._callable([t1], t1, variables=[t1])])
+
+    def test_empty_input(self) -> None:
+        res = self._tk.rust_merge_typevars_in_callables_by_name(
+            [], TypeVarId.next_raw_id, True
+        )
+        assert res is not None
+        _, callables_bytes, typevars_bytes = res
+        assert callables_bytes == [] and typevars_bytes == []
+
+    def test_paramspec_deferred(self) -> None:
+        # A generic callable whose declared variables include a ParamSpec
+        # defers to Python so output is never partial.
+        ps = ParamSpecType(
+            name="P",
+            fullname="P",
+            id=TypeVarId(-1),
+            flavor=ParamSpecFlavor.BARE,
+            upper_bound=self.fx.o,
+            default=AnyType(TypeOfAny.from_omitted_generics),
+        )
+        t1 = self._tvar("T", 1)
+        call1 = self._callable([t1], t1, variables=[t1, ps])
+        res = self._tk.rust_merge_typevars_in_callables_by_name(
+            [self._bytes_of(call1)], TypeVarId.next_raw_id, True
+        )
+        assert res is None
+
+    def test_typevartuple_deferred(self) -> None:
+        # Same for a TypeVarTuple declared variable.
+        tvt = TypeVarTupleType(
+            name="Ts",
+            fullname="Ts",
+            id=TypeVarId(-1),
+            upper_bound=self.fx.a,
+            tuple_fallback=self.fx.std_tuple,
+            default=AnyType(TypeOfAny.from_omitted_generics),
+        )
+        t1 = self._tvar("T", 1)
+        call1 = self._callable([t1], t1, variables=[t1, tvt])
+        res = self._tk.rust_merge_typevars_in_callables_by_name(
+            [self._bytes_of(call1)], TypeVarId.next_raw_id, True
+        )
+        assert res is None
+
+
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.

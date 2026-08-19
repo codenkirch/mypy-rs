@@ -440,6 +440,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_overload::rust_combine_function_signatures,
         module
     )?)?;
+    // Issue #489: merge_typevars_in_callables_by_name (checkexpr.py:8309-8351),
+    // the freshen+rename step shared with combine_function_signatures.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_overload::rust_merge_typevars_in_callables_by_name,
+        module
+    )?)?;
     // Issue #432: overload-ambiguity approximate-similarity.
     module.add_function(wrap_pyfunction!(
         argapprox::rust_arg_approximate_similarity,

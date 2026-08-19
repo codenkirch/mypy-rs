@@ -256,6 +256,7 @@ try:
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
+        rust_merge_typevars_in_callables_by_name as _rust_merge_typevars_in_callables_by_name,
         rust_method_fullname as _rust_method_fullname,
         rust_normalize_callable as _rust_normalize_callable,
         rust_possible_none_type_var_overlap as _rust_possible_none_type_var_overlap,
@@ -298,6 +299,7 @@ except ImportError:
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
+    _rust_merge_typevars_in_callables_by_name = None  # type: ignore[assignment]
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
@@ -8325,6 +8327,36 @@ def merge_typevars_in_callables_by_name(
 
     Returns both the new list of callables and a list of all distinct TypeVarType objects used.
     """
+    # Native seam: the freshen+rename loop shares rust_combine_function_signatures
+    # machinery. Rust defers (None) on ParamSpec/TypeVarTuple and any expand_type
+    # deferral so output is never partial; otherwise Python runs the same loop.
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
+        try:
+            start_raw_id = TypeVarId.next_raw_id
+            res = _rust_merge_typevars_in_callables_by_name(
+                [_serialize_type_for_checkexpr(c) for c in callables],
+                start_raw_id,
+                state.strict_optional,
+            )
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            res = None
+        if res is not None:
+            next_raw_id, callables_bytes, typevars_bytes = res
+            output = [_deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes]
+            variables = [_deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes]
+            if all(isinstance(c, CallableType) for c in output) and all(
+                isinstance(v, TypeVarType) for v in variables
+            ):
+                TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
+                return (
+                    cast("list[CallableType]", output),
+                    cast("list[TypeVarType]", variables),
+                )
+
     output: list[CallableType] = []
     unique_typevars: dict[str, TypeVarType] = {}
     variables: list[TypeVarType] = []
