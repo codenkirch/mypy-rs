@@ -260,16 +260,16 @@ fn is_trivial_suffix(arg_types: &[Type], arg_kinds: &[i64]) -> bool {
 }
 
 /// The bundle of `CallableType` fields the compatibility engine reads.
-struct CallableFields<'a> {
-    arg_types: &'a [Type],
-    arg_kinds: &'a [i64],
-    arg_names: &'a [Option<String>],
-    ret_type: &'a Type,
-    is_ellipsis_args: bool,
-    implicit: bool,
-    from_concatenate: bool,
-    imprecise_arg_kinds: bool,
-    unpack_kwargs: bool,
+pub(crate) struct CallableFields<'a> {
+    pub(crate) arg_types: &'a [Type],
+    pub(crate) arg_kinds: &'a [i64],
+    pub(crate) arg_names: &'a [Option<String>],
+    pub(crate) ret_type: &'a Type,
+    pub(crate) is_ellipsis_args: bool,
+    pub(crate) implicit: bool,
+    pub(crate) from_concatenate: bool,
+    pub(crate) imprecise_arg_kinds: bool,
+    pub(crate) unpack_kwargs: bool,
 }
 
 impl<'a> CallableFields<'a> {
@@ -280,7 +280,7 @@ impl<'a> CallableFields<'a> {
 
 /// Extract the `Callable` fields. `None` means the type is not a
 /// `CallableType` (e.g. a `Parameters`), which defers to Python.
-fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
+pub(crate) fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
     match t {
         Type::CallableType {
             arg_types,
@@ -408,7 +408,7 @@ fn are_args_compatible(
 
 /// `mypy.subtypes.are_parameters_compatible` (subtypes.py:1912-2105).
 #[allow(clippy::too_many_arguments)]
-fn are_parameters_compatible(
+pub(crate) fn are_parameters_compatible(
     left_types: &[Type],
     left_kinds: &[i64],
     left_names: &[Option<String>],
@@ -590,7 +590,7 @@ fn are_parameters_compatible(
 
 /// Does this callable have any `UnpackType` in its arg types? The native path
 /// defers those (out-of-line `*args: *Ts` / `**kwargs: **Ts` shapes).
-fn any_unpack_anywhere(t: &Type) -> bool {
+pub(crate) fn any_unpack_anywhere(t: &Type) -> bool {
     match t {
         Type::CallableType {
             arg_types,

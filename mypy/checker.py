@@ -351,6 +351,8 @@ try:
         rust_is_typed_callable as _rust_is_typed_callable,
         rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
         rust_is_unreachable_map as _rust_is_unreachable_map,
+        rust_is_unsafe_overlapping_overload_signatures
+        as _rust_is_unsafe_overlapping_overload_signatures,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
         rust_is_more_general_arg_prefix as _rust_is_more_general_arg_prefix,
@@ -383,6 +385,7 @@ except ImportError:
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
+    _rust_is_unsafe_overlapping_overload_signatures = None  # type: ignore[assignment]
     _rust_is_untyped_decorator = None  # type: ignore[assignment]
     _rust_is_typeddict_type_context = None  # type: ignore[assignment]
     _rust_is_valid_inferred_type = None  # type: ignore[assignment]
@@ -9953,6 +9956,24 @@ def is_unsafe_overlapping_overload_signatures(
     Assumes that 'signature' appears earlier in the list of overload
     alternatives then 'other' and that their argument counts are overlapping.
     """
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            res = _rust_is_unsafe_overlapping_overload_signatures(
+                _serialize_type_for_checker(signature),
+                _serialize_type_for_checker(other),
+                _serialize_type_list(class_type_vars),
+                partial_only,
+                state.strict_optional,
+                _native_checker_resolver,
+            )
+            if res is not None:
+                return res
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     # Try detaching callables from the containing class so that all TypeVars
     # are treated as being free, i.e. the signature is as seen from inside the class,
     # where "self" is not yet bound to anything.

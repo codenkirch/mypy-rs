@@ -93,6 +93,7 @@ mod messages;
 mod modulefinder;
 mod mro;
 mod operators;
+mod overlap_unsafe;
 mod overload;
 mod overload_never;
 mod partially_defined;
@@ -2506,6 +2507,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         overload_never::rust_is_same_arg_prefix,
+        module
+    )?)?;
+
+    // is_unsafe_overlapping_overload_signatures: judge overload-overlap
+    // safety on detached, expanded wire callables (mypy.checker).
+    #[allow(clippy::unsafe_removed_from_name)]
+    module.add_function(wrap_pyfunction!(
+        overlap_unsafe::rust_is_unsafe_overlapping_overload_signatures,
         module
     )?)?;
 

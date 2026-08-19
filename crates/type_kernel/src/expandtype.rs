@@ -734,7 +734,7 @@ fn is_leaf_type(typ: &Type) -> bool {
 /// True if `typ` contains any TypeVar-like node. Such results do not
 /// survive a wire round-trip intact (object identity is lost), so the
 /// caller defers to Python.
-fn result_has_typevar(typ: &Type) -> bool {
+pub(crate) fn result_has_typevar(typ: &Type) -> bool {
     let mut stack = vec![typ];
     while let Some(cur) = stack.pop() {
         match cur {
