@@ -11873,3 +11873,149 @@ class NativeExpandCallableVariantsSuite(Suite):
         on = self._with_gate(True, lambda: expand_callable_variants(c))
         assert_equal(len(on), 1)
         self._assert_engages(c)
+
+class NativeBuiltinItemTypeSuite(Suite):
+    """Parity for the Rust `builtin_item_type` port (mypy.checker).
+
+    `builtin_item_type` extracts the element type of a builtin container
+    (list, dict, set, frozenset, dict_keys, KeysView, Tuple, TypedDict)
+    so the checker can narrow optional types in `x in (...)`. The Rust
+    port claims only the positive cases on the wire `Type` enum: an
+    `Instance` of one of the 7 builtin containers whose first arg is not
+    `Any`, a `TupleType` whose normalized items are all non-`Any`
+    (`UnpackType` items normalize through their `upper_bound`), and a
+    `TypedDictType` whose fallback's MRO contains `typing.Mapping`.
+    Every `None`-result case and wire-unsupported shape defers to the
+    pure-Python path. Toggling the checker gate off (Python) and on
+    (Rust) must produce identical results; a direct seam call proves the
+    Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.int_info = self.fx.make_type_info("builtins.int")
+        self.mapping_info = self.fx.make_type_info(
+            "typing.Mapping",
+            mro=[self.fx.str_type_info, self.fx.oi],
+            typevars=["K", "V"],
+            variances=[CONTRAVARIANT, COVARIANT],
+            bases=[self.fx.str_type, self.fx.o],
+        )
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # str_type_info does not end in "i"; snapshot it explicitly (the
+        # TypedDict/Mapping cases need it for wire fixup).
+        type_infos.extend([self.fx.str_type_info, self.int_info, self.mapping_info])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _assert_par(self, t: Type) -> None:
+        from mypy.checker import builtin_item_type
+
+        off = self._with_gate(False, lambda: builtin_item_type(t))
+        on = self._with_gate(True, lambda: builtin_item_type(t))
+        assert_equal(str(on), str(off), f"builtin_item_type parity {t}")
+
+    def _assert_engages(self, t: Type) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_builtin_item_type(
+            _serialize_type_for_checker(t), state.strict_optional, self.resolver
+        )
+        assert result is not None, f"Rust builtin_item_type did not engage for {t}"
+
+    def test_list_instance(self) -> None:
+        from mypy.checker import builtin_item_type
+
+        t = Instance(self.fx.std_listi, [Instance(self.int_info, [])])
+        self._assert_par(t)
+        result = self._with_gate(True, lambda: builtin_item_type(t))
+        assert_equal(str(result), "builtins.int")
+        self._assert_engages(t)
+
+    def test_unparameterized_container(self) -> None:
+        from mypy.checker import builtin_item_type
+
+        t = Instance(self.fx.std_listi, [])
+        self._assert_par(t)
+        assert self._with_gate(True, lambda: builtin_item_type(t)) is None
+
+    def test_any_first_arg_defers(self) -> None:
+        # Rust defers on an Any first arg; the Python path returns None.
+        from mypy.checker import builtin_item_type
+
+        t = Instance(self.fx.std_listi, [self.fx.anyt])
+        self._assert_par(t)
+        assert self._with_gate(True, lambda: builtin_item_type(t)) is None
+
+    def test_non_container_instance(self) -> None:
+        from mypy.checker import builtin_item_type
+
+        t = Instance(self.fx.ai, [])
+        self._assert_par(t)
+        assert builtin_item_type(t) is None
+
+    def test_tuple_items(self) -> None:
+        from mypy.checker import builtin_item_type
+
+        t = TupleType([Instance(self.int_info, []), self.fx.str_type], self.fx.std_tuple)
+        self._assert_par(t)
+        result = self._with_gate(True, lambda: builtin_item_type(t))
+        assert_equal(str(result), "builtins.int | builtins.str")
+        self._assert_engages(t)
+
+    def test_tuple_unpack(self) -> None:
+        # An UnpackType item normalizes through its upper_bound
+        # (a builtins.tuple instance); the tuple's item is the arg.
+        from mypy.checker import builtin_item_type
+
+        tv = TypeVarTupleType(
+            "Ts",
+            "Ts",
+            TypeVarId(1),
+            self.fx.std_tuple.copy_modified(args=[Instance(self.int_info, [])]),
+            self.fx.std_tuple.copy_modified(args=[self.fx.o]),
+            self.fx.anyt,
+        )
+        t = TupleType([UnpackType(tv), self.fx.str_type], self.fx.std_tuple)
+        self._assert_par(t)
+        result = self._with_gate(True, lambda: builtin_item_type(t))
+        assert_equal(str(result), "builtins.int | builtins.str")
+        self._assert_engages(t)
+
+    def test_typed_dict(self) -> None:
+        from mypy.checker import builtin_item_type
+
+        td_fallback = Instance(self.mapping_info, [self.fx.str_type, self.fx.o])
+        t = TypedDictType({"x": self.fx.o}, {"x"}, set(), td_fallback)
+        self._assert_par(t)
+        result = self._with_gate(True, lambda: builtin_item_type(t))
+        assert_equal(str(result), "builtins.str")
+        self._assert_engages(t)

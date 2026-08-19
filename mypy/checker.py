@@ -319,6 +319,7 @@ try:
     from type_kernel import (
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
+        rust_builtin_item_type as _rust_builtin_item_type,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -378,6 +379,7 @@ except ImportError:
     _rust_is_typed_callable = None  # type: ignore[assignment]
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
+    _rust_builtin_item_type = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -9514,6 +9516,19 @@ def builtin_item_type(tp: Type) -> Type | None:
     Note: this is only OK for built-in containers, where we know the behavior
     of __contains__.
     """
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _native_checker_resolver is not None
+    ):
+        try:
+            result = _rust_builtin_item_type(
+                _serialize_type_for_checker(tp), state.strict_optional, _native_checker_resolver
+            )
+            if result is not None:
+                return _deserialize_type_from_checker(bytes(result))
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     tp = get_proper_type(tp)
 
     if isinstance(tp, Instance):

@@ -48,6 +48,7 @@ mod argmap;
 mod astwire;
 mod attrs;
 mod binder;
+mod builtin_item;
 mod cache;
 mod callable_compat;
 mod checkcall;
@@ -2517,6 +2518,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // #566: checker.group_comparison_operands (pure-data union-find port).
     module.add_function(wrap_pyfunction!(
         comparison_group::rust_group_comparison_operands,
+        module
+    )?)?;
+
+    // checker.builtin_item_type (parity seam for a builtin container's
+    // element type, optional narrow).
+    module.add_function(wrap_pyfunction!(
+        builtin_item::rust_builtin_item_type,
         module
     )?)?;
 
