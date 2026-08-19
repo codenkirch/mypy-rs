@@ -380,13 +380,15 @@ fn are_args_compatible(
     if left.required && right.required {
         allow_partial_overlap = false;
     }
-    // name mismatch (`is_different` with allow_overlap=allow_partial_overlap):
-    // right has a name left lacks (or a different one) → False, unless we
-    // ignore pos arg names and the right arg is positional.
-    if right.name.is_some()
-        && left.name != right.name
-        && (!ignore_pos_arg_names || right.pos.is_none())
-    {
+    // name mismatch (`is_different` with allow_overlap=allow_partial_overlap,
+    // subtypes.py:2272-2286). A missing right name never differs; a missing
+    // left name differs when partial overlap is off, else matches any name.
+    let name_diff = match (&left.name, &right.name) {
+        (_, None) => false,
+        (None, Some(_)) => !allow_partial_overlap,
+        (Some(l), Some(r)) => l != r,
+    };
+    if name_diff && (!ignore_pos_arg_names || right.pos.is_none()) {
         return Some(false);
     }
     // position mismatch (`is_different` with allow_overlap=False): Some !=

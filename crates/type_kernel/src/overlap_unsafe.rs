@@ -154,6 +154,8 @@ fn expand_callable_variants(c: &Type, strict_optional: bool) -> Option<Vec<Type>
         }
         variants.push(variant);
         // Increment the cartesian-product index; stop after the last row.
+        // `k == 0` also fires on a successful carry into index 0, so only
+        // stop when index 0 rolled back to 0 (the product is exhausted).
         let mut k = per_var.len();
         while k > 0 {
             k -= 1;
@@ -163,7 +165,7 @@ fn expand_callable_variants(c: &Type, strict_optional: bool) -> Option<Vec<Type>
             }
             indices[k] = 0;
         }
-        if k == 0 {
+        if k == 0 && indices[0] == 0 {
             break;
         }
     }
