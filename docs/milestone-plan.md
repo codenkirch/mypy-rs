@@ -3,11 +3,13 @@
 ## Current State (verified live, August 2026)
 
 ### GitHub Language Stats
-- Python: 6,284,312 bytes (66.6%) *(GH API, 2026-08-14)*
-- Rust: 3,156,702 bytes (33.4%) *(GH API, 2026-08-14)*
-- Total: 9,441,014
-- **Target: 20%+ Rust: met and sustained; 33.4% on the GitHub languages
-  API (Phase D, 2026-08-14), above the 30% target (D4).**
+- Python: 6,503,139 bytes (65.0%) *(GH API, 2026-08-19)*
+- Rust: 3,511,010 bytes (35.0%) *(GH API, 2026-08-19)*
+- Total: 10,014,149 (Python + Rust only; GH counts all languages)
+- **Target: 20%+ Rust: met and sustained; 35.06% on the GitHub languages
+  API (Phase D, 2026-08-19), above the 30% target (D4).** The 3-port swarm
+  (#688/#691/#692) closed the last leaf candidates; further gains need
+  Phase B/C depth ports.
 
 ### Native Gates Status
 
