@@ -39,6 +39,7 @@ from mypy.nodes import (
     ArgKind,
     BytesExpr,
     CallExpr,
+    Context,
     Decorator,
     DictExpr,
     EllipsisExpr,
@@ -63,6 +64,7 @@ from mypy.nodes import (
     Var,
 )
 from mypy.plugins.common import find_shallow_matching_overload_item
+from mypy.options import Options
 from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
@@ -3866,6 +3868,175 @@ class NativeTryGettingLiteralSuite(Suite):
     def test_uninhabited(self) -> None:
         self._assert_par(self.fx.uninhabited)
         self._assert_engages(self.fx.uninhabited)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInstantiateTypeAliasSuite(Suite):
+    """Parity for the Rust `instantiate_type_alias` port (mypy.typeanal).
+
+    `instantiate_type_alias` normalizes a TypeAlias node plus type
+    arguments into the instantiated result type. The Rust port decides
+    the three non-error success paths (bare-generic eager expansion,
+    non-generic alias, correct generic instantiation) and returns a
+    branch tag; the Python shim rebuilds the live result object exactly
+    as the pure-Python body would. Every error / Any-fill path returns
+    None and Python runs the full pure-Python body. Toggling the typeanal
+    gate off (pure Python) and on (Rust seam) must produce identical
+    `(str(t), used_default)` results on both success and deferral paths.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_alias(
+        self,
+        target: Type,
+        *,
+        alias_tvars: list[TypeVarLikeType] | None = None,
+        no_args: bool = False,
+    ) -> TypeAlias:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            "mod.AL",
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],  # type: ignore[arg-type]
+            no_args=no_args,
+        )
+
+    def _ctx(self) -> Context:
+        ctx = Context(5, 5)
+        ctx.end_line = 6
+        ctx.end_column = 7
+        return ctx
+
+    def _instantiate(
+        self,
+        node: TypeAlias,
+        args: list[Type],
+        no_args: bool,
+        *,
+        empty_tuple_index: bool = False,
+    ) -> tuple[Type, bool]:
+        from mypy.typeanal import instantiate_type_alias
+
+        return instantiate_type_alias(
+            node,
+            args,
+            lambda *a, **k: None,
+            lambda *a, **k: None,
+            no_args,
+            self._ctx(),
+            Options(),
+            empty_tuple_index=empty_tuple_index,
+        )
+
+    def _assert_par(
+        self,
+        node: TypeAlias,
+        args: list[Type],
+        no_args: bool,
+        *,
+        empty_tuple_index: bool = False,
+    ) -> None:
+        off = self._with_gate(False, lambda: self._instantiate(node, args, no_args, empty_tuple_index=empty_tuple_index))
+        on = self._with_gate(True, lambda: self._instantiate(node, args, no_args, empty_tuple_index=empty_tuple_index))
+        assert_equal(
+            (str(on[0]), on[1]),
+            (str(off[0]), off[1]),
+            f"instantiate_type_alias parity {node.name} args={args}",
+        )
+
+    def _assert_engages(self, node: TypeAlias, args: list[Type], no_args: bool) -> None:
+        from mypy.typeanal import _rust_instantiate_type_alias, _serialize_typeanal_type
+
+        result = _rust_instantiate_type_alias(
+            node, [_serialize_typeanal_type(a) for a in args], no_args, False
+        )
+        assert result is not None, f"Rust instantiate_type_alias did not engage for {node.name}"
+
+    def test_non_generic_alias(self) -> None:
+        # S = str; used bare -> TypeAliasType(S, []), normalization deferred.
+        from mypy.nodes import TypeAlias, Context
+
+        node = TypeAlias(Instance(self.fx.str_type_info, []), "mod.S", "mod", -1, -1)
+        self._assert_par(node, [], False)
+        self._assert_engages(node, [], False)
+
+    def test_no_args_bare_generic_empty(self) -> None:
+        # L = List (no_args); used bare -> eager Instance(list, []).
+        node = self._make_alias(
+            Instance(self.fx.std_listi, [AnyType(TypeOfAny.special_form)]), no_args=True
+        )
+        self._assert_par(node, [], True)
+        self._assert_engages(node, [], True)
+
+    def test_no_args_bare_generic_with_args(self) -> None:
+        # L = List; L[int] -> eager Instance(list, [int]) carrying location.
+        node = self._make_alias(
+            Instance(self.fx.std_listi, [AnyType(TypeOfAny.special_form)]), no_args=True
+        )
+        self._assert_par(node, [self.fx.a], True)
+        self._assert_engages(node, [self.fx.a], True)
+
+    def test_generic_alias_correct_args(self) -> None:
+        # G[T]; G[int] -> TypeAliasType(G, [int]).
+        node = self._make_alias(
+            Instance(self.fx.gi, [self.fx.t]), alias_tvars=[self.fx.t]
+        )
+        self._assert_par(node, [self.fx.a], False)
+        self._assert_engages(node, [self.fx.a], False)
+
+    def test_generic_alias_missing_args_defers(self) -> None:
+        # G[T] used bare -> Python fills Any (set_any_tvars); Rust defers.
+        node = self._make_alias(
+            Instance(self.fx.gi, [self.fx.t]), alias_tvars=[self.fx.t]
+        )
+        # Parity holds even though the path defers to Python.
+        self._assert_par(node, [], False)
+
+    def test_generic_alias_bad_count_defers(self) -> None:
+        # G[T] with two args -> error + Any fill; Rust defers.
+        node = self._make_alias(
+            Instance(self.fx.gi, [self.fx.t]), alias_tvars=[self.fx.t]
+        )
+        self._assert_par(node, [self.fx.a, self.fx.b], False)
+
+    def test_variadic_alias_split_defers(self) -> None:
+        # H[T, Ts, S] with a split TypeVarTuple -> error; Rust defers.
+        node = self._make_alias(
+            Instance(self.fx.hi, [self.fx.t, self.fx.ts, self.fx.s]),
+            alias_tvars=[self.fx.t, self.fx.ts, self.fx.s],
+        )
+        unpack = UnpackType(self.fx.ts)
+        self._assert_par(node, [unpack], False)
+
+    def test_flexible_alias_unwrap(self) -> None:
+        # FlexibleAlias[T, typ] expands to typ (last argument).
+        from mypy.bogus_type import FlexibleAlias
+        from mypy.nodes import TypeAlias
+
+        flex_info = self.fx.make_type_info("mypy_extensions.FlexibleAlias")
+        target = Instance(flex_info, [self.fx.t, self.fx.a])
+        node = self._make_alias(target, alias_tvars=[self.fx.t])
+        self._assert_par(node, [self.fx.b], False)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

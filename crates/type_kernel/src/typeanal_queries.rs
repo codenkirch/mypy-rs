@@ -435,7 +435,7 @@ pub(crate) fn rust_find_self_type(
     }
 }
 
-struct DeferError;
+pub(crate) struct DeferError;
 
 struct SelfTypeCtx<'a> {
     refs: &'a TypeRefs<'a>,
@@ -1485,7 +1485,7 @@ fn get_attr_or_defer<'a>(obj: &'a PyAny, name: &str) -> Result<&'a PyAny, DeferE
     obj.getattr(name).map_err(|_| DeferError)
 }
 
-fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
+pub(crate) fn iter_seq(obj: &PyAny) -> Result<Vec<&PyAny>, DeferError> {
     if let Ok(list) = obj.downcast::<PyList>() {
         Ok(list.iter().collect())
     } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
