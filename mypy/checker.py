@@ -327,6 +327,7 @@ try:
         rust_get_generator_return_type as _rust_get_generator_return_type,
         rust_get_generator_yield_type as _rust_get_generator_yield_type,
         rust_get_property_type as _rust_get_property_type,
+        rust_group_comparison_operands as _rust_group_comparison_operands,
         rust_has_bool_item as _rust_has_bool_item,
         rust_has_custom_eq_checks as _rust_has_custom_eq_checks,
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
@@ -402,6 +403,7 @@ except ImportError:
     _rust_get_generator_return_type = None  # type: ignore[assignment]
     _rust_get_generator_yield_type = None  # type: ignore[assignment]
     _rust_get_property_type = None  # type: ignore[assignment]
+    _rust_group_comparison_operands = None  # type: ignore[assignment]
     _rust_is_async_generator_return_type = None  # type: ignore[assignment]
     _rust_is_generator_return_type = None  # type: ignore[assignment]
     _checker_serialize_node = None  # type: ignore[assignment]
@@ -10306,14 +10308,43 @@ def group_comparison_operands(
 
     This function is currently only used to assist with type-narrowing refinements
     and is extracted out to a helper function so we can unit test it.
+
+    A Rust port (pure data, no type objects, no wire codec) handles the gated
+    fast path. `pairwise_comparisons` is materialized once because
+    `ComparisonExpr.pairwise()` is a generator and both the Rust seam and the
+    pure-Python fallback iterate it.
     """
+    pair_list = list(pairwise_comparisons)
+    if (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_active
+        and _rust_group_comparison_operands is not None
+    ):
+        try:
+            # Stable integer id per distinct literal hash: `Key` (a tuple) is
+            # not hashable across the boundary, so Rust only ever sees ids.
+            hash_to_id: dict[Key, int] = {}
+            literal_hashes: dict[int, int] = {}
+            for index, key in operand_to_literal_hash.items():
+                if key not in hash_to_id:
+                    hash_to_id[key] = len(hash_to_id)
+                literal_hashes[index] = hash_to_id[key]
+            ops_and_indices = [
+                (operator, i, i + 1) for i, (operator, _left, _right) in enumerate(pair_list)
+            ]
+            return _rust_group_comparison_operands(
+                ops_and_indices, literal_hashes, list(operators_to_group)
+            )
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
+
     groups: dict[str, DisjointDict[Key, int]] = {op: DisjointDict() for op in operators_to_group}
 
     simplified_operator_list: list[tuple[str, list[int]]] = []
     last_operator: str | None = None
     current_indices: set[int] = set()
     current_hashes: set[Key] = set()
-    for i, (operator, left_expr, right_expr) in enumerate(pairwise_comparisons):
+    for i, (operator, left_expr, right_expr) in enumerate(pair_list):
         if last_operator is None:
             last_operator = operator
 

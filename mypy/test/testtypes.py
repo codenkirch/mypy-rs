@@ -11016,3 +11016,158 @@ class NativeClassmethodStaticSuite(Suite):
         self._assert_par(None)
         assert_equal(self._with_gate(True, lambda: is_classmethod_node(None)), None)
         assert_equal(self._with_gate(True, lambda: is_node_static(None)), None)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeGroupComparisonOperandsSuite(Suite):
+    """Parity for the Rust `group_comparison_operands` port (mypy.checker).
+
+    PURE DATA: no Type objects, no wire codec, no resolver. The seam maps
+    each distinct literal hash (a `Key` tuple) to a stable integer id, and
+    Rust union-finds operand chains over those ids, returning (op, sorted
+    indices). Toggling the checker gate off (pure Python) and on (Rust) must
+    yield identical output, and a direct seam call proves the Rust function
+    engages rather than silently falling back.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _keymap(self, operands: dict[int, str]) -> dict[int, tuple[str, ...]]:
+        # A hashable Key tuple; distinct names -> distinct ids, repeated
+        # names -> the same id (the coalescing signal).
+        return {index: ("FakeExpr", name) for index, name in operands.items()}
+
+    def _assert_par(self, pairs, keymap, operators: set[str]) -> None:
+        from mypy.checker import group_comparison_operands
+
+        off = self._with_gate(
+            False, lambda: group_comparison_operands(pairs, keymap, operators)
+        )
+        on = self._with_gate(True, lambda: group_comparison_operands(pairs, keymap, operators))
+        assert_equal(on, off, f"group_comparison_operands parity {pairs}")
+
+    def test_doc_example_no_assignable(self) -> None:
+        # x0 == x1 == x2 < x3 < x4 is x5 is x6 is not x7 is not x8
+        from mypy.checker import group_comparison_operands
+
+        x = [NameExpr(f"x{i}") for i in range(9)]
+        pairs = [
+            ("==", x[0], x[1]),
+            ("==", x[1], x[2]),
+            ("<", x[2], x[3]),
+            ("<", x[3], x[4]),
+            ("is", x[4], x[5]),
+            ("is", x[5], x[6]),
+            ("is not", x[6], x[7]),
+            ("is not", x[7], x[8]),
+        ]
+        self._assert_par(pairs, self._keymap({}), {"==", "is"})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, self._keymap({}), {"==", "is"})
+        )
+        assert_equal(
+            result,
+            [
+                ("==", [0, 1, 2]),
+                ("<", [2, 3]),
+                ("<", [3, 4]),
+                ("is", [4, 5, 6]),
+                ("is not", [6, 7]),
+                ("is not", [7, 8]),
+            ],
+        )
+
+    def test_doc_example_coalesce(self) -> None:
+        # same == x < y == same
+        from mypy.checker import group_comparison_operands
+
+        same, xv, yv = NameExpr("same"), NameExpr("x"), NameExpr("y")
+        pairs = [("==", same, xv), ("<", xv, yv), ("==", yv, same)]
+        # Hashes present on operands 0 and 3 -> the two "==" chains merge.
+        self._assert_par(pairs, self._keymap({0: "same", 3: "same"}), {"=="})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, self._keymap({0: "same", 3: "same"}), {"=="})
+        )
+        assert_equal(result, [("==", [0, 1, 2, 3]), ("<", [1, 2])])
+        # No hash entry -> no coalescing, plain size-2/3 groups.
+        self._assert_par(pairs, self._keymap({}), {"=="})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, self._keymap({}), {"=="})
+        )
+        assert_equal(result, [("==", [0, 1]), ("<", [1, 2]), ("==", [2, 3])])
+
+    def test_two_groups_merged(self) -> None:
+        # x0==x1==x2 < x3==x4==x5 where x0 and x5 share a hash.
+        from mypy.checker import group_comparison_operands
+
+        x = [NameExpr(f"x{i}") for i in range(6)]
+        pairs = [
+            ("==", x[0], x[1]),
+            ("==", x[1], x[2]),
+            ("<", x[2], x[3]),
+            ("==", x[3], x[4]),
+            ("==", x[4], x[5]),
+        ]
+        self._assert_par(pairs, self._keymap({0: "x0", 5: "x0"}), {"=="})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, self._keymap({0: "x0", 5: "x0"}), {"=="})
+        )
+        assert_equal(result, [("==", [0, 1, 2, 3, 4, 5]), ("<", [2, 3])])
+
+    def test_different_operators_never_combine(self) -> None:
+        # "==" and "is" groups never merge even when operands share a hash.
+        from mypy.checker import group_comparison_operands
+
+        x0, x1, x2, x3 = NameExpr("x0"), NameExpr("x1"), NameExpr("x2"), NameExpr("x3")
+        pairs = [("==", x0, x1), ("==", x1, x2), ("is", x2, x3), ("is", x3, x0)]
+        keymap = self._keymap({0: "x0", 1: "x1", 2: "x2", 3: "x3", 4: "x0"})
+        self._assert_par(pairs, keymap, {"==", "is"})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, keymap, {"==", "is"})
+        )
+        assert_equal(result, [("==", [0, 1, 2]), ("is", [2, 3, 4])])
+
+    def test_empty(self) -> None:
+        from mypy.checker import group_comparison_operands
+
+        self._assert_par([], self._keymap({}), {"=="})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands([], self._keymap({}), {"=="})
+        )
+        assert_equal(result, [])
+
+    def test_single_pair(self) -> None:
+        # A lone "== a b" with no hashes is a size-2 group.
+        from mypy.checker import group_comparison_operands
+
+        a, b = NameExpr("a"), NameExpr("b")
+        pairs = [("==", a, b)]
+        for keymap in (self._keymap({}), self._keymap({0: "a"})):
+            self._assert_par(pairs, keymap, {"=="})
+        result = self._with_gate(
+            True, lambda: group_comparison_operands(pairs, keymap, {"=="})
+        )
+        assert_equal(result, [("==", [0, 1])])
+
+    def test_engages(self) -> None:
+        # Direct seam call proves the Rust function runs and is correct.
+        result = _type_kernel.rust_group_comparison_operands(
+            [("==", 0, 1), ("<", 1, 2), ("==", 2, 3)],
+            {0: 0, 3: 0},
+            ["=="],
+        )
+        assert_equal(result, [("==", [0, 1, 2, 3]), ("<", [1, 2])])

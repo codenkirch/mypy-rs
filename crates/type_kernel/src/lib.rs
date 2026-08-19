@@ -63,6 +63,7 @@ mod checkoperator;
 mod checkpattern;
 mod checkstrformat;
 mod classmethod_static;
+mod comparison_group;
 mod condmaps;
 mod constant_fold;
 mod constraints;
@@ -2477,6 +2478,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,
+        module
+    )?)?;
+
+    // #566: checker.group_comparison_operands (pure-data union-find port).
+    module.add_function(wrap_pyfunction!(
+        comparison_group::rust_group_comparison_operands,
         module
     )?)?;
 
