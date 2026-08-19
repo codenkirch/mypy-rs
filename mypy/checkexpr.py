@@ -172,9 +172,6 @@ from mypy.types import (
     ExtraAttrs,
     FunctionLike,
     Instance,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
     LiteralType,
     LiteralValue,
     NoneType,
@@ -198,6 +195,9 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     find_unpack_in_list,
     flatten_nested_tuples,
     flatten_nested_unions,
@@ -228,8 +228,8 @@ try:
         WriteBuffer as _CheckExprWriteBuffer,
     )
     from type_kernel import (
-        rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_all_same_types as _rust_all_same_types,
+        rust_allow_fast_container_literal as _rust_allow_fast_container_literal,
         rust_analyze_cond_branch as _rust_analyze_cond_branch,
         rust_any_causes_overload_ambiguity as _rust_any_causes_overload_ambiguity,
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
@@ -243,6 +243,7 @@ try:
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
+        rust_dangerous_comparison as _rust_dangerous_comparison,
         rust_get_partial_instance_type as _rust_get_partial_instance_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
@@ -316,6 +317,7 @@ except ImportError:
     _rust_build_tuple_type = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_check_overload_call = None  # type: ignore[assignment]
+    _rust_dangerous_comparison = None  # type: ignore[assignment]
     _rust_check_argument_count = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
     _rust_try_getting_int_literals = None  # type: ignore[assignment]
@@ -5032,6 +5034,47 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         if not self.chk.options.strict_equality:
             return False
+
+        # Native seam: Rust reruns the branch-for-branch decision tree on
+        # wire types and returns Some(bool), or None to defer. The
+        # recursion guard `(left, right) in seen_types` and the
+        # AbstractSet/Mapping/list-tuple item recursion use live type
+        # identities the wire cannot carry, so Rust defers there and the
+        # pure-Python body (with the live guard) runs unchanged.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+        ):
+            try:
+                if seen_types is not None:
+                    python_seen = (left, right) in seen_types
+                else:
+                    python_seen = False
+                if original_container is None or not _wire_cache_enabled():
+                    orig_bytes = None
+                else:
+                    orig_bytes = _serialize_type_for_checkexpr(original_container)
+                result = _rust_dangerous_comparison(
+                    _serialize_type_for_checkexpr(left),
+                    _serialize_type_for_checkexpr(right),
+                    orig_bytes,
+                    python_seen,
+                    prefer_literal,
+                    identity_check,
+                    self.chk.options.strict_equality_for_none,
+                    self.chk.binder.is_unreachable_warning_suppressed(),
+                    custom_special_method(left, "__eq__"),
+                    custom_special_method(right, "__eq__"),
+                    self.chk.options.strict_optional,
+                    None,
+                    None,
+                    _native_checkexpr_resolver,
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
 
         if seen_types is None:
             seen_types = set()

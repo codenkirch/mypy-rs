@@ -72,6 +72,7 @@ mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
 mod copymodified;
+mod dangerous_comparison;
 mod dataclasses;
 mod detach_callable;
 mod equality_ambiguity;
@@ -693,6 +694,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_visit_newtype_expr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        dangerous_comparison::rust_dangerous_comparison,
         module
     )?)?;
     // Issue #457: Node object-model pure predicates from mypy/nodes.py.

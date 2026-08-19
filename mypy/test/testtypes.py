@@ -22,6 +22,7 @@ from mypy.checkstrformat import _set_native_strformat_active
 
 _set_native_strformat_active(bool(os.environ.get("TEST_NATIVE_TYPE_KERNEL")))
 T = TypeVar("T")
+from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.indirection import TypeIndirectionVisitor
 from mypy.join import join_types
 from mypy.meet import is_overlapping_types, meet_types, narrow_declared_type
@@ -69,7 +70,6 @@ from mypy.state import state
 from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
-from mypy.constraints import SUBTYPE_OF, SUPERTYPE_OF
 from mypy.traverser import (
     all_name_and_member_expressions,
     all_return_statements,
@@ -137,8 +137,8 @@ from mypy.types import (
 
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
-from mypy.checkstrformat import ConversionSpecifier  # noqa: F401  (re-export for tests)
 from mypy.checker_shared import TypeRange
+from mypy.checkstrformat import ConversionSpecifier
 
 
 class TypesSuite(Suite):
@@ -2031,6 +2031,7 @@ class NativeBindSelfSuite(Suite):
 
     def setUp(self) -> None:
         from librt.internal import ReadBuffer as _RB
+
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
@@ -4986,7 +4987,6 @@ class NativeHasAnyTypeSuite(Suite):
         # An alias whose fullname is not in the resolver snapshot: Rust
         # cannot expand → defer to Python.
         from mypy.nodes import TypeAlias
-        from mypy.types import TypeVarType as _TVT
 
         tv = TypeVarType(
             "U", "mod.U", TypeVarId(70), [], self.fx.str_type, self.fx.nonet, 0
@@ -11363,7 +11363,9 @@ class NativeCallableArgConstraintsSuite(Suite):
         self._set_active(False)
 
     def tearDown(self) -> None:
-        from mypy.constraints import _set_native_constraints_active, _set_native_constraints_resolver
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+        )
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
@@ -11390,7 +11392,6 @@ class NativeCallableArgConstraintsSuite(Suite):
         self, template: Type, actual: Type, direction: int, native: bool
     ) -> list[Any]:
         from mypy.constraints import (
-            _set_native_constraints_active,
             _set_native_constraints_resolver,
             infer_callable_arguments_constraints,
         )
@@ -12643,7 +12644,11 @@ class NativeConditionalTypesSuite(Suite):
         # proposed is a protocol. The Rust `is_subtype` defers protocol
         # implementation checks (subtypes.rs returns None for Instance-vs-
         # protocol right), so structural-BTS falls back to Python.
-        from mypy.checker import conditional_types, _serialize_type_for_checker, _serialize_type_ranges
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _serialize_type_ranges,
+            conditional_types,
+        )
 
         proto_inst = Instance(self.proto_info, [])
         current = self.fx.a
@@ -12909,3 +12914,183 @@ class NativeEqualityAmbiguitySuite(Suite):
         self._assert_ambiguity_par(self.fx.o, b)
         self._assert_engages(self.fx.o, b)
 
+
+class NativeDangerousComparisonSuite(Suite):
+    """Parity for the Rust `dangerous_comparison` port (mypy.checkexpr).
+
+    `dangerous_comparison` is an `ExpressionChecker` method whose pure
+    branch-for-branch decision tree (strict-equality diagnostics) is mirrored
+    in Rust. The seam needs a checker with `options`, `binder`, and
+    `lookup_typeinfo`, so this suite drives it through a lightweight stub:
+    the checker carries the strict-equality options and a query-only binder.
+    Toggling the checkexpr gate off (pure Python) and on (Rust seam) must
+    produce identical booleans, and a direct seam call proves the Rust
+    function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        import types as _types
+
+        from mypy.binder import ConditionalTypeBinder
+        from mypy.checkexpr import (
+            ExpressionChecker,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.options import Options
+
+        self.fx = TypeFixture()
+        # The fixture's std_listi / std_tuplei already have fullnames
+        # builtins.list / builtins.tuple; construct byte-ish infos via the
+        # fixture so their fullnames match the Rust allowlists.
+        self.bytesi = self.fx.make_type_info("builtins.bytes")
+        self.bytearrayi = self.fx.make_type_info("builtins.bytearray")
+        self.memoryviewi = self.fx.make_type_info("builtins.memoryview")
+
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.di,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+                self.fx.bool_type_info,
+                self.fx.str_type_info,
+                self.bytesi,
+                self.bytearrayi,
+                self.memoryviewi,
+            ]
+        )
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+        # Stub checker driving the seam: strict-equality on, no unreachable
+        # suppression, and the bytes allowlist types for lookups.
+        options = Options()
+        options.strict_equality = True
+        options.strict_equality_for_none = False
+        options.strict_optional = True
+        chk = _types.SimpleNamespace(
+            options=options,
+            binder=ConditionalTypeBinder(options),
+            lookup_typeinfo=lambda name: {
+                "builtins.bytes": self.bytesi,
+                "builtins.bytearray": self.bytearrayi,
+                "builtins.memoryview": self.memoryviewi,
+            }.get(name),
+        )
+        self.method = ExpressionChecker.__new__(ExpressionChecker)
+        self.method.chk = chk  # type: ignore[attr-defined]
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+        self._set_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, left: Type, right: Type, **kw: object) -> None:
+        off = self._with_gate(False, lambda: self.method.dangerous_comparison(left, right, **kw))
+        on = self._with_gate(True, lambda: self.method.dangerous_comparison(left, right, **kw))
+        assert_equal(on, off, f"dangerous_comparison parity {left} / {right}")
+
+    def _assert_engages(self, left: Type, right: Type, original: Type | None = None, **kw: object) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+        from mypy.typeops import custom_special_method
+
+        result = _type_kernel.rust_dangerous_comparison(
+            _serialize_type_for_checkexpr(left),
+            _serialize_type_for_checkexpr(right),
+            _serialize_type_for_checkexpr(original) if original is not None else None,
+            False,
+            kw.get("prefer_literal", True),
+            kw.get("identity_check", False),
+            False,  # strict_equality_for_none (matches py)
+            kw.get("unreachable_suppressed", False),
+            custom_special_method(left, "__eq__"),
+            custom_special_method(right, "__eq__"),
+            kw.get("strict_optional", True),
+            "typing.AbstractSet",
+            "typing.Mapping",
+            self.resolver,
+        )
+        assert result is not None, f"Rust dangerous_comparison did not engage for {left} / {right}"
+
+    def test_disjoint_siblings_true(self) -> None:
+        # A and D are disjoint siblings -> the comparison can never be True.
+        self._assert_par(self.fx.a, self.fx.d)
+        self._assert_engages(self.fx.a, self.fx.d)
+
+    def test_same_type_false(self) -> None:
+        # Comparing a type against itself can be True.
+        self._assert_par(self.fx.a, self.fx.a)
+        result = self._with_gate(True, lambda: self.method.dangerous_comparison(self.fx.a, self.fx.a))
+        assert_equal(result, False)
+        self._assert_engages(self.fx.a, self.fx.a)
+
+    def test_none_vs_str_false(self) -> None:
+        # None and str are not overlapping in strict-optional mode.
+        self._assert_par(self.fx.nonet, self.fx.str_type)
+        self._assert_engages(self.fx.nonet, self.fx.str_type)
+
+    def test_union_remove_optional_true(self) -> None:
+        # Optional[A] vs Optional[D]: remove_optional -> A / D,
+        # disjoint -> True.
+        opt_a = UnionType([self.fx.a, self.fx.nonet])
+        opt_d = UnionType([self.fx.d, self.fx.nonet])
+        self._assert_par(opt_a, opt_d)
+        self._assert_engages(opt_a, opt_d)
+
+    def test_literal_int_true(self) -> None:
+        # Non-equal int literals never overlap.
+        self._assert_par(self.fx.lit1, self.fx.lit2)
+        self._assert_engages(self.fx.lit1, self.fx.lit2)
+
+    def test_literal_bool_false(self) -> None:
+        # Different bool literals are NOT dangerous (explicit branch).
+        lit_t = LiteralType(True, self.fx.bool_type)
+        lit_f = LiteralType(False, self.fx.bool_type)
+        self._assert_par(lit_t, lit_f)
+        self._assert_engages(lit_t, lit_f)
+
+    def test_list_same_elem_overlap_false(self) -> None:
+        # list[A] vs list[A]: item A/A overlaps -> not dangerous.
+        la = Instance(self.fx.std_listi, [self.fx.a])
+        self._assert_par(la, la)
+        self._assert_engages(la, la)
+
+    def test_list_disjoint_elem_true(self) -> None:
+        # list[A] vs list[D]: item A/D disjoint -> dangerous.
+        la = Instance(self.fx.std_listi, [self.fx.a])
+        ld = Instance(self.fx.std_listi, [self.fx.d])
+        self._assert_par(la, ld)
+        self._assert_engages(la, ld)
+
+    def test_bytes_component_container_safe(self) -> None:
+        # b'abc' in b'cde' is safe (has_bytes_component on original).
+        left = Instance(self.bytesi, [])
+        right = Instance(self.bytesi, [])
+        original = Instance(self.bytesi, [])
+        self._assert_par(left, right, original_container=original)
+        self._assert_engages(left, right, original_container=original)
+
+    def test_bytearray_vs_bytes_safe(self) -> None:
+        # bytearray / bytes comparisons are supported even when disjoint.
+        ba = Instance(self.bytearrayi, [])
+        b = Instance(self.bytesi, [])
+        self._assert_par(ba, b)
+        self._assert_engages(ba, b)
