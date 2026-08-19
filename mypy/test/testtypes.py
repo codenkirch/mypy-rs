@@ -13784,3 +13784,53 @@ class NativeDangerousComparisonSuite(Suite):
         b = Instance(self.bytesi, [])
         self._assert_par(ba, b)
         self._assert_engages(ba, b)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCleanUpBasesSuite(Suite):
+    """Parity for the Rust base-class classification front (semanal_bases.rs).
+
+    `clean_up_bases_and_infer_type_variables` removes `Generic[...]` /
+    `Protocol[...]` base declarations. The Rust seam classifies each
+    UnboundType base as KEEP / GENERIC / PROTOCOL_GENERIC / BARE_PROTOCOL,
+    mirroring the branch order of `analyze_class_typevar_declaration`
+    (semanal.py:2817-2843) and the bare-Protocol removal
+    (semanal.py:2768-2774). Assertions on the four tags cover the full
+    decision table.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+
+    def _classify(self, fullname: str | None, in_protocol_names: bool, has_args: bool) -> int | None:
+        return self._tk.rust_clean_up_bases(fullname, in_protocol_names, has_args)
+
+    def test_plain_base_kept(self) -> None:
+        assert self._classify("mod.Bar", False, False) == 1  # KEEP
+
+    def test_generic_base_with_args_kept(self) -> None:
+        # `class B(A[int])`: A[int] is not a Generic/Protocol declaration.
+        assert self._classify("mod.A", False, True) == 1  # KEEP
+
+    def test_bare_generic_removed(self) -> None:
+        # Bare `Generic` still declares no tvars and is removed.
+        assert self._classify("typing.Generic", False, False) == 2  # GENERIC
+
+    def test_generic_with_args_removed(self) -> None:
+        assert self._classify("typing.Generic", False, True) == 2  # GENERIC
+
+    def test_protocol_with_args_declares_tvars(self) -> None:
+        assert self._classify("typing.Protocol", True, True) == 3  # PROTOCOL_GENERIC
+
+    def test_bare_protocol_removed(self) -> None:
+        assert self._classify("typing_extensions.Protocol", True, False) == 4  # BARE_PROTOCOL
+
+    def test_unresolved_symbol_kept(self) -> None:
+        # Missing node / failed lookup: neither declaration fires.
+        assert self._classify(None, False, True) == 1
+        assert self._classify(None, False, False) == 1
+
+    def test_non_protocol_name_kept(self) -> None:
+        assert self._classify("mod.NotProtocol", False, True) == 1  # KEEP

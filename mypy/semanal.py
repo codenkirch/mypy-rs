@@ -424,6 +424,7 @@ try:
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_imports as _rust_classify_imports,
+        rust_clean_up_bases as _rust_clean_up_bases,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -529,6 +530,7 @@ except ImportError:
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
+    _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
@@ -622,6 +624,16 @@ _native_semanal_visitor_active: bool = False
 def _set_native_semanal_visitor_active(active: bool) -> None:
     global _native_semanal_visitor_active
     _native_semanal_visitor_active = active
+
+
+# Native base-class classification tags (see semanal_bases.rs). KEEP means
+# the base is not a Generic/Protocol declaration; GENERIC / PROTOCOL_GENERIC
+# declare type variables (removed); BARE_PROTOCOL marks the class as a
+# protocol (removed). Only used when the Rust seam is active.
+_ACTION_KEEP = 1
+_ACTION_GENERIC = 2
+_ACTION_PROTOCOL_GENERIC = 3
+_ACTION_BARE_PROTOCOL = 4
 
 
 def _serialize_semanal_type(t: Type) -> bytes:
@@ -2751,7 +2763,21 @@ class SemanticAnalyzer(
             except TypeTranslationError:
                 # This error will be caught later.
                 continue
-            result = self.analyze_class_typevar_declaration(base, has_type_var_tuple)
+            # Native base-class classification (strangler-fig). Rust tags each
+            # UnboundType base as KEEP / Generic / Protocol; all side effects
+            # stay 1:1 with the pure-Python loop. When the tag is None the
+            # pure checks below run unchanged.
+            native_action = self._native_base_classification(base)
+            if native_action == _ACTION_KEEP:
+                result = None
+            elif native_action == _ACTION_BARE_PROTOCOL:
+                removed.append(i)
+                is_protocol = True
+                result = None
+            else:
+                result = self.analyze_class_typevar_declaration(base, has_type_var_tuple)
+                if native_action in (_ACTION_GENERIC, _ACTION_PROTOCOL_GENERIC):
+                    assert result is not None
             if result is not None:
                 tvars = result[0]
                 is_protocol |= result[1]
@@ -2843,6 +2869,32 @@ class SemanticAnalyzer(
                     self.fail("Free type variable expected in %s[...]" % sym.node.name, base)
             return tvars, is_proto
         return None
+
+    def _native_base_classification(self, base: Type) -> int | None:
+        """Classify a base via the Rust seam, or None to use the pure checks.
+
+        Only called for UnboundType bases whose translation succeeded. Rust
+        mirrors the branch order of analyze_class_typevar_declaration
+        (semanal.py:2817-2843) and the bare-Protocol check (semanal.py:2768-
+        2774). The single lookup here matches the one inside that method; a
+        resolved symbol performs no extra side effects on the second lookup,
+        so error counts and module_refs stay identical. On any failure the
+        pure-Python checks run unchanged.
+        """
+        if not (_SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active):
+            return None
+        if not isinstance(base, UnboundType):
+            return None
+        sym = self.lookup_qualified(base.name, base)
+        if sym is None or sym.node is None:
+            return None
+        try:
+            in_protocol_names = sym.node.fullname in PROTOCOL_NAMES
+            return _rust_clean_up_bases(
+                sym.node.fullname, in_protocol_names, bool(base.args)
+            )
+        except (AssertionError, NotImplementedError, ValueError):
+            return None
 
     def analyze_unbound_tvar(self, t: Type) -> tuple[str, TypeVarLikeExpr] | None:
         if isinstance(t, UnpackType) and isinstance(t.type, UnboundType):
