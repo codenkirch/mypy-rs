@@ -36,9 +36,11 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
+use crate::argmap;
+use crate::checkexpr_functions;
 use crate::setops::make_simplified_union;
-use crate::subtypes::SubtypeContext;
-use crate::typeinfo::NativeTypeResolver;
+use crate::subtypes::{self, SubtypeContext};
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -613,4 +615,181 @@ pub(crate) fn rust_merge_typevars_in_callables_by_name(
         typevars_out.push(b);
     }
     Ok(Some((next_id, callables_out, typevars_out)))
+}
+// rust_any_causes_overload_ambiguity (checkexpr.py:8231-8286)
+// ---------------------------------------------------------------------------
+
+/// `all_same_types` (checkexpr.py:8289-8306) on already-decoded wire Types:
+/// empty list yields True; otherwise every item after the first must be
+/// `is_same_type` against the first with `ignore_promotions=True` (matching
+/// the `rust_all_same_types` seam). Defer (None) on any `is_same_type` defer.
+fn all_same_wire(items: &[Type], strict_optional: bool, resolver: &TypeResolver) -> Option<bool> {
+    if items.is_empty() {
+        return Some(true);
+    }
+    let first = &items[0];
+    for t in items.iter().skip(1) {
+        match subtypes::is_same_type(first, t, true, strict_optional, resolver) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
+}
+
+/// `#[pyfunction]` entry for `any_causes_overload_ambiguity`
+/// (checkexpr.py:8231-8286).
+///
+/// Inputs (all wire blobs):
+///   * `items_bytes` — `list[CallableType]`, the overload items matching the
+///     actual arguments.
+///   * `return_types_bytes` — `list[Type]`, the per-item matched return types.
+///   * `arg_types_bytes` — `list[Type]`, the actual argument types.
+///   * `arg_kinds` — `Vec<i64>`, the actual argument `ArgKind` values.
+///   * `arg_names` — `Vec<Option<String>>` or None, the actual argument names.
+///   * `strict_optional` — forwarded to `is_same_type`.
+///
+/// Returns `Some(bool)` on a decided result, `None` to defer to Python
+/// (the per-call strangler-fig gate).
+///
+/// Defer conditions: a wire decode failure, a non-`CallableType` item, or a
+/// `map_formals_to_actuals` / `has_any_type` / `is_same_type` defer (the
+/// latter covers star actuals and subtype-resolution uncertainty).
+#[pyfunction]
+#[pyo3(signature = (
+    resolver,
+    items_bytes,
+    return_types_bytes,
+    arg_types_bytes,
+    arg_kinds,
+    arg_names,
+    strict_optional
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_any_causes_overload_ambiguity(
+    resolver: &NativeTypeResolver,
+    items_bytes: Vec<Vec<u8>>,
+    return_types_bytes: Vec<Vec<u8>>,
+    arg_types_bytes: Vec<Vec<u8>>,
+    arg_kinds: Vec<i64>,
+    arg_names: Option<Vec<Option<String>>>,
+    strict_optional: bool,
+) -> PyResult<Option<bool>> {
+    let resolver_ref = resolver.resolver();
+    let aliases = resolver.alias_resolver();
+
+    // Decode the actual argument types and per-item return types once.
+    let Some(arg_types) = arg_types_bytes
+        .iter()
+        .map(|b| decode_type(b))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let Some(return_types) = return_types_bytes
+        .iter()
+        .map(|b| decode_type(b))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    // `if all_same_types(return_types): return False`.
+    let Some(same) = all_same_wire(&return_types, strict_optional, resolver_ref) else {
+        return Ok(None);
+    };
+    if same {
+        return Ok(Some(false));
+    }
+
+    // Decode the overload items once.
+    let Some(items) = items_bytes
+        .iter()
+        .map(|b| decode_type(b))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    // `actual_to_formal = [map_formals_to_actuals(...) for item in items]`.
+    // Each item's formal kinds/names live on the wire; star actuals defer.
+    let actual_names = arg_names.unwrap_or_default();
+    let mut actual_to_formal: Vec<Vec<Vec<i64>>> = Vec::with_capacity(items.len());
+    for item in &items {
+        let Type::CallableType {
+            arg_kinds: item_kinds,
+            arg_names: item_names,
+            ..
+        } = item
+        else {
+            return Ok(None);
+        };
+        let lookup = argmap::rust_map_formals_to_actuals(
+            arg_kinds.clone(),
+            actual_names.clone(),
+            item_kinds.clone(),
+            item_names.clone(),
+        );
+        let Some(lookup) = lookup else {
+            // Star actual (or unexpected kind) defers the whole call.
+            return Ok(None);
+        };
+        actual_to_formal.push(lookup);
+    }
+
+    for (arg_idx, arg_type) in arg_types.iter().enumerate() {
+        // `has_any_type(arg_type, ignore_in_type_obj=True)`.
+        let Some(has_any) = checkexpr_functions::has_any_type_inner(arg_type, true, aliases) else {
+            return Ok(None);
+        };
+        if !has_any {
+            continue;
+        }
+
+        // `matching_formals_unfiltered`: items whose lookup[arg_idx] is non-empty.
+        let mut matching_returns: Vec<Type> = Vec::new();
+        let mut matching_formals: Vec<Type> = Vec::new();
+        for (item_idx, lookup) in actual_to_formal.iter().enumerate() {
+            let Some(formals) = lookup.get(arg_idx) else {
+                continue;
+            };
+            if formals.is_empty() {
+                continue;
+            }
+            let Type::CallableType {
+                arg_types: item_arg_types,
+                ret_type,
+                ..
+            } = &items[item_idx]
+            else {
+                return Ok(None);
+            };
+            matching_returns.push(ret_type.as_ref().clone());
+            for &formal in formals {
+                let Some(formal_idx) = usize::try_from(formal).ok() else {
+                    return Ok(None);
+                };
+                let Some(ft) = item_arg_types.get(formal_idx) else {
+                    return Ok(None);
+                };
+                matching_formals.push(ft.clone());
+            }
+        }
+
+        // `if not all_same_types(matching_formals) and not
+        // all_same_types(matching_returns): return True`.
+        let Some(same_formals) = all_same_wire(&matching_formals, strict_optional, resolver_ref)
+        else {
+            return Ok(None);
+        };
+        let Some(same_returns) = all_same_wire(&matching_returns, strict_optional, resolver_ref)
+        else {
+            return Ok(None);
+        };
+        if !same_formals && !same_returns {
+            return Ok(Some(true));
+        }
+    }
+    Ok(Some(false))
 }

@@ -449,6 +449,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_overload::rust_merge_typevars_in_callables_by_name,
         module
     )?)?;
+    // Issue #489: overload any-ambiguity detection (any_causes_overload_ambiguity).
+    module.add_function(wrap_pyfunction!(
+        checkexpr_overload::rust_any_causes_overload_ambiguity,
+        module
+    )?)?;
     // Issue #432: overload-ambiguity approximate-similarity.
     module.add_function(wrap_pyfunction!(
         argapprox::rust_arg_approximate_similarity,
