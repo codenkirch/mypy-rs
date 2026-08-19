@@ -59,16 +59,16 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// `EqualityDomainInfo` (checker.py:10614): the member type's names and enum
 /// names that participate in one equality domain.
 #[derive(Debug, Clone)]
-struct EqualityDomainInfo {
-    type_names: HashSet<String>,
-    enum_type_names: HashSet<String>,
+pub(crate) struct EqualityDomainInfo {
+    pub(crate) type_names: HashSet<String>,
+    pub(crate) enum_type_names: HashSet<String>,
 }
 
 /// `EqualityValueInfo` (checker.py:10620).
 #[derive(Debug, Clone, Default)]
-struct EqualityValueInfo {
-    domains: HashMap<String, EqualityDomainInfo>,
-    is_top: bool,
+pub(crate) struct EqualityValueInfo {
+    pub(crate) domains: HashMap<String, EqualityDomainInfo>,
+    pub(crate) is_top: bool,
 }
 
 impl EqualityValueInfo {
@@ -113,7 +113,11 @@ impl EqualityValueInfo {
 /// whose TypeInfo snapshot is missing from the resolver. Recursion into
 /// `last_known_value`, `LiteralType.fallback`, `TypeVarType` values /
 /// upper_bound, and union items mirrors the Python dispatch order exactly.
-fn equality_value_info_inner(t: &Type, resolver: &TypeResolver) -> Option<EqualityValueInfo> {
+/// Reused by `equality_ambiguity` for the per-item split.
+pub(crate) fn equality_value_info_inner(
+    t: &Type,
+    resolver: &TypeResolver,
+) -> Option<EqualityValueInfo> {
     match t {
         // get_proper_type(t) would expand a TypeAliasType from live TypeInfo;
         // the wire cannot, so defer.
