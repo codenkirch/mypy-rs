@@ -709,11 +709,39 @@ fn visit_meet(
             Some(SetOpResult::Encoded(wbuf.into_bytes()))
         }
 
+        // visit_param_spec (meet.py:1008-1012): s == t -> self.s
+        // (SameS). Else -> default(self.s): UnboundType -> Any, others
+        // -> Bottom (strict) / NoneType (non-strict, shim maps Bottom).
+        // ParamSpec is not callable-like, so both-ParamSpec reaches
+        // here; the pre-dispatch is_proper_subtype catches identical
+        // pairs first, discounting the SameS arm in practice.
+        Type::ParamSpecType { .. } => {
+            if paramspec_eq(s, t) {
+                Some(SetOpResult::SameS)
+            } else if matches!(s, Type::UnboundType { .. }) {
+                Some(SetOpResult::Any)
+            } else {
+                Some(SetOpResult::Bottom)
+            }
+        }
+
+        // visit_parameters (meet.py:1023-1033). Both-Parameters is
+        // intercepted by the meet_types both-callable pre-dispatch, so
+        // here s is never Parameters: always default(self.s) ->
+        // UnboundType ? Any : Bottom.
+        Type::Parameters { .. } => {
+            if matches!(s, Type::UnboundType { .. }) {
+                Some(SetOpResult::Any)
+            } else {
+                Some(SetOpResult::Bottom)
+            }
+        }
+
         // Full visitors (callable, typeddict, tuple,
-        // paramspec, typevartuple, parameters, overloaded) — deferred.
-        // The both-FunctionLike case is already deferred by meet_types
-        // pre-dispatch. The remaining cases (s non-callable, t
-        // callable-like) reach here and defer.
+        // typevartuple, overloaded) — deferred. The both-FunctionLike
+        // case is already deferred by meet_types pre-dispatch. The
+        // remaining cases (s non-callable, t callable-like) reach here
+        // and defer.
         _ => None,
     }
 }
@@ -830,6 +858,9 @@ fn reconstruct_args_from_discs(arg_discs: &[i8], s_args: &[Type], t_args: &[Type
 /// `meet_callable_like` (meet.py:1120-1146, 1148-1165): handles all
 /// callable-like (CallableType, Overloaded, Parameters) vs callable-like
 /// meet cases. Produces an encoded result or None (defer).
+/// Both-Parameters pairs build the arg-type join (meet_parameters_pair);
+/// mixed Parameters/Callable/Overloaded fall to the conservative
+/// catch-all (Bottom), matching Python's default for s not UnboundType.
 fn meet_callable_like(
     s: &Type,
     t: &Type,
@@ -898,6 +929,13 @@ fn meet_callable_like(
                 // Not similar: fallback join
                 Some(SetOpResult::SameT)
             }
+        }
+        // Both standalone Parameters: meet_parameters_pair (the
+        // meet.py:1023-1031 visit_parameters path — arg types are
+        // joined, not met). Previously this fell into the `_` catch-all
+        // and wrongly answered Bottom for a same-length pair.
+        (Type::Parameters(s_p), Type::Parameters(t_p)) => {
+            meet_parameters_pair(s_p, t_p, ctx, resolver)
         }
         // Overloaded vs callable-like: fallback join
         _ => {
@@ -1283,6 +1321,137 @@ fn min_args(arg_kinds: &[i64]) -> usize {
 
 fn is_var_arg(arg_kinds: &[i64]) -> bool {
     arg_kinds.contains(&2)
+}
+
+/// `ParamSpecType.__eq__` (types.py:931-938): id (raw_id + namespace),
+/// flavor, prefix, and default. name/fullname/upper_bound are ignored
+/// by Python equality; the prefix uses the derived `Parameters`
+/// PartialEq (all five wire fields), strictly tighter than
+/// `Parameters.__eq__` (types.py:2255) — safe direction: may defer
+/// where Python deems equal, never answers wrongly.
+fn paramspec_eq(s: &Type, t: &Type) -> bool {
+    match (s, t) {
+        (
+            Type::ParamSpecType {
+                prefix: s_prefix,
+                raw_id: s_raw,
+                namespace: s_ns,
+                flavor: s_flavor,
+                default: s_default,
+                ..
+            },
+            Type::ParamSpecType {
+                prefix: t_prefix,
+                raw_id: t_raw,
+                namespace: t_ns,
+                flavor: t_flavor,
+                default: t_default,
+                ..
+            },
+        ) => {
+            s_raw == t_raw
+                && s_ns == t_ns
+                && s_flavor == t_flavor
+                && s_prefix == t_prefix
+                && s_default == t_default
+        }
+        _ => false,
+    }
+}
+
+/// `is_similar_params` (join.py:1050-1055): same arg count, same
+/// min_args (ARG_POS count), same var_arg presence (any ARG_STAR).
+/// Symmetric; mirrors `is_similar_callables` for Parameters.
+fn is_similar_parameters(s: &wire::Parameters, t: &wire::Parameters) -> bool {
+    s.arg_types.len() == t.arg_types.len()
+        && min_args(&s.arg_kinds) == min_args(&t.arg_kinds)
+        && is_var_arg(&s.arg_kinds) == is_var_arg(&t.arg_kinds)
+}
+
+/// `ArgKind.is_named` (nodes.py): ARG_NAMED (3) or ARG_NAMED_OPT (5).
+fn is_named_kind(kind: i64) -> bool {
+    kind == 3 || kind == 5
+}
+
+/// `combine_arg_names` (join.py:1169-1188), called as
+/// `combine_arg_names(self.s, t)`. The result name at index i is outer
+/// s's name when the names match or either kind is named, else None.
+fn combine_parameter_arg_names(
+    s_names: &[Option<String>],
+    t_names: &[Option<String>],
+    s_kinds: &[i64],
+    t_kinds: &[i64],
+) -> Vec<Option<String>> {
+    (0..s_names.len())
+        .map(|i| {
+            if s_names[i] == t_names[i] || is_named_kind(s_kinds[i]) || is_named_kind(t_kinds[i]) {
+                s_names[i].clone()
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `TypeJoinVisitor.default` (join.py:990-1005), Rust subset. Returns
+/// the set-op disc for the default join of `s`. Instance -> Object;
+/// UnboundType / non-chain kinds -> Any; TypeVar / ParamSpec / TypeType
+/// / TypedDict / FunctionLike recurse into the enclosing type;
+/// TupleType needs tuple_fallback (resolver) — defer when unavailable.
+fn join_default(s: &Type, resolver: &TypeResolver) -> Option<SetOpResult> {
+    match s {
+        Type::Instance { .. } => Some(SetOpResult::Object),
+        Type::UnboundType { .. } => Some(SetOpResult::Any),
+        Type::TypeVarType { upper_bound, .. } | Type::ParamSpecType { upper_bound, .. } => {
+            // TypeVarTupleType is NOT in the Python elif chain -> Any.
+            join_default(upper_bound, resolver)
+        }
+        Type::TypeType { item, .. } => join_default(item, resolver),
+        Type::TypedDictType { fallback, .. } => join_default(fallback, resolver),
+        Type::CallableType { fallback, .. } => join_default(fallback, resolver),
+        Type::Overloaded { items } => {
+            // Overloaded.fallback == items[0].fallback (types.py:17).
+            let Type::CallableType { fallback, .. } = items.first()? else {
+                return Some(SetOpResult::Any);
+            };
+            join_default(fallback, resolver)
+        }
+        Type::TupleType { .. } => match crate::typeops::tuple_fallback(s, resolver) {
+            Some(fb) => join_default(&fb, resolver),
+            None => None,
+        },
+        _ => Some(SetOpResult::Any),
+    }
+}
+
+/// `TypeMeetVisitor.visit_parameters` same-length pair (meet.py:1023-
+/// 1031): join arg_types (args are contravariant), keep t's remaining
+/// Parameters fields. Diff length -> Python default(self.s) -> Bottom
+/// (s is Parameters, not UnboundType). Encodes the fresh Parameters.
+fn meet_parameters_pair(
+    s_p: &wire::Parameters,
+    t_p: &wire::Parameters,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    if s_p.arg_types.len() != t_p.arg_types.len() {
+        return Some(SetOpResult::Bottom);
+    }
+    let mut new_arg_types = Vec::with_capacity(s_p.arg_types.len());
+    for (s_a, t_a) in s_p.arg_types.iter().zip(t_p.arg_types.iter()) {
+        let joined = join_types(s_a, t_a, ctx, resolver)?;
+        new_arg_types.push(fruit_to_type(joined, s_a, t_a)?);
+    }
+    let result = Type::Parameters(wire::Parameters {
+        arg_types: new_arg_types,
+        arg_kinds: t_p.arg_kinds.clone(),
+        arg_names: t_p.arg_names.clone(),
+        variables: t_p.variables.clone(),
+        imprecise_arg_kinds: t_p.imprecise_arg_kinds,
+    });
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &result).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
 }
 
 /// `is_equivalent` (subtypes.py:277-300) for two Callables: is_subtype
@@ -2030,15 +2199,16 @@ fn visit_join(
         //   make_simplified_union([s, t]). When the enum has exactly
         //   these 2 members, contraction collapses to the enum
         //   Instance (Encoded). Partial coverage returns a 2-item
-        //   union, which is neither s nor t -> defer.
+        //   union, which we now encode too (write_type emits UnionType).
         // 3 (s is LiteralType, neither enum) -> join_types(s.fallback,
         //   t.fallback). When both fallbacks are the same Instance (the
         //   common bool case: Literal[True] vs Literal[False]), the
         //   recursive join returns SameS -> s.fallback, which we encode.
         //   When fallbacks differ, the recursive join may defer -> None.
         // 4 (s is Instance, s.last_known_value == t) -> SameT.
-        // 5 (else) -> join_types(s, t.fallback) -> defer (result not
-        //   generally s or t).
+        // 5 (else) -> join_types(s, t.fallback), materialized and
+        //   encoded when decodable (defer if setop_result_to_type
+        //   can't materialize, e.g. a recursive Encoded result).
         Type::LiteralType { value: t_val, .. } => {
             if let Type::LiteralType {
                 value: s_val,
@@ -2051,21 +2221,22 @@ fn visit_join(
                 if let Type::LiteralType { fallback: t_fb, .. } = t {
                     // Case 2 (both enum): make_simplified_union([s, t]).
                     // Contraction collapses to a single Instance when
-                    // the enum's full member set is covered; the result
-                    // is the fallback. Partial coverage yields a union
-                    // of 2 literals, which is neither s nor t -> defer.
+                    // the enum's full member set is covered; partial
+                    // coverage leaves a union of 2 literals. Both encode
+                    // (Python returns the union unchecked); anything
+                    // else (e.g. TypeAliasType) defers.
                     if is_enum_fallback(s_fb, resolver)
                         && is_enum_fallback(t_fb, resolver)
                         && s_fb.as_ref() == t_fb.as_ref()
                     {
                         let simplified =
                             make_simplified_union(&[s.clone(), t.clone()], ctx, resolver, true)?;
-                        if matches!(simplified, Type::Instance { .. }) {
-                            let mut wbuf = WriteBuffer::new();
-                            wire::write_type(&mut wbuf, &simplified).ok()?;
-                            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                        if !matches!(simplified, Type::Instance { .. } | Type::UnionType { .. }) {
+                            return None;
                         }
-                        return None;
+                        let mut wbuf = WriteBuffer::new();
+                        wire::write_type(&mut wbuf, &simplified).ok()?;
+                        return Some(SetOpResult::Encoded(wbuf.into_bytes()));
                     }
                     // Case 3: join_types(s.fallback, t.fallback). Build
                     // the joined fallback and encode it (the result is
@@ -2089,7 +2260,19 @@ fn visit_join(
                     }
                 }
             }
-            None
+            // Case 5: join_types(s, t.fallback) (join.py:966). s is not
+            // a LiteralType and not an Instance with a matching LKV.
+            // t.fallback is always an Instance; the recursive join
+            // typically returns SameS/SameT/Ancestor/Object, which
+            // setop_result_to_type materializes. setop_result_to_type
+            // defers on Encoded and SameTypeWithArgs -> graceful defer.
+            let Type::LiteralType { fallback: t_fb, .. } = t else {
+                return None;
+            };
+            let joined = setop_result_to_type(join_types(s, t_fb, ctx, resolver), s, t_fb)?;
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &joined).ok()?;
+            Some(SetOpResult::Encoded(wbuf.into_bytes()))
         }
 
         // visit_type_var (join.py:463-474), case 1 same-id-same-bound
@@ -2215,7 +2398,20 @@ fn visit_join(
                     }
                     return None;
                 }
-                // Case 2 (diff id): join upper_bounds -> defer (not generally s or t).
+                // Case 2 (diff id) (join.py:545-546): return
+                // get_proper_type(join_types(s.upper_bound,
+                // t.upper_bound)) — a fresh TYPE, not a TypeVarType.
+                // Materialize the bound join and encode. A TypeAliasType
+                // result can't expand without the live alias graph ->
+                // defer to Python.
+                let joined = fruit_to_type(join_types(s_ub, t_ub, ctx, resolver)?, s_ub, t_ub)?;
+                if matches!(joined, Type::TypeAliasType { .. }) {
+                    return None;
+                }
+                let mut wbuf = WriteBuffer::new();
+                if wire::write_type(&mut wbuf, &joined).is_ok() {
+                    return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                }
                 return None;
             }
             // Case 3 (s not TypeVarType): default(s). For Instance s,
@@ -2407,6 +2603,57 @@ fn visit_join(
                 }
             } else {
                 None
+            }
+        }
+
+        // visit_param_spec (join.py:550-553): s == t -> t (SameT).
+        // Else -> default(s) via join_default. ParamSpec never swaps in
+        // the pre-dispatch (t=ParamSpec implies swapped=false), so the
+        // emitted discs are not flipped.
+        Type::ParamSpecType { .. } => {
+            if paramspec_eq(s, t) {
+                Some(SetOpResult::SameT)
+            } else {
+                join_default(s, resolver)
+            }
+        }
+
+        // visit_parameters (join.py:566-580). Both-Parameters reaches
+        // here (no both-callable pre-dispatch on the join side). Similar
+        // pair -> arg_types meet + combine_arg_names (encoded); not
+        // similar -> default(s) = Any (Parameters is not in the join
+        // default elif chain). s not Parameters -> default(s).
+        Type::Parameters(t_p) => {
+            if let Type::Parameters(s_p) = s {
+                if !is_similar_parameters(s_p, t_p) {
+                    return Some(SetOpResult::Any);
+                }
+                // arg_types: meet (contravariant join); all other
+                // fields kept from t (copy_modified semantics).
+                let mut new_arg_types = Vec::with_capacity(s_p.arg_types.len());
+                for (s_a, t_a) in s_p.arg_types.iter().zip(t_p.arg_types.iter()) {
+                    let met = meet_types(s_a, t_a, ctx, resolver)?;
+                    new_arg_types.push(fruit_to_type(met, s_a, t_a)?);
+                }
+                let new_names = combine_parameter_arg_names(
+                    &s_p.arg_names,
+                    &t_p.arg_names,
+                    &s_p.arg_kinds,
+                    &t_p.arg_kinds,
+                );
+                let result = Type::Parameters(wire::Parameters {
+                    arg_types: new_arg_types,
+                    arg_kinds: t_p.arg_kinds.clone(),
+                    arg_names: new_names,
+                    variables: t_p.variables.clone(),
+                    imprecise_arg_kinds: t_p.imprecise_arg_kinds,
+                });
+                let mut wbuf = WriteBuffer::new();
+                wire::write_type(&mut wbuf, &result).ok()?;
+                Some(SetOpResult::Encoded(wbuf.into_bytes()))
+            } else {
+                // s not Parameters -> default(s).
+                join_default(s, resolver)
             }
         }
 
@@ -5735,6 +5982,41 @@ mod tests {
         }
     }
 
+    /// Minimal `ParamSpecType` for meet/join tests. `raw_id` +
+    /// `namespace` form the `TypeVarId` used by `ParamSpecType.__eq__`
+    /// (types.py:931-938); prefix/flavor/default take non-deferring
+    /// defaults.
+    fn param_spec(raw_id: i64, namespace: &str, upper_bound: Type) -> Type {
+        Type::ParamSpecType {
+            prefix: Box::new(wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "P".to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            flavor: 0,
+            upper_bound: Box::new(upper_bound),
+            default: Box::new(any_type()),
+        }
+    }
+
+    /// Minimal `Type::Parameters` for meet/join tests. `arg_kinds` are
+    /// wire i64s (ARG_POS=0, ARG_NAMED=3, ARG_STAR=2, ARG_NAMED_OPT=5).
+    fn parameters(arg_types: Vec<Type>, arg_kinds: Vec<i64>) -> Type {
+        Type::Parameters(wire::Parameters {
+            arg_names: vec![None; arg_types.len()],
+            variables: vec![],
+            imprecise_arg_kinds: false,
+            arg_types,
+            arg_kinds,
+        })
+    }
+
     /// Minimal `TypedDictType` for join tests. `fallback_ref` is the
     /// Instance TypedDict falls back to (typically builtins.dict or a
     /// user TypedDict class). The portable join case (visit_typeddict
@@ -5923,13 +6205,13 @@ mod tests {
     }
 
     #[test]
-    fn join_instance_with_mismatched_last_known_value_defers() {
+    fn join_instance_with_mismatched_last_known_value_encodes_fallback_join() {
         // visit_literal_type case 5 (join.py:847): s is Instance,
         // s.last_known_value != t -> join_types(self.s, t.fallback).
         // The recursive call is Instance-vs-Instance (both fallback=A),
-        // which yields SameS. But the result (A) is neither s nor t.
-        // Defer (can't express as SameS/SameT relative to the outer
-        // s=Instance(A, lkv=Lit[1]), t=Lit[2] frame).
+        // which yields SameS -> s.fallback = A. Encoded: the joined
+        // fallback is dropped of the LKV (fresh Instance(A, [])), which
+        // mirrors Python join_types(A, A) = A.
         let o = snap("builtins.object", "object");
         let a = snap("a.A", "A");
         let r = make_resolver(vec![o, a]);
@@ -5941,7 +6223,17 @@ mod tests {
             extra_attrs: None,
         };
         let t = literal(LiteralValue::Int(2), "a.A");
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("a.A", vec![]));
+        }
     }
 
     #[test]
@@ -6511,13 +6803,24 @@ mod tests {
     }
 
     #[test]
-    fn join_type_var_different_id_defers() {
-        // visit_type_var case 2 (join.py:472): s is TypeVarType but
-        // s.id != t.id -> join_types(s.upper_bound, t.upper_bound).
-        // The bound join is generally neither s nor t -> defer.
+    fn join_type_var_different_id_encodes_bound_join() {
+        // visit_type_var case 2 (join.py:545-546): s is TypeVarType but
+        // s.id != t.id -> get_proper_type(join_types(s.upper_bound,
+        // t.upper_bound)). join(int, int) = int — a fresh TYPE (the
+        // bound), not a TypeVarType. Materialized and encoded.
         let s = type_var(1, "~", instance("builtins.int", vec![]));
         let t = type_var(2, "~", instance("builtins.int", vec![]));
-        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+        let result = join_types(&s, &t, &ctx(true), &make_resolver(vec![]));
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("builtins.int", vec![]));
+        }
     }
 
     #[test]
@@ -6536,13 +6839,24 @@ mod tests {
     }
 
     #[test]
-    fn join_type_var_same_id_different_namespace_defers() {
+    fn join_type_var_same_id_different_namespace_encodes_bound_join() {
         // TypeVarId equality checks namespace (types.py:576): same
         // raw_id, different namespace -> s.id != t.id -> case 2 ->
-        // defer.
+        // join_types(upper_bound, upper_bound). join(object, object) =
+        // object, materialized and encoded.
         let s = type_var(1, "~", instance("builtins.object", vec![]));
         let t = type_var(1, "other", instance("builtins.object", vec![]));
-        assert_eq!(join_types(&s, &t, &ctx(true), &make_resolver(vec![])), None);
+        let result = join_types(&s, &t, &ctx(true), &make_resolver(vec![]));
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("builtins.object", vec![]));
+        }
     }
 
     #[test]
@@ -7876,5 +8190,237 @@ mod tests {
         let t = instance("a.B", vec![]);
         let s = instance("a.A", vec![]);
         assert!(is_better_join(&t, &s, &r));
+    }
+
+    #[test]
+    fn meet_paramspec_same_returns_s() {
+        // visit_param_spec (meet.py:1008-1012): s == t -> self.s.
+        // is_proper_subtype(ParamSpec, ParamSpec) defers (line 706
+        // `_ => return None`), so visit_meet's paramspec_eq decides.
+        let r = make_resolver(vec![]);
+        let s = param_spec(1, "~", instance("builtins.object", vec![]));
+        let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_paramspec_different_ids_returns_bottom() {
+        // Same visitor, distinct ids -> else branch -> Bottom.
+        let r = make_resolver(vec![]);
+        let s = param_spec(1, "~", instance("builtins.object", vec![]));
+        let t = param_spec(2, "~", instance("builtins.object", vec![]));
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_paramspec_s_is_unbound_returns_any() {
+        // default(self.s): s is UnboundType -> Any. has_unbound skips
+        // the subtype pre-check, so visit_meet's paramspec arm fires.
+        let r = make_resolver(vec![]);
+        let s = unbound_type();
+        let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::Any));
+    }
+
+    #[test]
+    fn meet_parameters_same_length_encodes_join() {
+        // Both-Parameters routed to meet_callable_like (both-callable
+        // pre-dispatch), then meet_parameters_pair: same length -> join
+        // int/int = int -> Encoded Parameters([int], [0]).
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
+        let s = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let result = meet_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+            let expected = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn meet_parameters_different_length_returns_bottom() {
+        // meet_parameters_pair length mismatch -> Bottom (s is
+        // Parameters, not UnboundType, so default(s) = Bottom).
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
+        let s = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let t = parameters(
+            vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.int", vec![]),
+            ],
+            vec![0, 0],
+        );
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn meet_parameters_s_is_instance_returns_bottom() {
+        // s=Instance, t=Parameters: not both-callable -> visit_meet
+        // Parameters arm -> default(s): s not Unbound -> Bottom.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
+    }
+
+    #[test]
+    fn join_paramspec_same_returns_t() {
+        // visit_param_spec (join.py:550-553): s == t -> t (SameT).
+        let r = make_resolver(vec![]);
+        let s = param_spec(1, "~", instance("builtins.object", vec![]));
+        let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameT));
+    }
+
+    #[test]
+    fn join_paramspec_different_s_instance_returns_object() {
+        // s=Instance, t=ParamSpec, ids differ -> default(s) = Object
+        // (object_from_instance). No swap (s not Union), no Any/None/
+        // Uninhabited -> visit_join ParamSpec arm.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Object)
+        );
+    }
+
+    #[test]
+    fn join_paramspec_different_s_literal_returns_any() {
+        // s=LiteralType, t=ParamSpec: default(s) has no LiteralType arm
+        // in join_default's chain -> Any.
+        let r = make_resolver(vec![snap("builtins.bool", "bool")]);
+        let s = literal(LiteralValue::Bool(true), "builtins.bool");
+        let t = param_spec(1, "~", instance("builtins.object", vec![]));
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::Any));
+    }
+
+    #[test]
+    fn join_parameters_similar_encodes_meet() {
+        // visit_parameters (join.py:566-580): similar pair -> arg_types
+        // meet (int/int = int), arg_names combined (both None), kept
+        // from t -> Encoded Parameters([int], [0]).
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
+        let s = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+            let expected = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn join_parameters_not_similar_returns_any() {
+        // Different arg count -> not similar -> default(s) = Any
+        // (Parameters not in the join default elif chain).
+        let r = make_resolver(vec![snap("builtins.int", "int")]);
+        let s = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        let t = parameters(
+            vec![
+                instance("builtins.int", vec![]),
+                instance("builtins.int", vec![]),
+            ],
+            vec![0, 0],
+        );
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::Any));
+    }
+
+    #[test]
+    fn join_parameters_s_is_instance_returns_object() {
+        // s=Instance, t=Parameters -> not both-Parameters -> default(s)
+        // = Object.
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = instance("a.A", vec![]);
+        let t = parameters(vec![instance("builtins.int", vec![])], vec![0]);
+        assert_eq!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Object)
+        );
+    }
+
+    #[test]
+    fn join_literals_partial_enum_coverage_encodes_union() {
+        // visit_literal_type case 2: both LiteralTypes, same enum
+        // fallback Color={RED,BLUE,GREEN}, values RED/BLUE. Partial
+        // coverage -> make_simplified_union keeps both literals ->
+        // Encoded UnionType (previously defers; now encodes).
+        let o = snap("builtins.object", "object");
+        let mut color = snap("color.Color", "Color");
+        color.is_enum = true;
+        color.enum_members = vec!["RED".to_string(), "BLUE".to_string(), "GREEN".to_string()];
+        let r = make_resolver(vec![color, o]);
+        let s = literal(LiteralValue::Str("RED".to_string()), "color.Color");
+        let t = literal(LiteralValue::Str("BLUE".to_string()), "color.Color");
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+            let expected = Type::UnionType {
+                items: vec![
+                    literal(LiteralValue::Str("RED".to_string()), "color.Color"),
+                    literal(LiteralValue::Str("BLUE".to_string()), "color.Color"),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            };
+            assert_eq!(decoded, expected);
+        }
+    }
+
+    #[test]
+    fn join_literals_full_enum_coverage_encodes_instance() {
+        // Case-2 full-coverage branch: both sides LiteralType, same
+        // 2-member enum fallback, values RED/BLUE. Contraction collapses
+        // [RED, BLUE] to the enum Instance Color (Encoded), the path
+        // case 2 used to reach before partial coverage was added.
+        let o = snap("builtins.object", "object");
+        let mut color = snap("color.Color", "Color");
+        color.is_enum = true;
+        color.enum_members = vec!["RED".to_string(), "BLUE".to_string()];
+        let r = make_resolver(vec![color, o]);
+        let s = literal(LiteralValue::Str("RED".to_string()), "color.Color");
+        let t = literal(LiteralValue::Str("BLUE".to_string()), "color.Color");
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(
+            matches!(result, Some(SetOpResult::Encoded(_))),
+            "got {:?}",
+            result
+        );
+        if let Some(SetOpResult::Encoded(bytes)) = result {
+            let mut rbuf = ReadBuffer::new(&bytes);
+            let decoded = wire::read_type(&mut rbuf, None).expect("decode failed");
+            assert_eq!(decoded, instance("color.Color", vec![]));
+        }
     }
 }
