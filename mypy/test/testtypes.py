@@ -7194,8 +7194,9 @@ class NativeJoinTupleSuite(Suite):
 class NativeMeetSuite(Suite):
     """Parity suite for the Rust `meet_types` (Stage 3c M8p).
 
-    Exercises the leaf visitors (meet.py:822+) and the args-less
-    Instance-Instance nominal meet (meet.py:913-979). Cases that
+    Exercises the leaf visitors (meet.py:822+) and the Instance-Instance
+    nominal meet, including same-type-with-args per-arg combination
+    (meet.py:1035-1079, encoded via the wire format). Cases that
     produce a new type (union, callable, typeddict, tuple, type_type,
     type_var with bound-meet) or need live TypeInfo (alt_promote,
     protocol) defer to Python; the result is identical regardless of
@@ -7333,14 +7334,15 @@ class NativeMeetSuite(Suite):
         # meet(B, A) = B (same subtype, swapped args).
         assert meet_types(self.fx.b, self.fx.a) == self.fx.b
 
-    def test_meet_instance_with_args_same_type_defers_to_python(self) -> None:
-        # visit_instance same type_ref with args -> combine args
-        # (produces new Instance) -> defers. Result identical to Python.
+    def test_meet_instance_with_args_same_type_combines_args(self) -> None:
+        # visit_instance same type_ref with args -> per-arg meet
+        # combined into a new Instance (Rust when the gate/per-arg meet
+        # resolve, Python otherwise). Result identical either way.
         assert meet_types(self.fx.ga, self.fx.ga) == self.fx.ga
 
-    def test_meet_instance_with_args_different_subtype_defers_to_python(self) -> None:
-        # visit_instance different types with args -> needs
-        # map_instance_to_supertype + arg combination -> defers.
+    def test_meet_instance_with_args_different_subtype_returns_subtype(self) -> None:
+        # visit_instance different types with args -> Python's branch
+        # never combines args; is_subtype decides (B <: A -> subtype).
         assert meet_types(self.fx.gsab, self.fx.gb) == self.fx.gsab
 
     def test_meet_union_s_non_union_t_defers_to_python(self) -> None:
