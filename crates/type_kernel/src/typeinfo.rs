@@ -56,6 +56,10 @@ pub(crate) struct TypeInfoSnapshot {
     pub is_newtype: bool,
     /// `TypeInfo.has_type_var_tuple_type` (nodes.py:3921). Display `[()]`.
     pub has_type_var_tuple_type: bool,
+    /// `TypeInfo.has_param_spec_type` (nodes.py:3830). typeanal.py:1201
+    /// uses it for the ParamSpec pack step, and validates a single ParamSpec
+    /// with exactly one argument.
+    pub has_param_spec_type: bool,
     /// `TypeInfo.is_abstract` (nodes.py:3704). checkexpr hot path.
     pub is_abstract: bool,
     /// `TypeInfo.type_vars` (nodes.py:3768, list[str]). subtypes.py:1358.
@@ -1014,6 +1018,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
     let is_named_tuple = read_bool_attr(item, "is_named_tuple").unwrap_or(false);
     let is_newtype = read_bool_attr(item, "is_newtype").unwrap_or(false);
     let has_type_var_tuple_type = read_bool_attr(item, "has_type_var_tuple_type").unwrap_or(false);
+    let has_param_spec_type = read_bool_attr(item, "has_param_spec_type").unwrap_or(false);
     let is_abstract = read_bool_attr(item, "is_abstract").unwrap_or(false);
     let type_vars = read_str_list_attr(item, "type_vars").unwrap_or_default();
     let mro = read_mro_fullnames(item, "mro").unwrap_or_default();
@@ -1059,6 +1064,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
         is_named_tuple,
         is_newtype,
         has_type_var_tuple_type,
+        has_param_spec_type,
         is_abstract,
         type_vars,
         mro,

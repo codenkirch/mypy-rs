@@ -1421,6 +1421,30 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         This handles simple cases like 'int', 'modname.UserClass[str]', etc.
         """
 
+        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+            try:
+                tag = _rust_classify_type_with_info(
+                    info.fullname,
+                    len(args),
+                    info.tuple_type is not None,
+                    info.special_alias is not None,
+                    info.typeddict_type is not None,
+                )
+            except (AssertionError, NotImplementedError):
+                tag = None
+            if tag == _TYPE_WITH_INFO_TAG_TUPLE:
+                self.check_and_warn_deprecated(info, ctx)
+                fallback = Instance(info, [AnyType(TypeOfAny.special_form)], ctx.line)
+                return TupleType(self.anal_array(args, allow_unpack=True), fallback, ctx.line)
+            if tag == _TYPE_WITH_INFO_TAG_NONE_TYPE:
+                self.check_and_warn_deprecated(info, ctx)
+                self.fail(
+                    "NoneType should not be used as a type, please use None instead",
+                    ctx,
+                    code=codes.NONETYPE_TYPE,
+                )
+                return NoneType(ctx.line, ctx.column)
+
         self.check_and_warn_deprecated(info, ctx)
 
         if len(args) > 0 and info.fullname == "builtins.tuple":
@@ -3230,7 +3254,8 @@ try:
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
         rust_check_vec_type_args as _rust_check_vec_type_args,
-        rust_classify_special_unbound as _rust_classify_special_unbound,
+rust_classify_special_unbound as _rust_classify_special_unbound,
+        rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
         rust_detect_diverging_alias as _rust_detect_diverging_alias,
@@ -3263,6 +3288,7 @@ except ImportError:
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
+    _rust_classify_type_with_info = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
@@ -3355,6 +3381,19 @@ _UNBOUND_SPECIAL_TAG_NOTREQUIRED_DEFER = 30
 _UNBOUND_SPECIAL_TAG_READONLY_BAD_CTX = 31
 _UNBOUND_SPECIAL_TAG_READONLY_ARG_ERR = 32
 _UNBOUND_SPECIAL_TAG_READONLY_DEFER = 33
+
+# Branch tags for `analyze_type_with_type_info` (issue #721).
+# Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
+# side effect + result construction for the two inline tags, the rest
+# re-run the original body.
+_TYPE_WITH_INFO_TAG_TUPLE = 1
+_TYPE_WITH_INFO_TAG_VEC = 2
+_TYPE_WITH_INFO_TAG_TUPLE_TAIL = 3
+_TYPE_WITH_INFO_TAG_TUPLE_TAIL_ALIAS = 4
+_TYPE_WITH_INFO_TAG_TYPEDDICT_TAIL = 5
+_TYPE_WITH_INFO_TAG_TYPEDDICT_TAIL_ALIAS = 6
+_TYPE_WITH_INFO_TAG_NONE_TYPE = 7
+_TYPE_WITH_INFO_TAG_INSTANCE = 8
 
 
 def native_analyze_type(

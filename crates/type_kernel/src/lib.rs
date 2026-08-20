@@ -125,6 +125,7 @@ mod supported_self_type;
 mod traverser;
 mod treetransform;
 mod typealias_instantiate;
+mod typeanal_info;
 mod typeanal_queries;
 mod typeanal_special;
 mod typeanal_unbound;
@@ -1389,6 +1390,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_validate_instance,
+        module
+    )?)?;
+    // analyze_type_with_type_info: the decision front (tuple-with-args,
+    // librt.vecs.vec, named-tuple/TypedDict tails, types.NoneType, plain
+    // Instance). Rust returns a branch tag from raw node facts; Python
+    // applies the side effects and builds the result objects for the two
+    // tags it executes inline, the rest re-run the body. None defers.
+    module.add_function(wrap_pyfunction!(
+        typeanal_info::rust_classify_type_with_info,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
