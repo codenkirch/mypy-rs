@@ -1137,8 +1137,11 @@ fn visit_instance_meet_args(
 /// recurses on `t.item`/`s.item` which are always Instance, so the
 /// Object result is always `builtins.object`).
 ///
-/// `Encoded` decodes back to the `Type` (the wire format already
-/// rejects un-encodable variants, so a failed decode defers).
+/// `Encoded` defers (returns `None`): the converter is shared with the
+/// join visitors, and join keeps batch-1 semantics of deferring
+/// recursive `Encoded` results to Python. The meet-only per-arg path
+/// that must decode uses `fruit_to_type` (which has its own `Encoded`
+/// arm) instead.
 fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Type> {
     match r? {
         SetOpResult::SameS => Some(s.clone()),
@@ -1190,7 +1193,14 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
         // visit_type_type only recurse on args-less Instance items,
         // so this arm is unreachable in practice. Defer conservatively.
         SetOpResult::SameTypeWithArgs { .. } => None,
-        SetOpResult::Encoded(bytes) => decode_type(&bytes),
+        // Encoded must NOT be decoded here: this converter is shared
+        // with the join visitors, and batch-1's join semantics rely on
+        // deferring recursive `Encoded` results to Python (the join
+        // shim in mypy/join.py decodes top-level disc=7 itself, and
+        // inner encodings re-joined here would change inference). The
+        // meet-only per-arg path that needs the decode uses
+        // `fruit_to_type` instead, which has its own Encoded arm.
+        SetOpResult::Encoded(_) => None,
     }
     .filter(|typ| {
         // Only return types the encoder can write. Other variants
