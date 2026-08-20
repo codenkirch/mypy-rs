@@ -560,11 +560,11 @@ fn visit_meet(
                     if s_ub == t_ub {
                         return Some(SetOpResult::SameS);
                     }
-                    // Different upper_bound: copy_modified ->
-                    // defer (no encoder).
-                    // Meet upper bounds and encode.
-                    let new_ub = meet_types(s_ub, t_ub, ctx, resolver)
-                        .and_then(|r| setop_result_to_type(Some(r), s_ub, t_ub))?;
+                    // Different upper_bound: meet upper bounds and
+                    // encode. fruit_to_type (not setop_result_to_type)
+                    // so a recursive Encoded result decodes: this is a
+                    // meet-only path, so join semantics are unaffected.
+                    let new_ub = fruit_to_type(meet_types(s_ub, t_ub, ctx, resolver)?, s_ub, t_ub)?;
                     let new_tv = Type::TypeVarType {
                         raw_id: *t_raw,
                         namespace: t_ns.clone(),
@@ -639,30 +639,81 @@ fn visit_meet(
             Some(SetOpResult::Bottom)
         }
 
-        // visit_type_type (meet.py:1248-1261), case 2 only: case 1/3
-        // (TypeType/CallableType) recurse or normalize -> defer; case 2
-        // (s is Instance(builtins.type)) -> SameT; else Bottom.
-        Type::TypeType { .. } => {
+        // visit_type_type (meet.py:1248-1261, 1412-1419).
+        Type::TypeType {
+            item: t_item,
+            is_type_form: t_itf,
+        } => {
             if let Type::Instance { type_ref, .. } = s {
                 if type_ref == "builtins.type" {
                     return Some(SetOpResult::SameT);
                 }
             }
-            if matches!(s, Type::TypeType { .. } | Type::CallableType { .. }) {
-                // Case 1 (both TypeType) + case 3 (CallableType):
-                // recursive meet -> defer.
+            if let Type::TypeType {
+                item: s_item,
+                is_type_form: s_itf,
+            } = s
+            {
+                // Python meet.py:1412-1419: typ = meet(t.item, s.item);
+                // if not NoneType: wrap
+                // TypeType.make_normalized(typ,
+                // is_type_form=s.is_type_form and t.is_type_form).
+                // Skip NoneType (bottom) results; Python returns the
+                // raw NoneType in that case (no wrap). Materialize the
+                // met item via fruit_to_type (decodes recursive
+                // Encoded), then encode the result: the NoneType path
+                // encodes NoneType directly, the wrapped path encodes
+                // the fresh TypeType. Mirrors the join-side
+                // implementation at setops.rs:1958-1969, except the
+                // flag is AND (meet) not OR (join).
+                let met_item =
+                    fruit_to_type(meet_types(t_item, s_item, ctx, resolver)?, t_item, s_item)?;
+                let result = if matches!(met_item, Type::NoneType) {
+                    met_item
+                } else {
+                    Type::TypeType {
+                        item: Box::new(met_item),
+                        is_type_form: *s_itf && *t_itf,
+                    }
+                };
+                let mut wbuf = WriteBuffer::new();
+                wire::write_type(&mut wbuf, &result).ok()?;
+                return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+            }
+            if matches!(s, Type::CallableType { .. }) {
+                // Case 3 (s is CallableType): meet.py recurses
+                // meet(t, self.s) -> defer.
                 return None;
             }
             // Else -> default -> Bottom.
             Some(SetOpResult::Bottom)
         }
 
-        // Full visitors (union, callable, typeddict, tuple,
+        // visit_union_type (meet.py:962-970): t is UnionType and s is
+        // not (the both-Union case is routed to meet_union in the
+        // pre-dispatch). meet.py:965-966 else-branch:
+        // meets = [meet_types(x, self.s) for x in t.items], then
+        // make_simplified_union(meets). One-sided: s is fixed.
+        Type::UnionType { items: t_items, .. } => {
+            let mut meets = Vec::with_capacity(t_items.len());
+            for t_item in t_items {
+                let m = meet_types(t_item, s, ctx, resolver)?;
+                meets.push(fruit_to_type(m, t_item, s)?);
+            }
+            // Drop UninhabitedType items, then make_simplified_union
+            // (which itself drops/contracts; defer when it can't).
+            meets.retain(|item| !matches!(item, Type::UninhabitedType { .. }));
+            let joined = make_simplified_union(&meets, ctx, resolver, false)?;
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &joined).ok()?;
+            Some(SetOpResult::Encoded(wbuf.into_bytes()))
+        }
+
+        // Full visitors (callable, typeddict, tuple,
         // paramspec, typevartuple, parameters, overloaded) — deferred.
-        // The both-FunctionLike and both-Union cases are already
-        // deferred by meet_types pre-dispatch. The remaining cases (s
-        // non-callable, t callable-like; s non-union, t union after
-        // swap) reach here and defer.
+        // The both-FunctionLike case is already deferred by meet_types
+        // pre-dispatch. The remaining cases (s non-callable, t
+        // callable-like) reach here and defer.
         _ => None,
     }
 }
@@ -888,11 +939,13 @@ fn meet_similar_callables_impl(
     }
     // meet.py:1414 ret_type=meet_types(t_ret, s_ret); map with the same
     // argument order (SameS -> first). The old (s_ret, t_ret) order
-    // mapped an is_subtype win onto the wrong operand.
-    let new_ret = setop_result_to_type(meet_types(t_ret, s_ret, ctx, resolver), t_ret, s_ret)?;
+    // mapped an is_subtype win onto the wrong operand. fruit_to_type
+    // (not setop_result_to_type) so a recursive Encoded ret decodes:
+    // meet-only path, join unaffected.
+    let new_ret = fruit_to_type(meet_types(t_ret, s_ret, ctx, resolver)?, t_ret, s_ret)?;
     let new_instance_type = match (t_inst, s_inst) {
-        (Some(ti), Some(si)) => Some(Box::new(setop_result_to_type(
-            meet_types(ti, si, ctx, resolver),
+        (Some(ti), Some(si)) => Some(Box::new(fruit_to_type(
+            meet_types(ti, si, ctx, resolver)?,
             ti,
             si,
         )?)),
@@ -6947,6 +7000,154 @@ mod tests {
             meet_types(&s, &t, &ctx(true), &r),
             Some(SetOpResult::Encoded(_))
         ));
+    }
+
+    #[test]
+    fn meet_types_one_sided_union_decodes_and_simplifies() {
+        // visit_union_type (meet.py:965-966), one-sided: t is Union,
+        // s is a plain Instance unrelated to the items. Pre-dispatch
+        // proper-subtype checks miss (C <: A|B false, A|B <: C false),
+        // so the arm runs: meets = [meet_types(x, s) for x in
+        // t.items] = [Bottom, Bottom] -> all dropped -> empty ->
+        // make_simplified_union([]) -> UninhabitedType. Encoded bottom
+        // matches Python's meet (all items disjoint).
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B"), snap("a.C", "C")]);
+        let s = instance("a.C", vec![]);
+        let t = Type::UnionType {
+            items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        match meet_types(&s, &t, &ctx(true), &r) {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let decoded = decode_type(&bytes).unwrap();
+                assert!(matches!(decoded, Type::UninhabitedType { .. }));
+            }
+            other => panic!("expected Encoded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn meet_types_typevar_upper_bound_decodes() {
+        // visit_type_var (meet.py:1000-1004): same raw_id/namespace but
+        // different upper_bound -> meet upper bounds and encode the
+        // new TypeVar (copy_modified). The pre-dispatch
+        // is_proper_subtype(s, t) recurses on the upper bounds and,
+        // with ignore_promotions, G[i64] is not a proper subtype of
+        // G[int] (i64 promotes to int, not subclasses it) -> pre-check
+        // misses. The arm runs: meet_types(G[i64], G[int]) = Encoded
+        // (same-type-with-args per-arg meet, i64 via promote) and
+        // fruit_to_type decodes it into the new TypeVar's upper_bound.
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        let mut i64 = snap("a.i64", "i64");
+        i64.promote_bytes = vec![crate::wire::encode_instance_simple_for_test("builtins.int")];
+        let int_snap = snap("builtins.int", "int");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, i64, int_snap, o]);
+        let s = type_var(1, "ns", instance("g.G", vec![instance("a.i64", vec![])]));
+        let t = type_var(
+            1,
+            "ns",
+            instance("g.G", vec![instance("builtins.int", vec![])]),
+        );
+        match meet_types(&s, &t, &ctx(true), &r) {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let decoded = decode_type(&bytes).unwrap();
+                match decoded {
+                    Type::TypeVarType {
+                        upper_bound,
+                        raw_id,
+                        namespace,
+                        ..
+                    } => {
+                        assert_eq!(raw_id, 1);
+                        assert_eq!(namespace, "ns");
+                        assert_eq!(
+                            *upper_bound,
+                            instance("g.G", vec![instance("a.i64", vec![])])
+                        );
+                    }
+                    other => panic!("expected TypeVarType, got {:?}", other),
+                }
+            }
+            other => panic!("expected Encoded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn meet_types_typevar_upper_bound_same_returns_same() {
+        // Same bound -> SameS (no encode needed).
+        let r = make_resolver(vec![snap("a.A", "A")]);
+        let s = type_var(1, "ns", instance("a.A", vec![]));
+        let t = type_var(1, "ns", instance("a.A", vec![]));
+        assert_eq!(meet_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
+    }
+
+    #[test]
+    fn meet_types_both_type_type_encodes() {
+        // visit_type_type (meet.py:1412-1419), case 1: both TypeType.
+        // typ = meet(t.item, s.item); if not NoneType, wrap
+        // TypeType.make_normalized with is_type_form = AND. s is a
+        // TypeForm, t is a plain TypeType: is_subtype(TypeForm[B],
+        // Type[A]) is Some(false) (subtypes.py:537 — the right side
+        // lacks is_type_form), so the pre-dispatch skips and the arm
+        // runs. B <: A, meet(A, B)=B -> TypeType[B] encoded with
+        // is_type_form = True AND False = False.
+        let mut b = snap("a.B", "B");
+        b.has_base.insert("a.A".to_string());
+        b.mro.push("a.A".to_string());
+        let a = snap("a.A", "A");
+        let r = make_resolver(vec![b, a]);
+        let s = Type::TypeType {
+            item: Box::new(instance("a.B", vec![])),
+            is_type_form: true,
+        };
+        let t = Type::TypeType {
+            item: Box::new(instance("a.A", vec![])),
+            is_type_form: false,
+        };
+        match meet_types(&s, &t, &ctx(true), &r) {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let decoded = decode_type(&bytes).unwrap();
+                match decoded {
+                    Type::TypeType { item, is_type_form } => {
+                        assert_eq!(*item, instance("a.B", vec![]));
+                        assert!(!is_type_form);
+                    }
+                    other => panic!("expected TypeType, got {:?}", other),
+                }
+            }
+            other => panic!("expected Encoded, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn meet_types_both_type_type_unrelated_encodes_union() {
+        // A vs B (unrelated) -> meet returns Bottom (Uninhabited). In
+        // Python, TypeType.make_normalized(UninhabitedType) returns a
+        // TypeType of bottom. Fresh encode wraps the Uninhabited item
+        // in a TypeType.
+        let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
+        let s = Type::TypeType {
+            item: Box::new(instance("a.A", vec![])),
+            is_type_form: false,
+        };
+        let t = Type::TypeType {
+            item: Box::new(instance("a.B", vec![])),
+            is_type_form: false,
+        };
+        match meet_types(&s, &t, &ctx(true), &r) {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let decoded = decode_type(&bytes).unwrap();
+                match decoded {
+                    Type::TypeType { .. } => {}
+                    other => panic!("expected TypeType, got {:?}", other),
+                }
+            }
+            other => panic!("expected Encoded, got {:?}", other),
+        }
     }
 
     #[test]
