@@ -13563,6 +13563,294 @@ class NativeOverloadingOverloadsSuite(Suite):
         self._assert_parity(sigs, [], strict_optional=False)
         assert_equal(self._native_decisions(sigs, [], False, True), [])
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAndOrConditionalMapsSuite(Suite):
+    """Parity for the Rust `and_conditional_maps` / `or_conditional_maps` ports.
+
+    `mypy.checker.and_conditional_maps` (checker.py:9704) and
+    `or_conditional_maps` (checker.py:9783) combine two narrowing TypeMaps
+    for the truth of `e1 and e2` / `e1 or e2`; the Rust ports in
+    `condmaps.rs` mirror the Python precedence rules and defer (None) when a
+    value fails to decode or a `meet_types` / `make_simplified_union` call
+    defers. The `use_meet=True` path hard-defers in Rust (condmaps.rs), so
+    both gates run the Python meet loop there. Toggling the checker gate off
+    (Python) and on (Rust) must produce identical result maps for a few
+    if/elif/while narrowing shapes, and the direct seam calls prove the Rust
+    functions engage rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        # Cache a bound NameExpr per variable name so common-key scenarios
+        # share the same Expression/Var identity across both maps, matching
+        # production where and/or_conditional_maps receives the same
+        # narrowed expression object in both TypeMaps.
+        self._keys: dict[str, NameExpr] = {}
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in type_infos})
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _map(self, pairs: list[tuple[str, Type]]) -> TypeMap:
+        """Build a TypeMap keyed by cached NameExprs.
+
+        Each name resolves to one cached NameExpr bound to its own Var, so
+        `literal_hash` yields a distinct, stable key per variable (an unbound
+        NameExpr hashes as ("Var", None) for every name, collapsing all keys
+        into one). Reusing the cached key across maps mirrors production,
+        where the same narrowed expression object appears in both TypeMaps.
+        """
+        from mypy.checker import TypeMap
+
+        m: TypeMap = {}
+        for name, t in pairs:
+            e = self._keys.get(name)
+            if e is None:
+                e = NameExpr(name)
+                e.node = Var(name)
+                self._keys[name] = e
+            m[e] = t
+        return m
+
+    def _normalize(self, m: TypeMap) -> set[tuple[str, str]]:
+        return {(str(e), str(t)) for e, t in m.items()}
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        from mypy.checker import _set_native_checker_active
+
+        _set_native_checker_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_active(True)
+
+    def _assert_and_parity(
+        self, m1: TypeMap, m2: TypeMap, *, use_meet: bool = False
+    ) -> None:
+        from mypy.checker import and_conditional_maps
+
+        off = self._with_gate(False, lambda: and_conditional_maps(m1, m2, use_meet=use_meet))
+        on = self._with_gate(True, lambda: and_conditional_maps(m1, m2, use_meet=use_meet))
+        # assert_equal reformats fmt with .format(), and dict reprs contain
+        # braces, so build a brace-free message with the normalized sets.
+        assert_equal(
+            self._normalize(off),
+            self._normalize(on),
+            "and_conditional_maps parity gate-off={} vs gate-on={}".format(
+                sorted(self._normalize(off)), sorted(self._normalize(on))
+            ),
+        )
+
+    def _assert_or_parity(
+        self, m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False
+    ) -> None:
+        from mypy.checker import or_conditional_maps
+
+        off = self._with_gate(False, lambda: or_conditional_maps(m1, m2, coalesce_any=coalesce_any))
+        on = self._with_gate(True, lambda: or_conditional_maps(m1, m2, coalesce_any=coalesce_any))
+        assert_equal(
+            self._normalize(off),
+            self._normalize(on),
+            "or_conditional_maps parity gate-off={} vs gate-on={}".format(
+                sorted(self._normalize(off)), sorted(self._normalize(on))
+            ),
+        )
+
+    def _and_engages(self, m1: TypeMap, m2: TypeMap, *, use_meet: bool = False) -> None:
+        from mypy.checker import _serialize_type_for_checker
+        from mypy.literals import literal_hash
+
+        keys1 = [hash(literal_hash(e)) for e in m1]
+        vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
+        keys2 = [hash(literal_hash(e)) for e in m2]
+        vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
+        result = _type_kernel.rust_and_conditional_maps(
+            keys1, vals1, keys2, vals2, use_meet, state.strict_optional, self.resolver
+        )
+        assert result is not None, f"Rust and_conditional_maps did not engage: {m1} vs {m2}"
+
+    def _or_engages(self, m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False) -> None:
+        from mypy.checker import _serialize_type_for_checker
+        from mypy.literals import literal_hash
+
+        keys1 = [hash(literal_hash(e)) for e in m1]
+        vals1 = [_serialize_type_for_checker(t) for t in m1.values()]
+        keys2 = [hash(literal_hash(e)) for e in m2]
+        vals2 = [_serialize_type_for_checker(t) for t in m2.values()]
+        result = _type_kernel.rust_or_conditional_maps(
+            keys1, vals1, keys2, vals2, coalesce_any, state.strict_optional, self.resolver
+        )
+        assert result is not None, f"Rust or_conditional_maps did not engage: {m1} vs {m2}"
+
+    def test_and_common_key_m2_precedence(self) -> None:
+        from mypy.checker import and_conditional_maps
+
+        # Same expression narrowed by both conditions; use_meet=False keeps
+        # m2's value unless m1 is Never or m2 is Any over a non-Any union.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("x", self.fx.b)])
+        self._assert_and_parity(m1, m2)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "B")})
+        self._and_engages(m1, m2)
+
+    def test_and_disjoint_keys(self) -> None:
+        from mypy.checker import and_conditional_maps
+
+        # Different expressions: the result combines both maps.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("y", self.fx.b)])
+        self._assert_and_parity(m1, m2)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "A"), ("NameExpr(y)", "B")})
+        self._and_engages(m1, m2)
+
+    def test_and_m1_never_wins(self) -> None:
+        from mypy.checker import and_conditional_maps
+
+        # m1 narrowed to Never wins over m2's refinement.
+        m1 = self._map([("x", UninhabitedType())])
+        m2 = self._map([("x", self.fx.b)])
+        self._assert_and_parity(m1, m2)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "Never")})
+        self._and_engages(m1, m2)
+
+    def test_and_m2_any_uses_m1(self) -> None:
+        from mypy.checker import and_conditional_maps
+
+        # m2 is Any and m1 is a plain instance (not a union containing Any):
+        # keep m1's precise refinement.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("x", AnyType(TypeOfAny.special_form))])
+        self._assert_and_parity(m1, m2)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "A")})
+        self._and_engages(m1, m2)
+
+    def test_and_m2_any_union_keeps_m2(self) -> None:
+        from mypy.checker import and_conditional_maps
+
+        # m1 is a union containing Any: m2's Any is kept.
+        m1 = self._map([("x", UnionType([self.fx.a, AnyType(TypeOfAny.special_form)]))])
+        m2 = self._map([("x", AnyType(TypeOfAny.special_form))])
+        self._assert_and_parity(m1, m2)
+        result = self._with_gate(True, lambda: and_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "Any")})
+        self._and_engages(m1, m2)
+
+    def test_and_use_meet_true_defers(self) -> None:
+        from mypy.checker import _serialize_type_for_checker
+        from mypy.literals import literal_hash
+
+        # use_meet=True hard-defers in Rust: the seam must return None, and
+        # both gates run the Python meet loop, so parity still holds.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("x", self.fx.b)])
+        self._assert_and_parity(m1, m2, use_meet=True)
+        result = _type_kernel.rust_and_conditional_maps(
+            [hash(literal_hash(NameExpr("x")))],
+            [_serialize_type_for_checker(self.fx.a)],
+            [hash(literal_hash(NameExpr("x")))],
+            [_serialize_type_for_checker(self.fx.b)],
+            True,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is None, f"expected use_meet deferral, got {result}"
+
+    def test_or_common_key_union(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # Same expression narrowed differently to unrelated types: the
+        # result joins both values. (fx.d is unrelated to fx.a, unlike
+        # fx.b which is a subtype of A in the fixture.)
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("x", self.fx.d)])
+        self._assert_or_parity(m1, m2)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "A | D")})
+        self._or_engages(m1, m2)
+
+    def test_or_m1_unreachable(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # An unreachable m1 contributes nothing: the result is m2.
+        m1 = self._map([("x", UninhabitedType())])
+        m2 = self._map([("y", self.fx.b)])
+        self._assert_or_parity(m1, m2)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(y)", "B")})
+        self._or_engages(m1, m2)
+
+    def test_or_m2_unreachable(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # An unreachable m2 contributes nothing: the result is m1.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("y", UninhabitedType())])
+        self._assert_or_parity(m1, m2)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "A")})
+        self._or_engages(m1, m2)
+
+    def test_or_no_common_keys(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # No expression refined by both conditions: empty result.
+        m1 = self._map([("x", self.fx.a)])
+        m2 = self._map([("y", self.fx.b)])
+        self._assert_or_parity(m1, m2)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), set())
+        self._or_engages(m1, m2)
+
+    def test_or_coalesce_any_keeps_any(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # coalesce_any with an Any m1 keeps the Any.
+        m1 = self._map([("x", AnyType(TypeOfAny.special_form))])
+        m2 = self._map([("x", self.fx.b)])
+        self._assert_or_parity(m1, m2, coalesce_any=True)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2, coalesce_any=True))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "Any")})
+        self._or_engages(m1, m2, coalesce_any=True)
+
+    def test_or_coalesce_any_false_unions(self) -> None:
+        from mypy.checker import or_conditional_maps
+
+        # Without coalesce_any, an Any m1 and a concrete m2 both weigh in;
+        # make_simplified_union keeps both items (Any | B does not collapse).
+        m1 = self._map([("x", AnyType(TypeOfAny.special_form))])
+        m2 = self._map([("x", self.fx.b)])
+        self._assert_or_parity(m1, m2)
+        result = self._with_gate(True, lambda: or_conditional_maps(m1, m2))
+        assert_equal(self._normalize(result), {("NameExpr(x)", "Any | B")})
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

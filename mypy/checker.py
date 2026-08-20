@@ -9706,8 +9706,7 @@ def and_conditional_maps(m1: TypeMap, m2: TypeMap, *, use_meet: bool = False) ->
     in terms of the information that we can learn from the truth of e1 and
     the truth of e2.
     """
-    _condmaps_disabled = True
-    if not _condmaps_disabled and (
+    if (
         _CHECKER_HAS_TYPE_KERNEL
         and _native_checker_active
         and _native_checker_resolver is not None
@@ -9786,8 +9785,7 @@ def or_conditional_maps(m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False)
     the truth of e2. If coalesce_any is True, consider Any a supertype when
     joining restrictions.
     """
-    _condmaps_disabled = True
-    if not _condmaps_disabled and (
+    if (
         _CHECKER_HAS_TYPE_KERNEL
         and _native_checker_active
         and _native_checker_resolver is not None
