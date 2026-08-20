@@ -4368,6 +4368,545 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         v.type = self.fx.o
         sym = SymbolTableNode(MDEF, v)
         self._assert_par(t, sym, False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUnboundBranchFrontSuite(Suite):
+    """Parity for the Rust `visit_unbound_type_nonoptional` decision front.
+
+    The dispatch hub that decides how an unbound type expression resolves
+    (unresolved symbol, PlaceholderNode, ParamSpecExpr, TypeVarExpr,
+    TypeVarTupleExpr) runs in Rust from raw node facts and returns a branch
+    tag; the Python shim applies the side effects (defer /
+    record_incomplete_ref / fail) and rebuilds the result object. Branches
+    Rust cannot classify from facts alone (plugin hook, non-front node
+    kinds, unbound non-alias TypeVarExpr) defer to the pure-Python body.
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical (str(result), captured fail/note messages, defer and
+    record_incomplete_ref counts) on both engaged and deferred paths, and a
+    direct seam call proves the Rust classifier engages on each front family.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, syms: dict[str, SymbolTableNode], **kwargs: object) -> object:
+        from mypy.tvar_scope import TypeVarLikeScope
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.final_iteration = False
+                self.calls: dict[str, int] = {
+                    "defer": 0,
+                    "record_incomplete_ref": 0,
+                    "is_func_scope": 0,
+                }
+                self.errors: list[str] = []
+
+            def lookup_qualified(
+                self, name: str, ctx: Context, suppress_errors: bool = False
+            ) -> SymbolTableNode | None:
+                return syms.get(name)
+
+            def fail(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+            def defer(self) -> None:
+                self.calls["defer"] += 1
+
+            def record_incomplete_ref(self) -> None:
+                self.calls["record_incomplete_ref"] += 1
+
+            def is_func_scope(self) -> bool:
+                self.calls["is_func_scope"] += 1
+                return False
+
+        class FakePlugin:
+            def __init__(self, hook: object) -> None:
+                self._hook = hook
+
+            def get_type_analyze_hook(self, fullname: str) -> object:
+                return self._hook
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.tvar_scope = TypeVarLikeScope()
+        ta.plugin = FakePlugin(kwargs.pop("hook", None))
+        ta.options = Options()
+        ta.defining_alias = False
+        ta.python_3_12_type_alias = False
+        ta.alias_type_params_names = None
+        ta.allowed_alias_tvars = []
+        ta.erase_tvar_defs = []
+        ta.allow_unbound_tvars = False
+        ta.allow_placeholder = False
+        ta.allow_param_spec_literals = False
+        ta.allow_type_any = False
+        ta.allow_type_var_tuple = -1
+        ta.nesting_level = 0
+        ta.is_typeshed_stub = False
+        ta.analyzing_tvar_def = False
+        ta.aliases_used = set()
+        if kwargs.pop("api_final_iteration", False):
+            api.final_iteration = True
+        if kwargs.pop("bound_tvar", False):
+            ta.tvar_scope.bind_existing(self._bound_tvar())
+        if kwargs.pop("bound_pspec", False):
+            ta.tvar_scope.bind_existing(self._bound_pspec())
+        if kwargs.pop("bound_tvt", False):
+            ta.tvar_scope.bind_existing(self._bound_tvt())
+        for key, value in kwargs.items():
+            setattr(ta, key, value)
+        return ta, api
+
+    def _tvar_expr_sym(self, name: str = "T", fullname: str = "mod.T") -> SymbolTableNode:
+        from mypy.nodes import SymbolTableNode, TypeVarExpr
+
+        tv = TypeVarExpr(
+            name, fullname, -1, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        return SymbolTableNode(MDEF, tv)
+
+    def _pspec_expr_sym(self, name: str = "P", fullname: str = "mod.P") -> SymbolTableNode:
+        from mypy.nodes import ParamSpecExpr, SymbolTableNode
+
+        pe = ParamSpecExpr(
+            name, fullname, self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        return SymbolTableNode(MDEF, pe)
+
+    def _tvt_expr_sym(self, name: str = "Ts", fullname: str = "mod.Ts") -> SymbolTableNode:
+        from mypy.nodes import SymbolTableNode, TypeVarTupleExpr
+
+        te = TypeVarTupleExpr(
+            name, fullname, self.fx.o, self.fx.std_tuple, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        return SymbolTableNode(MDEF, te)
+
+    def _bind(self, ta: object, tvar_def: TypeVarLikeType) -> None:
+        ta.tvar_scope.bind_existing(tvar_def)
+
+    def _bound_tvar(self, name: str = "T", fullname: str = "mod.T") -> TypeVarType:
+        return TypeVarType(
+            name, fullname, TypeVarId(1), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+
+    def _bound_pspec(self, name: str = "P", fullname: str = "mod.P") -> ParamSpecType:
+        return ParamSpecType(
+            name, fullname, TypeVarId(1), 0, self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+
+    def _bound_tvt(self, name: str = "Ts", fullname: str = "mod.Ts") -> TypeVarTupleType:
+        return TypeVarTupleType(
+            name,
+            fullname,
+            TypeVarId(1),
+            self.fx.o,
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _visit(
+        self, t: UnboundType, ta: object, defining_literal: bool = False
+    ) -> tuple[str, list[str], dict[str, int]]:
+        result = ta.visit_unbound_type_nonoptional(t, defining_literal)
+        messages = [m for m in ta.api.errors if not m.startswith("note: ")]
+        return str(result), messages, ta.api.calls
+
+    def _assert_par(self, t: UnboundType, syms: dict[str, SymbolTableNode], **kwargs: object) -> None:
+        off_ta, _ = self._analyser(syms, **kwargs)
+        off = self._with_gate(False, lambda: self._visit(t, off_ta))
+        self._set_active(True)
+        on_ta, _ = self._analyser(syms, **kwargs)
+        on = self._with_gate(True, lambda: self._visit(t, on_ta))
+        assert_equal(str(on), str(off), f"visit_unbound_type_nonoptional parity {t.name}")
+        assert_equal(on[1], off[1], f"visit_unbound_type_nonoptional errors {t.name}")
+        assert_equal(
+            on[2]["defer"],
+            off[2]["defer"],
+            f"visit_unbound_type_nonoptional defer parity {t.name}",
+        )
+        assert_equal(
+            on[2]["record_incomplete_ref"],
+            off[2]["record_incomplete_ref"],
+            f"visit_unbound_type_nonoptional record parity {t.name}",
+        )
+
+    def _assert_engages(self, **facts: object) -> None:
+        from mypy.typeanal import _rust_classify_unbound_front
+
+        defaults: dict[str, object] = {
+            "node_kind": -1,
+            "placeholder_becomes_typeinfo": False,
+            "final_iteration": False,
+            "allow_placeholder": False,
+            "has_hook": False,
+            "tvar_def_exists": False,
+            "tvar_def_in_allowed": False,
+            "tvar_def_erased": False,
+            "placeholder_in_tvar_params": False,
+            "allow_unbound_tvars": False,
+            "defining_alias": False,
+            "defining_literal": False,
+            "param_spec_name_set": False,
+            "allow_param_spec_literals": False,
+            "has_args": False,
+            "alias_type_params_names": None,
+            "tname": "T",
+            "allow_type_var_tuple": -1,
+            "nesting_level": 0,
+        }
+        defaults.update(facts)
+        result = _rust_classify_unbound_front(
+            defaults["node_kind"],
+            defaults["placeholder_becomes_typeinfo"],
+            defaults["final_iteration"],
+            defaults["allow_placeholder"],
+            defaults["has_hook"],
+            defaults["tvar_def_exists"],
+            defaults["tvar_def_in_allowed"],
+            defaults["tvar_def_erased"],
+            defaults["placeholder_in_tvar_params"],
+            defaults["allow_unbound_tvars"],
+            defaults["defining_alias"],
+            defaults["defining_literal"],
+            defaults["param_spec_name_set"],
+            defaults["allow_param_spec_literals"],
+            defaults["has_args"],
+            defaults["alias_type_params_names"],
+            defaults["tname"],
+            defaults["allow_type_var_tuple"],
+            defaults["nesting_level"],
+        )
+        assert result is not None, "Rust visit_unbound_type_nonoptional front did not engage"
+
+    def test_unresolved_symbol(self) -> None:
+        # sym is None (lookup misses) -> Any(special_form).
+        t = UnboundType("mod.missing")
+        self._assert_par(t, {})
+        self._assert_engages(node_kind=-1)
+
+    def test_placeholder_becomes_typeinfo_final(self) -> None:
+        # Cyclic reference to a class -> "Cannot resolve name".
+        from mypy.nodes import PlaceholderNode, SymbolTableNode
+
+        t = UnboundType("mod.C")
+        sym = SymbolTableNode(
+            MDEF, PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        )
+        self._assert_par(t, {"mod.C": sym}, api_final_iteration=True)
+        self._assert_engages(node_kind=1, placeholder_becomes_typeinfo=True, final_iteration=True)
+
+    def test_placeholder_becomes_typeinfo_defer(self) -> None:
+        # Incomplete reference, placeholder allowed -> PlaceholderType + defer.
+        from mypy.nodes import PlaceholderNode, SymbolTableNode
+
+        t = UnboundType("mod.C")
+        sym = SymbolTableNode(
+            MDEF, PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        )
+        self._assert_par(t, {"mod.C": sym}, allow_placeholder=True)
+        self._assert_engages(node_kind=1, placeholder_becomes_typeinfo=True, allow_placeholder=True)
+
+    def test_placeholder_becomes_typeinfo_record(self) -> None:
+        # Incomplete reference, not allowed -> PlaceholderType + record.
+        from mypy.nodes import PlaceholderNode, SymbolTableNode
+
+        t = UnboundType("mod.C")
+        sym = SymbolTableNode(
+            MDEF, PlaceholderNode("mod.C", Var("C"), 1, becomes_typeinfo=True)
+        )
+        self._assert_par(t, {"mod.C": sym})
+        self._assert_engages(node_kind=1, placeholder_becomes_typeinfo=True)
+
+    def test_placeholder_plain_final(self) -> None:
+        # Unknown placeholder on the final iteration -> error Any.
+        from mypy.nodes import PlaceholderNode, SymbolTableNode
+
+        t = UnboundType("mod.C")
+        sym = SymbolTableNode(MDEF, PlaceholderNode("mod.C", Var("C"), 1))
+        self._assert_par(t, {"mod.C": sym}, api_final_iteration=True)
+        self._assert_engages(node_kind=1, final_iteration=True)
+
+    def test_placeholder_plain_record(self) -> None:
+        # Unknown placeholder -> Any(special_form) + record.
+        from mypy.nodes import PlaceholderNode, SymbolTableNode
+
+        t = UnboundType("mod.C")
+        sym = SymbolTableNode(MDEF, PlaceholderNode("mod.C", Var("C"), 1))
+        self._assert_par(t, {"mod.C": sym})
+        self._assert_engages(node_kind=1)
+
+    def test_node_none_internal_error(self) -> None:
+        # Resolved symbol with no node -> internal error + Any(special_form).
+        t = UnboundType("mod.x")
+        sym = SymbolTableNode(MDEF, None)
+        self._assert_par(t, {"mod.x": sym})
+        self._assert_engages(node_kind=0)
+
+    def test_hook_defers(self) -> None:
+        # A registered plugin hook always defers to the Python body.
+        t = UnboundType("mod.T")
+        sym = self._tvar_expr_sym()
+        self._assert_par(t, {"mod.T": sym}, hook=lambda ctx: AnyType(TypeOfAny.special_form))
+
+    def test_pspec_unbound_tvar_allowed(self) -> None:
+        # Unbound param spec in an allowed context -> t unchanged.
+        t = UnboundType("mod.P")
+        self._assert_par(t, {"mod.P": self._pspec_expr_sym()}, allow_unbound_tvars=True)
+        self._assert_engages(
+            node_kind=2, allow_unbound_tvars=True, tname="mod.P"
+        )
+
+    def test_pspec_unbound_not_declared(self) -> None:
+        # Generic alias without P in type_params -> error.
+        t = UnboundType("mod.P")
+        self._assert_par(
+            t,
+            {"mod.P": self._pspec_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["X"],
+        )
+        self._assert_engages(
+            node_kind=2, defining_alias=True, tname="mod.P", alias_type_params_names=["X"]
+        )
+
+    def test_pspec_unbound_plain(self) -> None:
+        # Unbound param spec -> "is unbound" error.
+        t = UnboundType("mod.P")
+        self._assert_par(t, {"mod.P": self._pspec_expr_sym()}, defining_alias=True)
+        self._assert_engages(node_kind=2, defining_alias=True, tname="mod.P")
+
+    def test_pspec_bound_args(self) -> None:
+        # Bound param spec with arguments -> "used with arguments" + build.
+        t = UnboundType("mod.P", [UnboundType("int")])
+        psym = self._pspec_expr_sym()
+        self._assert_par(t, {"mod.P": psym}, bound_pspec=True)
+        self._assert_engages(node_kind=2, tvar_def_exists=True, has_args=True, tname="mod.P")
+
+    def test_pspec_bound_ok(self) -> None:
+        # Plain bound param spec -> ParamSpecType with the new line.
+        t = UnboundType("mod.P")
+        self._assert_par(t, {"mod.P": self._pspec_expr_sym()}, bound_pspec=True)
+        self._assert_engages(node_kind=2, tvar_def_exists=True, tname="mod.P")
+
+    def test_pspec_args_suffix(self) -> None:
+        # `P.args`/`P.kwargs` component literal when literals are allowed.
+        t = UnboundType("mod.P.args")
+        sym = self._pspec_expr_sym()
+        self._assert_par(
+            t, {"mod.P.args": sym, "mod.P": sym}, bound_pspec=True, allow_param_spec_literals=True
+        )
+        self._assert_engages(
+            node_kind=2,
+            tvar_def_exists=True,
+            param_spec_name_set=True,
+            allow_param_spec_literals=True,
+            tname="mod.P.args",
+        )
+
+    def test_pspec_args_suffix_component_error(self) -> None:
+        # `P.args` where literals are not allowed -> component error.
+        t = UnboundType("mod.P.args")
+        sym = self._pspec_expr_sym()
+        self._assert_par(t, {"mod.P.args": sym, "mod.P": sym}, bound_pspec=True)
+        self._assert_engages(
+            node_kind=2, tvar_def_exists=True, param_spec_name_set=True, tname="mod.P.args"
+        )
+
+    def test_typevar_alias_not_declared(self) -> None:
+        # Generic alias using T that is not in type_params -> error.
+        t = UnboundType("mod.T")
+        self._assert_par(
+            t,
+            {"mod.T": self._tvar_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["X"],
+        )
+        self._assert_engages(
+            node_kind=3, defining_alias=True, tname="mod.T", alias_type_params_names=["X"]
+        )
+
+    def test_typevar_alias_not_declared_312(self) -> None:
+        # PEP 696 style alias error message on Python 3.12.
+        t = UnboundType("mod.T")
+        self._assert_par(
+            t,
+            {"mod.T": self._tvar_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["X"],
+            python_3_12_type_alias=True,
+        )
+        self._assert_engages(
+            node_kind=3, defining_alias=True, tname="mod.T", alias_type_params_names=["X"]
+        )
+
+    def test_typevar_alias_bound(self) -> None:
+        # Generic alias using T that is bound but not allowed -> error.
+        t = UnboundType("mod.T")
+        self._assert_par(
+            t,
+            {"mod.T": self._tvar_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["mod.T"],
+            bound_tvar=True,
+        )
+        self._assert_engages(
+            node_kind=3,
+            defining_alias=True,
+            tvar_def_exists=True,
+            tname="mod.T",
+            alias_type_params_names=["mod.T"],
+        )
+
+    def test_typevar_alias_allowed(self) -> None:
+        # Generic alias using T that is allowed -> TypeVarType (allowed).
+        t = UnboundType("mod.T")
+        self._assert_par(
+            t,
+            {"mod.T": self._tvar_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["T"],
+            bound_tvar=True,
+            allowed_alias_tvars=[self._bound_tvar()],
+        )
+        self._assert_engages(
+            node_kind=3, defining_alias=True, tvar_def_exists=True, tvar_def_in_allowed=True
+        )
+
+    def test_typevar_erased(self) -> None:
+        # Erased tvar -> Any(from_error) without a new message.
+        t = UnboundType("mod.T")
+        self._assert_par(
+            t, {"mod.T": self._tvar_expr_sym()}, bound_tvar=True, erase_tvar_defs=[self._bound_tvar()]
+        )
+        self._assert_engages(node_kind=3, tvar_def_exists=True, tvar_def_erased=True)
+
+    def test_typevar_plain(self) -> None:
+        # Plain bound tvar -> copy_modified with the new line.
+        t = UnboundType("mod.T")
+        self._assert_par(t, {"mod.T": self._tvar_expr_sym()}, bound_tvar=True)
+        self._assert_engages(node_kind=3, tvar_def_exists=True)
+
+    def test_typevar_with_args(self) -> None:
+        # Bound tvar with arguments -> "used with arguments" + copy_modified.
+        t = UnboundType("mod.T", [UnboundType("int")])
+        self._assert_par(t, {"mod.T": self._tvar_expr_sym()}, bound_tvar=True)
+        self._assert_engages(node_kind=3, tvar_def_exists=True, has_args=True)
+
+    def test_tvt_alias_not_declared(self) -> None:
+        # Generic alias using Ts that is not in type_params -> error.
+        t = UnboundType("mod.Ts")
+        self._assert_par(
+            t,
+            {"mod.Ts": self._tvt_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["X"],
+            bound_tvt=True,
+        )
+        self._assert_engages(
+            node_kind=4,
+            tvar_def_exists=True,
+            defining_alias=True,
+            tname="mod.Ts",
+            alias_type_params_names=["X"],
+        )
+
+    def test_tvt_alias_bound(self) -> None:
+        # Generic alias using Ts that is bound but not allowed -> error.
+        t = UnboundType("mod.Ts")
+        self._assert_par(
+            t,
+            {"mod.Ts": self._tvt_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["Ts"],
+            bound_tvt=True,
+        )
+        self._assert_engages(
+            node_kind=4, tvar_def_exists=True, defining_alias=True, tname="mod.Ts"
+        )
+
+    def test_tvt_unbound_tvar_allowed(self) -> None:
+        # Unbound Ts in an allowed context -> t unchanged.
+        t = UnboundType("mod.Ts")
+        self._assert_par(t, {"mod.Ts": self._tvt_expr_sym()}, allow_unbound_tvars=True)
+        self._assert_engages(node_kind=4, allow_unbound_tvars=True, tname="mod.Ts")
+
+    def test_tvt_unbound_not_declared(self) -> None:
+        # Unbound Ts in a generic alias -> 3.12-aware "not included" error.
+        t = UnboundType("mod.Ts")
+        self._assert_par(
+            t,
+            {"mod.Ts": self._tvt_expr_sym()},
+            defining_alias=True,
+            alias_type_params_names=["X"],
+            python_3_12_type_alias=True,
+        )
+        self._assert_engages(
+            node_kind=4, defining_alias=True, tname="mod.Ts", alias_type_params_names=["X"]
+        )
+
+    def test_tvt_unbound_plain(self) -> None:
+        # Unbound Ts not allowed -> "is unbound" error.
+        t = UnboundType("mod.Ts")
+        self._assert_par(t, {"mod.Ts": self._tvt_expr_sym()})
+        self._assert_engages(node_kind=4, tname="mod.Ts")
+
+    def test_tvt_nesting_mismatch(self) -> None:
+        # Ts at the wrong unpack nesting -> "only valid with an unpack" error.
+        t = UnboundType("mod.Ts")
+        self._assert_par(
+            t,
+            {"mod.Ts": self._tvt_expr_sym()},
+            bound_tvt=True,
+            allow_type_var_tuple=1,
+            nesting_level=2,
+        )
+        self._assert_engages(
+            node_kind=4, tvar_def_exists=True, allow_type_var_tuple=1, nesting_level=2
+        )
+
+    def test_tvt_with_args(self) -> None:
+        # Bound Ts with arguments -> "used with arguments" + build.
+        t = UnboundType("mod.Ts", [UnboundType("int")])
+        self._assert_par(t, {"mod.Ts": self._tvt_expr_sym()}, bound_tvt=True)
+        self._assert_engages(node_kind=4, tvar_def_exists=True, has_args=True)
+
+    def test_tvt_plain(self) -> None:
+        # Plain bound Ts -> TypeVarTupleType with the new line.
+        t = UnboundType("mod.Ts")
+        self._assert_par(t, {"mod.Ts": self._tvt_expr_sym()}, bound_tvt=True)
+        self._assert_engages(node_kind=4, tvar_def_exists=True)
+
+    def test_other_kind_defers(self) -> None:
+        # A Var node is resolved by the back of the method (deferred).
+        t = UnboundType("mod.x")
+        v = Var("x")
+        v._fullname = "mod.x"
+        v.type = self.fx.o
+        self._assert_par(t, {"mod.x": SymbolTableNode(MDEF, v)})
 class NativeCheckArgumentTypesPlanSuite(Suite):
     """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
 
