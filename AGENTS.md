@@ -333,6 +333,19 @@ including:
   leaked into `infer_literal_expr_type` → `copy_modified` → Python
   fallback → `AssertionError: De-serialization failure: TypeInfo not
   fixed` inside `_is_subtype` (`testSpecialSignatureForSubclassOfDict2`).
+- `check_overlapping_overloads` screening loop (mypy.checker): the Rust
+  driver in `overload_override.rs` runs the pairwise screening part of
+  `TypeChecker.check_overlapping_overloads` (checker.py:1559-1603) in one
+  call on wire callables (each signature serialized once instead of once per
+  predicate): the argument-count gate, the never-match predicate, the
+  unsafe-overlap predicate under `strict_optional=True`, and the flip note.
+  The impl-vs-items tail and the message emission stay in Python. Engages
+  only when every item's `var.type` is already a plain `CallableType`;
+  defers (`None`) on any pair a predicate cannot decide and the Python shim
+  runs the original pure-Python loop. Gated by `_native_checker_active`
+  (wired from `mypy/build.py`) and covered by
+  `NativeOverloadingOverloadsSuite` in `mypy/test/testtypes.py` (gate-off
+  vs gate-on differential on the decision lists).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

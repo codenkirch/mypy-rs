@@ -100,6 +100,8 @@ mod operators;
 mod overlap_unsafe;
 mod overload;
 mod overload_never;
+mod overload_override;
+
 mod partially_defined;
 mod plugin_helpers;
 mod plugin_hooks;
@@ -2568,6 +2570,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     #[allow(clippy::unsafe_removed_from_name)]
     module.add_function(wrap_pyfunction!(
         overlap_unsafe::rust_is_unsafe_overlapping_overload_signatures,
+        module
+    )?)?;
+
+    // overload_override: check_overlapping_overloads pairwise screening loop
+    // over the three predicates above (mypy.checker). The impl-vs-items tail
+    // and the message emission stay in Python.
+    module.add_function(wrap_pyfunction!(
+        overload_override::rust_check_overlapping_overloads,
         module
     )?)?;
 

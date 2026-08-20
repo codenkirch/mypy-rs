@@ -257,30 +257,25 @@ fn is_callable_compatible_full(
     )
 }
 
-/// `#[pyfunction]` entry: `is_unsafe_overlapping_overload_signatures`
-/// (mypy/checker.py:9870-9947). `signature`/`other` are wire blobs of the two
-/// `CallableType`s, `class_type_vars` a wire type-list of the class's
-/// `TypeVarLikeType`s, and `partial_only`/`strict_optional` mirror the Python
-/// flags and running state. Returns `Some(bool)` when Rust decided, `None`
-/// (defer to the pure-Python path) otherwise.
-#[pyfunction]
-#[allow(clippy::unsafe_removed_from_name)]
-pub(crate) fn rust_is_unsafe_overlapping_overload_signatures(
-    signature: &[u8],
-    other: &[u8],
-    class_type_vars: &[u8],
+/// The `is_unsafe_overlapping_overload_signatures` decision engine on decoded
+/// wire types. Mirrors checker.py:9870-9947 between the decode step and the
+/// answer: detach both callables with `class_vars`, expand all type-variable
+/// combinations, and judge subset / overlap / callable compatibility.
+/// Shared by the `#[pyfunction]` entry and the
+/// `overload_override::rust_check_overlapping_overloads` driver loop.
+pub(crate) fn is_unsafe_overlapping_overload_signatures_inner(
+    sig: &Type,
+    oth: &Type,
+    class_vars: &[Type],
     partial_only: bool,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let sig = decode_type(signature)?;
-    let oth = decode_type(other)?;
     if !matches!(sig, Type::CallableType { .. }) || !matches!(oth, Type::CallableType { .. }) {
         return None;
     }
-    let class_vars = decode_type_list(class_type_vars)?;
-    let sig = detach_variables(&sig, &class_vars)?;
-    let oth = detach_variables(&oth, &class_vars)?;
+    let sig = detach_variables(sig, class_vars)?;
+    let oth = detach_variables(oth, class_vars)?;
     let sig_variants = expand_callable_variants(&sig, strict_optional)?;
     let oth_variants = expand_callable_variants(&oth, strict_optional)?;
 
@@ -346,4 +341,33 @@ pub(crate) fn rust_is_unsafe_overlapping_overload_signatures(
         }
     }
     Some(false)
+}
+
+/// `#[pyfunction]` entry: `is_unsafe_overlapping_overload_signatures`
+/// (mypy/checker.py:9870-9947). `signature`/`other` are wire blobs of the two
+/// `CallableType`s, `class_type_vars` a wire type-list of the class's
+/// `TypeVarLikeType`s, and `partial_only`/`strict_optional` mirror the Python
+/// flags and running state. Returns `Some(bool)` when Rust decided, `None`
+/// (defer to the pure-Python path) otherwise.
+#[pyfunction]
+#[allow(clippy::unsafe_removed_from_name)]
+pub(crate) fn rust_is_unsafe_overlapping_overload_signatures(
+    signature: &[u8],
+    other: &[u8],
+    class_type_vars: &[u8],
+    partial_only: bool,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let sig = decode_type(signature)?;
+    let oth = decode_type(other)?;
+    let class_vars = decode_type_list(class_type_vars)?;
+    is_unsafe_overlapping_overload_signatures_inner(
+        &sig,
+        &oth,
+        &class_vars,
+        partial_only,
+        strict_optional,
+        resolver,
+    )
 }
