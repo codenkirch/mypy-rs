@@ -5569,7 +5569,7 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
         off = self._with_gate(False, lambda: self._call(info, args, empty_tuple_index))
         self._set_active(True)
         on = self._with_gate(True, lambda: self._call(info, args, empty_tuple_index))
-        assert_equal(str(on), str(off), f"analyze_type_with_type_info parity {info.fullname}")
+        assert_equal(on[0], off[0], f"analyze_type_with_type_info parity {info.fullname}")
         assert_equal(on[1], off[1], f"analyze_type_with_type_info errors {info.fullname}")
 
     def _assert_engages(self, expected: int, **facts: object) -> None:

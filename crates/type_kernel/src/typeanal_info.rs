@@ -4,9 +4,10 @@
 //! `mypy.typeanal.TypeAnalyser.analyze_type_with_type_info`
 //! (typeanal.py:1166-1289).
 //!
-//! The method binds an unbound type that resolved to a `TypeInfo` node. After
-//! the deprecation check it settles a small fixed set of branches over the
-//! node + argument-list facts:
+//! The method binds an unbound type that resolved to a `TypeInfo` node. The
+//! Python shim runs the deprecation check itself, then calls this classifier;
+//! it settles a small fixed set of branches over the node + argument-list
+//! facts:
 //!
 //! - `tuple[...]` with arguments -> a `TupleType` (typeanal.py:1176-1178);
 //! - `librt.vecs.vec` with an invalid item type -> `Any(from_error)`
@@ -28,7 +29,7 @@ use pyo3::prelude::*;
 /// Branch tags handed to the Python shim. Each maps to a terminal branch of
 /// `analyze_type_with_type_info`; the comment cites the typeanal.py line.
 const TAG_TUPLE: i64 = 1; // 1176-1178 tuple[...] with args -> TupleType
-const TAG_VEC: i64 = 2; // 1204-1207 librt.vecs.vec bade item -> Any(from_error)
+const TAG_VEC: i64 = 2; // 1204-1207 librt.vecs.vec bad item -> Any(from_error)
 const TAG_TUPLE_TAIL: i64 = 3; // 1228-1253 named-tuple base, no alias
 const TAG_TUPLE_TAIL_ALIAS: i64 = 4; // 1232-1250 tuple-alias base
 const TAG_TYPEDDICT_TAIL: i64 = 5; // 1254-1279 TypedDict base, no alias
