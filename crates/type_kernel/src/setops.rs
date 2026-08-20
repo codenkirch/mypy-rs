@@ -1629,7 +1629,7 @@ fn visit_join(
                 // port does not replicate that logic, and the
                 // join_similar_callables path also uses safe_meet (not
                 // safe_join) for arg types, which is not yet ported. Defer.
-                return None;
+                None
             } else if let Type::Overloaded { .. } = s {
                 // join.py:583-585: s is Overloaded -> swap so the
                 // visit_overloaded walk runs with self.s=callable
@@ -3364,9 +3364,7 @@ fn visit_instance_with_args(
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let Some(typ) = setop_result_to_type(Some(r), ta, sa) else {
-                            return None;
-                        };
+                        let typ = setop_result_to_type(Some(r), ta, sa)?;
                         needs_encode = true;
                         (0, typ)
                     }
@@ -3396,9 +3394,7 @@ fn visit_instance_with_args(
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let Some(typ) = setop_result_to_type(Some(r), ta, sa) else {
-                            return None;
-                        };
+                        let typ = setop_result_to_type(Some(r), ta, sa)?;
                         needs_encode = true;
                         (0, typ)
                     }
