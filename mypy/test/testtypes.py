@@ -7372,6 +7372,36 @@ class NativeMeetSuite(Suite):
         tup2 = TupleType([self.fx.a], self.fx.std_tuple)
         assert meet_types(tup1, tup2) == tup1
 
+    def test_meet_both_type_type_unrelated_wraps_bottom(self) -> None:
+        # visit_type_type case 1 (meet.py:1412-1419): t and s both
+        # TypeType with unrelated items. D and E have no subclass
+        # relation, so is_proper_subtype(Type[D], Type[E]) is False
+        # both ways and the Rust arm runs: meet(D, E) =
+        # UninhabitedType -> wrapped in a fresh TypeType (not NoneType,
+        # so not unwrapped) and encoded. Python computes
+        # TypeType.make_normalized(UninhabitedType()) — the same
+        # wrapped-bottom result.
+        from mypy.types import TypeType
+
+        td = TypeType.make_normalized(self.fx.d)
+        te = TypeType.make_normalized(self.fx.e)
+        result = meet_types(td, te)
+        assert isinstance(result, TypeType)
+        assert isinstance(result.item, UninhabitedType)
+
+    def test_meet_one_sided_union_unrelated_returns_bottom(self) -> None:
+        # visit_union_type one-sided (meet.py:965-966): t is a Union,
+        # s is an Instance unrelated to every item. D is unrelated to
+        # both E and F, so the proper-subtype pre-check misses both
+        # ways and the Rust one-sided arm runs: meets =
+        # [meet(E, D), meet(F, D)] = [Bottom, Bottom], all dropped ->
+        # make_simplified_union([]) -> UninhabitedType. Python's
+        # visitor computes the same bottom.
+        from mypy.types import UnionType
+
+        u = UnionType.make_union([self.fx.e, self.fx.f])
+        assert meet_types(self.fx.d, u) == UninhabitedType()
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMeetUnboundSuite(Suite):
@@ -7577,6 +7607,24 @@ class NativeMeetTypeVarTupleSuite(Suite):
         # visit_type_var case 1 (meet.py:880-881): s.id == t.id,
         # s.upper_bound == t.upper_bound -> return self.s.
         assert meet_types(self.fx.t, self.fx.t) == self.fx.t
+
+    def test_meet_type_var_same_id_different_ub_meets_bounds(self) -> None:
+        # visit_type_var case 2 (meet.py:882): same id, different
+        # upper_bound -> s.copy_modified(upper_bound=meet(s.ub, t.ub)).
+        # Rust encodes the fresh TypeVar; its upper-bound meet goes
+        # through fruit_to_type so a recursive Encoded result decodes.
+        # meet(object, a) = a, so the new TypeVar's bound is a.
+        from mypy.types import TypeVarType
+
+        tv_obj = TypeVarType(
+            "T", "T", TypeVarId(1), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        tv_a = TypeVarType(
+            "T", "T", TypeVarId(1), [], self.fx.a, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        result = meet_types(tv_obj, tv_a)
+        assert isinstance(result, TypeVarType)
+        assert result.upper_bound == self.fx.a  # meet(object, a) == a
 
     def test_meet_type_var_different_id_returns_bottom(self) -> None:
         # visit_type_var else (meet.py:883-884): s.id != t.id ->
