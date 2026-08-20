@@ -109,13 +109,8 @@ pub(crate) fn trivial_join(
         None => return None,
     }
     // object_or_any_from_type(t): always returns either
-    // Instance(builtins.object) or AnyType (from AnyType / NoneType /
-    // UninhabitedType). For Instance t returns Instance(builtins.object).
-    // The full Python helper walks fallback chains / upper_bounds / union
-    // items — we return Object for all t (parity-safe since disc==2 in
-    // join_types only fires when neither operand is the result, and the
-    // Python path would always produce object-or-any for the non-Instance
-    // variants that can reach here).
+    // Instance(builtins.object) or AnyType; for Instance t returns
+    // Instance(builtins.object) (parity-safe per join.py disc==2).
     Some(SetOpResult::Object)
 }
 
@@ -1635,8 +1630,14 @@ fn visit_join(
                 // join_similar_callables path also uses safe_meet (not
                 // safe_join) for arg types, which is not yet ported. Defer.
                 return None;
+            } else if let Type::Overloaded { .. } = s {
+                // join.py:583-585: s is Overloaded -> swap so the
+                // visit_overloaded walk runs with self.s=callable
+                // (CallableType.items == [self], types.py:2633).
+                join_types(t, s, ctx, resolver)
+            } else {
+                visit_callable_fallback(s, fallback, ctx, resolver)
             }
-            visit_callable_fallback(s, fallback, ctx, resolver)
         }
 
         // visit_overloaded (join.py:581-632).
@@ -1648,26 +1649,34 @@ fn visit_join(
             };
 
             // Both-FunctionLike: s is CallableType or Overloaded.
-            // join.py:644-658: for each (t_item, s_item) pair that is
-            // similar, if equivalent -> combine, if t_item <: s_item ->
-            // s_item. Result is either Overloaded(result) or the fallback
-            // join.
-            if let Type::Overloaded { items: s_items, .. } = s {
-                // s is also Overloaded: visit both lists.
-                if s_items.is_empty() {
-                    return None;
+            // FunctionLike.items: Overloaded returns its items,
+            // CallableType returns [self] (types.py:2633).
+            // join.py:644-658 walks (t_item, s_item) pairs: similar ->
+            // equivalent -> combine, else t_item <: s_item -> s_item.
+            let s_items: Vec<&Type> = match s {
+                Type::Overloaded { items: s_items, .. } => {
+                    if s_items.is_empty() {
+                        return None;
+                    }
+                    s_items.iter().collect()
                 }
+                Type::CallableType { .. } => vec![s],
+                _ => vec![],
+            };
+            if !s_items.is_empty() {
                 let mut result_items: Vec<SetOpResult> = Vec::new();
                 for t_item in items {
                     let t_callable = match t_item {
                         Type::CallableType { .. } => t_item,
                         _ => return None,
                     };
-                    for s_item in s_items {
-                        let s_callable = match s_item {
-                            Type::CallableType { .. } => s_item,
-                            _ => return None,
-                        };
+                    for s_item in &s_items {
+                        // s_item is always a CallableType here: the Overloaded arm
+                        // collects only CallableType items, and a plain
+                        // CallableType s is a single-item list. The
+                        // subtype arm therefore only encodes, never
+                        // pushes an Overloaded.
+                        let s_callable = s_item;
                         // is_similar_callables check.
                         let t_arg_types = match &t_callable {
                             Type::CallableType { arg_types, .. } => arg_types,
@@ -1755,27 +1764,21 @@ fn visit_join(
                                 result_items.push(SetOpResult::Encoded(bytes));
                             }
                         } else if is_subtype(t_callable, s_callable, ctx, resolver)? {
-                            // t_item <: s_item -> s_item.
-                            result_items.push(match s_item {
-                                Type::Overloaded { items, .. } => {
-                                    // s_item is Overloaded, extract its first Callable
-                                    match items.first() {
-                                        Some(Type::CallableType { .. }) => {
-                                            // Encode the s_callable (which is s_item)
-                                            encode_callable(s_item.clone())?
-                                        }
-                                        _ => continue,
-                                    }
-                                }
-                                _ => continue,
-                            });
+                            // t_item <: s_item -> s_item (join.py:653).
+                            result_items.push(encode_callable((*s_callable).clone())?);
                         }
                     }
                 }
                 if result_items.is_empty() {
-                    // join.py:659: join_types(t.fallback, s.fallback)
-                    let s_fb = match s_items.first() {
-                        Some(Type::CallableType { fallback, .. }) => fallback.as_ref(),
+                    // join.py:659: join_types(t.fallback, s.fallback).
+                    // `s_fb` is `s`'s own fallback: CallableType s uses
+                    // its fallback; Overloaded s uses items[0].fallback.
+                    let s_fb: &Type = match s {
+                        Type::CallableType { fallback, .. } => fallback.as_ref(),
+                        Type::Overloaded { items: s_items, .. } => match s_items.first() {
+                            Some(Type::CallableType { fallback, .. }) => fallback.as_ref(),
+                            _ => return None,
+                        },
                         _ => return None,
                     };
                     visit_callable_fallback(s, s_fb, ctx, resolver)
@@ -1801,10 +1804,6 @@ fn visit_join(
                     // Encode each item and wrap as Overloaded.
                     encode_overloaded(result_items)
                 }
-            } else if let Type::CallableType { .. } = s {
-                // s is CallableType, t is Overloaded. Swap and recurse:
-                // join.py:644: switch order to get to visit_overloaded.
-                join_types(t, s, ctx, resolver)
             } else {
                 // s is neither FunctionLike nor protocol-Instance ->
                 // fallback join.
@@ -2092,12 +2091,27 @@ fn visit_join(
             } else if let Type::Instance { .. } = s {
                 // Case 2: s is Instance -> join_types(s, t.fallback).
                 // SameS/SameT -> outer SameS (s==fallback or result=s);
-                // Ancestor/Object pass through.
-                match join_types(s, fallback, ctx, resolver)? {
+                // Ancestor/Object pass through; Any/Bottom/Encoded are
+                // fresh types, encode whole (disc=7).
+                let r = join_types(s, fallback, ctx, resolver)?;
+                match &r {
                     SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
-                    SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+                    SetOpResult::Ancestor(fullname) => {
+                        Some(SetOpResult::Ancestor(fullname.to_string()))
+                    }
                     SetOpResult::Object => Some(SetOpResult::Object),
-                    _ => None,
+                    SetOpResult::Any | SetOpResult::Bottom => {
+                        match setop_result_to_type(Some(r.clone()), s, fallback) {
+                            Some(typ) => {
+                                let mut wbuf = WriteBuffer::new();
+                                wire::write_type(&mut wbuf, &typ).ok()?;
+                                Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                            }
+                            None => None,
+                        }
+                    }
+                    SetOpResult::Encoded(bytes) => Some(SetOpResult::Encoded(bytes.clone())),
+                    SetOpResult::SameTypeWithArgs { .. } => None,
                 }
             } else {
                 None
@@ -2199,11 +2213,25 @@ fn visit_join(
             {
                 // Case 2: s is not TupleType. join_types(s, tuple_fallback(t)).
                 if fb_ref != "builtins.tuple" {
-                    match join_types(s, t_pf, ctx, resolver)? {
+                    let r = join_types(s, t_pf, ctx, resolver)?;
+                    match &r {
                         SetOpResult::SameS | SetOpResult::SameT => Some(SetOpResult::SameS),
-                        SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+                        SetOpResult::Ancestor(fullname) => {
+                            Some(SetOpResult::Ancestor(fullname.to_string()))
+                        }
                         SetOpResult::Object => Some(SetOpResult::Object),
-                        _ => None,
+                        SetOpResult::Any | SetOpResult::Bottom => {
+                            match setop_result_to_type(Some(r.clone()), s, t_pf) {
+                                Some(typ) => {
+                                    let mut wbuf = WriteBuffer::new();
+                                    wire::write_type(&mut wbuf, &typ).ok()?;
+                                    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+                                }
+                                None => None,
+                            }
+                        }
+                        SetOpResult::Encoded(bytes) => Some(SetOpResult::Encoded(bytes.clone())),
+                        SetOpResult::SameTypeWithArgs { .. } => None,
                     }
                 } else {
                     None
@@ -2254,19 +2282,39 @@ fn visit_callable_fallback(
             }
         }
     }
-    match join_types(fallback, s, ctx, resolver)? {
+    let r = join_types(fallback, s, ctx, resolver)?;
+    // Encode a recursive join result that is a real type (neither s nor
+    // t): hand it back whole via disc=7. Replaces the old blanket defer
+    // once the encoder existed.
+    let encode_result = |typ: Type| -> Option<SetOpResult> {
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, &typ).ok()?;
+        Some(SetOpResult::Encoded(wbuf.into_bytes()))
+    };
+    match &r {
         // Recursive SameT: result = s (recursive right) -> outer SameS
         // (the shim returns s).
         SetOpResult::SameT => Some(SetOpResult::SameS),
         // Recursive SameS: result = fallback (recursive left). Only
         // expressible if fallback == s (then result is s -> SameS).
         SetOpResult::SameS if fallback == s => Some(SetOpResult::SameS),
+        SetOpResult::SameS => setop_result_to_type(Some(r.clone()), fallback, s).and_then(encode_result),
         // Ancestor / Object pass through (swap-invariant).
-        SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname)),
+        SetOpResult::Ancestor(fullname) => {
+            Some(SetOpResult::Ancestor(fullname.to_string()))
+        }
         SetOpResult::Object => Some(SetOpResult::Object),
-        // SameS (fallback != s), Any, Bottom, SameTypeWithArgs: can't
-        // express without a Type encoder. Defer.
-        _ => None,
+        // Any, Bottom: fresh type, encode whole. SameTypeWithArgs: a
+        // per-arg reconstruction, cannot express as a single encoded
+        // type here. Defer.
+        SetOpResult::Any | SetOpResult::Bottom => {
+            setop_result_to_type(Some(r.clone()), fallback, s).and_then(encode_result)
+        }
+        // Encoded: the recursive join already produced a fresh encoded
+        // type; pass it through (it decodes to the same type in the
+        // shim).
+        SetOpResult::Encoded(bytes) => Some(SetOpResult::Encoded(bytes.clone())),
+        SetOpResult::SameTypeWithArgs { .. } => None,
     }
 }
 
@@ -3237,6 +3285,8 @@ fn visit_instance_with_args(
     }
 
     let mut arg_discs: Vec<i8> = Vec::with_capacity(tvars.len());
+    let mut joined_args: Vec<Type> = Vec::with_capacity(tvars.len());
+    let mut needs_encode = false;
     for (i, (_, variance, kind)) in tvars.iter().enumerate() {
         let ta = &t_args[i]; // Python's t.args[i] (right arg).
         let sa = &s_args[i]; // Python's s.args[i] (left arg).
@@ -3249,16 +3299,28 @@ fn visit_instance_with_args(
         // new_type = ta (disc 1).
         if matches!(ta, Type::UninhabitedType { ambiguous: true }) {
             arg_discs.push(0); // new_type = sa = s.args[i]
+            joined_args.push(sa.clone());
             continue;
         }
         if matches!(sa, Type::UninhabitedType { ambiguous: true }) {
             arg_discs.push(1); // new_type = ta = t.args[i]
+            joined_args.push(ta.clone());
             continue;
         }
 
         // join.py:131-135: AnyType arg -> AnyType(from_another_any).
         if matches!(ta, Type::AnyType { .. }) || matches!(sa, Type::AnyType { .. }) {
             arg_discs.push(4);
+            let src = if matches!(ta, Type::AnyType { .. }) {
+                ta
+            } else {
+                sa
+            };
+            joined_args.push(Type::AnyType {
+                type_of_any: 4, // from_another_any
+                source_any: Some(Box::new(src.clone())),
+                missing_import_name: None,
+            });
             continue;
         }
 
@@ -3274,6 +3336,10 @@ fn visit_instance_with_args(
             _ => return None,
         }
 
+        // Push a joined arg. `disc` keeps the SameTypeWithArgs path
+        // intact for pure-0/1/4 arg lists; `needs_encode` flips once a
+        // real join (Ancestor/Object/Any/Bottom) appears, and the
+        // function then emits the full Instance encoded.
         match *variance {
             v if v == COVARIANT || v == VARIANCE_NOT_READY => {
                 // join.py:136-148: covariant. new_type = join_types(ta,
@@ -3290,22 +3356,26 @@ fn visit_instance_with_args(
                 let upper_bound = decode_type(ub_blob)?;
                 // Recursive join. SameS -> result = ta = t.args[i]
                 // (disc 1); SameT -> result = sa = s.args[i] (disc 0).
-                // Ancestor/Object/Any/Bottom -> defer (can't express as
-                // an arg disc without a Type encoder). In practice
-                // Instance-Instance recursion only yields SameS/SameT
-                // (when args are equal) or Ancestor (when they differ),
-                // so the covariant branch fires on equal-arg cases and
-                // defers otherwise.
-                let new_type_disc = match join_types(ta, sa, ctx, resolver) {
-                    Some(SetOpResult::SameS) => 1i8,
-                    Some(SetOpResult::SameT) => 0,
-                    Some(_) | None => return None,
+                // Ancestor/Object/Any/Bottom: a real join; materialize
+                // via setop_result_to_type and emit the whole Instance
+                // encoded (disc=7) instead of deferring.
+                let r = join_types(ta, sa, ctx, resolver)?;
+                let (disc, typ) = match &r {
+                    SetOpResult::SameS => (1i8, ta.clone()),
+                    SetOpResult::SameT => (0, sa.clone()),
+                    _ => {
+                        let Some(typ) = setop_result_to_type(Some(r), ta, sa) else {
+                            return None;
+                        };
+                        needs_encode = true;
+                        (0, typ)
+                    }
                 };
-                let new_type = if new_type_disc == 1 { ta } else { sa };
-                if !is_subtype(new_type, &upper_bound, ctx, resolver)? {
+                if !is_subtype(&typ, &upper_bound, ctx, resolver)? {
                     return Some(SetOpResult::Object);
                 }
-                arg_discs.push(new_type_disc);
+                arg_discs.push(disc);
+                joined_args.push(typ);
             }
             v if v == INVARIANT || v == CONTRAVARIANT => {
                 // join.py:149-160: invariant/contravariant.
@@ -3320,15 +3390,37 @@ fn visit_instance_with_args(
                 // Equivalent: new_type = join_types(ta, sa). SameS ->
                 // result = ta = t.args[i] (disc 1); SameT -> result =
                 // sa = s.args[i] (disc 0). Ancestor/Object/Any/Bottom
-                // -> defer (can't express without a Type encoder).
-                match join_types(ta, sa, ctx, resolver)? {
-                    SetOpResult::SameS => arg_discs.push(1),
-                    SetOpResult::SameT => arg_discs.push(0),
-                    _ => return None,
-                }
+                // -> real join, encode whole (disc=7).
+                let r = join_types(ta, sa, ctx, resolver)?;
+                let (disc, typ) = match &r {
+                    SetOpResult::SameS => (1i8, ta.clone()),
+                    SetOpResult::SameT => (0, sa.clone()),
+                    _ => {
+                        let Some(typ) = setop_result_to_type(Some(r), ta, sa) else {
+                            return None;
+                        };
+                        needs_encode = true;
+                        (0, typ)
+                    }
+                };
+                arg_discs.push(disc);
+                joined_args.push(typ);
             }
             _ => return None,
         }
+    }
+    if needs_encode {
+        // At least one arg needed a real join. Emit the full Instance
+        // encoded (disc=7) so the Python shim decodes the exact args.
+        let result = Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: joined_args,
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, &result).ok()?;
+        return Some(SetOpResult::Encoded(wbuf.into_bytes()));
     }
     Some(SetOpResult::SameTypeWithArgs {
         type_ref: type_ref.to_string(),
@@ -5788,7 +5880,9 @@ mod tests {
     #[test]
     fn join_overloaded_with_callable_defers() {
         // s=CallableType, t=Overloaded. Both callable-like -> the
-        // pre-dispatch defers (both sides callable-like).
+        // walk runs with s_items=[s] (CallableType.items == [self]).
+        // Identical items -> similar+equivalent -> combine -> the
+        // walk yields one result, encoded (disc=7).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -5802,7 +5896,8 @@ mod tests {
             vec![instance("builtins.object", vec![])],
             instance("builtins.object", vec![]),
         )]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(matches!(result, Some(SetOpResult::Encoded(_))));
     }
 
     #[test]
@@ -6104,14 +6199,14 @@ mod tests {
     }
 
     #[test]
-    fn join_instance_covariant_subtype_defers() {
+    fn join_instance_covariant_subtype_encodes() {
         // Covariant T, upper_bound=object. join(G[B], G[A]) where
         // B <: A. The recursive join_types(A, B) returns Ancestor(A)
         // (the common supertype), not SameS/SameT. The covariant
         // branch can't express an Ancestor result as an arg disc, so
-        // it defers to Python. This is a known limitation: the
-        // covariant branch only fires when ta and sa are structurally
-        // equal (trivial join -> SameS/SameT).
+        // it encodes the full Instance (disc=7) instead of deferring
+        // (join.py:136-148: new_type = join_types(ta, sa) is a real
+        // type once the encoder exists).
         let g = snap_with_covariant_tvar("g.G");
         let a = snap("a.A", "A");
         let b = snap_with_bases("a.B", "B", &["a.A"]);
@@ -6119,15 +6214,18 @@ mod tests {
         let r = make_resolver(vec![g, a, b, o]);
         let s = instance("g.G", vec![instance("a.B", vec![])]);
         let t = instance("g.G", vec![instance("a.A", vec![])]);
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        let result = join_types(&s, &t, &ctx(true), &r);
+        assert!(matches!(result, Some(SetOpResult::Encoded(_))));
     }
 
     #[test]
     fn join_instance_covariant_unrelated_defers() {
         // Covariant T, upper_bound=object. join(G[A], G[D]) where
-        // A, D unrelated. The recursive join_types(A, D) returns
-        // Ancestor(builtins.object), which the covariant branch
-        // can't express as an arg disc. Defers to Python.
+        // A, D unrelated with no shared bases in the snapshot. The
+        // recursive join_types(A, D) cannot decide an ancestor (no
+        // bases/mro), so it returns None and the whole call defers to
+        // Python. (With resolvable ancestors the covariant branch
+        // encodes the full Instance instead.)
         let g = snap_with_covariant_tvar("g.G");
         let a = snap("a.A", "A");
         let d = snap("a.D", "D");
