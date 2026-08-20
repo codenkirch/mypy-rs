@@ -1917,28 +1917,27 @@ pub(crate) fn rust_check_typevarlike_name(
     let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
 
     // typevarlike_type = callee.name if NameExpr else callee.fullname
-    let typevarlike_type: String;
-    if callee.is_instance(name_expr_cls)? {
+    let typevarlike_type: String = if callee.is_instance(name_expr_cls)? {
         let name_obj = match callee.getattr("name") {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
-        typevarlike_type = match name_obj.downcast::<PyString>() {
+        match name_obj.downcast::<PyString>() {
             Ok(s) => s.to_str()?.to_string(),
             Err(_) => return Ok(None),
-        };
+        }
     } else if callee.is_instance(ref_expr_cls)? {
         let fullname_obj = match callee.getattr("fullname") {
             Ok(f) => f,
             Err(_) => return Ok(None),
         };
-        typevarlike_type = match fullname_obj.downcast::<PyString>() {
+        match fullname_obj.downcast::<PyString>() {
             Ok(s) => s.to_str()?.to_string(),
             Err(_) => return Ok(None),
-        };
+        }
     } else {
         return Ok(None);
-    }
+    };
 
     let args = call.getattr("args")?;
     let args_list = match args.downcast::<PyList>() {
