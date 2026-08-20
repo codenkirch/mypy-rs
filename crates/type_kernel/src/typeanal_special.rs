@@ -1,0 +1,690 @@
+#![allow(non_local_definitions)]
+
+//! Native port of the special-form dispatch classifier of
+//! `mypy.typeanal.TypeAnalyser.try_analyze_special_unbound_type`
+//! (typeanal.py:931-1141).
+//!
+//! The method is the elif-chain that binds an unbound type whose resolved
+//! fullname is a magic special-form name (`builtins.None`, `typing.Any`,
+//! `typing.Union`, `Tuple`, `ClassVar`, `Required`, ...). Almost every
+//! branch's *decision* is a pure function of the fullname plus a handful of
+//! scalar facts (argument count, `empty_tuple_index`, analyzer flags, the
+//! configured Python version). This module owns that decision table and
+//! returns a single branch tag; the Python shim applies the side effects
+//! (error messages, object construction, `anal_type`/`anal_array`
+//! recursion) exactly as the original body does.
+//!
+//! Rust returns `None` (defer) on any path where the decision is not pure
+//! or the branch needs recursive type analysis the shim does not route:
+//! the tuple full form (`tuple_type`), the `typing.Union` gold path
+//! (`make_union` over `anal_array` results), `Optional`'s gold path,
+//! `analyze_callable_type`, the `Type[...]`/`TypeForm[...]` one-arg and
+//! multi-arg tails, the `ClassVar` one-arg tail, `Annotated`'s gold path,
+//! the `Required`/`NotRequired`/`ReadOnly` gold paths, and everything past
+//! ClassVar's arity check (`Literal`, TypeGuard, `Unpack`, `Self`). The
+//! deferred branches keep their full pure-Python body, honoring the
+//! strangler-fig per-call gate.
+//!
+//! The fullname membership sets are passed from Python as booleans (the
+//! shim computes the tuple membership with the live `mypy.types.*_NAMES`
+//! constants, so a Rust copy of the sets cannot drift).
+
+use pyo3::prelude::*;
+
+// Branch tags handed to the Python shim. Each maps to exactly one terminal
+// branch of `try_analyze_special_unbound_type`; the comment cites the
+// typeanal.py line and the Python-side effect the shim must apply.
+// Branch tags handed to the Python shim. Each maps to exactly one terminal
+// branch of `try_analyze_special_unbound_type`; the comment cites the
+// typeanal.py line and the Python-side effect the shim must apply. Plain
+// names (not special forms) return `None` from the classifier and keep the
+// full pure-Python body.
+const TAG_NONE_TYPE: i64 = 2; // 936-937 NoneType()
+const TAG_ANY_TYPE: i64 = 3; // 938-939 AnyType(explicit)
+const TAG_NEVER: i64 = 4; // 1044-1045 UninhabitedType()
+const TAG_FINAL_ERROR: i64 = 5; // 940-954 error Any (flags only)
+const TAG_TUPLE_LOOKUP_DEFER: i64 = 6; // 958-964 sym lookup missing/placeholder
+const TAG_TUPLE_BARE: i64 = 7; // 965-968 named_type(tuple, [omitted Any])
+const TAG_TUPLE_ELLIPSIS: i64 = 8; // 969-973 named_type(tuple, [anal arg])
+const TAG_TUPLE_FULL_DEFER: i64 = 9; // 974-976 tuple_type construction
+const TAG_UNION_DEFER: i64 = 11; // 1028-1030 make_union over anal_array
+const TAG_OPTIONAL_ARG_ERR: i64 = 12; // 981-985 arity != 1 -> fail + Any(from_error)
+const TAG_OPTIONAL_DEFER: i64 = 13; // 986-987 make_optional_type
+const TAG_CALLABLE_DEFER: i64 = 14; // 988-989 analyze_callable_type
+const TAG_TYPE_BARE_ANY: i64 = 15; // 1042-1045 typing.Type bare -> TypeType(Any)
+const TAG_TYPE_BARE_NONE: i64 = 16; // 1046-1049 builtins.type bare -> None (#9476)
+const TAG_TYPE_ONE_ARG: i64 = 17; // 999-1009 one arg, make_normalized
+const TAG_TYPE_ARG_ERR: i64 = 18; // 1000-1003 arity != 1 -> fail + Any(from_error)
+const TAG_TYPEFORM_BARE: i64 = 19; // 1011-1013 TypeType(Any, is_type_form)
+const TAG_TYPEFORM_DEFER: i64 = 20; // 1014-1020 make_normalized + arity check
+const TAG_CLASSVAR_ZERO: i64 = 21; // 1036-1037 Any(from_omitted_generics)
+const TAG_CLASSVAR_DEFER: i64 = 22; // 1038-1043 one arg or arity error
+const TAG_ANNOTATED_ARG_ERR: i64 = 23; // 1049-1056 arity < 2 -> fail + Any(from_error)
+const TAG_ANNOTATED_DEFER: i64 = 24; // 1057-1059 anal_type
+const TAG_REQUIRED_BAD_CTX: i64 = 25; // 1061-1067 flag off -> fail + Any(from_error)
+const TAG_REQUIRED_ARG_ERR: i64 = 26; // 1068-1072 arity != 1 -> fail + Any(from_error)
+const TAG_REQUIRED_DEFER: i64 = 27; // 1073-1075 gold path
+const TAG_NOTREQUIRED_BAD_CTX: i64 = 28; // 1077-1083 flag off -> fail + Any(from_error)
+const TAG_NOTREQUIRED_ARG_ERR: i64 = 29; // 1084-1088 arity != 1 -> fail + Any(from_error)
+const TAG_NOTREQUIRED_DEFER: i64 = 30; // 1089-1091 gold path
+const TAG_READONLY_BAD_CTX: i64 = 31; // 1093-1099 flag off -> fail + Any(from_error)
+const TAG_READONLY_ARG_ERR: i64 = 32; // 1100-1104 arity != 1 -> fail + Any(from_error)
+const TAG_READONLY_DEFER: i64 = 33; // 1105 gold path
+
+/// `try_analyze_special_unbound_type` classifier. Mirrors the branch order
+/// of typeanal.py:936-1141 and returns the terminal branch tag; `None`
+/// defers to the pure-Python body.
+///
+/// Facts (all scalars / strings, no live type objects):
+/// - `fullname`: the resolved magic fullname (`typing.Tuple` for both
+///   `typing.Tuple` and `typing_extensions.Tuple`).
+/// - `arg_count`, `empty_tuple_index`: from `t`.
+/// - `allow_typed_dict_special_forms`: the analyzer flag gating the
+///   `Required`/`NotRequired`/`ReadOnly` "bad context" error.
+/// - `tuple_missing_or_placeholder`: the `builtins.tuple` symbol lookup for
+///   the Tuple family failed (missing or a `PlaceholderNode`).
+/// - `tuple_ellipsis_form`: `len(t.args) == 2 and isinstance(t.args[1],
+///   EllipsisType)` computed on the live `t` (the Tuple[T, ...] form).
+/// - `not_in_*`: the fullname is not in the corresponding
+///   `mypy.types.*_NAMES` tuple (computed Python-side).
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub(crate) fn rust_classify_special_unbound(
+    fullname: String,
+    arg_count: i64,
+    empty_tuple_index: bool,
+    allow_typed_dict_special_forms: bool,
+    tuple_missing_or_placeholder: bool,
+    tuple_ellipsis_form: bool,
+    not_in_final: bool,
+    not_in_tuple: bool,
+    not_in_type: bool,
+    not_in_typeform: bool,
+    not_in_classvar: bool,
+    not_in_never: bool,
+    not_in_annotated: bool,
+    not_in_required: bool,
+    not_in_notrequired: bool,
+    not_in_readonly: bool,
+) -> PyResult<Option<i64>> {
+    // builtins.None (typeanal.py:936-937).
+    if fullname == "builtins.None" {
+        return Ok(Some(TAG_NONE_TYPE));
+    }
+    // typing.Any (typeanal.py:938-939).
+    if fullname == "typing.Any" {
+        return Ok(Some(TAG_ANY_TYPE));
+    }
+    // Final (typeanal.py:940-954): always a from_error Any; the shim applies
+    // the prohibiting-context / allow_final message.
+    if !not_in_final {
+        return Ok(Some(TAG_FINAL_ERROR));
+    }
+    // Tuple (typeanal.py:955-976).
+    if !not_in_tuple {
+        if tuple_missing_or_placeholder {
+            // 958-964: lookup missing/placeholder -> record_incomplete_ref /
+            // fail + Any(special_form). Decision is pure; the message
+            // depends on api.is_incomplete_namespace, which the shim holds.
+            return Ok(Some(TAG_TUPLE_LOOKUP_DEFER));
+        }
+        if tuple_ellipsis_form {
+            return Ok(Some(TAG_TUPLE_ELLIPSIS));
+        }
+        if arg_count == 0 && !empty_tuple_index {
+            // Bare 'Tuple' is same as 'tuple'.
+            return Ok(Some(TAG_TUPLE_BARE));
+        }
+        // Tuple[()] (empty_tuple_index) and Tuple[T, U, ...] (any other
+        // arity) -> the full form.
+        return Ok(Some(TAG_TUPLE_FULL_DEFER));
+    }
+    // typing.Union (typeanal.py:1028-1030): no arity check in the original;
+    // make_union over anal_array.
+    if fullname == "typing.Union" {
+        return Ok(Some(TAG_UNION_DEFER));
+    }
+    // typing.Optional (typeanal.py:980-987).
+    if fullname == "typing.Optional" {
+        return Ok(Some(if arg_count == 1 {
+            TAG_OPTIONAL_DEFER
+        } else {
+            TAG_OPTIONAL_ARG_ERR
+        }));
+    }
+    // typing.Callable (typeanal.py:988-989): analyze_callable_type is not
+    // pure, always defer.
+    if fullname == "typing.Callable" {
+        return Ok(Some(TAG_CALLABLE_DEFER));
+    }
+    // typing.Type / type (typeanal.py:990-1009).
+    if !not_in_type {
+        return Ok(Some(if arg_count == 0 {
+            if fullname == "typing.Type" {
+                TAG_TYPE_BARE_ANY
+            } else {
+                TAG_TYPE_BARE_NONE
+            }
+        } else if arg_count == 1 {
+            TAG_TYPE_ONE_ARG
+        } else {
+            TAG_TYPE_ARG_ERR
+        }));
+    }
+    // TypeForm (typeanal.py:1010-1020).
+    if !not_in_typeform {
+        return Ok(Some(if arg_count == 0 {
+            TAG_TYPEFORM_BARE
+        } else {
+            TAG_TYPEFORM_DEFER
+        }));
+    }
+    // ClassVar (typeanal.py:1021-1043).
+    if !not_in_classvar {
+        return Ok(Some(if arg_count == 0 {
+            TAG_CLASSVAR_ZERO
+        } else {
+            TAG_CLASSVAR_DEFER
+        }));
+    }
+    // Never (typeanal.py:1044-1045).
+    if !not_in_never {
+        return Ok(Some(TAG_NEVER));
+    }
+    // typing.Literal (typeanal.py:1046-1047): analyze_literal_type, pure
+    // classification impossible, defer.
+    if fullname == "typing.Literal" {
+        return Ok(None);
+    }
+    // Annotated (typeanal.py:1048-1059).
+    if !not_in_annotated {
+        return Ok(Some(if arg_count < 2 {
+            TAG_ANNOTATED_ARG_ERR
+        } else {
+            TAG_ANNOTATED_DEFER
+        }));
+    }
+    // Required / NotRequired / ReadOnly (typeanal.py:1060-1105).
+    let (bad_ctx_tag, arg_err_tag, defer_tag) = if !not_in_required {
+        (
+            TAG_REQUIRED_BAD_CTX,
+            TAG_REQUIRED_ARG_ERR,
+            TAG_REQUIRED_DEFER,
+        )
+    } else if !not_in_notrequired {
+        (
+            TAG_NOTREQUIRED_BAD_CTX,
+            TAG_NOTREQUIRED_ARG_ERR,
+            TAG_NOTREQUIRED_DEFER,
+        )
+    } else if !not_in_readonly {
+        (
+            TAG_READONLY_BAD_CTX,
+            TAG_READONLY_ARG_ERR,
+            TAG_READONLY_DEFER,
+        )
+    } else {
+        // Everything past this point (TypeGuard, Unpack, Self) defers; the
+        // decision is not classifiable from facts alone.
+        return Ok(None);
+    };
+    let tag = if !allow_typed_dict_special_forms {
+        bad_ctx_tag
+    } else if arg_count != 1 {
+        arg_err_tag
+    } else {
+        defer_tag
+    };
+    Ok(Some(tag))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct Facts {
+        fullname: String,
+        arg_count: i64,
+        empty_tuple_index: bool,
+        allow_typed_dict_special_forms: bool,
+        tuple_missing_or_placeholder: bool,
+        tuple_ellipsis_form: bool,
+    }
+
+    impl Default for Facts {
+        fn default() -> Self {
+            Facts {
+                fullname: "mod.SomeName".to_string(),
+                arg_count: 0,
+                empty_tuple_index: false,
+                allow_typed_dict_special_forms: false,
+                tuple_missing_or_placeholder: false,
+                tuple_ellipsis_form: false,
+            }
+        }
+    }
+
+    /// Build the per-family membership booleans exactly as the Python shim
+    /// does with the live `mypy.types.*_NAMES` tuples. The sets are
+    /// duplicated here inline; a divergence would fail the parity suites.
+    fn classify(f: &Facts) -> Option<i64> {
+        rust_classify_special_unbound(
+            f.fullname.clone(),
+            f.arg_count,
+            f.empty_tuple_index,
+            f.allow_typed_dict_special_forms,
+            f.tuple_missing_or_placeholder,
+            f.tuple_ellipsis_form,
+            !(f.fullname == "typing.Final" || f.fullname == "typing_extensions.Final"),
+            !(f.fullname == "builtins.tuple" || f.fullname == "typing.Tuple"),
+            !(f.fullname == "builtins.type" || f.fullname == "typing.Type"),
+            !(f.fullname == "typing.TypeForm" || f.fullname == "typing_extensions.TypeForm"),
+            !(f.fullname == "typing.ClassVar"),
+            !(f.fullname == "typing.NoReturn"
+                || f.fullname == "typing_extensions.NoReturn"
+                || f.fullname == "mypy_extensions.NoReturn"
+                || f.fullname == "typing.Never"
+                || f.fullname == "typing_extensions.Never"),
+            !(f.fullname == "typing.Annotated" || f.fullname == "typing_extensions.Annotated"),
+            f.fullname != "typing.Required" && f.fullname != "typing_extensions.Required",
+            f.fullname != "typing.NotRequired" && f.fullname != "typing_extensions.NotRequired",
+            f.fullname != "typing.ReadOnly" && f.fullname != "typing_extensions.ReadOnly",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_name_defers() {
+        // A plain (non-special) name returns None -> pure-Python body.
+        assert_eq!(classify(&Facts::default()), None);
+    }
+
+    #[test]
+    fn none_type() {
+        let f = Facts {
+            fullname: "builtins.None".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NONE_TYPE));
+    }
+
+    #[test]
+    fn any_type() {
+        let f = Facts {
+            fullname: "typing.Any".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_ANY_TYPE));
+    }
+
+    #[test]
+    fn final_is_always_error_any() {
+        let f = Facts {
+            fullname: "typing.Final".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_FINAL_ERROR));
+    }
+
+    #[test]
+    fn final_ext_is_always_error_any() {
+        let f = Facts {
+            fullname: "typing_extensions.Final".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_FINAL_ERROR));
+    }
+
+    #[test]
+    fn tuple_bare() {
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_BARE));
+    }
+
+    #[test]
+    fn tuple_ellipsis() {
+        // Tuple[T, ...]: arg_count 2, second arg is EllipsisType (the shim
+        // computes tuple_ellipsis_form on the live t).
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            arg_count: 2,
+            tuple_ellipsis_form: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_ELLIPSIS));
+    }
+
+    #[test]
+    fn tuple_full_non_ellipsis_defers() {
+        // Tuple[int, str]: arg_count 2 but no EllipsisType -> full form.
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            arg_count: 2,
+            tuple_ellipsis_form: false,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_FULL_DEFER));
+    }
+
+    #[test]
+    fn tuple_fixed_arity_defers() {
+        // Tuple[int, str] has arg_count 2 with empty_tuple_index False; the
+        // search hits the "other arity" tail -> full form.
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_FULL_DEFER));
+    }
+
+    #[test]
+    fn tuple_empty_index_is_full_form() {
+        // Tuple[()] -> arg_count 1, empty_tuple_index True -> the Python
+        // conditional `len(t.args) == 0 and not t.empty_tuple_index` fails,
+        // so it falls to the full form.
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            arg_count: 1,
+            empty_tuple_index: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_FULL_DEFER));
+    }
+
+    #[test]
+    fn tuple_missing_lookup_defers() {
+        let f = Facts {
+            fullname: "typing.Tuple".to_string(),
+            tuple_missing_or_placeholder: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TUPLE_LOOKUP_DEFER));
+    }
+
+    #[test]
+    fn union_single_arg_defers() {
+        // The original Union branch has no arity check; any arity defers to
+        // make_union over anal_array.
+        let f = Facts {
+            fullname: "typing.Union".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_UNION_DEFER));
+    }
+
+    #[test]
+    fn union_gold_path_defers() {
+        let f = Facts {
+            fullname: "typing.Union".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_UNION_DEFER));
+    }
+
+    #[test]
+    fn optional_arity_error() {
+        let f = Facts {
+            fullname: "typing.Optional".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_OPTIONAL_ARG_ERR));
+    }
+
+    #[test]
+    fn optional_gold_path_defers() {
+        let f = Facts {
+            fullname: "typing.Optional".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_OPTIONAL_DEFER));
+    }
+
+    #[test]
+    fn callable_defers() {
+        let f = Facts {
+            fullname: "typing.Callable".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_CALLABLE_DEFER));
+    }
+
+    #[test]
+    fn type_bare_any() {
+        // typing.Type bare -> TypeType(Any) (#9476 only forces None for
+        // builtins.type, which keeps 'type' from collapsing to object).
+        let f = Facts {
+            fullname: "typing.Type".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPE_BARE_ANY));
+    }
+
+    #[test]
+    fn type_bare_none_9476() {
+        let f = Facts {
+            fullname: "builtins.type".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPE_BARE_NONE));
+    }
+
+    #[test]
+    fn type_one_arg() {
+        let f = Facts {
+            fullname: "typing.Type".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPE_ONE_ARG));
+    }
+
+    #[test]
+    fn type_arity_error() {
+        let f = Facts {
+            fullname: "typing.Type".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPE_ARG_ERR));
+    }
+
+    #[test]
+    fn typeform_bare() {
+        let f = Facts {
+            fullname: "typing.TypeForm".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPEFORM_BARE));
+    }
+
+    #[test]
+    fn typeform_one_arg_defers() {
+        let f = Facts {
+            fullname: "typing.TypeForm".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_TYPEFORM_DEFER));
+    }
+
+    #[test]
+    fn classvar_zero() {
+        let f = Facts {
+            fullname: "typing.ClassVar".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_CLASSVAR_ZERO));
+    }
+
+    #[test]
+    fn classvar_one_arg_defers() {
+        let f = Facts {
+            fullname: "typing.ClassVar".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_CLASSVAR_DEFER));
+    }
+
+    #[test]
+    fn classvar_multi_arg_defers() {
+        let f = Facts {
+            fullname: "typing.ClassVar".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_CLASSVAR_DEFER));
+    }
+
+    #[test]
+    fn never_tag() {
+        let f = Facts {
+            fullname: "typing.Never".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NEVER));
+    }
+
+    #[test]
+    fn never_noreturn_tag() {
+        let f = Facts {
+            fullname: "typing.NoReturn".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NEVER));
+    }
+
+    #[test]
+    fn annotate_arity_error() {
+        let f = Facts {
+            fullname: "typing.Annotated".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_ANNOTATED_ARG_ERR));
+    }
+
+    #[test]
+    fn annotate_gold_path_defers() {
+        let f = Facts {
+            fullname: "typing_extensions.Annotated".to_string(),
+            arg_count: 2,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_ANNOTATED_DEFER));
+    }
+
+    #[test]
+    fn required_bad_ctx() {
+        let f = Facts {
+            fullname: "typing.Required".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_REQUIRED_BAD_CTX));
+    }
+
+    #[test]
+    fn required_arg_err() {
+        let f = Facts {
+            fullname: "typing.Required".to_string(),
+            arg_count: 2,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_REQUIRED_ARG_ERR));
+    }
+
+    #[test]
+    fn required_defer() {
+        let f = Facts {
+            fullname: "typing.Required".to_string(),
+            arg_count: 1,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_REQUIRED_DEFER));
+    }
+
+    #[test]
+    fn notrequired_bad_ctx() {
+        let f = Facts {
+            fullname: "typing_extensions.NotRequired".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NOTREQUIRED_BAD_CTX));
+    }
+
+    #[test]
+    fn notrequired_arg_err() {
+        let f = Facts {
+            fullname: "typing.NotRequired".to_string(),
+            arg_count: 0,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NOTREQUIRED_ARG_ERR));
+    }
+
+    #[test]
+    fn notrequired_defer() {
+        let f = Facts {
+            fullname: "typing.NotRequired".to_string(),
+            arg_count: 1,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NOTREQUIRED_DEFER));
+    }
+
+    #[test]
+    fn readonly_bad_ctx() {
+        let f = Facts {
+            fullname: "typing.ReadOnly".to_string(),
+            arg_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_READONLY_BAD_CTX));
+    }
+
+    #[test]
+    fn readonly_arg_err() {
+        let f = Facts {
+            fullname: "typing.ReadOnly".to_string(),
+            arg_count: 2,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_READONLY_ARG_ERR));
+    }
+
+    #[test]
+    fn readonly_defer() {
+        let f = Facts {
+            fullname: "typing.ReadOnly".to_string(),
+            arg_count: 1,
+            allow_typed_dict_special_forms: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_READONLY_DEFER));
+    }
+
+    #[test]
+    fn literal_defers() {
+        let f = Facts {
+            fullname: "typing.Literal".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), None);
+    }
+}

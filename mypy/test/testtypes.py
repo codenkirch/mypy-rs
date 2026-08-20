@@ -53,6 +53,7 @@ from mypy.nodes import (
     MypyFile,
     NameExpr,
     OpExpr,
+    PlaceholderNode,
     SetExpr,
     SliceExpr,
     StarExpr,
@@ -109,6 +110,7 @@ from mypy.types import (
     AnyType,
     CallableType,
     DeletedType,
+    EllipsisType,
     ErasedType,
     FunctionLike,
     Instance,
@@ -4610,7 +4612,7 @@ class NativeUnboundBranchFrontSuite(Suite):
 
     def test_placeholder_becomes_typeinfo_final(self) -> None:
         # Cyclic reference to a class -> "Cannot resolve name".
-        from mypy.nodes import PlaceholderNode, SymbolTableNode
+        from mypy.nodes import SymbolTableNode
 
         t = UnboundType("mod.C")
         sym = SymbolTableNode(
@@ -4621,7 +4623,7 @@ class NativeUnboundBranchFrontSuite(Suite):
 
     def test_placeholder_becomes_typeinfo_defer(self) -> None:
         # Incomplete reference, placeholder allowed -> PlaceholderType + defer.
-        from mypy.nodes import PlaceholderNode, SymbolTableNode
+        from mypy.nodes import SymbolTableNode
 
         t = UnboundType("mod.C")
         sym = SymbolTableNode(
@@ -4632,7 +4634,7 @@ class NativeUnboundBranchFrontSuite(Suite):
 
     def test_placeholder_becomes_typeinfo_record(self) -> None:
         # Incomplete reference, not allowed -> PlaceholderType + record.
-        from mypy.nodes import PlaceholderNode, SymbolTableNode
+        from mypy.nodes import SymbolTableNode
 
         t = UnboundType("mod.C")
         sym = SymbolTableNode(
@@ -4643,7 +4645,7 @@ class NativeUnboundBranchFrontSuite(Suite):
 
     def test_placeholder_plain_final(self) -> None:
         # Unknown placeholder on the final iteration -> error Any.
-        from mypy.nodes import PlaceholderNode, SymbolTableNode
+        from mypy.nodes import SymbolTableNode
 
         t = UnboundType("mod.C")
         sym = SymbolTableNode(MDEF, PlaceholderNode("mod.C", Var("C"), 1))
@@ -4652,7 +4654,7 @@ class NativeUnboundBranchFrontSuite(Suite):
 
     def test_placeholder_plain_record(self) -> None:
         # Unknown placeholder -> Any(special_form) + record.
-        from mypy.nodes import PlaceholderNode, SymbolTableNode
+        from mypy.nodes import SymbolTableNode
 
         t = UnboundType("mod.C")
         sym = SymbolTableNode(MDEF, PlaceholderNode("mod.C", Var("C"), 1))
@@ -4907,6 +4909,542 @@ class NativeUnboundBranchFrontSuite(Suite):
         v._fullname = "mod.x"
         v.type = self.fx.o
         self._assert_par(t, {"mod.x": SymbolTableNode(MDEF, v)})
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTryAnalyzeSpecialUnboundSuite(Suite):
+    """Parity for the Rust `try_analyze_special_unbound_type` classifier.
+
+    The special-form elif-chain (builtins.None, typing.Any, Final, Tuple,
+    Union, Optional, Callable, Type, TypeForm, ClassVar, Never, Annotated,
+    Required, NotRequired, ReadOnly) is decided in Rust from scalar facts
+    (fullname + arity + a few flags); the Python shim applies the branch
+    bodies (errors, object construction, anal recursion). Branches the Rust
+    classifier cannot decide purely (Literal, TypeGuard, Unpack, Self, the
+    non-special tail, and every gold path that recurses) defer to the
+    pure-Python body.
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical (str(result), captured fail/note messages) on both
+    engaged and deferred paths, and a direct seam call proves the Rust
+    classifier engages on each special family. The `builtins.tuple` /
+    `builtins.function` / `builtins.int` TypeInfos are snapshotted so the
+    Tuple and Callable branches can build their fallbacks.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, **kwargs: object) -> tuple[object, object]:
+        from mypy.tvar_scope import TypeVarLikeScope
+        from mypy.typeanal import TypeAnalyser
+
+        fx = self.fx
+        self_tuple_info: TypeInfo = fx.std_tuplei
+        int_info: TypeInfo = fx.make_type_info("builtins.int")
+
+        class FakePlugin:
+            def get_type_analyze_hook(self, fullname: str) -> object:
+                return None
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.final_iteration = False
+                self.type = None
+                self.errors: list[str] = []
+                self.syms: dict[str, SymbolTableNode] = {
+                    "builtins.tuple": SymbolTableNode(MDEF, self_tuple_info),
+                    "builtins.function": SymbolTableNode(MDEF, fx.functioni),
+                    "builtins.int": SymbolTableNode(MDEF, int_info),
+                    "builtins.str": SymbolTableNode(MDEF, fx.str_type_info),
+                    # Short names too: `anal_type` resolves type args like
+                    # `int` through `lookup_qualified(name)`, and the fixture
+                    # has no module scope for the `int`/`str` short names to
+                    # fall back to. Keying only the builtin fullnames above
+                    # would leave every `UnboundType("int")` argument an
+                    # unresolvable Any, hiding the golden-path values.
+                    "int": SymbolTableNode(MDEF, int_info),
+                    "str": SymbolTableNode(MDEF, fx.str_type_info),
+                }
+
+            def lookup_qualified(
+                self, name: str, ctx: Context, suppress_errors: bool = False
+            ) -> SymbolTableNode | None:
+                return self.syms.get(name)
+
+            def lookup_fully_qualified(self, fullname: str) -> SymbolTableNode:
+                return self.syms[fullname]
+
+            def lookup_fully_qualified_or_none(
+                self, fullname: str
+            ) -> SymbolTableNode | None:
+                return self.syms.get(fullname)
+
+            def is_incomplete_namespace(self, fullname: str) -> bool:
+                return False
+
+            def record_incomplete_ref(self) -> None:
+                self.errors.append("record_incomplete_ref")
+
+            def fail(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+            def is_func_scope(self) -> bool:
+                return False
+
+            def record_fixed_type(self, typ: Type) -> None:
+                pass
+
+            def defer(self) -> None:
+                pass
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.tvar_scope = TypeVarLikeScope()
+        ta.plugin = FakePlugin()
+        ta.options = Options()
+        ta.defining_alias = False
+        ta.python_3_12_type_alias = False
+        ta.alias_type_params_names = None
+        ta.allowed_alias_tvars = []
+        ta.erase_tvar_defs = []
+        ta.allow_unbound_tvars = False
+        ta.allow_placeholder = False
+        ta.allow_param_spec_literals = False
+        ta.allow_type_any = False
+        ta.allow_type_var_tuple = -1
+        ta.nesting_level = 0
+        ta.is_typeshed_stub = False
+        ta.analyzing_tvar_def = False
+        ta.aliases_used = set()
+        ta.prohibit_special_class_field_types = None
+        ta.allow_typed_dict_special_forms = False
+        ta.allow_final = True
+        ta.allow_unpack = False
+        ta.allow_ellipsis = False
+        ta.allow_tuple_literal = True
+        ta.report_invalid_types = False
+        ta.prohibit_self_type = None
+        ta.cur_mod_node = None
+        for key, value in kwargs.items():
+            setattr(ta, key, value)
+        return ta, api
+
+    _t_fullname = "typing.Any"
+
+    @staticmethod
+    def _t(fullname: str, args: list[Type] | None = None, **kw: object) -> UnboundType:
+        return UnboundType(fullname, args, **kw)
+
+    def _call(
+        self, ta: object, t: UnboundType, fullname: str
+    ) -> tuple[str, list[str]]:
+        result = ta.try_analyze_special_unbound_type(t, fullname)
+        messages = list(ta.api.errors)
+        return str(result), messages
+
+    def _assert_par(
+        self,
+        fullname: str,
+        args: list[Type] | None = None,
+        *,
+        expected: str | None = None,
+        **kwargs: object,
+    ) -> None:
+        off_ta, _ = self._analyser(**kwargs)
+        off = self._with_gate(
+            False, lambda: self._call(off_ta, self._t(fullname, args), fullname)
+        )
+        self._set_active(True)
+        on_ta, _ = self._analyser(**kwargs)
+        on = self._with_gate(
+            True, lambda: self._call(on_ta, self._t(fullname, args), fullname)
+        )
+        assert_equal(on[0], off[0], f"try_analyze_special_unbound parity result {fullname}")
+        assert_equal(on[1], off[1], f"try_analyze_special_unbound parity messages {fullname}")
+        if expected is not None:
+            assert_equal(on[0], expected, f"try_analyze_special_unbound result {fullname}")
+
+    def _assert_engages(self, **facts: object) -> None:
+        from mypy.typeanal import _rust_classify_special_unbound
+
+        defaults: dict[str, object] = {
+            "fullname": "typing.Any",
+            "arg_count": 0,
+            "empty_tuple_index": False,
+            "allow_typed_dict_special_forms": False,
+            "tuple_missing_or_placeholder": False,
+            "tuple_ellipsis_form": False,
+            "not_in_final": True,
+            "not_in_tuple": True,
+            "not_in_type": True,
+            "not_in_typeform": True,
+            "not_in_classvar": True,
+            "not_in_never": True,
+            "not_in_annotated": True,
+            "not_in_required": True,
+            "not_in_notrequired": True,
+            "not_in_readonly": True,
+        }
+        defaults.update(facts)
+        result = _rust_classify_special_unbound(
+            defaults["fullname"],
+            defaults["arg_count"],
+            defaults["empty_tuple_index"],
+            defaults["allow_typed_dict_special_forms"],
+            defaults["tuple_missing_or_placeholder"],
+            defaults["tuple_ellipsis_form"],
+            defaults["not_in_final"],
+            defaults["not_in_tuple"],
+            defaults["not_in_type"],
+            defaults["not_in_typeform"],
+            defaults["not_in_classvar"],
+            defaults["not_in_never"],
+            defaults["not_in_annotated"],
+            defaults["not_in_required"],
+            defaults["not_in_notrequired"],
+            defaults["not_in_readonly"],
+        )
+        assert result is not None, "Rust try_analyze_special_unbound did not engage"
+
+    def test_none(self) -> None:
+        self._assert_par("builtins.None", expected="None")
+        self._assert_engages(fullname="builtins.None")
+
+    def test_any(self) -> None:
+        self._assert_par("typing.Any", expected="Any")
+        self._assert_engages(fullname="typing.Any")
+
+    def test_final_error(self) -> None:
+        # Final in a non-final context -> error Any; message depends on flags.
+        self._assert_par("typing.Final", expected="Any")
+        self._assert_engages(fullname="typing.Final", not_in_final=False)
+
+    def test_final_ext_error(self) -> None:
+        self._assert_par("typing_extensions.Final", expected="Any")
+        self._assert_engages(fullname="typing_extensions.Final", not_in_final=False)
+
+    def test_tuple_bare(self) -> None:
+        # Bare 'Tuple' same as 'tuple'; builds via named_type with omitted Any.
+        self._assert_par("typing.Tuple", expected="builtins.tuple[Any, ...]")
+        self._assert_engages(fullname="typing.Tuple", not_in_tuple=False)
+
+    def test_tuple_ellipsis(self) -> None:
+        # Tuple[T, ...] -> tuple[T] (uniform).
+        arg = UnboundType("int")
+        self._assert_par(
+            "typing.Tuple", [arg, EllipsisType()], expected="builtins.tuple[builtins.int, ...]"
+        )
+        self._assert_engages(
+            fullname="typing.Tuple",
+            arg_count=2,
+            not_in_tuple=False,
+            tuple_ellipsis_form=True,
+        )
+
+    def test_tuple_fixed_arity(self) -> None:
+        # Tuple[int, str] -> full form via tuple_type.
+        self._assert_par(
+            "typing.Tuple",
+            [UnboundType("int"), UnboundType("str")],
+        )
+        self._assert_engages(
+            fullname="typing.Tuple",
+            arg_count=2,
+            not_in_tuple=False,
+            tuple_ellipsis_form=False,
+        )
+
+    def test_tuple_empty_index(self) -> None:
+        # Tuple[()] -> empty_tuple_index; full form.
+        t = UnboundType("typing.Tuple", [], empty_tuple_index=True)
+        off_ta, _ = self._analyser()
+        off = self._with_gate(False, lambda: self._call(off_ta, t, "typing.Tuple"))
+        self._set_active(True)
+        on_ta, _ = self._analyser()
+        on = self._with_gate(True, lambda: self._call(on_ta, t, "typing.Tuple"))
+        assert_equal(on[0], off[0], "Tuple[()] parity result")
+        self._assert_engages(
+            fullname="typing.Tuple",
+            arg_count=0,
+            empty_tuple_index=True,
+            not_in_tuple=False,
+        )
+
+    def test_tuple_missing_lookup(self) -> None:
+        # builtins.tuple missing -> lookup-defer branch; fail('Name "tuple" is
+        # not defined') since is_incomplete_namespace is False.
+        off_ta, off_api = self._analyser()
+        off_api.syms.pop("builtins.tuple")
+        t = UnboundType("typing.Tuple")
+        off = self._with_gate(False, lambda: self._call(off_ta, t, "typing.Tuple"))
+        self._set_active(True)
+        on_ta, on_api = self._analyser()
+        on_api.syms.pop("builtins.tuple")
+        on = self._with_gate(True, lambda: self._call(on_ta, t, "typing.Tuple"))
+        assert_equal(on[0], off[0], "Tuple missing-lookup parity result")
+        assert_equal(on[1], off[1], "Tuple missing-lookup parity messages")
+        self._assert_engages(
+            fullname="typing.Tuple",
+            not_in_tuple=False,
+            tuple_missing_or_placeholder=True,
+        )
+
+    def test_union_no_arity_check(self) -> None:
+        # The original Union branch has no arity check: Union[int] defers to
+        # make_union and collapses to builtins.int.
+        self._assert_par("typing.Union", [UnboundType("int")], expected="builtins.int")
+        self._assert_engages(fullname="typing.Union", arg_count=1)
+
+    def test_union_gold(self) -> None:
+        # Union[int, str] -> UnionType.make_union (defer for the make).
+        self._assert_par(
+            "typing.Union",
+            [UnboundType("int"), UnboundType("str")],
+            expected="builtins.int | builtins.str",
+        )
+        self._assert_engages(fullname="typing.Union", arg_count=2)
+
+    def test_optional_arity_error(self) -> None:
+        self._assert_par(
+            "typing.Optional",
+            [UnboundType("int"), UnboundType("str")],
+            expected="Any",
+        )
+        self._assert_engages(fullname="typing.Optional", arg_count=2)
+
+    def test_optional_gold(self) -> None:
+        self._assert_par(
+            "typing.Optional",
+            [UnboundType("int")],
+            expected="builtins.int | None",
+        )
+        self._assert_engages(fullname="typing.Optional", arg_count=1)
+
+    def test_callable_bare(self) -> None:
+        # Callable (bare) -> callable_with_ellipsis; deferred for building.
+        self._assert_par("typing.Callable")
+        self._assert_engages(fullname="typing.Callable")
+
+    def test_callable_two_args(self) -> None:
+        self._assert_par(
+            "typing.Callable",
+            [EllipsisType(), UnboundType("int")],
+        )
+        self._assert_engages(fullname="typing.Callable", arg_count=2)
+
+    def test_type_bare_any(self) -> None:
+        # typing.Type bare -> TypeType(Any).
+        self._assert_par("typing.Type", expected="type[Any]")
+        self._assert_engages(fullname="typing.Type", not_in_type=False)
+
+    def test_type_bare_none(self) -> None:
+        # builtins.type bare -> None (not special, #9476: builtins.type
+        # must not collapse to builtins.object).
+        self._assert_par("builtins.type", expected="None")
+        self._assert_engages(fullname="builtins.type", arg_count=0, not_in_type=False)
+
+    def test_type_one_arg(self) -> None:
+        self._assert_par("typing.Type", [UnboundType("int")], expected="type[builtins.int]")
+        self._assert_engages(fullname="typing.Type", arg_count=1, not_in_type=False)
+
+    def test_type_arity_error(self) -> None:
+        self._assert_par(
+            "typing.Type",
+            [UnboundType("int"), UnboundType("str")],
+            expected="type[builtins.int]",  # one-arg golden path still used
+        )
+        self._assert_engages(fullname="typing.Type", arg_count=2, not_in_type=False)
+
+    def test_typeform_bare(self) -> None:
+        self._assert_par("typing.TypeForm", expected="TypeForm[Any]")
+        self._assert_engages(fullname="typing.TypeForm", not_in_typeform=False)
+
+    def test_typeform_one_arg(self) -> None:
+        self._assert_par(
+            "typing.TypeForm", [UnboundType("int")], expected="TypeForm[builtins.int]"
+        )
+        self._assert_engages(fullname="typing.TypeForm", arg_count=1, not_in_typeform=False)
+    def test_classvar_zero(self) -> None:
+        # Bare ClassVar in a plain context -> Any (from_omitted_generics).
+        self._assert_par("typing.ClassVar", expected="Any")
+        # Bare ClassVar inside a TypedDict (prohibit context) still reports
+        # the "can't be used inside" error before the arg-count dispatch.
+        self._assert_par(
+            "typing.ClassVar",
+            prohibit_special_class_field_types="TypedDict",
+            expected="Any",
+        )
+        self._assert_engages(fullname="typing.ClassVar", not_in_classvar=False)
+
+    def test_classvar_one_arg(self) -> None:
+        self._assert_par("typing.ClassVar", [UnboundType("int")], expected="builtins.int")
+        self._assert_engages(fullname="typing.ClassVar", arg_count=1, not_in_classvar=False)
+
+    def test_classvar_nested(self) -> None:
+        # ClassVar nested inside a type -> "Invalid type" error + int.
+        off_ta, _ = self._analyser(nesting_level=1)
+        t = UnboundType("typing.ClassVar", [UnboundType("int")])
+        off = self._with_gate(False, lambda: self._call(off_ta, t, "typing.ClassVar"))
+        self._set_active(True)
+        on_ta, _ = self._analyser(nesting_level=1)
+        on = self._with_gate(True, lambda: self._call(on_ta, t, "typing.ClassVar"))
+        assert_equal(on[0], off[0], "ClassVar nested parity result")
+        assert_equal(on[1], off[1], "ClassVar nested parity messages")
+        self._assert_engages(
+            fullname="typing.ClassVar", arg_count=1, not_in_classvar=False
+        )
+
+    def test_classvar_arity_error(self) -> None:
+        self._assert_par(
+            "typing.ClassVar",
+            [UnboundType("int"), UnboundType("str")],
+            expected="Any",
+        )
+        self._assert_engages(
+            fullname="typing.ClassVar", arg_count=2, not_in_classvar=False
+        )
+
+    def test_never(self) -> None:
+        self._assert_par("typing.Never", expected="Never")
+        self._assert_engages(fullname="typing.Never", not_in_never=False)
+
+    def test_noreturn(self) -> None:
+        self._assert_par("typing.NoReturn", expected="Never")
+        self._assert_engages(fullname="typing.NoReturn", not_in_never=False)
+
+    def test_annotated_arity_error(self) -> None:
+        self._assert_par("typing.Annotated", [UnboundType("int")], expected="Any")
+        self._assert_engages(
+            fullname="typing.Annotated", arg_count=1, not_in_annotated=False
+        )
+
+    def test_annotated_gold(self) -> None:
+        self._assert_par(
+            "typing.Annotated",
+            [UnboundType("int"), UnboundType("unit")],
+            expected="builtins.int",
+        )
+        self._assert_engages(
+            fullname="typing.Annotated", arg_count=2, not_in_annotated=False
+        )
+
+    def test_required_bad_ctx(self) -> None:
+        # Required outside a TypedDict -> "can be only used" + error Any.
+        self._assert_par("typing.Required", [UnboundType("int")], expected="Any")
+        self._assert_engages(
+            fullname="typing.Required",
+            arg_count=1,
+            allow_typed_dict_special_forms=False,
+            not_in_required=False,
+        )
+
+    def test_required_arg_err(self) -> None:
+        self._assert_par(
+            "typing.Required",
+            [UnboundType("int"), UnboundType("str")],
+            allow_typed_dict_special_forms=True,
+            expected="Any",
+        )
+        self._assert_engages(
+            fullname="typing.Required",
+            arg_count=2,
+            allow_typed_dict_special_forms=True,
+            not_in_required=False,
+        )
+
+    def test_required_gold(self) -> None:
+        self._assert_par(
+            "typing.Required",
+            [UnboundType("int")],
+            allow_typed_dict_special_forms=True,
+            expected="Required[builtins.int]",
+        )
+        self._assert_engages(
+            fullname="typing.Required",
+            arg_count=1,
+            allow_typed_dict_special_forms=True,
+            not_in_required=False,
+        )
+
+    def test_notrequired_bad_ctx(self) -> None:
+        self._assert_par(
+            "typing_extensions.NotRequired", [UnboundType("int")], expected="Any"
+        )
+        self._assert_engages(
+            fullname="typing_extensions.NotRequired",
+            arg_count=1,
+            allow_typed_dict_special_forms=False,
+            not_in_notrequired=False,
+        )
+
+    def test_notrequired_gold(self) -> None:
+        self._assert_par(
+            "typing_extensions.NotRequired",
+            [UnboundType("int")],
+            allow_typed_dict_special_forms=True,
+            expected="NotRequired[builtins.int]",
+        )
+        self._assert_engages(
+            fullname="typing_extensions.NotRequired",
+            arg_count=1,
+            allow_typed_dict_special_forms=True,
+            not_in_notrequired=False,
+        )
+
+    def test_readonly_bad_ctx(self) -> None:
+        self._assert_par(
+            "typing_extensions.ReadOnly", [UnboundType("int")], expected="Any"
+        )
+        self._assert_engages(
+            fullname="typing_extensions.ReadOnly",
+            arg_count=1,
+            allow_typed_dict_special_forms=False,
+            not_in_readonly=False,
+        )
+
+    def test_readonly_gold(self) -> None:
+        self._assert_par(
+            "typing_extensions.ReadOnly",
+            [UnboundType("int")],
+            allow_typed_dict_special_forms=True,
+            expected="ReadOnly[builtins.int]",
+        )
+        self._assert_engages(
+            fullname="typing_extensions.ReadOnly",
+            arg_count=1,
+            allow_typed_dict_special_forms=True,
+            not_in_readonly=False,
+        )
+
+    def test_plain_name_defers(self) -> None:
+        # A non-special name -> None; the tag path is skipped entirely and
+        # the caller runs the full body -> same result both ways.
+        self._assert_par("mod.SomeName")
+
+    def test_literal_defers(self) -> None:
+        # Literal -> Rust returns None (defer); Python runs analyze_literal_type.
+        self._assert_par("typing.Literal", [UnboundType("int")])
+
 class NativeCheckArgumentTypesPlanSuite(Suite):
     """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
 

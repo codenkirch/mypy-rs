@@ -1570,6 +1570,24 @@ def rust_type_analyze(
     allow_param_spec_literals: bool = False,
     allow_unpack: bool = False,
 ) -> bytes | None: ...
+def rust_classify_special_unbound(
+    fullname: str,
+    arg_count: int,
+    empty_tuple_index: bool,
+    allow_typed_dict_special_forms: bool,
+    tuple_missing_or_placeholder: bool,
+    tuple_ellipsis_form: bool,
+    not_in_final: bool,
+    not_in_tuple: bool,
+    not_in_type: bool,
+    not_in_typeform: bool,
+    not_in_classvar: bool,
+    not_in_never: bool,
+    not_in_annotated: bool,
+    not_in_required: bool,
+    not_in_notrequired: bool,
+    not_in_readonly: bool,
+) -> int | None: ...
 
 # mypy/semanal.py — decorator/semanal-visitor helpers.
 def rust_erase_func_annotations(func: Any) -> None: ...
