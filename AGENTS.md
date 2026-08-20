@@ -346,6 +346,24 @@ including:
   (wired from `mypy/build.py`) and covered by
   `NativeOverloadingOverloadsSuite` in `mypy/test/testtypes.py` (gate-off
   vs gate-on differential on the decision lists).
+- `rust_classify_unbound_front` (issue #714) — mirrors the decision
+  front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
+  (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub
+  (unresolved symbol, `PlaceholderNode`, `node is None`, `ParamSpecExpr`,
+  `TypeVarExpr`, `TypeVarTupleExpr`) from raw node facts (ints, bools, the
+  `alias_type_params_names` string list, the type name) and returns a
+  branch tag; the Python shim applies the side effects (defer /
+  `record_incomplete_ref` / `fail`) and rebuilds the result object. The
+  plugin hook path, non-front node kinds (Var, TypeAlias, TypeInfo, ...),
+  and unbound non-alias `TypeVarExpr` defer (`None`) to the pure-Python
+  body; `tvar_scope.get_binding` and the "a typevar param is a
+  `PlaceholderType` → `api.defer()`" pre-check stay Python-side (the
+  shim re-flags the pre-check as a fact and re-applies the deferral on a
+  decided tag). Gated by `_set_native_typeanal_active` (wired from
+  `mypy/build.py`) and covered by `NativeUnboundBranchFrontSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
+  result string, error messages, and defer / record counts), plus pure
+  decision unit tests in `typeanal_unbound2.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

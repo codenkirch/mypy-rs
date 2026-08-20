@@ -38,6 +38,7 @@ from mypy.nodes import (
     Decorator,
     ImportFrom,
     MypyFile,
+    Node,
     ParamSpecExpr,
     PlaceholderNode,
     SymbolTableNode,
@@ -307,6 +308,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         )
 
     def visit_unbound_type_nonoptional(self, t: UnboundType, defining_literal: bool) -> Type:
+        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+            result = self._native_visit_unbound_front(t, defining_literal)
+            if result is not None:
+                return result
         sym = self.lookup_qualified(t.name, t)
         param_spec_name = None
         if t.name.endswith((".args", ".kwargs")):
@@ -546,6 +551,305 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 return self.analyze_unbound_type_without_type_info(t, sym, defining_literal)
         else:  # sym is None
             return AnyType(TypeOfAny.special_form)
+
+    def _native_visit_unbound_front(
+        self, t: UnboundType, defining_literal: bool
+    ) -> Type | None:
+        """Classify the visit_unbound_type_nonoptional branch front in Rust.
+
+        Ports the dispatch hub of typeanal.py:310-482. Rust receives only
+        scalars / strings (facts) and returns a branch tag; this shim applies
+        the side effects (defer / record_incomplete_ref / fail) and builds the
+        result object. Returns None when Rust defers, so the caller runs the
+        pure-Python body unchanged.
+        """
+        try:
+            sym = self.lookup_qualified(t.name, t)
+            param_spec_name = None
+            if t.name.endswith((".args", ".kwargs")):
+                param_spec_name = t.name.rsplit(".", 1)[0]
+                maybe_param_spec = self.lookup_qualified(param_spec_name, t)
+                if maybe_param_spec and isinstance(maybe_param_spec.node, ParamSpecExpr):
+                    sym = maybe_param_spec
+                else:
+                    param_spec_name = None
+
+            if sym is None:
+                node_kind = _UNBOUND_FRONT_KIND_SYM_NONE
+                node = None
+            else:
+                node = sym.node
+                if node is None:
+                    node_kind = _UNBOUND_FRONT_KIND_NODE_NONE
+                elif isinstance(node, PlaceholderNode):
+                    node_kind = _UNBOUND_FRONT_KIND_PLACEHOLDER
+                elif isinstance(node, ParamSpecExpr):
+                    node_kind = _UNBOUND_FRONT_KIND_PARAM_SPEC
+                elif isinstance(node, TypeVarExpr):
+                    node_kind = _UNBOUND_FRONT_KIND_TYPE_VAR
+                elif isinstance(node, TypeVarTupleExpr):
+                    node_kind = _UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE
+                else:
+                    node_kind = _UNBOUND_FRONT_KIND_OTHER
+            if isinstance(node, PlaceholderNode):
+                placeholder_becomes_typeinfo = node.becomes_typeinfo
+            else:
+                placeholder_becomes_typeinfo = False
+            if node is not None and not isinstance(node, PlaceholderNode):
+                hook = self.plugin.get_type_analyze_hook(node.fullname)
+            else:
+                hook = None
+            # The body reaches tvar_scope.get_binding (typeanal.py:360) only
+            # after the placeholder / node-None / hook branches return, i.e.
+            # for non-placeholder, non-None nodes. Match that so a node-None
+            # symbol (fullname is None) cannot trip the get_binding assert.
+            if node is not None and not isinstance(node, PlaceholderNode):
+                tvar_def = self.tvar_scope.get_binding(sym)
+                # Mirrors the pre-check at typeanal.py:361-369. Re-applied by
+                # the shim below only when Rust decides a front branch, since
+                # the body reaches it only on the param-spec/typevar arms.
+                placeholder_in_tvar_params = False
+                if tvar_def is not None:
+                    tvar_params = [tvar_def.upper_bound, tvar_def.default]
+                    if isinstance(tvar_def, TypeVarType):
+                        tvar_params += list(tvar_def.values)
+                    placeholder_in_tvar_params = any(
+                        isinstance(tp, PlaceholderType) for tp in tvar_params
+                    )
+            else:
+                tvar_def = None
+                placeholder_in_tvar_params = False
+            tag = _rust_classify_unbound_front(
+                node_kind,
+                placeholder_becomes_typeinfo,
+                self.api.final_iteration,
+                self.allow_placeholder,
+                hook is not None,
+                tvar_def is not None,
+                tvar_def is not None and tvar_def in self.allowed_alias_tvars,
+                tvar_def is not None and tvar_def in self.erase_tvar_defs,
+                placeholder_in_tvar_params,
+                self.allow_unbound_tvars,
+                self.defining_alias,
+                defining_literal,
+                param_spec_name is not None,
+                self.allow_param_spec_literals,
+                len(t.args) > 0,
+                self.alias_type_params_names,
+                t.name,
+                self.allow_type_var_tuple,
+                self.nesting_level,
+            )
+            if tag is None:
+                return None
+            if node_kind in (
+                _UNBOUND_FRONT_KIND_PARAM_SPEC,
+                _UNBOUND_FRONT_KIND_TYPE_VAR,
+                _UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE,
+            ) and placeholder_in_tvar_params:
+                # The body applies this deferral before the param-spec /
+                # typevar arms, which is exactly where these tags live.
+                self.api.defer()
+            return self._apply_unbound_front_tag(tag, t, sym, node, param_spec_name, tvar_def)
+        except (AssertionError, NotImplementedError):
+            return None
+
+    def _apply_unbound_front_tag(
+        self,
+        tag: int,
+        t: UnboundType,
+        sym: SymbolTableNode | None,
+        node: Node | None,
+        param_spec_name: str | None,
+        tvar_def: TypeVarLikeType | None,
+    ) -> Type:
+        """Apply the side effects and result building for a front tag.
+
+        Exactly mirrors the branch bodies of typeanal.py:310-482; see
+        crates/type_kernel/src/typeanal_unbound2.rs for the tag table.
+        """
+        if tag == _UNBOUND_FRONT_TAG_PH_BECOMES_FINAL:
+            self.cannot_resolve_type(t)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PH_BECOMES_DEFER:
+            self.api.defer()
+            assert isinstance(node, PlaceholderNode)
+            return PlaceholderType(
+                node.fullname,
+                self.anal_array(
+                    t.args,
+                    allow_param_spec=True,
+                    allow_param_spec_literals=True,
+                    allow_unpack=True,
+                ),
+                t.line,
+            )
+        if tag == _UNBOUND_FRONT_TAG_PH_BECOMES_RECORD:
+            self.api.record_incomplete_ref()
+            assert isinstance(node, PlaceholderNode)
+            return PlaceholderType(
+                node.fullname,
+                self.anal_array(
+                    t.args,
+                    allow_param_spec=True,
+                    allow_param_spec_literals=True,
+                    allow_unpack=True,
+                ),
+                t.line,
+            )
+        if tag == _UNBOUND_FRONT_TAG_PH_PLAIN_FINAL:
+            self.cannot_resolve_type(t)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PH_PLAIN_RECORD:
+            self.api.record_incomplete_ref()
+            return AnyType(TypeOfAny.special_form)
+        if tag == _UNBOUND_FRONT_TAG_SYM_NONE:
+            return AnyType(TypeOfAny.special_form)
+        if tag == _UNBOUND_FRONT_TAG_NODE_NONE:
+            assert sym is not None
+            self.fail(f"Internal error (node is None, kind={sym.kind})", t)
+            return AnyType(TypeOfAny.special_form)
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_UNBOUND_TVAR:
+            return t
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_NOT_DECLARED:
+            name = param_spec_name or t.name
+            self.fail(
+                f'ParamSpec "{name}" is not included in type_params', t, code=codes.VALID_TYPE
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_UNBOUND:
+            name = param_spec_name or t.name
+            self.fail(f'ParamSpec "{name}" is unbound', t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_ARGS_COMPONENT:
+            self.fail(
+                f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE
+            )
+            self.fail("ParamSpec components are not allowed here", t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_ARGS:
+            self.fail(
+                f'ParamSpec "{t.name}" used with arguments', t, code=codes.VALID_TYPE
+            )
+            assert isinstance(tvar_def, ParamSpecType)
+            return ParamSpecType(
+                tvar_def.name,
+                tvar_def.fullname,
+                tvar_def.id,
+                tvar_def.flavor,
+                tvar_def.upper_bound,
+                tvar_def.default,
+                line=t.line,
+                column=t.column,
+            )
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_COMPONENT:
+            self.fail("ParamSpec components are not allowed here", t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_PSPEC_OK:
+            assert isinstance(tvar_def, ParamSpecType)
+            return ParamSpecType(
+                tvar_def.name,
+                tvar_def.fullname,
+                tvar_def.id,
+                tvar_def.flavor,
+                tvar_def.upper_bound,
+                tvar_def.default,
+                line=t.line,
+                column=t.column,
+            )
+        if tag == _UNBOUND_FRONT_TAG_TVAR_ALIAS_NOT_DECLARED:
+            if self.python_3_12_type_alias:
+                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(
+                    f'"{t.name}"'
+                )
+            else:
+                msg = f'Type variable "{t.name}" is not included in type_params'
+            self.fail(msg, t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVAR_ALIAS_BOUND:
+            self.fail(
+                f'Can\'t use bound type variable "{t.name}" to define generic alias',
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVAR_ERASED:
+            # The caller should have already given a relevant error.
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVAR_ARGS:
+            assert isinstance(tvar_def, TypeVarType)
+            self.fail(
+                f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE
+            )
+            return tvar_def.copy_modified(line=t.line, column=t.column)
+        if tag == _UNBOUND_FRONT_TAG_TVAR_OK:
+            assert isinstance(tvar_def, TypeVarType)
+            return tvar_def.copy_modified(line=t.line, column=t.column)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_ALIAS_NOT_DECLARED:
+            self.fail(
+                f'Type variable "{t.name}" is not included in type_params',
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_ALIAS_BOUND:
+            self.fail(
+                f'Can\'t use bound type variable "{t.name}" to define generic alias',
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_UNBOUND_TVAR:
+            return t
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_NOT_DECLARED:
+            if self.python_3_12_type_alias:
+                msg = message_registry.TYPE_PARAMETERS_SHOULD_BE_DECLARED.format(
+                    f'"{t.name}"'
+                )
+            else:
+                msg = f'TypeVarTuple "{t.name}" is not included in type_params'
+            self.fail(msg, t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_UNBOUND:
+            self.fail(f'TypeVarTuple "{t.name}" is unbound', t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_NESTING:
+            self.fail(
+                f'TypeVarTuple "{t.name}" is only valid with an unpack',
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_ARGS:
+            assert isinstance(tvar_def, TypeVarTupleType)
+            assert isinstance(node, TypeVarTupleExpr)
+            self.fail(
+                f'Type variable "{t.name}" used with arguments', t, code=codes.VALID_TYPE
+            )
+            return TypeVarTupleType(
+                tvar_def.name,
+                tvar_def.fullname,
+                tvar_def.id,
+                tvar_def.upper_bound,
+                node.tuple_fallback,
+                tvar_def.default,
+                line=t.line,
+                column=t.column,
+            )
+        if tag == _UNBOUND_FRONT_TAG_TVARTUPLE_OK:
+            assert isinstance(tvar_def, TypeVarTupleType)
+            assert isinstance(node, TypeVarTupleExpr)
+            return TypeVarTupleType(
+                tvar_def.name,
+                tvar_def.fullname,
+                tvar_def.id,
+                tvar_def.upper_bound,
+                node.tuple_fallback,
+                tvar_def.default,
+                line=t.line,
+                column=t.column,
+            )
+        raise AssertionError(f"unknown unbound front tag {tag}")
 
     def pack_paramspec_args(self, an_args: Sequence[Type], empty_tuple_index: bool) -> list[Type]:
         # "Aesthetic" ParamSpec literals for single ParamSpec: C[int, str] -> C[[int, str]].
@@ -2675,6 +2979,7 @@ try:
     )
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
+        rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_explicit_any as _rust_has_explicit_any,
@@ -2707,6 +3012,7 @@ except ImportError:
     _rust_is_typevar_default_recursive = None  # type: ignore[assignment]
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
+    _rust_classify_unbound_front = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -2718,6 +3024,49 @@ _native_typeanal_active: bool = False
 def _set_native_typeanal_active(active: bool) -> None:
     global _native_typeanal_active
     _native_typeanal_active = active
+
+
+# Front branch tags for `visit_unbound_type_nonoptional` (issue #714).
+# Mirrored in crates/type_kernel/src/typeanal_unbound2.rs; Python applies
+# the side effect + result construction for the tag Rust returns.
+_UNBOUND_FRONT_TAG_PH_BECOMES_FINAL = 1
+_UNBOUND_FRONT_TAG_PH_BECOMES_DEFER = 2
+_UNBOUND_FRONT_TAG_PH_BECOMES_RECORD = 3
+_UNBOUND_FRONT_TAG_PH_PLAIN_FINAL = 4
+_UNBOUND_FRONT_TAG_PH_PLAIN_RECORD = 5
+_UNBOUND_FRONT_TAG_SYM_NONE = 6
+_UNBOUND_FRONT_TAG_NODE_NONE = 7
+_UNBOUND_FRONT_TAG_PSPEC_UNBOUND_TVAR = 8
+_UNBOUND_FRONT_TAG_PSPEC_NOT_DECLARED = 9
+_UNBOUND_FRONT_TAG_PSPEC_UNBOUND = 10
+_UNBOUND_FRONT_TAG_PSPEC_ARGS_COMPONENT = 11
+_UNBOUND_FRONT_TAG_PSPEC_ARGS = 12
+_UNBOUND_FRONT_TAG_PSPEC_COMPONENT = 13
+_UNBOUND_FRONT_TAG_PSPEC_OK = 14
+_UNBOUND_FRONT_TAG_TVAR_ALIAS_NOT_DECLARED = 15
+_UNBOUND_FRONT_TAG_TVAR_ALIAS_BOUND = 16
+_UNBOUND_FRONT_TAG_TVAR_ERASED = 17
+_UNBOUND_FRONT_TAG_TVAR_ARGS = 18
+_UNBOUND_FRONT_TAG_TVAR_OK = 19
+_UNBOUND_FRONT_TAG_TVARTUPLE_ALIAS_NOT_DECLARED = 20
+_UNBOUND_FRONT_TAG_TVARTUPLE_ALIAS_BOUND = 21
+_UNBOUND_FRONT_TAG_TVARTUPLE_UNBOUND_TVAR = 22
+_UNBOUND_FRONT_TAG_TVARTUPLE_NOT_DECLARED = 23
+_UNBOUND_FRONT_TAG_TVARTUPLE_UNBOUND = 24
+_UNBOUND_FRONT_TAG_TVARTUPLE_NESTING = 25
+_UNBOUND_FRONT_TAG_TVARTUPLE_ARGS = 26
+_UNBOUND_FRONT_TAG_TVARTUPLE_OK = 27
+
+# Node-kind tags for the resolved `sym.node`, computed by the shim:
+# -1 sym is None, 0 node is None, 1 PlaceholderNode, 2 ParamSpecExpr,
+# 3 TypeVarExpr, 4 TypeVarTupleExpr, 5 anything else (defer).
+_UNBOUND_FRONT_KIND_SYM_NONE = -1
+_UNBOUND_FRONT_KIND_NODE_NONE = 0
+_UNBOUND_FRONT_KIND_PLACEHOLDER = 1
+_UNBOUND_FRONT_KIND_PARAM_SPEC = 2
+_UNBOUND_FRONT_KIND_TYPE_VAR = 3
+_UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE = 4
+_UNBOUND_FRONT_KIND_OTHER = 5
 
 
 def native_analyze_type(

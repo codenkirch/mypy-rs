@@ -127,6 +127,7 @@ mod treetransform;
 mod typealias_instantiate;
 mod typeanal_queries;
 mod typeanal_unbound;
+mod typeanal_unbound2;
 mod typeinfo;
 mod typeops;
 mod types_impl;
@@ -1416,6 +1417,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // variable, enum member Literal). None defers to pure Python.
     module.add_function(wrap_pyfunction!(
         typeanal_unbound::rust_analyze_unbound_without_info,
+        module
+    )?)?;
+    // visit_unbound_type_nonoptional: the decision front (placeholder /
+    // node-None / ParamSpec / TypeVar / TypeVarTuple families). Rust
+    // returns a branch tag from raw node facts; Python applies the side
+    // effects and builds the result objects. None defers to pure Python.
+    module.add_function(wrap_pyfunction!(
+        typeanal_unbound2::rust_classify_unbound_front,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
