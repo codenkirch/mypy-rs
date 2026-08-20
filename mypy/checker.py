@@ -325,6 +325,7 @@ try:
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
+        rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
@@ -390,6 +391,7 @@ except ImportError:
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
     _rust_builtin_item_type = None  # type: ignore[assignment]
+    _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
@@ -434,6 +436,11 @@ except ImportError:
     _checker_read_type = None  # type: ignore[assignment]
     _CHECKER_HAS_TYPE_KERNEL = False
 
+
+# Decision kinds returned by `_rust_check_overlapping_overloads`; must match
+# `KIND_*` in crates/type_kernel/src/overload_override.rs.
+NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP = 0
+NATIVE_OVERLOAD_KIND_NEVER_MATCH = 1
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -1556,50 +1563,97 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             impl_type = self.extract_callable_type(inner_type, defn.impl)
 
         is_descriptor_get = defn.info and defn.name == "__get__"
+
+        # Native type_kernel seam: run the pairwise screening loop (the
+        # counts-overlap gate, never-match, unsafe-overlap, and flip note)
+        # in one Rust call on wire callables (overload_override.rs). Each
+        # signature is serialized once instead of once per predicate, and
+        # the loop itself runs natively. Engages only when every item's
+        # var.type is already a plain CallableType (checked without
+        # extraction, so the not_callable emissions of extract_callable_type
+        # cannot diverge) and the resolver is installed; Rust defers on any
+        # pair it cannot decide, and the pure-Python loop below runs exactly
+        # as before.
+        overlap_decisions: list[tuple[int, int, int, bool]] | None = None
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _native_checker_resolver is not None
+        ):
+            try:
+                sig_types = []
+                for item in defn.items:
+                    assert isinstance(item, Decorator)
+                    sig_types.append(get_proper_type(item.var.type))
+                if all(isinstance(t, CallableType) for t in sig_types):
+                    current_class = self.scope.active_class()
+                    type_vars = current_class.defn.type_vars if current_class else []
+                    overlap_decisions = _rust_check_overlapping_overloads(
+                        [_serialize_type_for_checker(t) for t in sig_types],
+                        _serialize_type_list(type_vars),
+                        bool(is_descriptor_get),
+                        state.strict_optional,
+                        _native_checker_resolver,
+                    )
+            except (AssertionError, NotImplementedError, ValueError):
+                overlap_decisions = None
+
         for i, item in enumerate(defn.items):
             assert isinstance(item, Decorator)
             sig1 = self.extract_callable_type(item.var.type, item)
             if sig1 is None:
                 continue
 
-            for j, item2 in enumerate(defn.items[i + 1 :]):
-                assert isinstance(item2, Decorator)
-                sig2 = self.extract_callable_type(item2.var.type, item2)
-                if sig2 is None:
-                    continue
+            if overlap_decisions is None:
+                for j, item2 in enumerate(defn.items[i + 1 :]):
+                    assert isinstance(item2, Decorator)
+                    sig2 = self.extract_callable_type(item2.var.type, item2)
+                    if sig2 is None:
+                        continue
 
-                if not are_argument_counts_overlapping(sig1, sig2):
-                    continue
+                    if not are_argument_counts_overlapping(sig1, sig2):
+                        continue
 
-                if overload_can_never_match(sig1, sig2):
-                    self.msg.overloaded_signature_will_never_match(i + 1, i + j + 2, item2.func)
-                elif not is_descriptor_get:
-                    # Note: we force mypy to check overload signatures in strict-optional mode
-                    # so we don't incorrectly report errors when a user tries typing an overload
-                    # that happens to have a 'if the argument is None' fallback.
-                    #
-                    # For example, the following is fine in strict-optional mode but would throw
-                    # the unsafe overlap error when strict-optional is disabled:
-                    #
-                    #     @overload
-                    #     def foo(x: None) -> int: ...
-                    #     @overload
-                    #     def foo(x: str) -> str: ...
-                    #
-                    # See Python 2's map function for a concrete example of this kind of overload.
-                    current_class = self.scope.active_class()
-                    type_vars = current_class.defn.type_vars if current_class else []
-                    with state.strict_optional_set(True):
-                        if is_unsafe_overlapping_overload_signatures(sig1, sig2, type_vars):
-                            flip_note = (
-                                j == 0
-                                and not is_unsafe_overlapping_overload_signatures(
-                                    sig2, sig1, type_vars
+                    if overload_can_never_match(sig1, sig2):
+                        self.msg.overloaded_signature_will_never_match(i + 1, i + j + 2, item2.func)
+                    elif not is_descriptor_get:
+                        # Note: we force mypy to check overload signatures in strict-optional mode
+                        # so we don't incorrectly report errors when a user tries typing an overload
+                        # that happens to have a 'if the argument is None' fallback.
+                        #
+                        # For example, the following is fine in strict-optional mode but would throw
+                        # the unsafe overlap error when strict-optional is disabled:
+                        #
+                        #     @overload
+                        #     def foo(x: None) -> int: ...
+                        #     @overload
+                        #     def foo(x: str) -> str: ...
+                        #
+                        # See Python 2's map function for a concrete example of this kind of overload.
+                        current_class = self.scope.active_class()
+                        type_vars = current_class.defn.type_vars if current_class else []
+                        with state.strict_optional_set(True):
+                            if is_unsafe_overlapping_overload_signatures(sig1, sig2, type_vars):
+                                flip_note = (
+                                    j == 0
+                                    and not is_unsafe_overlapping_overload_signatures(
+                                        sig2, sig1, type_vars
+                                    )
+                                    and not overload_can_never_match(sig2, sig1)
                                 )
-                                and not overload_can_never_match(sig2, sig1)
+                                self.msg.overloaded_signatures_overlap(
+                                    i + 1, i + j + 2, flip_note, item.func
+                                )
+            else:
+                for i2, j2, kind, flip_note in overlap_decisions:
+                    if i2 == i:
+                        if kind == NATIVE_OVERLOAD_KIND_NEVER_MATCH:
+                            self.msg.overloaded_signature_will_never_match(
+                                i2 + 1, i2 + j2 + 2, defn.items[i2 + j2 + 1].func
                             )
+                        else:
                             self.msg.overloaded_signatures_overlap(
-                                i + 1, i + j + 2, flip_note, item.func
+                                i2 + 1, i2 + j2 + 2, flip_note, defn.items[i2].func
                             )
 
             if impl_type is not None:

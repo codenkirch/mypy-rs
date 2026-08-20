@@ -69,21 +69,34 @@ fn plain_callables(t_bytes: &[u8], s_bytes: &[u8]) -> Option<(Type, Type)> {
 
 /// `mypy.checker.overload_can_never_match` (checker.py:9974-9994):
 /// `is_callable_compatible(exp_sig, other, is_compat=is_more_precise,
-/// is_proper_subtype=True, ignore_return=True)`. The non-generic fast path
-/// skips the erase+expand (a no-op when there are no variables).
-#[pyfunction]
-pub(crate) fn rust_overload_can_never_match(
-    signature_bytes: &[u8],
-    other_bytes: &[u8],
+/// is_proper_subtype=True, ignore_return=True)`.
+///
+/// The engine runs on decoded wire types; `sig`/`other` must both be plain
+/// non-generic `CallableType`s (the erase+expand Python does is a no-op when
+/// there are no variables; generic operands defer). Shared by the
+/// `#[pyfunction]` entry and the
+/// `overload_override::rust_check_overlapping_overloads` driver loop.
+pub(crate) fn overload_can_never_match_inner(
+    sig: &Type,
+    other: &Type,
     strict_optional: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
-    let (sig, other) = plain_callables(signature_bytes, other_bytes)?;
+    let tvar =
+        |v: &Type| matches!(v, Type::CallableType { variables, .. } if !variables.is_empty());
+    if tvar(sig) || tvar(other) {
+        return None;
+    }
+    let t_is_call = matches!(sig, Type::CallableType { .. });
+    let s_is_call = matches!(other, Type::CallableType { .. });
+    if !(t_is_call && s_is_call) {
+        return None;
+    }
     let res = resolver.resolver();
     let more_precise = |l: &Type, r: &Type| is_more_precise(l, r, false, strict_optional, res);
     is_callable_compatible(
-        &sig,
-        &other,
+        sig,
+        other,
         &more_precise,
         true,  // is_proper_subtype
         false, // ignore_pos_arg_names
@@ -92,6 +105,21 @@ pub(crate) fn rust_overload_can_never_match(
         false, // check_args_covariantly
         res,
     )
+}
+
+/// `#[pyfunction]` entry: `mypy.checker.overload_can_never_match`
+/// (checker.py:9974-9994). Wire blobs in, `Some(bool)` when Rust decided,
+/// `None` (defer to the pure-Python path) for generic or non-callable
+/// operands.
+#[pyfunction]
+pub(crate) fn rust_overload_can_never_match(
+    signature_bytes: &[u8],
+    other_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let (sig, other) = plain_callables(signature_bytes, other_bytes)?;
+    overload_can_never_match_inner(&sig, &other, strict_optional, resolver)
 }
 
 /// `mypy.checker.is_more_general_arg_prefix` (checker.py:9997-10012), the

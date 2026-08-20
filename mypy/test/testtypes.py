@@ -13117,6 +13117,246 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
         )
         assert result is None, "Rust should defer on a non-callable signature"
 
+class NativeOverloadingOverloadsSuite(Suite):
+    """Parity for the Rust `check_overlapping_overloads` screening-loop port.
+
+    `TypeChecker.check_overlapping_overloads` (checker.py:1537-1658) runs a
+    pairwise screening loop over every ordered pair of overload items and
+    emits two message families from the results. The Rust driver
+    (`overload_override.rs`) reproduces exactly that screening part (the
+    argument-count gate, the never-match predicate, the unsafe-overlap
+    predicate under strict_optional=True, and the flip note) on wire
+    callables in one call. The impl-vs-items tail and the message emission
+    stay in Python and are not exercised here.
+
+    The reference replicates the loop with the pure-Python predicates
+    (checker gate off); the native side calls the Rust driver directly.
+    Both must produce identical `(i, j, kind, flip_note)` decision lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        _set_native_checker_active(False)
+        _set_native_checker_resolver(None)
+
+    def _callable(self, args: list[Type], ret: Type) -> CallableType:
+        return CallableType(
+            args,
+            [ARG_POS] * len(args),
+            [None] * len(args),
+            ret,
+            self.fx.function,
+        )
+
+    def _native_decisions(
+        self,
+        sigs: list[CallableType],
+        class_type_vars: list[TypeVarLikeType],
+        is_descriptor_get: bool,
+        strict_optional: bool,
+    ) -> list[tuple[int, int, int, bool]]:
+        from mypy.checker import _serialize_type_for_checker, _serialize_type_list
+
+        result = _type_kernel.rust_check_overlapping_overloads(
+            [_serialize_type_for_checker(s) for s in sigs],
+            _serialize_type_list(class_type_vars),
+            is_descriptor_get,
+            strict_optional,
+            self.resolver,
+        )
+        assert result is not None, "Rust check_overlapping_overloads did not engage"
+        return [tuple(r) for r in result]  # type: ignore[arg-type]
+
+    def _reference_decisions(
+        self,
+        sigs: list[CallableType],
+        class_type_vars: list[TypeVarLikeType],
+        is_descriptor_get: bool,
+        strict_optional: bool,
+    ) -> list[tuple[int, int, int, bool]]:
+        """Replicate checker.py's pairwise screening loop with the checker gate off.
+
+        Same pairing as check_overlapping_overloads (checker.py:1611-1658):
+        the main never-match check reads the current strict_optional, while
+        the unsafe-overlap check and the flip-note reversed checks always run
+        under strict_optional=True. The checker gate is forced off around the
+        loop so each predicate runs its pure-Python body, giving a true
+        Python-vs-Rust differential against the native driver decisions.
+        """
+        from mypy.checker import (
+            NATIVE_OVERLOAD_KIND_NEVER_MATCH,
+            NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP,
+            _set_native_checker_active,
+            are_argument_counts_overlapping,
+            is_unsafe_overlapping_overload_signatures,
+            overload_can_never_match,
+        )
+        from mypy.state import state
+
+        _set_native_checker_active(False)
+        try:
+            with state.strict_optional_set(strict_optional):
+                out: list[tuple[int, int, int, bool]] = []
+                for i, sig1 in enumerate(sigs):
+                    for j, sig2 in enumerate(sigs[i + 1 :]):
+                        if not are_argument_counts_overlapping(sig1, sig2):
+                            continue
+                        if overload_can_never_match(sig1, sig2):
+                            out.append((i, j, NATIVE_OVERLOAD_KIND_NEVER_MATCH, False))
+                        elif not is_descriptor_get:
+                            with state.strict_optional_set(True):
+                                if is_unsafe_overlapping_overload_signatures(
+                                    sig1, sig2, class_type_vars
+                                ):
+                                    flip_note = (
+                                        j == 0
+                                        and not is_unsafe_overlapping_overload_signatures(
+                                            sig2, sig1, class_type_vars
+                                        )
+                                        and not overload_can_never_match(sig2, sig1)
+                                    )
+                                    out.append((i, j, NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP, flip_note))
+                return out
+        finally:
+            _set_native_checker_active(True)
+
+    def _assert_parity(
+        self,
+        sigs: list[CallableType],
+        class_vars: list[TypeVarLikeType],
+        *,
+        is_descriptor_get: bool = False,
+        strict_optional: bool = True,
+    ) -> None:
+        native = self._native_decisions(sigs, class_vars, is_descriptor_get, strict_optional)
+        reference = self._reference_decisions(sigs, class_vars, is_descriptor_get, strict_optional)
+        assert_equal(
+            native,
+            reference,
+            "check_overlapping_overloads screening parity for "
+            f"{[str(s) for s in sigs]} class_vars={[str(t) for t in class_vars]}",
+        )
+
+    def test_never_match_reported(self) -> None:
+        from mypy.checker import (
+            NATIVE_OVERLOAD_KIND_NEVER_MATCH,
+        )
+        # The first signature is broader (object), so the second can never be
+        # matched: (0, 0) never-match decision, no flip note.
+        sigs = [
+            self._callable([self.fx.o], self.fx.a),
+            self._callable([self.fx.a], self.fx.b),
+        ]
+        self._assert_parity(sigs, [])
+        assert_equal(
+            self._native_decisions(sigs, [], False, True),
+            [(0, 0, NATIVE_OVERLOAD_KIND_NEVER_MATCH, False)],
+        )
+
+    def test_no_decision_disjoint_counts(self) -> None:
+        # Argument counts do not overlap (1 vs 3 positional), so the pair is
+        # screened out before either predicate runs.
+        sigs = [
+            self._callable([self.fx.a], self.fx.a),
+            self._callable([self.fx.a, self.fx.a, self.fx.a], self.fx.b),
+        ]
+        self._assert_parity(sigs, [])
+        assert_equal(self._native_decisions(sigs, [], False, True), [])
+
+    def test_unsafe_overlap_reversed_never_no_flip(self) -> None:
+        from mypy.checker import (
+            NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP,
+        )
+        # sig (A)->A then a broader catch-all (object)->B: unsafe overlap (the
+        # partial-only return guard trips), but the reversed direction is
+        # never-match, so the flip note is suppressed (checker.py flip_note).
+        sigs = [
+            self._callable([self.fx.a], self.fx.a),
+            self._callable([self.fx.o], self.fx.b),
+        ]
+        self._assert_parity(sigs, [])
+        assert_equal(
+            self._native_decisions(sigs, [], False, True),
+            [(0, 0, NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP, False)],
+        )
+
+    def test_unsafe_overlap_reversed_unsafe_no_flip(self) -> None:
+        from mypy.checker import (
+            NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP,
+        )
+        # sig (A)->C then (B|D)->D: both directions are unsafely overlapping,
+        # so the flip note is suppressed (reversed direction is also unsafe).
+        sigs = [
+            self._callable([self.fx.a], self.fx.c),
+            self._callable([UnionType([self.fx.b, self.fx.d])], self.fx.d),
+        ]
+        self._assert_parity(sigs, [])
+        assert_equal(
+            self._native_decisions(sigs, [], False, True),
+            [(0, 0, NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP, False)],
+        )
+
+    def test_descriptor_get_suppresses_unsafe(self) -> None:
+        # An overloaded __get__ suppresses unsafe-overlap errors but keeps
+        # never-match ones.
+        sigs = [
+            self._callable([self.fx.a], self.fx.c),
+            self._callable([self.fx.o], self.fx.d),
+        ]
+        self._assert_parity(sigs, [], is_descriptor_get=True)
+        assert_equal(self._native_decisions(sigs, [], True, True), [])
+
+    def test_three_items_middle_and_last(self) -> None:
+        from mypy.checker import (
+            NATIVE_OVERLOAD_KIND_NEVER_MATCH,
+        )
+        # Three items exercise the two inner pairs (0,1) and (1,2) plus the
+        # (0,2) pair, checking that j tracks the slice offset correctly.
+        sigs = [
+            self._callable([self.fx.o], self.fx.a),
+            self._callable([self.fx.a], self.fx.c),
+            self._callable([self.fx.a, self.fx.a], self.fx.b),
+        ]
+        self._assert_parity(sigs, [])
+        assert_equal(
+            self._native_decisions(sigs, [], False, True),
+            [(0, 0, NATIVE_OVERLOAD_KIND_NEVER_MATCH, False)],
+        )
+
+    def test_strict_optional_current_state(self) -> None:
+        # The main never-match check reads the current strict_optional; the
+        # unsafe check always runs under strict_optional=True. The
+        # (None)->int / (str)->str pair is unsafely overlapping only outside
+        # strict-optional (checker.py:1584-1595), so under apt flags the
+        # native driver must keep it unflagged.
+        none_type = NoneType()
+        sigs = [
+            self._callable([none_type], self.fx.a),
+            self._callable([self.fx.str_type], self.fx.b),
+        ]
+        self._assert_parity(sigs, [], strict_optional=True)
+        self._assert_parity(sigs, [], strict_optional=False)
+        assert_equal(self._native_decisions(sigs, [], False, True), [])
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeConditionalTypesSuite(Suite):
     """Parity for the Rust `conditional_types` port (mypy.checker).

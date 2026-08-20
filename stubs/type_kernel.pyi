@@ -26,8 +26,7 @@ from mypy.nodes import (
     AssignmentStmt,
     Block,
     CallExpr,
-    ClassDef,
-    Context,
+    DataclassTransformSpec,
     Decorator,
     Expression,
     FuncDef,
@@ -44,7 +43,6 @@ from mypy.nodes import (
     TypeAlias,
     TypeInfo,
 )
-from mypy.nodes import DataclassTransformSpec
 from mypy.types import ProperType, TupleType, Type, TypeVarLikeType
 
 T = TypeVar("T")
@@ -175,6 +173,7 @@ __all__ = [
     "rust_type_requires_usage",
     "rust_with_exit_suppresses",
     "rust_try_handler_union",
+    "rust_check_overlapping_overloads",
     "rust_classify_except_handler_tests",
     "rust_conditional_types",
     "rust_is_true_literal",
@@ -649,6 +648,13 @@ def rust_is_typed_callable(type_bytes: bytes) -> bool | None: ...
 def rust_is_private(node_name: str) -> bool: ...
 def rust_is_operator_method(fullname: str | None) -> bool: ...
 def rust_are_argument_counts_overlapping(t_bytes: bytes, s_bytes: bytes) -> bool | None: ...
+def rust_check_overlapping_overloads(
+    signatures: list[bytes],
+    class_type_vars: bytes,
+    is_descriptor_get: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> list[tuple[int, int, int, bool]] | None: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes
 ) -> bool | None: ...
