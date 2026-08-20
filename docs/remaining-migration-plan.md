@@ -4,24 +4,71 @@ Date: 2026-08-13
 
 ## Current State
 
-### Metrics (local tree, August 2026)
+### Primary metric: native work share (representative)
+
+The byte-share metrics below understate progress: a strangler-fig port
+keeps every Python fallback in place, so Python bytes never shrink and
+the denominator stays inflated. The representative metric for "how much
+we already have ported successfully to Rust" is the runtime work share:
+the fraction of the self-check corpus's type-checking work that now
+executes in Rust, measured as the differential between the pure-Python
+path (`--no-native-type-kernel`) and the default-on native path on the
+cold self-check (`mypy_self_check.ini -p mypy -p mypyc`,
+`--no-incremental`, `-n0` serial, `--dump-build-stats`):
+
+| Phase | Python-only | Native (prod) | Rust-absorbed share |
+|-------|------------|---------------|---------------------|
+| parse_time | 5.046s | 4.997s | 1.0% |
+| semanal_time | 2.716s | 1.110s | 59.1% |
+| type_check_time | 9.951s | 2.326s | 76.6% |
+| **Total** | **17.713s** | **8.433s** | **52.4%** |
+
+Measured 2026-08-13 (M17 baseline, before #700/#702). A re-measure
+on 2026-08-20 after the #700/#702 merges was attempted with the same
+serial flags, but the shared machine was under heavy load (loadavg
+5-43 from parallel agents), inflating all wall-clock times (python-only
+baseline rose 17.7s -> ~26s) and inverting the per-phase shares to
+negative (native appeared slower). The parse_time control (identical
+code in both modes) stayed near-parity, so the measurement pipeline is
+sound but absolute numbers are load-dependent. Subset diffs
+(mypy.util; mypy.types+nodes) with the parse control passing reproducibly
+showed native ~39-71% slower even at doubled corpus size, so the
+inverted sign is not pure load: it is consistent with the accumulated
+per-call wire/deferral overhead of the dozens of seams landed since
+M17 outweighing their speedups at this corpus scale (Phase B deferral
+reduction is the named lever). Re-measure on a quiet machine before
+treating any new number as the updated baseline; the M17 numbers below
+remain the last trustworthy measurement.
+
+The share is `(python - native) / python` per phase: the fraction of the
+pure-Python phase time that the native path absorbs. It understates
+Rust's true fraction when Rust runs the same logic faster than the Python
+it replaces (the ported code still executes, just cheaper), and it is
+confounded by deferred sub-paths. Treat it as a lower bound on native
+coverage.
+
+Over half the type-checking work already runs in Rust; the type-check
+phase (the dominant cost) is three-quarters native. This is the number
+to watch: every landed seam raises it. Re-run with
+`scripts/measure_work_share.py` (runs the cold self-check twice with
+`--dump-build-stats` and prints the share table) after any kernel seam
+lands.
+
+### Secondary metrics (bytes)
 
 | Metric | Value |
 |--------|-------|
-| Rust bytes (local, .rs) | ~3.52M |
-| Python bytes (mypy + mypyc, ex test/) | ~6.16M |
-| Rust % (local) | ~36.4% |
-| Rust % (GitHub languages API) | ~35.06% |
-| Rust LOC (crates/) | ~86K |
-| Rust source files | 88 (type_kernel) + ast_serialize + module_resolver + fs_probe |
-| Gap to 50% | ~1.34M bytes Python->Rust |
+| Rust bytes (local, .rs) | ~3.62M |
+| Python bytes (mypy + mypyc, ex test/) | ~6.67M |
+| Rust % (local) | ~35.2% |
+| Rust % (GitHub languages API) | ~35.41% |
+| Rust LOC (crates/) | ~96K |
+| Rust source files | 100 (type_kernel) + ast_serialize + module_resolver + fs_probe |
 
-Updated 2026-08-19 after the 3-port swarm (#688: overlap_unsafe,
-#691: conditional_types, #692: equality_ambiguity). Local share ~36.4%;
-GitHub metric ~35.06%. These were the last un-ported leaf candidates in
-`docs/swarm-candidates-2026-08-19.md`: leaf ports (each nets only
-~5-33K bytes) surface is now exhausted. Reaching the target requires the
-wider levers in Phase B/C (deferral reduction, depth ports).
+Updated 2026-08-20 after #700 (type_object_type_from_function) and #702
+(check_overlapping_overloads screening). GitHub metric ~35.41%. The
+byte metrics remain useful for tracking port volume but are NOT the
+progress target: they penalize the strangler for preserving fallbacks.
 
 ## Honest assessment: path to 50%
 
@@ -62,14 +109,20 @@ task. The execution sequence that gets there:
 This document itself was updated to keep the honest number close to the
 plan rather than let "no progress" silently compound.
 
-### Performance (M17 graduation, cold self-check)
+### Path to a majority-Rust checker (work-share framing)
 
-| Phase | Python baseline | Native (prod) | Reduction |
-|-------|----------------|---------------|-----------|
-| parse_time | 5.046s | 4.997s | 1.0% |
-| semanal_time | 2.716s | 1.110s | 59.1% |
-| type_check_time | 9.951s | 2.326s | 76.6% |
-| **Total** | **17.713s** | **8.433s** | **52.4%** |
+The 50% byte-share goal is a proxy; the meaningful target is a
+majority-Rust **work share**. The type-check phase was three-quarters
+native at the M17 baseline (2026-08-13); the realistic wedge to push
+the **total** past 52% is to
+attract more of semanal (+ parse) into the native path, then extend
+into the checker's remaining hot loops (deferral reduction, more depth
+ports). Each landed seam should be validated by re-running the
+self-check differential and recording the new total work share in the
+table at the top of this document. A 2026-08-20 re-measure was
+inconclusive due to machine load (see caveat above); the next clean
+re-measure should re-establish the current baseline before planning
+deferral-reduction work.
 
 ### Native gates shipped (production default-on)
 
