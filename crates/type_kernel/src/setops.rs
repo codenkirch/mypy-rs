@@ -98,6 +98,15 @@ pub(crate) fn trivial_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
+    // Defer FunctionLike pairs: since is_subtype now decides
+    // Callable-vs-Callable via callable_compat (Some(true/false)
+    // instead of None), the old implicit defer signal is gone and
+    // the object/`s`/`t` falls-through below would fire on similar
+    // callables. Python's join produces a joined CallableType there,
+    // so neither the union nor object is parity: defer explicitly.
+    if is_function_like(s) && is_function_like(t) {
+        return None;
+    }
     match is_subtype(s, t, ctx, resolver) {
         Some(true) => return Some(SetOpResult::SameT),
         Some(false) => {}
@@ -125,7 +134,10 @@ pub(crate) fn trivial_meet(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
-    // First direction: s <: t? If yes, meet is s.
+    // Same as trivial_join: FunctionLike pairs must defer.
+    if is_function_like(s) && is_function_like(t) {
+        return None;
+    }
     // First direction: s <: t? If yes, meet is s.
     match is_subtype(s, t, ctx, resolver) {
         Some(true) => Some(SetOpResult::SameS),
@@ -139,6 +151,12 @@ pub(crate) fn trivial_meet(
         }
         None => None,
     }
+}
+
+/// `Type.is_equivalent`-style FunctionLike test for the defer guards:
+/// `CallableType` or `Overloaded` (types.py:1986, types.py:2674).
+fn is_function_like(t: &Type) -> bool {
+    matches!(t, Type::CallableType { .. } | Type::Overloaded { .. })
 }
 
 /// Decode a wire-format `Type` blob via `wire::read_type`. Returns

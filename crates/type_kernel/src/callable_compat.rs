@@ -270,6 +270,11 @@ pub(crate) struct CallableFields<'a> {
     pub(crate) from_concatenate: bool,
     pub(crate) imprecise_arg_kinds: bool,
     pub(crate) unpack_kwargs: bool,
+    /// The `type_guard` / `type_is` refinement payloads (types.py
+    /// CallableType): needed for the both-only / one-only incompatibility
+    /// pre-checks in the C1 visitor port (subtypes.py:910-929).
+    pub(crate) type_guard: Option<&'a Type>,
+    pub(crate) type_is: Option<&'a Type>,
 }
 
 impl<'a> CallableFields<'a> {
@@ -292,6 +297,8 @@ pub(crate) fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
             from_concatenate,
             imprecise_arg_kinds,
             unpack_kwargs,
+            type_guard,
+            type_is,
             ..
         } => Some(CallableFields {
             arg_types,
@@ -303,6 +310,8 @@ pub(crate) fn callable_fields(t: &Type) -> Option<CallableFields<'_>> {
             from_concatenate: *from_concatenate,
             imprecise_arg_kinds: *imprecise_arg_kinds,
             unpack_kwargs: *unpack_kwargs,
+            type_guard: type_guard.as_deref(),
+            type_is: type_is.as_deref(),
         }),
         _ => None,
     }
@@ -658,26 +667,83 @@ pub(crate) fn rust_callables_compatible(
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
 
-    // Both sides must be plain CallableType. `Parameters` (either side) defers:
-    // the wire format drops `Parameters.is_ellipsis_args`, which the Python
-    // `are_parameters_compatible` reads.
-    let (lf, rf) = match (callable_fields(&left), callable_fields(&right)) {
-        (Some(l), Some(r)) => (l, r),
-        _ => return None,
-    };
-
-    let ctx = SubtypeContext::new(
+    let ctx = SubtypeContext::with_callable_flags(
         false, // ignore_type_params
         false, // ignore_declared_variance
         false, // always_covariant
         false, // ignore_promotions
         is_proper_subtype,
         strict_optional,
+        ignore_pos_arg_names,
+        strict_concatenate,
     );
     let res = resolver.resolver();
+    callables_compatible(
+        &left,
+        &right,
+        ctx.ignore_pos_arg_names,
+        ctx.strict_concatenate,
+        &ctx,
+        res,
+    )
+}
+
+/// Entry used by both the `#[pyfunction]` seam and the `subtypes::is_subtype`
+/// visitor (Stage C1, issue #719). The `ignore_pos_arg_names` and
+/// `strict_concatenate` flags are explicit because the wire seam passes them
+/// as serialized parameters, while the visitor derives them from its
+/// `SubtypeContext`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn callables_compatible(
+    left: &Type,
+    right: &Type,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    // Both sides must be plain CallableType. `Parameters` (either side) defers:
+    // the wire format drops `Parameters.is_ellipsis_args`, which the Python
+    // `are_parameters_compatible` reads.
+    let (lf, rf) = match (callable_fields(left), callable_fields(right)) {
+        (Some(l), Some(r)) => (l, r),
+        _ => return None,
+    };
+
+    // type_guard / type_is mismatch pre-checks
+    // (subtypes.py:910-929): both-only TypeGuard (covariant on the guarded
+    // type), both-only TypeIs (checked both ways), or a guard/is on one side
+    // only → False. These run before the general engine; the guarded
+    // sub-type comparison goes through the same SubtypeContext as the
+    // overall check (`self._is_subtype` in the Python visitor). Only when
+    // that comparison itself defers do we defer the whole check.
+    if let (Some(lg), Some(rg)) = (lf.type_guard, rf.type_guard) {
+        match ctx_compat_is_subtype(ctx, resolver, lg, rg) {
+            Some(false) => return Some(false),
+            None => return None,
+            Some(true) => {}
+        }
+    } else if let (Some(li), Some(ri)) = (lf.type_is, rf.type_is) {
+        match ctx_compat_is_subtype(ctx, resolver, li, ri) {
+            Some(false) => return Some(false),
+            None => return None,
+            Some(true) => {}
+        }
+        match ctx_compat_is_subtype(ctx, resolver, ri, li) {
+            Some(false) => return Some(false),
+            None => return None,
+            Some(true) => {}
+        }
+    } else if (rf.type_guard.is_some() && lf.type_guard.is_none())
+        || (rf.type_is.is_some() && lf.type_is.is_none())
+    {
+        // One side has a refinement the other lacks: incompatible
+        // (subtypes.py:922-929).
+        return Some(false);
+    }
 
     // Everything exotic defers to Python.
-    if let Some(vars) = left_variables(&left) {
+    if let Some(vars) = left_variables(left) {
         if !vars.is_empty() {
             return None;
         }
@@ -685,23 +751,23 @@ pub(crate) fn rust_callables_compatible(
     if lf.unpack_kwargs || rf.unpack_kwargs {
         return None;
     }
-    if any_unpack_anywhere(&left) || any_unpack_anywhere(&right) {
+    if any_unpack_anywhere(left) || any_unpack_anywhere(right) {
         return None;
     }
 
     let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> =
-        &|l, r| crate::subtypes::is_subtype(l, r, &ctx, res);
+        &|l, r| crate::subtypes::is_subtype(l, r, ctx, resolver);
 
     is_callable_compatible(
-        &left,
-        &right,
+        left,
+        right,
         is_compat,
-        is_proper_subtype,
+        ctx.proper_subtype,
         ignore_pos_arg_names,
         strict_concatenate,
         false, // ignore_return
         false, // check_args_covariantly
-        res,
+        resolver,
     )
 }
 
@@ -710,6 +776,20 @@ fn left_variables(t: &Type) -> Option<&[Type]> {
         Type::CallableType { variables, .. } => Some(variables),
         _ => None,
     }
+}
+
+/// `is_subtype` through the same `SubtypeContext` the caller is using,
+/// mirroring the Python visitor's `self._is_subtype(l, r)` — which
+/// re-enters `is_subtype` with the current `subtype_context` (and the
+/// same `proper_subtype`). Used by the type_guard / type_is refinement
+/// pre-checks. `None` (defer on an unsupported nested shape) propagates.
+fn ctx_compat_is_subtype(
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    left: &Type,
+    right: &Type,
+) -> Option<bool> {
+    crate::subtypes::is_subtype(left, right, ctx, resolver)
 }
 
 /// `mypy.subtypes.is_callable_compatible` (subtypes.py:1883-2036), the subset

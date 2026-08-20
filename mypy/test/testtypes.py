@@ -15852,3 +15852,241 @@ class NativeCleanUpBasesSuite(Suite):
 
     def test_non_protocol_name_kept(self) -> None:
         assert self._classify("mod.NotProtocol", False, True) == 1  # KEEP
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSubtypesCallableSuite(Suite):
+    """Parity for the native Callable-vs-Callable routing in
+    `rust_is_subtype` (Stage C1, #719).
+
+    Previously `is_subtype(CallableType, CallableType)` returned None from
+    the Rust visitor and the Python shim fell through to pure-Python
+    `is_callable_compatible`. Now the visitor routes Callable-vs-Callable
+    into the native callable_compat engine (and Callable-vs-Overloaded into
+    an all-items recursion of the same engine), matching the Python
+    `visit_callable_type` decision table. The gate-off / gate-on
+    differential must produce identical booleans; each test asserts the
+    pair (off, on) equal, so a deferral (None -> Python decides) and a
+    wrong native answer both fail.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _call(self, *args: Type) -> CallableType:
+        return self.fx.callable(*args)
+
+    def _call_named(self, arg_names: list[str | None], arg_types: list[Type], ret: Type) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            arg_names,
+            ret,
+            self.fx.function,
+        )
+
+    def _par(self, left: Type, right: Type) -> tuple[bool, bool]:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        off = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(left, right)
+        return off, on
+
+    def test_callable_equal_signatures(self) -> None:
+        # (A) -> A <: (A) -> A: identical signature, True both ways.
+        left = self._call(self.fx.a, self.fx.a)
+        right = self._call(self.fx.a, self.fx.a)
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_callable_arg_type_differs(self) -> None:
+        # (A) -> None <: (B) -> None when B <: A (contravariant arg:
+        # needs B <: A, which holds as B(A)) -> True.
+        left = self._call(self.fx.a, NoneType())
+        right = self._call(self.fx.b, NoneType())
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+        # (B) -> None !<: (A) -> None (needs A <: B, which does not
+        # hold) -> False.
+        left = self._call(self.fx.b, NoneType())
+        right = self._call(self.fx.a, NoneType())
+        off, on = self._par(left, right)
+        assert (off, on) == (False, False)
+
+    def test_callable_covariant_return(self) -> None:
+        # (None) -> A <: (None) -> object (return covariant).
+        left = self._call(NoneType(), self.fx.a)
+        right = self._call(NoneType(), self.fx.o)
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_callable_param_name_mismatch_default(self) -> None:
+        # Same types, different positional names, no ignore_pos_arg_names
+        # passed: `is_subtype` defaults the flag to False, so names must
+        # match -> (False, False). This is the differentiated case the
+        # native entry must decide identically.
+        left = self._call_named(["x"], [self.fx.a], self.fx.a)
+        right = self._call_named(["y"], [self.fx.a], self.fx.a)
+        off, on = self._par(left, right)
+        assert (off, on) == (False, False)
+
+    def test_ignore_pos_arg_names_off_requires_names(self) -> None:
+        # With ignore_pos_arg_names=False (as produced by usages that pass
+        # the flag explicitly), matching names become mandatory; both
+        # engines agree False for a name mismatch, True for a match.
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        left = self._call_named(["x"], [self.fx.a], self.fx.a)
+        right = self._call_named(["y"], [self.fx.a], self.fx.a)
+        off = is_subtype(left, right, ignore_pos_arg_names=False)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(left, right, ignore_pos_arg_names=False)
+        assert (off, on) == (False, False)
+
+        match_right = self._call_named(["x"], [self.fx.a], self.fx.a)
+        off = is_subtype(left, match_right, ignore_pos_arg_names=False)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(left, match_right, ignore_pos_arg_names=False)
+        assert (off, on) == (True, True)
+
+    def test_strict_concatenate_from_concatenate(self) -> None:
+        # When either side carries `from_concatenate`, Python forces
+        # strict_concatenate_check=True regardless of the option
+        # (subtypes.py:1872-1875); the native engine must mirror the
+        # resulting arg compatibility. A ParamSpec-prefixed callable
+        # compared against a plain (A, B) callable: with
+        # strict_concatenate_check True the prefix is matched literally,
+        # so the fixed args must equal the prefix (A, B) — True here.
+        # The differential (off, on) must agree.
+        ps = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            0,  # ParamSpecFlavor.BARE
+            self.fx.o,
+            AnyType(TypeOfAny.special_form),
+        )
+        left = CallableType(
+            [UnpackType(ps)],
+            [ARG_STAR],
+            [None],
+            NoneType(),
+            self.fx.function,
+            from_concatenate=True,
+        )
+        right = self._call(self.fx.a, self.fx.b, NoneType())
+        off, on = self._par(left, right)
+        assert off == on
+
+    def test_callable_vs_overloaded_all_items_match(self) -> None:
+        # f: (A) -> None <: overload[(A) -> None, (B) -> None] -> True
+        # (subtypes.py:966-967: all items).
+        left = self._call(self.fx.a, NoneType())
+        right = Overloaded(
+            [self._call(self.fx.a, NoneType()), self._call(self.fx.b, NoneType())]
+        )
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_callable_vs_overloaded_one_item_fails(self) -> None:
+        # f: (A) -> None <: overload[(A) -> int, (B) -> None]: the (A) -> int
+        # item fails the return check -> False (all items must match).
+        left = self._call(self.fx.a, NoneType())
+        right = Overloaded(
+            [self._call(self.fx.a, self.fx.a), self._call(self.fx.b, NoneType())]
+        )
+        off, on = self._par(left, right)
+        assert (off, on) == (False, False)
+
+    def test_callable_vs_overloaded_mismatched_arg(self) -> None:
+        # f: (A) -> None <: overload[(B) -> None] when B <: A: the (B) ->
+        # None item is satisfied via contravariance (A <: B needed... no:
+        # contravariance requires B <: A, which holds) -> True. This
+        # documents that `b` is a subtype of `a` (B(A)) in the fixture.
+        left = self._call(self.fx.a, NoneType())
+        right = Overloaded([self._call(self.fx.b, NoneType())])
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)
+
+    def test_type_guard_mismatch_false(self) -> None:
+        # RIGHT has TypeGuard, LEFT does not: incompatible, False
+        # (subtypes.py:922-925, guard set via CallableType.type_guard).
+        # LEFT with the guard against a plain right falls through to the
+        # return-type check only when the guard types are comparable.
+        guarded = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.b,
+            self.fx.function,
+            type_guard=self.fx.a,
+        )
+        plain = self._call(self.fx.a, self.fx.b)
+        # Right-guard / left-plain: incompatible.
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        off = is_subtype(plain, guarded)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(plain, guarded)
+        assert (off, on) == (False, False)
+        # Left-guard / right-plain: allowed (return types compare; both
+        # fake `-> B` and `-> TypeGuard(B)` compare by B).
+        assert is_subtype(guarded, plain)
+
+    def test_type_guard_both_sides_subtype_of_guard(self) -> None:
+        # Both sides guard, guarded types comparable covariantly:
+        # type_guard=A <: type_guard=object -> True.
+        left = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function, type_guard=self.fx.a
+        )
+        right = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function, type_guard=self.fx.o
+        )
+        off, on = self._par(left, right)
+        assert (off, on) == (True, True)

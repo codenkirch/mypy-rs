@@ -545,6 +545,12 @@ def _is_subtype(
                 subtype_context.ignore_promotions,
                 proper_subtype,
                 state.strict_optional,
+                subtype_context.ignore_pos_arg_names,
+                (
+                    (subtype_context.options.extra_checks or subtype_context.options.strict_concatenate)
+                    if subtype_context.options
+                    else False
+                ),
                 _native_subtype_resolver,
             )
         except (AssertionError, NotImplementedError):
