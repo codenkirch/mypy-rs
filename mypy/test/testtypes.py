@@ -90,6 +90,10 @@ from mypy.traverser import (
     is_global_expr,
 )
 from mypy.typeanal import (
+    _TYPE_WITH_INFO_TAG_INSTANCE,
+    _TYPE_WITH_INFO_TAG_NONE_TYPE,
+    _TYPE_WITH_INFO_TAG_TUPLE,
+    _TYPE_WITH_INFO_TAG_VEC,
     _set_native_typeanal_active,
     collect_all_inner_types,
     has_any_from_unimported_type,
@@ -5444,6 +5448,207 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
     def test_literal_defers(self) -> None:
         # Literal -> Rust returns None (defer); Python runs analyze_literal_type.
         self._assert_par("typing.Literal", [UnboundType("int")])
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAnalyzeTypeWithInfoSuite(Suite):
+    """Parity for the Rust `analyze_type_with_type_info` decision front.
+
+    `TypeAnalyser.analyze_type_with_type_info` binds an unbound type that
+    resolved to a `TypeInfo` node. The front classifier runs in Rust from
+    raw node facts (fullname, argument count, which of tuple_type /
+    special_alias / typeddict_type are set) and returns a branch tag; the
+    Python shim applies the side effects for the two tags it executes inline
+    (tuple with args, types.NoneType). Every other tag re-runs the original
+    body, so message side effects stay single-sourced and parity is trivial
+    for the vec / tail / Instance branches.
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical (str(result), captured fail messages) on both engaged
+    and body paths, and a direct seam call proves the classifier engages on
+    each decision branch.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+        # The body re-analyzes bound argument types through native_analyze_type,
+        # so the fixture TypeInfos must resolve through the wire fixup.
+        set_wire_typeinfo_map(
+            {
+                getattr(self.fx, attr).fullname: getattr(self.fx, attr)
+                for attr in dir(self.fx)
+                if isinstance(getattr(self.fx, attr), TypeInfo)
+            }
+        )
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, **kwargs: object) -> object:
+        from mypy.errors import ErrorCode as _ErrorCode
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.final_iteration = False
+                self.errors: list[str] = []
+
+            def fail(self, msg: str, ctx: Context, code: _ErrorCode | None = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: _ErrorCode | None = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.tvar_scope = None  # anal_type must not reach the tvar scope for bound args
+        ta.options = Options()
+        ta.defining_alias = False
+        ta.nesting_level = 0
+        ta.allow_type_any = False
+        ta.allow_placeholder = False
+        ta.allow_param_spec_literals = False
+        ta.allow_type_var_tuple = -1
+        ta.allow_unpack = False
+        ta.allow_ellipsis = False
+        ta.allow_final = False
+        ta.allow_typed_dict_special_forms = False
+        ta.allow_tuple_literal = False
+        ta.allow_unbound_tvars = False
+        ta.alias_type_params_names = None
+        ta.allowed_alias_tvars = []
+        ta.erase_tvar_defs = []
+        ta.aliases_used = set()
+        ta.is_typeshed_stub = False
+        ta.analyzing_tvar_def = False
+        ta.python_3_12_type_alias = False
+        for key, value in kwargs.items():
+            setattr(ta, key, value)
+        return ta, api
+
+    def _generic(self, fullname: str, n_tvars: int = 1) -> TypeInfo:
+        """A TypeInfo with `n_tvars` type variables set in both the short and
+        the defn list, so validate_instance sees a well-formed generic class."""
+        info = self.fx.make_type_info(fullname, typevars=["T"] * n_tvars)
+        assert info.defn.type_vars
+        return info
+
+    def _call(
+        self, info: TypeInfo, args: Sequence[Type], empty_tuple_index: bool = False
+    ) -> tuple[str, list[str]]:
+        from mypy.typeanal import TypeAnalyser
+
+        ta, api = self._analyser()
+        ctx = UnboundType("ctx")
+        result = TypeAnalyser.analyze_type_with_type_info(
+            ta, info, list(args), ctx, empty_tuple_index
+        )
+        messages = [m for m in api.errors if not m.startswith("note: ")]
+        return str(result), messages
+
+    def _assert_par(
+        self, info: TypeInfo, args: Sequence[Type], empty_tuple_index: bool = False
+    ) -> None:
+        off = self._with_gate(False, lambda: self._call(info, args, empty_tuple_index))
+        self._set_active(True)
+        on = self._with_gate(True, lambda: self._call(info, args, empty_tuple_index))
+        assert_equal(str(on), str(off), f"analyze_type_with_type_info parity {info.fullname}")
+        assert_equal(on[1], off[1], f"analyze_type_with_type_info errors {info.fullname}")
+
+    def _assert_engages(self, expected: int, **facts: object) -> None:
+        from mypy.typeanal import _rust_classify_type_with_info
+
+        defaults: dict[str, object] = {
+            "fullname": "mod.UserClass",
+            "args_len": 0,
+            "tuple_type_not_none": False,
+            "special_alias_not_none": False,
+            "typeddict_type_not_none": False,
+        }
+        defaults.update(facts)
+        result = _rust_classify_type_with_info(
+            defaults["fullname"],
+            defaults["args_len"],
+            defaults["tuple_type_not_none"],
+            defaults["special_alias_not_none"],
+            defaults["typeddict_type_not_none"],
+        )
+        assert result == expected, (
+            f"Rust analyze_type_with_type_info classifier {defaults!r}: "
+            f"got {result}, want {expected}"
+        )
+
+    def test_plain_no_args(self) -> None:
+        # Plain class, no type arguments -> plain Instance.
+        info = self.fx.make_type_info("mod.UserClass")
+        self._assert_par(info, [])
+        self._assert_engages(_TYPE_WITH_INFO_TAG_INSTANCE, fullname="mod.UserClass", args_len=0)
+
+    def test_generic_with_args(self) -> None:
+        # Generic class, one argument -> plain Instance.
+        info = self._generic("mod.UserClass")
+        self._assert_par(info, [self.fx.str_type])
+        self._assert_engages(
+            _TYPE_WITH_INFO_TAG_INSTANCE, fullname="mod.UserClass", args_len=1
+        )
+
+    def test_generic_too_few_args(self) -> None:
+        # Generic class with no arguments -> validate_instance fails, the
+        # body's fix_instance emits "Missing type parameters" and fills Any.
+        info = self._generic("mod.UserClass")
+        self._assert_par(info, [])
+
+    def test_bare_tuple_no_args(self) -> None:
+        # builtins.tuple with no arguments is not the tuple special form; it
+        # is a plain Instance branch (the body then fails arg count).
+        info = self._generic("builtins.tuple")
+        self._assert_par(info, [])
+        self._assert_engages(_TYPE_WITH_INFO_TAG_INSTANCE, fullname="builtins.tuple", args_len=0)
+
+    def test_tuple_args(self) -> None:
+        # tuple[...] with arguments -> TupleType (shim-inline branch).
+        info = self._generic("builtins.tuple")
+        self._assert_par(info, [self.fx.str_type])
+        self._assert_engages(_TYPE_WITH_INFO_TAG_TUPLE, fullname="builtins.tuple", args_len=1)
+
+    def test_nonetype(self) -> None:
+        # types.NoneType -> error + NoneType return (shim-inline branch).
+        info = self.fx.make_type_info("types.NoneType")
+        self._assert_par(info, [])
+        self._assert_engages(_TYPE_WITH_INFO_TAG_NONE_TYPE, fullname="types.NoneType", args_len=0)
+
+    def test_named_tuple_tail(self) -> None:
+        # A class with a tuple_type base but no special_alias -> the body
+        # resolves the named-tuple tail (not inline in the shim).
+        info = self.fx.make_type_info("mod.Point")
+        info.tuple_type = TupleType(
+            [self.fx.str_type], Instance(self.fx.std_tuplei, [self.fx.str_type]), 1
+        )
+        self._assert_par(info, [])
+
+    def test_vec(self) -> None:
+        # librt.vecs.vec with no item -> check_vec_type_args fails, the body
+        # returns Any(from_error). Engages the vec tag.
+        info = self._generic("librt.vecs.vec")
+        self._assert_par(info, [])
+        self._assert_engages(_TYPE_WITH_INFO_TAG_VEC, fullname="librt.vecs.vec", args_len=0)
 
 class NativeCheckArgumentTypesPlanSuite(Suite):
     """Parity for the Rust `check_argument_types` plan port (mypy.checkexpr).
