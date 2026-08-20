@@ -2298,11 +2298,11 @@ fn visit_callable_fallback(
         // Recursive SameS: result = fallback (recursive left). Only
         // expressible if fallback == s (then result is s -> SameS).
         SetOpResult::SameS if fallback == s => Some(SetOpResult::SameS),
-        SetOpResult::SameS => setop_result_to_type(Some(r.clone()), fallback, s).and_then(encode_result),
-        // Ancestor / Object pass through (swap-invariant).
-        SetOpResult::Ancestor(fullname) => {
-            Some(SetOpResult::Ancestor(fullname.to_string()))
+        SetOpResult::SameS => {
+            setop_result_to_type(Some(r.clone()), fallback, s).and_then(encode_result)
         }
+        // Ancestor / Object pass through (swap-invariant).
+        SetOpResult::Ancestor(fullname) => Some(SetOpResult::Ancestor(fullname.to_string())),
         SetOpResult::Object => Some(SetOpResult::Object),
         // Any, Bottom: fresh type, encode whole. SameTypeWithArgs: a
         // per-arg reconstruction, cannot express as a single encoded
