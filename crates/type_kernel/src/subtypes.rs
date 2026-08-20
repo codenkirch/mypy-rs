@@ -2937,23 +2937,21 @@ mod tests {
     #[test]
     fn overloaded_subtype_of_callable_when_one_matches() {
         // right is CallableType: at least one overload item must match
-        // (subtypes.py:1126-1130). Each item is CallableType vs
-        // CallableType, which defers to the callable_compat engine (not
-        // called from recursive is_subtype), so None propagates.
+        // (subtypes.py:1126-1130). The lane routed Callable-vs-Callable
+        // into the native callable_compat engine, so the item check no
+        // longer defers: identical signatures -> True.
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let item = callable_type(vec![], Type::NoneType, None);
         let left = Type::Overloaded {
             items: vec![item.clone()],
         };
-        assert_eq!(is_subtype(&left, &item, &ctx_nominal(), &r), None);
+        assert_eq!(is_subtype(&left, &item, &ctx_nominal(), &r), Some(true));
     }
 
     #[test]
     fn overloaded_not_subtype_of_callable_when_none_match() {
-        // right is CallableType: no item matches -> False.
-        // The items differ (ret_type None vs int instance), and
-        // Callable-vs-Callable defers (callable_compat not called from
-        // recursive is_subtype), so None propagates.
+        // right is CallableType: no item matches -> False. The items differ
+        // (ret_type None vs int instance); callable_compat decides it.
         let r = make_resolver(vec![
             snap("builtins.function", "function"),
             snap("builtins.int", "int"),
@@ -2963,8 +2961,8 @@ mod tests {
         let left = Type::Overloaded {
             items: vec![item1.clone()],
         };
-        // item1 vs item2: Callable-vs-Callable defers -> None.
-        assert_eq!(is_subtype(&left, &item2, &ctx_nominal(), &r), None);
+        // item1 vs item2: Callable-vs-Callable -> False.
+        assert_eq!(is_subtype(&left, &item2, &ctx_nominal(), &r), Some(false));
     }
 
     #[test]
@@ -3033,24 +3031,25 @@ mod tests {
     }
 
     #[test]
-    fn callable_defers_callable_right() {
-        // right is CallableType: handled by callable_compat (Python shim),
-        // not this function. Defer (subtypes.py:809-865).
+    fn callable_subtype_of_callable_right() {
+        // right is CallableType: routed into the native callable_compat
+        // engine. Identical signatures -> True (was defer before the lane).
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let left = callable_type(vec![], Type::NoneType, None);
         let right = callable_type(vec![], Type::NoneType, None);
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
     }
 
     #[test]
-    fn callable_defers_overloaded_right() {
-        // right is Overloaded: each item is Callable-vs-Callable (defers).
-        // Defer the whole check (subtypes.py:866-867).
+    fn callable_subtype_of_overloaded_right() {
+        // right is Overloaded: at least one item must match
+        // (subtypes.py:866-867). Identical item -> True (was defer before
+        // the lane).
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let item = callable_type(vec![], Type::NoneType, None);
         let left = callable_type(vec![], Type::NoneType, None);
         let right = Type::Overloaded { items: vec![item] };
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
     }
 
     #[test]
