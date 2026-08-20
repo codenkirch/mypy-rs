@@ -928,11 +928,70 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         )
         return ps.copy_modified(prefix=pre) if isinstance(ps, ParamSpecType) else pre
 
+    def _native_special_tag(self, t: UnboundType, fullname: str) -> int | None:
+        """Classify the `try_analyze_special_unbound_type` elif-chain in Rust.
+
+        The special forms (`builtins.None`, `typing.Any`, `Final`, `Tuple`,
+        `Union`, `Optional`, `Callable`, `Type`, `TypeForm`, `ClassVar`,
+        `Never`, `Annotated`, `Required`, `NotRequired`, `ReadOnly`) are all
+        decided by the fullname plus scalar facts. Every branch keeps its
+        full Python body; this seam only replaces the *decision*, returning
+        a tag the caller uses to jump straight to the matching branch.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        tuple_missing_or_placeholder = False
+        tuple_ellipsis_form = False
+        if fullname in TUPLE_NAMES:
+            # The Tuple branch needs the `builtins.tuple` symbol lookup and
+            # the EllipsisType arity check, which stay Python-owned.
+            sym = self.api.lookup_fully_qualified_or_none("builtins.tuple")
+            tuple_missing_or_placeholder = bool(
+                not sym or isinstance(sym.node, PlaceholderNode)
+            )
+            tuple_ellipsis_form = bool(
+                len(t.args) == 2
+                and isinstance(t.args[1], EllipsisType)
+                and not tuple_missing_or_placeholder
+            )
+        try:
+            # `allow_typed_dict_special_forms` is lazily read in the original
+            # branch bodies, so use its constructor default rather than
+            # requiring the attr to exist (test-only analyzers built with
+            # `TypeAnalyser.__new__` omit it).
+            return _rust_classify_special_unbound(
+                fullname,
+                len(t.args),
+                t.empty_tuple_index,
+                getattr(
+                    self,
+                    "allow_typed_dict_special_forms",
+                    False,
+                ),
+                tuple_missing_or_placeholder,
+                tuple_ellipsis_form,
+                fullname not in FINAL_TYPE_NAMES,
+                fullname not in TUPLE_NAMES,
+                fullname not in TYPE_NAMES,
+                fullname not in ("typing_extensions.TypeForm", "typing.TypeForm"),
+                fullname != "typing.ClassVar",
+                fullname not in NEVER_NAMES,
+                fullname not in ANNOTATED_TYPE_NAMES,
+                fullname not in ("typing_extensions.Required", "typing.Required"),
+                fullname not in ("typing_extensions.NotRequired", "typing.NotRequired"),
+                fullname not in ("typing_extensions.ReadOnly", "typing.ReadOnly"),
+            )
+        except (AssertionError, NotImplementedError):
+            return None
+
     def try_analyze_special_unbound_type(self, t: UnboundType, fullname: str) -> Type | None:
         """Bind special type that is recognized through magic name such as 'typing.Any'.
 
         Return the bound type if successful, and return None if the type is a normal type.
         """
+        spec_tag = self._native_special_tag(t, fullname)
+        if spec_tag is not None:
+            return self._apply_special_unbound_tag(spec_tag, t, fullname)
         if fullname == "builtins.None":
             return NoneType()
         elif fullname == "typing.Any":
@@ -1139,6 +1198,197 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             self.fail("Unexpected Self type", t)
             return AnyType(TypeOfAny.from_error)
         return None
+
+    def _apply_special_unbound_tag(self, tag: int, t: UnboundType, fullname: str) -> Type | None:
+        """Apply the side effects and result building for a special tag.
+
+        Exactly mirrors the branch bodies of typeanal.py:936-1141; see
+        crates/type_kernel/src/typeanal_special.rs for the tag table. The
+        deferred tags (Rust returned None) never reach this method: the
+        caller runs the full pure-Python body instead. A `None` return (the
+        bare `typing.Type` branch, #9476) means "not a special type";
+        the caller treats it the same as the fallback body's `return None`.
+        """
+        if tag == _UNBOUND_SPECIAL_TAG_NONE_TYPE:
+            return NoneType()
+        if tag == _UNBOUND_SPECIAL_TAG_ANY:
+            return AnyType(TypeOfAny.explicit, line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_NEVER:
+            return UninhabitedType()
+        if tag == _UNBOUND_SPECIAL_TAG_FINAL_ERROR:
+            if self.prohibit_special_class_field_types:
+                self.fail(
+                    f"Final[...] can't be used inside a {self.prohibit_special_class_field_types}",
+                    t,
+                    code=codes.VALID_TYPE,
+                )
+            else:
+                if not self.allow_final:
+                    self.fail(
+                        "Final can be only used as an outermost qualifier in a variable annotation",
+                        t,
+                        code=codes.VALID_TYPE,
+                    )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_TUPLE_LOOKUP_DEFER:
+            sym = self.api.lookup_fully_qualified_or_none("builtins.tuple")
+            if not sym or isinstance(sym.node, PlaceholderNode):
+                if self.api.is_incomplete_namespace("builtins"):
+                    self.api.record_incomplete_ref()
+                else:
+                    self.fail('Name "tuple" is not defined', t)
+                return AnyType(TypeOfAny.special_form)
+        if tag == _UNBOUND_SPECIAL_TAG_TUPLE_BARE:
+            any_type = self.get_omitted_any(t)
+            return self.named_type("builtins.tuple", [any_type], line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_TUPLE_ELLIPSIS:
+            instance = self.named_type("builtins.tuple", [self.anal_type(t.args[0])])
+            instance.line = t.line
+            return instance
+        if tag == _UNBOUND_SPECIAL_TAG_TUPLE_FULL_DEFER:
+            return self.tuple_type(
+                self.anal_array(t.args, allow_unpack=True), line=t.line, column=t.column
+            )
+        if tag == _UNBOUND_SPECIAL_TAG_UNION_DEFER:
+            items = self.anal_array(t.args)
+            return UnionType.make_union(items, line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_OPTIONAL_ARG_ERR:
+            self.fail(
+                "Optional[...] must have exactly one type argument", t, code=codes.VALID_TYPE
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_OPTIONAL_DEFER:
+            item = self.anal_type(t.args[0])
+            return make_optional_type(item)
+        if tag == _UNBOUND_SPECIAL_TAG_CALLABLE_DEFER:
+            return self.analyze_callable_type(t)
+        if tag == _UNBOUND_SPECIAL_TAG_TYPE_BARE_ANY:
+            any_type = self.get_omitted_any(t)
+            return TypeType(any_type, line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_TYPE_BARE_NONE:
+            # To prevent assignment of 'builtins.type' inferred as
+            # 'builtins.object'. See https://github.com/python/mypy/issues/9476
+            return None  # type: ignore[return-value]
+        if tag in (_UNBOUND_SPECIAL_TAG_TYPE_ONE_ARG, _UNBOUND_SPECIAL_TAG_TYPE_ARG_ERR):
+            type_str = "Type[...]" if fullname == "typing.Type" else "type[...]"
+            if len(t.args) != 1:
+                self.fail(
+                    f"{type_str} must have exactly one type argument", t, code=codes.VALID_TYPE
+                )
+            item = self.anal_type(t.args[0])
+            bad_item_name = get_bad_type_type_item(item)
+            if bad_item_name:
+                self.fail(f'{type_str} can\'t contain "{bad_item_name}"', t, code=codes.VALID_TYPE)
+                item = AnyType(TypeOfAny.from_error)
+            return TypeType.make_normalized(item, line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_TYPEFORM_BARE:
+            any_type = self.get_omitted_any(t)
+            return TypeType(any_type, line=t.line, column=t.column, is_type_form=True)
+        if tag == _UNBOUND_SPECIAL_TAG_TYPEFORM_DEFER:
+            type_str = "TypeForm[...]"
+            if len(t.args) != 1:
+                self.fail(
+                    type_str + " must have exactly one type argument", t, code=codes.VALID_TYPE
+                )
+            item = self.anal_type(t.args[0])
+            return TypeType.make_normalized(item, line=t.line, column=t.column, is_type_form=True)
+        if tag == _UNBOUND_SPECIAL_TAG_CLASSVAR_ZERO:
+            # The three context checks run before the arg-count dispatch in
+            # the original (typeanal.py:1081-1094), so bare ClassVar still
+            # reports nesting / TypedDict / alias errors.
+            if self.nesting_level > 0:
+                self.fail(
+                    "Invalid type: ClassVar nested inside other type", t, code=codes.VALID_TYPE
+                )
+            if self.prohibit_special_class_field_types:
+                self.fail(
+                    f"ClassVar[...] can't be used inside a {self.prohibit_special_class_field_types}",
+                    t,
+                    code=codes.VALID_TYPE,
+                )
+            if self.defining_alias:
+                self.fail(
+                    "ClassVar[...] can't be used inside a type alias", t, code=codes.VALID_TYPE
+                )
+            return AnyType(TypeOfAny.from_omitted_generics, line=t.line, column=t.column)
+        if tag == _UNBOUND_SPECIAL_TAG_CLASSVAR_DEFER:
+            if self.nesting_level > 0:
+                self.fail(
+                    "Invalid type: ClassVar nested inside other type", t, code=codes.VALID_TYPE
+                )
+            if self.prohibit_special_class_field_types:
+                self.fail(
+                    f"ClassVar[...] can't be used inside a {self.prohibit_special_class_field_types}",
+                    t,
+                    code=codes.VALID_TYPE,
+                )
+            if self.defining_alias:
+                self.fail(
+                    "ClassVar[...] can't be used inside a type alias", t, code=codes.VALID_TYPE
+                )
+            if len(t.args) != 1:
+                self.fail(
+                    "ClassVar[...] must have at most one type argument", t, code=codes.VALID_TYPE
+                )
+                return AnyType(TypeOfAny.from_error)
+            return self.anal_type(t.args[0], allow_final=self.options.python_version >= (3, 13))
+        if tag == _UNBOUND_SPECIAL_TAG_ANNOTATED_ARG_ERR:
+            self.fail(
+                "Annotated[...] must have exactly one type argument"
+                " and at least one annotation",
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_ANNOTATED_DEFER:
+            return self.anal_type(
+                t.args[0], allow_typed_dict_special_forms=self.allow_typed_dict_special_forms
+            )
+        if tag == _UNBOUND_SPECIAL_TAG_REQUIRED_BAD_CTX:
+            self.fail(
+                "Required[] can be only used in a TypedDict definition",
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_REQUIRED_ARG_ERR:
+            self.fail("Required[] must have exactly one type argument", t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_REQUIRED_DEFER:
+            return RequiredType(
+                self.anal_type(t.args[0], allow_typed_dict_special_forms=True), required=True
+            )
+        if tag == _UNBOUND_SPECIAL_TAG_NOTREQUIRED_BAD_CTX:
+            self.fail(
+                "NotRequired[] can be only used in a TypedDict definition",
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_NOTREQUIRED_ARG_ERR:
+            self.fail(
+                "NotRequired[] must have exactly one type argument", t, code=codes.VALID_TYPE
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_NOTREQUIRED_DEFER:
+            return RequiredType(
+                self.anal_type(t.args[0], allow_typed_dict_special_forms=True), required=False
+            )
+        if tag == _UNBOUND_SPECIAL_TAG_READONLY_BAD_CTX:
+            self.fail(
+                "ReadOnly[] can be only used in a TypedDict definition",
+                t,
+                code=codes.VALID_TYPE,
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_READONLY_ARG_ERR:
+            self.fail(
+                '"ReadOnly[]" must have exactly one type argument', t, code=codes.VALID_TYPE
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_READONLY_DEFER:
+            return ReadOnlyType(self.anal_type(t.args[0], allow_typed_dict_special_forms=True))
+        raise AssertionError(f"unknown special unbound tag {tag}")
 
     def get_omitted_any(self, typ: Type, fullname: str | None = None) -> AnyType:
         disallow_any = not self.is_typeshed_stub and self.options.disallow_any_generics
@@ -2979,19 +3229,20 @@ try:
     )
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
+        rust_check_vec_type_args as _rust_check_vec_type_args,
+        rust_classify_special_unbound as _rust_classify_special_unbound,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
+        rust_detect_diverging_alias as _rust_detect_diverging_alias,
+        rust_find_self_type as _rust_find_self_type,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
         rust_has_explicit_any as _rust_has_explicit_any,
+        rust_instantiate_type_alias as _rust_instantiate_type_alias,
+        rust_is_typevar_default_recursive as _rust_is_typevar_default_recursive,
         rust_make_optional_type as _rust_make_optional_type,
         rust_type_analyze as _rust_type_analyze,
         rust_unknown_unpack as _rust_unknown_unpack,
         rust_validate_instance as _rust_validate_instance,
-        rust_detect_diverging_alias as _rust_detect_diverging_alias,
-        rust_find_self_type as _rust_find_self_type,
-        rust_check_vec_type_args as _rust_check_vec_type_args,
-        rust_is_typevar_default_recursive as _rust_is_typevar_default_recursive,
-        rust_instantiate_type_alias as _rust_instantiate_type_alias,
     )
 
     from mypy.types import read_type as _typeanal_read_type
@@ -3013,6 +3264,7 @@ except ImportError:
     _rust_instantiate_type_alias = None  # type: ignore[assignment]
     _rust_analyze_unbound_without_info = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
+    _rust_classify_special_unbound = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -3067,6 +3319,42 @@ _UNBOUND_FRONT_KIND_PARAM_SPEC = 2
 _UNBOUND_FRONT_KIND_TYPE_VAR = 3
 _UNBOUND_FRONT_KIND_TYPE_VAR_TUPLE = 4
 _UNBOUND_FRONT_KIND_OTHER = 5
+
+# Branch tags for `try_analyze_special_unbound_type` (issue #720).
+# Mirrored in crates/type_kernel/src/typeanal_special.rs; Python applies
+# the side effect + result construction for the tag Rust returns. Deferred
+# branches (tag None) keep the full pure-Python body.
+_UNBOUND_SPECIAL_TAG_NONE_TYPE = 2
+_UNBOUND_SPECIAL_TAG_ANY = 3
+_UNBOUND_SPECIAL_TAG_NEVER = 4
+_UNBOUND_SPECIAL_TAG_FINAL_ERROR = 5
+_UNBOUND_SPECIAL_TAG_TUPLE_LOOKUP_DEFER = 6
+_UNBOUND_SPECIAL_TAG_TUPLE_BARE = 7
+_UNBOUND_SPECIAL_TAG_TUPLE_ELLIPSIS = 8
+_UNBOUND_SPECIAL_TAG_TUPLE_FULL_DEFER = 9
+_UNBOUND_SPECIAL_TAG_UNION_DEFER = 11
+_UNBOUND_SPECIAL_TAG_OPTIONAL_ARG_ERR = 12
+_UNBOUND_SPECIAL_TAG_OPTIONAL_DEFER = 13
+_UNBOUND_SPECIAL_TAG_CALLABLE_DEFER = 14
+_UNBOUND_SPECIAL_TAG_TYPE_BARE_ANY = 15
+_UNBOUND_SPECIAL_TAG_TYPE_BARE_NONE = 16
+_UNBOUND_SPECIAL_TAG_TYPE_ONE_ARG = 17
+_UNBOUND_SPECIAL_TAG_TYPE_ARG_ERR = 18
+_UNBOUND_SPECIAL_TAG_TYPEFORM_BARE = 19
+_UNBOUND_SPECIAL_TAG_TYPEFORM_DEFER = 20
+_UNBOUND_SPECIAL_TAG_CLASSVAR_ZERO = 21
+_UNBOUND_SPECIAL_TAG_CLASSVAR_DEFER = 22
+_UNBOUND_SPECIAL_TAG_ANNOTATED_ARG_ERR = 23
+_UNBOUND_SPECIAL_TAG_ANNOTATED_DEFER = 24
+_UNBOUND_SPECIAL_TAG_REQUIRED_BAD_CTX = 25
+_UNBOUND_SPECIAL_TAG_REQUIRED_ARG_ERR = 26
+_UNBOUND_SPECIAL_TAG_REQUIRED_DEFER = 27
+_UNBOUND_SPECIAL_TAG_NOTREQUIRED_BAD_CTX = 28
+_UNBOUND_SPECIAL_TAG_NOTREQUIRED_ARG_ERR = 29
+_UNBOUND_SPECIAL_TAG_NOTREQUIRED_DEFER = 30
+_UNBOUND_SPECIAL_TAG_READONLY_BAD_CTX = 31
+_UNBOUND_SPECIAL_TAG_READONLY_ARG_ERR = 32
+_UNBOUND_SPECIAL_TAG_READONLY_DEFER = 33
 
 
 def native_analyze_type(

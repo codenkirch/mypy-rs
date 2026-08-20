@@ -126,6 +126,7 @@ mod traverser;
 mod treetransform;
 mod typealias_instantiate;
 mod typeanal_queries;
+mod typeanal_special;
 mod typeanal_unbound;
 mod typeanal_unbound2;
 mod typeinfo;
@@ -1425,6 +1426,16 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // effects and builds the result objects. None defers to pure Python.
     module.add_function(wrap_pyfunction!(
         typeanal_unbound2::rust_classify_unbound_front,
+        module
+    )?)?;
+    // try_analyze_special_unbound_type: the special-form dispatch classifier
+    // (builtins.None / Any / Final / Tuple / Union / Optional / Callable /
+    // Type / TypeForm / ClassVar / Never / Annotated / Required /
+    // NotRequired / ReadOnly). Rust returns a branch tag from scalar facts;
+    // Python applies the side effects and builds the result objects. None
+    // defers to pure Python for the branches needing recursive analysis.
+    module.add_function(wrap_pyfunction!(
+        typeanal_special::rust_classify_special_unbound,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types

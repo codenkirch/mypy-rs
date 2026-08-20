@@ -364,6 +364,30 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
   result string, error messages, and defer / record counts), plus pure
   decision unit tests in `typeanal_unbound2.rs`.
+- `rust_classify_special_unbound` (issue #720) — mirrors the special-form
+  dispatch classifier of
+  `mypy.typeanal.TypeAnalyser.try_analyze_special_unbound_type`
+  (typeanal.py:987-1199, the `builtins.None` / `Any` / `Final` / `Tuple` /
+  `Union` / `Optional` / `Callable` / `Type` / `TypeForm` / `ClassVar` /
+  `Never` / `Annotated` / `Required` / `NotRequired` / `ReadOnly`
+  elif-chain): Rust decides the branch from scalar facts (fullname + arity
+  + `empty_tuple_index` + `allow_typed_dict_special_forms` + the
+  `not_in_*` flags + the Tuple lookup / ellipsis-form flags), returning a
+  branch tag; the Python shim applies the side effects (fail / note /
+  `record_incomplete_ref`) and rebuilds the result objects. Branches the
+  classifier cannot decide purely (`Literal`, `TypeGuard`, `Unpack`,
+  `Self`, the non-special tail, and every gold path that recurses) defer
+  (`None`) to the pure-Python body. Order of checks matches the original:
+  `Union` has no arity check (collapses via `make_union`), bare
+  `typing.Type` builds `TypeType(Any)` while bare `builtins.type` returns
+  `None` (#9476), `ClassVar` runs its nesting / TypedDict-prohibit / alias
+  checks before the arg-count dispatch, and the Required/NotRequired/
+  ReadOnly bad-context check runs before their arity check. Gated by
+  `_set_native_typeanal_active` (wired from `mypy/build.py`) and covered by
+  `NativeTryAnalyzeSpecialUnboundSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential on the result string and captured
+  fail/note messages, plus a direct seam call proving engagement from the
+  scalar facts), and pure decision unit tests in `typeanal_special.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
