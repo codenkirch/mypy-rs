@@ -68,6 +68,16 @@ pub(crate) struct SubtypeContext {
     pub ignore_promotions: bool,
     pub proper_subtype: bool,
     pub strict_optional: bool,
+    /// `SubtypeContext.ignore_pos_arg_names` (subtypes.py:192): when true,
+    /// positional-argument names are not required to match in callable
+    /// compatibility. Read by the callable_compat engine (Stage C1).
+    pub ignore_pos_arg_names: bool,
+    /// `strict_concatenate` for the callable_compat engine: Python computes
+    /// it as `options.extra_checks or options.strict_concatenate` at the
+    /// subtype call site (subtypes.py:944-947) and passes it explicitly;
+    /// stored on the context so the `visit_callable_type` port can forward
+    /// it to the native engine without an options lookup.
+    pub strict_concatenate: bool,
 }
 
 impl SubtypeContext {
@@ -79,6 +89,32 @@ impl SubtypeContext {
         proper_subtype: bool,
         strict_optional: bool,
     ) -> Self {
+        Self::with_callable_flags(
+            ignore_type_params,
+            ignore_declared_variance,
+            always_covariant,
+            ignore_promotions,
+            proper_subtype,
+            strict_optional,
+            false, // ignore_pos_arg_names
+            false, // strict_concatenate
+        )
+    }
+
+    /// Full constructor including the callable-compat flags. `new` keeps the
+    /// historical 6-arg shape (the callable flags default to False) and every
+    /// pre-C1 call site is unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_callable_flags(
+        ignore_type_params: bool,
+        ignore_declared_variance: bool,
+        always_covariant: bool,
+        ignore_promotions: bool,
+        proper_subtype: bool,
+        strict_optional: bool,
+        ignore_pos_arg_names: bool,
+        strict_concatenate: bool,
+    ) -> Self {
         Self {
             ignore_type_params,
             ignore_declared_variance,
@@ -86,6 +122,8 @@ impl SubtypeContext {
             ignore_promotions,
             proper_subtype,
             strict_optional,
+            ignore_pos_arg_names,
+            strict_concatenate,
         }
     }
 }
@@ -635,10 +673,21 @@ pub(crate) fn is_subtype(
     {
         // right is Overloaded (subtypes.py:866-867): left must be a subtype
         // of every overload item. Each recursion is CallableType-vs-
-        // CallableType, which the callable_compat engine handles (not
-        // this function), so each item defers; defer the whole check.
+        // CallableType, which the callable_compat engine handles below, so
+        // the whole check is answerable natively (C1). Defer only if an
+        // item recursion defers (wire-unsupported shape).
         if matches!(right, Type::Overloaded { .. }) {
-            return None;
+            let Type::Overloaded { items } = right else {
+                return None;
+            };
+            for item in items {
+                match is_subtype(left, item, ctx, resolver) {
+                    Some(false) => return Some(false),
+                    None => return None,
+                    Some(true) => {}
+                }
+            }
+            return Some(true);
         }
         // right is Instance (subtypes.py:868-884). Protocol Instance with
         // "__call__" in protocol_members needs find_member and
@@ -692,14 +741,31 @@ pub(crate) fn is_subtype(
             // fallback.is_metaclass() historic path. Defer to Python.
             return None;
         }
-        // right is anything else (subtypes.py:888-889): False.
-        // Note: CallableType-vs-CallableType is handled by callable_compat,
-        // not here; if we reach this point with right=CallableType it
-        // means the Python shim's callable_compat gate returned None and
-        // fell through to the visitor, which then calls is_callable_compatible
-        // (Python-only). Defer that case too.
-        if matches!(right, Type::CallableType { .. }) {
-            return None;
+        // right is CallableType (C1): route into the native callable_compat
+        // engine (subtypes.py:909-965). The engine mirrors the Python
+        // `is_callable_compatible` including the pre-checks for
+        // type_guard/type_is incompatibility (defers on wire-unsupported
+        // forms: Parameters, generic left with variables, unpack, resolver
+        // misses on the type-obj check, and any nested is_subtype that
+        // returns None). The flags the visitor passes (`ignore_pos_arg_names`
+        // from the SubtypeContext, `strict_concatenate` from extra_checks/
+        // strict_concatenate, proper_subtype, strict_optional) come from
+        // this context; `ignore_return = False`, `check_args_covariantly =
+        // False`, and `allow_partial_overlap = False`, matching the
+        // `visit_callable_type` call site.
+        if let Type::CallableType { .. } = right {
+            let res = crate::callable_compat::callables_compatible(
+                left,
+                right,
+                ctx.ignore_pos_arg_names,
+                ctx.strict_concatenate,
+                ctx,
+                resolver,
+            );
+            // The engine already incorporates any nested subtype checks
+            // through the `is_compat` closure; `None` means it could not
+            // decide (all-or-nothing), so defer the whole comparison.
+            return res;
         }
         return Some(false);
     }
@@ -1868,17 +1934,21 @@ pub(crate) fn rust_is_subtype(
     ignore_promotions: bool,
     proper_subtype: bool,
     strict_optional: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
-    let ctx = SubtypeContext::new(
+    let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
         always_covariant,
         ignore_promotions,
         proper_subtype,
         strict_optional,
+        ignore_pos_arg_names,
+        strict_concatenate,
     );
     is_subtype(&left, &right, &ctx, resolver.resolver())
 }
