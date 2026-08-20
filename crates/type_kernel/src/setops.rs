@@ -334,10 +334,11 @@ fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
 ///   * visit_deleted_type (meet.py:864-873): s is NoneType ->
 ///     SameS (strict) / SameT (non-strict); s is UninhabitedType ->
 ///     SameS; else SameT.
-///   * visit_instance (meet.py:913-996), args-less nominal only:
-///     same type_ref -> SameS (equal, no args to combine); different
-///     type_ref with is_subtype(t, s) -> SameT; is_subtype(s, t) ->
-///     SameS; else Bottom. Args / alt_promote / protocol defers.
+///   * visit_instance (meet.py:913-996): same type_ref, args-less ->
+///     SameS (equal); same type_ref with args -> per-arg meet combined
+///     into a new Instance (encoded); different type_ref with
+///     is_subtype(t, s) -> SameT; is_subtype(s, t) -> SameS; else
+///     Bottom. Variadic / alt_promote / protocol defers.
 ///
 /// Returns `None` (defer to Python) for:
 /// - `is_recursive_pair` (checked in Python before the Rust call).
@@ -352,7 +353,8 @@ fn flip_if(r: SetOpResult, swapped: bool) -> SetOpResult {
 /// - TypedDictType/TupleType/TypeType/LiteralType right: produce a new
 ///   type or need live TypeInfo (alt_promote, is_metaclass, etc.) ->
 ///   defer.
-/// - Instance right with args: needs arg combination -> defer.
+/// - Instance right with args when the per-arg meet defers (variadic,
+///   ParamSpec/TypeVarTuple tv, arity mismatch, is_subtype gate).
 ///
 /// The Python shim is responsible for `get_proper_type` expansion
 /// BEFORE calling this, matching `meet.py:120-121`.
@@ -686,58 +688,7 @@ fn meet_union(
     for s_item in s_items {
         for t_item in t_items {
             let m = meet_types(s_item, t_item, ctx, resolver)?;
-            // Convert the SetOpResult discriminator to an actual Type
-            let meet_type = match m {
-                SetOpResult::SameS => s_item.clone(),
-                SetOpResult::SameT => t_item.clone(),
-                SetOpResult::Bottom => Type::UninhabitedType { ambiguous: true },
-                SetOpResult::Any => Type::AnyType {
-                    type_of_any: 3,
-                    source_any: None,
-                    missing_import_name: None,
-                },
-                SetOpResult::Object => Type::Instance {
-                    type_ref: "builtins.object".into(),
-                    args: Vec::new(),
-                    last_known_value: None,
-                    extra_attrs: None,
-                },
-                SetOpResult::Ancestor(fullname) => Type::Instance {
-                    type_ref: fullname,
-                    args: Vec::new(),
-                    last_known_value: None,
-                    extra_attrs: None,
-                },
-                SetOpResult::SameTypeWithArgs {
-                    type_ref,
-                    arg_discs,
-                } => {
-                    // Build Instance(type_ref, reconstructed args). disc 0
-                    // -> s.args[i], disc 1 -> t.args[i], disc 4 -> Any.
-                    // The operands must be Instances to index args; defer
-                    // otherwise (mirrors join.py:422-423).
-                    let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) =
-                        (s_item, t_item)
-                    else {
-                        return None;
-                    };
-                    if arg_discs.len() != s_args.len() || arg_discs.len() != t_args.len() {
-                        return None;
-                    }
-                    let args = reconstruct_args_from_discs(&arg_discs, s_args, t_args);
-                    Type::Instance {
-                        type_ref,
-                        args,
-                        last_known_value: None,
-                        extra_attrs: None,
-                    }
-                }
-                SetOpResult::Encoded(bytes) => {
-                    // Decode the encoded type
-                    decode_type(&bytes)?
-                }
-            };
-            meets.push(meet_type);
+            meets.push(fruit_to_type(m, s_item, t_item)?);
         }
     }
 
@@ -749,6 +700,60 @@ fn meet_union(
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, &joined).ok()?;
     Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
+/// Convert a per-item `SetOpResult` from `meet_types`/`join_types` into
+/// the concrete `Type` it denotes, relative to the `s_item`/`t_item`
+/// operands. Shared by `meet_union` and `visit_instance_meet_args`.
+///
+/// `SameTypeWithArgs` builds `Instance(type_ref, reconstructed args)`
+/// (disc 0 -> s.args[i], 1 -> t.args[i], 4 -> Any); the operands must
+/// be Instances with matching arity, else `None` (mirrors
+/// join.py:422-423). `Encoded` decodes back to the `Type`.
+fn fruit_to_type(m: SetOpResult, s_item: &Type, t_item: &Type) -> Option<Type> {
+    Some(match m {
+        SetOpResult::SameS => s_item.clone(),
+        SetOpResult::SameT => t_item.clone(),
+        SetOpResult::Bottom => Type::UninhabitedType { ambiguous: true },
+        SetOpResult::Any => Type::AnyType {
+            type_of_any: 3,
+            source_any: None,
+            missing_import_name: None,
+        },
+        SetOpResult::Object => Type::Instance {
+            type_ref: "builtins.object".into(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        },
+        SetOpResult::Ancestor(fullname) => Type::Instance {
+            type_ref: fullname,
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        },
+        SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        } => {
+            let (Type::Instance { args: s_args, .. }, Type::Instance { args: t_args, .. }) =
+                (s_item, t_item)
+            else {
+                return None;
+            };
+            if arg_discs.len() != s_args.len() || arg_discs.len() != t_args.len() {
+                return None;
+            }
+            let args = reconstruct_args_from_discs(&arg_discs, s_args, t_args);
+            Type::Instance {
+                type_ref,
+                args,
+                last_known_value: None,
+                extra_attrs: None,
+            }
+        }
+        SetOpResult::Encoded(bytes) => decode_type(&bytes)?,
+    })
 }
 
 /// Reconstruct args from per-arg discriminators for SameTypeWithArgs.
@@ -924,22 +929,24 @@ fn meet_similar_callables_impl(
     encode_callable(new_callable)
 }
 
-/// `TypeMeetVisitor.visit_instance` (meet.py:913-996), args-less
-/// nominal subset. Mirrors `visit_instance_join` but for meet.
+/// `TypeMeetVisitor.visit_instance` (meet.py:913-996), Rust subset.
+/// Mirrors `visit_instance_join` but for meet.
 ///
 /// Handles:
-/// - Same type_ref, both args-less -> SameS (equal).
-/// - Different type_ref, args-less: `is_subtype(t, s)` -> SameT;
-///   `is_subtype(s, t)` -> SameS; else Bottom.
+/// - Same type_ref, args-less -> SameS (equal).
+/// - Same type_ref with args -> `visit_instance_meet_args`: per-arg
+///   `meet_types(ta, sa)` combined into a new Instance (encoded).
+/// - Different type_ref (args present or not): `is_subtype(t, s)` ->
+///   SameT; `is_subtype(s, t)` -> SameS; else Bottom. The Python
+///   different-type branch (meet.py:1086-1101) never combines args,
+///   so args on either side need no special handling here.
 ///
 /// Defers (returns `None`) for:
 /// - s not Instance (FunctionLike/TypeType/Tuple/Literal/TypedDict
 ///   branches recurse into meet_types(t, self.s) or default).
-/// - Same type_ref with args: combines args via meet -> produces a new
-///   Instance -> defer (no Type encoder).
-/// - Different type_ref with args: needs map_instance_to_supertype +
-///   arg combination -> defer.
-/// - `alt_promote` (meet.py:964-969): snapshot has no alt_promote
+/// - Same type_ref with args when `visit_instance_meet_args` defers
+///   (is_subtype gate / per-arg meet / variadic / arity mismatch).
+/// - `alt_promote` (meet.py:1086-1091): snapshot has no alt_promote
 ///   field. For args-less Instance-Instance, the is_subtype check
 ///   covers the common case; alt_promote fires for mypyc native ints
 ///   (i64, i32) which the parity suite (TypeFixture) does not set.
@@ -961,7 +968,7 @@ fn visit_instance_meet(
         _ => return None,
     };
 
-    // meet.py:914-957: t.type == self.s.type -> combine args.
+    // meet.py:1035-1037: t.type == self.s.type -> combine args.
     if t_ref == s_ref {
         if s_args.is_empty() && t_args.is_empty() {
             // Equal args-less Instances -> meet is the type itself.
@@ -970,14 +977,8 @@ fn visit_instance_meet(
             // returns there before reaching this visitor.)
             return Some(SetOpResult::SameS);
         }
-        // Same type with args: needs arg combination -> defer.
-        return None;
-    }
-
-    // Different types with args: needs map_instance_to_supertype ->
-    // defer.
-    if !s_args.is_empty() || !t_args.is_empty() {
-        return None;
+        // Same type with args: per-arg meet combination.
+        return visit_instance_meet_args(s, t, ctx, resolver);
     }
 
     // meet.py:1024-1029: alt_promote check BEFORE is_subtype. Python
@@ -1018,6 +1019,107 @@ fn visit_instance_meet(
     }
 }
 
+/// Same-type-with-args branch of `TypeMeetVisitor.visit_instance`
+/// (meet.py:1035-1079), Rust subset.
+///
+/// Python's flow:
+/// 1. `is_subtype(t, s) or is_subtype(s, t)` gate (meet.py:1038);
+///    both False -> UninhabitedType (strict) / NoneType (non-strict).
+/// 2. Variadic instances (`has_type_var_tuple_type`) need
+///    `split_with_prefix_and_suffix` + `TupleType` wrapping
+///    (meet.py:1044-1063) -> defer; snapshot can't rebuild the
+///    tuple fallback.
+/// 3. Per-arg `self.meet(ta, sa)` (meet.py:1067-1078). A `TupleType`
+///    meet result for a TypeVarTupleType arg unpacks into multiple
+///    args (meet.py:1072-1074); a TypeVarTupleType tv whose arg meet is
+///    UninhabitedType wraps `UnpackType(tv.tuple_fallback[meet])`
+///    (meet.py:1076-1077) -> both defer (snapshot has no
+///    `tuple_fallback`).
+/// 4. Python zips (tolerates arg-count mismatch during daemon
+///    reprocessing); Rust requires equal arity.
+///
+/// The final `Instance(t.type, args)` is written via the wire format
+/// (disc=7) and decoded back by the Python shim via `read_type` +
+/// fixup, so type_ref strings resolve to live TypeInfo there.
+fn visit_instance_meet_args(
+    s: &Type,
+    t: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let (
+        Type::Instance {
+            type_ref,
+            args: s_args,
+            ..
+        },
+        Type::Instance { args: t_args, .. },
+    ) = (s, t)
+    else {
+        return None;
+    };
+
+    let snap = resolver.get(type_ref)?;
+    // Variadic instances need split_with_prefix_and_suffix +
+    // TupleType wrapping (meet.py:1044-1063) — defer.
+    if snap.has_type_var_tuple_type {
+        return None;
+    }
+    // Python zips t.args, s.args, type_vars; mismatched lengths during
+    // daemon reprocessing tolerate the zip. Rust requires equal arity.
+    let tvars_len = snap.type_vars_with_variance.len();
+    if s_args.len() != t_args.len() || s_args.len() != tvars_len {
+        return None;
+    }
+
+    // meet.py:1038: gate on is_subtype(t, s) or is_subtype(s, t), with
+    // Python's `or` short-circuit: t<:s is evaluated first; s<:t only
+    // when the first is False. Both False -> Bottom (the shim maps disc
+    // 3 to UninhabitedType (strict) / NoneType (non-strict), matching
+    // meet.py:1081-1084). Any deferral -> defer the whole meet.
+    let gate_ok = match is_subtype(t, s, ctx, resolver) {
+        Some(true) => true,
+        Some(false) => match is_subtype(s, t, ctx, resolver) {
+            Some(true) => true,
+            Some(false) => false,
+            None => return None,
+        },
+        None => return None,
+    };
+    if !gate_ok {
+        return Some(SetOpResult::Bottom);
+    }
+
+    // meet.py:1067-1078: per-arg meets. A TypeVarTupleType tv can't be
+    // handled: the TupleType-unpack / UnpackType-wrap branches need the
+    // live `tuple_fallback`, and a mismatched zip would double-count.
+    // Defer if any tv is a TypeVarTupleType or ParamSpec (kind 2/1).
+    if snap
+        .type_vars_with_variance
+        .iter()
+        .any(|(_, _, kind)| *kind == 1 || *kind == 2)
+    {
+        return None;
+    }
+
+    let mut args_out: Vec<Type> = Vec::with_capacity(t_args.len());
+    for (ta, sa) in t_args.iter().zip(s_args.iter()) {
+        let r = meet_types(ta, sa, ctx, resolver)?;
+        let typ = fruit_to_type(r, ta, sa)?;
+        args_out.push(typ);
+    }
+
+    let result = Type::Instance {
+        type_ref: type_ref.to_string(),
+        args: args_out,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, &result).ok()?;
+    Some(SetOpResult::Encoded(wbuf.into_bytes()))
+}
+
 /// Map a `SetOpResult` to the `Type` it denotes, given the `s`/`t`
 /// operands. Used by visitors that need to feed the recursive result
 /// into a new type (e.g. `visit_type_type` case 1 wraps the joined
@@ -1034,6 +1136,9 @@ fn visit_instance_meet(
 /// of `object_or_any_from_type` for Instance right; `visit_type_type`
 /// recurses on `t.item`/`s.item` which are always Instance, so the
 /// Object result is always `builtins.object`).
+///
+/// `Encoded` decodes back to the `Type` (the wire format already
+/// rejects un-encodable variants, so a failed decode defers).
 fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Type> {
     match r? {
         SetOpResult::SameS => Some(s.clone()),
@@ -1084,7 +1189,8 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
         // pick from s vs t); the visitor callers above
         // visit_type_type only recurse on args-less Instance items,
         // so this arm is unreachable in practice. Defer conservatively.
-        SetOpResult::SameTypeWithArgs { .. } | SetOpResult::Encoded(_) => None,
+        SetOpResult::SameTypeWithArgs { .. } => None,
+        SetOpResult::Encoded(bytes) => decode_type(&bytes),
     }
     .filter(|typ| {
         // Only return types the encoder can write. Other variants
@@ -6744,27 +6850,47 @@ mod tests {
     }
 
     #[test]
-    fn meet_types_instance_with_args_same_type_defers() {
-        // visit_instance same type_ref with args -> combine args
-        // (produces new Instance with meet args) -> defer (no encoder).
-        let r = make_resolver(vec![snap("a.A", "A")]);
-        let s = instance("a.A", vec![instance("builtins.int", vec![])]);
-        let t = instance("a.A", vec![instance("builtins.str", vec![])]);
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    fn meet_types_instance_with_args_same_type_promote_encodes() {
+        // visit_instance same type_ref with args -> per-arg meet.
+        // G[i64] meet G[int] with covariant T: the outer proper-subtype
+        // pre-check (ignore_promotions) misses (i64 !<: int properly),
+        // the non-proper gate passes via i64's promote to int, and the
+        // per-arg meet_types(int, i64) -> i64 <: int via promote ->
+        // returns i64. Result: G[i64] encoded (disc=7).
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        let mut i64 = snap("a.i64", "i64");
+        i64.promote_bytes = vec![crate::wire::encode_instance_simple_for_test("builtins.int")];
+        let int_snap = snap("builtins.int", "int");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, i64, int_snap, o]);
+        let s = instance("g.G", vec![instance("a.i64", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.int", vec![])]);
+        match meet_types(&s, &t, &ctx(true), &r) {
+            Some(SetOpResult::Encoded(bytes)) => {
+                let decoded = decode_type(&bytes).unwrap();
+                assert_eq!(decoded, instance("g.G", vec![instance("a.i64", vec![])]));
+            }
+            other => panic!("expected Encoded, got {:?}", other),
+        }
     }
 
     #[test]
-    fn meet_types_instance_with_args_different_subtype_defers() {
-        // visit_instance different types with args -> needs
-        // map_instance_to_supertype + arg combination -> defer.
-        let mut a = snap("a.A", "A");
-        a.has_base.insert("a.B".to_string());
-        a.mro.push("a.B".to_string());
-        let b = snap("a.B", "B");
-        let r = make_resolver(vec![a, b]);
-        let s = instance("a.B", vec![instance("builtins.int", vec![])]);
-        let t = instance("a.A", vec![instance("builtins.int", vec![])]);
-        assert_eq!(meet_types(&s, &t, &ctx(true), &r), None);
+    fn meet_types_instance_with_args_unrelated_bottom() {
+        // visit_instance same type_ref with args, gate fails both ways
+        // (invariant T, int/str unrelated). meet.py:1081-1084 ->
+        // Bottom (shim maps disc 3 to UninhabitedType / NoneType).
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), INVARIANT, 0)];
+        let int_snap = snap("builtins.int", "int");
+        let str_snap = snap("builtins.str", "str");
+        let r = make_resolver(vec![g, int_snap, str_snap]);
+        let s = instance("g.G", vec![instance("builtins.int", vec![])]);
+        let t = instance("g.G", vec![instance("builtins.str", vec![])]);
+        assert_eq!(
+            meet_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Bottom)
+        );
     }
 
     #[test]
