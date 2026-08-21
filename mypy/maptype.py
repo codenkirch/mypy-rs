@@ -125,10 +125,11 @@ def _native_map_instance_to_supertype(
         )
         if result is None:
             return None
-        decoded = read_type(_ReadBuffer(bytes(result)))
+        raw = bytes(result)
+        decoded = read_type(_ReadBuffer(raw))
         from mypy.wirefixup import fixup_wire_type
 
-        fixed = fixup_wire_type(decoded)
+        fixed = fixup_wire_type(decoded, raw)
         if isinstance(fixed, Instance):  # type: ignore[misc]
             # The wire format does not carry line/column; decoded types
             # default to line -1. Preserve the input location so derived

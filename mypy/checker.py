@@ -791,7 +791,7 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     """
     from mypy.wirefixup import fixup_wire_type
 
-    t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
+    t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)), b)
     assert t is not None, "checker wire decode produced unresolvable type_ref"
     return t
 

@@ -170,7 +170,7 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    return fixup_wire_type(decoded, data)
 
 
 # Flags for detected protocol members

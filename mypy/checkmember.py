@@ -232,7 +232,7 @@ def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    fixed = fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded, data)
     if fixed is not None:
         # Wire round-trip loses fresh meta-var identity; re-unify
         # occurrences before returning (mirrors expandtype.py:463-467).

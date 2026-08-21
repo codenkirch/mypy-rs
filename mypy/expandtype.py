@@ -273,10 +273,11 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 state.strict_optional,
             )
             if result is not None:
-                decoded = read_type(_ReadBuffer(bytes(result)))
+                raw = bytes(result)
+                decoded = read_type(_ReadBuffer(raw))
                 from mypy.wirefixup import fixup_wire_type
 
-                fixed = fixup_wire_type(decoded)
+                fixed = fixup_wire_type(decoded, raw)
                 # The wire format does not carry line/column; decoded
                 # types default to line -1. Preserve the input type's
                 # location so derived contexts (e.g. plugin
@@ -344,10 +345,11 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                     state.strict_optional,
                 )
                 if result is not None:
-                    decoded = read_type(_ReadBuffer(bytes(result)))
+                    raw = bytes(result)
+                    decoded = read_type(_ReadBuffer(raw))
                     from mypy.wirefixup import fixup_wire_type
 
-                    fixed = fixup_wire_type(decoded)
+                    fixed = fixup_wire_type(decoded, raw)
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
@@ -466,10 +468,11 @@ def freshen_all_functions_type_vars(t: T) -> T:
                     next_raw_id, changed, serialized = call
                     if changed:
                         TypeVarId.next_raw_id = next_raw_id
-                        decoded = read_type(_ReadBuffer(bytes(serialized)))
+                        raw = bytes(serialized)
+                        decoded = read_type(_ReadBuffer(raw))
                         from mypy.wirefixup import fixup_wire_type
 
-                        fixed = fixup_wire_type(decoded)
+                        fixed = fixup_wire_type(decoded, raw)
                         # The wire format has no line/column; decoded types
                         # default to -1. Preserve the input type's location so
                         # derived contexts report errors at the call site.

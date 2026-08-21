@@ -9596,6 +9596,174 @@ class NativeWireFixupSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFixupFastPathSuite(Suite):
+    """Parity tests for the rust_verify_type_refs fast path (Phase E1).
+
+    The Rust function scans wire-format Type bytes and checks that every
+    type_ref string resolves against the typeinfo_map. When it returns
+    True, the Python _TypeRefFixer walk is redundant (all refs resolve).
+    When it returns False, the Python walk is skipped (a ref is missing).
+    These tests verify the ref-verification logic in isolation.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture(INVARIANT)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _typeinfo_fullnames(self) -> list[str]:
+        names = []
+        for name in dir(self.fx):
+            if name.endswith("i"):
+                value = getattr(self.fx, name)
+                if _is_type_info(value):
+                    names.append(value.fullname)
+        return names
+
+    def test_instance_all_refs_present(self) -> None:
+        b = self._bytes_of(self.fx.b)
+        valid = self._typeinfo_fullnames()
+        assert _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_instance_missing_ref(self) -> None:
+        b = self._bytes_of(self.fx.b)
+        # Empty valid set: the Instance's type_ref won't resolve.
+        assert not _type_kernel.rust_verify_type_refs(b, [])
+
+    def test_generic_instance_all_refs_present(self) -> None:
+        t = Instance(self.fx.std_listi, [self.fx.a])
+        b = self._bytes_of(t)
+        valid = self._typeinfo_fullnames()
+        assert _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_generic_instance_missing_arg_ref(self) -> None:
+        t = Instance(self.fx.std_listi, [self.fx.a])
+        b = self._bytes_of(t)
+        # Valid set has std_listi but not the arg's type_ref.
+        valid = [self.fx.std_listi.fullname]
+        assert not _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_callable_all_refs_present(self) -> None:
+        sig = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.a,
+            self.fx.function,
+        )
+        b = self._bytes_of(sig)
+        valid = self._typeinfo_fullnames()
+        assert _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_callable_missing_fallback_ref(self) -> None:
+        sig = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.a,
+            self.fx.function,
+        )
+        b = self._bytes_of(sig)
+        # Exclude function fallback from the valid set.
+        valid = [info.fullname for info in self._all_typeinfos()
+                 if not info.fullname.startswith("builtins.function")]
+        assert not _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_union_all_refs_present(self) -> None:
+        t = UnionType([self.fx.a, self.fx.b])
+        b = self._bytes_of(t)
+        valid = self._typeinfo_fullnames()
+        assert _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_union_missing_ref(self) -> None:
+        t = UnionType([self.fx.a, self.fx.b])
+        b = self._bytes_of(t)
+        # Only one of the two refs is valid.
+        valid = [self.fx.a.type.fullname]
+        assert not _type_kernel.rust_verify_type_refs(b, valid)
+
+    def test_none_type_no_refs_always_true(self) -> None:
+        b = self._bytes_of(NoneType())
+        assert _type_kernel.rust_verify_type_refs(b, [])
+
+    def test_bad_bytes_returns_false(self) -> None:
+        assert not _type_kernel.rust_verify_type_refs(b"\xff\x00\x42", [])
+
+    def test_empty_bytes_returns_false(self) -> None:
+        assert not _type_kernel.rust_verify_type_refs(b"", [])
+
+    def _all_typeinfos(self) -> list[Any]:
+        typeinfos = []
+        for name in dir(self.fx):
+            if name.endswith("i"):
+                value = getattr(self.fx, name)
+                if _is_type_info(value):
+                    typeinfos.append(value)
+        return typeinfos
+
+    def test_fast_path_matches_python_fixup(self) -> None:
+        """For a type whose refs all resolve, the fast path says True
+        and the Python fixup produces a clean result (no FakeInfo).
+        """
+        from mypy.wirefixup import (
+            _set_native_fixup_active,
+            check_no_fake_info,
+            fixup_wire_type,
+            set_wire_typeinfo_map,
+        )
+        from mypy.types import ReadBuffer, read_type
+
+        typeinfo_map = {info.fullname: info for info in self._all_typeinfos()}
+        set_wire_typeinfo_map(typeinfo_map)
+        _set_native_fixup_active(True)
+        try:
+            t = Instance(self.fx.std_listi, [self.fx.a])
+            b = self._bytes_of(t)
+            assert _type_kernel.rust_verify_type_refs(b, list(typeinfo_map))
+            decoded = read_type(ReadBuffer(b))
+            fixed = fixup_wire_type(decoded, b)
+            assert fixed is not None
+            assert check_no_fake_info(fixed)
+        finally:
+            _set_native_fixup_active(False)
+            set_wire_typeinfo_map(None)
+
+    def test_fast_path_missing_ref_defers_to_python(self) -> None:
+        """When a ref is missing from the typeinfo_map, the fast path
+        says False and fixup_wire_type returns None (defers to Python).
+        """
+        from mypy.wirefixup import (
+            _set_native_fixup_active,
+            fixup_wire_type,
+            set_wire_typeinfo_map,
+        )
+        from mypy.types import ReadBuffer, read_type
+
+        # Install a map that excludes std_listi so the outer ref is
+        # genuinely unresolvable.
+        all_infos = self._all_typeinfos()
+        typeinfo_map = {
+            info.fullname: info for info in all_infos
+            if info.fullname != self.fx.std_listi.fullname
+        }
+        set_wire_typeinfo_map(typeinfo_map)
+        _set_native_fixup_active(True)
+        try:
+            t = Instance(self.fx.std_listi, [self.fx.a])
+            b = self._bytes_of(t)
+            assert not _type_kernel.rust_verify_type_refs(b, list(typeinfo_map))
+            decoded = read_type(ReadBuffer(b))
+            fixed = fixup_wire_type(decoded, b)
+            assert fixed is None
+        finally:
+            _set_native_fixup_active(False)
+            set_wire_typeinfo_map(None)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTraverserSuite(Suite):
     """Parity suite for the native AST traverser (Stage 14, #304).
 

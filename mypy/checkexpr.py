@@ -560,7 +560,7 @@ def _deserialize_type_from_checkexpr(b: bytes) -> Type | None:
     """
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)))
+    return fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)), b)
 
 
 def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
