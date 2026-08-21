@@ -1117,13 +1117,6 @@ class BuildManager:
 
         _set_native_applytype_active(self.options.native_type_kernel)
         _set_native_typevars_active(self.options.native_type_kernel)
-        # Phase E1: gate the Rust verify_type_refs fast path in
-        # fixup_wire_type. When active, the Rust kernel pre-checks all
-        # type_ref strings against the typeinfo_map before the Python
-        # _TypeRefFixer walk; missing refs skip the walk entirely.
-        from mypy.wirefixup import _set_native_fixup_active
-
-        _set_native_fixup_active(self.options.native_type_kernel)
         # Stage 18 (M27): gate did-you-mean suggestion ranking and
         # formatting. Pure computation (no AST, no plugins), so no
         # resolver needed. Ports Ratcliff-Obershelp fuzzy matching.

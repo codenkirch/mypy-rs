@@ -44,8 +44,6 @@ import mypy.type_visitor  # ruff: isort: skip
 from mypy.type_visitor import TypeTranslator
 
 _wire_typeinfo_map: dict[str, Any] | None = None
-_native_fixup_active: bool = False
-_type_kernel: Any = None
 
 
 def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
@@ -54,38 +52,23 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
     _wire_typeinfo_map = typeinfo_map
 
 
-def _set_native_fixup_active(active: bool) -> None:
-    """Enable/disable the Rust verify_type_refs fast path."""
-    global _native_fixup_active, _type_kernel
-    _native_fixup_active = active
-    if active and _type_kernel is None:
-        try:
-            import type_kernel as _type_kernel  # noqa: F811
-        except ImportError:
-            _native_fixup_active = False
-
-
-def fixup_wire_type(typ: Type, raw_bytes: bytes | None = None) -> Type | None:
+def fixup_wire_type(typ: Type) -> Type | None:
     """Resolve type_ref strings in a wire-decoded Type to live TypeInfo.
 
     Returns None if the typeinfo map is unset or any Instance's type_ref
     is absent, so the caller can defer to Python.
-
-    When ``raw_bytes`` is provided and the native kernel is active, a
-    Rust ref-verification fast path runs first: if any type_ref is
-    missing, the Python ``_TypeRefFixer`` walk is skipped entirely.
     """
     if _wire_typeinfo_map is None:
+        # No typeinfo map (erasetype/typeops seam): cannot resolve
+        # NOT_READY singletons, so evict them; a poisoned cache Instance
+        # must never leak into the type graph via a later read_type.
         fixup_instance_cache()
         return None
-    if raw_bytes is not None and _native_fixup_active:
-        if not _type_kernel.rust_verify_type_refs(
-            raw_bytes, list(_wire_typeinfo_map)
-        ):
-            fixup_instance_cache()
-            return None
     fixer = _TypeRefFixer(_wire_typeinfo_map)
     result = typ.accept(fixer)
+    # Also fixup shared instance_cache singletons that read_type may
+    # have populated with NOT_READY instances: a failed fixup (returning
+    # None) must not leave NOT_READY singletons leaking into later calls.
     fixup_instance_cache()
     return None if fixer.missing else result
 
@@ -276,10 +259,11 @@ class _TypeRefFixer(TypeTranslator):
             type_guard=type_guard,
             type_is=type_is,
         )
-        # Wire format drops CallableType.definition (only used for error
-        # messages); re-link it so messages render `f(self)` and self-typevar
-        # solving sees the original argument. Match the containing class's
-        # symbol table by name + arity, mirroring fixup.py's FuncDef/OverloadedFuncDef linking.
+        # The wire format drops CallableType.definition (only used for
+        # error messages); re-link it so messages render `f(self)` and
+        # self-typevar solving sees the original argument. Match the
+        # containing class's symbol table by name + arity, mirroring
+        # fixup.py's FuncDef/OverloadedFuncDef linking.
         if result.definition is None and not self.missing:
             definition = self._match_definition(result)
             if definition is not None:
