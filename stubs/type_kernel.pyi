@@ -1759,9 +1759,9 @@ def rust_analyze_unbound_without_info(
 ) -> Any: ...
 def rust_any_causes_overload_ambiguity(
     resolver: NativeTypeResolver,
-    items_bytes: bytes,
-    return_types_bytes: bytes,
-    arg_types_bytes: bytes,
+    items_bytes: list[bytes],
+    return_types_bytes: list[bytes],
+    arg_types_bytes: list[bytes],
     arg_kinds: Any,
     arg_names: Any,
     strict_optional: bool,
@@ -1855,7 +1855,7 @@ def rust_classify_unbound_front(
     has_args: bool,
     alias_type_params_names: Any,
     tname: Any,
-    allow_type_var_tuple: bool,
+    allow_type_var_tuple: int,
     nesting_level: Any,
 ) -> Any: ...
 def rust_clean_up_bases(
