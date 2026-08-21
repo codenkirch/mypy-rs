@@ -332,6 +332,16 @@ The M17 benchmark (52.4% build-time reduction) is the current baseline.
 After Phase B (deferral reduction), re-run the self-check benchmark to
 measure the improvement. Target: 60%+ total reduction.
 
+Measured 2026-08-21 (after #737, fresh `type_kernel` release `.so`,
+cold cache, `-n0 --no-incremental -p mypy -p mypyc`): the 5x regression
+(#735) is resolved. Root cause: #727's `rust_verify_type_refs` fast
+path re-decoded wire bytes and rebuilt a full typeinfo-map HashSet on
+every `fixup_wire_type` call (`type_check_time` 107s -> 29s after
+revert). The remaining ~2.1x type-check gap vs Python (29s native vs
+14s pure) is the cumulative wire serialize/fixup overhead of the
+kernel-ported hot paths, not a single gate: toggling any one gate off
+kept type_check in the 94-253s range.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):
