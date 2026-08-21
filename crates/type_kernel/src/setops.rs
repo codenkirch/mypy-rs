@@ -3930,6 +3930,13 @@ fn join_instances_via_supertype(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<JoinResult> {
+    // Fast path: when right is builtins.object, the join is always
+    // object (everything is a subtype of object). This short-circuits
+    // the bases walk + recursion that would otherwise find object via
+    // every base path and hit the tie-breaker.
+    if right_ref == "builtins.object" {
+        return Some(JoinResult::Ancestor("builtins.object".to_string()));
+    }
     let left_snap = resolver.get(left_ref)?;
     let right_snap = resolver.get(right_ref);
 
@@ -4035,8 +4042,10 @@ fn join_instances_via_supertype(
             None => best = Some((mapped, mro)),
             Some((_, best_mro)) if mro > *best_mro => best = Some((mapped, mro)),
             // Tie: defer to Python. Python's is_better returns False on
-            // ties (keeping the first), but Python also has map_instance_to_supertype
-            // and the second promote loop that may change the result.
+            // ties (keeping the first), but Python also checks protocol
+            // status first (non-protocol beats protocol) and has
+            // map_instance_to_supertype + the second promote loop, none
+            // of which the Rust mro_len-only comparison replicates.
             // Deferring on ties avoids wrong answers on complex MROs.
             Some((_, best_mro)) if mro == *best_mro => return None,
             _ => {}
