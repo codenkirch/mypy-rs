@@ -428,6 +428,23 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 instance_cache.function_type = None
                 fixed = fixup_wire_type(decoded, raw)
                 if fixed is not None:
+                    # Rust-built callable joins (combine_similar_callables
+                    # / join_similar_callables) encode a fresh wire
+                    # CallableType that cannot carry `definition` (only
+                    # used for error messages; see wirefixup). The pure
+                    # Python path does `t.copy_modified(...)` on the
+                    # visited right operand, preserving its `definition`
+                    # so `pretty_callable` renders `def <name>`. Restore
+                    # it here from the live `t` (the join's right
+                    # operand, in scope), mirroring bind_self's
+                    # rebuild-on-live-object pattern.
+                    if (
+                        isinstance(fixed, CallableType)
+                        and fixed.definition is None
+                        and isinstance(t, CallableType)
+                        and getattr(t, "definition", None) is not None
+                    ):
+                        fixed = fixed.copy_modified(definition=t.definition)
                     return fixed
                 # Fall through to Python.
             elif disc == 5:
