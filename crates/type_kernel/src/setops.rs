@@ -98,12 +98,9 @@ pub(crate) fn trivial_join(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
-    // Defer FunctionLike pairs: since is_subtype now decides
-    // Callable-vs-Callable via callable_compat (Some(true/false)
-    // instead of None), the old implicit defer signal is gone and
-    // the object/`s`/`t` falls-through below would fire on similar
-    // callables. Python's join produces a joined CallableType there,
-    // so neither the union nor object is parity: defer explicitly.
+    // Defer FunctionLike pairs: is_subtype now decides
+    // Callable-vs-Callable via callable_compat, so the object/`s`/`t`
+    // falls-through below would fire; Python joins them instead.
     if is_function_like(s) && is_function_like(t) {
         return None;
     }
@@ -235,10 +232,8 @@ pub(crate) fn join_types(
     // make_simplified_union — it handles flattening and dedup.
     let (s, t, swapped) =
         if matches!(s, Type::UnionType { .. }) && matches!(t, Type::UnionType { .. }) {
-            // Both UnionType: merge items, call make_simplified_union,
-            // return Encoded. (join.py:432-436 visit_union_type calls
-            // make_simplified_union([self.s, t]) when self.s is not
-            // a subtype of t; merging both sides is the equivalent operation.)
+            // Both UnionType: merge items, call make_simplified_union.
+            // (join.py:432-436; merging both sides is the equivalent.)
             let Type::UnionType { items: s_items, .. } = s else {
                 unreachable!()
             };
@@ -289,15 +284,9 @@ pub(crate) fn join_types(
     };
     let swapped = swapped ^ swap3;
 
-    // normalize_callables (join.py:327) is a no-op for the Rust path:
-    // the Python shim serializes the post-normalization form. The
-    // both-CallableType case is handled in visit_join (identical check
-    // + similar-callables combine + join_similar_callables).
-    // Overloaded and Parameters arms added below.
-
-    // t.accept(TypeJoinVisitor(s)) — leaf visitors only. The visitor
-    // returns SameS/SameT relative to the post-swap s/t; flip back to
-    // the original s/t frame so the Python shim can map to its args.
+    // normalize_callables is a no-op here (shim serializes the
+    // post-normalization form); the both-CallableType case lives in
+    // visit_join. t.accept leaf visitors — flip back post-swap.
     visit_join(s, t, ctx, resolver).map(|r| flip_if(r, swapped))
 }
 
@@ -2541,16 +2530,30 @@ fn visit_join(
                 // 5. Else: TupleType(items, fallback).
                 let s_fb = crate::typeops::tuple_fallback(s, resolver)?;
                 let t_fb = crate::typeops::tuple_fallback(t, resolver)?;
-                let joined_fb = rust_join_types_inner(&s_fb, &t_fb, ctx.strict_optional, resolver)?;
+                let joined_fb =
+                    match rust_join_types_inner(&s_fb, &t_fb, ctx.strict_optional, resolver) {
+                        Some(v) => v,
+                        None => {
+                            return None;
+                        }
+                    };
 
                 let items = join_tuples_inner(s_items, t_items, ctx.strict_optional, resolver);
 
                 match items {
                     None => {
-                        // join.py:862-868: items is None -> fallback.
-                        // Python: if is_proper_subtype(s, t): return t;
-                        // elif is_proper_subtype(t, s): return s;
-                        // else: return fallback.
+                        // Python's join_tuples returns None only for fixed tuples with
+                        // unequal arity; other None here is a Rust deferral
+                        // that Python resolves into a real item list.
+                        if find_unpack(s_items).is_some()
+                            || find_unpack(t_items).is_some()
+                            || s_items.len() == t_items.len()
+                        {
+                            return None;
+                        }
+                        // items is None -> fallback (join.py:862-868):
+                        // is_proper_subtype(s,t) -> t; (t,s) -> s; else
+                        // the joined fallback.
                         let proper_ctx = SubtypeContext {
                             proper_subtype: true,
                             ..*ctx
@@ -3134,30 +3137,96 @@ fn remove_redundant_union_items(
     Some(current)
 }
 
-/// `try_contracting_literals_in_union` (typeops.py:1121-1161), Rust
-/// port. Contracts literals sharing a fallback back into the sum type
-/// when all values of the sum are present.
-///
-/// Ported: the `bool` case and the `enum` case. For bool, when both
-/// `Literal[True]` and `Literal[False]` appear, replace the first with
-/// `builtins.bool` and drop the rest. For enum, when every member in
-/// `TypeInfo.enum_members` appears as a `LiteralType(value=Str(name))`
-/// with the same enum fallback, replace the first with the fallback
-/// Instance and drop the rest.
-///
-/// Deferred: nothing in this function (enum_members is now in the
-/// snapshot). Returns `None` only if a snapshot lookup is needed but
-/// the fullname is absent (conservative defer; the Python path's
-/// `is_enum` defaults to false so a missing snapshot is non-enum).
+/// Reconstruct an `Instance` from a `SameTypeWithArgs` result. Each
+/// arg_disc picks the arg to reuse: 0 -> s.args[i], 1 -> t.args[i],
+/// 4 -> `AnyType(from_another_any)`. `type_ref` is the shared fullname.
+/// Returns `None` if a disc is unexpected or the arg lists are too short.
+fn reconstruct_instance_from_args(
+    s: &Type,
+    t: &Type,
+    type_ref: &str,
+    arg_discs: &[i8],
+) -> Option<Type> {
+    let s_args = match s {
+        Type::Instance { args, .. } => args,
+        _ => return None,
+    };
+    let t_args = match t {
+        Type::Instance { args, .. } => args,
+        _ => return None,
+    };
+    let mut args = Vec::with_capacity(arg_discs.len());
+    for (i, disc) in arg_discs.iter().enumerate() {
+        match disc {
+            0 => args.push(s_args.get(i)?.clone()),
+            1 => args.push(t_args.get(i)?.clone()),
+            4 => args.push(Type::AnyType {
+                type_of_any: 4, // from_another_any
+                source_any: None,
+                missing_import_name: None,
+            }),
+            _ => return None,
+        }
+    }
+    Some(Type::Instance {
+        type_ref: type_ref.to_string(),
+        args,
+        last_known_value: None,
+        extra_attrs: None,
+    })
+}
+
+/// Materialize a `SetOpResult` into a concrete `Type` for the instance
+/// join rewrap. Unlike `setop_result_to_type` (which defers on `Encoded`
+/// and `SameTypeWithArgs` because the batch-1 seam keeps deferral
+/// semantics for callers that only forward the discriminator), this
+/// helper decodes the full result: the instance-arg join genuinely
+/// produces new types (a merged `Instance` for the argwise join, an
+/// `Any` for diverged args) that must be re-wrapped into the outer
+/// `Instance`. `SameTypeWithArgs` is reconstructed via
+/// `reconstruct_instance_from_args`.
+fn materialize_join(s: &Type, t: &Type, r: SetOpResult, resolver: &TypeResolver) -> Option<Type> {
+    let typ = match &r {
+        SetOpResult::SameS => s.clone(),
+        SetOpResult::SameT => t.clone(),
+        SetOpResult::Encoded(bytes) => decode_type(bytes)?,
+        SetOpResult::Any => Type::AnyType {
+            type_of_any: 3, // TypeOfAny.special_form
+            source_any: None,
+            missing_import_name: None,
+        },
+        SetOpResult::Bottom => Type::UninhabitedType { ambiguous: true },
+        SetOpResult::Object => {
+            // object_or_any_from_type: an Instance(builtins.object).
+            Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }
+        }
+        SetOpResult::Ancestor(fullname) => Type::Instance {
+            type_ref: fullname.clone(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        },
+        SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        } => reconstruct_instance_from_args(s, t, type_ref, arg_discs)?,
+    };
+    // Ancestor/Object from a real join produce a fresh Instance whose
+    // type_ref may be an unfixed fullname; callers that wrap the result
+    // rely on the Python-side fixup to resolve refs.
+    let _ = resolver;
+    Some(typ)
+}
+
 fn try_contracting_literals_in_union(
     items: Vec<Type>,
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
-    // Contraction groups keyed by fallback fullname. Each group tracks
-    // the set of sum-type values still missing and the indices of
-    // LiteralType items that participate. For bool, the "sum" is
-    // {true, false}; for enum, the "sum" is `TypeInfo.enum_members`.
-    // fullname -> (missing_values, indices, is_bool)
     enum Sum {
         Bool(std::collections::HashSet<bool>),
         Enum(std::collections::HashSet<String>),
@@ -3574,7 +3643,6 @@ fn visit_instance_join(
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,
     };
-
     // join.py:114: t.type == s.type -> combine type args.
     // Defer when either side has fallback_to_any: Python's join_instances
     // uses is_proper_subtype (bypasses fallback_to_any) for dispatch,
@@ -3707,8 +3775,62 @@ fn visit_instance_with_args(
     resolver: &TypeResolver,
 ) -> Option<SetOpResult> {
     let snap = resolver.get(type_ref)?;
-    // Variadic instance: needs split_with_prefix_and_suffix — defer.
     if snap.has_type_var_tuple_type {
+        // Variadic instance (builtins.tuple[Ts]): Python partitions args
+        // via split_with_prefix_and_suffix and joins the middle as a
+        // TupleType (prefix=0/suffix=0/single-arg: whole list).
+        let prefix = snap.type_var_tuple_prefix.unwrap_or(0);
+        let suffix = snap.type_var_tuple_suffix.unwrap_or(0);
+        if prefix == 0 && suffix == 0 && s_args.len() == 1 && t_args.len() == 1 {
+            // The per-type-var TypeVarTupleType branch (join.py:230-241):
+            // join the rewrapped TupleType args, decode the Encoded result
+            // via materialize_join (not recomputable from s/t operands).
+            let r = join_types(&t_args[0], &s_args[0], ctx, resolver)?;
+            let new_type = materialize_join(&t_args[0], &s_args[0], r, resolver)?;
+            // join.py:235-241: rewrap. Instance(builtins.tuple) ->
+            // UnpackType; TupleType -> extend items; UnionType (tuple
+            // fallback shape) -> Instance(tuple, [union]).
+            let result = match &new_type {
+                Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
+                    Type::UnpackType {
+                        typ: Box::new(new_type),
+                    }
+                }
+                Type::TupleType { items, .. } => {
+                    if items.len() == 1 {
+                        if let Type::UnpackType { typ } = &items[0] {
+                            if let Type::Instance { type_ref, .. } = typ.as_ref() {
+                                if type_ref == "builtins.tuple" {
+                                    return Some(SetOpResult::Encoded({
+                                        let mut wbuf = WriteBuffer::new();
+                                        wire::write_type(&mut wbuf, typ.as_ref()).ok()?;
+                                        wbuf.into_bytes()
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                    Type::Instance {
+                        type_ref: type_ref.to_string(),
+                        args: items.clone(),
+                        last_known_value: None,
+                        extra_attrs: None,
+                    }
+                }
+                Type::UnionType { .. } => Type::Instance {
+                    type_ref: type_ref.to_string(),
+                    args: vec![new_type],
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+                _ => return None,
+            };
+            let mut wbuf = WriteBuffer::new();
+            wire::write_type(&mut wbuf, &result).ok()?;
+            return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+        }
+        // Other variadic patterns (prefix>0, suffix>0, or multi-arg):
+        // need split_with_prefix_and_suffix — defer.
         return None;
     }
     let tvars = &snap.type_vars_with_variance;
@@ -3798,7 +3920,7 @@ fn visit_instance_with_args(
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let typ = setop_result_to_type(Some(r), ta, sa)?;
+                        let typ = materialize_join(ta, sa, r, resolver)?;
                         needs_encode = true;
                         (0, typ)
                     }
@@ -3828,7 +3950,7 @@ fn visit_instance_with_args(
                     SetOpResult::SameS => (1i8, ta.clone()),
                     SetOpResult::SameT => (0, sa.clone()),
                     _ => {
-                        let typ = setop_result_to_type(Some(r), ta, sa)?;
+                        let typ = materialize_join(ta, sa, r, resolver)?;
                         needs_encode = true;
                         (0, typ)
                     }
@@ -4789,7 +4911,7 @@ fn rust_join_types_inner(
         &SubtypeContext::new(false, false, false, false, false, strict_optional),
         resolver,
     ) {
-        Some(r) => setop_result_to_type(Some(r), s, t),
+        Some(r) => materialize_join(s, t, r, resolver),
         None => None,
     }
 }
