@@ -40,15 +40,18 @@ from mypy.util import hash_digest
 # The transactional memoizing cache is implemented in Rust
 # (``crates/module_resolver/src/fs_cache.rs``); this class is a thin Python
 # delegate that forwards every method to the ``module_resolver.FsCache``
+
 # pyclass. The delegate exists so ``FileSystemCache`` keeps its Python type
 # identity (callers subclass it, annotate against it, and
 # ``fswatcher``/``build`` import it by name) while the implementation —
+
 # including the per-transaction snapshot semantics and the Bazel fake
 # ``__init__.py`` synthesis — lives in Rust.
-#
+
 # When the compiled extension is not on PYTHONPATH (e.g. a daemon subprocess
 # that overrides PYTHONPATH to the repo root), we fall back to the pure
 # Python implementation below. This preserves the strangler-fig contract:
+
 # Python keeps working without the extension; the extension is an
 # optimization when present.
 try:
@@ -62,6 +65,7 @@ except ImportError:
 # os.stat_result indices (matches the CPython struct stat sequence order
 # used by fscache._fake_init when it synthesizes a stat). We only need a
 # subset to build a result callers can read st_mode/st_size/st_mtime/st_ino/
+
 # st_dev/st_nlink off; the remaining fields default to 0.
 _ST_MODE = stat.ST_MODE
 _ST_INO = stat.ST_INO

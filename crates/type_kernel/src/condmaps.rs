@@ -148,6 +148,7 @@ pub(crate) fn rust_and_conditional_maps(
     // Defer use_meet path: the meet_types Rust kernel does not yet handle
     // all type combinations correctly (TypedDict meets, intersection types).
     // Python handles these correctly; only the common use_meet=False path
+
     // goes through Rust.
     if use_meet {
         return Ok(None);
@@ -221,6 +222,7 @@ pub(crate) fn rust_and_conditional_maps(
                     // Precedence logic from checker.py:9376-9391.
                     // If m1[key] is UninhabitedType: use m1[key].
                     // Else if m2[key] is AnyType and m1[key] is not a union
+
                     // containing AnyType: use m1[key].
                     // Else: keep m2[key] (already in result).
                     if is_uninhabited_type(t1) {

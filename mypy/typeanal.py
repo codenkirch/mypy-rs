@@ -265,6 +265,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # Should we report an error whenever we encounter a RawExpressionType outside
         # of a Literal context: e.g. whenever we encounter an invalid type? Normally,
         # we want to report an error, but the caller may want to do more specialized
+
         # error handling.
         self.report_invalid_types = report_invalid_types
         self.plugin = plugin
@@ -601,6 +602,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 hook = None
             # The body reaches tvar_scope.get_binding (typeanal.py:360) only
             # after the placeholder / node-None / hook branches return, i.e.
+
             # for non-placeholder, non-None nodes. Match that so a node-None
             # symbol (fullname is None) cannot trip the get_binding assert.
             if node is not None and not isinstance(node, PlaceholderNode):
@@ -958,6 +960,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             # `allow_typed_dict_special_forms` is lazily read in the original
             # branch bodies, so use its constructor default rather than
             # requiring the attr to exist (test-only analyzers built with
+
             # `TypeAnalyser.__new__` omit it).
             return _rust_classify_special_unbound(
                 fullname,
@@ -1454,9 +1457,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # Analyze arguments and (usually) construct Instance type. The
         # number of type arguments and their values are
         # checked only later, since we do not always know the
+
         # valid count at this point. Thus we may construct an
         # Instance with an invalid number of type arguments.
-        #
+
         # We allow ParamSpec literals based on a heuristic: it will be
         # checked later anyways but the error message may be worse.
         instance = Instance(
@@ -1623,6 +1627,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # Option 1:
         # Something with an Any type -- make it an alias for Any in a type
         # context. This is slightly problematic as it allows using the type 'Any'
+
         # as a base class -- however, this will fail soon at runtime so the problem
         # is pretty minor.
         if isinstance(sym.node, Var):
@@ -1649,9 +1654,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # Option 3:
         # Enum value. Note: we only want to return a LiteralType when
         # we're using this enum value specifically within context of
+
         # a "Literal[...]" type. So, if `defining_literal` is not set,
         # we bail out early with an error.
-        #
+
         # If, in the distant future, we decide to permit things like
         # `def foo(x: Color.RED) -> None: ...`, we can remove that
         # check entirely.
@@ -1729,6 +1735,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # TODO: Would it be better to always return Any instead of UnboundType
         # in case of an error? On one hand, UnboundType has a name so error messages
         # are more detailed, on the other hand, some of them may be bogus,
+
         # see https://github.com/python/mypy/issues/4987.
         return t
 
@@ -1802,7 +1809,8 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         self, t: CallableType, nested: bool = True, namespace: str = ""
     ) -> Type:
         # Every Callable can bind its own type variables, if they're not in the outer scope
-        # TODO: attach namespace for nested free type variables (these appear in return type only).
+        # TODO: attach namespace for nested free type variables (these appear in return
+        # type only).
         with self.tvar_scope_frame(namespace=namespace):
             unpacked_kwargs = t.unpack_kwargs
             if self.defining_alias:
@@ -1956,7 +1964,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def visit_overloaded(self, t: Overloaded) -> Type:
         # Overloaded types are manually constructed in semanal.py by analyzing the
         # AST and combining together the Callable types this visitor converts.
-        #
+
         # So if we're ever asked to reanalyze an Overloaded type, we know it's
         # fine to just return it as-is.
         return t
@@ -2049,11 +2057,13 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # We should never see a bare Literal. We synthesize these raw literals
         # in the earlier stages of semantic analysis, but those
         # "fake literals" should always be wrapped in an UnboundType
+
         # corresponding to 'Literal'.
-        #
+
         # Note: if at some point in the distant future, we decide to
         # make signatures like "foo(x: 20) -> None" legal, we can change
         # this method so it generates and returns an actual LiteralType
+
         # instead.
 
         if self.report_invalid_types:
@@ -2068,6 +2078,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 # And in all other cases, we default to a generic error message.
                 # Note: the reason why we use a generic error message for strings
                 # but not ints or bools is because whenever we see an out-of-place
+
                 # string, it's unclear if the user meant to construct a literal type
                 # or just misspelled a regular type. So we avoid guessing.
                 msg = "Invalid type comment or annotation"
@@ -2257,6 +2268,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 with self.tvar_scope_frame(namespace=""):
                     # Temporarily bind ParamSpecs to allow code like this:
                     #     my_fun: Callable[Q, Foo[Q]]
+
                     # We usually do this later in visit_callable_type(), but the analysis
                     # below happens at very early stage.
                     variables = []
@@ -2424,15 +2436,16 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         arg = get_proper_type(arg)
         if isinstance(arg, AnyType):
             # Note: We can encounter Literals containing 'Any' under three circumstances:
-            #
+
             # 1. If the user attempts use an explicit Any as a parameter
             # 2. If the user is trying to use an enum value imported from a module with
             #    no type hints, giving it an implicit type of 'Any'
+
             # 3. If there's some other underlying problem with the parameter.
-            #
+
             # We report an error in only the first two cases. In the third case, we assume
             # some other region of the code has already reported a more relevant error.
-            #
+
             # TODO: Once we start adding support for enums, make sure we report a custom
             # error for case 2 as well.
             if arg.type_of_any not in (TypeOfAny.from_error, TypeOfAny.special_form):
@@ -2514,6 +2527,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # When finding type variables in the return type of a function, don't
         # look inside Callable types.  Type variables only appearing in
         # functions in the return type belong to those functions, not the
+
         # function we're currently analyzing.
         visitor.include_callables = False
         type.ret_type.accept(visitor)
@@ -2877,8 +2891,10 @@ def instantiate_type_alias(
     # Native seam: Rust decides the non-error success paths (bare
     # generic eager expansion, non-generic alias, correct generic
     # instantiation) and returns a branch tag; Python rebuilds the live
+
     # result object exactly as the pure-Python body below would. Every
     # path that would emit an error or rewrite to Any (set_any_tvars)
+
     # returns None and the pure-Python body takes over, keeping message
     # side effects single-sourced.
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
@@ -3172,7 +3188,8 @@ def is_typevar_default_recursive(tv_fname: str, start: TypeInfo | TypeAlias) -> 
 class DivergingAliasDetector(TrivialSyntheticTypeTranslator):
     """See docstring of detect_diverging_alias() for details."""
 
-    # TODO: this doesn't really need to be a translator, but we don't have a trivial visitor.
+    # TODO: this doesn't really need to be a translator, but we don't have a trivial
+    # visitor.
     def __init__(self, seen_nodes: set[TypeAlias]) -> None:
         super().__init__()
         self.seen_nodes = seen_nodes
@@ -3349,6 +3366,7 @@ _UNBOUND_FRONT_KIND_OTHER = 5
 # Branch tags for `try_analyze_special_unbound_type` (issue #720).
 # Mirrored in crates/type_kernel/src/typeanal_special.rs; Python applies
 # the side effect + result construction for the tag Rust returns. Deferred
+
 # branches (tag None) keep the full pure-Python body.
 _UNBOUND_SPECIAL_TAG_NONE_TYPE = 2
 _UNBOUND_SPECIAL_TAG_ANY = 3
@@ -3385,6 +3403,7 @@ _UNBOUND_SPECIAL_TAG_READONLY_DEFER = 33
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
 # side effect + result construction for the two inline tags, the rest
+
 # re-run the original body.
 _TYPE_WITH_INFO_TAG_TUPLE = 1
 _TYPE_WITH_INFO_TAG_VEC = 2
@@ -3618,7 +3637,8 @@ def validate_instance(t: Instance, fail: MsgCallback, indexed: bool) -> bool:
                         fail("TypeVarTuple cannot be split", t, code=codes.TYPE_ARG)
                         return False
     elif any(isinstance(a, UnpackType) for a in t.args):
-        # A variadic unpack in fixed size instance (fixed unpacks must be flattened by the caller)
+        # A variadic unpack in fixed size instance (fixed unpacks must be flattened by
+        # the caller)
         fail(message_registry.INVALID_UNPACK_POSITION, t, code=codes.VALID_TYPE)
         t.args = ()
         return False

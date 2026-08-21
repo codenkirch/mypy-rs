@@ -389,7 +389,8 @@ type BoundSets = (
     HashMap<TvId, Vec<Type>>,
 );
 
-/// `solve_with_dependent_native` outcome: `Some` = both blobs, `None` = empty solutions.
+/// `solve_with_dependent_native` outcome: `Some` = both blobs, `None` = empty
+/// solutions.
 type NativeDependentOut = Option<(Option<Vec<u8>>, Option<Vec<u8>>)>;
 
 /// PyO3-facing `(num_solved, sol_blob, free_blob)`; `None` defers to Python.
@@ -613,7 +614,8 @@ fn transitive_closure(
             if graph.contains(&(lower.clone(), upper.clone())) {
                 continue;
             }
-            // graph |= {(l,u) for l in tvars for u in tvars if (l,lower) in graph and (upper,u) in graph}
+            // graph |= {(l,u) for l in tvars for u in tvars if (l,lower) in graph and
+            // (upper,u) in graph}
             let mut new_pairs = Vec::new();
             for l in tvars {
                 for u in tvars {
@@ -1736,9 +1738,11 @@ fn decode_solve_solutions_here(blob: &[u8]) -> Option<Vec<((i64, i64, String), O
 
 // ---------------------------------------------------------------------------
 // Standalone PyO3 exports for pure-computation helpers (solve.py).
+
 // These mirror small pure functions that take `Type` objects and return
 // values without mutation or side effects. Each returns `None` to defer
 // to the Python fallback for any unhandled type variant.
+
 // ---------------------------------------------------------------------------
 
 /// `_join_sorted_key` (solve.py:488-497): sort key for `join_type_list`.

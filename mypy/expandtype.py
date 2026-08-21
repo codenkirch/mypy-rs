@@ -57,6 +57,7 @@ import mypy.type_visitor  # ruff: isort: skip
 # Stage 3c type-kernel seam: when type_kernel is importable and a resolver
 # is installed, expand_type routes through Rust. Rust returns None for any
 # type it does not handle, in which case we fall back to the pure-Python
+
 # visitor. This is the strangler-fig per-call gate.
 
 
@@ -151,6 +152,7 @@ except ImportError:
 # Module-level flag + resolver, set by the build manager from
 # `Options.native_type_kernel` at the start of each build. When
 # `_native_expand_type_active` is True but `_native_expand_type_resolver`
+
 # is None, the shim falls through to Python.
 _native_expand_type_active: bool = False
 _native_expand_type_resolver: Any = None
@@ -257,6 +259,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     # Stage 3c type-kernel seam: try the Rust expand_type path. Rust
     # returns None for unsupported cases (ParamSpec, TypeAliasType, etc.);
     # we then fall through to the pure-Python visitor. Mirrors the
+
     # erasetype.py strangler-fig contract.
     if (
         _HAS_TYPE_KERNEL
@@ -280,6 +283,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 # The wire format does not carry line/column; decoded
                 # types default to line -1. Preserve the input type's
                 # location so derived contexts (e.g. plugin
+
                 # default_return_type) report errors at the call site
                 # instead of a phantom line 0/-1.
                 if fixed is not None and isinstance(fixed, ProperType):
@@ -290,6 +294,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 # Clear the process-global primitive decode singletons after
                 # a read so NOT_READY Instances cannot leak into later builds
                 # (read_type lazily fills instance_cache with
+
                 # Instance(NOT_READY, []) singletons for str/int/bool/etc).
                 from mypy.types import instance_cache
 
@@ -351,6 +356,7 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
+
                     # call site instead of a phantom line 0/-1.
                     if fixed is not None and isinstance(fixed, ProperType):
                         fixed.line = typ.line
@@ -540,6 +546,7 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
         # This may happen during type inference if some function argument
         # type is a generic callable, and its erased form will appear in inferred
         # constraints, then solver may check subtyping between them, which will trigger
+
         # unify_generic_callables(), this is why we can get here. Another example is
         # when inferring type of lambda in generic context, the lambda body contains
         # a generic method in generic class.
@@ -555,8 +562,9 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
             # The type checker expands function definitions and bodies
             # if they depend on constrained type variables but the body
             # might contain a tuple type comment (e.g., # type: (int, float)),
+
             # in which case 't.type' is not yet available.
-            #
+
             # See: https://github.com/python/mypy/issues/16649
             return t.copy_modified(args=args)
 
@@ -697,6 +705,7 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
             # Some failed inference scenarios will try to set all type variables to Never.
             # Instead of being picky and require all the callers to wrap them,
             # do this here instead.
+
             # Note: most cases when this happens are handled in expand unpack below, but
             # in rare cases (e.g. ParamSpec containing Unpack star args) it may be skipped.
             return t.tuple_fallback.copy_modified(args=[repl])
@@ -705,10 +714,11 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
     def visit_unpack_type(self, t: UnpackType) -> Type:
         # It is impossible to reasonably implement visit_unpack_type, because
         # unpacking inherently expands to something more like a list of types.
-        #
+
         # Relevant sections that can call unpack should call expand_unpack()
         # instead.
         # However, if the item is a variadic tuple, we can simply carry it over.
+
         # In particular, if we expand A[*tuple[T, ...]] with substitutions {T: str},
         # it is hard to assert this without getting proper type. Another important
         # example is non-normalized types when called from semanal.py.
@@ -774,9 +784,11 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
             # If a ParamSpec in a callable type is substituted with a
             # callable type, we can't use normal substitution logic,
             # since ParamSpec is actually split into two components
+
             # *P.args and **P.kwargs in the original type. Instead, we
             # must expand both of them with all the argument types,
             # kinds and names in the replacement. The return type in
+
             # the replacement is ignored.
             if isinstance(repl, Parameters):
                 # We need to expand both the types in the prefix and the ParamSpec itself
@@ -876,7 +888,8 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
             ):
                 unpacked = get_proper_type(item.type)
                 if isinstance(unpacked, Instance):
-                    # expand_type() may be called during semantic analysis, before invalid unpacks are fixed.
+                    # expand_type() may be called during semantic analysis, before
+                    # invalid unpacks are fixed.
                     if unpacked.type.fullname != "builtins.tuple":
                         return t.partial_fallback.accept(self)
                     if t.partial_fallback.type.fullname != "builtins.tuple":
@@ -918,6 +931,7 @@ class ExpandTypeVisitor(TrivialSyntheticTypeTranslator):
         # This call to get_proper_type() is unfortunate but is required to preserve
         # the invariant that ProperType will stay ProperType after applying expand_type(),
         # otherwise a single item union of a type alias will break it. Note this should not
+
         # cause infinite recursion since pathological aliases like A = Union[A, B] are
         # banned at the semantic analysis level.
         result = get_proper_type(simplified)

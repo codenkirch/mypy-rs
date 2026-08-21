@@ -396,6 +396,7 @@ class TypedDictAnalyzer:
             # If a read-only field is only defined in base classes, joining the types
             # is unlikely to produce a tight enough result. We could check all the
             # candidates from the base classes, but it would be O(n^2) complexity
+
             # to find out which is a supertype of all the others. Instead, use the
             # first definition we encounter, and let the user provide the correct
             # definition in the subclass if this fails.

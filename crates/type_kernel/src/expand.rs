@@ -31,12 +31,15 @@ const ARG_STAR2: i64 = 4;
 
 // Decision tags returned to the Python shim; `expand_actual_type` maps each
 // back to a branch of its own implementation:
+
 //   * TUPLE: ARG_STAR tuple `*args`. Python sets `tuple_index` from the
 //     returned state and yields `items[tuple_index - 1]`, including its own
 //     UnpackType fallback when `allow_unpack` is false.
+
 //   * KWARG: ARG_STAR2 TypedDict `**kwargs`. Python yields
 //     `items[returned_name]` and records the key as consumed.
 //   * PASSTHROUGH: 1:1 (non-star kinds) or ParamSpec, no state change.
+
 //   * ANY_ERROR: an un-unpackable actual; Python yields
 //     `AnyType(TypeOfAny.from_error)` (the deterministic Python else branch).
 const DECISION_TUPLE: i64 = 0;

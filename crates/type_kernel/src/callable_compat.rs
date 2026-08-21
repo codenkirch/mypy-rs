@@ -17,7 +17,8 @@
 //! * either side `unpack_kwargs` (`with_unpacked_kwargs` expands a trailing
 //!   `TypedDictType` into named args);
 //! * any arg is an `UnpackType` (`with_normalized_var_args` would unfold);
-//! * the `mypy.meet.meet_types` merge case in `mypy.typeops.callable_corresponding_argument`
+//! * the `mypy.meet.meet_types` merge case in
+//!   `mypy.typeops.callable_corresponding_argument`
 //!   (`SetOpResult` carries only input markers, not the merged type);
 //! * any nested `subtypes::is_subtype` returns `None` (all-or-nothing: Rust
 //!   cannot enrich one comparison with Python's answer while deciding the rest);
@@ -344,6 +345,7 @@ pub(crate) fn callable_corresponding_argument(
             // Distinct by-name and by-pos: Python merges only when both are
             // optional, by_name pos-only, by_pos name-only, and neither typ is
             // an UnpackType. The merged type is `meet_types(by_name.typ,
+
             // by_pos.typ)` — unreconstructible from `SetOpResult`, so defer.
             let _ = (a, b);
             Err(Defer)
@@ -713,9 +715,11 @@ pub(crate) fn callables_compatible(
     // type_guard / type_is mismatch pre-checks
     // (subtypes.py:910-929): both-only TypeGuard (covariant on the guarded
     // type), both-only TypeIs (checked both ways), or a guard/is on one side
+
     // only → False. These run before the general engine; the guarded
     // sub-type comparison goes through the same SubtypeContext as the
     // overall check (`self._is_subtype` in the Python visitor). Only when
+
     // that comparison itself defers do we defer the whole check.
     if let (Some(lg), Some(rg)) = (lf.type_guard, rf.type_guard) {
         match ctx_compat_is_subtype(ctx, resolver, lg, rg) {
@@ -825,6 +829,7 @@ pub(crate) fn is_callable_compatible(
     // right.is_type_obj() and not left.is_type_obj() and not allow_partial_overlap
     // → False (subtypes.py:1845-1846). allow_partial_overlap is False here, so:
     // right is a type object and left is not → False. If either side's
+
     // is_type_obj result is unknown (resolver miss), defer via `?`.
     let right_is_type_obj = is_type_obj(right, resolver)?;
     let left_is_type_obj = is_type_obj(left, resolver)?;

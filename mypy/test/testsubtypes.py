@@ -296,9 +296,11 @@ class SubtypingSuite(Suite):
     # IDEA: Maybe add these test cases (they are tested pretty well in type
     #       checker tests already):
     #  * more interface subtyping test cases
+
     #  * more generic interface subtyping test cases
     #  * type variables
     #  * tuple types
+
     #  * None type
     #  * any type
     #  * generic function types
@@ -395,9 +397,11 @@ class NativeSubtypeSuite(Suite):
         # GS[A, B] <: G[B] needs map_instance_to_supertype (generic
         # substitution via expand_type_by_instance). The fixture's
         # TypeVars carry namespace="" (not the class fullname), so the
+
         # Rust substitution check (tvar.namespace == left.type_ref)
         # does not match and Rust returns None. Python falls through
         # and computes the correct result. This proves the
+
         # strangler-fig contract: Rust's `None` doesn't change the
         # answer. Real code (class typevars with namespace=class
         # fullname) exercises the Rust substitution path.
@@ -408,6 +412,7 @@ class NativeSubtypeSuite(Suite):
         # Real code path: class typevars carry namespace=class.fullname.
         # Build GS[T, S] <: G[S] with namespace set on both the class's
         # defn.type_vars and the base Instance's TypeVar args. The Rust
+
         # path substitutes tvar.raw_id=2 (S) -> left.args[1] (B),
         # producing G[B], so GS[A, B] <: G[B] holds and GS[A, B] <:
         # G[A] does not.
@@ -436,6 +441,7 @@ class NativeSubtypeSuite(Suite):
             # mro must include base type infos so has_base() works
             # (nodes.py:4140 walks mro by fullname). Real TypeInfo
             # mro is built by calculate_mro(), but for this test we
+
             # assemble it manually.
             mro = [info]
             for base in bases:
@@ -469,6 +475,7 @@ class NativeSubtypeSuite(Suite):
         # Rebuild resolver so Rust sees the new TypeInfos' bases blobs.
         # Must include the fixture's TypeInfos (A, B, object) so the
         # recursive check_type_parameter calls (is_subtype(B, B)) can
+
         # resolve the Instance type_refs.
         from mypy.subtypes import _set_native_subtype_resolver
 
@@ -481,6 +488,7 @@ class NativeSubtypeSuite(Suite):
     # Callable parameter-compat parity (Stage 3c/M8c). These mirror
     # SubtypingSuite's callable tests; the Rust engine returns None for
     # shapes it does not handle (Parameters, generics, unpack), so every
+
     # assertion must match the pure-Python result and coverage is run
     # with the resolver active in setUp.
 
@@ -607,11 +615,13 @@ class NativeSubtypeGapSuite(Suite):
         # right.has_type_var_tuple_type: Rust returns None; Python's
         # split_with_prefix_and_suffix path computes the answer. We
         # verify the result matches pure-Python by constructing a
+
         # TupleType right (the partial-fallback of a variadic class).
 
         # Build a synthetic TypeInfo with has_type_var_tuple_type=True
         # by re-installing the resolver with a modified snapshot is
         # not possible. Instead, use the existing fixture and verify
+
         # that a TupleType right (which is what variadic partial
         # fallbacks produce) still works end-to-end.
         tuple_right = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
@@ -625,9 +635,11 @@ class NativeSubtypeGapSuite(Suite):
         # When a nested is_subtype hits an unsupported variant (e.g.
         # CallableType inside Instance args), check_type_parameter must
         # propagate None, not assume not-subtype. The fix:
+
         # check_type_parameter returns Option<bool> and the caller
         # returns None on None (not nominal=false).
         # We construct: a.A[A] <: a.A[CallableType] where the right
+
         # side contains an unsupported variant. The old code would
         # incorrectly return false (unwrap_or(false)); the new code
         # defers to Python which returns the correct answer.
@@ -645,6 +657,7 @@ class NativeSubtypeGapSuite(Suite):
         # A is not a subtype of A[CallableType] (covariant would be
         # true only if A <: CallableType, which it isn't). Python
         # returns False; Rust must defer (not assert False via
+
         # unwrap_or). We just check parity: both sides agree.
         left = Instance(self.fx.ai, [self.fx.a])
         right = Instance(self.fx.ai, [callable_arg])

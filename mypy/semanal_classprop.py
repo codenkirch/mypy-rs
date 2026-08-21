@@ -40,9 +40,11 @@ except ImportError:
 # Hard coded type promotions (shared between all Python versions).
 # These add extra ad-hoc edges to the subtyping relation. For example,
 # int is considered a subtype of float, even though there is no
+
 # subclass relationship.
 # Note that the bytearray -> bytes promotion is a little unsafe
 # as some functions only accept bytes objects. Here convenience
+
 # trumps safety.
 TYPE_PROMOTIONS: Final = {
     "builtins.int": "float",
@@ -85,6 +87,7 @@ def calculate_class_abstract_status(typ: TypeInfo, is_stub_file: bool, errors: E
                 # Unwrap an overloaded function definition. We can just
                 # check arbitrarily the first overload item. If the
                 # different items have a different abstract status, there
+
                 # should be an error reported elsewhere.
                 if node.items:  # can be empty for invalid overloads
                     func: Node | None = node.items[0]

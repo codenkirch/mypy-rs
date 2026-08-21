@@ -456,6 +456,7 @@ class Attribute:
             # This is a compromise.  If you don't have a type here then the
             # __init__ will be untyped. But since the __init__ is added it's
             # pointing at the decorator. So instead we also show the error in the
+
             # assignment, which is where you would fix the issue.
             node = self.info[self.name].node
             assert node is not None
@@ -667,7 +668,8 @@ def attr_class_maker_callback_impl(
     }
 
     adder = MethodAdder(ctx)
-    # If  __init__ is not being generated, attrs still generates it as __attrs_init__ instead.
+    # If __init__ is not being generated, attrs still generates it as __attrs_init__
+    # instead.
     _add_init(ctx, attributes, adder, "__init__" if init else ATTRS_INIT_NAME)
 
     if order:
@@ -729,6 +731,7 @@ def _analyze_class(
                 # When attrs are defined twice in the same body we want to use the 2nd definition
                 # in the 2nd location. So remove it from the OrderedDict.
                 # Unless it's auto_attribs in which case we want the 2nd definition in the
+
                 # 1st location.
                 if not auto_attribs and attr.name in own_attrs:
                     del own_attrs[attr.name]
@@ -880,9 +883,11 @@ def _cleanup_decorator(stmt: Decorator, attr_map: dict[str, Attribute]) -> None:
                 # These are decorators on the attrib object that only exist during
                 # class creation time.  In order to not trigger a type error later we
                 # just remove them.  This might leave us with a Decorator with no
+
                 # decorators (Emperor's new clothes?)
                 # TODO: It would be nice to type-check these rather than remove them.
                 #       default should be Callable[[], T]
+
                 #       validator should be Callable[[Any, 'Attribute', T], Any]
                 #       where T is the type of the attribute.
                 remove_me.append(func_decorator)
@@ -1117,6 +1122,7 @@ def _add_order(ctx: mypy.plugin.ClassDefContext, adder: MethodAdder) -> None:
     # Make the types be:
     #    AT = TypeVar('AT')
     #    def __lt__(self: AT, other: AT) -> bool
+
     # This way comparisons with subclasses will work correctly.
     fullname = f"{ctx.cls.info.fullname}.{SELF_TVAR_NAME}"
     tvd = TypeVarType(
@@ -1409,7 +1415,8 @@ def evolve_function_sig_callback(ctx: mypy.plugin.FunctionSigContext) -> Callabl
     and dependent on the type of the first argument.
     """
     if len(ctx.args) != 2:
-        # Ideally the name and context should be callee's, but we don't have it in FunctionSigContext.
+        # Ideally the name and context should be callee's, but we don't have it in
+        # FunctionSigContext.
         ctx.api.fail(f'"{ctx.default_signature.name}" has unexpected type annotation', ctx.context)
         return ctx.default_signature
 

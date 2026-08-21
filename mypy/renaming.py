@@ -134,7 +134,8 @@ class VariableRenameVisitor(TraverserVisitor):
     def visit_for_stmt(self, stmt: ForStmt) -> None:
         stmt.expr.accept(self)
         self.analyze_lvalue(stmt.index, True)
-        # Also analyze as non-lvalue so that every for loop index variable is assumed to be read.
+        # Also analyze as non-lvalue so that every for loop index variable is assumed to
+        # be read.
         stmt.index.accept(self)
         with self.enter_loop():
             stmt.body.accept(self)
@@ -177,6 +178,7 @@ class VariableRenameVisitor(TraverserVisitor):
         # We allow redefinitions in the body of a with statement for
         # convenience.  This is unsafe since with statements can affect control
         # flow by catching exceptions, but this is rare except for
+
         # assertRaises() and other similar functions, where the exception is
         # raised by the last statement in the body, which usually isn't a
         # problem.

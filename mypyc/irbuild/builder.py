@@ -254,6 +254,7 @@ class IRBuilder:
         # Class body context: tracks ClassVars defined so far when processing
         # a class body, so that intra-class references (e.g. C = A | B where A is
         # a ClassVar defined earlier in the same class) can be resolved correctly.
+
         # Without this, mypyc looks up such names in module globals, which fails.
         self.class_body_classvars: dict[Var, None] = {}
         self.class_body_obj: Value | None = None
@@ -261,7 +262,10 @@ class IRBuilder:
 
         # This list operates similarly to a function call stack for nested functions. Whenever a
         # function definition begins to be generated, a FuncInfo instance is added to the stack,
-        # and information about that function (e.g. whether it is nested, its environment class to
+        # and information about that function (e.g. whether it is nested, its
+
+        # environment class to
+
         # be generated) is stored in that FuncInfo instance. When the function is done being
         # generated, its corresponding FuncInfo is popped off the stack.
         self.fn_info = FuncInfo(INVALID_FUNC_DEF, "", "")
@@ -317,6 +321,7 @@ class IRBuilder:
                 # If we hit an error during compilation, we want to
                 # keep trying, so we can produce more error
                 # messages. Generate a temp of the right type to keep
+
                 # from causing more downstream trouble.
                 except UnsupportedException:
                     res = Register(self.node_type(node))
@@ -612,6 +617,7 @@ class IRBuilder:
         # Some best-effort attempts to disallow assigning to class
         # variables that aren't marked ClassVar, since we blatantly
         # miscompile the interaction between instance and class
+
         # variables.
         for lvalue in lvalues:
             if (
@@ -729,6 +735,7 @@ class IRBuilder:
                     # If the function is a generator function, then first define a new variable
                     # in the current function's environment class. Next, define a target that
                     # refers to the newly defined variable in that environment class. Add the
+
                     # target to the table containing class environment variables, as well as the
                     # current environment.
                     if self.fn_info.is_generator or self.fn_info.is_coroutine:
@@ -1249,14 +1256,18 @@ class IRBuilder:
             if target:
                 return target
 
-        # Standard native call if signature and fullname are good and all arguments are positional
+        # Standard native call if signature and fullname are good and all arguments are
+        # positional
         # or named.
         callee_node = callee.node
         if isinstance(callee_node, OverloadedFuncDef):
             callee_node = callee_node.impl
         # TODO: use native calls for any decorated functions which have all their decorators
         # removed, not just singledispatch functions (which we don't do now just in case those
-        # decorated functions are callable classes or cannot be called without the python API for
+        # decorated functions are callable classes or cannot be called without the
+
+        # python API for
+
         # some other reason)
         if (
             isinstance(callee_node, Decorator)
@@ -1361,6 +1372,7 @@ class IRBuilder:
         # Copy the parent symtable so variables from the enclosing scope
         # (e.g. function parameters used as the comprehension iterable)
         # remain accessible. The comprehension is inlined (same basic blocks
+
         # and registers), so the parent's register references are still valid.
         self.symtables.append(dict(self.symtables[-1]))
         self.runtime_args.append([])

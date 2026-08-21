@@ -456,15 +456,19 @@ class ImportTracker:
         # module_for['foo'] has the module name where 'foo' was imported from, or None if
         # 'foo' is a module imported directly;
         # direct_imports['foo'] is the module path used when the name 'foo' was added to the
+
         # namespace.
         # reverse_alias['foo'] is the name that 'foo' had originally when imported with an
         # alias; examples
+
         #     'from pkg import mod'      ==> module_for['mod'] == 'pkg'
         #     'from pkg import mod as m' ==> module_for['m'] == 'pkg'
         #                                ==> reverse_alias['m'] == 'mod'
+
         #     'import pkg.mod as m'      ==> module_for['m'] == None
         #                                ==> reverse_alias['m'] == 'pkg.mod'
         #     'import pkg.mod'           ==> module_for['pkg'] == None
+
         #                                ==> module_for['pkg.mod'] == None
         #                                ==> direct_imports['pkg'] == 'pkg.mod'
         #                                ==> direct_imports['pkg.mod'] == 'pkg.mod'
@@ -704,6 +708,7 @@ class BaseStubGenerator:
             # Note we emit all names in the runtime __all__ here, even if they
             # don't actually exist. If that happens, the runtime has a bug, and
             # it's not obvious what the correct behavior should be. We choose
+
             # to reflect the runtime __all__ as closely as possible.
             return f"__all__ = {self._all_!r}\n"
         return ""

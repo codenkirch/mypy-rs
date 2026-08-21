@@ -315,38 +315,46 @@ fn encode_type_owned(t: &Type) -> Option<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // is_valid_inferred_type (issue #445)
 // ---------------------------------------------------------------------------
-//
+
 // Ports `mypy.checker.is_valid_inferred_type` (checker.py:9748-9772) and its
 // `InvalidInferredTypes` visitor (checker.py:9775-9799). This is a pure
 // boolean query on a type tree with no diagnostics, no mutation, and no
+
 // side effects. It is the non-diagnostic helper called from the
 // `check_assignment` narrowing path for simple lvalues.
-//
+
 // `InvalidInferredTypes` is a `BoolTypeQuery(ANY_STRATEGY)` with these
 // overrides (checker.py:9785-9799):
 //   * `visit_uninhabited_type`: returns `t.ambiguous` (base: default=False).
+
 //   * `visit_erased_type`: returns `True` (unreachable on the wire, since
 //     `ErasedType` has no `write`/`read` in mypy/types.py, so it can never
 //     appear in serialized input).
+
 //   * `visit_type_var`: returns `t.id.is_meta_var()` i.e. `meta_level > 0`
 //     (base: query upper_bound + default + values).
+
 //   * `visit_tuple_type`: returns `query_types(t.items)` (base: query items
 //     + partial_fallback).
-//
+
 // The top-level `is_valid_inferred_type` first calls `get_proper_type`
 // (which needs the live alias target for a `TypeAliasType`, so any alias at
 // the top level defers). Then:
+
 //   * `NoneType`: `is_lvalue_final or (not is_lvalue_member and allow_redefinition)`.
 //   * `UninhabitedType`: `False`.
 //   * Otherwise: `not typ.accept(InvalidInferredTypes())`.
-//
+
 // Deferred (return None) cases:
 //   * Undecodable input bytes.
+
 //   * `TypeAliasType` at the top level (get_proper_type needs the live
 //     alias target).
+
 //   * `TypeAliasType` anywhere in the tree: the base `visit_type_alias_type`
 //     calls `get_proper_type` and recurses into the alias target, which
 //     needs the live `alias` node. The wire format stores only `type_ref`,
+
 //     so defer the entire query to the pure-Python path.
 
 /// `mypy.checker.is_valid_inferred_type` — pure boolean validity query.
@@ -517,17 +525,20 @@ fn invalid_inferred_children(typ: &Type) -> Vec<&Type> {
 // ---------------------------------------------------------------------------
 // checker narrowing stubs (issue #347)
 // ---------------------------------------------------------------------------
-//
+
 // These four entry points are the #347 checker-narrowing seam: each returns
 // `None` so the Python shim falls through to the pure-Python implementation.
+
 // They exist so the dispatch gate (`_native_checker_narrowing_active`) can be
 // wired and asserted for the functions that legitimately stay Python-only
 // (live expression nodes, the conditional type binder, symbol-table lookups,
+
 // and `PartialType` state are all un-serializable across the wire).
-//
+
 // `rust_narrow_declared_type` (also part of #347 but already ported) lives in
 // `meet.rs` and is registered from `meet::rust_narrow_declared_type`: it is the
 // authoritative seam wired into `mypy/meet.py`. It is intentionally NOT
+
 // duplicated here to avoid shadowing that registration.
 
 /// `mypy.checker.narrow_type` — general narrowing from a condition expression.
@@ -571,34 +582,41 @@ pub(crate) fn rust_partial_type_inference(py: Python<'_>) -> PyResult<PyObject> 
 // ---------------------------------------------------------------------------
 // narrow_type_by_identity_equality (issue #387), identity-only branch
 // ---------------------------------------------------------------------------
-//
+
 // Ports the identity (`is` / `is not`) path of
 // `mypy.checker.narrow_type_by_identity_equality` (checker.py:7127). The
 // caller serializes the raw expr_type and the already-coerced target_type.
+
 // Rust mirrors the caller's else-branch (checker.py:7227-7237):
-//
+
 // ```text
 // narrowable = try_expanding_sum_type_to_union(
 //     coerce_to_literal(narrowable_expr_type), None)
+
 // if_type, else_type = conditional_types(
 //     narrowable, [TypeRange(target_type, is_upper_bound=False)],
 //     from_equality=True)
+
 // ```
-//
+
 // For identity the partition is a no-op (`is_identity=True` returns
 // `(current_type, None)`), so narrowable_expr_type == expr_type and there is
 // no ambiguous side to re-merge. Equality operators (==/!=) defer: they need
+
 // the partition machinery and the ambiguous union-merge.
-//
+
 // Deferred (return None) cases, all structurally safe:
 //   * `coerce_to_literal` on a single-member enum (stale enum_members) or a
 //     TypeAliasType (no alias target on the wire).
+
 //   * `try_expanding_sum_type_to_union` or an alias on either side.
 //   * `is_subtype` returning None (LiteralType/NoneType/other non-Instance
 //     current); proper-subtype True then proceeds natively.
+
 //   * A Callable / protocol target needing `restrict_subtype_away`
 //     (structural guards need live TypeInfo).
 //   * Overlap True but not proper-subtype (also `restrict_subtype_away`).
+
 //   * A generic Instance target (Instance with args) that
 //     `shallow_erase_type_for_equality` would erase vars off.
 //   * `make_simplified_union` deferring (alias or a non-Instance subset).
@@ -708,6 +726,7 @@ fn conditional_types_identity_subset(
 
     // Factorize over union types (checker.py:8917-8931): each item is
     // narrowed against the whole proposed range, with itself as the default.
+
     // With a non-None default the recursive results are always concrete, so
     // an inner None pair or a sub-defer propagates a defer out of the whole
     // union call (Python would have computed a definite result).
@@ -1367,6 +1386,7 @@ mod tests {
         // `try_handler_union_inner` mirrors checker.py's `_ => [typ]` fallback:
         // a TypeAliasType leaf is passed through unchanged. The pyfunction
         // layer then defers (see `encode_type_owned`) rather than crossing the
+
         // seam, because the wire format drops the live TypeAlias node and the
         // Python side would deserialize a poisoned alias=None type.
         let alias = Type::TypeAliasType {

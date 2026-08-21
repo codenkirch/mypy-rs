@@ -213,6 +213,7 @@ def find_always_defined_attributes(
             # If an attribute we *set* may be sometimes undefined and
             # sometimes defined, don't consider it always defined. Unlike
             # the get case, it's fine for the attribute to be undefined.
+
             # The set operation will then be treated as initialization.
             if isinstance(op, SetAttr) and op.obj is self_reg:
                 if (
@@ -427,6 +428,7 @@ def detect_undefined_bitmap(cl: ClassIR, seen: set[ClassIR]) -> None:
     # Build fresh and assign once. This function is called per SCC and `seen`
     # only dedupes within a single call, so appending in place to a shared base
     # would accumulate duplicates across SCCs and produce non-deterministic
+
     # struct layouts under separate=True.
     new_attrs: list[str] = []
     if len(cl.base_mro) > 1:

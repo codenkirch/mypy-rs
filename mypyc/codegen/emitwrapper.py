@@ -40,18 +40,25 @@ from mypyc.namegen import NameGenerator
 # Generic vectorcall wrapper functions (Python 3.7+)
 #
 # A wrapper function has a signature like this:
+
 #
-# PyObject *fn(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject *kwnames)
+# PyObject *fn(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyObject
+# *kwnames)
+
 #
+
 # The function takes a self object, pointer to an array of arguments,
 # the number of positional arguments, and a tuple of keyword argument
 # names (that are stored starting in args[nargs]).
+
 #
 # It returns the returned object, or NULL on an exception.
 #
+
 # These are more efficient than legacy wrapper functions, since
 # usually no tuple or dict objects need to be created for the
 # arguments. Vectorcalls also use pre-constructed str objects for
+
 # keyword argument names and other pre-computed information, instead
 # of processing the argument format string on each call.
 
@@ -74,6 +81,7 @@ def generate_traceback_code(
     # If we hit an error while processing arguments, then we emit a
     # traceback frame to make it possible to debug where it happened.
     # Unlike traceback frames added for exceptions seen in IR, we do this
+
     # even if there is no `traceback_name`. This is because the error will
     # have originated here and so we need it in the traceback.
     globals_static = emitter.static_name("globals", module_name)
@@ -213,6 +221,7 @@ def generate_wrapper_function(
 # Legacy generic wrapper functions
 #
 # These take a self object, a Python tuple of positional arguments,
+
 # and a dict of keyword arguments. These are a lot slower than
 # vectorcall wrappers, especially in calls involving keyword
 # arguments.
@@ -370,15 +379,19 @@ def generate_bin_op_forward_only_wrapper(
     # If some argument has an incompatible type, treat this the same as
     # returning NotImplemented, and try to call the reverse operator method.
     #
+
     # Note that in normal Python you'd instead of an explicit
     # return of NotImplemented, but it doesn't generally work here
     # the body won't be executed at all if there is an argument
+
     # type check failure.
     #
     # The recommended way is to still use a type check in the
+
     # body. This will only be used in interpreted mode:
     #
     #    def __add__(self, other: int) -> Foo:
+
     #        if not isinstance(other, int):
     #            return NotImplemented
     #        ...
@@ -406,9 +419,11 @@ def generate_bin_op_both_wrappers(
     # There's both a forward and a reverse operator method. First
     # check if we should try calling the forward one. If the
     # argument type check fails, fall back to the reverse method.
+
     #
     # Similar to above, we can't perfectly match Python semantics.
     # In regular Python code you'd return NotImplemented if the
+
     # operand has the wrong type, but in compiled code we'll never
     # get to execute the type check.
     emitter.emit_line(
@@ -474,6 +489,7 @@ def handle_third_pow_argument(
         # If the power dunder only supports two arguments and the third
         # argument (AKA mod) is set to a non-default value, simply bail.
         #
+
         # Importantly, this prevents any ternary __rpow__ calls from
         # happening (as per the language specification).
         emitter.emit_line("if (obj_mod != Py_None) {")
@@ -483,6 +499,7 @@ def handle_third_pow_argument(
         # The slot wrapper will receive three arguments, but the call only
         # supports two so make sure that the third argument isn't passed
         # along. This is needed as two-argument __(i)pow__ is allowed and
+
         # rather common.
         if len(gen.arg_names) == 3:
             gen.arg_names.pop()

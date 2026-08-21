@@ -43,12 +43,15 @@ from mypy.typevartuples import erased_vars
 # Stage 1/2 type-kernel seam: when the `type_kernel` Rust extension is
 # importable and `Options.native_type_kernel` is set, `erase_type` and
 # `remove_instance_last_known_values` are routed through Rust. The Rust path
+
 # returns `None` for any type it does not handle, in which case we fall back to
 # the pure-Python visitor. This is the strangler-fig per-call gate — no
 # behavior change unless the option is explicitly enabled.
+
 #
 # Stage 4c: `erase_typevars` and `replace_meta_vars` also route through Rust
 # via the wire-format Type enum. Same gate pattern: Rust returns None for
+
 # TypeAliasType/UnboundType/TypeVarTuple-copy_modified cases, Python falls
 # back to the pure-Python TypeVarEraser visitor.
 try:
@@ -416,6 +419,7 @@ class LastKnownValueEraser(TypeTranslator):
         # Erasure can result in many duplicate items; merge them.
         # Call make_simplified_union only on lists of instance types
         # that all have the same fullname, to avoid simplifying too
+
         # much.
         instances = [item for item in new.items if isinstance(get_proper_type(item), Instance)]
         # Avoid merge in simple cases such as optional types.

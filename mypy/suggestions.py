@@ -216,10 +216,14 @@ class SuggestionFailure(Exception):
 
 
 def is_explicit_any(typ: AnyType) -> bool:
-    # Originally I wanted to count as explicit anything derived from an explicit any, but that
+    # Originally I wanted to count as explicit anything derived from an explicit any,
+    # but that
     # seemed too strict in some testing.
+
     # return (typ.type_of_any == TypeOfAny.explicit
-    #         or (typ.source_any is not None and typ.source_any.type_of_any == TypeOfAny.explicit))
+    #         or (typ.source_any is not None and typ.source_any.type_of_any ==
+    #         TypeOfAny.explicit))
+
     # Important question: what should we do with source_any stuff? Does that count?
     # And actually should explicit anys count at all?? Maybe not!
     return typ.type_of_any == TypeOfAny.explicit
@@ -560,6 +564,7 @@ class SuggestionEngine:
             # A colon might be part of a drive name on Windows (like `C:/foo/bar`)
             # and is also used as a delimiter between file path and lineno.
             # If a colon is there for any of those reasons, it must be a file+line
+
             # reference.
             platform_key_count = 2 if sys.platform == "win32" else 1
             if key.count(":") > platform_key_count:
@@ -910,6 +915,7 @@ class TypeFormatter(TypeStrVisitor):
             # Note: for default arguments, we just assume that they
             # are required.  This isn't right, but neither is the
             # other thing, and I suspect this will produce more better
+
             # results than falling back to `...`
             args = [typ.accept(self) for typ in t.arg_types]
             arg_str = f"[{', '.join(args)}]"

@@ -307,6 +307,7 @@ class Server:
             # If the final command is something other than a clean
             # stop, remove the status file. (We can't just
             # simplify the logic and always remove the file, since
+
             # that could cause us to remove a future server's
             # status file.)
             if command != "stop":
@@ -353,6 +354,7 @@ class Server:
         # We need to remove the status file *before* we complete the
         # RPC. Otherwise a race condition exists where a subsequent
         # command can see a status file from a dying server and think
+
         # it is a live one.
         os.unlink(self.status_file)
         return {}
@@ -843,7 +845,7 @@ class Server:
             all_suppressed |= state.suppressed_set
 
         # Filter out things that shouldn't actually be considered suppressed.
-        #
+
         # TODO: Figure out why these are treated as suppressed
         all_suppressed = {
             module

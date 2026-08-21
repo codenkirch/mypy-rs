@@ -386,6 +386,7 @@ def ready_to_read(conns: Sequence[IPCBase], timeout: float | None = None) -> lis
         # Windows doesn't support select() on named pipes. Instead, start an overlapped
         # ReadFile on each pipe (which internally creates an event via CreateEventW),
         # then WaitForMultipleObjects on those events for efficient OS-level waiting.
+
         # Any data consumed by the probe reads is stored into each connection's buffer
         # so the subsequent read_bytes() call will find it via frame_from_buffer().
         WAIT_FAILED = 0xFFFFFFFF
@@ -424,6 +425,7 @@ def ready_to_read(conns: Sequence[IPCBase], timeout: float | None = None) -> lis
         # Cancel all pending operations. CancelIoEx is asynchronous, so an
         # operation may have completed before the cancel took effect. We then
         # wait for all operations to finalize and check each result: completed
+
         # reads get their data saved and are marked ready; cancelled ones are
         # simply skipped. This avoids a race between checking if an operation
         # is signaled and cancelling it.

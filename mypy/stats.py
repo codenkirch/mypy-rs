@@ -107,6 +107,7 @@ class StatisticsVisitor(TraverserVisitor):
         # For each scope (top level/function), whether the scope was type checked
         # (annotated function).
         #
+
         # TODO: Handle --check-untyped-defs
         self.checked_scopes = [True]
 
@@ -184,7 +185,9 @@ class StatisticsVisitor(TraverserVisitor):
         self.record_line(o.line, TYPE_PRECISE)  # TODO: Look at base classes
         # Override this method because we don't want to analyze base_type_exprs (base_type_exprs
         # are base classes in a class declaration).
-        # While base_type_exprs are technically expressions, type analyzer does not visit them and
+        # While base_type_exprs are technically expressions, type analyzer does not
+
+        # visit them and
         # they are not in the typemap.
         for d in o.decorators:
             d.accept(self)

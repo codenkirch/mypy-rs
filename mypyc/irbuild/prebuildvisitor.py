@@ -82,6 +82,7 @@ class PreBuildVisitor(ExtendedTraverserVisitor):
         # Intermediate data structure used to find the function where
         # a SymbolNode is declared. Initially this may point to a
         # function nested inside the function with the declaration,
+
         # but we'll eventually update this to refer to the function
         # with the declaration.
         self.symbols_to_funcs: dict[SymbolNode, FuncItem] = {}
@@ -150,9 +151,11 @@ class PreBuildVisitor(ExtendedTraverserVisitor):
             # Only add the function being decorated if there exist
             # (ordinary) decorators in the decorator list. Certain
             # decorators (such as @property, @abstractmethod) are
+
             # special cased and removed from this list by
             # mypy. Functions decorated only by special decorators
             # (and property setters) are not treated as decorated
+
             # functions by the IR builder.
             if isinstance(dec.decorators[0], MemberExpr) and dec.decorators[0].name == "setter":
                 # Property setters are not treated as decorated methods.
@@ -184,6 +187,7 @@ class PreBuildVisitor(ExtendedTraverserVisitor):
         # If there were already functions or lambda expressions
         # defined in the function stack, then note the previous
         # FuncItem as containing a nested function and the current
+
         # FuncItem as being a nested function.
         if self.funcs:
             # Add the new func to the set of nested funcs within the
@@ -273,6 +277,7 @@ class PreBuildVisitor(ExtendedTraverserVisitor):
                 # The function in which the symbol was previously seen is
                 # nested within the function currently being visited. Thus
                 # the current function is a better candidate to contain the
+
                 # declaration.
                 self.symbols_to_funcs[symbol] = self.funcs[-1]
                 # TODO: Remove from the orig_func free_variables set?

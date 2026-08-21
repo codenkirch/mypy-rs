@@ -52,9 +52,11 @@ def getsyspath() -> list[str]:
     # Drop the first entry of sys.path
     # - If pyinfo.py is executed as a script (in a subprocess), this is the directory
     #   containing pyinfo.py
+
     # - Otherwise, if mypy launched via console script, this is the directory of the script
     # - Otherwise, if mypy launched via python -m mypy, this is the current directory
     # In all these cases, it is desirable to drop the first entry
+
     # Note that mypy adds the cwd to SearchPaths.python_path, so we still find things on the
     # cwd consistently (the return value here sets SearchPaths.package_path)
 

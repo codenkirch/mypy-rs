@@ -179,6 +179,7 @@ def split_commas(value: str) -> list[str]:
 # For most options, the type of the default value set in options.py is
 # sufficient, and we don't have to do anything here.  This table
 # exists to specify types for values initialized to None or container
+
 # types.
 ini_config_types: Final[dict[str, _INI_PARSER_CALLABLE]] = {
     "python_version": parse_version,
@@ -495,7 +496,8 @@ def parse_section(
     results: dict[str, object] = {}
     report_dirs: dict[str, str] = {}
 
-    # Because these fields exist on Options, without proactive checking, we would accept them
+    # Because these fields exist on Options, without proactive checking, we would accept
+    # them
     # and crash later
     invalid_options = {
         "enabled_error_codes": "enable_error_code",
@@ -702,6 +704,7 @@ def parse_mypy_comments(
         # Because this is currently special-cased
         # (the new_sections for an inline config *always* includes 'disable_error_code' and
         # 'enable_error_code' fields, usually empty, which overwrite the old ones),
+
         # we have to manipulate them specially.
         # This could use a refactor, but so could the whole subsystem.
         if (

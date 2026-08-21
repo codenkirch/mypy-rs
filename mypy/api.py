@@ -80,6 +80,7 @@ def run_dmypy(args: list[str]) -> tuple[str, str, int]:
     # A bunch of effort has been put into threading stdout and stderr
     # through the main API to avoid the threadsafety problems of
     # modifying sys.stdout/sys.stderr, but that hasn't been done for
+
     # the dmypy client, so we just do the non-threadsafe thing.
     def f(stdout: TextIO, stderr: TextIO) -> None:
         old_stdout = sys.stdout

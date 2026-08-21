@@ -178,6 +178,7 @@ class ConditionalTypeBinder:
         # The stack of frames currently used.  These map
         # literal_hash(expr) -- literals like 'foo.bar' --
         # to types. The last element of this list is the
+
         # top-most, current frame. Each earlier element
         # records the state as of when that frame was last
         # on top of the stack.
@@ -186,6 +187,7 @@ class ConditionalTypeBinder:
         # For frames higher in the stack, we record the set of
         # Frames that can escape there, either by falling off
         # the end of the frame or by a loop control construct
+
         # or raised exception. The last element of self.frames
         # has no corresponding element in this list.
         self.options_on_return: list[list[Frame]] = []
@@ -325,6 +327,7 @@ class ConditionalTypeBinder:
             # Keys can be narrowed using two different semantics. The new semantics
             # is enabled for inferred variables when bind_all is true, and it allows
             # variable types to be widened using subsequent assignments. This is
+
             # not allowed for instance attributes and annotated variables.
             var = extract_var_from_literal_hash(key)
             old_semantics = (
@@ -342,6 +345,7 @@ class ConditionalTypeBinder:
                 # Do not synthesize a new type if we encountered a conditional block
                 # (if, while or match-case) without assignments.
                 # See check-isinstance.test::testNoneCheckDoesNotMakeTypeVarOptional
+
                 # This is a safe assumption: the fact that we checked something with `is`
                 # or `isinstance` does not change the type of the value.
                 continue
@@ -382,9 +386,11 @@ class ConditionalTypeBinder:
                     # Try simplifying resulting type for unions involving variadic tuples.
                     # Technically, everything is still valid without this step, but if we do
                     # not do this, this may create long unions after exiting an if check like:
+
                     #     x: tuple[int, ...]
                     #     if len(x) < 10:
                     #         ...
+
                     # We want the type of x to be tuple[int, ...] after this block (if it is
                     # still equivalent to such type).
                     if isinstance(type, UnionType):
@@ -417,9 +423,11 @@ class ConditionalTypeBinder:
                     # If there is no current value compare with the declaration. This prevents
                     # reporting false changes in cases like this:
                     #     x: int
+
                     #     if foo():
                     #         x = 1
                     #     else:
+
                     #         x = 2
                     # We check partial types and widening in accept_loop() separately, so
                     # this should be safe.
@@ -502,6 +510,7 @@ class ConditionalTypeBinder:
             # Ideally this function wouldn't be called if the
             # expression has a type error, though -- do other kinds of
             # errors cause this function to get called at invalid
+
             # times?
             return
 

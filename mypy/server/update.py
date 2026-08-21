@@ -312,12 +312,14 @@ class FineGrainedBuildManager:
             # It looks like we are done processing everything, so now
             # reprocess all targets with errors. We are careful to
             # support the possibility that reprocessing an errored module
+
             # might trigger loading of a module, but I am not sure
             # if this can really happen.
             if not changed_modules:
                 # N.B: We just checked next_id, so manager.errors contains
                 # the errors from it. Thus we consider next_id up to date
                 # when propagating changes from the errored targets,
+
                 # which prevents us from reprocessing errors in it.
                 changed_modules = propagate_changes_using_dependencies(
                     self.manager,
@@ -583,9 +585,11 @@ def ensure_trees_loaded(
 # The result of update_module_isolated when no blockers, with these items:
 #
 # - Id of the changed module (can be different from the module argument)
+
 # - Path of the changed module
 # - New AST for the changed module (None if module was deleted)
 # - Remaining changed modules that are not processed yet as (module id, path)
+
 #   tuples (non-empty if the original changed module imported other new
 #   modules)
 class NormalUpdate(NamedTuple):
@@ -675,6 +679,7 @@ def update_module_isolated(
     # Reparsing the file may have brought in dependencies that we
     # didn't have before. Make sure that they are loaded to restore
     # the invariant that a module having a loaded tree implies that
+
     # its dependencies do as well.
     ensure_trees_loaded(manager, graph, graph[module].dependencies)
 
@@ -889,9 +894,11 @@ def calculate_active_triggers(
                 # Activate catch-all wildcard trigger for top-level module changes (used for
                 # "from m import *"). This also gets triggered by changes to module-private
                 # entries, but as these unneeded dependencies only result in extra processing,
+
                 # it's a minor problem.
                 #
                 # TODO: Some __* names cause mistriggers. Fix the underlying issue instead of
+
                 #     special casing them here.
                 diff.add(id + WILDCARD_TAG)
             if item.count(".") > package_nesting_level + 1:
@@ -1262,6 +1269,7 @@ def _lookup_target_impl(
         # A ClassDef target covers the body of the class and everything defined
         # within it.  To get the body we include the entire surrounding target,
         # typically a module top-level, since we don't support processing class
+
         # bodies as separate entities for simplicity.
         assert file is not None
         if node.fullname != target:

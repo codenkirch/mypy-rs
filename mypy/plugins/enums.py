@@ -103,6 +103,7 @@ def _infer_value_type_with_auto_fallback(
     # Find the first _generate_next_value_ on the mro.  We need to know
     # if it is `Enum` because `Enum` types say that the return-value of
     # `_generate_next_value_` is `Any`.  In reality the default `auto()`
+
     # returns an `int` (presumably the `Any` in typeshed is to make it
     # easier to subclass and change the returned type).
     type_with_gnv = _first(ti for ti in info.mro if ti.names.get("_generate_next_value_"))
@@ -185,6 +186,7 @@ def enum_value_callback(ctx: mypy.plugin.AttributeContext) -> Type:
         # We do not know the enum field name (perhaps it was passed to a
         # function and we only know that it _is_ a member).  All is not lost
         # however, if we can prove that the all of the enum members have the
+
         # same value-type, then it doesn't matter which member was passed in.
         # The value-type is still known.
         if isinstance(ctx.type, Instance):
@@ -219,6 +221,7 @@ def enum_value_callback(ctx: mypy.plugin.AttributeContext) -> Type:
             # At first we try to predict future `value` type if all other items
             # have the same type. For example, `int`.
             # If this is the case, we simply return this type.
+
             # See https://github.com/python/mypy/pull/9443
             all_same_value_type = all(
                 proper_type is not None and proper_type == underlying_type
@@ -231,15 +234,19 @@ def enum_value_callback(ctx: mypy.plugin.AttributeContext) -> Type:
             # But, after we started treating all `Enum` values as `Final`,
             # we start to infer types in
             # `item = 1` as `Literal[1]`, not just `int`.
+
             # So, for example types in this `Enum` will all be different:
             #
             #  class Ordering(IntEnum):
+
             #      one = 1
             #      two = 2
             #      three = 3
+
             #
             # We will infer three `Literal` types here.
             # They are not the same, but they are equivalent.
+
             # So, we unify them to make sure `.value` prediction still works.
             # Result will be `Literal[1] | Literal[2] | Literal[3]` for this case.
             all_equivalent_types = all(

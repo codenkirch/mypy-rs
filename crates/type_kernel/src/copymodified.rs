@@ -163,6 +163,7 @@ fn read_int_list_blob(bytes: &[u8]) -> Option<Vec<i64>> {
 // ---------------------------------------------------------------------------
 // Re-encoders for replacement values (mirror the Python write helpers).
 // Only used by unit tests: in production the value blob is built by Python.
+
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

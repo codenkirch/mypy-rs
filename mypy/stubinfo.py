@@ -58,9 +58,11 @@ _legacy_bundled_packages: dict[str, str] = {
 # Map package name to PyPI stub distribution name from typeshed.
 # Stubs for these packages were never bundled with mypy. Don't
 # include packages that have a release that includes PEP 561 type
+
 # information.
 #
 # Note that these packages are omitted for now:
+
 #   pika:       typeshed's stubs are on PyPI as types-pika-ts.
 #               types-pika already exists on PyPI, and is more complete in many ways,
 #               but is a non-typeshed stubs package.
@@ -305,7 +307,9 @@ non_bundled_packages_flat: dict[str, str] = {
     "zstd": "types-zstd",
     "zxcvbn": "types-zxcvbn",
     # Stub packages that are not from typeshed
-    # Since these can be installed automatically via --install-types, we have a high trust bar
+    # Since these can be installed automatically via --install-types, we have a high
+    # trust bar
+
     # for additions here
     "pandas": "pandas-stubs",  # https://github.com/pandas-dev/pandas-stubs
     "lxml": "lxml-stubs",  # https://github.com/lxml/lxml-stubs

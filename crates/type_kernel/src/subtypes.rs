@@ -147,12 +147,15 @@ pub(crate) fn is_subtype(
     // subtypes.py:352-359: non-proper subtype of Any/Unbound/Erased is
     // always True (unless left is UnpackType, which the wire format
     // doesn't produce in this recursive path). The Python shim handles
+
     // this at the top-level entry, but recursive calls from
     // check_type_parameter and the internal visit_* recursions
     // (e.g. TypeType-vs-TypeType recursing on items, subtypes.py:1323)
+
     // bypass the shim, so we must mirror it here. UnboundType right is
     // produced by forward references ("A?") that survive get_proper_type;
     // ErasedType has no wire representation (left/right args are never
+
     // Erased after the shim filters them).
     if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
         // Python expands both operands with get_proper_type before every
@@ -169,9 +172,11 @@ pub(crate) fn is_subtype(
     // _is_subtype (subtypes.py:363-410): when right is UnionType and
     // left is not, left <: right iff left <: some item. Python handles
     // this BEFORE the visitor dispatch; mirror it here so recursive
+
     // calls from check_type_parameter (which bypass the Python shim)
     // get the right answer for union-typed type arguments. Must fire
     // before the NoneType handler (visit_none_type returns False for
+
     // UnionType right, but Python's _is_subtype short-circuit would
     // have already found None <: some union item).
     if let Type::UnionType { items, .. } = right {
@@ -200,6 +205,7 @@ pub(crate) fn is_subtype(
     // visit_uninhabited_type (subtypes.py:555-556): UninhabitedType is
     // a subtype of everything (bottom type). Fires before any right-side
     // dispatch because the Python visitor's `accept` lands on
+
     // `visit_uninhabited_type` regardless of `self.right`.
     if matches!(left, Type::UninhabitedType { .. }) {
         return Some(true);
@@ -226,6 +232,7 @@ pub(crate) fn is_subtype(
                 // subtypes.py:543-549: right is a protocol Instance.
                 // When all protocol_members are __hash__/__str__ (or
                 // members is empty), Python returns True; else False.
+
                 // Non-protocol Instance -> False (subtypes.py:551).
                 let snap = resolver.get(type_ref)?;
                 if snap.is_protocol {
@@ -247,6 +254,7 @@ pub(crate) fn is_subtype(
     // visit_literal_type (subtypes.py:1068-1072): when both sides are
     // LiteralType, subtype is structural equality. Needed by the
     // `_remove_redundant_union_items` dedup pass for unions like
+
     // [Literal[True], Literal[False]] (neither is a subtype of the
     // other, so dedup keeps both before literal contraction collapses
     // them to `bool`).
@@ -256,9 +264,11 @@ pub(crate) fn is_subtype(
     // visit_literal_type else-branch (subtypes.py:1072):
     // is_subtype(LiteralType, right) = is_subtype(lit.fallback, right)
     // for any non-LiteralType right. Python's SubtypeVisitor dispatches
+
     // on left (LiteralType) and recurses into the fallback Instance for
     // every right class except LiteralType (handled above by
     // structural equality), so mirror the full else-branch, not just
+
     // the Instance-right case.
     if let Type::LiteralType { fallback, .. } = left {
         return is_subtype(fallback, right, ctx, resolver);
@@ -266,6 +276,7 @@ pub(crate) fn is_subtype(
     // visit_instance vs LiteralType right (subtypes.py:724-728): only
     // fires when left.last_known_value is Some, recursing into
     // is_subtype(left.last_known_value, right). When lkv is None,
+
     // Instance is NOT a subtype of LiteralType (falls to else: False).
     if let Type::LiteralType { .. } = right {
         if let Type::Instance {
@@ -286,12 +297,15 @@ pub(crate) fn is_subtype(
     // visit_type_var (subtypes.py:735-748), fast path only. When both
     // sides are TypeVarType with the same id (raw_id + namespace, per
     // TypeVarId.__eq__ types.py:567-577; meta_level is not in the wire
+
     // format) and the same upper_bound, Python returns True. The
     // values-with-upper_bound and upper_bound-recursion branches
     // produce results that need a deeper walker; defer those.
+
     //
     // This fast path is what makes is_equivalent_callable return
     // Some(true) for `def f[T](x: T) -> T` vs `def g[T](x: T) -> T`
+
     // after match_generic_callables renumbers both T's to the same id.
     if let Type::TypeVarType {
         raw_id: l_raw,
@@ -322,6 +336,7 @@ pub(crate) fn is_subtype(
             // Different id: Python checks `left.values` then falls back
             // to `_is_subtype(left.upper_bound, right)`. Convert values
             // to a UnionType and try it; if that decides True, done.
+
             // Otherwise fall through to the upper-bound comparison.
             if !l_values.is_empty() {
                 let union = Type::UnionType {
@@ -355,15 +370,19 @@ pub(crate) fn is_subtype(
     // visit_instance (subtypes.py:567-710) when right is TypeVarType:
     // Python falls through to `return False` (line 710) since right is
     // not Instance/TupleType/TypeVarTupleType/TypeType. Mirror that
+
     // for the common case (left=Instance, right=TypeVarType). The
     // protocol/TypeType branches are not reachable here (right is
     // TypeVarType, not those).
+
     // visit_typeddict_type (subtypes.py:1039-1096): structural TypedDict
     // subtyping. Previously used `left == right` (nominal equality including
     // fallback), which rejected two structurally identical TypedDicts with
+
     // different fallback type_refs (e.g. ast_serialize.ParseError vs
     // mypy.nodes.ParseError). Python's structural check ignores fallbacks
     // (subtypes.py:1093) and compares items, required_keys, readonly_keys,
+
     // and is_closed.
     if let Type::TypedDictType { .. } = left {
         return visit_typeddict_subtype(left, right, ctx, resolver);
@@ -390,9 +409,11 @@ pub(crate) fn is_subtype(
     // visit_union_type (subtypes.py:1175-1227): each item of left must be
     // a subtype of right. Python first optimises for right being Instance
     // or UnionType with literal-pruning; the general case is
+
     // `all(self._is_subtype(item, self.orig_right) for item in left.items)`.
     // We always fire the general case — Python's shim has already handled
     // the UnionType-right case at the top-level entry (subtypes.py:362-408),
+
     // so this only fires when left is UnionType and right is something else
     // (or when the shim returned None).
     if let Type::UnionType { items, .. } = left {
@@ -408,6 +429,7 @@ pub(crate) fn is_subtype(
     // visit_tuple_type (subtypes.py:950-1037): TupleType left vs right.
     // Handles right=Instance (Sized, TUPLE_LIKE, structural fallback,
     // protocol) and right=TupleType (variadic via `variadic_tuple_subtype`,
+
     // length, item-by-item, fallback matching).
     if let Type::TupleType {
         partial_fallback,
@@ -608,6 +630,7 @@ pub(crate) fn is_subtype(
             // Check if left.item has a __call__ equivalent.
             // Simplified: if left_item is Instance, get its type_object_type
             // and check return type match. For full parity, we defer to Python
+
             // the complex callable matching.
             return None;
         }
@@ -633,9 +656,11 @@ pub(crate) fn is_subtype(
         // right is Instance (subtypes.py:1105-1119): for a protocol Instance
         // the check is `find_member("__call__", right, right)` then a
         // subtyping check plus `is_protocol_implementation`; for a plain
+
         // Instance it recurses on `left.fallback`. Neither is ported
         // (find_member / is_protocol_implementation stay on the Python
         // side), so defer — deciding here produced a false "incompatible
+
         // type" for an Overloaded passed to a __call__-Protocol.
         if matches!(right, Type::Instance { .. }) {
             return None;
@@ -661,9 +686,11 @@ pub(crate) fn is_subtype(
     // visit_callable_type (subtypes.py:807-889): CallableType left. The
     // Callable-vs-Callable case is handled by the separate callable_compat
     // engine (called from the Python shim), so here we only handle the
+
     // non-Callable right cases that the Python visitor dispatches after the
     // Callable right check. Each path that needs a Python-only helper
     // (find_member, is_protocol_implementation) or the callable_compat
+
     // engine defers to Python.
     if let Type::CallableType {
         fallback: left_fallback,
@@ -674,6 +701,7 @@ pub(crate) fn is_subtype(
         // right is Overloaded (subtypes.py:866-867): left must be a subtype
         // of every overload item. Each recursion is CallableType-vs-
         // CallableType, which the callable_compat engine handles below, so
+
         // the whole check is answerable natively (C1). Defer only if an
         // item recursion defers (wire-unsupported shape).
         if matches!(right, Type::Overloaded { .. }) {
@@ -692,6 +720,7 @@ pub(crate) fn is_subtype(
         // right is Instance (subtypes.py:868-884). Protocol Instance with
         // "__call__" in protocol_members needs find_member and
         // is_protocol_implementation (Python-only); defer those. Protocol
+
         // Instance with left.is_type_obj() also needs
         // is_protocol_implementation; defer. Non-protocol Instance falls
         // through to `is_subtype(left.fallback, right)` (subtypes.py:884).
@@ -713,9 +742,11 @@ pub(crate) fn is_subtype(
                 // Protocol without __call__: Python checks
                 // is_protocol_implementation(left.fallback, right) only if
                 // left.is_type_obj() (subtypes.py:878-883). Defer that too;
+
                 // the non-type-obj path falls to is_subtype(fallback, right).
                 // We can't distinguish is_type_obj here without the
                 // fallback.is_metaclass() check, so defer all protocol
+
                 // Instance right to be safe.
                 return None;
             }
@@ -726,9 +757,11 @@ pub(crate) fn is_subtype(
         // right is TypeType (subtypes.py:885-887): unsound, only checks
         // `left.is_type_obj() and is_subtype(left.get_instance_type(),
         // right.item)`. is_type_obj() is `fallback.type.is_metaclass() and
+
         // ret_type is not UninhabitedType`; we can't read is_metaclass from
         // the snapshot, but instance_type being Some is a strong signal
         // (it's only set for type objects). Defer when instance_type is
+
         // None (can't decide is_type_obj); otherwise recurse on it.
         if let Type::TypeType {
             item: right_item, ..
@@ -744,12 +777,15 @@ pub(crate) fn is_subtype(
         // right is CallableType (C1): route into the native callable_compat
         // engine (subtypes.py:909-965). The engine mirrors the Python
         // `is_callable_compatible` including the pre-checks for
+
         // type_guard/type_is incompatibility (defers on wire-unsupported
         // forms: Parameters, generic left with variables, unpack, resolver
         // misses on the type-obj check, and any nested is_subtype that
+
         // returns None). The flags the visitor passes (`ignore_pos_arg_names`
         // from the SubtypeContext, `strict_concatenate` from extra_checks/
         // strict_concatenate, proper_subtype, strict_optional) come from
+
         // this context; `ignore_return = False`, `check_args_covariantly =
         // False`, and `allow_partial_overlap = False`, matching the
         // `visit_callable_type` call site.
@@ -776,9 +812,11 @@ pub(crate) fn is_subtype(
     // Python's visit_instance falls through to `return False` when right
     // is Any under a proper-subtype check (the _is_subtype Any
     // short-circuit at subtypes.py:348-355 is non-proper-only; visit_any
+
     // handles left=Any; visit_union_type handles left-Union). Deciding
     // here instead of deferring is required: is_proper_subtype(X, Any)
     // is pervasive in thank-you paths like _remove_redundant_union_items,
+
     // and a `None` deferral there would push the whole simplified union to
     // Python, defeating the port.
     if ctx.proper_subtype && matches!(right, Type::AnyType { .. }) {
@@ -789,9 +827,11 @@ pub(crate) fn is_subtype(
         // Python's `visit_instance` (subtypes.py:567-710) continues past
         // the Instance-right case for several non-Instance right types,
         // returning a definite `False` for most. Port that tail here so
+
         // the huge Instance-left / non-Instance-right population stops
         // deferring to Python (issue #591, ~124k deferrals on the
         // self-check corpus). Cases needing Python-only helpers
+
         // (find_member, is_metaclass, is_protocol_implementation,
         // callable_compat) still defer.
         _ => {
@@ -840,6 +880,7 @@ fn visit_instance_noninstance_right(
     // Left snapshot missing (synthesized instance, e.g. from isinstance
     // narrowing): matching Python needs the live TypeInfo, which the
     // nominal path also treats as missing-snapshot. Defer rather than
+
     // risk a wrong result for FakeInfo / fallback_to_any left types.
     let left_snap = resolver.get(left_ref)?;
     // fallback_to_any short-circuit (subtypes.py:638-643): a class with
@@ -864,6 +905,7 @@ fn visit_instance_noninstance_right(
         // Snapshot missing (synthesized fallback): can't confirm the
         // `is_enum` / `has_base` conditions, so defer like the nominal
         // path does on a missing left snapshot rather than risk a wrong
+
         // `False`.
         let pf_snap = resolver.get(pf_ref)?;
         // subtypes.py:595-596: partial_fallback.type.is_enum.
@@ -911,6 +953,7 @@ fn visit_instance_noninstance_right(
     // TypeVarTupleType right (subtypes.py:617-620) needs
     // `map_instance_to_supertype` against the typevar's variadic
     // tuple_fallback and a first-arg check; rare for Instance-left on
+
     // production corpora and not exercised by the deferred ports' parity
     // suite. Defer to Python.
     if matches!(right, Type::TypeVarTupleType { .. }) {
@@ -919,6 +962,7 @@ fn visit_instance_noninstance_right(
     // TypeType right (subtypes.py:784-795): when left is `builtins.type`
     // (non-proper) recurse against Any; when left's type is a metaclass
     // AND the right item is `builtins.object` (a class can accept any
+
     // metaclass instance as its "object"-typed slot) return True.
     // Otherwise fall through to the FunctionLike / literal / False tail
     // below, matching Python exactly.
@@ -933,6 +977,7 @@ fn visit_instance_noninstance_right(
             // subtypes.py:789-792: `left` is `builtins.type`: recurse
             // against `TypeType(Any)`. (TypeType is reached for
             // `type[builtins.type]`, i.e. a `type` object passed where a
+
             // class object is expected.)
             if left_ref == "builtins.type" {
                 let special_any = Type::AnyType {
@@ -1266,6 +1311,7 @@ fn map_derivation_path(
     // Variadic left: expand_type_by_instance would need the
     // split_with_prefix_and_suffix logic to substitute the TypeVarTuple
     // middle. Not ported; defer to Python. Also guards mid-path bases
+
     // that are variadic even when the original left isn't.
     if left_snap.has_type_var_tuple_type {
         return None;
@@ -1320,6 +1366,7 @@ fn visit_instance_nominal(
     // If left's TypeInfo is not in the resolver, it may be a synthesized
     // type (e.g. ad-hoc intersection from isinstance narrowing) whose
     // MRO and bases are only available on the live Python TypeInfo.
+
     // Defer rather than returning a wrong Some(false).
     #[allow(clippy::question_mark)]
     if left_snap.is_none() {
@@ -1371,18 +1418,23 @@ fn visit_instance_nominal(
     // Python's NamedTuple clause (subtypes.py:632-635) fires only when
     // `rname in TYPED_NAMEDTUPLE_NAMES` (right is typing.NamedTuple or
     // typing_extensions.NamedTuple literally) AND some class in left's
+
     // mro is a NamedTuple. The snapshot's `is_named_tuple` flag is True
     // for ANY NamedTuple subclass (e.g. __main__.A), not just the
     // typing.NamedTuple base, so checking `right_snap.is_named_tuple`
+
     // would wrongly apply the nominal branch to two unrelated
     // NamedTuples (e.g. is_subtype(A, B) -> Some(true)). Rust can't read
     // `rname in TYPED_NAMEDTUPLE_NAMES` from the snapshot alone without
+
     // also special-casing the two base fullnames; defer the whole
     // NamedTuple-right case so Python's exact condition decides.
     // Python's NamedTuple clause (subtypes.py:632-637) fires when right
+
     // is literally typing.NamedTuple or typing_extensions.NamedTuple (the
     // only two names in TYPED_NAMEDTUPLE_NAMES) AND some class in left's
     // mro is_named_tuple. Checking right_snap.is_named_tuple would be
+
     // wrong because that flag is True for ANY NamedTuple subclass.
     let is_named_tuple_right = matches!(
         right_ref,
@@ -1431,6 +1483,7 @@ fn visit_instance_nominal(
         // Generic substitution path: map_instance_to_supertype walks
         // class_derivation_paths over the snapshot's bases blobs,
         // substituting TypeVars via expand_type_by_instance. Returns
+
         // None when an unsupported Type variant is in the tree (e.g.
         // UnpackType, ParamSpec), in which case Python falls through.
         map_instance_to_supertype(left_ref, left_args, right_ref, resolver)?
@@ -1454,6 +1507,7 @@ fn visit_instance_nominal(
         // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else
         // branch (subtypes.py:691-696) treats them as COVARIANT, but
         // the arg shapes (CallableType with ParamSpec prefix, TupleType
+
         // for variadic middle) hit unsupported variants in the
         // recursive is_subtype. Defer to Python.
         if *kind != 0 {
@@ -1511,6 +1565,7 @@ fn check_type_parameter(
     // subtypes.py:522-526: an `ambiguous` UninhabitedType (empty
     // collection literal / partial state) is safe to treat as COVARIANT
     // even under INVARIANT, since such a type can't be stored in a
+
     // variable. Without this, the invariant two-way check would demand
     // `right <: Never` and reject empty literals against dict/list
     // contexts. Mirrors `checker.is_valid_inferred_type()`.
@@ -2087,6 +2142,7 @@ mod tests {
         // proper_subtype=True: the fallback_to_any branch is skipped
         // (subtypes.py:493 `not self.proper_subtype`). a.AnyBase is not
         // a nominal base of a.Other and a.Other is not a protocol, so
+
         // Python records a negative cache and returns False
         // (subtypes.py:634-635).
         let mut base = snap("a.AnyBase", "AnyBase");
@@ -2452,6 +2508,7 @@ mod tests {
         // visit_none_type (subtypes.py:551): strict_optional + right is
         // Instance (non-protocol) -> False. Protocol detection needs the
         // snapshot's is_protocol field; this test uses a non-protocol
+
         // Instance, so we return False.
         let r = make_resolver(vec![snap("a.A", "A")]);
         assert_eq!(
@@ -2579,6 +2636,7 @@ mod tests {
         // M18 parity: two TypedDicts with identical items but different
         // fallback type_refs (e.g. ast_serialize.ParseError vs
         // mypy.nodes.ParseError) must be compatible. Python ignores
+
         // fallbacks (subtypes.py:1093); the old Rust `left == right`
         // check rejected this.
         let mk_typeddict = |type_ref: &str| Type::TypedDictType {
@@ -2939,6 +2997,7 @@ mod tests {
         // right is CallableType: at least one overload item must match
         // (subtypes.py:1126-1130). The lane routed Callable-vs-Callable
         // into the native callable_compat engine, so the item check no
+
         // longer defers: identical signatures -> True.
         let r = make_resolver(vec![snap("builtins.function", "function")]);
         let item = callable_type(vec![], Type::NoneType, None);

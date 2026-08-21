@@ -222,6 +222,7 @@ pub(crate) fn read_short_int(buf: &mut ReadBuffer<'_>, first: u8) -> Result<i64,
 fn read_long_int(buf: &mut ReadBuffer<'_>) -> Result<i64, WireError> {
     // Short-int encoding: (size << 1) | sign.
     // read_short_int returns raw value, so we extract directly:
+
     // sign = size_and_sign & 1
     //   size = size_and_sign >> 1
     let first = buf.read_u8()?;
@@ -470,6 +471,7 @@ pub(crate) struct Parameters {
 // Variant names mirror mypy's `Type` subclasses (Instance, AnyType, NoneType,
 // ...) for direct cross-referencing with `mypy/types.py`. Clippy's
 // `enum_variant_names` lint would force renames that diverge from that
+
 // one-to-one mapping.
 #[allow(dead_code, clippy::enum_variant_names)]
 pub(crate) enum Type {
@@ -758,6 +760,7 @@ fn read_type_var_type(buf: &mut ReadBuffer<'_>) -> Result<Type, WireError> {
             // The writer always appends END_TAG after an optional
             // meta_level; when the tag was LITERAL_INT the END_TAG is
             // still in the stream (unlike the absent case above, where
+
             // the peek consumed it). Consume it so back-to-back records
             // (e.g. `read_type_list`) stay aligned.
             let end = read_tag(buf)?;
@@ -1286,6 +1289,7 @@ impl fmt::Display for Type {
                 // The wire format carries `type_ref: String` but no resolved
                 // `TypeAlias` node, so `t.alias is None` and `TypeStrVisitor`
                 // renders `"<alias (unfixed)>"`. Stage 3b will resolve refs
+
                 // and expand non-recursive aliases here.
                 write!(f, "<alias (unfixed)>")
             }
@@ -1297,9 +1301,11 @@ impl fmt::Display for Type {
             } => {
                 // visit_instance renders `t.type.name` (the short class name)
                 // when `not reveal_verbose_types and fullname.startswith("builtins.")`.
+
                 // The wire format carries only `type.fullname` (as `type_ref`),
                 // not `type.name`, so we cannot replicate the prefix strip
                 // without resolving the ref against a TypeInfo snapshot.
+
                 // Render `type_ref` verbatim — this matches the test fixture
                 // (where `TypeInfo.name == fullname`) exactly, and Stage 3b
                 // will resolve refs for production-correct stripping.
@@ -1368,6 +1374,7 @@ impl fmt::Display for Type {
                 // visit_callable_type. Python builds `def {vars_block} ({params}) -> {ret}`:
                 // the variables block (if any) is rendered as `[v1, v2] `
                 // *after* `def ` and *before* the params. We build the params
+
                 // and ret first, then prepend `def ` + the variables block.
                 let mut params = String::new();
                 let mut asterisk = false;
@@ -1693,13 +1700,15 @@ pub(crate) fn read_type_to_str(bytes: &[u8]) -> PyResult<String> {
 // ---------------------------------------------------------------------------
 // WriteBuffer + write_type (Stage 3c M8s)
 // ---------------------------------------------------------------------------
-//
+
 // The reader above is the source of truth for the byte layout: every
 // `write_*` here is the exact inverse of the corresponding `read_*`, so
 // `read_type(&write_type(t)) == t` over the supported variants. Mirrors
+
 // `Type.write(WriteBuffer)` in mypy/types.py and the bare primitives in
 // librt_internal.c. Only the variants the set-ops visitors can produce
 // (leaf types + args-less Instance + TypeType) are implemented; other
+
 // variants return `Err(WireError::Invalid(...))` so callers fail loudly
 // rather than emitting malformed bytes.
 
@@ -2132,6 +2141,7 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             // Truthiness flags (cache wire layout >= 11): must mirror
             // `UnionType.write`/`read` in types.py so round-trips
             // preserve can_be_true/can_be_false instead of resetting
+
             // them to defaults (issue #201).
             write_bool(buf, *can_be_true);
             write_bool(buf, *can_be_false);
@@ -2652,6 +2662,7 @@ mod tests {
     // ----- write_type round-trip (M8s) -----
     // Every test writes a Type then reads it back; the result must equal
     // the input. This is the exact contract Python's Type.read() will
+
     // rely on when decoding bytes Rust produces over FFI.
 
     fn round_trip(t: &Type) -> Type {
@@ -2828,6 +2839,7 @@ mod tests {
         // ParamSpecType has a write arm (added with the typeanal/constraint
         // wire support), so it writes and reads back cleanly. If a future
         // variant is added without a write arm, `write_type` must error
+
         // rather than emit bytes Type.read() would reject.
         let prefix = Parameters {
             arg_types: vec![],

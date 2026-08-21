@@ -389,6 +389,7 @@ pub(crate) fn rust_is_custom_settable_property(py: Python<'_>, defn: &PyAny) -> 
     // get_property_type(get_proper_type(var.type))
     // get_property_type: CallableType -> proper ret_type; Overloaded ->
     // proper items[0].ret_type; otherwise the type itself
+
     // (checker.py:9908-9913).
     let var_proper = get_proper_type.call1((var_type,))?;
     let property_type = get_property_type(py, get_proper_type, var_proper)?;

@@ -206,6 +206,7 @@ fn dangerous_comparison_inner(
             // Recurse on the two item types of the mapped AbstractSet
             // supertype, mirroring Python's fresh recursive call: the item
             // pair's custom-__eq__ is re-evaluated and the per-call flags
+
             // reset. The mapped supertype may be a non-generated pair, but
             // `map_instance_to_supertype` resolves to the wire snapshot.
             let left_args =

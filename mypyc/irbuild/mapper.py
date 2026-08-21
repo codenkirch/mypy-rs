@@ -201,9 +201,11 @@ class Mapper:
         # mypyc FuncSignatures (unlike mypy types) want to have a name
         # present even when the argument is position only, since it is
         # the sole way that FuncDecl arguments are tracked. This is
+
         # generally fine except in some cases (like for computing
         # init_sig) we need to produce FuncSignatures from a
         # deserialized FuncDef that lacks arguments. We won't ever
+
         # need to use those inside of a FuncIR, so we just make up
         # some crap.
         if hasattr(fdef, "arguments"):
@@ -222,6 +224,7 @@ class Mapper:
             # We force certain dunder methods to return objects to support letting them
             # return NotImplemented. It also avoids some pointless boxing and unboxing,
             # since tp_richcompare needs an object anyways.
+
             # However, it also prevents some optimizations.
             if fdef.name in ("__eq__", "__ne__", "__lt__", "__gt__", "__le__", "__ge__"):
                 ret = object_rprimitive

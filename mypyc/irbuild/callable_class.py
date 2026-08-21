@@ -47,12 +47,15 @@ def setup_callable_class(builder: IRBuilder) -> None:
     # Check to see that the name has not already been taken. If so,
     # rename the class. We allow multiple uses of the same function
     # name because this is valid in if-else blocks. Example:
+
     #
     #     if True:
     #         def foo():          ---->    foo_obj()
+
     #             return True
     #     else:
     #         def foo():          ---->    foo_obj_0()
+
     #             return False
     name = base_name = f"{builder.fn_info.namespaced_name()}_obj"
     count = 0
@@ -70,6 +73,7 @@ def setup_callable_class(builder: IRBuilder) -> None:
     # The functools @wraps decorator attempts to call setattr on
     # nested functions, so we create a dict for these nested
     # functions.
+
     # https://github.com/python/cpython/blob/3.7/Lib/functools.py#L58
     if builder.fn_info.is_nested:
         callable_class_ir.has_dict = True
@@ -215,15 +219,19 @@ def instantiate_callable_class(builder: IRBuilder, fn_info: FuncInfo) -> Value:
     # Set the environment attribute of the callable class to point at
     # the environment class defined in the callable class' immediate
     # outer scope. Note that there are three possible environment
+
     # class registers we may use. This depends on what the encapsulating
     # (parent) function is:
     #
+
     # - A nested function: the callable class is instantiated
     #   from the current callable class' '__call__' function, and hence
     #   the callable class' environment register is used.
+
     # - A generator function: the callable class is instantiated
     #   from the '__next__' method of the generator class, and hence the
     #   environment of the generator class is used.
+
     # - Regular function or comprehension scope: we use the environment
     #   of the original function. Comprehension scopes are inlined (no
     #   callable class), so they fall into this case despite is_nested.
@@ -237,7 +245,9 @@ def instantiate_callable_class(builder: IRBuilder, fn_info: FuncInfo) -> Value:
     if curr_env_reg:
         builder.add(SetAttr(func_reg, ENV_ATTR_NAME, curr_env_reg, fitem.line))
     # Initialize function wrapper for callable classes. As opposed to regular functions,
-    # each instance of a callable class needs its own wrapper because they might be instantiated
+    # each instance of a callable class needs its own wrapper because they might be
+    # instantiated
+
     # inside other functions.
     if not fn_info.in_non_ext and fn_info.is_coroutine:
         builder.add_coroutine_setup_call(fn_info.callable_class.ir.name, func_reg)

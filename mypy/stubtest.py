@@ -314,9 +314,12 @@ def _verify_exported_names(
             "names exported from the stub do not correspond to the names exported at runtime. "
             "This is probably due to things being missing from the stub or an inaccurate `__all__` in the stub"
         ),
-        # Pass in MISSING instead of the stub and runtime objects, as the line numbers aren't very
+        # Pass in MISSING instead of the stub and runtime objects, as the line numbers
+        # aren't very
         # relevant here, and it makes for a prettier error message
+
         # This means this error will be ignored when using `--ignore-missing-stub`, which is
+
         # desirable in at least the `names_in_runtime_not_stub` case
         stub_object=MISSING,
         runtime_object=MISSING,
@@ -522,7 +525,9 @@ def _shape_differs(t1: type[object], t2: type[object]) -> bool:
         return t1.__basicsize__ != t2.__basicsize__ or t1.__itemsize__ != t2.__itemsize__
     else:
         # CPython had more complicated logic before 3.12:
-        # https://github.com/python/cpython/blob/f3c6f882cddc8dc30320d2e73edf019e201394fc/Objects/typeobject.c#L2224
+        # https://github.com/python/cpython/blob/f3c6f882cddc8dc30320d2e73edf019e201394fc
+        #   /Objects/typeobject.c#L2224
+
         # We attempt to mirror it here well enough to support the most common cases.
         if t1.__itemsize__ or t2.__itemsize__:
             return t1.__basicsize__ != t2.__basicsize__ or t1.__itemsize__ != t2.__itemsize__
@@ -606,8 +611,10 @@ def _verify_disjoint_base(
 def _verify_metaclass(
     stub: nodes.TypeInfo, runtime: type[Any], object_path: list[str], *, is_runtime_typeddict: bool
 ) -> Iterator[Error]:
-    # We exclude protocols, because of how complex their implementation is in different versions of
+    # We exclude protocols, because of how complex their implementation is in different
+    # versions of
     # python. Enums are also hard, as are runtime TypedDicts; ignoring.
+
     # TODO: check that metaclasses are identical?
     if not stub.is_protocol and not stub.is_enum and not is_runtime_typeddict:
         runtime_metaclass = type(runtime)
@@ -682,7 +689,10 @@ def verify_typeinfo(
 
     # Check everything already defined on the stub class itself (i.e. not inherited)
     #
-    # Filter out non-identifier names, as these are (hopefully always?) whacky/fictional things
+    # Filter out non-identifier names, as these are (hopefully always?) whacky/fictional
+
+    # things
+
     # (like __mypy-replace or __mypy-post_init, etc.) that don't exist at runtime,
     # and exist purely for internal mypy reasons
     to_check = {name for name in stub.names if name.isidentifier()}
@@ -693,6 +703,7 @@ def verify_typeinfo(
     # Special-case the __init__ method for Protocols and the __new__ method for TypedDicts
     #
     # TODO: On Python <3.11, __init__ methods on Protocol classes
+
     # are silently discarded and replaced.
     # However, this is not the case on Python 3.11+.
     # Ideally, we'd figure out a good way of validating Protocol __init__ methods on 3.11+.
@@ -740,6 +751,7 @@ def verify_typeinfo(
         # Do not error for an object missing from the stub
         # If the runtime object is a types.WrapperDescriptorType object
         # and has a non-special dunder name.
+
         # The vast majority of these are false positives.
         if not (
             isinstance(stub_to_verify, Missing)
@@ -769,7 +781,8 @@ def _verify_static_class_methods(
         # Special cased by Python, so don't bother checking
         return
     if inspect.isbuiltin(runtime):
-        # The isinstance checks don't work reliably for builtins, e.g. datetime.datetime.now, so do
+        # The isinstance checks don't work reliably for builtins, e.g.
+        # datetime.datetime.now, so do
         # something a little hacky that seems to work well
         probably_class_method = isinstance(getattr(runtime, "__self__", None), type)
         if probably_class_method and not stub.is_class:
@@ -847,6 +860,7 @@ def _verify_arg_default_value(
             # Fallback to the type annotation type if var type is missing. The type annotation
             # is an UnboundType, but I don't know enough to know what the pros and cons here are.
             # UnboundTypes have ugly question marks following them, so default to var type.
+
             # Note we do this same fallback when constructing signatures in from_overloadedfuncdef
             stub_type = stub_arg.variable.type or stub_arg.type_annotation
             if isinstance(stub_type, mypy.types.TypeVarType):
@@ -1043,6 +1057,7 @@ class Signature(Generic[T]):
                 # For positional-only args, we allow overloads to have different names for the same
                 # argument. To accomplish this, we just make up a fake index-based name.
                 # We can only use the index-based name if the argument is always
+
                 # positional only. Sometimes overloads have an arg as positional-only
                 # in some but not all branches of the overload.
                 name = arg.variable.name
@@ -1141,10 +1156,16 @@ def _verify_signature(
 
     # Check unmatched positional args
     if len(stub.pos) > len(runtime.pos):
-        # There are cases where the stub exhaustively lists out the extra parameters the function
-        # would take through *args. Hence, a) if runtime accepts *args, we don't check whether the
-        # runtime has all of the stub's parameters, b) below, we don't enforce that the stub takes
-        # *args, since runtime logic may prevent arbitrary arguments from actually being accepted.
+        # There are cases where the stub exhaustively lists out the extra parameters the
+        # function
+        # would take through *args. Hence, a) if runtime accepts *args, we don't check
+
+        # whether the
+        # runtime has all of the stub's parameters, b) below, we don't enforce that the
+        # stub takes
+
+        # *args, since runtime logic may prevent arbitrary arguments from actually being
+        # accepted.
         if runtime.varpos is None:
             for stub_arg in stub.pos[len(runtime.pos) :]:
                 # If the variable is in runtime.kwonly, it's just mislabelled as not a
@@ -1183,10 +1204,16 @@ def _verify_signature(
 
     # Check unmatched keyword-only args
     if runtime.varkw is None or not set(runtime.kwonly).issubset(set(stub.kwonly)):
-        # There are cases where the stub exhaustively lists out the extra parameters the function
-        # would take through **kwargs. Hence, a) if runtime accepts **kwargs (and the stub hasn't
-        # exhaustively listed out params), we don't check whether the runtime has all of the stub's
-        # parameters, b) below, we don't enforce that the stub takes **kwargs, since runtime logic
+        # There are cases where the stub exhaustively lists out the extra parameters the
+        # function
+        # would take through **kwargs. Hence, a) if runtime accepts **kwargs (and the
+
+        # stub hasn't
+        # exhaustively listed out params), we don't check whether the runtime has all of
+        # the stub's
+
+        # parameters, b) below, we don't enforce that the stub takes **kwargs, since
+        # runtime logic
         # may prevent arbitrary keyword arguments from actually being accepted.
         for arg in sorted(set(stub.kwonly) - set(runtime.kwonly)):
             if arg in {runtime_arg.name for runtime_arg in runtime.pos}:
@@ -1217,7 +1244,8 @@ def _verify_signature(
         # Also check against positional parameters, to avoid a nitpicky message when an argument
         # isn't marked as keyword-only
         stub_pos_names = {stub_arg.variable.name for stub_arg in stub.pos}
-        # Ideally we'd do a strict subset check, but in practice the errors from that aren't useful
+        # Ideally we'd do a strict subset check, but in practice the errors from that
+        # aren't useful
         if not set(runtime.kwonly).issubset(set(stub.kwonly) | stub_pos_names):
             yield f'stub does not have **kwargs parameter "{runtime.varkw.name}"'
     if stub.varkw is not None and runtime.varkw is None:
@@ -1395,8 +1423,11 @@ def verify_overloadedfuncdef(
     # mypy doesn't allow overloads where one overload is abstract but another isn't,
     # so it should be okay to just check whether the first overload is abstract or not.
     #
-    # TODO: Mypy *does* allow properties where e.g. the getter is abstract but the setter is not;
+
+    # TODO: Mypy *does* allow properties where e.g. the getter is abstract but the
+    # setter is not;
     # and any property with a setter is represented as an OverloadedFuncDef internally;
+
     # not sure exactly what (if anything) we should do about that.
     first_part = stub.items[0]
     if isinstance(first_part, nodes.Decorator) and first_part.is_overload:
@@ -1476,8 +1507,11 @@ def verify_paramspecexpr(
 
 def _is_django_cached_property(runtime: Any) -> bool:  # pragma: no cover
     # This is a special case for
-    # https://docs.djangoproject.com/en/5.2/ref/utils/#django.utils.functional.cached_property
+    # https://docs.djangoproject.com/en/5.2/ref/utils/
+    #   #django.utils.functional.cached_property
+
     # This is needed in `django-stubs` project:
+
     # https://github.com/typeddjango/django-stubs
     if type(runtime).__name__ != "cached_property":
         return False
@@ -1881,6 +1915,7 @@ def safe_inspect_signature(runtime: Any) -> inspect.Signature | None:
         # This is an __init__ method with the generic C-class signature.
         # In this case, the underlying class often has a better signature,
         # which we can convert into an __init__ signature by adding in the
+
         # self parameter.
         try:
             s = inspect.signature(runtime.__objclass__)
@@ -1908,6 +1943,7 @@ def safe_inspect_signature(runtime: Any) -> inspect.Signature | None:
         # This is a __new__ method with the generic C-class signature.
         # In this case, the underlying class often has a better signature,
         # which we can convert into a __new__ signature by adding in the
+
         # cls parameter.
 
         # If the attached class has a valid __init__, skip recovering a
@@ -1962,6 +1998,7 @@ def safe_inspect_signature(runtime: Any) -> inspect.Signature | None:
         # inspect.signature throws ValueError all the time
         # catch RuntimeError because of https://bugs.python.org/issue39504
         # catch TypeError because of https://github.com/python/typeshed/pull/5762
+
         # catch AttributeError because of inspect.signature(_curses.window.border)
         return None
 
@@ -2290,12 +2327,15 @@ def get_importable_stdlib_modules() -> set[str]:
             # There are many annoying *.__main__ stdlib modules,
             # and including stubs for them isn't really that useful anyway:
             # tkinter.__main__ opens a tkinter windows; unittest.__main__ raises SystemExit; etc.
+
             #
             # The idlelib.* submodules are similarly annoying in opening random tkinter windows,
             # and we're unlikely to ever add stubs for idlelib in typeshed
+
             # (see discussion in https://github.com/python/typeshed/pull/9193)
             #
             # test.* modules do weird things like raising exceptions in __del__ methods,
+
             # leading to unraisable exceptions being logged to the terminal
             # as a warning at the end of the stubtest run
             if submodule_name.endswith(".__main__") or submodule_name.startswith(

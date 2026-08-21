@@ -25,10 +25,14 @@ class Pattern(Node):
 class AsPattern(Pattern):
     """The pattern <pattern> as <name>"""
 
-    # The python ast, and therefore also our ast merges capture, wildcard and as patterns into one
+    # The python ast, and therefore also our ast merges capture, wildcard and as
+    # patterns into one
     # for easier handling.
-    # If pattern is None this is a capture pattern. If name and pattern are both none this is a
+
+    # If pattern is None this is a capture pattern. If name and pattern are both none
+    # this is a
     # wildcard pattern.
+
     # Only name being None should not happen but also won't break anything.
     pattern: Pattern | None
     name: NameExpr | None
@@ -94,7 +98,8 @@ class SequencePattern(Pattern):
 
 
 class StarredPattern(Pattern):
-    # None corresponds to *_ in a list pattern. It will match multiple items but won't bind them to
+    # None corresponds to *_ in a list pattern. It will match multiple items but won't
+    # bind them to
     # a name.
     capture: NameExpr | None
 

@@ -13,51 +13,67 @@ from mypyc.namegen import NameGenerator, exported_name
 # Some notes on the vtable layout: Each concrete class has a vtable
 # that contains function pointers for its methods. So that subclasses
 # may be efficiently used when their parent class is expected, the
+
 # layout of child vtables must be an extension of their base class's
 # vtable.
 #
+
 # This makes multiple inheritance tricky, since obviously we cannot be
 # an extension of multiple parent classes. We solve this by requiring
 # all but one parent to be "traits", which we can operate on in a
+
 # somewhat less efficient way. For each trait implemented by a class,
 # we generate a separate vtable for the methods in that trait.
 # We then store an array of (trait type, trait vtable) pointers alongside
+
 # a class's main vtable. When we want to call a trait method, we
 # (at runtime!) search the array of trait vtables to find the correct one,
 # then call through it.
+
 # Trait vtables additionally need entries for attribute getters and setters,
 # since they can't always be in the same location.
 #
+
 # To keep down the number of indirections necessary, we store the
 # array of trait vtables in the memory *before* the class vtable, and
 # search it backwards.  (This is a trick we can only do once---there
+
 # are only two directions to store data in---but I don't think we'll
 # need it again.)
 # There are some tricks we could try in the future to store the trait
+
 # vtables inline in the trait table (which would cut down one indirection),
 # but this seems good enough for now.
 #
+
 # As an example:
 # Imagine that we have a class B that inherits from a concrete class A
 # and traits T1 and T2, and that A has methods foo() and
+
 # bar() and B overrides bar() with a more specific type.
 # Then B's vtable will look something like:
 #
+
 #      T1 type object
 #      ptr to B's T1 trait vtable
 #      T2 type object
+
 #      ptr to B's T2 trait vtable
 # -> | A.foo
 #    | Glue function that converts between A.bar's type and B.bar
+
 #      B.bar
 #      B.baz
 #
+
 # The arrow points to the "start" of the vtable (what vtable pointers
 # point to) and the bars indicate which parts correspond to the parent
 # class A's vtable layout.
+
 #
 # Classes that allow interpreted code to subclass them also have a
 # "shadow vtable" that contains implementations that delegate to
+
 # making a pycall, so that overridden methods in interpreted children
 # will be called. (A better strategy could dynamically generate these
 # vtables based on which methods are overridden in the children.)
@@ -65,6 +81,7 @@ from mypyc.namegen import NameGenerator, exported_name
 # Descriptions of method and attribute entries in class vtables.
 # The 'cls' field is the class that the method/attr was defined in,
 # which might be a parent class.
+
 # The 'shadow_method', if present, contains the method that should be
 # placed in the class's shadow vtable (if it has one).
 
@@ -117,12 +134,15 @@ class ClassIR:
         # Is this class declared as serializable (supports copy.copy
         # and pickle) using @mypyc_attr(serializable=True)?
         #
+
         # Additionally, any class with this attribute False but with
         # an __init__ that can be called without any arguments is
         # *implicitly serializable*. In this case __init__ will be
+
         # called during deserialization without arguments. If this is
         # True, we match Python semantics and __init__ won't be called
         # during deserialization.
+
         #
         # This impacts also all subclasses. Use is_serializable() to
         # also consider base classes.
@@ -136,6 +156,7 @@ class ClassIR:
         # Declare setup method that allocates and initializes an object. type is the
         # type of the class being initialized, which could be another class if there
         # is an interpreted subclass.
+
         # TODO: Make it a regular method and generate its body in IR
         self.setup = FuncDecl(
             "__mypyc__" + name + "_setup",
@@ -162,6 +183,7 @@ class ClassIR:
         # Properties are accessed like attributes, but have behavior like method calls.
         # They don't belong in the methods dictionary, since we don't want to expose them to
         # Python's method API. But we want to put them into our own vtable as methods, so that
+
         # they are properly handled and overridden. The property dictionary values are a tuple
         # containing a property getter and an optional property setter.
         self.properties: dict[str, tuple[FuncIR, FuncIR | None]] = {}
@@ -185,6 +207,7 @@ class ClassIR:
         # Direct subclasses of this class (use subclasses() to also include non-direct ones)
         # None if separate compilation prevents this from working.
         #
+
         # Often it's better to use has_no_subclasses() or subclasses() instead.
         self.children: list[ClassIR] | None = []
 
@@ -194,9 +217,11 @@ class ClassIR:
         # Attributes that are always initialized in __init__ or class body
         # (inferred in mypyc.analysis.attrdefined using interprocedural analysis).
         # These can never raise AttributeError when accessed. If an attribute
+
         # is *not* always initialized, we normally use the error value for
         # an undefined value. If the attribute byte has an overlapping error value
         # (the error_overlap attribute is true for the RType), we use a bitmap
+
         # to track if the attribute is defined instead (see bitmap_attrs).
         self._always_initialized_attrs: set[str] = set()
 
@@ -209,6 +234,7 @@ class ClassIR:
         # Definedness of these attributes is backed by a bitmap. Index in the list
         # indicates the bit number. Includes inherited attributes. We need the
         # bitmap for types such as native ints (i64 etc.) that can't have a dedicated
+
         # error value that doesn't overlap a valid value. The bitmap is used if the
         # value of an attribute is the same as the error value.
         self.bitmap_attrs: list[str] = []
@@ -219,6 +245,7 @@ class ClassIR:
         # If True, keep one freed, cleared instance available for immediate reuse to
         # speed up allocations. This helps if many objects are freed quickly, before
         # other instances of the same class are allocated. This is effectively a
+
         # per-type free "list" of up to length 1.
         self.reuse_freed_instance = False
 

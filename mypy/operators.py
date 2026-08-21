@@ -129,6 +129,7 @@ neg_ops: Final = {
 # Stage 4c type-kernel seam: when the `type_kernel` Rust extension is
 # importable, replace the Python data tables with the Rust-native copies.
 # The data is identical (pure static mappings), so this is a zero-risk swap
+
 # that exercises the Rust module loading path and gives other kernel
 # modules a single FFI call to fetch all operator tables.
 try:

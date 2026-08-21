@@ -136,6 +136,7 @@ pub(crate) fn custom_special_method_inner(
         } if is_type_obj(fallback, ret_type, *from_concatenate, resolver) => {
             // FunctionLike.is_type_obj(): look up on the metaclass
             // (the fallback). For CallableType, `is_type_obj` means
+
             // fallback.type.is_metaclass() and ret_type is not
             // UninhabitedType. We recurse on the fallback Instance.
             custom_special_method_inner(fallback, name, check_all, resolver)
@@ -144,6 +145,7 @@ pub(crate) fn custom_special_method_inner(
             // FunctionLike.is_type_obj(): all items agree, so check
             // items[0]. If it's a type obj, recurse on its fallback;
             // otherwise defer (the Python path checks the fallback
+
             // via `typ.fallback` which the wire Overloaded lacks).
             if let Some(Type::CallableType {
                 fallback,
@@ -257,6 +259,7 @@ fn has_custom_eq_checks_inner(typ: &Type, resolver: &TypeResolver) -> Option<boo
     // custom_special_method(t, "__eq__", check_all=False) or
     // custom_special_method(t, "__ne__", check_all=False)
     // Defer (return None) when either call returns None, matching the
+
     // Python `or` short-circuit: if __eq__ is None, the result is None
     // (the `or` of None and bool is None in the parity contract).
     match custom_special_method_inner(typ, "__eq__", false, resolver) {
@@ -538,6 +541,7 @@ pub(crate) fn restrict_subtype_away_inner(
                 // erase_instances=True — Python checks is_proper_subtype
                 // again with erase_instances. Rust's SubtypeContext lacks
                 // an erase_instances field, so this second check is
+
                 // incomplete. Defer to Python.
                 None
             }
@@ -649,7 +653,7 @@ pub(crate) fn rust_join_type_list(
 ///
 /// Handles the two pure special cases that do not need `find_member`:
 ///   1. `member == "__call__" and class_obj` -> return `type_object_type(left.type)`.
-///   2. `member == "__call__" and left.type.is_metaclass(precise=True)` -> return `None`.
+/// 2. `member == "__call__" and left.type.is_metaclass(precise=True)` -> return `None`.
 ///
 /// For all other cases, defers to Python (returns `None`), since the
 /// general path needs `find_member` + `checker_state`.
@@ -1030,6 +1034,7 @@ mod tests {
         // covers_at_runtime calls is_proper_subtype(erase(int), Any).
         // Rust's is_subtype with proper_subtype=true and right=Any defers
         // (the Any-right short-circuit only fires for non-proper). So the
+
         // whole restrict_subtype_away defers to Python.
         let result = restrict_subtype_away_inner(&t, &s, true, true, &r);
         assert_eq!(result, None);

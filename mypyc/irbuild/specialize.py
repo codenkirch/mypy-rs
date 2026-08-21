@@ -160,28 +160,29 @@ from mypyc.primitives.tuple_ops import isinstance_tuple, new_tuple_set_item_op
 # Specializers are attempted before compiling the arguments to the
 # function.  Specializers can return None to indicate that they failed
 # and the call should be compiled normally. Otherwise they should emit
+
 # code for the call and return a Value containing the result.
-#
+
 # Specializers take three arguments: the IRBuilder, the CallExpr being
 # compiled, and the RefExpr that is the left hand side of the call.
 Specializer = Callable[["IRBuilder", CallExpr, RefExpr], Value | None]
 
 # Dunder specializers are for special method calls like __getitem__, __setitem__, etc.
 # that don't naturally map to CallExpr nodes (e.g., from IndexExpr).
-#
+
 # They take four arguments: the IRBuilder, the base expression (target object),
 # the list of argument expressions (positional arguments to the dunder), and the
 # context expression (e.g., IndexExpr) for error reporting.
 DunderSpecializer = Callable[["IRBuilder", Expression, list[Expression], Expression], Value | None]
 
 # Dictionary containing all configured specializers.
-#
+
 # Specializers can operate on methods as well, and are keyed on the
 # name and RType in that case.
 specializers: dict[tuple[str, RType | None], list[Specializer]] = {}
 
 # Dictionary containing all configured dunder specializers.
-#
+
 # Dunder specializers are keyed on the dunder name and RType (always a method call).
 dunder_specializers: dict[tuple[str, RType], list[DunderSpecializer]] = {}
 
@@ -189,7 +190,8 @@ dunder_specializers: dict[tuple[str, RType], list[DunderSpecializer]] = {}
 def _apply_specialization(
     builder: IRBuilder, expr: CallExpr, callee: RefExpr, name: str | None, typ: RType | None = None
 ) -> Value | None:
-    # TODO: Allow special cases to have default args or named args. Currently they don't since
+    # TODO: Allow special cases to have default args or named args. Currently they don't
+    # since
     #       they check that everything in arg_kinds is ARG_POS.
 
     # If there is a specializer for this function, try calling it.
@@ -600,7 +602,9 @@ def any_all_helper(
 def translate_sum_call(builder: IRBuilder, expr: CallExpr, callee: RefExpr) -> Value | None:
     # specialized implementation is used if:
     # - only one or two arguments given (if not, sum() has been given invalid arguments)
-    # - first argument is a Generator (there is no benefit to optimizing the performance of eg.
+
+    # - first argument is a Generator (there is no benefit to optimizing the performance
+    # of eg.
     #   sum([1, 2, 3]), so non-Generator Iterables are not handled)
     if not (
         len(expr.args) in (1, 2)
@@ -1267,9 +1271,14 @@ def translate_object_new(builder: IRBuilder, expr: CallExpr, callee: RefExpr) ->
         subs = ir.subclasses()
         if subs is not None and len(subs) == 0:
             return builder.add(Call(ir.setup, [subtype], expr.line))
-        # Call a function that dynamically resolves the setup function of extension classes from the type object.
-        # This is necessary because the setup involves default attribute initialization and setting up
-        # the vtable which are specific to a given type and will not work if a subtype is created using
+        # Call a function that dynamically resolves the setup function of extension
+        # classes from the type object.
+
+        # This is necessary because the setup involves default attribute
+        # initialization
+        # and setting up the vtable which are specific to a given type and will not
+
+        # work if a subtype is created using
         # the setup function of its base.
         return builder.call_c(setup_object, [subtype], expr.line)
 
@@ -1287,7 +1296,8 @@ def translate_object_setattr(builder: IRBuilder, expr: CallExpr, callee: RefExpr
     ir = builder.get_current_class_ir()
     if ir and (not ir.is_ext_class or ir.builtin_base or ir.inherits_python):
         return None
-    # Need to offset by 1 for super().__setattr__ calls because there is no self arg in this case.
+    # Need to offset by 1 for super().__setattr__ calls because there is no self arg in
+    # this case.
     name_idx = 0 if is_super else 1
     value_idx = 1 if is_super else 2
     attr_name = expr.args[name_idx]

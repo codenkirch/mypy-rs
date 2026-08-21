@@ -566,7 +566,8 @@ def write_str_opt_list(data: WriteBuffer, value: list[str | None]) -> None:
 Value: _TypeAlias = None | int | float | str | bool
 
 # Our JSON format is somewhat non-standard as we distinguish lists and tuples.
-# This is convenient for some internal things, like mypyc plugin and error serialization.
+# This is convenient for some internal things, like mypyc plugin and error
+# serialization.
 JsonValue: _TypeAlias = (
     Value | list["JsonValue"] | dict[str, "JsonValue"] | tuple["JsonValue", ...]
 )

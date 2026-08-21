@@ -262,6 +262,7 @@ class FindModuleCache:
         # The native resolver holds derived resolution caches
         # (initial_components, ns_ancestors) that must not outlive an FS
         # transaction: fscache.flush() clears the shared FS caches, so the
+
         # resolver's derived caches would otherwise read stale toplevel
         # listings on the next fine-grained increment.
         if self._native_resolver is not None:
@@ -279,6 +280,7 @@ class FindModuleCache:
             # We need to make sure we still have __init__.py all the way up
             # otherwise we might have false positives compared to slow path
             # in case of deletion of init files, which is covered by some tests.
+
             # TODO: are there some combination of flags in which this check should be skipped?
             d = os.path.dirname(p)
             for _ in range(id.count(".")):
@@ -304,12 +306,15 @@ class FindModuleCache:
                 # If we do find such a *module* (and crucially, we don't want a package,
                 # hence the filtering out of __init__ files, and checking for the presence
                 # of a folder with a matching name), then we can be pretty confident that
+
                 # 'baz' will either be a top-level variable in foo.bar, or will not exist.
                 #
                 # Either way, spelunking in other search paths for another 'foo.bar.baz'
+
                 # module should be avoided because:
                 #  1. in the unlikely event that one were found, it's highly likely that
                 #     it would be unrelated to the source being typechecked and therefore
+
                 #     more likely to lead to erroneous results
                 #  2. as described in _find_module, in some cases the search itself could
                 #  potentially waste significant amounts of time
@@ -538,27 +543,35 @@ class FindModuleCache:
         # Fast path for any modules in the current source set.
         # This is particularly important when there are a large number of search
         # paths which share the first (few) component(s) due to the use of namespace
+
         # packages, for instance:
         # foo/
         #    company/
+
         #        __init__.py
         #        foo/
         # bar/
+
         #    company/
         #        __init__.py
         #        bar/
+
         # baz/
         #    company/
         #        __init__.py
+
         #        baz/
         #
         # mypy gets [foo/company/foo, bar/company/bar, baz/company/baz, ...] as input
+
         # and computes [foo, bar, baz, ...] as the module search path.
         #
         # This would result in O(n) search for every import of company.*, leading to
+
         # O(n**2) behavior in load_graph as such imports are unsurprisingly present
         # at least once, and usually many more times than that, in each and every file
         # being parsed.
+
         #
         # Thankfully, such cases are efficiently handled by looking up the module path
         # via BuildSourceSet.
@@ -573,6 +586,7 @@ class FindModuleCache:
         # If we're looking for a module like 'foo.bar.baz', it's likely that most of the
         # many elements of lib_path don't even have a subdirectory 'foo/bar'.  Discover
         # that only once and cache it for when we look for modules like 'foo.bar.blah'
+
         # that will require the same subdirectory.
         components = id.split(".")
         dir_chain = os.sep.join(components[:-1])  # e.g., 'foo/bar'
@@ -605,6 +619,7 @@ class FindModuleCache:
                         # Stub packages can have a py.typed file, which must include
                         # 'partial\n' to make the package partial.
                         # Partial here means that mypy should look at the runtime
+
                         # package if installed.
                         if fscache.read(stub_typed_file).decode().strip() == "partial":
                             runtime_path = os_path_join(pkg_dir, dir_chain)
@@ -644,6 +659,7 @@ class FindModuleCache:
         # If we're looking for a module like 'foo.bar.baz', then candidate_base_dirs now
         # contains just the subdirectories 'foo/bar' that actually exist under the
         # elements of lib_path.  This is probably much shorter than lib_path itself.
+
         # Now just look for 'baz.pyi', 'baz/__init__.py', etc., inside those directories.
         seplast = os.sep + components[-1]  # so e.g. '/baz'
         sepinit = os.sep + "__init__"
@@ -694,21 +710,27 @@ class FindModuleCache:
         # In namespace mode, re-check those entries that had 'verify'.
         # Assume search path entries xxx, yyy and zzz, and we're
         # looking for foo.bar.baz.  Suppose near_misses has:
+
         #
         # - xxx/foo/bar/baz.py
         # - yyy/foo/bar/baz/__init__.py
+
         # - zzz/foo/bar/baz.pyi
         #
         # If any of the foo directories has __init__.py[i], it wins.
+
         # Else, we look for foo/bar/__init__.py[i], etc.  If there are
         # none, the first hit wins.  Note that this does not take into
         # account whether the lowest-level module is a file (baz.py),
+
         # a package (baz/__init__.py), or a stub file (baz.pyi) -- for
         # these the first one encountered along the search path wins.
         #
+
         # The helper function highest_init_level() returns an int that
         # indicates the highest level at which a __init__.py[i] file
         # is found; if no __init__ was found it returns 0, if we find
+
         # only foo/bar/__init__.py it returns 1, and if we have
         # foo/__init__.py it returns 2 (regardless of what's in
         # foo/bar).  It doesn't look higher than that.
@@ -723,6 +745,7 @@ class FindModuleCache:
         # Finally, we may be asked to produce an ancestor for an
         # installed package with a py.typed marker that is a
         # subpackage of a namespace package.  We only fess up to these
+
         # if we would otherwise return "not found".
         ancestor = self.ns_ancestors.get(id)
         if ancestor is not None:
@@ -765,6 +788,7 @@ class FindModuleCache:
         # This logic closely mirrors that in find_sources. One small but important difference is
         # that we do not sort names with keyfunc. The recursive call to find_modules_recursive
         # calls find_module, which will handle the preference between packages, pyi and py.
+
         # Another difference is it doesn't handle nested search paths / package roots.
 
         seen: set[str] = set()
@@ -1037,6 +1061,7 @@ def compute_search_paths(
     # Gate the Rust search-path computation on the same option the native
     # resolver uses (_native_gate_active), so `--no-native-resolver` disables
     # the native modulefinder here too. The Rust and Python implementations
+
     # produce identical SearchPaths on the same inputs (verified in Phase D,
     # #596), so this is a contract fix, not a behavior change.
     if _HAS_RUST_MODULEFINDER and options.native_resolver:
@@ -1061,6 +1086,7 @@ def compute_search_paths(
         # Use stub builtins (to speed up test cases and to make them easier to
         # debug).  This is a test-only feature, so assume our files are laid out
         # as in the source tree.
+
         # We also need to allow overriding where to look for it. Argh.
         root_dir = os.getenv("MYPY_TEST_PREFIX", None)
         if not root_dir:
@@ -1081,6 +1107,7 @@ def compute_search_paths(
         # Do this even if running as a file, for sanity (mainly because with
         # multiple builds, there could be a mix of files/modules, so its easier
         # to just define the semantics that we always add the current director
+
         # to the lib_path
         # TODO: Don't do this in some cases; for motivation see see
         # https://github.com/python/mypy/issues/4195#issuecomment-341915031

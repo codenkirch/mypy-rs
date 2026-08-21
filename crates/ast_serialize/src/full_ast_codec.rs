@@ -1,6 +1,7 @@
 //! Complete AST Nodes & Serialization Engine (Phase 7, Module 2) for Issue #138.
 //!
-//! Implements full binary codec, field table mapping, and node definitions for all AST node classes.
+//! Implements full binary codec, field table mapping, and node definitions for
+//! all AST node classes.
 
 use std::collections::HashMap;
 

@@ -125,6 +125,7 @@ def run_mypy(files: list[Path], repo_root: Path) -> CheckerResult:
     # Write the file list to a tempfile and pass --files-from-stdin would
     # need a here-doc; simpler to batch. mypy accepts a directory or a
     # list of files. Cap at 500 files per invocation to stay under argv
+
     # limits on macOS (256KB).
     diags: list[Diagnostic] = []
     batch_size = 500

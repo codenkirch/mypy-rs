@@ -100,6 +100,7 @@ pub(crate) fn expand_type_with_env(
     // A surviving TypeAliasType decodes from the wire with alias=None, and
     // Python's TypeAliasType.is_recursive asserts alias is not None
     // (types.py:397), so an unfixed alias crashes the caller. Defer any
+
     // expansion whose result still contains a TypeAliasType node.
     if result_contains_typealias(&expanded) {
         return None;

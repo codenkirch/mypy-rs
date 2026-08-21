@@ -319,6 +319,7 @@ class LineCoverageVisitor(TraverserVisitor):
         # For each line of source, we maintain a pair of
         #  * the indentation level of the surrounding function
         #    (-1 if not inside a function), and
+
         #  * whether the surrounding function is typed.
         # Initially, everything is covered at indentation level -1.
         self.lines_covered = [(-1, True) for l in source]
@@ -326,11 +327,13 @@ class LineCoverageVisitor(TraverserVisitor):
     # The Python AST has position information for the starts of
     # elements, but not for their ends. Fortunately the
     # indentation-based syntax makes it pretty easy to find where a
+
     # block ends without doing any real parsing.
 
     # TODO: Handle line continuations (explicit and implicit) and
     # multi-line string literals. (But at least line continuations
     # are normally more indented than their surrounding block anyways,
+
     # by PEP 8.)
 
     def indentation_level(self, line_number: int) -> int | None:
@@ -394,6 +397,7 @@ class LineCoverageVisitor(TraverserVisitor):
             old_indent, _ = self.lines_covered[line]
             # If there was an old indent level for this line, and the new
             # level isn't increasing the indentation, ignore it.
+
             # This is to be defensive against funniness in our line numbers,
             # which are not always reliable.
             if old_indent <= start_indent:

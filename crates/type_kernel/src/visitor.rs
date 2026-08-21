@@ -143,6 +143,7 @@ pub(crate) fn has_type_vars_inner(typ: &Type) -> bool {
 // ---------------------------------------------------------------------------
 // has_recursive_types: defers (returns None) because wire format lacks
 // `is_recursive` on TypeAliasType
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.types.has_recursive_types` — check if a type contains any

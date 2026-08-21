@@ -181,6 +181,7 @@ from mypy.version import __version__
 # Switch to True to produce debug output related to fine-grained incremental
 # mode only that is useful during development. This produces only a subset of
 # output compared to --verbose output. We use a global flag to enable this so
+
 # that it's easy to enable this when running tests.
 DEBUG_FINE_GRAINED: Final = False
 
@@ -442,6 +443,7 @@ def build(
         # CompileErrors raised from an errors object carry all the
         # messages that have not been reported out by error streaming.
         # Patch it up to contain either none or all none of the messages,
+
         # depending on whether we are flushing errors.
         serious = not e.use_stdout
         flush_errors(None, e.messages, serious)
@@ -870,6 +872,7 @@ class BuildManager:
         # Native type-kernel resolver state accumulated across SCCs
         # (issue #599). `None` until the first `_build_native_resolvers(scc)`
         # call; `_clear_native_resolvers` resets both so a fresh build
+
         # starts from an empty resolver and an empty typeinfo map.
         self._native_resolver: Any = None
         self._native_typeinfo_map: dict[str, TypeInfo] = {}
@@ -884,6 +887,7 @@ class BuildManager:
         # fg_deps holds the dependencies of every module that has been
         # processed. We store this in BuildManager so that we can compute
         # dependencies as we go, which allows us to free ASTs and type information,
+
         # saving a ton of memory on net.
         self.fg_deps: dict[str, set[str]] = {}
         # Always convert the plugin to a ChainedPlugin so that it can be manipulated if needed
@@ -926,6 +930,7 @@ class BuildManager:
         # Clear stale resolvers from a previous build so the kernel
         # defers to Python until the new snapshot is installed in
         # `_build_native_resolvers` (process_stale_scc). Without this,
+
         # semantic-analysis calls between __init__ and the resolver
         # rebuild would use the previous build's TypeInfo graph,
         # producing wrong MROs and subtype results.
@@ -946,6 +951,7 @@ class BuildManager:
         # Stage 4 (M8ba): gate the pure-positional/named branch of
         # `map_actuals_to_formals`. The Rust path returns None for any call
         # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
+
         # so star-actual calls fall through to Python unchanged.
         from mypy.argmap import _set_native_argmap_active
 
@@ -953,9 +959,11 @@ class BuildManager:
         # Stage 5 (M8bc): gate the C3 `calculate_mro` linearization. The
         # Rust path (`rust_linearize_hierarchy`) returns None for cycles,
         # missing bases, the `obj_type` callback edge, and inconsistent
+
         # merges, so those fall through to Python (which raises the real
         # MroError on inconsistency). The resolver is installed separately
         # (see `_build_native_resolvers`); without it the shim falls through
+
         # to Python unchanged, so this gate is parity-only and default-off.
         from mypy.mro import _set_native_mro_active
 
@@ -969,6 +977,7 @@ class BuildManager:
         # Stage 6 (issue #425): gate the map_instance_to_supertype hot
         # path. The Rust primitive returns None for unsupported edges
         # (missing TypeInfo, variadic tuples), so those fall through to
+
         # the pure-Python maptype path. Mirrors the expand_type wiring.
         from mypy.maptype import _set_native_map_active
 
@@ -1067,6 +1076,7 @@ class BuildManager:
         # M17 checker statement helpers (type_requires_usage,
         # is_unreachable_map, etc.) and semanal visitor helpers
         # (refers_to_fullname, is_trivial_body, etc.). Parity verified
+
         # 8151/0; graduated to production.
         from mypy.checker import _set_native_checker_stmts_active
 
@@ -1074,6 +1084,7 @@ class BuildManager:
         # M22: gate checkpattern standalone helpers (is_uninhabited,
         # get_match_arg_names, get_type_range, should_self_match,
         # can_match_sequence). Uses the subtype resolver installed in
+
         # _build_native_resolvers for should_self_match / can_match_sequence.
         from mypy.checkpattern import _set_native_checkpattern_active
 
@@ -1126,6 +1137,7 @@ class BuildManager:
         # M28: gate fine-grained dependency trigger computation. Ports
         # get_type_triggers / TypeTriggersVisitor to Rust. The DependencyVisitor
         # AST traversal stays in Python; only the hot per-type trigger
+
         # collection is ported (the strangler-fig per-call gate).
         from mypy.server.deps import _set_native_server_deps_active
 
@@ -1148,6 +1160,7 @@ class BuildManager:
         # Stage 3c/4 production wiring (M8bb): the resolver is built per
         # SCC in `process_stale_scc` (after semantic analysis populates
         # the TypeInfo graph). See `_build_native_resolvers` for status.
+
         # Set of namespaces (module or class) that are being populated during semantic
         # analysis and may have missing definitions.
         self.incomplete_namespaces: set[str] = set()
@@ -1221,9 +1234,11 @@ class BuildManager:
         # Cache for mypy ASTs that have completed semantic analysis
         # pass 1. When multiple files are added to the build in a
         # single daemon increment, only one of the files gets added
+
         # per step and the others are discarded. This gets repeated
         # until all the files have been added. This means that a
         # new file can be processed O(n**2) times. This cache
+
         # avoids most of this redundant work.
         self.ast_cache: dict[str, tuple[MypyFile, list[ErrorInfo], str | None]] = {}
         # Number of times we used GC optimization hack for fresh SCCs.
@@ -1374,6 +1389,7 @@ class BuildManager:
         # Grow the accumulated fullname -> TypeInfo map with this call's
         # (already-seen + new) infos. Overwriting with the same stable
         # TypeInfo objects is a no-op for the new entries; the deletions
+
         # the daemon needs are handled by `_clear_native_resolvers`.
         for info in type_infos:
             self._native_typeinfo_map[info.fullname] = info
@@ -1382,6 +1398,7 @@ class BuildManager:
         # Stage 3c resolvers wired: the subtype/join kernels now defer
         # (return None) for all unsupported generic substitution edges,
         # so they cannot return wrong answers. See PR #72 for the
+
         # correctness gap closure (26 testcheck failures -> 0).
         _set_native_subtype_resolver(resolver)
         _set_native_join_resolver(resolver)
@@ -1401,6 +1418,7 @@ class BuildManager:
         # Stage 3d: expand_type is wired to production. It defers
         # (returns None) for bound methods, ParamSpec/Unpack args,
         # empty envs, and any result still carrying a TypeVar-like node,
+
         # so it cannot return a wrong answer across the wire.
         from mypy.expandtype import (
             _set_native_expand_type_active,
@@ -1424,6 +1442,7 @@ class BuildManager:
         # Live TypeInfo map for typeops' live-enum/final reads
         # (coerce_to_literal, singleton identity/equality). The snapshot's
         # enum_members can go stale (members resolving after the class's
+
         # SCC sealed), and is_final is not snapshotted, so these reads go
         # through the live map, not the resolver wire map.
         resolver.set_live_typeinfo_map(self._native_typeinfo_map)
@@ -1778,6 +1797,7 @@ class BuildManager:
                 # Add cur_id as a dependency, even if all the
                 # imports are submodules. Processing import from will try
                 # to look through cur_id, so we should depend on it.
+
                 # As a workaround for some bugs in cycle handling (#4498),
                 # if all the imports are submodules, do the import at a lower
                 # priority.
@@ -1793,6 +1813,7 @@ class BuildManager:
         # Sort such that module (e.g. foo.bar.baz) comes before its ancestors (e.g. foo
         # and foo.bar) so that, if FindModuleCache finds the target module in a
         # package marked with py.typed underneath a namespace package installed in
+
         # site-packages, (gasp), that cache's knowledge of the ancestors
         # (aka FindModuleCache.ns_ancestors) can be primed when it is asked to find
         # the parent.
@@ -1959,6 +1980,7 @@ class BuildManager:
             # Three notes keep in mind here:
             #   * Heap key is *negative* size (so that larger SCCs appear first).
             #   * Each batch must have at least one item.
+
             #   * Adding another SCC to batch should not exceed maximum allowed size.
             size_in_batch - self.scc_queue[0][0] <= max_size_in_batch
             or not batch
@@ -2509,6 +2531,7 @@ def get_cache_names(id: str, path: str, options: Options) -> tuple[str, str, str
         # The cache map paths were specified relative to the base directory,
         # but the filesystem metastore APIs operates relative to the cache
         # prefix directory.
+
         # Solve this by rewriting the paths as relative to the root dir.
         # This only makes sense when using the filesystem backed cache.
         root = _cache_dir_prefix(options)
@@ -2696,10 +2719,16 @@ def validate_meta(
       Original meta, if mtime/size matched.
       Meta with mtime updated to match source file, if hash/size matched but mtime/path didn't.
     """
-    # This requires two steps. The first one is obvious: we check that the module source file
-    # contents is the same as it was when the cache data file was created. The second one is not
-    # too obvious: we check that the cache data file mtime has not changed; it is needed because
-    # we use cache data file mtime to propagate information about changes in the dependencies.
+    # This requires two steps. The first one is obvious: we check that the module source
+    # file
+    # contents is the same as it was when the cache data file was created. The second
+
+    # one is not
+    # too obvious: we check that the cache data file mtime has not changed; it is needed
+    # because
+
+    # we use cache data file mtime to propagate information about changes in the
+    # dependencies.
 
     if meta is None:
         manager.log(f"Metadata not found for {id}")
@@ -2741,15 +2770,19 @@ def validate_meta(
     # When we are using a fine-grained cache, we want our initial
     # build() to load all of the cache information and then do a
     # fine-grained incremental update to catch anything that has
+
     # changed since the cache was generated. We *don't* want to do a
     # coarse-grained incremental rebuild, so we accept the cache
     # metadata even if it doesn't match the source file.
+
     #
     # We still *do* the mtime/hash checks, however, to enable
     # fine-grained mode to take advantage of the mtime-updating
+
     # optimization when mtimes differ but hashes match.  There is
     # essentially no extra time cost to computing the hash here, since
     # it will be cached and will be needed for finding changed files
+
     # later anyways.
     fine_grained_cache = manager.use_fine_grained_cache()
 
@@ -2766,6 +2799,7 @@ def validate_meta(
             # If the mtime and the size of the file recorded in the quickstart dump matches
             # what we see on disk, we know (assume) that the hash matches the quickstart
             # data as well. If that hash matches the hash in the metadata, then we know
+
             # the file is up to date even though the mtime is wrong, without needing to hash it.
             qmtime, qsize, qhash = manager.quickstart_state[path]
             if int(qmtime) == mtime and qsize == size and qhash == meta.hash:
@@ -2824,6 +2858,7 @@ def compute_hash(text: str) -> str:
     # We use a crypto hash instead of the builtin hash(...) function
     # because the output of hash(...)  can differ between runs due to
     # hash randomization (enabled by default in Python 3.3).  See the
+
     # note in
     # https://docs.python.org/3/reference/datamodel.html#object.__hash__.
     return hash_digest(text.encode("utf-8"))
@@ -2921,9 +2956,11 @@ def write_cache(
             # Let's continue without writing the meta file.  Analysis:
             # If the replace failed, we've changed nothing except left
             # behind an extraneous temporary file; if the replace
+
             # worked but the getmtime() call failed, the meta file
             # will be considered invalid on the next run because the
             # data_mtime field won't match the data file's mtime.
+
             # Both have the effect of slowing down the next run a
             # little bit due to an out-of-date cache file.
             return interface_hash, None
@@ -2939,6 +2976,7 @@ def write_cache(
     # Note that the options we store in the cache are the options as
     # specified by the command line/config file and *don't* reflect
     # updates made by inline config directives in the file. This is
+
     # important, or otherwise the options would never match when
     # verifying the cache.
     assert source_hash is not None
@@ -3172,6 +3210,7 @@ class State:
     # We keep both a list and set of dependencies. A set because it makes it efficient to
     # prevent duplicates and the list because I am afraid of changing the order of
     # iteration over dependencies.
+
     # They should be managed with add_dependency and suppress_dependency.
     dependencies: list[str]  # Modules directly imported by the module
     dependencies_set: set[str]  # The same but as a set for deduplication purposes
@@ -3203,6 +3242,7 @@ class State:
     # Hash of import structure that this module depends on. It is not 1:1 with
     # transitive dependencies set, but if two hashes are equal, transitive
     # dependencies are guaranteed to be identical. Some expensive checks can be
+
     # skipped if this value is unchanged for a module.
     trans_dep_hash: bytes = b""
 
@@ -3249,6 +3289,7 @@ class State:
         # If `temporary` is True, this State is being created to just
         # quickly parse/load the tree, without an intention to further
         # process it. With this flag, any changes to external state as well
+
         # as error reporting should be avoided.
         temporary: bool = False,
     ) -> State:
@@ -3370,9 +3411,11 @@ class State:
                 # Special case: if there were a previously missing package imported here,
                 # and it is not present, then we need to re-calculate dependencies.
                 # This is to support patterns like this:
+
                 #     from missing_package import missing_module  # type: ignore
                 # At first mypy doesn't know that `missing_module` is a module
                 # (it may be a variable, a class, or a function), so it is not added to
+
                 # suppressed dependencies. Therefore, when the package with module is added,
                 # we need to re-calculate dependencies.
                 # NOTE: see comment below for why we skip this in fine-grained mode.
@@ -3381,9 +3424,11 @@ class State:
                 # This is an inverse to the situation above. If we had an import like this:
                 #     from pkg import mod
                 # and then mod was deleted, we need to force recompute dependencies, to
+
                 # decide whether we should still depend on a missing pkg.mod. Otherwise,
                 # the above import is indistinguishable from something like this:
                 #     import pkg
+
                 #     import pkg.mod
                 if exist_removed_submodules(dependencies, manager):
                     state.needs_parse = True  # Same as above, the current state is stale anyway.
@@ -3597,6 +3642,7 @@ class State:
         # NOTE: self.dependencies may differ from
         # self.meta.dependencies when a dependency is dropped due to
         # suppression by silent mode.  However, when a suppressed
+
         # dependency is added back we find out later in the process.
         # Additionally, we need to verify that import following options are
         # same for suppressed dependencies, even if the first check is OK.
@@ -3725,6 +3771,7 @@ class State:
                     # ioerr.strerror differs for os.stat failures between Windows and
                     # other systems, but os.strerror(ioerr.errno) does not, so we use that.
                     # (We want the error messages to be platform-independent so that the
+
                     # tests have predictable output.)
                     assert ioerr.errno is not None
                     raise CompileError(
@@ -3831,6 +3878,7 @@ class State:
             # Size of serialized tree is a better proxy for file complexity than
             # file size, so we use that when possible. Note that we rely on lucky
             # coincidence that serialized tree size has same order of magnitude as
+
             # file size, so we don't need any normalization factor in situations
             # where parsed and cached files are mixed.
             self.size_hint = len(self.tree.raw_data.defs) + MIN_SIZE_HINT
@@ -3878,9 +3926,11 @@ class State:
         # Do the first pass of semantic analysis: analyze the reachability
         # of blocks and import statements. We must do this before
         # processing imports, since this may mark some import statements as
+
         # unreachable.
         #
         # TODO: This should not be considered as a semantic analysis
+
         #     pass -- it's an independent pass.
         if not options.native_parser:
             analyzer = SemanticAnalyzerPreAnalysis()
@@ -3927,6 +3977,7 @@ class State:
         # Compute (direct) dependencies.
         # Add all direct imports (this is why we needed the first pass).
         # Also keep track of each dependency's source line.
+
         # Missing dependencies will be moved from dependencies to
         # suppressed when they fail to be loaded in load_graph.
 
@@ -3947,6 +3998,7 @@ class State:
             # Native dependency-record extraction: Rust walks the import list
             # and resolves module ids via the same NativeResolver that
             # _resolve uses, returning (priority, module_id, line) records.
+
             # Plugin deps and the correct_rel_imp error reporting stay in
             # Python (concatenated / reported after the Rust call).
             import mypy.native_resolve as _native
@@ -4073,6 +4125,7 @@ class State:
                 # Two possible sources of indirect dependencies:
                 # * Symbols not directly imported in this module but accessed via an attribute
                 #   or via a re-export (vast majority of these recorded in semantic analysis).
+
                 # * For each expression type we need to record definitions of type components
                 #   since "meaning" of the type may be updated when definitions are updated.
                 self.tree.module_refs | self.type_checker().module_refs,
@@ -4125,9 +4178,11 @@ class State:
             # We don't track changes to core parts of typeshed -- the
             # assumption is that they are only changed as part of mypy
             # updates, which will invalidate everything anyway. These
+
             # will always be processed in the initial non-fine-grained
             # build. Other modules may be brought in as a result of an
             # fine-grained increment, and we may need these
+
             # dependencies then to handle cyclic imports.
             return {}
         from mypy.server.deps import get_dependencies  # Lazy import to speed up startup
@@ -4257,6 +4312,7 @@ class State:
                 # Swallow up any ModuleNotFounds or CompilerErrors while generating
                 # a diagnostic. CompileErrors may get generated in
                 # fine-grained mode when an __init__.py is deleted, if a module
+
                 # that was in that package has targets reprocessed before
                 # it is renamed.
                 pass
@@ -4334,6 +4390,7 @@ def find_module_and_diagnose(
         # For non-stubs, look at options.follow_imports:
         # - normal (default) -> fully analyze
         # - silent -> analyze but silence errors
+
         # - skip -> don't analyze, make the type Any
         follow_imports = options.follow_imports
         if (
@@ -4407,9 +4464,11 @@ def exist_added_packages(suppressed: list[str], manager: BuildManager) -> bool:
         # Technically this is not 100% correct, since we can have:
         #     from pkg import mod
         # with
+
         #     [mypy-pkg]
         #     follow-import = silent
         #     [mypy-pkg.mod]
+
         #     follow-imports = normal
         # But such cases are extremely rare, and this allows us to avoid
         # massive performance impact in much more common situations.
@@ -4585,6 +4644,7 @@ def skipping_ancestor(manager: BuildManager, id: str, path: str, ancestor_for: S
     # TODO: Read the path (the __init__.py file) and return
     # immediately if it's empty or only contains comments.
     # But beware, some package may be the ancestor of many modules,
+
     # so we'd need to cache the decision.
     save_import_context = manager.errors.import_context()
     manager.errors.set_import_context([])
@@ -4651,6 +4711,7 @@ def dispatch(
     # We disable GC while loading the graph as a performance optimization for
     # cold-cache runs. The parsed ASTs are trees, and therefore should not have any
     # reference cycles. This is an important optimization, since we create a lot of
+
     # new objects while parsing files.
     global initial_gc_freeze_done
     if (
@@ -4664,6 +4725,7 @@ def dispatch(
     # This is a kind of unfortunate hack to work around some of fine-grained's
     # fragility: if we have loaded less than 50% of the specified files from
     # cache in fine-grained cache mode, load the graph again honestly.
+
     # In this case, we just turn the cache off entirely, so we don't need
     # to worry about some files being loaded and some from cache and so
     # that fine-grained mode never *writes* to the cache.
@@ -4703,6 +4765,7 @@ def dispatch(
     # Fine-grained dependencies that didn't have an associated module in the build
     # are serialized separately, so we read them after we load the graph.
     # We need to read them both for running in daemon mode and if we are generating
+
     # a fine-grained cache (so that we can properly update them incrementally).
     # The `read_deps_cache` will also validate
     # the deps cache against the loaded individual cache files.
@@ -4739,6 +4802,7 @@ def dispatch(
             # If we are running a daemon or are going to write cache for further fine-grained use,
             # then we need to collect fine-grained protocol dependencies.
             # Since these are a global property of the program, they are calculated after we
+
             # processed the whole graph.
             type_state.add_all_protocol_deps(manager.fg_deps)
             if not manager.options.fine_grained_incremental:
@@ -4914,12 +4978,15 @@ def load_graph(
         # Strip out indirect dependencies.  These will be dealt with
         # when they show up as direct dependencies, and there's a
         # scenario where they hurt:
+
         # - Suppose A imports B and B imports C.
         # - Suppose on the next round:
         #   - C is deleted;
+
         #   - B is updated to remove the dependency on C;
         #   - A is unchanged.
         # - In this case A's cached *direct* dependencies are still valid
+
         #   (since direct dependencies reflect the imports found in the source)
         #   but A's cached *indirect* dependency on C is wrong.
         dependencies = [dep for dep in st.dependencies if st.priorities.get(dep) != PRI_INDIRECT]
@@ -4998,8 +5065,11 @@ def load_graph(
             if dep in graph:
                 st.add_dependency(dep)
                 manager.missing_modules.pop(dep, None)
-    # Second, in the initial loop we skip indirect dependencies, so to make indirect dependencies
-    # behave more consistently with regular ones, we suppress them manually here (when needed).
+    # Second, in the initial loop we skip indirect dependencies, so to make indirect
+    # dependencies
+    # behave more consistently with regular ones, we suppress them manually here (when
+
+    # needed).
     for st in graph.values():
         indirect = [dep for dep in st.dependencies if st.priorities.get(dep) == PRI_INDIRECT]
         for dep in indirect:
@@ -5026,6 +5096,7 @@ def order_ascc_ex(graph: Graph, ascc: SCC) -> list[str]:
         # If builtins is in the list, move it last.  (This is a bit of
         # a hack, but it's necessary because the builtins module is
         # part of a small cycle involving at least {builtins, abc,
+
         # typing}.  Of these, builtins must be processed last or else
         # some builtin objects will be incompletely processed.)
         scc.remove("builtins")
@@ -5195,6 +5266,7 @@ def process_graph(graph: Graph, manager: BuildManager) -> None:
         # We eagerly walk over fresh SCCs to reach as many stale SCCs as soon
         # as possible. Only when there are no fresh SCCs, we wait on scheduled stale ones.
         # This strategy, similar to a naive strategy in minesweeper game, will allow us
+
         # to leverage parallelism as much as possible.
         if fresh:
             done = fresh
@@ -5324,9 +5396,11 @@ def maybe_load_deps(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
             # When deserializing cache we create huge amount of new objects, so even
             # with our generous GC thresholds, GC is still doing a lot of pointless
             # work searching for garbage. So, we temporarily disable it when
+
             # processing fresh SCCs, and then move all the new objects to the oldest
             # generation with the freeze()/unfreeze() trick below. This is arguably
             # a hack, but it gives huge performance wins for large third-party
+
             # libraries, like torch.
             gc.disable()
         for prev_scc in fresh_sccs_to_load:
@@ -5401,6 +5475,7 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     # Stage 3c/4 production wiring (M8bb): build or extend the
     # NativeTypeResolver snapshot now that semantic analysis populated the
     # TypeInfo graph for this SCC. Incremental: `update` skips already-
+
     # snapshotted fullnames so the expensive per-TypeInfo reads happen
     # once per build, not once per SCC (issue #599). See
     # `_build_native_resolvers` for the kernel status.
@@ -5662,9 +5737,11 @@ def sorted_components(graph: Graph) -> list[SCC]:
         # Sort the sets in ready by reversed smallest State.order.  Examples:
         #
         # - If ready is [{x}, {y}], x.order == 1, y.order == 2, we get
+
         #   [{y}, {x}].
         #
         # - If ready is [{a, b}, {c, d}], a.order == 1, b.order == 3,
+
         #   c.order == 2, d.order == 4, the sort keys become [1, 2]
         #   and the result is [{c, d}, {a, b}].
         sorted_ready = sorted(ready, key=lambda scc: -min(graph[id].order for id in scc.mod_ids))
@@ -5796,9 +5873,11 @@ def write_undocumented_ref_info(
 # The IPC message classes and tags for communication with build workers are
 # in this file to avoid import cycles.
 # Note that we use a more compact fixed serialization format than in cache.py.
+
 # This is because the messages don't need to read by a generic tool, nor there
 # is any need for backwards compatibility. We still reuse some elements from
 # cache.py for convenience, and also some conventions (like using bare ints
+
 # to specify object size).
 # Note that we can use tags overlapping with cache.py, since they should never
 # appear on the same context.

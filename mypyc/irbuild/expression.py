@@ -197,6 +197,7 @@ def transform_name_expr(builder: IRBuilder, expr: NameExpr) -> Value:
     # If the expression is locally defined, then read the result from the corresponding
     # assignment target and return it. Otherwise if the expression is a global, load it from
     # the globals dictionary.
+
     # Except for imports, that currently always happens in the global namespace.
     if expr.kind == LDEF and not (isinstance(expr.node, Var) and expr.node.is_suppressed_import):
         # Try to detect and error when we hit the irritating mypy bug
@@ -218,6 +219,7 @@ def transform_name_expr(builder: IRBuilder, expr: NameExpr) -> Value:
             # Load reference to a module imported inside function from
             # the modules dictionary. It would be closer to Python
             # semantics to access modules imported inside functions
+
             # via local variables, but this is tricky since the mypy
             # AST doesn't include a Var node for the module. We
             # instead load the module separately on each access.
@@ -577,6 +579,7 @@ def translate_super_method_call(builder: IRBuilder, expr: CallExpr, callee: Supe
             # For generator classes, the self target is the 7th value
             # in the symbol table (which is an ordered dict). This is sort
             # of ugly, but we can't search by name since the 'self' parameter
+
             # could be named anything, and it doesn't get added to the
             # environment indexes.
             self_targ = list(builder.symtables[-1].values())[7]
@@ -656,6 +659,7 @@ def vec_from_iterable(
         # For generic iterables (typed as object) and bytes/bytearray
         # (which support the buffer protocol for fast memcpy), call the
         # C-level from_iterable. For concrete types like range, list,
+
         # vec, etc., the for-loop desugaring below produces better IR.
         name = f"{api_name}.from_iterable"
         extra_args: list[Value] = []
@@ -960,6 +964,7 @@ def transform_comparison_expr(builder: IRBuilder, e: ComparisonExpr) -> Value:
     # TODO: Don't produce an expression when used in conditional context
     # All of the trickiness here is due to support for chained conditionals
     # (`e1 < e2 > e3`, etc). `e1 < e2 > e3` is approximately equivalent to
+
     # `e1 < e2 and e2 > e3` except that `e2` is only evaluated once.
     expr_type = builder.node_type(e)
 
@@ -1320,12 +1325,15 @@ def _visit_display(
 # Comprehensions
 #
 # mypyc always inlines comprehensions (the loop body is emitted directly into
+
 # the enclosing function's IR, no implicit function call like CPython).
 #
 # However, when a comprehension body contains a lambda, we need a lightweight
+
 # scope boundary so the closure/env-class machinery can see the comprehension
 # as a separate scope. The comprehension is still inlined (same basic blocks
 # and registers), but we push a new FuncInfo and set up an env class so the
+
 # lambda can capture loop variables through the standard env-class chain.
 
 

@@ -22,6 +22,7 @@ from mypy.types import (
 # Stage 3c type-kernel seam: when type_kernel is importable and a resolver
 # is installed, map_instance_to_supertype routes through Rust. Rust returns
 # None for any type it does not handle, in which case we fall back to the
+
 # pure-Python path. This is the strangler-fig per-call gate.
 
 try:
@@ -41,6 +42,7 @@ except ImportError:
 # Module-level flag + resolver, set by the build manager from
 # `Options.native_type_kernel` at the start of each build. When
 # `_native_map_active` is True but `_native_map_resolver` is None, the
+
 # shim falls through to Python.
 _native_map_active: bool = False
 _native_map_resolver: Any = None
@@ -141,6 +143,7 @@ def _native_map_instance_to_supertype(
         # AssertionError: TypeInfo not yet fixed during semanal.
         # NotImplementedError: unserializable variant.
         # ValueError: decode/read failure.
+
         # All defer to Python.
         return None
 
@@ -163,6 +166,7 @@ def map_instance_to_supertype(instance: Instance, superclass: TypeInfo) -> Insta
     # Stage 3c type-kernel seam: try the Rust map path for the hot case
     # (both fast paths above handle the trivial edges). Rust returns None
     # for unsupported cases; we then fall through to pure Python. Mapping
+
     # to `builtins.tuple` defers too: the namedtuple tuple_fallback
     # special case is not ported, so Rust would return tuple[Any, ...]
     # instead of the element-preserving tuple fallback.

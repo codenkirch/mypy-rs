@@ -32,8 +32,11 @@ class TestHeaderDeps(unittest.TestCase):
     """
 
     def test_get_header_deps_quoted_includes(self) -> None:
-        # Quoted includes: the historical form. Used by the .c file to reach its own __native_<mod>.h /
-        # __native_internal_<mod>.h. The `False` in each tuple marks the include as non-angled, which
+        # Quoted includes: the historical form. Used by the .c file to reach its own
+        # __native_<mod>.h /
+        # __native_internal_<mod>.h. The `False` in each tuple marks the include as
+
+        # non-angled, which
         # `resolve_cfile_deps` uses to search the includer's directory.
         cfile = '#include "__native_caller.h"\n#include "__native_internal_caller.h"\n'
         assert get_header_deps([("caller.c", cfile)]) == [
@@ -42,10 +45,16 @@ class TestHeaderDeps(unittest.TestCase):
         ]
 
     def test_get_header_deps_angle_bracket_includes(self) -> None:
-        # Angle-bracket includes are also matched, and reported with is_angled=True so that the resolver
-        # skips the includer's dir for them (matching the C preprocessor). The cross-group export header
-        # is reached via `#include <other_group/__native_other.h>` in __native_internal_<mod>.h. Before
-        # this was matched the dep was missed entirely and the consumer's .o was never invalidated when
+        # Angle-bracket includes are also matched, and reported with is_angled=True so
+        # that the resolver
+        # skips the includer's dir for them (matching the C preprocessor). The
+
+        # cross-group export header
+        # is reached via `#include <other_group/__native_other.h>` in
+        # __native_internal_<mod>.h. Before
+
+        # this was matched the dep was missed entirely and the consumer's .o was never
+        # invalidated when
         # the other group's struct layout shifted.
         cfile = "#include <Python.h>\n#include <lib/__native_functions.h>\n"
         assert get_header_deps([("caller.c", cfile)]) == [
@@ -54,14 +63,20 @@ class TestHeaderDeps(unittest.TestCase):
         ]
 
     def test_get_header_deps_mixed_and_whitespace(self) -> None:
-        # The preprocessor tolerates whitespace and the leading-hash form. `get_header_deps` returns sorted
-        # tuples — non-angled (False) sorts before angled (True), then alphabetical within each kind.
+        # The preprocessor tolerates whitespace and the leading-hash form.
+        # `get_header_deps` returns sorted
+        # tuples — non-angled (False) sorts before angled (True), then alphabetical
+
+        # within each kind.
         cfile = '# include "a.h"\n#  include  <b.h>\n#include\t"c.h"\n'
         assert get_header_deps([("x.c", cfile)]) == [(False, "a.h"), (False, "c.h"), (True, "b.h")]
 
     def test_resolve_walks_transitively_through_headers(self) -> None:
-        # Reproduces the bug scenario: caller's .c only directly includes caller's own headers, but
-        # caller's __native_internal_caller.h includes the cross-group export header. The resolver
+        # Reproduces the bug scenario: caller's .c only directly includes caller's own
+        # headers, but
+        # caller's __native_internal_caller.h includes the cross-group export header.
+
+        # The resolver
         # must follow that chain so setuptools sees the cross-group header as a dep.
         with tempfile.TemporaryDirectory() as tmp:
             build_dir = tmp
@@ -93,9 +108,13 @@ class TestHeaderDeps(unittest.TestCase):
                 # Sibling group not reached from caller's chain => must NOT appear in the resolved set.
                 f.write("struct unrelated { int x; };\n")
 
-            # caller.c is in build_dir, so its includer-dir is build_dir. Both directly-included headers
-            # are quoted (`False`); the cross-group header that __native_internal_caller.h reaches via
-            # `<lib/__native_functions.h>` is found by the recursive walk re-reading the on-disk header.
+            # caller.c is in build_dir, so its includer-dir is build_dir. Both
+            # directly-included headers
+            # are quoted (`False`); the cross-group header that
+
+            # __native_internal_caller.h reaches via
+            # `<lib/__native_functions.h>` is found by the recursive walk re-reading the
+            # on-disk header.
             deps = resolve_cfile_deps(
                 cfile_dir=build_dir,
                 direct_includes=[
@@ -111,9 +130,13 @@ class TestHeaderDeps(unittest.TestCase):
             )
 
     def test_resolve_drops_unresolvable_includes(self) -> None:
-        # `<Python.h>`, `<CPy.h>`, etc. don't live under target_dir, so they're dropped from depends. They
-        # never change between builds, so this is the right behavior. Crucially, it stops setuptools'
-        # `missing="newer"` from treating them as always-newer and force-rebuilding every translation unit.
+        # `<Python.h>`, `<CPy.h>`, etc. don't live under target_dir, so they're dropped
+        # from depends. They
+        # never change between builds, so this is the right behavior. Crucially, it
+
+        # stops setuptools'
+        # `missing="newer"` from treating them as always-newer and force-rebuilding
+        # every translation unit.
         with tempfile.TemporaryDirectory() as tmp:
             cfile_dir = tmp
             deps = resolve_cfile_deps(
@@ -124,9 +147,14 @@ class TestHeaderDeps(unittest.TestCase):
             assert deps == set()
 
     def test_resolve_search_order_matches_preprocessor(self) -> None:
-        # When the same header name exists both next to the includer and under target_dir, the C preprocessor
-        # picks the includer-dir copy for `#include "shared.h"` and the target_dir copy for `#include <shared.h>`.
-        # The resolver must record the same path the compiler will actually consume, otherwise mtimes of the
+        # When the same header name exists both next to the includer and under
+        # target_dir, the C preprocessor
+        # picks the includer-dir copy for `#include "shared.h"` and the target_dir copy
+
+        # for `#include <shared.h>`.
+        # The resolver must record the same path the compiler will actually consume,
+        # otherwise mtimes of the
+
         # wrong file drive incremental rebuild decisions.
         with tempfile.TemporaryDirectory() as tmp:
             includer = os.path.join(tmp, "groupA")

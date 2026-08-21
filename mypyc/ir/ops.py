@@ -505,6 +505,7 @@ class Return(ControlOp):
         # If this return is created by a yield, keep track of the next
         # basic block. This doesn't affect the code we generate but
         # can feed into analysis that need to understand the
+
         # *original* CFG.
         self.yield_target = yield_target
 
@@ -749,6 +750,7 @@ class PrimitiveDescription:
         # Native integer types such as u8 can cause ambiguity in primitive
         # matching, since these are assignable to plain int *and* vice versa.
         # If this flag is set, the primitive has native integer types and must
+
         # be matched using more complex rules.
         self.is_ambiguous = any(has_fixed_width_int(t) for t in arg_types)
         self.type_params = None if not type_params else type_params
@@ -982,7 +984,8 @@ NAMESPACE_TYPE: Final = "type"
 # Namespace for modules
 NAMESPACE_MODULE: Final = "module"
 
-# Namespace for Python 3.12 type variable objects (implicitly created TypeVar instances, etc.)
+# Namespace for Python 3.12 type variable objects (implicitly created TypeVar instances,
+# etc.)
 NAMESPACE_TYPE_VAR: Final = "typevar"
 
 
@@ -1260,7 +1263,8 @@ class RaiseStandardError(RegisterOp):
         return visitor.visit_raise_standard_error(self)
 
 
-# True steals all arguments, False steals none, a list steals those in matching positions
+# True steals all arguments, False steals none, a list steals those in matching
+# positions
 StealsDescription = bool | list[bool]
 
 
@@ -2097,24 +2101,31 @@ class OpVisitor(Generic[T]):
 # We do a three-pass deserialization scheme in order to resolve name
 # references.
 #  1. Create an empty ClassIR for each class in an SCC.
+
 #  2. Deserialize all of the functions, which can contain references
 #     to ClassIRs in their types
 #  3. Deserialize all of the classes, which contain lots of references
+
 #     to the functions they contain. (And to other classes.)
 #
 # Note that this approach differs from how we deserialize ASTs in mypy itself,
+
 # where everything is deserialized in one pass then a second pass cleans up
 # 'cross_refs'. We don't follow that approach here because it seems to be more
 # code for not a lot of gain since it is easy in mypyc to identify all the objects
+
 # we might need to reference.
 #
 # Because of these references, we need to maintain maps from class
+
 # names to ClassIRs and func IDs to FuncIRs.
 #
 # These are tracked in a DeserMaps which is passed to every
+
 # deserialization function.
 #
 # (Serialization and deserialization *will* be used for incremental
+
 # compilation but so far it is not hooked up to anything.)
 class DeserMaps(NamedTuple):
     classes: dict[str, ClassIR]

@@ -524,6 +524,7 @@ def make_for_loop_generator(
             # Special case "for x in range(...)".
             # We support the 3 arg form but only for int literals, since it doesn't
             # seem worth the hassle of supporting dynamically determining which
+
             # direction of comparison to do.
             if len(expr.args) == 1:
                 start_reg: Value = Integer(0)
@@ -647,6 +648,7 @@ class ForGenerator:
         # Some for loops need a cleanup block that we execute at exit. We
         # create a cleanup block if needed. However, if we are generating a for
         # loop for a nested iterator, such as "e" in "enumerate(e)", the
+
         # outermost generator should generate the cleanup block -- we don't
         # need to do it here.
         if self.need_cleanup() and not nested:
@@ -707,6 +709,7 @@ class ForIterable(ForGenerator):
         # We call __next__ on the iterator and check to see if the return value
         # is NULL, which signals either the end of the Iterable being traversed
         # or an exception being raised. Note that Branch.IS_ERROR checks only
+
         # for NULL (an exception does not necessarily have to be raised).
         builder = self.builder
         line = self.line
@@ -731,6 +734,7 @@ class ForIterable(ForGenerator):
         # We set the branch to go here if the conditional evaluates to true. If
         # an exception was raised during the loop, then err_reg will be set to
         # True. If no_err_occurred_op returns False, then the exception will be
+
         # propagated using the ERR_FALSE flag.
         self.builder.call_c(no_err_occurred_op, [], self.line)
 
@@ -759,6 +763,7 @@ class ForNativeGenerator(ForGenerator):
         # Call generated generator helper method, passing a PyObject ** as the final
         # argument that will be used to store the return value in the return value
         # register. We ignore the return value but the presence of a return value
+
         # indicates that the generator has finished. This is faster than raising
         # and catching StopIteration, which is the non-native way of doing this.
         ptr = builder.add(LoadAddress(object_pointer_rprimitive, self.return_value))
@@ -802,6 +807,7 @@ class ForAsyncIterable(ForGenerator):
         # Define targets to contain the expression, along with the
         # iterator that will be used for the for-loop. We are inside
         # of a generator function, so we will spill these into
+
         # environment class.
         builder = self.builder
         iter_reg = builder.call_c(aiter_op, [expr_reg], self.line)
@@ -814,10 +820,12 @@ class ForAsyncIterable(ForGenerator):
         # This does the test and fetches the next value
         # try:
         #     TARGET = await type(iter).__anext__(iter)
+
         #     stop = False
         # except StopAsyncIteration:
+
         #     stop = True
-        #
+
         # What a pain.
         # There are optimizations available here if we punch through some abstractions.
 
@@ -925,6 +933,7 @@ class ForSequence(ForGenerator):
             # If we are iterating in reverse order, we obviously need
             # to check that the index is still positive. Somewhat less
             # obviously we still need to check against the length,
+
             # since it could shrink out from under us.
             comparison = builder.binary_op(
                 builder.read(self.index_target, line), Integer(0), ">=", line
@@ -1335,6 +1344,7 @@ def get_expr_length(builder: IRBuilder, expr: Expression) -> int | None:
     # TODO: extend this, passing length of listcomp and genexp should have worthwhile
     # performance boost and can be (sometimes) figured out pretty easily. set and dict
     # comps *can* be done as well but will need special logic to consider the possibility
+
     # of key conflicts.
 
     # we might still be able to get the length directly from the type

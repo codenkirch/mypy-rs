@@ -34,9 +34,11 @@ use pyo3::prelude::*;
 // Branch tags handed to the Python shim. Each maps to exactly one terminal
 // branch of `try_analyze_special_unbound_type`; the comment cites the
 // typeanal.py line and the Python-side effect the shim must apply.
+
 // Branch tags handed to the Python shim. Each maps to exactly one terminal
 // branch of `try_analyze_special_unbound_type`; the comment cites the
 // typeanal.py line and the Python-side effect the shim must apply. Plain
+
 // names (not special forms) return `None` from the classifier and keep the
 // full pure-Python body.
 const TAG_NONE_TYPE: i64 = 2; // 936-937 NoneType()

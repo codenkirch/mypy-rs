@@ -106,6 +106,7 @@ def _try_native_infer_constraints(
         # The wire round-trip rebuilds types as fresh objects; Rust validates
         # the result but the rebuilt target must not re-enter the type
         # graph (identity loss changes solver behavior). Use the original
+
         # `actual` object when Rust agrees with it, else defer.
         if target != actual:
             raise NotImplementedError("target not wire-safe")
@@ -150,6 +151,7 @@ def _try_native_constraint_builder(
             # The wire proto drops meta_level for ParamSpec/TypeVarTuple
             # origins, so the decoded id never matches a fresh call-site var
             # (meta_level > 0) and the constraint is dropped in solve. Rebuild
+
             # the id from the matching live variable in the template. c.f.
             # solve.py:693-695 for the same identity concern.
             live = [
@@ -514,6 +516,7 @@ def infer_constraints_for_callable(
                     # If actual arguments are mapped to ParamSpec type, we can't infer individual
                     # constraints, instead store them and infer single constraint at the end.
                     # It is impossible to map actual kind to formal kind, so use some heuristic.
+
                     # This inference is used as a fallback, so relying on heuristic should be OK.
                     if not incomplete_star_mapping:
                         param_spec_arg_types.append(
@@ -626,6 +629,7 @@ def _infer_constraints(
     # Ignore Any types from the type suggestion engine to avoid them
     # causing us to infer Any in situations where a better job could
     # be done otherwise. (This can produce false positives but that
+
     # doesn't really matter because it is all heuristic anyway.)
     if isinstance(actual, AnyType) and actual.type_of_any == TypeOfAny.suggestion_engine:
         return []
@@ -633,6 +637,7 @@ def _infer_constraints(
     # type[A | B] is always represented as type[A] | type[B] internally.
     # This makes our constraint solver choke on type[T] <: type[A] | type[B],
     # solving T as generic meet(A, B) which is often `object`. Force unwrap such unions
+
     # if both sides are type[...] or unions thereof. See `testTypeVarType` test
     type_type_unwrapped = False
     if _is_type_type(template) and _is_type_type(actual):
@@ -643,9 +648,11 @@ def _infer_constraints(
     # If the template is simply a type variable, emit a Constraint directly.
     # We need to handle this case before handling Unions for two reasons:
     #  1. "T <: Union[U1, U2]" is not equivalent to "T <: U1 or T <: U2",
+
     #     because T can itself be a union (notably, Union[U1, U2] itself).
     #  2. "T :> Union[U1, U2]" is logically equivalent to "T :> U1 and
     #     T :> U2", but they are not equivalent to the constraint solver,
+
     #     which never introduces new Union types (it uses join() instead).
     if isinstance(template, TypeVarType):
         if _native_constraints_active and _HAS_TYPE_KERNEL:
@@ -660,8 +667,11 @@ def _infer_constraints(
         and not actual.id.is_meta_var()
         and direction == SUPERTYPE_OF
     ):
-        # Unless template is also a type variable (or a union that contains one), using the upper
-        # bound for inference will usually give better result for actual that is a type variable.
+        # Unless template is also a type variable (or a union that contains one), using
+        # the upper
+        # bound for inference will usually give better result for actual that is a type
+
+        # variable.
         if not isinstance(template, UnionType) or not any(
             isinstance(t, TypeVarType) for t in template.items
         ):
@@ -689,6 +699,7 @@ def _infer_constraints(
     # Now the potential subtype is known not to be a Union or a type
     # variable that we are solving for. In that case, for a Union to
     # be a supertype of the potential subtype, some item of the Union
+
     # must be a supertype of it.
     if direction == SUBTYPE_OF and isinstance(actual, UnionType):
         # We infer constraints eagerly -- try to find constraints for a type
@@ -824,9 +835,12 @@ def merge_with_any(constraint: Constraint) -> Constraint:
 
 
 def handle_recursive_union(template: UnionType, actual: Type, direction: int) -> list[Constraint]:
-    # This is a hack to special-case things like Union[T, Inst[T]] in recursive types. Although
+    # This is a hack to special-case things like Union[T, Inst[T]] in recursive types.
+    # Although
     # it is quite arbitrary, it is a relatively common pattern, so we should handle it well.
+
     # This function may be called when inferring against such union resulted in different
+
     # constraints for each item. Normally we give up in such case, but here we instead split
     # the union in two parts, and try inferring sequentially.
     non_type_var_items = [t for t in template.items if not isinstance(t, TypeVarType)]
@@ -863,6 +877,7 @@ def any_constraints(options: list[list[Constraint] | None], *, eager: bool) -> l
         # All options have same structure. In this case we can merge-in trivial
         # options (i.e. those that only have Any) and try again.
         # TODO: More generally, if a given (variable, direction) pair appears in
+
         # every option, combine the bounds with meet/join always, not just for Any.
         trivial_options = select_trivial(valid_options)
         if trivial_options and len(trivial_options) < len(valid_options):
@@ -882,6 +897,7 @@ def any_constraints(options: list[list[Constraint] | None], *, eager: bool) -> l
     # Try harder: if that didn't work, try to strip typevars that aren't meta vars.
     # Note this is what we would always do, but unfortunately some callers may not
     # set the meta var status correctly (for historical reasons), so we use this as
+
     # a fallback only.
     filtered_options = [exclude_non_meta_vars(o) for o in options]
     if filtered_options != options:
@@ -1282,9 +1298,11 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                 # We avoid infinite recursion for structural subtypes by checking
                 # whether this type already appeared in the inference chain.
                 # This is a conservative way to break the inference cycles.
+
                 # It never produces any "false" constraints but gives up soon
                 # on purely structural inference cycles, see #3829.
                 # Note that we use is_protocol_implementation instead of is_subtype
+
                 # because some type may be considered a subtype of a protocol
                 # due to _promote, but still not implement the protocol.
                 not any(template == t for t in reversed(template.type.inferring))
@@ -1413,6 +1431,7 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
         # Normalize callables before matching against each other.
         # Note that non-normalized callables can be created in annotations
         # using e.g. callback protocols.
+
         # TODO: check that callables match? Ideally we should not infer constraints
         # callables that can never be subtypes of one another in given direction.
         template = template.with_unpacked_kwargs().with_normalized_var_args()
@@ -1442,6 +1461,7 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                     # Technically, the correct inferred type for application of e.g.
                     # Callable[..., T] -> Callable[..., T] (with literal ellipsis), to a generic
                     # like U -> U, should be Callable[..., Any], but if U is a self-type, we can
+
                     # allow it to leak, to be later bound to self. A bunch of existing code
                     # depends on this old behaviour.
                     and not (
@@ -1466,6 +1486,7 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
                     # When both ParamSpec and TypeVarTuple are present, things become messy
                     # quickly. For now, we only allow ParamSpec to "capture" TypeVarTuple,
                     # but not vice versa.
+
                     # TODO: infer more from prefixes when possible.
                     if unpack_present is not None and not cactual.param_spec():
                         # We need to re-normalize args to the form they appear in tuples,
@@ -1590,6 +1611,7 @@ class ConstraintBuilderVisitor(TypeVisitor[list[Constraint]]):
         # Create constraints by matching an overloaded type against a template.
         # This is tricky to do in general. We cheat by only matching against
         # the first overload item that is callable compatible. This
+
         # seems to work somewhat well, but we should really use a more
         # reliable technique.
         item = find_matching_overload_item(overloaded, template)
@@ -2098,7 +2120,8 @@ def infer_callable_arguments_constraints(
     right_star = right.var_arg()
     right_star2 = right.kw_arg()
 
-    # Numbering of steps below matches the one in are_parameters_compatible() for convenience.
+    # Numbering of steps below matches the one in are_parameters_compatible() for
+    # convenience.
     # Phase 1a: compare star vs star arguments.
     if left_star is not None and right_star is not None:
         res.extend(infer_directed_arg_constraints(left_star.typ, right_star.typ, direction))

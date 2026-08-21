@@ -865,6 +865,7 @@ class FineGrainedDeferredNode(NamedTuple):
 # Data structure returned by find_isinstance_check representing
 # information learned from the truth or falsehood of a condition.  The
 # dict maps nodes representing expressions like 'a[0].x' to their
+
 # refined types under the assumption that the condition has a
 # particular truth value. A value of None means that the condition can
 # never have that truth value.
@@ -872,6 +873,7 @@ class FineGrainedDeferredNode(NamedTuple):
 # NB: The keys of this dict are nodes in the original source program,
 # which are compared by reference equality--effectively, being *the
 # same* expression of the program, not just two identical expressions
+
 # (such as two references to the same variable). TODO: it would
 # probably be better to have the dict keyed by the nodes' literal_hash
 # field instead.
@@ -925,9 +927,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     # Types of type checked nodes. The first item is the "master" type
     # map that will store the final, exported types. Additional items
     # are temporary type maps used during type inference, and these
+
     # will be eventually popped and either discarded or merged into
     # the master type map.
-    #
+
     # Avoid accessing this directly, but prefer the lookup_type(),
     # has_type() etc. helpers instead.
     _type_maps: list[dict[Expression, Type]]
@@ -954,7 +957,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     # NOTE: The names might not be unique, they are only for debugging purposes.
     widened_vars: list[str]
     # Global variables widened inside a function body, to be propagated to
-    # the module-level binder after the function is type checked (with --allow-redefinition-new).
+    # the module-level binder after the function is type checked (with
+    # --allow-redefinition-new).
     _globals_widened_in_func: list[tuple[NameExpr, Type]]
     globals: SymbolTable
     modules: dict[str, MypyFile]
@@ -982,6 +986,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     # A map from variable nodes to a snapshot of the frame ids of the
     # frames that were active when the variable was declared. This can
     # be used to determine nearest common ancestor frame of a variable's
+
     # declaration and the current frame, which lets us determine if it
     # was declared in a different branch of the same `if` statement
     # (if that frame is a conditional_frame).
@@ -1050,6 +1055,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # This internal flag is used to track whether we a currently type-checking
         # a final declaration (assignment), so that some errors should be suppressed.
         # Should not be set manually, use get_final_context/enter_final_context instead.
+
         # NOTE: we use the context manager to avoid "threading" an additional `is_final_def`
         # argument through various `checker` and `checkmember` functions.
         self._is_final_def = False
@@ -1277,6 +1283,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Don't report an error yet. Just defer. Note that we don't defer
             # lambdas because they are coupled to the surrounding function
             # through the binder and the inferred type of the lambda, so it
+
             # would get messy.
             enclosing_class = self.scope.enclosing_class(node)
             self.defer_node(node, enclosing_class)
@@ -1329,6 +1336,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # Perform multiple iterations if something changed that might affect
                 # inferred types. Also limit the number of iterations. The limits are
                 # somewhat arbitrary, but they were chosen to 1) avoid slowdown from
+
                 # multiple iterations in common cases and 2) support common, valid use
                 # cases. Limits are needed since otherwise we could infer infinitely
                 # complex types.
@@ -1355,14 +1363,15 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if else_body:
                 self.accept(else_body)
 
-    #
+
     # Definitions
-    #
+
 
     def visit_overloaded_func_def(self, defn: OverloadedFuncDef) -> None:
         # We always process overload as part of the top-level to infer various
         # externally visible properties like its type, similar to visit_decorator().
         # Only the body of the implementation is checked as a function-level target.
+
         # TODO: clean-up deferral logic and the daemon to avoid unnecessary work.
         with self.tscope.function_scope(defn):
             self._visit_overloaded_func_def(defn)
@@ -1566,12 +1575,15 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         # Native type_kernel seam: run the pairwise screening loop (the
         # counts-overlap gate, never-match, unsafe-overlap, and flip note)
+
         # in one Rust call on wire callables (overload_override.rs). Each
         # signature is serialized once instead of once per predicate, and
         # the loop itself runs natively. Engages only when every item's
+
         # var.type is already a plain CallableType (checked without
         # extraction, so the not_callable emissions of extract_callable_type
         # cannot diverge) and the resolver is installed; Rust defers on any
+
         # pair it cannot decide, and the pure-Python loop below runs exactly
         # as before.
         overlap_decisions: list[tuple[int, int, int, bool]] | None = None
@@ -1620,15 +1632,16 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # Note: we force mypy to check overload signatures in strict-optional mode
                         # so we don't incorrectly report errors when a user tries typing an overload
                         # that happens to have a 'if the argument is None' fallback.
-                        #
+
                         # For example, the following is fine in strict-optional mode but would throw
                         # the unsafe overlap error when strict-optional is disabled:
-                        #
+
                         #     @overload
                         #     def foo(x: None) -> int: ...
+
                         #     @overload
                         #     def foo(x: str) -> str: ...
-                        #
+
                         # See Python 2's map function for a concrete example of this kind of overload.
                         current_class = self.scope.active_class()
                         type_vars = current_class.defn.type_vars if current_class else []
@@ -1675,8 +1688,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # We perform a unification step that's very similar to what
                 # 'is_callable_compatible' does -- the only difference is that
                 # we check and see if the impl_type's return value is a
+
                 # *supertype* of the overload alternative, not a *subtype*.
-                #
+
                 # This is to match the direction the implementation's return
                 # needs to be compatible in.
                 if impl_type.variables:
@@ -1712,45 +1726,51 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     self.msg.overloaded_signatures_ret_specific(i + 1, defn.impl)
 
     # Here's the scoop about generators and coroutines.
-    #
+
     # There are two kinds of generators: classic generators (functions
     # with `yield` or `yield from` in the body) and coroutines
     # (functions declared with `async def`).  The latter are specified
+
     # in PEP 492 and only available in Python >= 3.5.
-    #
+
     # Classic generators can be parameterized with three types:
     # - ty is the Yield type (the type of y in `yield y`)
     # - tc is the type reCeived by yield (the type of c in `c = yield`).
+
     # - tr is the Return type (the type of r in `return r`)
-    #
+
     # A classic generator must define a return type that's either
     # `Generator[ty, tc, tr]`, Iterator[ty], or Iterable[ty] (or
     # object or Any).  If tc/tr are not given, both are None.
-    #
+
     # A coroutine must define a return type corresponding to tr; the
     # other two are unconstrained.  The "external" return type (seen
     # by the caller) is Awaitable[tr].
-    #
+
     # In addition, there's the synthetic type AwaitableGenerator: it
     # inherits from both Awaitable and Generator and can be used both
     # in `yield from` and in `await`.  This type is set automatically
+
     # for functions decorated with `@types.coroutine` or
     # `@asyncio.coroutine`.  Its single parameter corresponds to tr.
-    #
+
     # PEP 525 adds a new type, the asynchronous generator, which was
     # first released in Python 3.6. Async generators are `async def`
     # functions that can also `yield` values. They can be parameterized
+
     # with two types, ty and tc, because they cannot return a value.
-    #
+
     # There are several useful methods, each taking a type t and a
     # flag c indicating whether it's for a generator or coroutine:
-    #
+
     # - is_generator_return_type(t, c) returns whether t is a Generator,
     #   Iterator, Iterable (if not c), or Awaitable (if c), or
     #   AwaitableGenerator (regardless of c).
+
     # - is_async_generator_return_type(t) returns whether t is an
     #   AsyncGenerator.
     # - get_generator_yield_type(t, c) returns ty.
+
     # - get_generator_receive_type(t, c) returns tc.
     # - get_generator_return_type(t, c) returns tr.
 
@@ -1828,6 +1848,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # If the function's declared supertype of Generator has no type
             # parameters (i.e. is `object`), then the yielded values can't
             # be accessed so any type is acceptable.  IOW, ty is Any.
+
             # (However, see https://github.com/python/mypy/issues/1933)
             return AnyType(TypeOfAny.special_form)
 
@@ -1939,6 +1960,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # If the definition is the implementation for an
                         # overload, the legality of the override has already
                         # been typechecked, and decorated methods will be
+
                         # checked when the decorator is.
                         found_method_base_classes = self.check_method_override(defn)
                         self.check_explicit_override_decorator(defn, found_method_base_classes)
@@ -2129,12 +2151,13 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     # We suppress reachability warnings for empty generator functions
                     # (return; yield) which have a "yield" that's unreachable by definition
                     # since it's only there to promote the function into a generator function.
-                    #
+
                     # We also suppress reachability warnings when we use TypeVars with value
                     # restrictions: we only want to report a warning if a certain statement is
                     # marked as being suppressed in *all* of the expansions, but we currently
+
                     # have no good way of doing this.
-                    #
+
                     # TODO: Find a way of working around this limitation
                     if _is_empty_generator_function(item) or len(expanded) >= 2:
                         self.binder.suppress_unreachable_warnings()
@@ -2663,25 +2686,25 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Note: Suppose we have two operator methods "A.__rOP__(B) -> R1" and
         # "B.__OP__(C) -> R2". We check if these two methods are unsafely overlapping
         # by using the following algorithm:
-        #
+
         # 1. Rewrite "B.__OP__(C) -> R1"  to "temp1(B, C) -> R1"
-        #
+
         # 2. Rewrite "A.__rOP__(B) -> R2" to "temp2(B, A) -> R2"
-        #
+
         # 3. Treat temp1 and temp2 as if they were both variants in the same
         #    overloaded function. (This mirrors how the Python runtime calls
         #    operator methods: we first try __OP__, then __rOP__.)
-        #
+
         #    If the first signature is unsafely overlapping with the second,
         #    report an error.
-        #
+
         # 4. However, if temp1 shadows temp2 (e.g. the __rOP__ method can never
         #    be called), do NOT report an error.
-        #
+
         #    This behavior deviates from how we handle overloads -- many of the
         #    modules in typeshed seem to define __OP__ methods that shadow the
         #    corresponding __rOP__ method.
-        #
+
         # Note: we do not attempt to handle unsafe overlaps related to multiple
         # inheritance. (This is consistent with how we handle overloads: we also
         # do not try checking unsafe overlaps due to multiple inheritance there.)
@@ -2720,6 +2743,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Construct normalized function signatures corresponding to the
         # operator methods. The first argument is the left operand and the
         # second operand is the right argument -- we switch the order of
+
         # the arguments of the reverse method.
 
         # TODO: this manipulation is dangerous if callables are generic.
@@ -2973,6 +2997,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     method = "__" + name[3:]
                     # An inplace operator method such as __iadd__ might not be
                     # always introduced safely if a base class defined __add__.
+
                     # TODO can't come up with an example where this is
                     #      necessary; now it's "just in case"
                     if self.check_method_override_for_base_with_name(defn, method, base):
@@ -3023,6 +3048,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # This may only happen if we're checking `x-redefinition` member
             # and `x` itself is for some reason gone. Normally the node should
             # be reachable from the containing class by its name.
+
             # The redefinition is never removed, use this as a sanity check to verify
             # the reasoning above.
             assert f"{defn.name}-redefinition" in defn.info.names
@@ -3268,6 +3294,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # override might have its own generic function type
                 # variables. If an argument or return type of override
                 # does not have the correct subtyping relationship
+
                 # with the original type even after these variables
                 # are erased, then it is definitely an incompatibility.
 
@@ -3334,7 +3361,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # Give a more detailed message in the case where the user is trying to
                 # override an overload, and the subclass's overload is plausible, except
                 # that the order of the variants are wrong.
-                #
+
                 # For example, if the parent defines the overload f(int) -> int and f(str) -> str
                 # (in that order), and if the child swaps the two and does f(str) -> str and
                 # f(int) -> int
@@ -3575,6 +3602,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Now, only `Var` is left, we need to check:
         # 1. Private name like in `__prop = 1`
         # 2. Dunder name like `__hash__ = some_hasher`
+
         # 3. Sunder name like `_order_ = 'a, b, c'`
         # 4. If it is a method / descriptor like in `method = classmethod(func)`
         if (
@@ -3889,9 +3917,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 rvalue_name="imported name",
             )
 
-    #
+
     # Statements
-    #
+
 
     def visit_block(self, b: Block) -> None:
         if b.is_unreachable:
@@ -4080,12 +4108,14 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         if not self.infer_partial_type(var, lvalue, rvalue_type):
                             # If that also failed, give up and let the caller know that we
                             # cannot read their mind. The definition site will be reported later.
+
                             # Calling .put() directly because the newly inferred type is
                             # not a subtype of None - we are not looking for narrowing
                             fallback = self.inference_error_fallback_type(rvalue_type)
                             self.binder.put(lvalue, fallback)
                             # Same as self.set_inference_error_fallback_type but inlined
                             # to avoid computing fallback twice.
+
                             # We are replacing partial<None> now, so the variable type
                             # should remain optional.
                             self.set_inferred_type(var, lvalue, make_optional_type(fallback))
@@ -4100,6 +4130,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     # Hacky special case for assigning a literal None
                     # to a variable defined in a previous if
                     # branch. When we detect this, we'll go back and
+
                     # make the type optional. This is somewhat
                     # unpleasant, and a generalization of this would
                     # be an improvement!
@@ -4514,6 +4545,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         if base_node.is_final and (node.is_final or not isinstance(base_node, Var)):
             # Give this error only for explicit override attempt with `Final`, or
             # if we are overriding a final method with variable.
+
             # Other override attempts will be flagged as assignment to constant
             # in `check_final()`.
             self.msg.cant_override_final(node.name, base.name, node)
@@ -4656,6 +4688,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         if isinstance(typ, Instance):
             # When working with instances, we need to know if they contain
             # `__set__` special method. Like `@property` does.
+
             # This makes assigning to properties possible,
             # even without extra slot spec.
             return typ.type.get("__set__") is not None
@@ -4707,6 +4740,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Recursively go into Tuple or List expression rhs instead of
             # using the type of rhs, because this allows more fine-grained
             # control in cases like: a, b = [int, str] where rhs would get
+
             # type List[object]
             rvalues: list[Expression] = []
             iterable_type: Type | None = None
@@ -4802,6 +4836,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if left_suffix > right_suffix or left_prefix > right_prefix:
                 # Case of asymmetric unpack like:
                 #     rv: tuple[int, *Ts, int, int]
+
                 #     x, y, *xs, z = rv
                 # it is technically valid, but is tricky to reason about.
                 # TODO: support this (at least if the r.h.s. unpack is a homogeneous tuple).
@@ -5003,6 +5038,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     # We can get Any if the current node is
                     # deferred. Doing more inference in deferred nodes
                     # is hard, so give up for now.  We can also get
+
                     # here if reinferring types above changes the
                     # inferred return type for an overloaded function
                     # to be ambiguous.
@@ -5210,6 +5246,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # If the node type is not defined, this must the first assignment
             # that we process => this is a definition, even though the semantic
             # analyzer did not recognize this as such. This can arise in code
+
             # that uses isinstance checks, if type checking of the primary
             # definition is skipped due to an always False type check.
             node = s.node
@@ -5245,6 +5282,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # We cannot use the type of the initialization expression for full type
             # inference (it's not specific enough), but we might be able to give
             # partial type which will be made more specific later. A partial type
+
             # gets generated in assignment like 'x = []' where item type is not known.
             if name.name != "_" and not self.infer_partial_type(name, lvalue, init_type):
                 self.msg.need_annotation_for_var(name, context, self.options)
@@ -5393,7 +5431,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def inference_error_fallback_type(self, type: Type) -> Type:
         fallback = type.accept(SetNothingToAny())
-        # Type variables may leak from inference, see https://github.com/python/mypy/issues/5738,
+        # Type variables may leak from inference, see
+        # https://github.com/python/mypy/issues/5738,
         # we therefore need to erase them.
         return erase_typevars(fallback)
 
@@ -5433,8 +5472,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # TODO: make assignment checking correct in presence of walrus in r.h.s.
         # We may accept r.h.s. twice. In presence of walrus this can lead to weird
         # false negatives and "back action". A proper solution would be to use
+
         # binder.accumulate_type_assignments() and assign the types inferred for type
         # context that is ultimately used. This is however tricky with redefinitions.
+
         # For now we simply disable second accept in cases known to cause problems,
         # see e.g. testAssignToOptionalTupleWalrus.
         assignment_expression_effect = self.assignment_expression_effect
@@ -5525,6 +5566,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # If redefinitions are allowed (i.e. we have --allow-redefinition
             # and a variable without annotation) or if a variable has union type we
             # try inferring r.h.s. twice with a fallback type context. The only exception
+
             # is TypedDicts, they are often useless without context.
             try_fallback = (
                 inferred is not None or isinstance(get_proper_type(lvalue_type), UnionType)
@@ -5673,6 +5715,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Special case: if the rvalue_type is a subtype of '__get__' type, and
         # '__get__' type is narrower than '__set__', then we invoke the binder to narrow type
         # by this assignment. Technically, this is not safe, but in practice this is
+
         # what a user expects.
         rvalue_type, _ = self.check_simple_assignment(set_lvalue_type, rvalue, context)
         rvalue_type = rvalue_type if is_subtype(rvalue_type, get_lvalue_type) else get_lvalue_type
@@ -5857,6 +5900,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
                 # This controls whether or not we allow a function call that
                 # returns None as the expression of this return statement.
+
                 # E.g. `return f()` for some `f` that returns None.  We allow
                 # this only if we're in a lambda or in a function that returns
                 # `None` or `Any`.
@@ -5871,6 +5915,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     # For expressions that (strongly) depend on type context (i.e. those that
                     # are handled like a function call), we allow fallback to empty type context
                     # in case of errors, this improves user experience in some cases,
+
                     # see e.g. testReturnFallbackInference.
                     typ = self.infer_context_dependent(s.expr, return_type, allow_none_func_call)
                 else:
@@ -6064,9 +6109,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Not only might the body of the try statement exit
             # abnormally, but so might an exception handler or else
             # clause. The finally clause runs in *all* cases, so we
+
             # need an outer try frame to catch all intermediate states
             # in case an exception is raised during an except or else
             # clause. As an optimization, only create the outer try
+
             # frame when there actually is a finally clause.
             self.visit_try_without_finally(s, try_frame=bool(s.finally_body))
             if s.finally_body:
@@ -6079,12 +6126,15 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Then we try again for the more restricted set of options
             # that can fall through. (Why do we need to check the
             # finally clause twice? Depending on whether the finally
+
             # clause was reached by the try clause falling off the end
             # or exiting abnormally, after completing the finally clause
             # either flow will continue to after the entire try statement
+
             # or the exception/return/etc. will be processed and control
             # flow will escape. We need to check that the finally clause
             # type checks in both contexts, but only the resulting types
+
             # from the latter context affect the type state in the code
             # that follows the try statement.)
             assert iter_errors is not None
@@ -6149,6 +6199,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Phase C2 (#609): native classification of each handler test type.
         # Rust returns (tag, blob) pairs preserving the Python dispatch; the
         # is_subtype(...BaseException) fence and the is_star reclassification
+
         # below stay in Python. Deserialized types need the same fixup as the
         # sibling get_types_from_except_handler native path.
         pairs = _try_native_except_handler_tests(test_types)
@@ -6480,7 +6531,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if len([k for k in sig.arg_kinds if k.is_required()]) > 1:
                     self.msg.fail("Too many arguments for property", e)
             self.check_incompatible_property_override(e)
-        # For overloaded functions/properties we already checked override for overload as a whole.
+        # For overloaded functions/properties we already checked override for overload
+        # as a whole.
         if allow_empty or skip_first_item:
             return
         if e.func.info and not e.is_overload:
@@ -6540,6 +6592,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # Based on the return type, determine if this context manager 'swallows'
             # exceptions or not. We determine this using a heuristic based on the
             # return type of the __exit__ method -- see the discussion in
+
             # https://github.com/python/mypy/issues/7214 and the section about context managers
             # in https://github.com/python/typeshed/blob/main/CONTRIBUTING.md#conventions
             # for more details.
@@ -6633,6 +6686,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # We infer types of patterns twice. The first pass is used
             # to infer the types of capture variables. The type of a
             # capture variable may depend on multiple patterns (it
+
             # will be a union of all capture types). This pass ignores
             # guard expressions.
             pattern_types = [self.pattern_checker.accept(p, subject_type) for p in s.patterns]
@@ -6730,7 +6784,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         sub_patterns_map: dict[Expression, Type] = {}
         typ_ = get_proper_type(typ)
         if isinstance(expr, TupleExpr) and isinstance(typ_, TupleType):
-            # When matching a tuple expression with a sequence pattern, narrow individual tuple items
+            # When matching a tuple expression with a sequence pattern, narrow
+            # individual tuple items
             assert len(expr.items) == len(typ_.items)
             for item_expr, item_typ in zip(expr.items, typ_.items):
                 sub_patterns_map[item_expr] = item_typ
@@ -6813,8 +6868,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Build the fake ClassDef and TypeInfo together.
         # The ClassDef is full of lies and doesn't actually contain a body.
         # Use format_bare to generate a nice name for error messages.
+
         # We skip fully filling out a handful of TypeInfo fields because they
         # should be irrelevant for a generated type like this:
+
         # is_protocol, protocol_members, is_abstract
         cdef = ClassDef(class_short_name, Block([]))
         cdef.fullname = curr_module_fullname + "." + class_gen_name
@@ -6852,6 +6909,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # First, retry narrowing while allowing promotions (they are disabled by default
         # for isinstance() checks, etc). This way we will still type-check branches like
         # x: complex = 1
+
         # if isinstance(x, int):
         #     ...
         left, right = instances
@@ -7018,9 +7076,11 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # We could do better probably?
             # Refine the type variable's bound as our type in the case that
             # callable() is true. This unfortunately loses the information that
+
             # the type is a type variable in that branch.
             # This matches what is done for isinstance, but it may be possible to
             # do better.
+
             # If it is possible for the false branch to execute, return the original
             # type to avoid losing type information.
             callables, uncallables = self.partition_by_callable(
@@ -7127,6 +7187,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # If an item is missing and the type is closed, we can exclude it from
                         # if_types; see testOperatorContainsNarrowsTypedDicts_closed
                         # We also support "final" as a legacy way of expressing "closed" in this
+
                         # specific case; see testOperatorContainsNarrowsTypedDicts_final
                         else_types.append(possible_iterable_type)
                     else:
@@ -7279,7 +7340,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if called_type is not None:
                     called_type = get_proper_type(called_type)
                     # TODO: there are some more cases in check_call() to handle.
-                    # If the callee is an instance, try to extract TypeGuard/TypeIs from its __call__ method.
+                    # If the callee is an instance, try to extract TypeGuard/TypeIs from
+                    # its __call__ method.
                     if isinstance(called_type, Instance):
                         call = find_member("__call__", called_type, called_type, is_operator=True)
                         if call is not None:
@@ -7296,6 +7358,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # *assuming* the overloaded function is correct, there's a couple cases:
                         #  1) The first argument has different names, but is pos-only. We don't
                         #     care about this case, the argument must be passed positionally.
+
                         #  2) The first argument allows keyword reference, therefore must be the
                         #     same between overloads.
                         if isinstance(called_type, (CallableType, Overloaded)):
@@ -7314,6 +7377,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         # Note: we wrap the target type, so that we can special case later.
                         # Namely, for isinstance() we use a normal meet, while TypeGuard is
                         # considered "always right" (i.e. even if the types are not overlapping).
+
                         # Also note that a care must be taken to unwrap this back at read places
                         # where we use this to narrow down declared type.
                         if type_guard is not None:
@@ -7441,17 +7505,18 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # Step 2: Group operands chained by either the 'is' or '==' operands
         # together. For all other operands, we keep them in groups of size 2.
         # So the expression:
-        #
+
         #   x0 == x1 == x2 < x3 < x4 is x5 is x6 is not x7 is not x8
-        #
+
         # ...is converted into the simplified operator list:
-        #
+
         #  [("==", [0, 1, 2]), ("<", [2, 3]), ("<", [3, 4]),
         #   ("is", [4, 5, 6]), ("is not", [6, 7]), ("is not", [7, 8])]
-        #
+
         # We group identity/equality expressions so we can propagate information
         # we discover about one operand across the entire chain. We don't bother
         # handling 'is not' and '!=' chains in a special way: those are very rare
+
         # in practice.
 
         simplified_operator_list = group_comparison_operands(
@@ -7614,7 +7679,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         """
         # is_target_for_value_narrowing:
-        # If the operator returns True when compared to this target, do we narrow in else branch?
+        # If the operator returns True when compared to this target, do we narrow in
+        # else branch?
+
         # E.g. if operator is "==", then:
         # - is_target_for_value_narrowing(str) == False
         # - is_target_for_value_narrowing(Literal["asdf"]) == True
@@ -7622,13 +7689,17 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         # should_coerce_literals:
         # Ideally, we should always attempt to have this set to True. Unfortunately, for now,
-        # performing this coercion can sometimes result in overly aggressive narrowing when taking
-        # in the context of other type checker behaviour.
+        # performing this coercion can sometimes result in overly aggressive narrowing
+
+        # when taking in the context of other type checker behaviour.
         should_coerce_literals: bool
 
         # custom_eq_indices:
-        # Operands at these indices define a custom `__eq__`. These can do arbitrary things, so we
-        # have to be more careful about what narrowing we can conclude from a successful comparison
+        # Operands at these indices define a custom `__eq__`. These can do arbitrary
+        # things, so we
+
+        # have to be more careful about what narrowing we can conclude from a
+        # successful comparison
         custom_eq_indices: set[int]
 
         # Equality can use value semantics, so `if x == Fruits.APPLE: ...` may also
@@ -7681,6 +7752,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # Morally what we want to do is narrow for each branch based on:
                 # `if_type, else_type = conditional_types(expr_type, target)`
                 # What we actually do is first munge expr_type based on target_type to handle some
+
                 # special cased known `__eq__` implementations.
                 narrowable_expr_type, ambiguous_expr_type = partition_equality_ambiguous_types(
                     expr_type, target_type, is_identity=is_identity_comparison
@@ -7719,16 +7791,20 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     # For value targets, it is safe to narrow in the negative case.
                     # e.g. if (x: Literal[5] | None) != (y: Literal[5]), we can narrow x to None
                     # However, for non-value targets, we cannot do this narrowing,
+
                     # and so we ignore else_map
                     # e.g. if (x: str | None) != (y: str), we cannot narrow x to None
 
                     # It is correct to always narrow here. It improves behaviour on tests and
                     # detects many inaccurate type annotations on primer.
+
                     # However, because mypy does not currently check unreachable code, it feels
                     # risky to narrow to unreachable without --warn-unreachable or not
                     # at module level
+
                     # See also this specific primer comment, where I force primer to run with
                     # --warn-unreachable to see what code we would stop checking:
+
                     # https://github.com/python/mypy/pull/20660#issuecomment-3865794148
                     if (
                         self.options.warn_unreachable and len(self.scope.stack) != 1
@@ -7744,6 +7820,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if not isinstance(union_expr_type, UnionType):
                 # Here we don't do any positive narrowing, because we can't conclude much
                 # from a custom __eq__ returning True.
+
                 # But we might be able to do some negative narrowing, since we can assume
                 # a custom __eq__ is reflexive. This should only apply to custom __eq__ enums,
                 # see testNarrowingEqualityCustomEqualityEnum
@@ -7937,6 +8014,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # First, check if this expression is one that's attempting to
             # "lookup" some key in the parent type. If so, save the parent type
             # and create function that will try replaying the same lookup
+
             # operation against arbitrary types.
             if isinstance(expr, MemberExpr):
                 parent_expr = self._propagate_walrus_assignments(expr.expr, output)
@@ -8021,6 +8099,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             # We currently only try refining the parent type if it's a Union.
             # If not, there's no point in trying to refine any further parents
             # since we have no further information we can use to refine the lookup
+
             # chain, so we end early as an optimization.
             parent_type = get_proper_type(parent_type)
             if not isinstance(parent_type, UnionType):
@@ -8137,6 +8216,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # First step: group consecutive `is` and `==` comparisons together.
         # This is essentially a simplified version of group_comparison_operands(),
         # tuned to the len()-like checks. Note that we don't propagate indirect
+
         # restrictions like e.g. `len(x) > foo() > 1` yet, since it is tricky.
         # TODO: propagate indirect len() comparison restrictions.
         chained = []
@@ -8363,9 +8443,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             yes_type, no_type = self.refine_instance_type_with_len(typ, neg_ops[op], size)
             return no_type, yes_type
 
-    #
+
     # Helpers
-    #
+
     @overload
     def check_subtype(
         self,
@@ -8923,6 +9003,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         # If conditional_types was unable to successfully narrow the expr_type
         # using the type_ranges and concluded if-branch is unreachable, we try
         # computing it again using a different algorithm that tries to generate
+
         # an ad-hoc intersection between the expr_type and the type_ranges.
         proper_type = get_proper_type(expr_type)
         if isinstance(proper_type, UnionType):
@@ -9337,7 +9418,7 @@ class TypeCheckerAsSemanticAnalyzer(SemanticAnalyzerCoreInterface):
 
     def is_func_scope(self) -> bool:
         # Return arbitrary value.
-        #
+
         # This method is currently only used to decide whether to pair
         # a fail() message with a note() message or not. Both of those
         # message types are ignored.
@@ -9828,6 +9909,7 @@ def or_conditional_maps(m1: TypeMap, m2: TypeMap, *, coalesce_any: bool = False)
     # Both conditions can be true. Combine information about
     # expressions whose type is refined by both conditions. (We do not
     # learn anything about expressions whose type is refined by only
+
     # one condition.)
     combined: dict[Expression, Type] = {}
     for n1 in m1:
@@ -10179,12 +10261,15 @@ def overload_can_never_match(signature: CallableType, other: CallableType) -> bo
     # The extra erasure is needed to prevent spurious errors
     # in situations where an `Any` overload is used as a fallback
     # for an overload with type variables. The spurious error appears
+
     # because the type variables turn into `Any` during unification in
     # the below subtype check and (surprisingly?) `is_proper_subtype(Any, Any)`
     # returns `True`.
+
     # TODO: find a cleaner solution instead of this ad-hoc erasure.
     # Native type_kernel seam: the non-generic Callable-vs-Callable fast path
     # (the erase+expand is a no-op when there are no variables). Generic or
+
     # non-callable operands defer to the pure-Python path below.
     if (
         _CHECKER_HAS_TYPE_KERNEL
@@ -10306,10 +10391,11 @@ def is_valid_inferred_type(
     if isinstance(proper_type, NoneType):
         # If the lvalue is final, we may immediately infer NoneType when the
         # initializer is None.
-        #
+
         # If not, we want to defer making this decision. The final inferred
         # type could either be NoneType or an Optional type, depending on
         # the context. This resolution happens in leave_partial_types when
+
         # we pop a partial types scope.
         return is_lvalue_final or (not is_lvalue_member and options.allow_redefinition)
     elif isinstance(proper_type, UninhabitedType):
@@ -10764,8 +10850,10 @@ def is_overlapping_types_for_overload(left: Type, right: Type) -> bool:
     # Note that among other effects 'overlap_for_overloads' flag will effectively
     # ignore possible overlap between type variables and None. This is technically
     # unsafe, but unsafety is tiny and this prevents some common use cases like:
+
     #     @overload
     #     def foo(x: None) -> None: ..
+
     #     @overload
     #     def foo(x: T) -> Foo[T]: ...
     return is_overlapping_types(left, right, ignore_promotions=True, overlap_for_overloads=True)

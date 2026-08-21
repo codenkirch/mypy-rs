@@ -274,8 +274,10 @@ class InstanceJoiner:
         # The definition of "best" may evolve; for now it is the one with
         # the longest MRO.  Ties are broken by using the earlier base.
 
-        # Go over both sets of bases in case there's an explicit Protocol base. This is important
+        # Go over both sets of bases in case there's an explicit Protocol base. This is
+        # important
         # to ensure commutativity of join (although in cases where both classes have relevant
+
         # Protocol bases this maybe might still not be commutative)
         base_types: dict[TypeInfo, None] = {}  # dict to deduplicate but preserve order
         for base in t.type.bases:
@@ -371,12 +373,15 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
     # Stage 3c (M8e/M8f/M8g): try the Rust join_types pre-dispatch +
     # leaf visitors + Instance-Instance nominal join. Rust handles the
     # UnionType swap, AnyType/NoneType/UninhabitedType/DeletedType
+
     # short-circuits, the leaf TypeJoinVisitor cases that don't
     # recurse, the args-less Instance-Instance nominal join
     # (same-type, direct-subtype, common-ancestor via bases walk), and
+
     # the same-type-with-args join (AnyType args + invariant
     # is_equivalent). Returns (disc, fullname, arg_discs) where disc is
     # 0=SameS, 1=SameT, 2=Object, 3=Bottom, 4=Any, 5=Ancestor (fullname
+
     # set), 6=SameTypeWithArgs (fullname + arg_discs set), or None
     # (defer to Python). Mirrors the erasetype.py:80-86 strangler-fig
     # contract.
@@ -412,6 +417,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # Encoded: Rust built a new type and serialized it in
                 # the wire format. Decode via read_type(ReadBuffer),
                 # then resolve wire-only `type_ref` strings to live
+
                 # TypeInfo via the fullname -> TypeInfo map. If any
                 # type_ref is missing, defer to Python.
                 decoded = read_type(_ReadBuffer(bytes(encoded)))
@@ -430,12 +436,15 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                     # Rust-built callable joins (combine_similar_callables
                     # / join_similar_callables) encode a fresh wire
                     # CallableType that cannot carry `definition` (only
+
                     # used for error messages; see wirefixup). The pure
                     # Python path does `t.copy_modified(...)` on the
                     # visited right operand, preserving its `definition`
+
                     # so `pretty_callable` renders `def <name>`. Restore
                     # it here from the live `t` (the join's right
                     # operand, in scope), mirroring bind_self's
+
                     # rebuild-on-live-object pattern.
                     if (
                         isinstance(fixed, CallableType)
@@ -457,6 +466,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # SameTypeWithArgs: reconstruct Instance(typeinfo,
                 # [joined_args]) from per-arg discriminators. arg_discs
                 # [i] is 0 (s.args[i]), 1 (t.args[i]), or 4 (AnyType).
+
                 # Covariant args yield 0/1 (SameS/SameT on equal args);
                 # invariant equivalent args yield 0/1; AnyType yields 4.
                 if _native_join_typeinfo_map is None or fullname not in _native_join_typeinfo_map:
@@ -673,30 +683,39 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
         # This is more complex than most other cases. Here are some
         # examples that illustrate how this works.
         #
+
         # First let's define a concise notation:
         #  - Cn are callable types (for n in 1, 2, ...)
         #  - Ov(C1, C2, ...) is an overloaded type with items C1, C2, ...
+
         #  - Callable[[T, ...], S] is written as [T, ...] -> S.
         #
         # We want some basic properties to hold (assume Cn are all
+
         # unrelated via Any-similarity):
         #
         #   join(Ov(C1, C2), C1) == C1
+
         #   join(Ov(C1, C2), Ov(C1, C2)) == Ov(C1, C2)
         #   join(Ov(C1, C2), Ov(C1, C3)) == C1
         #   join(Ov(C2, C2), C3) == join of fallback types
+
         #
         # The presence of Any types makes things more interesting. The join is the
         # most general type we can get with respect to Any:
+
         #
         #   join(Ov([int] -> int, [str] -> str), [Any] -> str) == Any -> str
         #
+
         # We could use a simplification step that removes redundancies, but that's not
         # implemented right now. Consider this example, where we get a redundancy:
         #
+
         #   join(Ov([int, Any] -> Any, [str, Any] -> Any), [Any, int] -> Any) ==
         #       Ov([Any, int] -> Any, [Any, int] -> Any)
         #
+
         # TODO: Consider more cases of callable subtyping.
         result: list[CallableType] = []
         s = self.s
@@ -755,6 +774,7 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
                     # Rust re-serializes each joined item as a wire Type
                     # carrying only a type_ref string; decode to live
                     # TypeInfo via the same fixup as the rust_join_types
+
                     # disc=7 path (join.py:389-402). A missing ref (or an
                     # unset typeinfo map) returns None -> defer to Python
                     # rather than wiring a FakeInfo into the type graph.
@@ -880,12 +900,15 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
         # When given two fixed-length tuples:
         # * If they have the same length, join their subtypes item-wise:
         #   Tuple[int, bool] + Tuple[bool, bool] becomes Tuple[int, bool]
+
         # * If lengths do not match, return a variadic tuple:
         #   Tuple[bool, int] + Tuple[bool] becomes Tuple[int, ...]
         #
+
         # Otherwise, `t` is a fixed-length tuple but `self.s` is NOT:
         # * Joining with a variadic tuple returns variadic tuple:
         #   Tuple[int, bool] + Tuple[bool, ...] becomes Tuple[int, ...]
+
         # * Joining with any Sequence also returns a Sequence:
         #   Tuple[int, bool] + List[bool] becomes Sequence[int]
         if isinstance(self.s, TupleType):
@@ -934,6 +957,7 @@ class TypeJoinVisitor(TypeVisitor[ProperType]):
                 # As one of the input types marks the key as not required, it must
                 # be not required in the join supertype. However, as the other input
                 # type does not have a delitem overload for the key, the delitem
+
                 # overload must be omitted in the join supertype too. This can only
                 # be done by marking the key as readonly.
                 is_readonly = True
@@ -1084,12 +1108,19 @@ def update_callable_ids(c: CallableType, ids: list[TypeVarId]) -> CallableType:
 
 
 def match_generic_callables(t: CallableType, s: CallableType) -> tuple[CallableType, CallableType]:
-    # The case where we combine/join/meet similar callables, situation where both are generic
-    # requires special care. A more principled solution may involve unify_generic_callable(),
+    # The case where we combine/join/meet similar callables, situation where both are
+    # generic
+    # requires special care. A more principled solution may involve
+
+    # unify_generic_callable(),
     # but it would have two problems:
+
     #   * This adds risk of infinite recursion: e.g. join -> unification -> solver -> join
     #   * Using unification is an incorrect thing for meets, as it "widens" the types
-    # Finally, this effectively falls back to an old behaviour before namespaces were added to
+    # Finally, this effectively falls back to an old behaviour before namespaces were
+
+    # added to
+
     # type variables, and it worked relatively well.
     max_len = max(len(t.variables), len(s.variables))
     min_len = min(len(t.variables), len(s.variables))
@@ -1105,8 +1136,10 @@ def join_similar_callables(t: CallableType, s: CallableType) -> CallableType:
     arg_types: list[Type] = []
     for i in range(len(t.arg_types)):
         arg_types.append(safe_meet(t.arg_types[i], s.arg_types[i]))
-    # TODO in combine_similar_callables also applies here (names and kinds; user metaclasses)
+    # TODO in combine_similar_callables also applies here (names and kinds; user
+    # metaclasses)
     # The fallback type can be either 'function', 'type', or some user-provided metaclass.
+
     # The result should always use 'function' as a fallback if either operands are using it.
     if t.fallback.type.fullname == "builtins.function":
         fallback = t.fallback
@@ -1163,8 +1196,11 @@ def combine_similar_callables(t: CallableType, s: CallableType) -> CallableType:
     for i in range(len(t.arg_types)):
         arg_types.append(safe_join(t.arg_types[i], s.arg_types[i]))
     # TODO kinds and argument names
-    # TODO what should happen if one fallback is 'type' and the other is a user-provided metaclass?
+    # TODO what should happen if one fallback is 'type' and the other is a user-provided
+    # metaclass?
+
     # The fallback type can be either 'function', 'type', or some user-provided metaclass.
+
     # The result should always use 'function' as a fallback if either operands are using it.
     if t.fallback.type.fullname == "builtins.function":
         fallback = t.fallback

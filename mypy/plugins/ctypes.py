@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-# Fully qualified instead of "from mypy.plugin import ..." to avoid circular import problems.
+# Fully qualified instead of "from mypy.plugin import ..." to avoid circular import
+# problems.
 import mypy.plugin
 from mypy import nodes
 from mypy.maptype import map_instance_to_supertype
@@ -51,7 +52,9 @@ def _autoconvertible_to_cdata(tp: Type, api: mypy.plugin.CheckerPluginInterface)
     """
     allowed_types = []
     # If tp is a union, we allow all types that are convertible to at least one of the union
-    # items. This is not quite correct - strictly speaking, only types convertible to *all* of the
+    # items. This is not quite correct - strictly speaking, only types convertible to
+    # *all* of the
+
     # union items should be allowed. This may be worth changing in the future, but the more
     # correct algorithm could be too strict to be useful.
     for t in flatten_nested_unions([tp]):
@@ -110,7 +113,8 @@ def _get_array_element_type(tp: Type) -> ProperType | None:
 
 def array_constructor_callback(ctx: mypy.plugin.FunctionContext) -> Type:
     """Callback to provide an accurate signature for the ctypes.Array constructor."""
-    # Extract the element type from the constructor's return type, i. e. the type of the array
+    # Extract the element type from the constructor's return type, i. e. the type of the
+    # array
     # being constructed.
     et = _get_array_element_type(ctx.default_return_type)
     if et is not None:

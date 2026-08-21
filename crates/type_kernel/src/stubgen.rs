@@ -126,7 +126,8 @@ fn render_bytes_expr(py: Python<'_>, node: &PyAny) -> PyResult<Option<String>> {
 // Composite nodes
 // ---------------------------------------------------------------------------
 
-/// IndexExpr → `base[index]` with special handling for typing.Union / typing.Optional.
+/// IndexExpr → `base[index]` with special handling for typing.Union /
+/// typing.Optional.
 fn render_index_expr(py: Python<'_>, node: &PyAny) -> PyResult<Option<String>> {
     let base = node.getattr("base")?;
     let index = node.getattr("index")?;
@@ -137,6 +138,7 @@ fn render_index_expr(py: Python<'_>, node: &PyAny) -> PyResult<Option<String>> {
     // Check for Union / Optional special handling.
     // The Python AliasPrinter checks `base_fullname == "typing.Union"` etc.
     // Only the fully-qualified names trigger the special syntax; bare
+
     // "Union" / "Optional" are passed through as-is.
     // AliasPrinter checks exact fullnames only; bare "Union"/"Optional" pass
     // through as regular names.
@@ -378,6 +380,7 @@ fn get_expr_qualified_name(node: &PyAny) -> PyResult<String> {
 // ---------------------------------------------------------------------------
 // PyO3 entry points
 // ---------------------------------------------------------------------------
+
 // ---------------------------------------------------------------------------
 
 /// Render a mypy AST expression node as stub text.

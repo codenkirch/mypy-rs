@@ -188,12 +188,15 @@ class NodeFixer(NodeVisitor[None]):
                 # The node seems to refer to itself, which can mean that
                 # the target is a deleted submodule of the current module,
                 # and thus lookup falls back to the symbol table of the parent
+
                 # package. Here's how this may happen:
                 #
                 #   pkg/__init__.py:
+
                 #     from pkg import sub
                 #
                 # Now if pkg.sub is deleted, the pkg.sub symbol table entry
+
                 # appears to refer to itself. Replace the entry with a
                 # placeholder to avoid a crash. We can't delete the entry,
                 # as it would stop dependency propagation.

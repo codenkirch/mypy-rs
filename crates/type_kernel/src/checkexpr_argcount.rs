@@ -482,6 +482,7 @@ pub(crate) fn rust_should_dispatch_union_call(
     // Python: `elif member is not None and isinstance(object_type, UnionType)`.
     // Only reached when callable_name is None (the `if callable_name:` branch
     // fires first).  The caller already handles callable_name, so we only
+
     // check member + union.
     if member.is_none() {
         return Some(false);
@@ -776,6 +777,7 @@ mod tests {
         // *args: list (not tuple) not matched to any formal. The star
         // actual itself is NOT an error (non-tuple iterables can be
         // empty), but the required ARG_POS formal with no actual IS an
+
         // error (too few positional). The star-actual branch must NOT
         // emit ERR_EXTRA_UNNAMED.
         let callee = make_callable(&[ARG_POS], &[Some("x")]);
@@ -840,6 +842,7 @@ mod tests {
         // TypeAliasType cannot be serialized on the wire (write_type panics),
         // so a real alias actual arrives as undecodable bytes.  decode_type
         // returns None, which triggers the defer path — same observable
+
         // behavior as the explicit TypeAliasType check in the inner logic.
         let callee = make_callable(&[ARG_POS], &[Some("x")]);
         let callee_bytes = encode(&callee);

@@ -628,6 +628,7 @@ fn check_callable_call_tail(callee: &Type, arg_types: &[Type]) -> Option<Type> {
         // An Instance with another type_ref, or a TypeVar/Tuple/TypedDict/
         // Literal whose force-fallback walk could reach builtins.type —
         // the wire cannot verify, so defer rather than risk a mismatch
+
         // with Python's calibrated ret_type.
         let walkable = |t: &Type| {
             matches!(

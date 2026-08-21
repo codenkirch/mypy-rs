@@ -246,9 +246,11 @@ fn fill_typevars_required(
             // Fixed-size alias (Python step 8). Python sets
             // `fill_typevars = act_len != max_tv_count` unconditionally
             // (not `!correct`): even when defaults cover a short arg list
+
             // (`min_tv_count <= act_len < max_tv_count`), the body still
             // runs `set_any_tvars`, which substitutes the default and may
             // record default recursion. That substitution is Python-side
+
             // (expand_type on a gradually-built env), so defer on ANY
             // arity mismatch, not just `!correct`.
             if args.iter().any(|a| matches!(a, Type::UnpackType { .. })) {

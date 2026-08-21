@@ -89,9 +89,11 @@ def spill_regs(
                 # When we decref a spilled value, we turn that into
                 # NULLing out the attribute, but only if the spilled
                 # value is not live *when we include yields in the
+
                 # CFG*. (The original decrefs are computed without that.)
                 #
                 # We also skip a decref is the env register is not
+
                 # live. That should only happen when an exception is
                 # being raised, so everything should be handled there.
                 if op.src not in live.after[block, i] and env_reg in live.after[block, i]:

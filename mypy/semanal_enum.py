@@ -33,7 +33,8 @@ from mypy.options import Options
 from mypy.semanal_shared import SemanticAnalyzerInterface
 from mypy.types import LiteralType, get_proper_type
 
-# Note: 'enum.EnumMeta' is deliberately excluded from this list. Classes that directly use
+# Note: 'enum.EnumMeta' is deliberately excluded from this list. Classes that directly
+# use
 # enum.EnumMeta do not necessarily automatically have the 'name' and 'value' attributes.
 ENUM_BASES: Final = frozenset(
     ("enum.Enum", "enum.IntEnum", "enum.Flag", "enum.IntFlag", "enum.StrEnum")
@@ -136,7 +137,10 @@ class EnumCallAnalyzer:
             var.is_property = True
             # When an enum is created by its functional form `Enum(name, values)`
             # - if it is a string it is first split by commas/whitespace
-            # - if it is an iterable of single items each item is assigned a value starting at `start`
+            # - if it is an iterable of single items each item is assigned a value
+
+            # starting at `start`
+
             # - if it is an iterable of (name, value) then the given values will be used
             # either way, each item should be treated as if it has an explicit value.
             var.has_explicit_value = True

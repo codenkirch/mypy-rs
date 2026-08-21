@@ -133,6 +133,7 @@ fn tf_visit_instance(
     // Resolve the type_ref BEFORE clearing it. If the lookup (or any
     // nested lazy-fixup it triggers) raises, the Python fallback in
     // TypeFixer.fixup retries via visit_instance — which checks
+
     // type_ref and bails if it is already None. Clearing type_ref only
     // after the lookup succeeds prevents the fallback from silently
     // skipping an unfixed Instance (leaving type=NOT_READY).

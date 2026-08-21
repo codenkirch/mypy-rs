@@ -122,7 +122,7 @@ class IRPrettyPrintVisitor(OpVisitor[str]):
             # We need to generate a string representation that won't vary
             # run-to-run because sets are unordered, otherwise we may get
             # spurious irbuild test failures.
-            #
+
             # Sorting by the item's string representation is a bit of a
             # hack, but it's stable and won't cause TypeErrors.
             formatted_items = [repr(i) for i in sorted(op.value, key=str)]

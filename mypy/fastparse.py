@@ -216,7 +216,9 @@ def parse(
     try:
         # Disable
         # - deprecation warnings for 'invalid escape sequence' (Python 3.11 and below)
-        # - syntax warnings for 'invalid escape sequence' (3.12+) and 'return in finally' (3.14+)
+        # - syntax warnings for 'invalid escape sequence' (3.12+) and 'return in
+
+        # finally' (3.14+)
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=DeprecationWarning)
             warnings.filterwarnings("ignore", category=SyntaxWarning)
@@ -234,6 +236,7 @@ def parse(
         # For very complex expressions it is possible to hit recursion limit
         # before reaching a leaf node.
         # Should reject at top level instead at bottom, since bottom would already
+
         # be at the threshold of the recursion limit, and may fail again later.
         # E.G. x1+x2+x3+...+xn -> BinOp(left=BinOp(left=BinOp(left=...
         try:
@@ -660,6 +663,7 @@ class ASTConverter:
                     # This is, strictly speaking, wrong: there might be a decorated
                     # implementation. However, it only affects the error message we show:
                     # ideally it's "already defined", but "implementation must come last"
+
                     # is also reasonable.
                     # TODO: can we get rid of this completely and just always emit
                     # "implementation must come last" instead?
@@ -673,6 +677,7 @@ class ASTConverter:
                 # IfStmt only contains stmts relevant to current_overload.
                 # Check if stmts are reachable and add them to current_overload,
                 # otherwise skip IfStmt to allow subsequent overload
+
                 # or function definitions.
                 skipped_if_stmts.append(stmt)
                 if if_block_with_overload is None:
@@ -722,6 +727,7 @@ class ASTConverter:
                 # If we have multiple decorated functions named "_" next to each, we want to treat
                 # them as a series of regular FuncDefs instead of one OverloadedFuncDef because
                 # most of mypy/mypyc assumes that all the functions in an OverloadedFuncDef are
+
                 # related, but multiple underscore functions next to each other aren't necessarily
                 # related
                 last_unconditional_func_def = None
@@ -896,13 +902,14 @@ class ASTConverter:
     # --- stmt ---
     # FunctionDef(identifier name, arguments args,
     #             stmt* body, expr* decorator_list, expr? returns, string? type_comment)
+
     # arguments = (arg* args, arg? vararg, arg* kwonlyargs, expr* kw_defaults,
     #              arg? kwarg, expr* defaults)
     def visit_FunctionDef(self, n: ast3.FunctionDef) -> FuncDef | Decorator:
         return self.do_func_def(n)
 
     # AsyncFunctionDef(identifier name, arguments args,
-    #                  stmt* body, expr* decorator_list, expr? returns, string? type_comment)
+    # stmt* body, expr* decorator_list, expr? returns, string? type_comment)
     def visit_AsyncFunctionDef(self, n: ast3.AsyncFunctionDef) -> FuncDef | Decorator:
         return self.do_func_def(n, is_coroutine=True)
 
@@ -1160,6 +1167,7 @@ class ASTConverter:
     # ClassDef(identifier name,
     #  expr* bases,
     #  keyword* keywords,
+
     #  stmt* body,
     #  expr* decorator_list)
     def visit_ClassDef(self, n: ast3.ClassDef) -> ClassDef:
@@ -1675,6 +1683,7 @@ class ASTConverter:
         # A FormattedValue is a component of a JoinedStr, or it can exist
         # on its own. We translate them to individual '{}'.format(value)
         # calls. Format specifier and conversion information is passed along
+
         # to allow mypyc to support f-strings with format specifiers and conversions.
         val_exp = self.visit(n.value)
         val_exp.set_line(n.lineno, n.col_offset)
@@ -2080,6 +2089,7 @@ class TypeConverter:
         # The node's field has the type complex, but complex isn't *really*
         # a parent of int and float, and this causes isinstance below
         # to think that the complex branch is always picked. Avoid
+
         # this by throwing away the type.
         if isinstance(value, int):
             numeric_value: int | None = value

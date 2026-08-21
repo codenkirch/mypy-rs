@@ -272,9 +272,11 @@ def process_functions(graph: Graph, scc: list[str], patches: Patches) -> None:
         # In principle, functions can be processed in arbitrary order,
         # but _methods_ must be processed in the order they are defined,
         # because some features (most notably partial types) depend on
+
         # order of definitions on self.
         #
         # There can be multiple generated methods per line. Use target
+
         # name as the second sort key to get a repeatable sort order.
         targets = sorted(get_all_leaf_targets(tree), key=lambda x: (x[1].line, x[0]))
         all_targets.extend(
@@ -523,7 +525,8 @@ def apply_hooks_to_class(
             if hook:
                 ok = ok and hook(ClassDefContext(defn, decorator, self))
 
-    # Check if the class definition itself triggers a dataclass transform (via a parent class/
+    # Check if the class definition itself triggers a dataclass transform (via a parent
+    # class/
     # metaclass)
     spec = find_dataclass_transform_spec(info)
     if spec is not None:

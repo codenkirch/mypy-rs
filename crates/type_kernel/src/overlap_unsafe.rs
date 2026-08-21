@@ -148,6 +148,7 @@ fn expand_callable_variants(c: &Type, strict_optional: bool) -> Option<Vec<Type>
         // Clear `variables` before the residual check: the field still holds
         // the class's type parameters here, so scanning for type variables
         // while they are populated would spuriously defer every generic
+
         // callable. Python only re-checks the expanded body.
         if result_has_typevar(&variant) {
             return None;
@@ -198,6 +199,7 @@ fn is_callable_compatible_full(
     // Normalization (subtypes.py:1983-1984): `with_unpacked_kwargs` rewrites
     // a TypedDict-typed **kwargs arg (the wire loses its key structure) and
     // `with_normalized_var_args` rewrites UnpackType var args. Both defer,
+
     // mirroring callable_compat.rs.
     if lf.unpack_kwargs || rf.unpack_kwargs {
         return None;

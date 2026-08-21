@@ -655,6 +655,7 @@ mod tests {
         // object is a supertype of Generator, hence a valid generator return:
         // Generator[Any,Any,Any] <: object (builtins.object fast-path). This
         // is the Rust-coverable instance of the "supertype of Generator"
+
         // clause (the nominal Iterator/Iterable derivations need bases
         // fixtures this module does not model).
         let obj = i("builtins.object", vec![]);
@@ -751,6 +752,7 @@ mod tests {
         // Generator[Any,Any,Any] is decidable on the nominal path
         // (same-ref exact match, 3 mapped == 3 right args), cleared as a
         // generator, and its args[0] = Any(special_form) comes back through
+
         // the args-not-empty branch.
         let r = make_resolver(vec![generator_snap()]);
         assert_eq!(
@@ -764,6 +766,7 @@ mod tests {
         // A zero-arg `Generator` is not constructible via typing (3
         // mandatory params, none with defaults). The arity guard in
         // visit_instance_nominal (3 mapped args != 0 right args) defers to
+
         // Python rather than panic on a stale/malformed snapshot. Rust's
         // job here is to defer safely, not decide.
         let r = make_resolver(vec![generator_snap()]);
@@ -798,9 +801,11 @@ mod tests {
         // Union[Generator[int,Any,Any], str]: the Generator branch -> int,
         // the str branch -> Any(from_error). make_simplified_union([int,
         // Any]) runs the Python two-pass dedup (a single reverse between
+
         // passes). Pass 1 keeps [int, Any], reverses to [Any, int]; pass 2:
         // is_proper_subtype(Any, int) is False (left-Any, right not Any) and
         // is_proper_subtype(int, Any) is False (any-right under proper), so
+
         // both survive as [Any, int], reversed back to [int, Any]. Expected
         // order is int first, mirrored below.
         let t = union(vec![
@@ -910,9 +915,11 @@ mod tests {
         // An Iterator return: is_generator is true (supertype of
         // Generator[Any,...] requires a bases derivation we do not model in
         // tests), so this specific case is not exercised here. Instead use
+
         // AwaitableGenerator with fewer than 3 args: the Generator <:
         // AwaitableGenerator probe decides False with the left snapshot, the
         // exact AwaitableGenerator match is a generator, then the receive
+
         // branches pass (args < 3) to NoneType.
         let r = make_resolver(vec![generator_snap()]);
         let t = i("typing.AwaitableGenerator", vec![any(), any()]);
@@ -987,6 +994,7 @@ mod tests {
         // AsyncGenerator[Any, Any] is not a generator return (non-coroutine
         // is_generator_return_type: the Generator <: AsyncGenerator probe
         // is False, and AsyncGenerator != AwaitableGenerator). The one-sided
+
         // check has NO is_async_generator alternative, so it yields
         // Any(from_error). The Generator/AsyncGenerator snapshots let the
         // first probe decide instead of defer.
@@ -1007,6 +1015,7 @@ mod tests {
         // An AwaitableGenerator with fewer than 3 args passes the
         // one-sided is_generator check (exact AwaitableGenerator match, the
         // Generator <: AwaitableGenerator probe needs the Generator left
+
         // snapshot) and falls past Awaitable/Generator to NoneType — the
         // Rust-coverable instance of the commented-out Iterator case.
         let r = make_resolver(vec![generator_snap()]);
@@ -1028,6 +1037,7 @@ mod tests {
         // Union[Generator[int,Any,Any], str]: the Generator branch -> int
         // (tr=args[2]), the str branch -> Any(from_error). The two-pass
         // dedup (single reverse between passes) yields int first, then Any
+
         // (see yield_type_union_recurses for the ordering proof).
         let t = union(vec![
             i(

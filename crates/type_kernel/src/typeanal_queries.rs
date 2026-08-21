@@ -1131,6 +1131,7 @@ fn detect_diverging_alias_inner(
         // node._is_recursive is None: compute via CollectAliasesVisitor.
         // This requires a full traversal of target.accept(CollectAliases).
         // Defer — the CollectAliasesVisitor is a complex visitor we
+
         // don't port here. Python handles this path.
         return Err(DeferError);
     } else {
@@ -2146,6 +2147,7 @@ fn analyze_type_inner(
             // UnboundType needs symbol lookup (lookup_qualified) in the
             // semantic analyzer. Python handles this by looking up the name
             // and dispatching to ParamSpecExpr/TypeVarExpr/TypeInfo/etc.
+
             // Rust has no access to the symbol table.
             None
         }
@@ -2208,6 +2210,7 @@ fn analyze_type_inner(
             // Callable analysis: analyze arg_types, ret_type, variables, and
             // optional fields. This is the most complex branch — mirroring
             // visit_callable_type which binds type vars, handles type guards,
+
             // and analyzes star args.
             let ret = analyze_type_inner(
                 ret_type,

@@ -56,7 +56,8 @@ def test_output_json(testcase: DataDrivenTestCase) -> None:
     # Remove temp file.
     os.remove(program_path)
 
-    # JSON encodes every `\` character into `\\`, so we need to remove `\\` from windows paths
+    # JSON encodes every `\` character into `\\`, so we need to remove `\\` from windows
+    # paths
     # and `/` from POSIX paths
     json_os_separator = os.sep.replace("\\", "\\\\")
     normalized_output = [line.replace(test_temp_dir + json_os_separator, "") for line in output]

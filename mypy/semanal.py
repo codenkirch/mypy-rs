@@ -323,6 +323,7 @@ T = TypeVar("T")
 # Whether to print diagnostic information for failed full parses
 # in SemanticAnalyzer.try_parse_as_type_expression().
 #
+
 # See also: misc/analyze_typeform_stats.py
 DEBUG_TYPE_EXPRESSION_FULL_PARSE_FAILURES: Final = False
 
@@ -361,6 +362,7 @@ Tag: _TypeAlias = int
 # Matches two words separated by whitespace, where each word lacks
 # any symbols which have special meaning in a type expression.
 #
+
 # Any string literal matching this common pattern cannot be a valid
 # type expression and can be ignored quickly when attempting to parse a
 # string literal as a type expression.
@@ -372,6 +374,7 @@ _MULTIPLE_WORDS_NONTYPE_RE = re.compile(r'\s*[^\s.\'"|\[]+\s+[^\s.\'"|\[]')
 # When `type_kernel` is importable and the gate is active, the pure
 # Type-transformation helpers `make_any_non_explicit`,
 # `make_any_non_unimported`, and `replace_implicit_first_type` route
+
 # through Rust via the wire format. Rust returns None for types it cannot
 # handle (decode failure), falling back to the pure-Python visitors.
 try:
@@ -414,6 +417,7 @@ def _set_native_semanal_resolver(resolver: Any) -> None:
 # Stage 16 (#209): native semanal_visitor seam (parity-only, default-off).
 # When the gate is active, the pure helper functions route through Rust
 # via PyO3 on live Python objects. Rust returns false/None for anything it
+
 # cannot handle, falling back to the pure-Python implementation.
 try:
     from type_kernel import (
@@ -629,6 +633,7 @@ def _set_native_semanal_visitor_active(active: bool) -> None:
 # Native base-class classification tags (see semanal_bases.rs). KEEP means
 # the base is not a Generic/Protocol declaration; GENERIC / PROTOCOL_GENERIC
 # declare type variables (removed); BARE_PROTOCOL marks the class as a
+
 # protocol (removed). Only used when the Rust seam is active.
 _ACTION_KEEP = 1
 _ACTION_GENERIC = 2
@@ -691,12 +696,15 @@ class SemanticAnalyzer(
     # These names couldn't be added to the symbol table due to incomplete deps.
     # Note that missing names are per module, _not_ per namespace. This means that e.g.
     # a missing name at global scope will block adding same name at a class scope.
+
     # This should not affect correctness and is purely a performance issue,
     # since it can cause unnecessary deferrals. These are represented as
     # PlaceholderNodes in the symbol table. We use this to ensure that the first
+
     # definition takes precedence even if it's incomplete.
     #
     # Note that a star import adds a special name '*' to the set, this blocks
+
     # adding _any_ names in the current file.
     missing_names: list[set[str]]
     # Callbacks that will be called after semantic analysis to tweak things.
@@ -715,6 +723,7 @@ class SemanticAnalyzer(
     # Mapping from 'async def' function definitions to their return type wrapped as a
     # 'Coroutine[Any, Any, T]'. Used to keep track of whether a function definition's
     # return type has already been wrapped, by checking if the function definition's
+
     # type is stored in this mapping and that it still matches.
     wrapped_coro_return_types: dict[FuncDef, Type] = {}
 
@@ -743,6 +752,7 @@ class SemanticAnalyzer(
         # Saved namespaces from previous iteration. Every top-level function/method body is
         # analyzed in several iterations until all names are resolved. We need to save
         # the local namespaces for the top level function and all nested functions between
+
         # these iterations. See also semanal_main.process_top_level_function().
         self.saved_locals: dict[
             FuncItem | GeneratorExpr | DictionaryComprehension, SymbolTable
@@ -778,6 +788,7 @@ class SemanticAnalyzer(
         # This is needed to properly support recursive type aliases. The problem is that
         # Foo[Bar] could mean three things depending on context: a target for type alias,
         # a normal index expression (including enum index), or a type application.
+
         # The latter is particularly problematic as it can falsely create incomplete
         # refs while analysing rvalues of type aliases. To avoid this we first analyse
         # rvalues while temporarily setting this to True.
@@ -809,9 +820,11 @@ class SemanticAnalyzer(
         # Imports of submodules transitively visible from given module.
         # This is needed to support patterns like this
         #   [a.py]
+
         #     import b
         #     import foo
         #     foo.bar  # <- this should work even if bar is not re-exported in foo
+
         #   [b.py]
         #     import foo.bar
         self.transitive_submodule_imports: dict[str, set[str]] = {}
@@ -896,9 +909,11 @@ class SemanticAnalyzer(
         # This is all pretty unfortunate. typeshed now has a
         # sys.version_info check for OrderedDict, and we shouldn't
         # take it out, because it is correct and a typechecker should
+
         # use that as a source of truth. But instead we rummage
         # through IfStmts to remove the info first.  (I tried to
         # remove this whole machinery and ran into issues with the
+
         # builtins/typing import cycle.)
         def helper(defs: list[Statement]) -> None:
             for stmt in defs.copy():
@@ -1058,6 +1073,7 @@ class SemanticAnalyzer(
                         # If we are not allowed to resolve imports from `importlib.machinery`,
                         # ModuleSpec will not be available at any iteration.
                         # Use the fallback earlier.
+
                         # (see https://github.com/python/mypy/issues/18237)
                         inst = self.named_type_or_none("builtins.object")
                         assert inst is not None, "Cannot find builtins.object"
@@ -1256,6 +1272,7 @@ class SemanticAnalyzer(
         # We don't add module top-level functions to symbol tables
         # when we analyze their bodies in the second phase on analysis,
         # since they were added in the first phase. Nested functions
+
         # get always added, since they aren't separate targets.
         if not self.recurse_into_functions or len(self.function_stack) > 0:
             if not defn.is_decorated and not defn.is_overload:
@@ -1562,6 +1579,7 @@ class SemanticAnalyzer(
         # NB: Since _visit_overloaded_func_def will call accept on the
         # underlying FuncDefs, the function might get entered twice.
         # This is fine, though, because only the outermost function is
+
         # used to compute targets.
         with self.scope.function_scope(defn), self.set_recurse_into_functions():
             self.analyze_overloaded_func_def(defn)
@@ -1578,6 +1596,7 @@ class SemanticAnalyzer(
         # OverloadedFuncDef refers to any legitimate situation where you have
         # more than one declaration for the same function in a row.  This occurs
         # with a @property with a setter or a deleter, and for a classic
+
         # @overload.
 
         defn._fullname = self.qualified_name(defn.name)
@@ -1629,6 +1648,7 @@ class SemanticAnalyzer(
             # TODO: should we enforce decorated overloads consistency somehow?
             # Some existing code uses both styles:
             #   * Put decorator only on implementation, use "effective" types in overloads
+
             #   * Put decorator everywhere, use "bare" types in overloads.
             defn.type = Overloaded(types)
             defn.type.line = defn.line
@@ -1928,6 +1948,7 @@ class SemanticAnalyzer(
             # This intentionally excludes getter. While `@prop.getter` is valid at
             # runtime, that would mean replacing the already processed getter type.
             # Such usage is almost definitely a mistake (except for overrides in
+
             # subclasses but we don't support them anyway) and might be a typo
             # (only one letter away from `setter`), it's likely almost never used,
             # so supporting it properly won't pay off.
@@ -2021,6 +2042,7 @@ class SemanticAnalyzer(
         # Issue #348: native decorator classification (strangler-fig). Rust
         # assigns each decorator a tag mirroring the branch order below; the
         # side effects stay 1:1 with the pure-Python loop. When the classifier
+
         # returns None the pure loop below runs unchanged.
         classifications: list[str] | None = None
         if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
@@ -2059,6 +2081,7 @@ class SemanticAnalyzer(
             # Native classification tag replaces the repeated
             # refers_to_fullname / get_deprecated lookups below; when the
             # native path is inactive `tag` is None and the original lookups
+
             # run unchanged (byte-for-byte parity).
             tag = classifications[i] if classifications is not None else None
             # A bunch of decorators are special cased here.
@@ -2339,13 +2362,15 @@ class SemanticAnalyzer(
             # Add placeholder so that self-references in base classes can be
             # resolved.  We don't want this to cause a deferral, since if there
             # are no incomplete references, we'll replace this with a TypeInfo
+
             # before returning.
             placeholder = PlaceholderNode(fullname, defn, defn.line, becomes_typeinfo=True)
             self.add_symbol(defn.name, placeholder, defn, can_defer=False)
 
         tag = self.track_incomplete_refs()
 
-        # Restore base classes after previous iteration (things like Generic[T] might be removed).
+        # Restore base classes after previous iteration (things like Generic[T] might be
+        # removed).
         defn.base_type_exprs.extend(defn.removed_base_type_exprs)
         defn.removed_base_type_exprs.clear()
 
@@ -2366,6 +2391,7 @@ class SemanticAnalyzer(
             # Some type variable bounds or values are not ready, we need to
             # re-analyze this class. Note we force progress to handle cases like
             # class C[T = C], this matches logic in process_typevar_parameters()
+
             # for "old style" type variables.
             self.defer(force_progress=tvar_defs != defn.type_vars)
 
@@ -2472,6 +2498,7 @@ class SemanticAnalyzer(
                         # Remove the ambiguous type variable, and record it, so that we can
                         # replace all its uses with Any. The native classification only ever
                         # marks TypeVarType-with-default entries invalid (default-after-
+
                         # typevartuple), matching the pure branch.
                         if isinstance(tv, TypeVarType):
                             self.removed_type_vars[-1].append(tv)
@@ -2641,7 +2668,8 @@ class SemanticAnalyzer(
                 if hook:
                     hook(ClassDefContext(defn, base_expr, self))
 
-        # Check if the class definition itself triggers a dataclass transform (via a parent class/
+        # Check if the class definition itself triggers a dataclass transform (via a
+        # parent class/
         # metaclass)
         spec = find_dataclass_transform_spec(defn)
         if spec is not None:
@@ -2766,6 +2794,7 @@ class SemanticAnalyzer(
             # Native base-class classification (strangler-fig). Rust tags each
             # UnboundType base as KEEP / Generic / Protocol; all side effects
             # stay 1:1 with the pure-Python loop. When the tag is None the
+
             # pure checks below run unchanged.
             native_action = self._native_base_classification(base)
             if native_action == _ACTION_KEEP:
@@ -3085,6 +3114,7 @@ class SemanticAnalyzer(
                 # Ignore magic bases for now.
                 # For example:
                 #  class Foo(TypedDict): ...  # RefExpr
+
                 #  class Foo(NamedTuple): ...  # RefExpr
                 #  class Foo(TypedDict("Foo", {"a": int})): ...  # CallExpr
                 continue
@@ -3411,6 +3441,7 @@ class SemanticAnalyzer(
         # Issue #444: native import classification (strangler-fig). Rust
         # computes (imported_id, base_id, module_public, kind) for every
         # id in one call; the side effects (SymbolTableNode construction,
+
         # add_imported_symbol / add_unknown_imported_symbol) stay in Python.
         # When the classifier returns None the pure loop below runs unchanged.
         classifications: list[tuple[str, str, bool, int | None]] | None = None
@@ -3504,6 +3535,7 @@ class SemanticAnalyzer(
                 # Submodule takes precedence over definition in surround package, for
                 # compatibility with runtime semantics in typical use cases. This
                 # could more precisely model runtime semantics by taking into account
+
                 # the line number beyond which the local definition should take
                 # precedence, but doesn't seem to be important in most use cases.
                 node = SymbolTableNode(GDEF, self.modules[fullname])
@@ -3830,6 +3862,7 @@ class SemanticAnalyzer(
         # Here we have a chicken and egg problem: at this stage we can't call
         # can_be_type_alias(), because we have not enough information about rvalue.
         # But we can't use a full visit because it may emit extra incomplete refs (namely
+
         # when analysing any type applications there) thus preventing the further analysis.
         # To break the tie, we first analyse rvalue partially, if it can be a type alias.
         if self.can_possibly_be_type_form(s):
@@ -4342,8 +4375,10 @@ class SemanticAnalyzer(
         lval = s.lvalues[0]
         assert isinstance(lval, RefExpr)
 
-        # Reset inferred status if it was set due to simple literal rvalue on previous iteration.
+        # Reset inferred status if it was set due to simple literal rvalue on previous
+        # iteration.
         # TODO: this is a best-effort quick fix, we should avoid the need to manually sync this,
+
         # see https://github.com/python/mypy/issues/6458.
         if lval.is_new_def:
             lval.is_inferred_def = s.type is None
@@ -4402,12 +4437,15 @@ class SemanticAnalyzer(
                 # Special case: we are working with an `Enum`:
                 #
                 #   class MyEnum(Enum):
+
                 #       key = 'some value'
                 #
                 # Here `key` is implicitly final. In runtime, code like
+
                 #
                 #     MyEnum.key = 'modified'
                 #
+
                 # will fail with `AttributeError: Cannot reassign members.`
                 # That's why we need to replicate this.
                 if (
@@ -4513,6 +4551,7 @@ class SemanticAnalyzer(
             # Skip inside a function; this is to avoid confusing
             # the code that handles dead code due to isinstance()
             # inside type variables with value restrictions (like
+
             # AnyStr).
             return None
 
@@ -4677,6 +4716,7 @@ class SemanticAnalyzer(
         # Third rule: type aliases can't be re-defined. For example:
         #     A: Type[float] = int
         #     A = float  # OK, but this doesn't define an alias
+
         #     B = int
         #     B = float  # Error!
         # Don't create an alias in these cases:
@@ -4700,12 +4740,15 @@ class SemanticAnalyzer(
             # Fourth rule (special case): Non-subscripted right hand side creates a variable
             # at class and function scopes. For example:
             #
+
             #   class Model:
             #       ...
             #   class C:
+
             #       model = Model # this is automatically a variable with type 'Type[Model]'
             #
             # without this rule, this typical use case will require a lot of explicit
+
             # annotations (see the second rule).
             return False
         if not pep_613 and not pep_695 and not self.can_be_type_alias(rvalue):
@@ -4758,9 +4801,13 @@ class SemanticAnalyzer(
             if not has_placeholder(res):
                 self.msg.unimported_type_becomes_any("Type alias target", res, s)
                 res = make_any_non_unimported(res)
-        # Note: with the new (lazy) type alias representation we only need to set no_args to True
+        # Note: with the new (lazy) type alias representation we only need to set
+        # no_args to True
         # if the expected number of arguments is non-zero, so that aliases like `A = List` work
-        # but not aliases like `A = TypeAliasType("A", List)` as these need explicit type params.
+
+        # but not aliases like `A = TypeAliasType("A", List)` as these need explicit
+        # type params.
+
         # However, eagerly expanding aliases like Text = str is a nice performance optimization.
         no_args = (
             isinstance(res, ProperType)
@@ -5615,6 +5662,7 @@ class SemanticAnalyzer(
                 # Type variables are special: we need to place them in the symbol table
                 # soon, even if upper bound is not ready yet. Otherwise, avoiding
                 # a "deadlock" in this common pattern would be tricky:
+
                 #     T = TypeVar('T', bound=Custom[Any])
                 #     class Custom(Generic[T]):
                 #         ...
@@ -5809,13 +5857,18 @@ class SemanticAnalyzer(
         class_def = ClassDef(name, Block([]))
         # Ground rules for classes nested in functions:
         #   * Use is_nested_within_func_scope(), not is_func_scope(), to determine whether
-        #     to use any special logic, because nothing inside top-level functions is serialized.
+        # to use any special logic, because nothing inside top-level functions is
+
+        # serialized.
+
         #   * ClassDef.name is not mangled (i.e. @line suffix is not appended).
         #   * ClassDef.fullname, and thus TypeInfo.fullname are always pkg.mod.Name@line, any
         #     "intermediate" classes are not included in the fullname.
+
         #   * The caller is responsible for storing the generated TypeInfo twice: once as usual
         #     with add_symbol(), and once using add_global_symbol() using the mangled name.
         #     The second one is needed to properly serialize any classes nested in functions.
+
         # TODO: make sure the daemon works well with these rules.
         class_def.fullname = self.class_fullname(name, line)
 
@@ -5920,23 +5973,29 @@ class SemanticAnalyzer(
             # rval and all lvals are either list or tuple, so we are dealing
             # with unpacking assignment like `x, y = a, b`. Mypy didn't
             # understand our all(isinstance(...)), so cast them as TupleExpr
+
             # so mypy knows it is safe to access their .items attribute.
             seq_lvals = cast(list[TupleExpr], lvals)
             # given an assignment like:
             #     (x, y) = (m, n) = (a, b)
             # we now have:
+
             #     seq_lvals = [(x, y), (m, n)]
             #     seq_rval = (a, b)
             # We now zip this into:
+
             #     elementwise_assignments = [(a, x, m), (b, y, n)]
             # where each elementwise assignment includes one element of rval and the
             # corresponding element of each lval. Basically we unpack
+
             #     (x, y) = (m, n) = (a, b)
             # into elementwise assignments
             #     x = m = a
+
             #     y = n = b
             # and then we recursively call this method for each of those assignments.
             # If the rval and all lvals are not all of the same length, zip will just ignore
+
             # extra elements, so no error will be raised here; mypy will later complain
             # about the length mismatch in type-checking.
             elementwise_assignments = zip(rval.items, *[v.items for v in seq_lvals])
@@ -6669,6 +6728,7 @@ class SemanticAnalyzer(
                 # try to determine just the variable declarations in module scope
                 # self.globals.values() contains SymbolTableNode's
                 # Each SymbolTableNode has an attribute node that is nodes.Var
+
                 # look for variable nodes that marked as is_inferred
                 # Each symboltable node has a Var node as .node
                 local_nodes = [
@@ -6816,9 +6876,11 @@ class SemanticAnalyzer(
         # Issue #421: native resolution-branch classification (strangler-fig).
         # Rust decides which resolution branch applies and returns the symbol
         # it resolves to; the AST assignments (expr.node/kind/fullname),
+
         # record_imported_symbol, and process_placeholder stay in Python.
         # state is None when the classifier is inactive or has no
         # classification (module re-export / incomplete-namespace /
+
         # __getattr__ / missing-module paths), in which case the pure
         # branches below run unchanged.
         state: tuple[str, SymbolTableNode | None] | None = None
@@ -6852,9 +6914,11 @@ class SemanticAnalyzer(
                 # This branch handles the case C.bar (or cls.bar or self.bar inside
                 # a classmethod/method), where C is a class and bar is a type
                 # definition or a module resulting from `import bar` (or a module
+
                 # assignment) inside class C. We look up bar in the class' TypeInfo
                 # namespace.  This is done only when bar is a module or a type;
                 # other things (e.g. methods) are handled by other code in
+
                 # checkmember.
                 type_info = None
                 if isinstance(base.node, TypeInfo):
@@ -6887,6 +6951,7 @@ class SemanticAnalyzer(
         # Classified path: apply the same side effects as the pure branch the
         # classifier selected. state == ("none", None) means Python also
         # leaves the expression unresolved (module_hidden symbol or a TypeInfo
+
         # member outside the (MypyFile, TypeInfo, TypeAlias) set).
         _, sym = state
         if sym is None:
@@ -6895,6 +6960,7 @@ class SemanticAnalyzer(
             # Mirror the module branch: defer/error via process_placeholder
             # without binding. Only module symbols classify as placeholders;
             # a TypeInfo member whose node is a PlaceholderNode is never
+
             # classified (it is outside the (MypyFile, TypeInfo, TypeAlias)
             # set), so this is the module-branch path only.
             self.process_placeholder(expr.name, "attribute", expr)
@@ -7353,6 +7419,7 @@ class SemanticAnalyzer(
             # Some nodes (currently only TypeVarLikeExpr subclasses) don't store
             # module fullname explicitly, infer it from the node fullname iteratively.
             # TODO: this is not 100% robust for type variables nested within a class
+
             # with a name that matches name of a submodule.
             fullname = node.fullname.rsplit(".", maxsplit=1)[0]
             if fullname == self.cur_mod_id:
@@ -7378,9 +7445,11 @@ class SemanticAnalyzer(
         # Issue #419: native name-resolution decision (strangler-fig). Rust
         # runs the pure local -> enclosing -> global -> builtins walk and
         # returns what it found; Python applies ALL side effects
+
         # (record_imported_symbol in caller, name_not_defined below, class-body
         # gating, __qualname__/__module__ Var synthesis). None means the walk
         # hit a sub-case Rust cannot decide (class-body attribute gating,
+
         # implicit self.x names, decl sets it can't see), and the pure loop
         # below runs unchanged.
         native_found = None
@@ -7744,6 +7813,7 @@ class SemanticAnalyzer(
             # This is a performance optimization for a common pattern. If one module
             # in a codebase uses import numpy as np; np.foo.bar, then it is likely that
             # other modules use similar pattern as well. So we pre-compute transitive
+
             # dependencies for np, to avoid possible duplicate work in the future.
             self.add_transitive_submodule_imports(base_id)
         if self.cur_mod_id not in self.transitive_submodule_imports:
@@ -7842,7 +7912,8 @@ class SemanticAnalyzer(
                 self.record_incomplete_ref()
             return result
         else:
-            # Else, try to find the longest prefix of the module name that is in the modules dictionary.
+            # Else, try to find the longest prefix of the module name that is in the
+            # modules dictionary.
             splitted_modules = fullname.split(".")
             names = []
 
@@ -8022,6 +8093,7 @@ class SemanticAnalyzer(
             # There is an existing node, so this may be a redefinition.
             # If the new node points to the same node as the old one,
             # or if both old and new nodes are placeholders, we don't
+
             # need to do anything.
             old = existing.node
             new = symbol.node
@@ -8064,6 +8136,7 @@ class SemanticAnalyzer(
         # Don't serialize redefined nodes. They are likely to have
         # busted internal references which can cause problems with
         # serialization, and they can't have any external references to
+
         # them.
         symbol.no_serialize = True
         while True:
@@ -8095,6 +8168,7 @@ class SemanticAnalyzer(
         # I promise this type checks; I'm just making mypyc issues go away.
         # mypyc is absolutely convinced that `symbol_node` narrows to a Var in the following,
         # when it can also be a FuncBase. Once fixed, `f` in the following can be removed.
+
         # See also https://github.com/mypyc/mypyc/issues/892
         f: Callable[[object], Any] = lambda x: x
         if isinstance(f(symbol_node), (Decorator, FuncBase, Var)):
@@ -8184,6 +8258,7 @@ class SemanticAnalyzer(
             # This makes it possible to add logical fine-grained dependencies
             # from a missing module. We can't use this by default, since in a
             # few places we assume that the full name points to a real
+
             # definition, but this name may point to nothing.
             var._fullname = target_name
         elif self.type:
@@ -8228,6 +8303,7 @@ class SemanticAnalyzer(
             # Usually, we report progress if we have replaced a placeholder node
             # with an actual valid node. However, sometimes we need to update an
             # existing node *in-place*. For example, this is used by type aliases
+
             # in context of forward references and/or recursive aliases, and in
             # similar situations (recursive named tuples etc).
             self.progress = True
@@ -8675,6 +8751,7 @@ class SemanticAnalyzer(
         # There are certain expressions that mypy does not need to semantically analyze,
         # since they analyzed solely as type. (For example, indexes in type alias definitions
         # and base classes in class defs). External consumers of the mypy AST may need
+
         # them semantically analyzed, however, if they need to treat it as an expression
         # and not a type. (Which is to say, mypyc needs to do this.) Do the analysis
         # in a fresh tvar scope in order to suppress any errors about using type variables.

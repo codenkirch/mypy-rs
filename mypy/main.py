@@ -320,6 +320,7 @@ def python_executable_prefix(v: str) -> list[str]:
         # on Windows, all Python executables are named `python`. To handle this, there
         # is the `py` launcher, which can be passed a version e.g. `py -3.8`, and it will
         # execute an installed Python 3.8 interpreter. See also:
+
         # https://docs.python.org/3/using/windows.html#python-launcher-for-windows
         return ["py", f"-{v}"]
     else:
@@ -353,7 +354,8 @@ def infer_python_executable(options: Options, special_opts: argparse.Namespace) 
     This function mutates options based on special_opts to infer the correct Python executable
     to use.
     """
-    # TODO: (ethanhs) Look at folding these checks and the site packages subprocess calls into
+    # TODO: (ethanhs) Look at folding these checks and the site packages subprocess
+    # calls into
     # one subprocess call for speed.
 
     # Use the command line specified executable, or fall back to one set in the
@@ -555,32 +557,43 @@ def define_options(
     # Unless otherwise specified, arguments will be parsed directly onto an
     # Options object.  Options that require further processing should have
     # their `dest` prefixed with `special-opts:`, which will cause them to be
+
     # parsed into the separate special_opts namespace object.
 
     # Our style guide for formatting the output of running `mypy --help`:
     # Flags:
     # 1.  The flag help text should start with a capital letter but never end with a period.
+
     # 2.  Keep the flag help text brief -- ideally just a single sentence.
     # 3.  All flags must be a part of a group, unless the flag is deprecated or suppressed.
     # 4.  Avoid adding new flags to the "miscellaneous" groups -- instead add them to an
+
     #     existing group or, if applicable, create a new group. Feel free to move existing
     #     flags to a new group: just be sure to also update the documentation to match.
     #
+
     # Groups:
     # 1.  The group title and description should start with a capital letter.
-    # 2.  The first sentence of a group description should be written in the bare infinitive.
+    # 2. The first sentence of a group description should be written in the bare
+
+    # infinitive.
+
     #     Tip: try substituting the group title and description into the following sentence:
     #     > {group_title}: these flags will {group_description}
     #     Feel free to add subsequent sentences that add additional details.
+
     # 3.  If you cannot think of a meaningful description for a new group, omit it entirely.
     #     (E.g. see the "miscellaneous" sections).
     # 4.  The text of the group description should end with a period, optionally followed
+
     #     by a documentation reference (URL).
     # 5.  If you want to include a documentation reference, place it at the end of the
     #     description. Feel free to open with a brief reference ("See also:", "For more
+
     #     information:", etc.), followed by a space, then the entire URL including
     #     "https://" scheme identifier and fragment ("#some-target-heading"), if any.
     #     Do not end with a period (or any other characters not part of the URL).
+
     #     URLs longer than the available terminal width will overflow without being
     #     broken apart. This facilitates both URL detection, and manual copy-pasting.
 
@@ -885,9 +898,11 @@ def define_options(
     # Note: this group is intentionally added here even though we don't add
     # --strict to this group near the end.
     #
+
     # That way, this group will appear after the various strictness groups
     # but before the remaining flags.
     # We add `--strict` near the end so we don't accidentally miss any strictness
+
     # flags that are added after this group.
     strictness_group = parser.add_argument_group(title="Miscellaneous strictness flags")
 
@@ -1173,7 +1188,8 @@ def define_options(
     internals_group.add_argument(
         "--no-fast-exit", action="store_false", dest="fast_exit", help=argparse.SUPPRESS
     )
-    # This flag is useful for mypy tests, where function bodies may be omitted. Plugin developers
+    # This flag is useful for mypy tests, where function bodies may be omitted. Plugin
+    # developers
     # may want to use this as well in their tests.
     add_invertible_flag(
         "--allow-empty-bodies", default=False, help=argparse.SUPPRESS, group=internals_group
@@ -1205,7 +1221,8 @@ def define_options(
     report_group.add_argument(
         "-a", dest="mypyc_annotation_file", type=str, default=None, help=argparse.SUPPRESS
     )
-    # Hidden mypyc feature: do not write any C files (keep existing ones and assume they exist).
+    # Hidden mypyc feature: do not write any C files (keep existing ones and assume they
+    # exist).
     # This can be useful when debugging mypyc bugs.
     report_group.add_argument(
         "--skip-c-gen", dest="mypyc_skip_c_generation", action="store_true", help=argparse.SUPPRESS
@@ -1321,8 +1338,12 @@ def define_options(
     )
     # --logical-deps adds some more dependencies that are not semantically needed, but
     # may be helpful to determine relative importance of classes and functions for overall
-    # type precision in a code base. It also _removes_ some deps, so this flag should be never
-    # used except for generating code stats. This also automatically enables --cache-fine-grained.
+    # type precision in a code base. It also _removes_ some deps, so this flag should be
+
+    # never
+
+    # used except for generating code stats. This also automatically enables
+    # --cache-fine-grained.
     # NOTE: This is an experimental option that may be modified or removed at any time.
     parser.add_argument("--logical-deps", action="store_true", help=argparse.SUPPRESS)
     # --bazel changes some behaviors for use with Bazel (https://bazel.build).
@@ -1335,6 +1356,7 @@ def define_options(
     # --cache-map FILE ... gives a mapping from source files to cache files.
     # Each triple of arguments is a source file, a cache meta file, and a cache data file.
     # Modules not mentioned in the file will go through cache_dir.
+
     # Must be followed by another flag or by '--' (and then only file args may follow).
     parser.add_argument(
         "--cache-map", nargs="+", dest="special-opts:cache_map", help=argparse.SUPPRESS

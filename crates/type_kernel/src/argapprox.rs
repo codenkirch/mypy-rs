@@ -215,6 +215,7 @@ fn tuple_fallback(t: &Type, strict_optional: bool, res: &TypeResolver) -> Option
     // Note `handle_recursive=False` in Python (typeops.py:218); the Rust
     // `make_simplified_union` does not model the recursion guard but the
     // port is safe because item lists here come from a live tuple, not a
+
     // recursive alias.
     let union = make_simplified_union(
         &new_items,
@@ -433,6 +434,7 @@ fn approx_proper(a: &Type, f: &Type, strict_optional: bool, res: &TypeResolver) 
     // Fall back to a standard subtype check of the erased types
     // (checkexpr.py:7916). The whole check stays rust-internal: erase on
     // the wire, then `subtypes::is_subtype` with the default context
+
     // (subtypes.py:170-203: all flags False, options=None ->
     // state.strict_optional).
     let erased_a = erase_type(actual, strict_optional, res)?;

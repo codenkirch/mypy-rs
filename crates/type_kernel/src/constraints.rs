@@ -177,9 +177,11 @@ pub(crate) fn infer_constraints_full_inner(
     // Python re-normalizes unions at the top of every `_infer_constraints`
     // entry (constraints.py:547-550) and resolves type aliases via
     // get_proper_type. Rust cannot re-run make_simplified_union, so defer any
+
     // union or alias on either side before the TypeVar/visitor dispatch:
     // Rust would otherwise emit a constraint against an unsimplified target
     // (`T <: bool | int | float` instead of `T <: int | float`) and change
+
     // solver results. The old union defer below this point ran too late,
     // because the TypeVar branch above returns first.
     if matches!(

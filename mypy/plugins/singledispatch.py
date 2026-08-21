@@ -76,7 +76,8 @@ def fail(ctx: PluginContext, msg: str, context: Context | None) -> None:
     location specified by `ctx.context`. This is helpful when the only context information about
     where you want to put the error message may be None (like it is for `CallableType.definition`)
     and falling back to the location of the calling function is fine."""
-    # TODO: figure out if there is some more reliable way of getting context information, so this
+    # TODO: figure out if there is some more reliable way of getting context
+    # information, so this
     # function isn't necessary
     if context is not None:
         err_context = context
@@ -121,6 +122,7 @@ def singledispatch_register_callback(ctx: MethodContext) -> Type:
         # HACK: We received a class as an argument to register. We need to be able
         # to access the function that register is being applied to, and the typeshed definition
         # of register has it return a generic Callable, so we create a new
+
         # SingleDispatchRegisterCallable class, define a __call__ method, and then add a
         # plugin hook for that.
 
@@ -133,9 +135,14 @@ def singledispatch_register_callback(ctx: MethodContext) -> Type:
     elif isinstance(first_arg_type, CallableType):
         # TODO: do more checking for registered functions
         register_function(ctx, ctx.type, first_arg_type, ctx.api.options)
-        # The typeshed stubs for register say that the function returned is Callable[..., T], even
-        # though the function returned is the same as the one passed in. We return the type of the
-        # function so that mypy can properly type check cases where the registered function is used
+        # The typeshed stubs for register say that the function returned is
+        # Callable[..., T], even
+        # though the function returned is the same as the one passed in. We return the
+
+        # type of the
+        # function so that mypy can properly type check cases where the registered
+        # function is used
+
         # directly (instead of through singledispatch)
         return first_arg_type
 

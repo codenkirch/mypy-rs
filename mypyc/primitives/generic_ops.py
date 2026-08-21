@@ -356,6 +356,7 @@ iter_op = function_op(
 # next(iterator)
 #
 # Although the error_kind is set to be ERR_NEVER, this can actually
+
 # return NULL, and thus it must be checked using Branch.IS_ERROR.
 next_op = custom_op(
     arg_types=[object_rprimitive],
@@ -366,9 +367,11 @@ next_op = custom_op(
 # next(iterator)
 #
 # Do a next, don't swallow StopIteration, but also don't propagate an
+
 # error. (N.B: This can still return NULL without an error to
 # represent an implicit StopIteration, but if StopIteration is
 # *explicitly* raised this will not swallow it.)
+
 # Can return NULL: see next_op.
 next_raw_op = custom_op(
     arg_types=[object_rprimitive],

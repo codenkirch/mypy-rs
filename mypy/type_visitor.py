@@ -344,6 +344,7 @@ class TypeTranslator(TypeVisitor[Type]):
         # This method doesn't have a default implementation for type translators,
         # because type aliases are special: some information is contained in the
         # TypeAlias node, and we normally don't generate new nodes. Every subclass
+
         # must implement this depending on its semantics.
         pass
 

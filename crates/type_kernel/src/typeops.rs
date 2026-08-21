@@ -408,6 +408,7 @@ pub(crate) fn rust_make_simplified_union(
     // Match Python's _remove_redundant_union_items which calls
     // is_proper_subtype, reading state.strict_optional live
     // (subtypes.py:575 passes it to _is_subtype). proper_subtype=True
+
     // prevents Any-absorption: Instance is NOT <: AnyType, so Any | C is
     // preserved; strict_optional must flow from the caller so that
     // --no-strict-optional drops NoneType items (None <: T is true then).
@@ -457,9 +458,11 @@ pub(crate) fn rust_is_literal_type_like(t_bytes: &[u8]) -> Option<bool> {
 /// t = get_proper_type(t)
 /// if t is None: return False
 /// elif isinstance(t, LiteralType): return True
-/// elif isinstance(t, UnionType): return any(is_literal_type_like(item) for item in t.items)
+/// elif isinstance(t, UnionType): return any(is_literal_type_like(item) for item in
+/// t.items)
 /// elif isinstance(t, TypeVarType):
-///     return is_literal_type_like(t.upper_bound) or any(is_literal_type_like(item) for item in t.values)
+/// return is_literal_type_like(t.upper_bound) or any(is_literal_type_like(item) for
+/// item in t.values)
 /// else: return False
 /// ```
 ///
@@ -592,6 +595,7 @@ fn make_union(items: Vec<Type>) -> Type {
             // UnionType.__init__ flattens nested unions (types.py:3465) with
             // handle_type_alias_type=False, so type aliases pass through and
             // the helper never returns None here. Truthiness iterates the
+
             // flattened items, matching Python's lazy any(item.can_be_true).
             let flat = crate::visitor::flatten_nested_unions_inner(&items, false, true)
                 .unwrap_or_else(|| items.clone());
@@ -662,6 +666,7 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
             // flatten_nested_unions(relevant, type_alias_type=True, recursive=True).
             // A recursive TypeAliasType inside yields None (defer); by then the
             // relevant items may include NoneTypes, which must not be dropped
+
             // twice, so `relevant` is the pre-None-filtered input.
             let flat = crate::visitor::flatten_nested_unions_inner(&relevant, true, true)?;
             let deduped = crate::visitor::remove_dups_inner(&flat);
@@ -692,8 +697,10 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
             // Non-bool, non-enum instances pass through unchanged.
             // Enum expansion is deferred to Python: the snapshot's
             // enum_members is captured at resolver-build time, when
+
             // nonmember members (e.g. `z = nonmember(3)`) may not yet
             // have their Var.type resolved, causing stale entries.
+
             // Python reads enum_members live at type-check time, which
             // correctly excludes nonmembers.
             let snap = resolver.get(type_ref)?;
@@ -842,6 +849,7 @@ pub(crate) fn tuple_fallback(typ: &Type, resolver: &TypeResolver) -> Option<Type
     // make_simplified_union(items, handle_recursive=False). The Rust
     // make_simplified_union ignores handle_recursive (it always flattens
     // with recursive=False semantics via flatten_nested_unions), so the
+
     // behavior matches the Python handle_recursive=False call.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
     let union_type = crate::setops::make_simplified_union(&collected, &ctx, resolver, true)?;
@@ -1201,6 +1209,7 @@ fn map_type_from_supertype_inner(
     // Map step fast paths mirroring maptype.map_instance_to_supertype
     // (maptype.py:15-21) that the subtypes primitive does not encode:
     //   * same class -> keep args (already the frame we want).
+
     //   * target has no type vars -> empty args.
     let sup_snap = resolver.resolver().get(&sup_ref)?;
     let mapped_args = if sub_ref == sup_ref {
@@ -1291,6 +1300,7 @@ fn coerce_to_literal_inner(
                 // Python: a zero-member enum returns the original type
                 // (early `if not items: return typ` in the expand path is
                 // separate; here coerce_to_literal checks `len == 1` only,
+
                 // so 0 members falls through to `return original_type`).
                 _ => Some(typ.clone()),
             }
@@ -1386,6 +1396,7 @@ fn is_singleton_identity_inner(
         // FunctionLike type-object branch needs
         // `CallableType.type_object()` force_fallback Instance resolution
         // (get_instance_type over instance_type/ret_type chains), which the
+
         // wire does not carry; defer to Python.
         Type::CallableType { .. } | Type::Overloaded { .. } => None,
         _ => Some(false),
@@ -1718,6 +1729,7 @@ pub(crate) fn rust_type_object_type_from_function(
     // 2. bind_self non-generic fast path. Python's bind_self with
     // `ignore_instances=True` takes the strip path for signature without
     // type variables; generic signatures (needing infer_type_arguments)
+
     // defer.
     let bound = bind_self_overloaded(&signature)?;
     // 3. map the bound signature from def_info's frame into info's frame.
@@ -1800,6 +1812,7 @@ fn class_callable_item_wire(
     // class_callable (typeops.py:478-501): explicit_type is the __init__
     // ret_type for __new__, else the declared self type. Both are resolved
     // through get_proper_type before the subtype checks; the wire format is
+
     // already proper except for TypeAliasType, which defers.
     let orig_self_proper = match orig_self {
         Some(t) if !matches!(t, Type::TypeAliasType { .. }) => Some(t.clone()),

@@ -62,6 +62,7 @@ pub(crate) fn rust_replace_meta_vars(type_bytes: &[u8], target_bytes: &[u8]) -> 
     // Before ErasedType gained a wire tag, serializing an ErasedType target
     // raised NotImplementedError, so replace_meta_vars always deferred to
     // the pure-Python TypeVarEraser. Nothing in the type kernel's
+
     // TypeVarEraser port exercised an ErasedType replacement, so keep that
     // behavior: defer when the target is ErasedType so inference semantics
     // do not change (parity-safe strangler).
@@ -220,9 +221,11 @@ pub(crate) fn erase_typevars_inner(
                 // Produce a TupleType(replacement) with tuple_fallback.
                 // tuple_fallback is Instance; copy_modified(args=[replacement])
                 // means the new tuple has a single arg = replacement.
+
                 // However, the wire format TypeVarTupleType.tuple_fallback is
                 // an Instance Type. copy_modified(args=[repl]) would create
                 // an Instance with args=[repl]. We can't do copy_modified on
+
                 // a wire-format Type without knowing the TypeInfo. Defer.
                 None
             } else {
@@ -286,6 +289,7 @@ pub(crate) fn erase_typevars_inner(
                     // If it's a named tuple (non-builtins.tuple fallback),
                     // return partial_fallback.accept(self) — i.e. erase the
                     // fallback. We can't easily detect named_tuple from wire
+
                     // format, so defer to Python for non-builtins.tuple.
                     return None;
                 }

@@ -114,6 +114,7 @@ pub(crate) fn rust_lookup_qualified(
                 // The found_fullname is the TypeInfo where the member
                 // lives. The member itself is accessed by `part`.
                 // For the next iteration, we need the member's node
+
                 // type. We can only continue if the member is itself a
                 // TypeInfo (nested class). Check via the resolver.
                 let next_fullname = format!("{}.{}", current_fullname, part);

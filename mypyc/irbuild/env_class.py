@@ -265,6 +265,7 @@ def add_vars_to_env(builder: IRBuilder, prefix: str = "") -> None:
                 # The return type is 'object' instead of an RInstance of the
                 # callable class because differently defined functions with
                 # the same name and signature across conditional blocks
+
                 # will generate different callable classes, so the callable
                 # class that gets instantiated must be generic.
                 if nested_fn.is_generator or nested_fn.is_coroutine:

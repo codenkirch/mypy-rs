@@ -201,9 +201,11 @@ class DefinedVariableTracker:
     """DefinedVariableTracker manages the state and scope for the UndefinedVariablesVisitor."""
 
     def __init__(self) -> None:
-        # There's always at least one scope. Within each scope, there's at least one "global" BranchingStatement.
+        # There's always at least one scope. Within each scope, there's at least one
+        # "global" BranchingStatement.
         self.scopes: list[Scope] = [Scope([BranchStatement()], ScopeType.Global)]
-        # disable_branch_skip is used to disable skipping a branch due to a return/raise/etc. This is useful
+        # disable_branch_skip is used to disable skipping a branch due to a
+        # return/raise/etc. This is useful
         # in things like try/except/finally statements.
         self.disable_branch_skip = False
         self.in_finally = False
@@ -275,7 +277,8 @@ class DefinedVariableTracker:
 
     def is_possibly_undefined(self, name: str) -> bool:
         assert len(self._scope().branch_stmts) > 0
-        # A variable is undefined if it's in a set of `may_be_defined` but not in `must_be_defined`.
+        # A variable is undefined if it's in a set of `may_be_defined` but not in
+        # `must_be_defined`.
         return self._scope().branch_stmts[-1].is_possibly_undefined(name)
 
     def is_defined_in_different_branch(self, name: str) -> bool:
@@ -552,6 +555,7 @@ class PossiblyUndefinedVariableVisitor(ExtendedTraverserVisitor):
             # In order to find undefined vars in `finally`, we need to
             # process try/except with branch skipping disabled. However, for the rest of the code
             # after finally, we need to process try/except with branch skipping enabled.
+
             # Therefore, we need to process try/finally twice.
             # Because processing is not idempotent, we should make a copy of the tracker.
             old_tracker = self.tracker.copy()
@@ -659,6 +663,7 @@ class PossiblyUndefinedVariableVisitor(ExtendedTraverserVisitor):
             # A variable is undefined. It could be due to two things:
             # 1. A variable is just totally undefined
             # 2. The variable is defined later in the code.
+
             # Case (1) will be caught by semantic analyzer. Case (2) is a forward ref that should
             # be caught by this visitor. Save the ref for later, so that if we see a definition,
             # we know it's a used-before-definition scenario.
