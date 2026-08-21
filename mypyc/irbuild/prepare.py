@@ -84,18 +84,6 @@ from mypyc.sametype import is_same_type
 
 GENERATOR_HELPER_NAME: Final = "__mypyc_generator_helper__"
 
-# Stage 16: native mypyc_port seam (parity-only, default-off).
-
-# Routes `can_subclass_builtin` through the Rust type_kernel extension.
-# Falls back to pure-Python on any error.
-try:
-    from type_kernel import rust_can_subclass_builtin as _rust_can_subclass_builtin
-
-    _MYPYC_HAS_KERNEL = True
-except ImportError:
-    _rust_can_subclass_builtin = None  # type: ignore[assignment]
-    _MYPYC_HAS_KERNEL = False
-
 
 def build_type_map(
     mapper: Mapper,
@@ -390,13 +378,6 @@ def is_valid_multipart_property_def(prop: OverloadedFuncDef) -> bool:
 
 def can_subclass_builtin(builtin_base: str) -> bool:
     # BaseException and dict are special cased.
-    if _MYPYC_HAS_KERNEL:
-        try:
-            result = _rust_can_subclass_builtin(builtin_base)
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
     return builtin_base in (
         (
             "builtins.Exception",
