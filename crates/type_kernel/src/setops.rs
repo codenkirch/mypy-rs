@@ -1660,10 +1660,9 @@ fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
     Some(Type::UninhabitedType { ambiguous: false })
 }
 
-/// `join_similar_callables` (join.py:1086-1119): non-equivalent similar
-/// callables. Per-arg safe_meet, ret join, instance_type join, fallback
-/// pick. Returns Encoded(new CallableType) or None (defer).
-//
+// `join_similar_callables` (join.py:1086-1119): non-equivalent similar
+// callables. Per-arg safe_meet, ret join, instance_type join, fallback
+// pick. Returns Encoded(new CallableType) or None (defer).
 // Called with the (t, self.s) operand order from join.py:622; the
 // operands are passed through in that frame, and the field handling
 

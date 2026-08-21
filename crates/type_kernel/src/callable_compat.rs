@@ -18,7 +18,7 @@
 //!   `TypedDictType` into named args);
 //! * any arg is an `UnpackType` (`with_normalized_var_args` would unfold);
 //! * the `mypy.meet.meet_types` merge case in
-//! `mypy.typeops.callable_corresponding_argument`
+//!   `mypy.typeops.callable_corresponding_argument`
 //!   (`SetOpResult` carries only input markers, not the merged type);
 //! * any nested `subtypes::is_subtype` returns `None` (all-or-nothing: Rust
 //!   cannot enrich one comparison with Python's answer while deciding the rest);

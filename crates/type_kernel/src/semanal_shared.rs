@@ -11,7 +11,7 @@
 //! - `special_function_elide_names` / `argument_elide_name` — pure magic-method
 //!   set membership checks from `mypy/sharedparse.py`.
 //! - `set_callable_name` — resolve the display name of a callable
-//! (semanal_shared.py:266-279).
+//!   (semanal_shared.py:266-279).
 //! - `calculate_tuple_fallback` — compute the union fallback for a
 //!   `TupleType` (semanal_shared.py:282-316).
 //! - `has_placeholder` — check whether a type tree contains a

@@ -499,7 +499,7 @@ fn typed_dict_mapping_pair(left: &Type, right: &Type, res: &TypeResolver) -> Opt
 /// Implements the logic from meet.py:1503-1573:
 /// - Required keys must each overlap with the mapping's value type
 /// - For TypedDicts with no required keys, at least one key must overlap with the value
-/// type
+///   type
 fn typed_dict_mapping_overlap(
     left: &Type,
     right: &Type,

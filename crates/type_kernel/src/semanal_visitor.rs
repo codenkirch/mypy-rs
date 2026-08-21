@@ -26,9 +26,9 @@
 //! - `is_init_only` — check whether a `Var` is a `dataclasses.InitVar` (Issue #391).
 //! - `erase_func_annotations` — erase type annotations from a `FuncDef` (Issue #391).
 //! - `get_deprecated` — extract deprecation string from a `CallExpr` decorator (Issue
-//! #391).
+//!   #391).
 //! - `get_name_repr_of_expr` — simplified textual representation of an expression
-//! (Issue #391).
+//!   (Issue #391).
 
 use std::collections::HashSet;
 
