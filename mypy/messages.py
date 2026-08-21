@@ -1386,6 +1386,7 @@ class MessageBuilder:
         # error: Signature of "f" incompatible with supertype "A"
         # note:      Superclass:
         # note:          def f(self) -> str
+
         # note:      Subclass:
         # note:          def f(self, x: str) -> None
         self.note("Superclass:", context, offset=ALIGN_OFFSET + OFFSET, parent_error=error)
@@ -1802,6 +1803,7 @@ class MessageBuilder:
         # In loops (and similar cases), the same expression might be analysed multiple
         # times and thereby confronted with different types.  We only want to raise a
         # `comparison-overlap` error if it occurs in all cases and therefore collect the
+
         # respective types of the current iteration here so that we can report the error
         # later if it is persistent over all iteration steps:
         for watcher in self.errors.get_watchers():
@@ -2972,7 +2974,8 @@ def format_type_inner(
             if param_spec is not None:
                 return f"Callable[{format(param_spec)}, {return_type}]"
 
-            # Use pretty format (def-style) for complex signatures with named, optional, or star args.
+            # Use pretty format (def-style) for complex signatures with named, optional,
+            # or star args.
             # Use compact Callable[[...], ...] only for signatures with all simple positional args.
             if use_pretty_callable:
                 if any(
@@ -3598,6 +3601,7 @@ COMMON_MISTAKES: Final[dict[str, Sequence[str]]] = {"add": ("append", "extend")}
 # Stage 18 (M27): when the `type_kernel` Rust extension is importable and
 # `Options.native_type_kernel` is set, `best_matches` and `pretty_seq` route
 # through Rust. The Rust path ports the Ratcliff-Obershelp similarity ratio
+
 # (difflib.SequenceMatcher.ratio) and the ranking/filtering logic in pure
 # Rust. Falls back to the pure-Python path if the extension is unavailable
 # or the gate is off.
@@ -3624,7 +3628,8 @@ def _set_native_suggestions_active(active: bool) -> None:
 
 def _real_quick_ratio(a: str, b: str) -> float:
     # this is an upper bound on difflib.SequenceMatcher.ratio
-    # similar to difflib.SequenceMatcher.real_quick_ratio, but faster since we don't instantiate
+    # similar to difflib.SequenceMatcher.real_quick_ratio, but faster since we don't
+    # instantiate
     al = len(a)
     bl = len(b)
     return 2.0 * min(al, bl) / (al + bl)

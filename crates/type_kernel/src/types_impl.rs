@@ -109,6 +109,7 @@ fn can_be_true_default_inner(typ: &Type) -> Option<bool> {
                 // can_be_any_bool is True: result is True. But we can only
                 // know it's True if we confirmed via TypeInfo. If we got
                 // here, can_be_any_bool_wire returned True, meaning the
+
                 // fallback is NOT builtins.tuple and we need TypeInfo to
                 // check __bool__. Defer.
                 None

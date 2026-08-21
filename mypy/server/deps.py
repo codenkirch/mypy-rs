@@ -122,9 +122,11 @@ def _set_native_server_deps_active(active: bool) -> None:
 # ====================================================================
 # M354: Pure server trigger/target computation — Python shims
 # ====================================================================
+
 #
 # These functions wrap the Rust pure computations. They check the native
 # gate and the `_HAS_TYPE_KERNEL` flag, then call into Rust. On any
+
 # failure or unhandled case, they fall back to the Python reference
 # implementations.
 
@@ -332,12 +334,15 @@ class DependencyVisitor(TraverserVisitor):
         # This attribute holds a mapping from target to names of type aliases
         # it depends on. These need to be processed specially, since they may
         # appear in expanded form in symbol tables, because of a get_proper_type()
+
         # somewhere. For example, after:
         #    A = int
         #    x: A
+
         # the module symbol table will just have a Var `x` with type `int`,
         # and the dependency of `x` on `A` is lost. Therefore, the alias dependencies
         # are preserved at alias expansion points in `semanal.py`, stored as an attribute
+
         # on MypyFile, and then passed here.
         # TODO: fine-grained is more susceptible to this partially because we are reckless
         # about get_proper_type() in *this specific file*.
@@ -390,6 +395,7 @@ class DependencyVisitor(TraverserVisitor):
             # Add logical dependencies from decorators to the function. For example,
             # if we have
             #     @dec
+
             #     def func(): ...
             # then if `dec` is unannotated, then it will "spoil" `func` and consequently
             # all call sites, making them all `Any`.
@@ -436,12 +442,15 @@ class DependencyVisitor(TraverserVisitor):
                 # We add dependencies from whole MRO to cover explicit subprotocols.
                 # For example:
                 #
+
                 #     class Super(Protocol):
                 #         x: int
                 #     class Sub(Super, Protocol):
+
                 #         y: int
                 #
                 # In this example we add <Super[wildcard]> -> <Sub>, to invalidate Sub if
+
                 # a new member is added to Super.
                 self.add_dependency(
                     make_wildcard_trigger(base_info.fullname), target=make_trigger(target)
@@ -468,9 +477,11 @@ class DependencyVisitor(TraverserVisitor):
                     # Skip logical dependency if an attribute is not overridden. For example,
                     # in case of:
                     #     class Base:
+
                     #         x = 1
                     #         y = 2
                     #     class Sub(Base):
+
                     #         x = 3
                     # we skip <Base.y> -> <Child.y>, because even if `y` is unannotated it
                     # doesn't affect precision of Liskov checking.
@@ -598,6 +609,7 @@ class DependencyVisitor(TraverserVisitor):
             # Special case: for definitions without an explicit type like this:
             #     x = func(...)
             # we add a logical dependency <func> -> <x>, because if `func` is not annotated,
+
             # then it will make all points of use of `x` unchecked.
             if (
                 isinstance(rvalue, CallExpr)
@@ -680,6 +692,7 @@ class DependencyVisitor(TraverserVisitor):
                 # Probably a secondary, non-definition assignment that doesn't
                 # result in a non-partial type. We won't be able to infer any
                 # dependencies from this so just return something. (The first,
+
                 # definition assignment with a partial type is handled
                 # differently, in the semantic analyzer.)
                 assert not lvalue.is_new_def
@@ -746,6 +759,7 @@ class DependencyVisitor(TraverserVisitor):
         # If this is a reference to a type, generate a dependency to its
         # constructor.
         # IDEA: Avoid generating spurious dependencies for except statements,
+
         #       class attribute references, etc., if performance is a problem.
         typ = get_proper_type(self.type_map.get(o))
         if isinstance(typ, FunctionLike) and typ.is_type_obj():
@@ -791,9 +805,11 @@ class DependencyVisitor(TraverserVisitor):
                     # Generate a logical dependency from an unimported
                     # definition (which comes from a missing module).
                     # Example:
+
                     #     import missing  # "missing" not in build
                     #
                     #     def g() -> None:
+
                     #         missing.f()  # Generate dependency from "missing.f"
                     self.add_dependency(make_trigger(name))
 
@@ -807,6 +823,7 @@ class DependencyVisitor(TraverserVisitor):
         # Unwrap nested member expression to handle cases like "a.b.c.d" where
         # "a.b" is a known reference to an unimported module. Find the base
         # reference to an unimported module (such as "a.b") and the name suffix
+
         # (such as "c.d") needed to build a full name.
         while typ.type_of_any == TypeOfAny.from_another_any and isinstance(e.expr, MemberExpr):
             suffix = "." + e.name + suffix
@@ -981,6 +998,7 @@ class DependencyVisitor(TraverserVisitor):
             # Don't track dependencies to certain library modules to keep the size of
             # the dependencies manageable. These dependencies should only
             # change on mypy version updates, which will require a full rebuild
+
             # anyway.
             return
         if target is None:

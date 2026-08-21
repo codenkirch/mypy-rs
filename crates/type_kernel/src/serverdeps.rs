@@ -409,6 +409,7 @@ fn class_name_is(obj: &PyAny, expected: &str) -> bool {
 // ====================================================================
 // M354: Pure server trigger/target computation
 // ====================================================================
+
 // These functions take dependency records (triggers -> target sets) and sets of
 // fully-qualified names as pure inputs and return the computed results. They do
 // NOT touch live AST objects, symbol tables, or any mutable daemon state.
@@ -1042,12 +1043,15 @@ pub fn rust_find_relative_leaf_module(
 // ====================================================================
 // Issue #389: dmypy_server pure helpers — plain-record shuffling
 // ====================================================================
+
 //
 // These functions port the pure (stateless) helpers from
 // `mypy.dmypy_server`. They take plain Python objects (dicts, lists,
+
 // strings, tuples) and return plain Python objects.  Each function
 // returns `None` when it cannot handle the input so the Python caller
 // falls back to the pure-Python implementation — the strangler-fig
+
 // per-call gate.
 
 /// Port of `mypy.dmypy_server.process_start_options`.
@@ -1575,6 +1579,7 @@ typ = fx.a
         // BFS: <A>→B. B is a non-trigger target (doesn't start with "<"),
         // so it resolves to module "B" and does NOT expand further.
         // D would only be reached if we followed <B> and <C> as triggers,
+
         // but B is a bare module name, not a trigger.
         assert_eq!(result, vec!["B"]);
     }
@@ -1642,6 +1647,7 @@ typ = fx.a
         // A continuation header like `foo/y.py: In function "f":` has no line
         // number (`extract_fnam` returns None) but its prefix `foo/y.py` IS a
         // known file key, so it must be grouped with the `foo/y.py:123`
+
         // messages that follow it and keep the file's `prev_messages` order.
         let messages: Vec<String> = vec![
             "x.py:1: error: \"int\" not callable".into(),

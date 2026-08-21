@@ -101,6 +101,7 @@ except ImportError:
 # Module-level flag + resolver, set by the build manager from
 # `Options.native_type_kernel` at the start of each build. The hot path
 # reads these without an options lookup per call. When `_native_subtype_active`
+
 # is True but `_native_subtype_resolver` is None, the shim falls through to
 # Python (the resolver isn't wired yet, e.g. in tests that only set the flag).
 _native_subtype_active: bool = False
@@ -265,21 +266,31 @@ def is_subtype(
     if mypy.typeops.is_recursive_pair(left, right):
         # This case requires special care because it may cause infinite recursion.
         # Our view on recursive types is known under a fancy name of iso-recursive mu-types.
+
         # Roughly this means that a recursive type is defined as an alias where right hand side
         # can refer to the type as a whole, for example:
         #     A = Union[int, Tuple[A, ...]]
+
         # and an alias unrolled once represents the *same type*, in our case all these represent
         # the same type:
+
         #    A
         #    Union[int, Tuple[A, ...]]
         #    Union[int, Tuple[Union[int, Tuple[A, ...]], ...]]
-        # The algorithm for subtyping is then essentially under the assumption that left <: right,
-        # check that get_proper_type(left) <: get_proper_type(right). On the example above,
+
+        # The algorithm for subtyping is then essentially under the assumption that
+        # left <: right,
+        # check that get_proper_type(left) <: get_proper_type(right). On the example
+
+        # above,
+
         # If we start with:
         #     A = Union[int, Tuple[A, ...]]
         #     B = Union[int, Tuple[B, ...]]
-        # When checking if A <: B we push pair (A, B) onto 'assuming' stack, then when after few
-        # steps we come back to initial call is_subtype(A, B) and immediately return True.
+
+        # When checking if A <: B we push pair (A, B) onto 'assuming' stack, then when
+        # after few steps we come back to initial call is_subtype(A, B) and
+        # immediately return True.
         with pop_on_exit(type_state.get_assumptions(is_proper=False), left, right):
             return _is_subtype(left, right, subtype_context, proper_subtype=False)
     return _is_subtype(left, right, subtype_context, proper_subtype=False)
@@ -414,6 +425,7 @@ def is_same_type(
 
     # Note that using ignore_promotions=True (default) makes types like int and int64
     # considered not the same type (which is the case at runtime).
+
     # Also Union[bool, int] (if it wasn't simplified before) will be different
     # from plain int, etc.
     return is_proper_subtype(
@@ -458,7 +470,8 @@ def _is_subtype(
         # ErasedType as we do for non-proper subtyping.
         return True
 
-    # Cases specific w.r.t. right type are easier to handle before entering the SubtypeVisitor.
+    # Cases specific w.r.t. right type are easier to handle before entering the
+    # SubtypeVisitor.
     # Currently, these include Union types and TypeVarType with values.
     if isinstance(right, UnionType) and not isinstance(left, UnionType):
         # Normally, when 'left' is not itself a union, the only way
@@ -477,6 +490,7 @@ def _is_subtype(
         # Recombine rhs literal types, to make an enum type a subtype
         # of a union of all enum items as literal types. Only do it if
         # the previous check didn't succeed, since recombining can be
+
         # expensive.
         # `bool` is a special case, because `bool` is `Literal[True, False]`.
         if (
@@ -500,6 +514,7 @@ def _is_subtype(
         # However, if 'left' is a type variable T, T might also have
         # an upper bound which is itself a union. This case will be
         # handled below by the SubtypeVisitor. We have to check both
+
         # possibilities, to handle both cases like T <: Union[T, U]
         # and cases like T <: B where B is the upper bound of T and is
         # a union. (See #2314.)
@@ -522,9 +537,11 @@ def _is_subtype(
     # Stage 3c (M8b): try the Rust nominal-instance path. By this point
     # `left`/`right` are proper types and the AnyType/UnionType/
     # TypeVarType-with-values right short-circuits have fired, matching
+
     # the Rust `is_subtype` contract. Rust returns `None` for any case
     # it does not handle (generics needing `expand_type_by_instance`,
     # protocols, tuples, callables, etc.); we then fall through to
+
     # `SubtypeVisitor`. Mirrors `erasetype.py:80-86`.
     if (
         _HAS_TYPE_KERNEL
@@ -685,6 +702,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
         if left.type.fallback_to_any and not self.proper_subtype:
             # NOTE: `None` is a *non-subclassable* singleton, therefore no class
             # can by a subtype of it, even with an `Any` fallback.
+
             # This special case is needed to treat descriptors in classes with
             # dynamic base classes correctly, see #5456.
             return not isinstance(self.right, NoneType)
@@ -704,6 +722,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                 if not self.proper_subtype:
                     # Special cases to consider:
                     #   * Plain tuple[Any, ...] instance is a subtype of all tuple types.
+
                     #   * Foo[*tuple[Any, ...]] (normalized) instance is a subtype of all
                     #     tuples with fallback to Foo (e.g. for variadic NamedTuples).
                     mapped = map_instance_to_supertype(left, right.partial_fallback.type)
@@ -744,6 +763,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
             rname = right.type.fullname
             # Always try a nominal check if possible,
             # there might be errors that a user wants to silence *once*.
+
             # NamedTuples are a special case, because `NamedTuple` is not listed
             # in `TypeInfo.mro`, so when `(a: NamedTuple) -> None` is used,
             # we need to check for `is_named_tuple` property
@@ -920,6 +940,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                 # For TypeIs we have to check both ways; it is unsafe to pass
                 # a TypeIs[Child] when a TypeIs[Parent] is expected, because
                 # if the narrower returns False, we assume that the narrowed value is
+
                 # *not* a Parent.
                 if not self._is_subtype(left.type_is, right.type_is) or not self._is_subtype(
                     right.type_is, left.type_is
@@ -1049,6 +1070,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
             if is_named_instance(right.partial_fallback, "builtins.tuple"):
                 # No need to verify fallback. This is useful since the calculated fallback
                 # may be inconsistent due to how we calculate joins between unions vs.
+
                 # non-unions. For example, join(int, str) == object, whereas
                 # join(Union[int, C], Union[str, C]) == Union[int, str, C].
                 return True
@@ -1132,6 +1154,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
 
             # The most tricky case with two variadic unpacks we handle similar to union
             # subtyping: *each* item on the left, must be a subtype of *some* item on the right.
+
             # For this we first check the "asymptotic case", i.e. that both unpacks a subtypes,
             # and then check subtyping for all finite overlaps.
             if not self._is_subtype(left_item, right_item):
@@ -1316,8 +1339,10 @@ class SubtypeVisitor(TypeVisitor[bool]):
             return True
 
         elif isinstance(self.right, UnionType):
-            # prune literals early to avoid nasty quadratic behavior which would otherwise arise when checking
+            # prune literals early to avoid nasty quadratic behavior which would
+            # otherwise arise when checking
             # subtype relationships between slightly different narrowings of an Enum
+
             # we achieve O(N+M) instead of O(N*M)
 
             fast_check: set[ProperType] = set()
@@ -1350,6 +1375,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
             # Special case, partial `None`. This might happen when defining
             # class-level attributes with explicit `None`.
             # We can still recover from this.
+
             # https://github.com/python/mypy/issues/11105
             return self.visit_none_type(NoneType())
         raise RuntimeError(f'Partial type "{left}" cannot be checked with "issubtype()"')
@@ -1402,6 +1428,7 @@ class SubtypeVisitor(TypeVisitor[bool]):
                     # TODO: Strictly speaking, the type builtins.type is considered equivalent to
                     #       Type[Any]. However, this would break the is_proper_subtype check in
                     #       conditional_types for cases like isinstance(x, type) when the type
+
                     #       of x is Type[int]. It's unclear what's the right way to address this.
                     return True
                 item = left.item
@@ -1660,9 +1687,11 @@ def find_member(
         # This is needed to avoid infinite recursion in situations involving protocols like
         #     class P(Protocol[T]):
         #         def combine(self, other: P[S]) -> P[Tuple[T, S]]: ...
+
         # Normally we call freshen_all_functions_type_vars() during attribute access,
         # to avoid type variable id collisions, but for protocols this means we can't
         # use the assumption stack, that will grow indefinitely.
+
         # TODO: find a cleaner solution that doesn't involve massive perf impact.
         preserve_type_var_ids=True,
     )
@@ -1719,6 +1748,7 @@ def find_member_simple(
                 # Normally, mypy assumes that instances that define __getattr__ have all
                 # attributes with the corresponding return type. If this will produce
                 # many false negatives, then this could be prohibited for
+
                 # structural subtyping.
                 method = info.get_method(method_name)
                 if method and method.info.fullname != "builtins.object":
@@ -2005,12 +2035,14 @@ def is_callable_compatible(
     # A callable L is a subtype of a generic callable R if L is a
     # subtype of every type obtained from R by substituting types for
     # the variables of R. We can check this by simply leaving the
+
     # generic variables of R as type variables, effectively varying
     # over all possible values.
 
     # It's okay even if these variables share ids with generic
     # type variables of L, because generating and solving
     # constraints for the variables of L to make L a subtype of R
+
     # (below) treats type variables on the two sides as independent.
     if left.variables:
         # Apply generic type variables away in left via type inference.
@@ -2100,6 +2132,7 @@ def are_parameters_compatible(
         # Similar to how (*Any, **Any) is considered a supertype of all callables, we consider
         # (*Any) a supertype of all callables with positional arguments. This is needed in
         # particular because we often refuse to try type inference if actual type is not
+
         # a subtype of erased template type.
         trivial_vararg_suffix = True
 
@@ -2113,6 +2146,7 @@ def are_parameters_compatible(
     # If left has one corresponding argument by name and another by position,
     # consider them to be one "merged" argument (and not ambiguous) if they're
     # both optional, they're name-only and position-only respectively, and they
+
     # have the same type.  This rule allows functions with (*args, **kwargs) to
     # properly stand in for the full domain of formal arguments that they're
     # used for in practice.
@@ -2124,7 +2158,7 @@ def are_parameters_compatible(
 
     # Phase 1a: If left and right can both accept an infinite number of args,
     #           their types must be compatible.
-    #
+
     #           Furthermore, if we're checking for compatibility in all cases,
     #           we confirm that if R accepts an infinite number of arguments,
     #           L must accept the same.
@@ -2169,6 +2203,7 @@ def are_parameters_compatible(
     # Phase 1c: Check var args. Right has an infinite series of optional positional
     #           arguments. Get all further positional args of left, and make sure
     #           they're more general than the corresponding member in right.
+
     # TODO: handle suffix in UnpackType (i.e. *args: *Tuple[Ts, X, Y]).
     if right_star is not None and not trivial_vararg_suffix:
         # Synthesize an anonymous formal argument for the right
@@ -2376,6 +2411,7 @@ def unify_generic_callable(
     # This function may be called by the solver, so we need to allow erased types here.
     # We anyway allow checking subtyping between other types containing <Erased>
     # (probably also because solver needs subtyping). See also comment in
+
     # ExpandTypeVisitor.visit_erased_type().
     applied = mypy.applytype.apply_generic_arguments(
         type, non_none_inferred_vars, report, context=target
@@ -2588,8 +2624,9 @@ def infer_variance(info: TypeInfo, i: int) -> bool:
                 # It's okay for a method in a generic class with a contravariant type
                 # variable to return a generic instance of the class, if it doesn't involve
                 # variance (i.e. values of type variables are propagated). Our normal rules
+
                 # would disallow this. Replace such return types with 'Any' to allow this.
-                #
+
                 # This could probably be more lenient (e.g. allow self type be nested, don't
                 # require all type arguments to be identical to self_type), but this will
                 # hopefully cover the vast majority of such cases, including Self.

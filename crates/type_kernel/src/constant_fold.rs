@@ -151,6 +151,7 @@ fn binary_int_op(
             // Python: `left ** right`; for ints this stays exact. We must
             // guard against OverflowError (Python's ints are arbitrary
             // precision but PyO3/CPython may still raise on huge exponents
+
             // in some builds) by catching and returning None.
             let pow = py.import("operator")?.getattr("pow")?;
             match pow.call1((left, right)) {

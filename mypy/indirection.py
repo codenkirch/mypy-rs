@@ -105,6 +105,7 @@ class TypeIndirectionVisitor(TypeVisitor[None]):
         # Instance is named, record its definition and continue digging into
         # components that constitute semantic meaning of this type: bases, metaclass,
         # tuple type, and typeddict type.
+
         # Note: we cannot simply record the MRO, in case an intermediate base contains
         # a reference to type alias, this affects meaning of map_instance_to_supertype(),
         # see e.g. testDoubleReexportGenericUpdated.

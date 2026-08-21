@@ -26,6 +26,7 @@ CONST_TYPES: Final = (int, bool, float, complex, str)
 # Native type-kernel seam: when the `type_kernel` Rust extension is
 # importable and the build manager has enabled it, `constant_fold_expr`
 # dispatches through Rust. The Rust path returns None for any node it
+
 # does not handle, so Python falls back to the pure-Python walk. Same
 # strangler-fig per-call gate as the eraser/kernel ports.
 try:

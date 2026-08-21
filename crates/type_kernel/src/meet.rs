@@ -498,7 +498,8 @@ fn typed_dict_mapping_pair(left: &Type, right: &Type, res: &TypeResolver) -> Opt
 /// Check if a TypedDict type is overlapping with a Mapping type.
 /// Implements the logic from meet.py:1503-1573:
 /// - Required keys must each overlap with the mapping's value type
-/// - For TypedDicts with no required keys, at least one key must overlap with the value type
+/// - For TypedDicts with no required keys, at least one key must overlap with the value
+/// type
 fn typed_dict_mapping_overlap(
     left: &Type,
     right: &Type,
@@ -565,7 +566,8 @@ fn typed_dict_mapping_overlap(
     let str_type = fallback_args.first()?.clone();
 
     // Special case: no required keys + both key/value are Uninhabited
-    // -> overlapping iff TypedDict has no required keys (empty TypedDict overlaps empty dict)
+    // -> overlapping iff TypedDict has no required keys (empty TypedDict overlaps empty
+    // dict)
     if matches!(key_type, Type::UninhabitedType { .. })
         && matches!(value_type, Type::UninhabitedType { .. })
     {
@@ -1396,6 +1398,7 @@ pub(crate) fn rust_get_possible_variants(
 // -----------------------------------------------------------------
 // Issue #525: wire-seam #[pyfunction] wrappers for meet.py helpers.
 // Each takes serialized Type bytes and returns Option<T> (None =
+
 // defer to Python). The internal functions above already implement
 // the logic; these wrappers just decode/encode at the seam.
 // -----------------------------------------------------------------
@@ -1649,6 +1652,7 @@ mod tests {
         // meet.py:222: declared == narrowed -> original_declared is handled
         // in the Python shim before Rust is reached, so narrow_rec must NOT
         // special-case identity. For equal types whose class is unknown to
+
         // the resolver, the overlap probe needs a TypeInfo lookup and defers
         // (None) rather than guessing. This pins that contract: the identity
         // branch is Python's, not Rust's.
@@ -1777,6 +1781,7 @@ mod tests {
         // The wrapper encodes the serialized bytes for the seam. We test the
         // same path via narrow_rec (wire round-trip through the real
         // encoder/decoder, no pyclass needed) for an alias-free, non-recursive
+
         // proper pair.
         let r = make_resolver();
         let d = instance("builtins.int");

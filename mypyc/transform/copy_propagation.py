@@ -28,6 +28,7 @@ def do_copy_propagation(fn: FuncIR, options: CompilerOptions) -> None:
     # Anything with an assignment count >1 will not be optimized
     # here, as it would be require data flow analysis and we want to
     # keep this simple and fast, at least until we've made data flow
+
     # analysis much faster.
     counts: dict[Value, int] = {}
     replacements: dict[Value, Value] = {}

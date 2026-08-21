@@ -498,8 +498,11 @@ fn parse_errors_to_py(
     // Ruff produces more specific syntax error messages than CPython.
     // The strangler-fig contract requires byte-identical output to Python.
     // Re-parse with CPython's ast.parse on ruff syntax errors to match.
-    // message and location. Syntax errors are rare in production (users fix
-    // them), so the double-parse cost is negligible.
+
+    // message and location.
+
+    // Syntax errors are rare in production (users fix them), so the
+    // double-parse cost is negligible.
     let cpython_error = cpython_syntax_error(py, source).ok();
 
     let mut result = Vec::with_capacity(errors.len());

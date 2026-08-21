@@ -57,7 +57,8 @@ def get_load_global_name(op: CallC) -> str | None:
     return None
 
 
-# These primitives perform an implicit IncRef for the return value. Only some of the most common ones
+# These primitives perform an implicit IncRef for the return value. Only some of the
+# most common ones
 # are included, and mostly ops that could be switched to use borrowing in some contexts.
 primitives_that_inc_ref: Final = {
     "list_get_item_unsafe",

@@ -23,6 +23,7 @@ fn erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObj
     // Class dispatch is by `isinstance` against the resolved class objects,
     // not by string compare, so plugin subclasses are handled correctly.
     //
+
     // Order mirrors the Python EraseTypeVisitor: leaf types first, then
     // the composite types that recurse.
 
@@ -66,6 +67,7 @@ fn erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObj
     // --- Instance ---
     // Python visitor:
     //   args = erased_vars(t.type.defn.type_vars, TypeOfAny.special_form)
+
     //   return Instance(t.type, args, t.line)
     if is_instance(obj, refs.instance) {
         return erase_instance(py, obj, refs);
@@ -102,6 +104,7 @@ fn erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObj
     // --- TypeType ---
     // Python visitor:
     //   return TypeType.make_normalized(t.item.accept(self), line=t.line,
+
     //                                  is_type_form=t.is_type_form)
     if is_instance(obj, refs.type_type) {
         let item = obj.getattr("item")?;
@@ -124,6 +127,7 @@ fn erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObj
     // --- UnionType ---
     // Python visitor:
     //   erased_items = [erase_type(item) for item in t.items]
+
     //   return make_simplified_union(erased_items)
     if is_instance(obj, refs.union_type) {
         return erase_union(py, obj, refs);
@@ -132,6 +136,7 @@ fn erase_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult<PyObj
     // --- Anything else ---
     // UnboundType, PartialType, PlaceholderType, Parameters, TypeGuardedType,
     // RawExpressionType, CallableArgument, TypeList, EllipsisType,
+
     // TypeAliasType (raises in Python visitor), etc. — either should not
     // leak past `get_proper_type` or the visitor raises. For safety we
     // fall back to Python.

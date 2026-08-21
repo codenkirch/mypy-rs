@@ -86,18 +86,23 @@ from mypy.types import (
 # M20: type-kernel seam for checkmember. When the `type_kernel` Rust
 # extension is importable and `Options.native_type_kernel` is set,
 # `bind_self_fast` and `_analyze_member_access` dispatch route through
+
 # Rust. The Rust path returns `None` for any type it does not handle, in
 # which case we fall back to the pure-Python implementation. This is the
 # strangler-fig per-call gate — no behavior change unless the option is
+
 # explicitly enabled.
 #
 # Import the buffer + read_type helpers and the 12 pre-existing checkmember
+
 # kernels. Issue-#476 adds five new kernels; four of them (check_self_arg,
 # expand_without_binding, expand_and_bind_callable, add_class_tvars) have a
 # known parity gap: the wire round-trip drops the CallableType.definition
+
 # link used by error-message rendering and Self-typevar solving, so their
 # gates defer to Python via `is not None` checks. They import real when
 # available so the Rust bytes still count toward the migration;
+
 # `descriptor_has_get_set` is parity-clean (0 failures) and fully active.
 try:
     from librt.internal import (
@@ -143,6 +148,7 @@ except ImportError:
 # Issue-#476 kernels. `descriptor_has_get_set` is parity-clean and active.
 # The other four were deferred in #484 because the wire format drops
 # CallableType.definition; wirefixup now re-links definition by name + arity
+
 # (issue #485), so they are active again via the inner try-block below.
 # Any kernels that fail to import fall back to Python (None gates).
 _rust_check_self_arg: Any = None
@@ -447,9 +453,11 @@ def _analyze_member_access(
     # M20: gate the general dispatch path through Rust when the kernel
     # is active.  Rust handles pure type-transform branches (AnyType,
     # DeletedType, UninhabitedType, TupleType fallback recursion,
+
     # Literal/Callable/Overloaded fallback recursion,
     # ParamSpec/TypeVarTuple fallback recursion).  Returns None (Python
     # None) for branches needing plugin state, union construction, error
+
     # reporting, or resolver lookups — Python falls through.
     if (
         _HAS_TYPE_KERNEL
@@ -605,9 +613,11 @@ def analyze_instance_member_access(
         # M20 native seam: for a static, non-overloaded method the whole
         # map -> expand -> freeze tail is replaceable by one Rust call.
         # Rust defers (None) for overloads, bound signatures, non-Instance
+
         # types, unresolvable derivation paths, and any expand result that
         # still carries type variables. Freshening already happened above,
         # and a fully successful Rust expand is already frozen, so
+
         # freeze_all_type_vars is a no-op on that path.
         if (
             _HAS_TYPE_KERNEL
@@ -632,6 +642,7 @@ def analyze_instance_member_access(
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
+
                     # call site instead of a phantom line 0/-1.
                     if decoded is not None and isinstance(decoded, ProperType):
                         decoded.line = typ.line
@@ -694,15 +705,19 @@ def analyze_type_callable_member_access(name: str, typ: FunctionLike, mx: Member
             # When Python sees an operator (eg `3 == 4`), it automatically translates that
             # into something like `int.__eq__(3, 4)` instead of `(3).__eq__(4)` as an
             # optimization.
+
             #
             # While it normally it doesn't matter which of the two versions are used, it
             # does cause inconsistencies when working with classes. For example, translating
+
             # `int == int` to `int.__eq__(int)` would not work since `int.__eq__` is meant to
             # compare two int _instances_. What we really want is `type(int).__eq__`, which
             # is meant to compare two types or classes.
+
             #
             # This check makes sure that when we encounter an operator, we skip looking up
             # the corresponding method in the current instance to avoid this edge case.
+
             # See https://github.com/python/mypy/pull/1787 for more info.
             # TODO: do not rely on same type variables being present in all constructor overloads.
             result = analyze_class_attribute_access(
@@ -781,6 +796,7 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
         # M20: gate the union-map through Rust when the kernel is active.
         # Rust maps relevant_items through the pure-type-transform subset of
         # _analyze_member_access and joins via make_simplified_union. Defer
+
         # (None) when any item needs checker state — Python falls through.
         if (
             _HAS_TYPE_KERNEL
@@ -886,9 +902,11 @@ def analyze_member_var_access(
         # If the associated variable is a TypeInfo synthesize a Var node for
         # the purposes of type checking.  This enables us to type check things
         # like accessing class attributes on an inner class. Similar we allow
+
         # using qualified type aliases in runtime context. For example:
         #     class C:
         #         A = List[int]
+
         #     x = C.A() <- this is OK
         typ = mx.chk.expr_checker.analyze_static_reference(vv, mx.context, mx.is_lvalue)
         v = Var(name, type=typ)
@@ -1076,6 +1094,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     # We do this check first to accommodate for descriptors with only __set__ method.
     # If there is no __set__, we type-check that the assigned value matches
     # the return type of __get__. This doesn't match the python semantics,
+
     # (which allow you to override the descriptor with any value), but preserves
     # the type of accessing the attribute (even after the override).
     if mx.is_lvalue and descriptor_type.type.has_readable_member("__set__"):
@@ -1397,6 +1416,7 @@ def expand_and_bind_callable(
     # M20: gate the trivial_self path through Rust. Rust handles
     # is_trivial_self=True + not is_property + no self_type + not is_self/super.
     # Defer (None) for non-trivial paths (check_self_arg + bind_self) and
+
     # property extraction.
     if (
         _HAS_TYPE_KERNEL
@@ -1537,6 +1557,7 @@ def check_self_arg(
     # M20: gate the overload filtering through Rust. Rust mirrors the
     # two-pass filter (Instance overlap special-case + is_subtype check)
     # and defers (None) for any case it cannot decide or that needs error
+
     # reporting (no_formal_self, incompatible_self_argument).
     if (
         _HAS_TYPE_KERNEL
@@ -1664,12 +1685,16 @@ def analyze_class_attribute_access(
         and not hook
         and mcs_fallback.type.get(name)
     ):
-        # If the same attribute is declared on the metaclass and the class but with different types,
+        # If the same attribute is declared on the metaclass and the class but with
+        # different types,
         # and the attribute on the class is not a ClassVar,
+
         # the type of the attribute on the metaclass should take priority
+
         # over the type of the attribute on the class,
         # when the attribute is being accessed from the class object itself.
         #
+
         # Return `None` here to signify that the name should be looked up
         # on the class object itself rather than the instance.
         return None
@@ -1726,6 +1751,7 @@ def analyze_class_attribute_access(
         # Map the type to how it would look as a defining class. For example:
         #     class C(Generic[T]): ...
         #     class D(C[Tuple[T, S]]): ...
+
         #     D[int, str].method()
         # Here itype is D[int, str], isuper is C[Tuple[int, str]].
         if not super_info:
@@ -1739,6 +1765,7 @@ def analyze_class_attribute_access(
             # Check if original variable type has type variables. For example:
             #     class C(Generic[T]):
             #         x: T
+
             #     C.x  # Error, ambiguous access
             #     C[int].x  # Also an error, since C[int] is same as C at runtime
             # Exception is Self type wrapped in ClassVar, that is safe.
@@ -1759,6 +1786,7 @@ def analyze_class_attribute_access(
             # Erase non-mapped variables, but keep mapped ones, even if there is an error.
             # In the above example this means that we infer following types:
             #     C.x -> Any
+
             #     C[int].x -> int
             if prohibit_generic:
                 erase_vars = set(itype.type.defn.type_vars)
@@ -1864,6 +1892,7 @@ def analyze_enum_class_attribute_access(
     # M20: gate the enum_literal tail through Rust. Rust handles only the
     # final branch (name in enum_members -> itype.copy_modified(last_known_value=
     # LiteralType(name, fallback=itype))). The EXCLUDED and nonmember paths
+
     # above need checker state / node types not in the snapshot — both run
     # in Python before this gate. Defer (None) when the class snapshot is
     # missing or name is not an enum member.
@@ -1940,6 +1969,7 @@ def analyze_typeddict_access(
             # It can also be `a.__setitem__(...)` direct call.
             # In this case `item_type` can be `Any`,
             # because we don't have args available yet.
+
             # TODO: check in `default` plugin that `__setitem__` is correct.
             item_type = AnyType(TypeOfAny.implementation_artifact)
         return CallableType(
@@ -1995,18 +2025,23 @@ def add_class_tvars(
     # We add class type variables if the class method is accessed on class object
     # without applied type arguments, this matches the behavior of __init__().
     # For example (continuing the example in docstring):
+
     #     A       # The type of callable is def [T] () -> A[T], _not_ def () -> A[Any]
     #     A[int]  # The type of callable is def () -> A[int]
     # and
+
     #     A.foo       # The type is generic def [T] () -> Tuple[T, A[T]]
     #     A[int].foo  # The type is non-generic def () -> Tuple[int, A[int]]
     #
+
     # This behaviour is useful for defining alternative constructors for generic classes.
     # To achieve such behaviour, we add the class type variables that are still free
     # (i.e. appear in the return type of the class object on which the method was accessed).
+
     # M20: gate the classmethod + trivial_self path through Rust. Rust handles
     # the CallableType path (freshen + bind_self_fast + expand + copy_modified)
     # and the Overloaded recursion. Defer (None) for non-classmethod, non-trivial,
+
     # already-bound, or property paths.
     if (
         _HAS_TYPE_KERNEL
@@ -2158,6 +2193,7 @@ def has_operator(typ: Type, op_method: str) -> bool:
     # This is much faster than analyze_member_access, and so using
     # it first as a filter is important for performance. This is mostly relevant
     # in situations where we can't expect that method is likely present,
+
     # e.g. for __OP__ vs __rOP__.
     typ = get_proper_type(typ)
 

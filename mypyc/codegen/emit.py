@@ -772,6 +772,7 @@ class Emitter:
             # If there are too many concrete subclasses or we can't find any
             # (meaning the code ought to be dead or we aren't doing global opts),
             # fall back to a normal typecheck.
+
             # Otherwise check all the subclasses.
             if not concrete or len(concrete) > FAST_ISINSTANCE_MAX_SUBCLASSES + 1:
                 check = "(PyObject_TypeCheck({}, {}))".format(

@@ -1,6 +1,7 @@
 //! Comprehensive AST Visitor Engine (Phase 6, Module 1) for Issue #136.
 //!
-//! Implements full recursive AST node traversal, parent-child linking, and attribute extraction.
+//! Implements full recursive AST node traversal, parent-child linking, and
+//! attribute extraction.
 
 use crate::nodes_codec::{AstNodeCodec, AstNodeKind};
 

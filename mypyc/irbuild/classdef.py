@@ -196,7 +196,8 @@ def transform_class_def(builder: IRBuilder, cdef: ClassDef) -> None:
         else:
             builder.error("Unsupported statement in class body", stmt.line)
 
-    # Clear class body context (nested classes are rejected above, so no need to save/restore).
+    # Clear class body context (nested classes are rejected above, so no need to
+    # save/restore).
     builder.class_body_classvars = {}
     builder.class_body_obj = None
     builder.class_body_ir = None
@@ -347,6 +348,7 @@ class ExtClassBuilder(ClassBuilder):
         # Under separate compilation, prepare.py pre-registers the decl iff
         # the class has its own default attribute assignments to emit, so we
         # can skip the body walk entirely when it isn't present. Without
+
         # separate compilation, find_attr_initializers walks the MRO so that
         # inherited defaults are reflected in ir.attrs_with_defaults (relied
         # on by the attribute-definedness analysis), so we always run it.
@@ -484,7 +486,8 @@ def allocate_class(builder: IRBuilder, cdef: ClassDef) -> Value:
     # Create the class
     tp = builder.call_c(pytype_from_template_op, [template, tp_bases, modname], cdef.line)
 
-    # Set type object to be immortal if free threaded, as otherwise reference count contention
+    # Set type object to be immortal if free threaded, as otherwise reference count
+    # contention
     # can cause a big performance hit.
     builder.set_immortal_if_free_threaded(tp, cdef.line)
 
@@ -679,9 +682,11 @@ def add_non_ext_class_attr_ann(
         if type_info:
             # NOTE: Using string type information is similar to using
             # `from __future__ import annotations` in standard python.
+
             # NOTE: For string types we need to use the fullname since it
             # includes the module. If string type doesn't have the module,
             # @dataclass will try to get the current module and fail since the
+
             # current module is not in sys.modules.
             if builder.current_module == type_info.module_name and stmt.line < type_info.line:
                 typ = builder.load_str(type_info.fullname)
@@ -697,7 +702,7 @@ def add_non_ext_class_attr_ann(
         ):
             # Annotation is a forward reference, so don't attempt to load the actual
             # type and load the string instead.
-            #
+
             # TODO: is it possible to determine whether a non-string annotation is
             # actually a forward reference due to the __annotations__ future?
             typ = builder.load_str(stmt.unanalyzed_type.original_str_expr)

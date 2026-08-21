@@ -165,6 +165,7 @@ class TypeAnalyzerPluginInterface:
     # An options object. Note: these are the cloned options for the current file.
     # This might be different from Plugin.options (that contains default/global options)
     # if there are per-file options in the config. This applies to all other interfaces
+
     # in this file.
     options: Options
 
@@ -443,6 +444,7 @@ class FunctionSigContext(NamedTuple):
 # A context for a function hook that infers the return type of a function with
 # a special signature.
 #
+
 # A no-op callback would just return the inferred return type, but a useful
 # callback at least sometimes can infer a more precise type.
 class FunctionContext(NamedTuple):
@@ -454,6 +456,7 @@ class FunctionContext(NamedTuple):
     # Names of actual arguments in the call expression. For example,
     # in a situation like this:
     #     def func(**kwargs) -> None:
+
     #         pass
     #     func(kw1=1, kw2=2)
     # callee_arg_names will be ['kwargs'] and arg_names will be [['kw1', 'kw2']].
@@ -467,6 +470,7 @@ class FunctionContext(NamedTuple):
 # A context for a method signature hook that infers a better signature for a
 # method.  Note that argument types aren't available yet.  If you need them,
 # you have to use a method hook instead.
+
 # TODO: document ProperType in the plugin changelog/update issue.
 class MethodSigContext(NamedTuple):
     type: ProperType  # Base object type for method call
@@ -479,6 +483,7 @@ class MethodSigContext(NamedTuple):
 # A context for a method hook that infers the return type of a method with a
 # special signature.
 #
+
 # This is very similar to FunctionContext (only differences are documented).
 class MethodContext(NamedTuple):
     type: ProperType  # Base object type for method call

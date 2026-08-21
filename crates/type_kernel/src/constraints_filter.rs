@@ -183,9 +183,11 @@ fn filter_imprecise_kinds_indices(constraints: &[WireConstraint]) -> Option<Vec<
     // Python logic (constraints.py:2010-2014):
     //   for c in cs:
     //     if not isinstance(c.origin, ParamSpecType) or c.type_var not in have_precise:
+
     //       new_cs.append(c)
     //     if not isinstance(c.target, Parameters) or not c.target.imprecise_arg_kinds:
     //       new_cs.append(c)
+
     //
     // A constraint can be appended twice (once by each condition); the
     // Python list allows duplicates, so we emit the index twice.
@@ -275,9 +277,11 @@ fn unwrap_type_type_inner(tp: &Type) -> Option<Type> {
             // UnionType.make_union = make_simplified_union. This needs a
             // resolver + subtype context. Defer so Python builds the union.
             // (The Python path calls UnionType.make_union which flattens
+
             // and deduplicates; Rust can't do that without a resolver.)
             // However, a simple UnionType with the items is sufficient
             // for the constraint solver, which normalizes unions anyway.
+
             // Return a plain UnionType — the Python caller will
             // re-normalize via make_simplified_union in _infer_constraints.
             Some(Type::UnionType {
@@ -519,6 +523,7 @@ mod tests {
         // The original constraint T <: Union[T, int] is removed because
         // item T == origin T and op == SUBTYPE_OF.
         // Also the reverse constraints (T, neg_op(SUBTYPE_OF)=SUPERTYPE_OF, T)
+
         // and (T, SUBTYPE_OF, T) are added to the remove set, but they
         // don't match any other constraint.
         assert!(result.is_empty());
@@ -619,9 +624,11 @@ mod tests {
         // P is now in have_precise. The imprecise Parameters constraint:
         //   condition (a): origin IS ParamSpec AND in have_precise -> not added
         //   condition (b): target IS imprecise Parameters -> not added
+
         // So the imprecise constraint is dropped entirely (index 0 absent).
         // The precise constraint (index 1):
         //   condition (a): origin IS ParamSpec AND in have_precise -> not added
+
         //   condition (b): target is ParamSpecType (not Parameters) -> added
         // So only index 1 remains.
         assert_eq!(result, vec![1]);
@@ -637,6 +644,7 @@ mod tests {
         // P not in have_precise (no precise target).
         // condition (a): origin IS ParamSpec but NOT in have_precise -> added
         // condition (b): target IS imprecise Parameters -> not added
+
         // So index 0 appears once.
         assert_eq!(result, vec![0]);
     }

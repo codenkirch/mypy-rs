@@ -7,6 +7,7 @@ from mypy import git
 # Base version.
 # - Release versions have the form "1.2.3".
 # - Dev versions have the form "1.2.3+dev" (PLUS sign to conform to PEP 440).
+
 # - Before 1.0 we had the form "0.NNN".
 __version__ = "2.2.0+dev"
 base_version = __version__

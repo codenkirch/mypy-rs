@@ -406,8 +406,9 @@ pub(crate) fn meet_types(
 
     // meet.py:139-141: is_proper_subtype pre-check (ignore_promotions),
     // skipped when either side is an UnboundType (meet.py:138) so an
-    // UnboundType is never eliminated by the sub-type pre-check; the
-    // visit_unbound_type visitor below decides the result instead.
+    // UnboundType is never eliminated by the sub-type pre-check;
+
+    // the visit_unbound_type visitor below decides the result instead.
     let has_unbound =
         matches!(s, Type::UnboundType { .. }) || matches!(t, Type::UnboundType { .. });
     if !has_unbound {
@@ -570,6 +571,7 @@ fn visit_meet(
                     // Different upper_bound: meet upper bounds and
                     // encode. fruit_to_type (not setop_result_to_type)
                     // so a recursive Encoded result decodes: this is a
+
                     // meet-only path, so join semantics are unaffected.
                     let new_ub = fruit_to_type(meet_types(s_ub, t_ub, ctx, resolver)?, s_ub, t_ub)?;
                     let new_tv = Type::TypeVarType {
@@ -664,12 +666,15 @@ fn visit_meet(
                 // Python meet.py:1412-1419: typ = meet(t.item, s.item);
                 // if not NoneType: wrap
                 // TypeType.make_normalized(typ,
+
                 // is_type_form=s.is_type_form and t.is_type_form).
                 // Skip NoneType (bottom) results; Python returns the
                 // raw NoneType in that case (no wrap). Materialize the
+
                 // met item via fruit_to_type (decodes recursive
                 // Encoded), then encode the result: the NoneType path
                 // encodes NoneType directly, the wrapped path encodes
+
                 // the fresh TypeType. Mirrors the join-side
                 // implementation at setops.rs:1958-1969, except the
                 // flag is AND (meet) not OR (join).
@@ -699,6 +704,7 @@ fn visit_meet(
         // visit_union_type (meet.py:962-970): t is UnionType and s is
         // not (the both-Union case is routed to meet_union in the
         // pre-dispatch). meet.py:965-966 else-branch:
+
         // meets = [meet_types(x, self.s) for x in t.items], then
         // make_simplified_union(meets). One-sided: s is fixed.
         Type::UnionType { items: t_items, .. } => {
@@ -719,6 +725,7 @@ fn visit_meet(
         // visit_param_spec (meet.py:1008-1012): s == t -> self.s
         // (SameS). Else -> default(self.s): UnboundType -> Any, others
         // -> Bottom (strict) / NoneType (non-strict, shim maps Bottom).
+
         // ParamSpec is not callable-like, so both-ParamSpec reaches
         // here; the pre-dispatch is_proper_subtype catches identical
         // pairs first, discounting the SameS arm in practice.
@@ -735,6 +742,7 @@ fn visit_meet(
         // visit_parameters (meet.py:1023-1033). Both-Parameters is
         // intercepted by the meet_types both-callable pre-dispatch, so
         // here s is never Parameters: always default(self.s) ->
+
         // UnboundType ? Any : Bottom.
         Type::Parameters { .. } => {
             if matches!(s, Type::UnboundType { .. }) {
@@ -747,6 +755,7 @@ fn visit_meet(
         // Full visitors (callable, typeddict, tuple,
         // typevartuple, overloaded) — deferred. The both-FunctionLike
         // case is already deferred by meet_types pre-dispatch. The
+
         // remaining cases (s non-callable, t callable-like) reach here
         // and defer.
         _ => None,
@@ -940,6 +949,7 @@ fn meet_callable_like(
         // Both standalone Parameters: meet_parameters_pair (the
         // meet.py:1023-1031 visit_parameters path — arg types are
         // joined, not met). Previously this fell into the `_` catch-all
+
         // and wrongly answered Bottom for a same-length pair.
         (Type::Parameters(s_p), Type::Parameters(t_p)) => {
             meet_parameters_pair(s_p, t_p, ctx, resolver)
@@ -985,6 +995,7 @@ fn meet_similar_callables_impl(
     // meet.py:1414 ret_type=meet_types(t_ret, s_ret); map with the same
     // argument order (SameS -> first). The old (s_ret, t_ret) order
     // mapped an is_subtype win onto the wrong operand. fruit_to_type
+
     // (not setop_result_to_type) so a recursive Encoded ret decodes:
     // meet-only path, join unaffected.
     let new_ret = fruit_to_type(meet_types(t_ret, s_ret, ctx, resolver)?, t_ret, s_ret)?;
@@ -1072,6 +1083,7 @@ fn visit_instance_meet(
             // Equal args-less Instances -> meet is the type itself.
             // (The extra_attrs same-type guard lives at the top of
             // meet_types, meet.py:129-141, so any attrs-bearing pair
+
             // returns there before reaching this visitor.)
             return Some(SetOpResult::SameS);
         }
@@ -1082,6 +1094,7 @@ fn visit_instance_meet(
     // meet.py:1024-1029: alt_promote check BEFORE is_subtype. Python
     // checks t.alt_promote == s.type -> return t, then s.alt_promote ==
     // t.type -> return s. This is needed for native int types where
+
     // i32.alt_promote = int (so meet(i32, int) = i32, NOT int, even
     // though is_subtype(int, i32) is also True via int._promote).
     let t_snap = resolver.get(t_ref);
@@ -1104,6 +1117,7 @@ fn visit_instance_meet(
     // meet.py:1030-1039: is_subtype(t, s) -> return t; is_subtype(s, t)
     // -> return s; else Bottom. Python's is_subtype always returns
     // bool; when Rust's is_subtype defers (None) the meet must defer
+
     // too. Falling through to Bottom would be a wrong answer when
     // Python would have returned t or s (e.g. via a promotion).
     match is_subtype(t, s, ctx, resolver) {
@@ -1173,6 +1187,7 @@ fn visit_instance_meet_args(
     // meet.py:1038: gate on is_subtype(t, s) or is_subtype(s, t), with
     // Python's `or` short-circuit: t<:s is evaluated first; s<:t only
     // when the first is False. Both False -> Bottom (the shim maps disc
+
     // 3 to UninhabitedType (strict) / NoneType (non-strict), matching
     // meet.py:1081-1084). Any deferral -> defer the whole meet.
     let gate_ok = match is_subtype(t, s, ctx, resolver) {
@@ -1191,6 +1206,7 @@ fn visit_instance_meet_args(
     // meet.py:1067-1078: per-arg meets. A TypeVarTupleType tv can't be
     // handled: the TupleType-unpack / UnpackType-wrap branches need the
     // live `tuple_fallback`, and a mismatched zip would double-count.
+
     // Defer if any tv is a TypeVarTupleType or ParamSpec (kind 2/1).
     if snap
         .type_vars_with_variance
@@ -1271,6 +1287,7 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
             // Prefer the fixed s/t operand when its type_ref matches
             // the ancestor fullname — the decoded bytes would otherwise
             // produce an unfixed Instance (type_ref only, no live
+
             // TypeInfo), which breaks == against fixed operands.
             for candidate in [s, t] {
                 if let Type::Instance { type_ref, .. } = candidate {
@@ -1289,14 +1306,17 @@ fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Ty
         // SameTypeWithArgs needs per-arg reconstruction (which arg to
         // pick from s vs t); the visitor callers above
         // visit_type_type only recurse on args-less Instance items,
+
         // so this arm is unreachable in practice. Defer conservatively.
         SetOpResult::SameTypeWithArgs { .. } => None,
         // Encoded must NOT be decoded here: this converter is shared
         // with the join visitors, and batch-1's join semantics rely on
         // deferring recursive `Encoded` results to Python (the join
+
         // shim in mypy/join.py decodes top-level disc=7 itself, and
         // inner encodings re-joined here would change inference). The
         // meet-only per-arg path that needs the decode uses
+
         // `fruit_to_type` instead, which has its own Encoded arm.
         SetOpResult::Encoded(_) => None,
     }
@@ -1646,6 +1666,7 @@ fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
 //
 // Called with the (t, self.s) operand order from join.py:622; the
 // operands are passed through in that frame, and the field handling
+
 // mirrors `combine_similar_callables`' callsite (s=left, t=right).
 #[allow(clippy::too_many_arguments)]
 fn join_similar_callables_impl(
@@ -1674,6 +1695,7 @@ fn join_similar_callables_impl(
     // join.py:627-630: if any arg is NoneType/UninhabitedType, Python
     // returns join_types(t.fallback, self.s) instead of the joined
     // callable. That fallback join cannot be reproduced here without
+
     // recursing into the visitor with a half-built operand, so defer.
     if new_arg_types
         .iter()
@@ -1711,6 +1733,7 @@ fn join_similar_callables_impl(
     // join.py:626-635: the caller sets from_type_type=True on the result
     // unless either operand is an abstract type object (is_type_obj &&
     // type_object().is_abstract); then it keeps t's flag (copy_modified).
+
     // min_len>0 (both generic) is deferred before this impl is reached,
     // so match_generic_callables is a no-op and t.variables is preserved.
     let t_abstract = callable_is_abstract_type_obj(t, resolver)?;
@@ -1723,9 +1746,11 @@ fn join_similar_callables_impl(
     // join.py:1108 sets `name=None` on the result, which is a
     // copy_modified on the live right operand `t`, so `t.definition`
     // survives and `pretty_callable` renders `def <right_operand_name>`.
+
     // The wire cannot carry `definition`; the Python shim restores it
     // from the live `t` after fixup. The wire `name` stays None to
     // match the pure result exactly (only `definition` differs, and the
+
     // shim repairs that).
     let new_callable = Type::CallableType {
         fallback: Box::new(new_fallback),
@@ -2044,6 +2069,7 @@ fn visit_join(
         // visit_instance (join.py:421-454), Instance-vs-Instance nominal
         // subset. Only handles args-less instances (no type params) and
         // defers when args are present or the s side is not an Instance
+
         // (FunctionLike/TypeType/TypedDict/Tuple/Literal cases recurse
         // into join_types and need the InstanceJoiner recursion guard).
         Type::Instance { .. } => visit_instance_join(s, t, ctx, resolver),
@@ -2051,21 +2077,26 @@ fn visit_join(
         // visit_union_type (join.py:432-436):
         //   if is_proper_subtype(s, t): return t (SameT)
         //   else: return make_simplified_union([s, t])
+
         // is_subtype(s, Union[..]) is True iff s <: any item. We also
         // check is_subtype(t, s): if every item <: s, the simplified
         // union collapses to s (SameS). Otherwise defer — building a
+
         // new union needs a Type encoder (not available reader-only).
         Type::UnionType { items, .. } => visit_union_join(s, items, ctx, resolver),
 
         // visit_callable_type (join.py:541-577). The both-CallableType
         // case (isinstance(s, CallableType)) needs is_similar_callables
         // + is_equivalent + combine_similar_callables, which build a
+
         // new CallableType. The wire encoder now supports CallableType,
         // so the structurally-identical case (join(c, c) = c) returns
         // SameS without building anything. The similar-but-not-identical
+
         // case (combine/join_similar_callables) and the protocol-Instance
         // case (unpack_callback_proxy) still defer to Python. The
         // fallback case (s non-callable, non-protocol) recurses into
+
         // join_types(t.fallback, s).
         Type::CallableType {
             fallback,
@@ -2109,15 +2140,19 @@ fn visit_join(
                 // join.py:620-622: is_similar_callables(t, self.s) &&
                 // is_equivalent(t, self.s) -> combine_similar_callables.
                 // For the structurally-identical case (t == s on all
+
                 // wire-relevant fields), combine_similar_callables(t, t)
                 // returns t (every arg_join is join(x, x) = x, ret_join
                 // is join(x, x) = x, fallback is t.fallback). So SameS
+
                 // is correct without building a new CallableType.
                 //
                 // BUT: when `variables` is non-empty, Python's
+
                 // `combine_similar_callables` always calls
                 // `match_generic_callables`, which renumbers the tvars
                 // via `TypeVarId.new` (a Python global counter). The
+
                 // result has fresh tvar ids that differ from the inputs,
                 // so `SameS` (= the original) would be wrong. Defer
                 // the both-generic identical case to Python.
@@ -2153,6 +2188,7 @@ fn visit_join(
                 // join.py:621: is_equivalent(t, self.s). Approximated
                 // by is_subtype both ways on pairwise arg_types +
                 // ret_type. Returns None (defer) if any is_subtype
+
                 // can't decide (non-Instance, generic args, etc.).
                 let equivalent = is_equivalent_callable(
                     arg_types,
@@ -2167,15 +2203,19 @@ fn visit_join(
                 // match_generic_callables (join.py:1039-1053): renumber
                 // tvars so both callables share the same id space.
                 // When `min_len == 0` (one side has no variables), the
+
                 // renumber is a no-op (Python returns the callables
                 // unchanged), so the combine/join_similar path proceeds
                 // with the original fields.
+
                 //
                 // When `min_len > 0` (both sides have variables), Python
                 // allocates fresh `TypeVarId`s via `TypeVarId.new` (a
+
                 // Python global counter, types.py:559-562). The result's
                 // tvar ids differ from any deterministic Rust allocation,
                 // and `CallableType.__eq__` compares tvar ids in
+
                 // `arg_types`/`ret_type`. Rust can't replicate the
                 // counter without FFI back to Python, so the both-generic
                 // case defers to preserve parity.
@@ -2187,6 +2227,7 @@ fn visit_join(
                     // `from_type_type` rides the wire now (issue #388),
                     // so combine_similar_callables preserves it via
                     // extract_callable_invariants. The equivalent path
+
                     // no longer needs the type-object deferral.
                     return combine_similar_callables(
                         s,
@@ -2210,12 +2251,15 @@ fn visit_join(
                 // Non-equivalent similar callables need
                 // `join_similar_callables` (join.py:622-637). The caller's
                 // fallback-join (join.py:628-629, when an arg meets to
+
                 // NoneType/UninhabitedType) cannot be reproduced here
                 // without recursing into the visitor with a half-built
                 // operand, so the Rust impl defers (returns None) in that
+
                 // case and Python runs the original path. The
                 // `from_type_type` force (join.py:630-636, suppress the
                 // abstract-instantiation error when concrete class objects
+
                 // join to their abstract superclass) is replicated.
                 join_similar_callables_impl(
                     s,
@@ -2257,6 +2301,7 @@ fn visit_join(
             // Both-FunctionLike: s is CallableType or Overloaded.
             // FunctionLike.items: Overloaded returns its items,
             // CallableType returns [self] (types.py:2633).
+
             // join.py:644-658 walks (t_item, s_item) pairs: similar ->
             // equivalent -> combine, else t_item <: s_item -> s_item.
             let s_items: Vec<&Type> = match s {
@@ -2280,6 +2325,7 @@ fn visit_join(
                         // s_item is always a CallableType here: the Overloaded arm
                         // collects only CallableType items, and a plain
                         // CallableType s is a single-item list. The
+
                         // subtype arm therefore only encodes, never
                         // pushes an Overloaded.
                         let s_callable = s_item;
@@ -2420,6 +2466,7 @@ fn visit_join(
         // visit_type_type (join.py:854-864). Case 2 (s is Instance with
         // fullname=="builtins.type") returns self.s -> SameS. Case 1
         // (s is TypeType) builds a new TypeType wrapping
+
         // join_types(t.item, s.item); the joined item is materialized
         // via setop_result_to_type and encoded via write_type. Case 3
         // (else -> default) walks s's fallback chain -> defer.
@@ -2440,9 +2487,11 @@ fn visit_join(
                 // Python `visit_type_type` (join.py:886-890): both
                 // TypeTypes always build a fresh
                 // TypeType.make_normalized(join_types(t.item, s.item),
+
                 // is_type_form=s.is_type_form or t.is_type_form), even
                 // when the items are identical. Materialize the joined
                 // item via setop_result_to_type and encode the fresh
+
                 // TypeType. If the joined item is not encodable,
                 // setop_result_to_type returns None -> defer to Python.
                 let joined_item = setop_result_to_type(
@@ -2464,18 +2513,23 @@ fn visit_join(
         // visit_literal_type (join.py:928-938). Cases:
         // 1 (s is LiteralType, t == s) -> SameT.
         // 2 (s is LiteralType, both fallbacks enum) ->
+
         //   make_simplified_union([s, t]). When the enum has exactly
         //   these 2 members, contraction collapses to the enum
         //   Instance (Encoded). Partial coverage returns a 2-item
+
         //   union, which we now encode too (write_type emits UnionType).
         // 3 (s is LiteralType, neither enum) -> join_types(s.fallback,
         //   t.fallback). When both fallbacks are the same Instance (the
+
         //   common bool case: Literal[True] vs Literal[False]), the
         //   recursive join returns SameS -> s.fallback, which we encode.
         //   When fallbacks differ, the recursive join may defer -> None.
+
         // 4 (s is Instance, s.last_known_value == t) -> SameT.
         // 5 (else) -> join_types(s, t.fallback), materialized and
         //   encoded when decodable (defer if setop_result_to_type
+
         //   can't materialize, e.g. a recursive Encoded result).
         Type::LiteralType { value: t_val, .. } => {
             if let Type::LiteralType {
@@ -2490,6 +2544,7 @@ fn visit_join(
                     // Case 2 (both enum): make_simplified_union([s, t]).
                     // Contraction collapses to a single Instance when
                     // the enum's full member set is covered; partial
+
                     // coverage leaves a union of 2 literals. Both encode
                     // (Python returns the union unchecked); anything
                     // else (e.g. TypeAliasType) defers.
@@ -2531,6 +2586,7 @@ fn visit_join(
             // Case 5: join_types(s, t.fallback) (join.py:966). s is not
             // a LiteralType and not an Instance with a matching LKV.
             // t.fallback is always an Instance; the recursive join
+
             // typically returns SameS/SameT/Ancestor/Object, which
             // setop_result_to_type materializes. setop_result_to_type
             // defers on Encoded and SameTypeWithArgs -> graceful defer.
@@ -2546,21 +2602,27 @@ fn visit_join(
         // visit_type_var (join.py:463-474), case 1 same-id-same-bound
         // and case 3 (s is Instance). Case 1 (s is TypeVarType,
         // s.id==t.id, s.upper_bound==t.upper_bound) returns self.s ->
+
         // SameS. The copy_modified branch (case 1, upper_bounds differ)
         // and case 2 (s.id != t.id -> join upper_bounds) both produce a
         // new TypeVarType or the bound's join result — neither s nor t
+
         // in general -> defer. Case 3 (s not TypeVarType -> default(s)):
         // for Instance s, default(s) = object_from_instance(s) = object.
         // The `Object` variant maps to object_or_any_from_type(t); for
+
         // t=TypeVarType this recurses into object_or_any_from_type(
         // t.upper_bound), which for an Instance upper_bound also returns
         // object. Both paths yield `builtins.object`, so `Object` is
+
         // parity-correct for the Instance-s + TypeVarType-t case.
         //
         // `TypeVarId.__eq__` (types.py:567-577) checks raw_id,
+
         // meta_level, AND namespace. The wire format serializes only
         // raw_id + namespace (types.py:739-740); `read` reconstructs
         // TypeVarId with meta_level=0 (types.py:752). Meta variables
+
         // (meta_level > 0) are constraint-solver internals that do
         // not cross this FFI seam, so raw_id + namespace equality here
         // matches wire-roundtrip semantics exactly.
@@ -2669,6 +2731,7 @@ fn visit_join(
                 // Case 2 (diff id) (join.py:545-546): return
                 // get_proper_type(join_types(s.upper_bound,
                 // t.upper_bound)) — a fresh TYPE, not a TypeVarType.
+
                 // Materialize the bound join and encode. A TypeAliasType
                 // result can't expand without the live alias graph ->
                 // defer to Python.
@@ -2685,6 +2748,7 @@ fn visit_join(
             // Case 3 (s not TypeVarType): default(s). For Instance s,
             // default(s) = object_from_instance(s) = object. The
             // `Object` variant (object_or_any_from_type(t)) yields the
+
             // same for t=TypeVarType with Instance upper_bound.
             if let Type::Instance { .. } = s {
                 return Some(SetOpResult::Object);
@@ -2698,6 +2762,7 @@ fn visit_join(
         // visit_typeddict (join.py:811-835).
         // Case 1 (s is TypedDictType): build a NEW TypedDictType via
         // resolve_typeddict_item over zipall, encode via write_type
+
         // (M8u). Case 2 (s is Instance): recurse into
         // join_types(self.s, t.fallback). Case 3 (else): defer.
         Type::TypedDictType {
@@ -2725,6 +2790,7 @@ fn visit_join(
                 // Case 2: s is Instance -> join_types(s, t.fallback).
                 // SameS/SameT -> outer SameS (s==fallback or result=s);
                 // Ancestor/Object pass through; Any/Bottom/Encoded are
+
                 // fresh types, encode whole (disc=7).
                 let r = join_types(s, fallback, ctx, resolver)?;
                 match &r {
@@ -2754,18 +2820,23 @@ fn visit_join(
         // visit_tuple_type (join.py:741-775). Two cases:
         //
         // Case 1 (s is TupleType): build a new TupleType via join_tuples
+
         // + InstanceJoiner.join_instances(tuple_fallback(s),
         // tuple_fallback(t)). Encoded result.
         //
+
         // Case 2 (s is not TupleType): join_types(self.s,
         // tuple_fallback(t)). SameS/SameT -> outer SameS; Ancestor/Object
         // pass through; else defer.
+
         //
         // `tuple_fallback(t)` (typeops.py:194-235) equals
         // `t.partial_fallback` when the fallback is NOT `builtins.tuple`.
+
         // When it IS `builtins.tuple`, it constructs
         // `Instance(builtins.tuple, [make_simplified_union(items)])`.
         //
+
         // The partial_fallback is always an Instance (wire reader
         // asserts the INSTANCE tag at wire.rs:968; types.py:2909
         // serializes `self.partial_fallback.write(data)`).
@@ -2783,9 +2854,11 @@ fn visit_join(
                 // Case 1: both TupleType (join.py:848-868).
                 // 1. Join fallbacks: instance_joiner.join_instances(
                 //    tuple_fallback(s), tuple_fallback(t)).
+
                 // 2. Join items: self.join_tuples(s, t).
                 // 3. If items is None: subtype-check fallback
                 //    (join.py:863-868).
+
                 // 4. If items has 1 UnpackType(Instance): return the
                 //    unpacked Instance (avoid double-wrapping, join.py:857-860).
                 // 5. Else: TupleType(items, fallback).
@@ -2891,6 +2964,7 @@ fn visit_join(
         // visit_param_spec (join.py:550-553): s == t -> t (SameT).
         // Else -> default(s) via join_default. ParamSpec never swaps in
         // the pre-dispatch (t=ParamSpec implies swapped=false), so the
+
         // emitted discs are not flipped.
         Type::ParamSpecType { .. } => {
             if paramspec_eq(s, t) {
@@ -2903,6 +2977,7 @@ fn visit_join(
         // visit_parameters (join.py:566-580). Both-Parameters reaches
         // here (no both-callable pre-dispatch on the join side). Similar
         // pair -> arg_types meet + combine_arg_names (encoded); not
+
         // similar -> default(s) = Any (Parameters is not in the join
         // default elif chain). s not Parameters -> default(s).
         Type::Parameters(t_p) => {
@@ -3362,6 +3437,7 @@ fn remove_redundant_union_items(
                 // An Instance with a last_known_value never removes
                 // another item, unless it is an Instance with the same
                 // last_known_value (typeops.py:878-890). Without this,
+
                 // `Literal[1]? | Literal[2]?` collapses to `Literal[1]?`.
                 if let Type::Instance {
                     last_known_value: Some(tj_lkv),
@@ -3659,9 +3735,11 @@ fn erase_extra_attrs_in_union(items: &[Type], result: &mut Type) {
     // Determine the result's fallback Instance. If result is a single
     // Instance, it IS the fallback. If result is a UnionType, Python
     // does `try_getting_instance_fallback(result)` on the union, which
+
     // returns None (UnionType has no fallback) -> step 5 is a no-op.
     // But the Python code path only reaches step 5 when nitems > 1 and
     // the result is the make_union of the simplified set. When the set
+
     // collapses to a single Instance (via dedup or contraction), the
     // result IS that Instance and step 5 applies.
     let erase = if distinct.len() > 1 {
@@ -3722,6 +3800,7 @@ pub(crate) fn make_simplified_union(
     // Step 4: contract literals (bool + enum) sharing a fallback
     // whose full value set is covered. Gated on >1 LiteralType item,
     // matching Python (typeops.py:785): a lone enum literal must stay a
+
     // literal (e.g. a single-member enum's sole value), never contract
     // back to the enum Instance. contract_literals=False (call from
     // try_expanding_sum_type_to_union) skips contraction entirely.
@@ -3809,6 +3888,7 @@ fn visit_union_join(
         // UninhabitedType (bottom) is never a supertype: is_subtype(s,
         // UninhabitedType) is False for all s. Rust is_subtype only
         // handles Instance vs Instance, so short-circuit here to avoid
+
         // a spurious None-defer.
         if matches!(item, Type::UninhabitedType { .. }) {
             continue;
@@ -3850,6 +3930,7 @@ fn visit_union_join(
     // Neither s <: t nor t <: s: Python calls
     // make_simplified_union([s, t]). Build the simplified union in
     // Rust and return it Encoded. Returns None (defer) when
+
     // make_simplified_union can't complete (LiteralType present,
     // TypeAliasType, non-Instance subtype check, etc.).
     let simplified = make_simplified_union(
@@ -3907,6 +3988,7 @@ fn visit_instance_join(
     // join.py:114: t.type == s.type -> combine type args.
     // Defer when either side has fallback_to_any: Python's join_instances
     // uses is_proper_subtype (bypasses fallback_to_any) for dispatch,
+
     // but the promote loop and join_instances_via_supertype need
     // _promote lists and map_instance_to_supertype that the Rust path
     // doesn't fully port. Deferring avoids wrong common-ancestor picks.
@@ -3920,6 +4002,7 @@ fn visit_instance_join(
             // join.py:281 constructs `Instance(t.type, [])` — a
             // fresh Instance with no last_known_value. Return the
             // operand without LKV to match Python; if both have
+
             // LKV, build a fresh Instance via Encoded.
             let t_has_lkv = matches!(
                 t,
@@ -3967,9 +4050,11 @@ fn visit_instance_join(
     // join.py:282-290: dispatch mirrors Python's join_instances.
     // Python uses is_proper_subtype(t, s, ignore_type_params=True) to
     // decide direction. proper_subtype=True bypasses the
+
     // fallback_to_any short-circuit (subtypes.py:493), which would
     // wrongly make D <: E when D has fallback_to_any. An
     // ignore_type_params=True context is used because join_instances
+
     // ignores type params at this stage (args are empty here anyway).
     let proper_ctx = SubtypeContext {
         proper_subtype: true,
@@ -4111,6 +4196,7 @@ fn visit_instance_with_args(
         // Ambiguous-UninhabitedType args (join.py:126-130): `ambiguous`
         // means the UninhabitedType came from an empty collection /
         // unreachable inference, and the OTHER side's arg wins outright
+
         // (no join, no is_equivalent, no upper-bound check).
         // ta_ambiguous -> new_type = sa (disc 0); sa_ambiguous ->
         // new_type = ta (disc 1).
@@ -4156,15 +4242,18 @@ fn visit_instance_with_args(
         // Push a joined arg. `disc` keeps the SameTypeWithArgs path
         // intact for pure-0/1/4 arg lists; `needs_encode` flips once a
         // real join (Ancestor/Object/Any/Bottom) appears, and the
+
         // function then emits the full Instance encoded.
         match *variance {
             v if v == COVARIANT || v == VARIANCE_NOT_READY => {
                 // join.py:136-148: covariant. new_type = join_types(ta,
                 // sa). If type_var.values non-empty, defer (needs
                 // values check, join.py:140-143; snapshot has no
+
                 // values). Then is_subtype(new_type, upper_bound):
                 // false -> object_from_instance(t) (Object).
                 // upper_bound blob is at type_var_upper_bounds[i].
+
                 // Empty blob -> defer (can't safely skip the check).
                 let ub_blob = snap.type_var_upper_bounds.get(i)?;
                 if ub_blob.is_empty() {
@@ -4174,6 +4263,7 @@ fn visit_instance_with_args(
                 // Recursive join. SameS -> result = ta = t.args[i]
                 // (disc 1); SameT -> result = sa = s.args[i] (disc 0).
                 // Ancestor/Object/Any/Bottom: a real join; materialize
+
                 // via setop_result_to_type and emit the whole Instance
                 // encoded (disc=7) instead of deferring.
                 let r = join_types(ta, sa, ctx, resolver)?;
@@ -4196,6 +4286,7 @@ fn visit_instance_with_args(
                 // join.py:149-160: invariant/contravariant.
                 // is_equivalent(ta, sa) = is_subtype(ta, sa) &&
                 // is_subtype(sa, ta). If not equivalent ->
+
                 // object_from_instance(t) (Object).
                 let equiv =
                     is_subtype(ta, sa, ctx, resolver)? && is_subtype(sa, ta, ctx, resolver)?;
@@ -4205,6 +4296,7 @@ fn visit_instance_with_args(
                 // Equivalent: new_type = join_types(ta, sa). SameS ->
                 // result = ta = t.args[i] (disc 1); SameT -> result =
                 // sa = s.args[i] (disc 0). Ancestor/Object/Any/Bottom
+
                 // -> real join, encode whole (disc=7).
                 let r = join_types(ta, sa, ctx, resolver)?;
                 let (disc, typ) = match &r {
@@ -4272,9 +4364,11 @@ fn join_instances_nominal(
     // Python's join_instances calls join_instances_via_supertype
     // directly (no inner is_subtype check). But via_supertype's bases
     // walk recurses into join_instances, which checks is_subtype(t, s)
+
     // at the TOP of join_instances (the is_proper_subtype dispatch).
     // Since we're in a recursive call without that dispatch, we need
     // the is_subtype check here to detect when one is already a
+
     // subtype of the other (the common-ancestor walk would otherwise
     // miss it and return Object). When t <: s, the join is s (Right);
     // when s <: t, the join is t (Left).
@@ -4316,6 +4410,7 @@ fn join_instances_via_supertype(
     // Fast path: when right is builtins.object, the join is always
     // object (everything is a subtype of object). This short-circuits
     // the bases walk + recursion that would otherwise find object via
+
     // every base path and hit the tie-breaker.
     if right_ref == "builtins.object" {
         return Some(JoinResult::Ancestor("builtins.object".to_string()));
@@ -4326,6 +4421,7 @@ fn join_instances_via_supertype(
     // join.py:298-303: walk _promote lists for duck-type joins.
     // First loop: if left has a promote p where p <: right, return
     // join_types(p, right). Since p <: right, join = right. Return
+
     // Ancestor(right_ref) so the caller builds Instance(right, []).
     // Second loop: if right has a promote p where p <: left, return
     // join_types(left, p). Since p <: left, join = left. Return Left.
@@ -4427,6 +4523,7 @@ fn join_instances_via_supertype(
             // Tie: defer to Python. Python's is_better returns False on
             // ties (keeping the first), but Python also checks protocol
             // status first (non-protocol beats protocol) and has
+
             // map_instance_to_supertype + the second promote loop, none
             // of which the Rust mro_len-only comparison replicates.
             // Deferring on ties avoids wrong answers on complex MROs.
@@ -4439,6 +4536,7 @@ fn join_instances_via_supertype(
             // Defer when the result is an Ancestor with type vars:
             // Python's join_instances_via_supertype calls
             // map_instance_to_supertype + join_instances which produces
+
             // Instance(ancestor, [joined_args]). Rust returns bare
             // Instance(ancestor, []), which is wrong for generic
             // ancestors like Sequence[object].
@@ -5554,6 +5652,7 @@ mod tests {
         // s=Uninhabited, t=None: the UninhabitedType swap fires
         // (s is Uninhabited, t is not) -> s=None, t=Uninhabited.
         // visit_uninhabited_type returns s (NoneType, post-swap).
+
         // flip_if(SameS, swapped=true) -> SameT (original t = None).
         let r = make_resolver(vec![]);
         let s = Type::UninhabitedType { ambiguous: false };
@@ -5606,6 +5705,7 @@ mod tests {
         // visit_none_type, strict_optional, s is Instance ->
         // make_simplified_union([Instance, None]) which now resolves to
         // Union[Instance, None] (issue #591: Instance-vs-NoneType no
+
         // longer defers; Python join.py:493-494 produces the same
         // simplified union). Previously deferred while the
         // Instance-vs-non-Instance subtype check fell through.
@@ -5644,6 +5744,7 @@ mod tests {
         // visit_union_type (join.py:432-434): if is_proper_subtype(s, t)
         // return t. s=A, t=Union[A, B] where A <: Union[A, B] (every
         // member of the union is a supertype of A via A itself). The
+
         // is_subtype(s, t) check walks the union items and returns True
         // if s is a subtype of any item -> SameT (return t=the union).
         let a = snap("a.A", "A");
@@ -5665,6 +5766,7 @@ mod tests {
         // visit_union_type: s is not <: t (s=A, t=Union[B, C] where A
         // is unrelated). make_simplified_union([s, t]) would flatten
         // to Union[A, B, C]. We can't express a new union without a
+
         // Type encoder, BUT if t <: s (every union item is a subtype of
         // s), the simplified union is just s. Detect via is_subtype(t,
         // s): Union[B, C] <: A when B <: A and C <: A -> SameS.
@@ -5692,9 +5794,11 @@ mod tests {
         // visit_union_type: s=A, t=Union[A] (single-item union, after
         // get_proper_type it's just A). is_subtype(A, Union[A])=True
         // (A is a subtype of A which is an item) -> SameT. But t is
+
         // Union[A] not A, so the result is the union. In practice the
         // Python shim calls get_proper_type before the Rust entry, so
         // single-item unions are flattened. This test guards the
+
         // is_subtype(s, t) path with a single-item union.
         let a = snap("a.A", "A");
         let o = snap("builtins.object", "object");
@@ -5714,6 +5818,7 @@ mod tests {
         // visit_union_type: s=A, t=Union[B, C] where A is not <: t
         // and t is not <: s (B, C unrelated to A). make_simplified_union
         // produces Union[A, B, C] via the Rust encoder + decoded/
+
         // type_ref-fixed on the Python side. The result is Encoded.
         let a = snap("a.A", "A");
         let b = snap("a.B", "B");
@@ -5755,6 +5860,7 @@ mod tests {
         // visit_literal_type case 3 (join.py:915-917): s is LiteralType,
         // s != t, neither fallback is_enum -> join_types(s.fallback,
         // t.fallback). For Literal[True] and Literal[False] both fallbacks
+
         // are builtins.bool, so join_types(bool, bool) = bool. The result
         // is builtins.bool (Encoded Instance), not s or t.
         let bool_snap = snap("builtins.bool", "bool");
@@ -5780,6 +5886,7 @@ mod tests {
         // s=A, t=Union[Literal[True], Literal[False]]. Neither s <: t
         // nor t <: s. make_simplified_union flattens to
         // [A, Literal[True], Literal[False]], dedup keeps all (A not
+
         // subtype of bool literal, bool literals not subtype of A or
         // each other), then try_contracting_literals_in_union collapses
         // Literal[True] + Literal[False] -> bool. Result: Union[A, bool].
@@ -5821,9 +5928,11 @@ mod tests {
         // s=A, t=Union[Literal[Color.RED], Literal[Color.BLUE],
         // Literal[Color.GREEN]]. make_simplified_union flattens,
         // dedup keeps all (enum literals with distinct str values are
+
         // not subtypes of each other), then
         // try_contracting_literals_in_union collects all 3 enum
         // literals sharing the builtins.Color fallback, checks that
+
         // every enum_member is covered (RED, BLUE, GREEN), and
         // collapses the first to Color + drops the rest.
         // Result: Union[A, Color].
@@ -5868,9 +5977,11 @@ mod tests {
         // s=A, t=Union[Literal[Color.RED], Literal[Color.BLUE]] with
         // Color={RED, BLUE, GREEN}. Only 2 of 3 members present ->
         // the enum is NOT fully covered, so contraction does NOT fire.
+
         // Python keeps the union as-is ([A, Color.RED, Color.BLUE]).
         // Rust defers (None): the wire format round-trip would need to
         // emit the partial union, but that path is identical to the
+
         // bool case's "missing member" branch, so we just defer.
         let a = snap("a.A", "A");
         let o = snap("builtins.object", "object");
@@ -5918,6 +6029,7 @@ mod tests {
         // step 5 (typeops.py:656-691): when one item has extra_attrs and
         // another item with the same fallback type_ref has none, the
         // collapsed result's extra_attrs is erased.
+
         // [A1(attrs={x:int}), A2(no attrs)] -> dedup keeps A1 (is_subtype
         // of A2 True, same type_ref) -> single A1. step 5: distinct=1
         // (from A1), but A2 has None -> erase -> A1.extra_attrs = None.
@@ -5938,6 +6050,7 @@ mod tests {
         // step 5: when all items with the same fallback type have the
         // SAME ExtraAttrs (and none lacks them), erase does NOT fire.
         // [A1(attrs={x:int}), A2(same attrs)] -> dedup keeps A1 ->
+
         // single A1. step 5: distinct=1, no item has None -> erase=False
         // -> attrs preserved.
         let a = snap("a.A", "A");
@@ -5955,6 +6068,7 @@ mod tests {
         // step 5: when items have >1 distinct ExtraAttrs sharing a
         // fallback type_ref, erase fires on the collapsed result.
         // [A1(attrs={x:int}), A2(attrs={y:str})] -> dedup keeps A1
+
         // (is_subtype A1<:A2 True) -> single A1. step 5: distinct=2
         // ({x}, {y}) -> erase -> A1.extra_attrs = None.
         let a = snap("a.A", "A");
@@ -5974,6 +6088,7 @@ mod tests {
         // s=A, t=Union[UninhabitedType, B]. Neither is_subtype(A, t)
         // (B unrelated) nor is_subtype(every item, A) (UninhabitedType
         // <: A is True, but B is not <: A). So make_simplified_union
+
         // fires: flatten -> [A, UninhabitedType, B], redundancy drops
         // UninhabitedType, leaving [A, B]. Encoded.
         let a = snap("a.A", "A");
@@ -6014,6 +6129,7 @@ mod tests {
         // Both s and t are UnionType. The pre-dispatch swap only fires
         // when exactly one side is a union (join.py:311-312). When both
         // are unions, visit_union_type calls make_simplified_union
+
         // which merges/flatten -> now returns Encoded union of
         // [a.A, a.B] (no longer defers, the union encoder is available).
         let a = snap("a.A", "A");
@@ -6056,15 +6172,19 @@ mod tests {
         // visit_callable_type fallback (join.py:579): s is a non-
         // callable, non-protocol Instance. Result is
         // join_types(t.fallback, s). t.fallback=builtins.function (with
+
         // bases=[object], mirroring the Python fixture), s=a.A (with
         // bases=[object]). Neither is_subtype(function, a) nor
         // is_subtype(a, function) holds, so join_instances_nominal(
+
         // function, a) -> via_supertype(a, function). a's bases=[object];
         // join_instances_nominal(object, function) -> is_subtype(
         // function, object)=True -> via_supertype(function, object).
+
         // function's bases=[object]; join_instances_nominal(object,
         // object) -> Left -> mapped to Ancestor("builtins.object").
         // The outer callable fallback passes Ancestor through; the
+
         // shim maps disc 5 to Instance(object_typeinfo, []) = object.
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let a = snap_with_bases("a.A", "A", &["builtins.object"]);
@@ -6087,12 +6207,15 @@ mod tests {
         // visit_callable_type fallback: s=builtins.object, t=callable
         // with fallback=builtins.function (bases=[object], mirroring
         // the Python fixture). join_types(function, object):
+
         // is_subtype(object, function)=False, is_subtype(function,
         // object)=True -> join_instances_nominal(function, object) ->
         // via_supertype(function, object). function's bases=[object];
+
         // join_instances_nominal(object, object) -> Left (same type)
         // -> mapped to Ancestor("builtins.object"). The outer
         // callable fallback passes Ancestor through. The shim maps
+
         // disc 5 to Instance(object_typeinfo, []) = object.
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let o = snap("builtins.object", "object");
@@ -6114,6 +6237,7 @@ mod tests {
         // visit_callable_type fallback: s=builtins.function (the
         // callable's own fallback), t=callable with fallback=
         // builtins.function. join_types(function, function) ->
+
         // visit_instance_join: same type, no args -> SameS. The
         // outer callable join returns SameS (s=builtins.function).
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6133,6 +6257,7 @@ mod tests {
         // Both s and t are CallableType but NOT similar (different arg
         // counts), so is_similar_callables returns false. The Rust
         // visit_callable_type both-CallableType case defers (the
+
         // var-arg / subtype fallback branches at join.py:638-646 need
         // is_subtype on whole callables -> not yet ported).
         let o = snap("builtins.object", "object");
@@ -6159,6 +6284,7 @@ mod tests {
         // join(c, c) where c is a non-generic CallableType. Both sides
         // are structurally identical, so visit_callable_type's
         // both-CallableType case returns SameS (the joined callable is
+
         // the same as s). Exercises the wire-format CallableType
         // encoder end-to-end (Encoded -> read_type -> fixup).
         let o = snap("builtins.object", "object");
@@ -6182,9 +6308,11 @@ mod tests {
         // join(callable(B, object), callable(A, object)) where B <: A.
         // is_similar_callables=True (same arg count, same min_args,
         // same is_var_arg). is_equivalent=False (B <: A but not A <: B).
+
         // The Rust port (join_similar_callables_impl) handles it:
         // per-arg safe_meet(B, A) = B (A is a supertype of B, so the
         // meet is the more specific B), ret join(object, object) =
+
         // object, from_type_type=True (neither operand is an abstract
         // type object). Result is an encoded CallableType, not None.
         let o = snap("builtins.object", "object");
@@ -6213,15 +6341,19 @@ mod tests {
         // join(callable(A, object), callable(A, object)) where the two
         // A instances are structurally equal (same type_ref) but the
         // callables are not the same Rust object. is_equivalent=True
+
         // (A <: A both ways). combine_similar_callables: per-arg
         // safe_join(A, A) = A, ret join(object, object) = object.
         // Result is a new CallableType(arg=[A], ret=object) returned as
+
         // Encoded. (Distinct from the identical case because the M8t
         // identical check compares the full struct; here we want to
         // exercise the combine path. Since the structs are identical,
+
         // M8t returns SameS. To force the combine path, we'd need
         // non-identical-but-equivalent args, which for Instance means
         // same type_ref. So this test is subsumed by the identical case;
+
         // we assert SameS here to document the overlap.)
         let o = snap("builtins.object", "object");
         let a = snap_with_bases("a.A", "A", &["builtins.object"]);
@@ -6246,15 +6378,19 @@ mod tests {
         // join(def f[T](x: T) -> T, def g(x: object) -> object) where
         // only f is generic. min_len == 0 (s.variables empty), so
         // match_generic_callables is a no-op (returns inputs unchanged,
+
         // join.py:1048-1050). No renumber, no fresh-id parity gap.
         //
         // is_similar_callables=True (same arity). is_equivalent=False:
+
         // is_subtype(T, object)=True (TypeVar upper_bound <: object),
         // but is_subtype(object, T)=False (Instance not <: TypeVar).
         // The Rust port handles it: safe_meet(T, object) = T (meet of
+
         // a TypeVar with its upper bound is the TypeVar), ret join(T,
         // object) = object, from_type_type=True (no abstract operands).
         // Result is an encoded CallableType, not None. The deferred
+
         // case is the one where args meet to NoneType/UninhabitedType.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6284,15 +6420,19 @@ mod tests {
         // join(def f[T](x: T) -> T, def g[T](x: T) -> T) where BOTH
         // callables are generic (min_len > 0). Python's
         // match_generic_callables renumbers both T's via
+
         // TypeVarId.new (a Python global counter, types.py:559-562).
         // The result's tvar ids differ from any deterministic Rust
         // allocation, and CallableType.__eq__ compares tvar ids in
+
         // arg_types/ret_type (types.py:2590-2604 + 699-706). Rust
         // can't replicate the counter without FFI back to Python, so
         // the both-generic case DEFERS to preserve parity.
+
         //
         // This test documents the defer (returns None) and guards
         // against a future change that ports match_generic_callables
+
         // without solving the fresh-id parity gap.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6325,15 +6465,19 @@ mod tests {
         // join(c, c) where c is a generic CallableType. Both sides are
         // structurally identical, BUT Python's combine_similar_callables
         // always calls match_generic_callables (join.py:1114), which
+
         // renumbers the tvars via TypeVarId.new even when both sides
         // share the same id (join.py:1047-1053). The result has fresh
         // tvar ids, so it is NOT equal to c (CallableType.__eq__
+
         // compares arg_types/ret_type which carry tvar ids). Returning
         // SameS (= c) would be a parity bug.
         //
+
         // The M8z identical-check guard defers when both sides have
         // non-empty variables (both_generic). This test documents that
         // guard: join(c, c) for generic c returns None (defer to
+
         // Python, which produces the correctly-renumbered result).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6535,9 +6679,11 @@ mod tests {
         // visit_type_type case 1 (join.py:855-860): both TypeType ->
         // TypeType(make_normalized(join_types(t.item, s.item)),
         // is_type_form=s.is_type_form or t.is_type_form). With same
+
         // item (builtins.object), join_types returns SameS, so the
         // joined item is s.item=Instance(builtins.object). The result
         // is TypeType{item: builtins.object, is_type_form: false},
+
         // encoded via write_type -> Encoded(bytes).
         let o = snap("builtins.object", "object");
         let r = make_resolver(vec![o]);
@@ -6588,6 +6734,7 @@ mod tests {
         // visit_literal_type case 3 (join.py:915-917): s is
         // LiteralType, t != s, neither enum -> join_types(s.fallback,
         // t.fallback). Both fallbacks are builtins.int, so the
+
         // recursive join returns SameS -> builtins.int (Encoded).
         let o = snap("builtins.object", "object");
         let i = snap("builtins.int", "int");
@@ -6631,6 +6778,7 @@ mod tests {
         // visit_literal_type case 5 (join.py:847): s is Instance,
         // s.last_known_value != t -> join_types(self.s, t.fallback).
         // The recursive call is Instance-vs-Instance (both fallback=A),
+
         // which yields SameS -> s.fallback = A. Encoded: the joined
         // fallback is dropped of the LKV (fresh Instance(A, [])), which
         // mirrors Python join_types(A, A) = A.
@@ -6663,9 +6811,11 @@ mod tests {
         // visit_overloaded fallback (join.py:632): s=object, t=Overloaded.
         // Recursive join_types(t.fallback=function, s=object) ->
         // is_subtype(function, object)=True -> via_supertype(function,
+
         // object) -> function.bases=[object] ->
         // join_instances_nominal(object, object) -> Left ->
         // Ancestor("builtins.object"). The outer overloaded fallback
+
         // passes Ancestor through; the shim maps disc 5 to
         // Instance(object_typeinfo, []) = object.
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6688,6 +6838,7 @@ mod tests {
         // visit_overloaded fallback: s=builtins.function, t=Overloaded
         // with fallback=builtins.function. Recursive join_types(function,
         // function) -> visit_instance_join: same type, no args -> SameS.
+
         // The outer overloaded join returns SameS (s=builtins.function).
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let o = snap("builtins.object", "object");
@@ -6706,9 +6857,11 @@ mod tests {
         // visit_overloaded fallback: s=a.A, t=Overloaded with fallback=
         // builtins.function. Neither is_subtype(function, a) nor
         // is_subtype(a, function) holds, so via_supertype(a, function)
+
         // walks a.bases=[object] -> join_instances_nominal(object,
         // function) -> is_subtype(function, object)=True ->
         // via_supertype(function, object) -> function.bases=[object] ->
+
         // join_instances_nominal(object, object) -> Left ->
         // Ancestor("builtins.object").
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6732,6 +6885,7 @@ mod tests {
         // Both s and t are callable-like (Overloaded). The both-FunctionLike
         // case (join.py:612-627) uses is_similar_callables +
         // combine_similar_callables which produces a new Overloaded via
+
         // wire encoder. No longer defers — now returns Encoded(Overloaded).
         // Fixed: combine_similar_callables was called with outer Overloaded
         // types instead of inner CallableType items, causing a panic.
@@ -6761,6 +6915,7 @@ mod tests {
         // s=CallableType, t=Overloaded. Both callable-like -> the
         // walk runs with s_items=[s] (CallableType.items == [self]).
         // Identical items -> similar+equivalent -> combine -> the
+
         // walk yields one result, encoded (disc=7).
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6784,6 +6939,7 @@ mod tests {
         // s=object, t=Overloaded. Same as
         // join_overloaded_with_object_returns_object but with s/t roles
         // verified from the other direction (s=object, t=overloaded).
+
         // The recursive join_types(fallback=function, s=object) ->
         // Ancestor("builtins.object"). Fires the Rust Ancestor path.
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
@@ -6806,6 +6962,7 @@ mod tests {
         // join.py:320-321: s is None, t is not -> swap. Post-swap:
         // visit_none_type, strict_optional, s=Instance, t=None ->
         // make_simplified_union([Instance, None]) which now resolves to
+
         // Union[Instance, None] (issue #591), then flip back (swapped)
         // yielding the same union.
         let r = make_resolver(vec![snap("a.A", "A")]);
@@ -6831,6 +6988,7 @@ mod tests {
         // join.py:323-324: s is Uninhabited, t is not -> swap.
         // Post-swap: s=Instance, t=Uninhabited.
         // visit_uninhabited_type returns s (Instance, post-swap).
+
         // flip_if(SameS, swapped=true) -> SameT (original t = Instance).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = Type::UninhabitedType { ambiguous: false };
@@ -6846,9 +7004,11 @@ mod tests {
         // Force t to be a callable-like so the normalize_callables
         // guard fires. Use a CallableType blob via the wire reader is
         // complex; instead verify the guard via the NoneType path: if
+
         // s is Any and t is CallableType, the AnyType short-circuit
         // (join.py:314) should fire BEFORE normalize_callables. So this
         // test verifies ordering: AnyType s returns SameS even with
+
         // callable t.
         let t = Type::NoneType;
         assert_eq!(join_types(&s, &t, &ctx(true), &r), Some(SetOpResult::SameS));
@@ -6883,6 +7043,7 @@ mod tests {
         // B <: A -> join(A, B): s=A, t=B. is_subtype(B, A)=true ->
         // join_instances_nominal(B, A) -> via_supertype(B, A).
         // B's bases=[A]. join_instances_nominal(A, A) -> Left.
+
         // Mapped: Left -> Ancestor("a.A") (the base is the common
         // ancestor, which equals original s=A).
         let a = snap("a.A", "A");
@@ -6901,9 +7062,11 @@ mod tests {
         // D <: C, E <: C, D not <: E, E not <: D.
         // join(D, E): t=D, s=E. is_subtype(D, E)=false ->
         // via_supertype(E, D). E's bases=[C].
+
         // join_instances_nominal(C, D): C != D, is_subtype(C, D)=false
         // -> via_supertype(D, C). D's bases=[C].
         // join_instances_nominal(C, C) -> SameS (Ancestor(C)).
+
         // The best candidate is C -> Ancestor("a.C").
         let c = snap("a.C", "C");
         let d = snap_with_bases("a.D", "D", &["a.C"]);
@@ -6945,6 +7108,7 @@ mod tests {
         // s is AnyType, t is Instance -> the visit_instance Instance
         // branch requires s to be Instance; AnyType s falls to the
         // else branch (join.py:453 default). But AnyType s is caught
+
         // by the AnyType short-circuit BEFORE visit_join. So this test
         // uses UnboundType s (not AnyType, not Instance).
         let r = make_resolver(vec![snap("a.A", "A")]);
@@ -6962,9 +7126,11 @@ mod tests {
     // ---- visit_instance with args (M8g) ----
     //
     // join.py:114-180: t.type == s.type, combine type args via
+
     // join_types (covariant) or is_equivalent (invariant). M8g
     // handles: AnyType arg, invariant is_equivalent (False -> Object,
     // True -> SameS/SameT). Covariant recursion needs upper_bound
+
     // (deferred to M8h). Variadic / ParamSpec / TypeVarTupleType
     // defer.
 
@@ -6991,6 +7157,7 @@ mod tests {
         // join(G[Any, int], G[int, Any]) where T1, T2 are invariant.
         // AnyType arg short-circuits (join.py:131-135) before the
         // variance dispatch. Both args have an Any on one side ->
+
         // both reduce to Any -> SameTypeWithArgs { [Any, Any] }.
         let mut g = snap("g.G", "G");
         g.type_vars_with_variance = vec![
@@ -7031,6 +7198,7 @@ mod tests {
         // join(G[A], G[A]) where T is invariant, A <: A.
         // is_equivalent(A, A) = true. join_types(A, A) = A (SameS).
         // SameS means result = ta = t.args[0] -> disc 1. Both args are
+
         // A so the reconstructed Instance is G[A] either way.
         let g = snap_with_invariant_tvar("g.G");
         let a = snap("a.A", "A");
@@ -7057,6 +7225,7 @@ mod tests {
         // Covariant T, upper_bound=object. join(G[A], G[A]):
         // join_types(ta, sa) where ta=t.args[0]=A, sa=s.args[0]=A.
         // Neither has LKV -> SameT (return t=sa=s.args[0]) -> disc 0.
+
         // is_subtype(A, object)=True.
         let g = snap_with_covariant_tvar("g.G");
         let a = snap("a.A", "A");
@@ -7082,9 +7251,11 @@ mod tests {
         // Covariant T, upper_bound=object. join(G[B], G[A]) where
         // B <: A. The recursive join_types(A, B) returns Ancestor(A)
         // (the common supertype), not SameS/SameT. The covariant
+
         // branch can't express an Ancestor result as an arg disc, so
         // it encodes the full Instance (disc=7) instead of deferring
         // (join.py:136-148: new_type = join_types(ta, sa) is a real
+
         // type once the encoder exists).
         let g = snap_with_covariant_tvar("g.G");
         let a = snap("a.A", "A");
@@ -7102,6 +7273,7 @@ mod tests {
         // Covariant T, upper_bound=object. join(G[A], G[D]) where
         // A, D unrelated with no shared bases in the snapshot. The
         // recursive join_types(A, D) cannot decide an ancestor (no
+
         // bases/mro), so it returns None and the whole call defers to
         // Python. (With resolvable ancestors the covariant branch
         // encodes the full Instance instead.)
@@ -7120,6 +7292,7 @@ mod tests {
         // Covariant T, upper_bound=A (narrow). join(G[B], G[B]) where
         // B is NOT <: A (an invalid arg, constructed for the test).
         // join_types(B, B) = SameS -> new_type = ta = B.
+
         // is_subtype(B, A) = False (B not in A's has_base) ->
         // object_from_instance(t) = Object (whole result bails).
         let mut g = snap("g.G", "G");
@@ -7218,6 +7391,7 @@ mod tests {
         // visit_type_var case 1 (join.py:468-470): s.id == t.id but
         // upper_bounds differ -> copy_modified(upper_bound=join_types(...)).
         // Produces a NEW TypeVarType (neither s nor t) -> defer (no Type
+
         // encoder).
         let s = type_var(1, "~", instance("builtins.int", vec![]));
         let t = type_var(1, "~", instance("builtins.str", vec![]));
@@ -7229,6 +7403,7 @@ mod tests {
         // visit_type_var case 2 (join.py:545-546): s is TypeVarType but
         // s.id != t.id -> get_proper_type(join_types(s.upper_bound,
         // t.upper_bound)). join(int, int) = int — a fresh TYPE (the
+
         // bound), not a TypeVarType. Materialized and encoded.
         let s = type_var(1, "~", instance("builtins.int", vec![]));
         let t = type_var(2, "~", instance("builtins.int", vec![]));
@@ -7250,6 +7425,7 @@ mod tests {
         // visit_type_var case 3 (join.py:474): s is NOT a TypeVarType ->
         // return self.default(self.s). For Instance s, default(s) =
         // object_from_instance(s) = builtins.object. t's object side
+
         // is object_or_any_from_type(upper_bound=object) = object. Both
         // sides collapse to object -> SetOpResult::Object.
         let t = type_var(1, "~", instance("builtins.object", vec![]));
@@ -7265,6 +7441,7 @@ mod tests {
         // TypeVarId equality checks namespace (types.py:576): same
         // raw_id, different namespace -> s.id != t.id -> case 2 ->
         // join_types(upper_bound, upper_bound). join(object, object) =
+
         // object, materialized and encoded.
         let s = type_var(1, "~", instance("builtins.object", vec![]));
         let t = type_var(1, "other", instance("builtins.object", vec![]));
@@ -7286,6 +7463,7 @@ mod tests {
         // visit_typeddict case 2 (join.py:832-833): s is Instance,
         // t is TypedDictType -> join_types(self.s, t.fallback).
         // Recursive call: join_types(s=builtins.dict, t.fallback=
+
         // builtins.dict). Same Instance, no LKV -> SameT, mapped to
         // outer SameS (s == fallback, so returning s is equivalent).
         let o = snap("builtins.object", "object");
@@ -7301,9 +7479,11 @@ mod tests {
         // visit_typeddict case 2: s is Instance(builtins.object),
         // t is TypedDictType with fallback=builtins.dict.
         // Recursive: join_types(object, builtins.dict). dict <: object,
+
         // so the join is object (the supertype). The Rust Instance
         // path returns Ancestor("builtins.object") (the common base),
         // which the Python shim reconstructs as Instance(object) =
+
         // object. Passes through.
         let o = snap("builtins.object", "object");
         let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
@@ -7321,9 +7501,11 @@ mod tests {
         // visit_typeddict case 2: s is Instance(builtins.dict), t is
         // TypedDictType with fallback=builtins.object. Recursive:
         // join_types(builtins.dict, builtins.object). dict <: object,
+
         // so the join is object (the supertype). The Rust path returns
         // Ancestor("builtins.object"), which passes through (the shim
         // reconstructs Instance(object) = object). NOT a defer — the
+
         // Ancestor is the correct result, not SameT.
         let o = snap("builtins.object", "object");
         let dict = snap_with_bases("builtins.dict", "dict", &["builtins.object"]);
@@ -7341,6 +7523,7 @@ mod tests {
         // visit_typeddict case 1 (join.py:812-831): s is TypedDictType
         // -> builds a NEW TypedDictType via resolve_typeddict_item over
         // zipall. Produces a new type (neither s nor t) -> defer (no
+
         // Type encoder).
         let o = snap("builtins.object", "object");
         let r = make_resolver(vec![o]);
@@ -7354,6 +7537,7 @@ mod tests {
         // visit_typeddict case 3 (join.py:834-835): s is not an
         // Instance (and not a TypedDictType) -> default(self.s).
         // Walks s's fallback chain -> defer. Use TypeVarType (passes
+
         // pre-dispatch: not Any/None/Uninhabited/Union/Callable, reaches
         // visit_typeddict case 3).
         let o = snap("builtins.object", "object");
@@ -7368,6 +7552,7 @@ mod tests {
         // visit_tuple_type case 2 (join.py:774-775): s is not a
         // TupleType -> join_types(self.s, tuple_fallback(t)). When
         // partial_fallback is NOT builtins.tuple (e.g. a namedtuple
+
         // class "nt.NT"), tuple_fallback(t) == t.partial_fallback
         // (typeops.py:108-109). Recursive: join_types(NT, NT).
         // Neither has LKV -> SameT, mapped to outer SameS (s==fallback).
@@ -7384,6 +7569,7 @@ mod tests {
         // visit_tuple_type case 2: s=object, t=Tuple(fallback=NT).
         // Recursive: join_types(object, NT). NT <: object, so the
         // join is object. Rust returns Ancestor("builtins.object"),
+
         // which the shim reconstructs as Instance(object).
         let o = snap("builtins.object", "object");
         let nt = snap_with_bases("nt.NT", "NT", &["builtins.object"]);
@@ -7417,6 +7603,7 @@ mod tests {
         // visit_tuple_type case 2: s is Instance, t=Tuple with
         // partial_fallback=builtins.tuple. tuple_fallback(t) constructs
         // Instance(builtins.tuple, [make_simplified_union(items)])
+
         // (typeops.py:110-129) — NOT the same as partial_fallback.
         // Rust can't replicate without a Type encoder -> defer.
         let o = snap("builtins.object", "object");
@@ -7456,6 +7643,7 @@ mod tests {
     // ---- meet_types (M8p) ----
     // Mirrors meet.py:114-153 (pre-dispatch) + meet.py:822+
     // (TypeMeetVisitor leaf visitors). Returns SameS/SameT/Bottom/Any
+
     // for the portable cases; defers (None) for everything else.
 
     #[test]
@@ -7472,6 +7660,7 @@ mod tests {
         // visit_any (meet.py:837): return self.s.
         // Pre-check (proper_subtype) returns None (not Instance-Instance
         // proper subtype via ignore_promotions). AnyType-s pre-dispatch
+
         // does not fire (s is Instance). Reaches visitor -> SameS.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
@@ -7484,6 +7673,7 @@ mod tests {
         // meet_types pre-dispatch (meet.py:138-139): is_proper_subtype
         // (s=None, t=None) is True (visit_none_type right=NoneType ->
         // True), so the dispatch returns s = SameS. The visitor's
+
         // visit_none_type would return SameT, but the pre-dispatch
         // fires first.
         let r = make_resolver(vec![]);
@@ -7653,6 +7843,7 @@ mod tests {
         // visit_instance same type_ref with args -> per-arg meet.
         // G[i64] meet G[int] with covariant T: the outer proper-subtype
         // pre-check (ignore_promotions) misses (i64 !<: int properly),
+
         // the non-proper gate passes via i64's promote to int, and the
         // per-arg meet_types(int, i64) -> i64 <: int via promote ->
         // returns i64. Result: G[i64] encoded (disc=7).
@@ -7697,9 +7888,11 @@ mod tests {
         // meet.py:147-148: isinstance(s, UnionType) and not isinstance(t,
         // UnionType) -> swap. After swap, s=A (Instance), t=A|B (Union).
         // trivial_meet: is_subtype(A, A|B) -> True (UnionType-right
+
         // handler finds A <: A). Returns SameT (t=A|B). The shim
         // returns t, which is the union. Python's meet would simplify
         // to just A, but Rust returns SameT (the full union) which
+
         // is a valid meet (A is in the union). Python simplification
         // happens in make_simplified_union (not ported), so this is
         // a conservative answer.
@@ -7743,9 +7936,11 @@ mod tests {
         // visit_union_type (meet.py:965-966), one-sided: t is Union,
         // s is a plain Instance unrelated to the items. Pre-dispatch
         // proper-subtype checks miss (C <: A|B false, A|B <: C false),
+
         // so the arm runs: meets = [meet_types(x, s) for x in
         // t.items] = [Bottom, Bottom] -> all dropped -> empty ->
         // make_simplified_union([]) -> UninhabitedType. Encoded bottom
+
         // matches Python's meet (all items disjoint).
         let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B"), snap("a.C", "C")]);
         let s = instance("a.C", vec![]);
@@ -7769,9 +7964,11 @@ mod tests {
         // visit_type_var (meet.py:1000-1004): same raw_id/namespace but
         // different upper_bound -> meet upper bounds and encode the
         // new TypeVar (copy_modified). The pre-dispatch
+
         // is_proper_subtype(s, t) recurses on the upper bounds and,
         // with ignore_promotions, G[i64] is not a proper subtype of
         // G[int] (i64 promotes to int, not subclasses it) -> pre-check
+
         // misses. The arm runs: meet_types(G[i64], G[int]) = Encoded
         // (same-type-with-args per-arg meet, i64 via promote) and
         // fruit_to_type decodes it into the new TypeVar's upper_bound.
@@ -7826,9 +8023,11 @@ mod tests {
         // visit_type_type (meet.py:1412-1419), case 1: both TypeType.
         // typ = meet(t.item, s.item); if not NoneType, wrap
         // TypeType.make_normalized with is_type_form = AND. s is a
+
         // TypeForm, t is a plain TypeType: is_subtype(TypeForm[B],
         // Type[A]) is Some(false) (subtypes.py:537 — the right side
         // lacks is_type_form), so the pre-dispatch skips and the arm
+
         // runs. B <: A, meet(A, B)=B -> TypeType[B] encoded with
         // is_type_form = True AND False = False.
         let mut b = snap("a.B", "B");
@@ -7864,6 +8063,7 @@ mod tests {
         // A vs B (unrelated) -> meet returns Bottom (Uninhabited). In
         // Python, TypeType.make_normalized(UninhabitedType) returns a
         // TypeType of bottom. Fresh encode wraps the Uninhabited item
+
         // in a TypeType.
         let r = make_resolver(vec![snap("a.A", "A"), snap("a.B", "B")]);
         let s = Type::TypeType {
@@ -7951,15 +8151,19 @@ mod tests {
         // visit_callable_type fallback case (s non-callable): meet_types
         // does NOT have a callable-fallback short-circuit like join's
         // visit_callable_type. Instead visit_instance handles s=Instance
+
         // via is_subtype(t.fallback, s) -> produces s or t only when
         // fallback <: s. For unrelated s, falls to default -> Bottom.
         // But CallableType t is not Instance -> visit_instance not
+
         // reached. visit_callable_type checks isinstance(self.s,
         // CallableType) (no), TypeType (no), Instance+protocol (no) ->
         // default(self.s) -> Bottom. However, reaching visit_callable_type
+
         // requires passing the both-callable guard; the Rust path defers
         // both-callable. For non-both-callable, t is CallableType and s
         // is not: Rust would hit visit_callable_type which checks s
+
         // shape. Defer conservatively (the s=Instance+protocol branch
         // needs unpack_callback_proxy).
         let r = make_resolver(vec![
@@ -7979,6 +8183,7 @@ mod tests {
     // ---- meet visit_type_var (M8q) ----
     // Mirrors meet.py:878-884. Case 1 (same id + same upper_bound) ->
     // SameS. copy_modified (different bound) -> defer. default (s not
+
     // TypeVarType or different id) -> Bottom.
 
     #[test]
@@ -8038,12 +8243,15 @@ mod tests {
         // meet_types(Instance, TypeVar) where the TypeVar's upper_bound
         // is the Instance. The pre-dispatch is_proper_subtype(t, s)
         // (meet.py:141) fires: is_subtype(TypeVar, Instance) recurses
+
         // into is_subtype(upper_bound=Instance, Instance) = True, so
         // the pre-check returns SameT (= t = the TypeVar). Python
         // matches: meet_types(a, tv) = T.
+
         //
         // Pre-M8z this returned Bottom because the Rust is_subtype
         // didn't handle TypeVarType on the left, so is_proper_subtype
+
         // returned None and the visitor (visit_type_var else) returned
         // default(s) = Bottom. The M8z is_subtype extension makes the
         // pre-dispatch fire, which is the parity-correct behavior.
@@ -8056,6 +8264,7 @@ mod tests {
     // ---- meet visit_literal_type (M8q) ----
     // Mirrors meet.py:1236-1242. Case 1 (s is LiteralType, s==t) ->
     // SameT. Case 2 (s is Instance, is_subtype(t.fallback, s)) ->
+
     // SameT. Else -> Bottom (default).
 
     #[test]
@@ -8114,6 +8323,7 @@ mod tests {
     // ---- meet visit_type_type (M8q) ----
     // Mirrors meet.py:1248-1261. Case 2 (s is Instance(builtins.type))
     // -> SameT. Case 1 (both TypeType) -> defer (recursive meet +
+
     // make_normalized). Case 3 (CallableType) -> defer (recursive).
     // Else -> Bottom (default).
 
@@ -8132,6 +8342,7 @@ mod tests {
         // visit_type_type case 1 (meet.py:1249-1255): s is TypeType ->
         // meet(t.item, s.item) + make_normalized. With TypeType now enabled
         // (issue #443), the is_proper_subtype pre-check (meet.py:139-141)
+
         // fires: is_proper_subtype(Type[A], Type[A]) recurses on items
         // (subtypes.py:1264-1265) -> True, so the meet pre-check returns
         // SameS before the visitor. This matches Python.
@@ -8159,9 +8370,11 @@ mod tests {
         // visit_type_type else: s is UninhabitedType -> default ->
         // Bottom (strict). Note: UninhabitedType as s would normally
         // be caught by visit_uninhabited_type if t were Uninhabited,
+
         // but here t is TypeType so visit_type_type fires.
         //
         // The meet_types pre-dispatch (meet.py:138-139) fires first
+
         // now that is_proper_subtype(Uninhabited, TypeType) returns
         // True (visit_uninhabited_type is subtype of everything):
         // returns s = SameS, not the visitor's Bottom.
@@ -8174,6 +8387,7 @@ mod tests {
     // ---- meet visit_unbound_type (M8r) ----
     // Mirrors meet.py:864-873. Three branches on s:
     //   * NoneType, strict_optional -> UninhabitedType (Bottom).
+
     //   * NoneType, non-strict -> self.s (SameS).
     //   * UninhabitedType -> self.s (SameS).
     //   * else -> AnyType (Any).
@@ -8230,6 +8444,7 @@ mod tests {
         // visit_unbound_type else branch fires for AnyType s too (AnyType
         // is not NoneType/Uninhabited). Result is AnyType. The meet_types
         // AnyType-s short-circuit (meet.py:145) returns t before the
+
         // visitor when s is AnyType, so this case is actually unreachable
         // in Python. Rust mirrors: meet_types returns SameT (t) for
         // AnyType-s. Assert the short-circuit wins.
@@ -8246,6 +8461,7 @@ mod tests {
     // ---- meet visit_type_var_tuple (M8r) ----
     // Mirrors meet.py:930-934. Same id (raw_id + namespace) -> pick by
     // min_len: s if s.min_len > t.min_len else t. Different id ->
+
     // default(self.s) -> Bottom (strict) / NoneType (non-strict).
 
     #[test]
@@ -8309,6 +8525,7 @@ mod tests {
         // visit_type_var_tuple else (meet.py:933): s not TypeVarTupleType
         // -> default(self.s). s is Instance -> default(Instance) ->
         // Bottom (strict). Instance.default falls to object_from_instance
+
         // in join but meet.default(strict) returns UninhabitedType.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = instance("a.A", vec![]);
@@ -8391,6 +8608,7 @@ mod tests {
         // s has key "x", t has key "y". zipall yields both. Each
         // item is joined with the other's missing key (is_closed=True
         // -> UninhabitedType). join_types(A, Uninhabited) = A.
+
         // Required: s.required(x)=True, t.required(x)=False (missing
         // in closed TD) -> is_required = True and False = False.
         let r = make_resolver(vec![snap("a.A", "A")]);
@@ -8513,6 +8731,7 @@ mod tests {
         // s has key "x" (open TD), t is open TD with no keys.
         // t.item("x") with open TD -> typ=None, required=False,
         // readonly=True. resolve_typeddict_item: s.typ=Some(A),
+
         // t.typ=None -> join_type=None -> key omitted.
         let r = make_resolver(vec![snap("a.A", "A")]);
         let s = typed_dict_full(
@@ -8790,6 +9009,7 @@ mod tests {
         // visit_literal_type case 2: both LiteralTypes, same enum
         // fallback Color={RED,BLUE,GREEN}, values RED/BLUE. Partial
         // coverage -> make_simplified_union keeps both literals ->
+
         // Encoded UnionType (previously defers; now encodes).
         let o = snap("builtins.object", "object");
         let mut color = snap("color.Color", "Color");
@@ -8825,6 +9045,7 @@ mod tests {
         // Case-2 full-coverage branch: both sides LiteralType, same
         // 2-member enum fallback, values RED/BLUE. Contraction collapses
         // [RED, BLUE] to the enum Instance Color (Encoded), the path
+
         // case 2 used to reach before partial coverage was added.
         let o = snap("builtins.object", "object");
         let mut color = snap("color.Color", "Color");

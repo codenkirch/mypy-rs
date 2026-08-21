@@ -144,6 +144,7 @@ def build_type_map(
     # Register __mypyc_defaults_setup FuncDecls on classes that have their own
     # class-level default attribute assignments. Done here, before any IR build
     # runs, so that the cross-class lookup in generate_attr_defaults_init is
+
     # order-independent: IR build within a compilation group proceeds in
     # filename order, so a subclass may be IR-built before its base.
     for module, cdef in classes:
@@ -204,6 +205,7 @@ def load_type_map(mapper: Mapper, modules: list[MypyFile], deser_ctx: DeserMaps)
                 # Some TypeInfo entries are mypy-synthetic (e.g. anonymous
                 # intersection classes like "<subclass of X and Y>") and have
                 # no corresponding mypyc ClassIR. Skip those rather than
+
                 # aborting the whole cache load.
                 ir = deser_ctx.classes.get(node.node.fullname)
                 if ir is None:
@@ -213,6 +215,7 @@ def load_type_map(mapper: Mapper, modules: list[MypyFile], deser_ctx: DeserMaps)
                 # Trait/builtin-base classes have an ir.ctor FuncDecl
                 # but no emitted CPyDef_<ctor>, so a cross-group direct
                 # call would hit an undefined symbol. Mirror the skip
+
                 # in prepare_init_method.
                 if not ir.is_trait and not ir.builtin_base:
                     mapper.func_to_decl[node.node] = ir.ctor
@@ -350,6 +353,7 @@ def prepare_fast_path(
         # The simplest case is a regular or overloaded method without decorators. In this
         # case we can generate practically identical IR method body, but with a signature
         # suitable for direct calls (usual non-extension class methods are converted to
+
         # callable classes, and thus have an extra __mypyc_self__ argument).
         name = FAST_PREFIX + node.name
         sig = mapper.fdef_to_sig(node, options.strict_dunders_typing)
@@ -538,6 +542,7 @@ def prepare_class_def(
                 # Note that if we try to subclass a C extension class that
                 # isn't in builtins, bad things will happen and we won't
                 # catch it here! But this should catch a lot of the most
+
                 # common pitfalls.
                 errors.error(
                     "Inheriting from most builtin types is unimplemented", path, cdef.line
@@ -581,6 +586,7 @@ def prepare_class_def(
         # If the first base is a non-trait, don't ever error here. While it is correct
         # to error if a trait comes before the next non-trait base (e.g. non-trait, trait,
         # non-trait), it's pointless, confusing noise from the bigger issue: multiple
+
         # inheritance is *not* supported.
         errors.error("Non-trait base must appear first in parent list", path, cdef.line)
     ir.traits = [c for c in bases if c.is_trait]
@@ -641,6 +647,7 @@ def prepare_methods_and_attributes(
                     # Traits don't have attribute definedness bitmaps, so use
                     # property accessor methods to access attributes that need them.
                     # We will generate accessor implementations that use the class bitmap
+
                     # for any concrete subclasses.
                     add_getter_declaration(ir, name, attr_rtype, module_name)
                     add_setter_declaration(ir, name, attr_rtype, module_name)
@@ -773,6 +780,7 @@ def prepare_init_method(cdef: ClassDef, ir: ClassIR, module_name: str, mapper: M
     # We are only interested in __new__ method defined in a user-defined class,
     # so we ignore it if it comes from a builtin type. It's usually builtins.object
     # but could also be builtins.type for metaclasses so we detect the prefix which
+
     # matches both.
     if new_symbol and new_symbol.fullname and not new_symbol.fullname.startswith("builtins."):
         new_node = new_symbol.node
@@ -905,6 +913,7 @@ class SingledispatchVisitor(TraverserVisitor):
                         # found a register decorator after a non-register decorator, which we
                         # don't support because we'd have to make a copy of the function before
                         # calling the decorator so that we can call it later, which complicates
+
                         # the implementation for something that is probably not commonly used
                         self.errors.error(
                             "Calling decorator after registering function not supported",

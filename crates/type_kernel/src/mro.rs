@@ -232,6 +232,7 @@ mod tests {
         // D : object
         // B : D
         // C : D
+
         // A : B, C  ->  A, B, C, D, object
         let a = snap_bases("mymod.A", &["mymod.B", "mymod.C"]);
         let b = snap_bases("mymod.B", &["mymod.D"]);
@@ -288,6 +289,7 @@ mod tests {
         // X : A, B  and  Y : B, A  with Z : X, Y  ->  merge fails (A before B
         // in X, B before A in Y); no consistent head exists. Rust returns
         // None so Python raises MroError.
+
         // A : object, B : object (so A and B each linearize trivially).
         let a = snap_bases("mymod.A", &["builtins.object"]);
         let b = snap_bases("mymod.B", &["builtins.object"]);

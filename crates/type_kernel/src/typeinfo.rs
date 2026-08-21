@@ -948,9 +948,11 @@ impl NativeTypeResolver {
             // Promotion sinks (`builtins.int`, `builtins.float`,
             // `builtins.bytearray`, `builtins.memoryview`) accumulate
             // `_promote` entries from later SCCs' `calculate_class_properties`
+
             // (native ints + TYPE_PROMOTIONS, semanal_classprop.py:205-223),
             // so a first-seal-wins snapshot of them goes stale. Always
             // re-snapshot `builtins.*` classes (a small constant set) so
+
             // their promotion lists stay current; the remaining ~full graph
             // keeps the first-seal semantics (a class's own SCC seals it
             // once, then it does not change).

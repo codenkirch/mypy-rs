@@ -114,8 +114,11 @@ def transform_decorator(builder: IRBuilder, dec: Decorator) -> None:
     if func_reg:
         decorated_func = load_decorated_func(builder, dec.func, func_reg)
         builder.assign(get_func_target(builder, dec.func), decorated_func, dec.func.line)
-    # If the prebuild pass didn't put this function in the function to decorators map (for example
-    # if this is a registered singledispatch implementation with no other decorators), we should
+    # If the prebuild pass didn't put this function in the function to decorators map
+    # (for example
+    # if this is a registered singledispatch implementation with no other decorators),
+
+    # we should
     # treat this function as a regular function, not a decorated function
     elif dec.func in builder.fdefs_to_decorators:
         # Obtain the function name in order to construct the name of the helper function.
@@ -250,9 +253,12 @@ def gen_func_item(
         generator_class_ir = builder.mapper.fdef_to_generator[fitem]
         builder.fn_info.generator_class = GeneratorClass(generator_class_ir)
 
-    # Functions that contain nested functions need an environment class to store variables that
+    # Functions that contain nested functions need an environment class to store
+    # variables that
     # are free in their nested functions. Generator functions need an environment class to
-    # store a variable denoting the next instruction to be executed when the __next__ function
+
+    # store a variable denoting the next instruction to be executed when the __next__
+    # function
     # is called, along with all the variables inside the function itself.
     if contains_nested or (
         is_generator and not builder.fn_info.can_merge_generator_and_env_classes()
@@ -465,6 +471,7 @@ def generate_setattr_wrapper(builder: IRBuilder, cdef: ClassDef, setattr: FuncDe
             # Call internal function that cpython normally calls when deleting an attribute.
             # Cannot call object.__delattr__ here because it calls PyObject_SetAttr internally
             # which in turn calls our wrapper and recurses infinitely.
+
             # Note that since native classes don't have __dict__, this will raise AttributeError
             # for dynamic attributes.
             builder.call_c(generic_setattr, [builder.self(), attr_arg, null], line)
@@ -535,12 +542,14 @@ def handle_ext_method(builder: IRBuilder, cdef: ClassDef, fdef: FuncDef) -> None
     # If the class allows interpreted children, create glue
     # methods that dispatch via the Python API. These will go in a
     # "shadow vtable" that will be assigned to interpreted
+
     # children.
     if class_ir.allow_interpreted_subclasses:
         f = gen_glue(builder, func_ir.sig, func_ir, class_ir, class_ir, fdef, do_py_ops=True)
         # Use func_ir.decl.name (unique) rather than fdef.name, because for properties
         # the getter and setter share the same fdef.name but have distinct decl names
         # (e.g. "prop" vs "__mypyc_setter__prop"). Using fdef.name would cause the
+
         # setter's glue to overwrite the getter's glue in the shadow vtable.
         class_ir.glue_methods[(class_ir, func_ir.decl.name)] = f
         builder.functions.append(f)
@@ -918,16 +927,26 @@ def get_func_target(builder: IRBuilder, fdef: FuncDef) -> AssignmentTarget:
 
 
 def load_type(builder: IRBuilder, typ: TypeInfo, unbounded_type: Type | None, line: int) -> Value:
-    # typ.fullname contains the module where the class object was defined. However, it is possible
-    # that the class object's module was not imported in the file currently being compiled. So, we
-    # use unbounded_type.name (if provided by caller) to load the class object through one of the
+    # typ.fullname contains the module where the class object was defined. However, it
+    # is possible
+    # that the class object's module was not imported in the file currently being
+
+    # compiled. So, we
+    # use unbounded_type.name (if provided by caller) to load the class object through
+    # one of the
+
     # imported modules.
-    # Example: for `json.JSONDecoder`, typ.fullname is `json.decoder.JSONDecoder` but the Python
+    # Example: for `json.JSONDecoder`, typ.fullname is `json.decoder.JSONDecoder` but
+    # the Python
+
     # file may import `json` not `json.decoder`.
     # Another corner case: The Python file being compiled imports mod1 and has a type hint
     # `mod1.OuterClass.InnerClass`. But, mod1/__init__.py might import OuterClass like this:
+
     # `from mod2.mod3 import OuterClass`. In this case, typ.fullname is
-    # `mod2.mod3.OuterClass.InnerClass` and `unbounded_type.name` is `mod1.OuterClass.InnerClass`.
+    # `mod2.mod3.OuterClass.InnerClass` and `unbounded_type.name` is
+    # `mod1.OuterClass.InnerClass`.
+
     # So, we must use unbounded_type.name to load the class object.
     # See issue mypyc/mypyc#1087.
     if typ in builder.mapper.type_to_ir:
@@ -950,8 +969,10 @@ def load_func(builder: IRBuilder, func_name: str, fullname: str | None, line: in
     if fullname and not fullname.startswith(builder.current_module):
         # we're calling a function in a different module
 
-        # We can't use load_module_attr_by_fullname here because we need to load the function using
+        # We can't use load_module_attr_by_fullname here because we need to load the
+        # function using
         # func_name, not the name specified by fullname (which can be different for underscore
+
         # function)
         module = fullname.rsplit(".")[0]
         loaded_module = builder.load_module(module)
@@ -1127,7 +1148,8 @@ def singledispatch_main_func_name(orig_name: str) -> str:
 def maybe_insert_into_registry_dict(builder: IRBuilder, fitem: FuncDef) -> None:
     line = fitem.line
     is_singledispatch_main_func = fitem in builder.singledispatch_impls
-    # dict of singledispatch_func to list of register_types (fitem is the function to register)
+    # dict of singledispatch_func to list of register_types (fitem is the function to
+    # register)
     to_register: defaultdict[FuncDef, list[TypeInfo]] = defaultdict(list)
     for main_func, impls in builder.singledispatch_impls.items():
         for dispatch_type, impl in impls:

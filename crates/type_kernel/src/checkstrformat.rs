@@ -519,10 +519,13 @@ fn parse_format_value_inner(format_value: &str, depth: u32) -> (i32, Vec<SpecTup
 // ===== Placeholder format spec taxonomy =====
 // Parses the format_spec (the part after ':' in a str.format() placeholder)
 // into its individual components, matching Python's FORMAT_RE_NEW structure.
-// Returns Option<(fill, align, sign, alt, zero_pad, width, grouping, precision, conv_type)>.
+
+// Returns Option<(fill, align, sign, alt, zero_pad, width, grouping, precision,
+// conv_type)>.
 
 /// Parsed placeholder format spec tuple returned to Python.
-/// Fields: (fill, align, sign, alternate, zero_pad, width, grouping, precision, conv_type)
+/// Fields: (fill, align, sign, alternate, zero_pad, width, grouping, precision,
+/// conv_type)
 type PlaceholderSpecTuple = (
     Option<String>,
     Option<String>,
@@ -651,6 +654,7 @@ fn parse_placeholder_format_inner(spec: &str) -> Option<PlaceholderSpecTuple> {
 // ===== Conversion specifier analysis =====
 // Mirrors analyze_conversion_specifiers: classifies a list of specifiers into
 // whether they have mapping keys, star widths/precisions, etc. Pure analysis,
+
 // no mutation or error reporting — Python handles those.
 
 /// Spec info needed for analysis: (key_present, conv_type, width, precision).
@@ -871,7 +875,8 @@ mod tests {
 
     #[test]
     fn test_parse_placeholder_full() {
-        // "x<+#012,.3f" — fill=x, align=<, sign=+, alt=#, zero=0, width=12, grouping=,, precision=.3, type=f
+        // "x<+#012,.3f" — fill=x, align=<, sign=+, alt=#, zero=0, width=12,
+        // grouping=,, precision=.3, type=f
         let spec = rust_parse_placeholder_format("x<+#012,.3f");
         assert!(spec.is_some());
         let (fill, align, sign, alt, zero, width, grouping, precision, conv_type) = spec.unwrap();

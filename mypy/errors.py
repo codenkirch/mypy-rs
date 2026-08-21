@@ -570,6 +570,7 @@ class Errors:
         # The path will be simplified later, in render_messages. That way
         #  * 'file' is always a key that uniquely identifies a source file
         #    that mypy read (simplified paths might not be unique); and
+
         #  * we only have to simplify in one place, while still supporting
         #    reporting errors for files other than the one currently being
         #    processed.
@@ -788,6 +789,7 @@ class Errors:
         # process the stack of ErrorWatchers before modifying any internal state
         # in case we need to filter out the error entirely
         # NB: we need to do this both here and in _add_error_info, otherwise we
+
         # might incorrectly update the sets of ignored or only_once messages
         if self._filter_error(file, info):
             return
@@ -819,6 +821,7 @@ class Errors:
             # Missing stubs can easily cause thousands of errors about
             # Any types, especially when upgrading to mypy 0.900,
             # which no longer bundles third-party library stubs. Avoid
+
             # showing too many errors to make it easier to see
             # import-related errors.
             info.hidden = True
@@ -1136,7 +1139,8 @@ class Errors:
 
         source_lines = None
         if self.options.pretty and self.read_source:
-            # Find shadow file mapping and read source lines if a shadow file exists for the given path.
+            # Find shadow file mapping and read source lines if a shadow file exists for
+            # the given path.
             # If shadow file mapping is not found, read source lines
             mapped_path = self.find_shadow_file_mapping(path)
             if mapped_path:

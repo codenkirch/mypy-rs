@@ -33,17 +33,23 @@ class FuncInfo:
         # that are nested inside of other functions.
         self._callable_class: ImplicitClass | None = None
         # Environment classes are ClassIR instances that contain attributes representing the
-        # variables in the environment of the function they correspond to. Environment classes are
+        # variables in the environment of the function they correspond to. Environment
+        # classes are
+
         # generated for functions that contain nested functions.
         self._env_class: ClassIR | None = None
-        # Generator classes implement the '__next__' method, and are used to represent generators
+        # Generator classes implement the '__next__' method, and are used to represent
+        # generators
         # returned by generator functions.
         self._generator_class: GeneratorClass | None = None
         # Environment class registers are the local registers associated with instances of an
-        # environment class, used for getting and setting attributes. curr_env_reg is the register
+        # environment class, used for getting and setting attributes. curr_env_reg is
+        # the register
+
         # associated with the current environment.
         self._curr_env_reg: Value | None = None
-        # These are flags denoting whether a given function is nested, contains a nested function,
+        # These are flags denoting whether a given function is nested, contains a nested
+        # function,
         # is decorated, or is within a non-extension class.
         self.is_nested = is_nested
         self.contains_nested = contains_nested
@@ -53,6 +59,7 @@ class FuncInfo:
         # Comprehension scopes are lightweight scope boundaries created when
         # a comprehension body contains a lambda. The comprehension is still
         # inlined (same basic blocks), but we push a new FuncInfo so the
+
         # closure machinery can capture loop variables through env classes.
         self.is_comprehension_scope = is_comprehension_scope
 
@@ -126,7 +133,9 @@ class ImplicitClass:
         # The register associated with the 'self' instance for this generator class.
         self._self_reg: Value | None = None
         # Environment class registers are the local registers associated with instances of an
-        # environment class, used for getting and setting attributes. curr_env_reg is the register
+        # environment class, used for getting and setting attributes. curr_env_reg is
+        # the register
+
         # associated with the current environment. prev_env_reg is the self.__mypyc_env__ field
         # associated with the previous environment.
         self._curr_env_reg: Value | None = None
@@ -165,7 +174,8 @@ class GeneratorClass(ImplicitClass):
 
     def __init__(self, ir: ClassIR) -> None:
         super().__init__(ir)
-        # This register holds the label number that the '__next__' function should go to the next
+        # This register holds the label number that the '__next__' function should go to
+        # the next
         # time it is called.
         self._next_label_reg: Value | None = None
         self._next_label_target: AssignmentTarget | None = None

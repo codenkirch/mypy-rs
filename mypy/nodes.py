@@ -82,6 +82,7 @@ from mypy.visitor import ExpressionVisitor, NodeVisitor, StatementVisitor
 # Issue #457: Node object-model pure predicates. When the `type_kernel`
 # Rust extension is importable and `Options.native_type_kernel` is set,
 # the pure predicates below (`has_self_or_cls_argument`, `is_dynamic`,
+
 # `is_generic`, `is_metaclass`, `has_base`) route through Rust. The Rust
 # path raises AssertionError/NotImplementedError for unhandled cases, in
 # which case we fall back to the pure-Python implementation.
@@ -188,6 +189,7 @@ MDEF: Final = 2
 # Placeholder for a name imported via 'from ... import'. Second phase of
 # semantic will replace this the actual imported reference. This is
 # needed so that we can detect whether a name has been imported during
+
 # XXX what?
 UNBOUND_IMPORTED: Final = 3
 
@@ -198,6 +200,7 @@ REVEAL_LOCALS: Final = 1
 # Kinds of 'literal' expressions.
 #
 # Use the function mypy.literals.literal to calculate these.
+
 #
 # TODO: Can we make these less confusing?
 LITERAL_YES: Final = 2  # Value of expression known statically
@@ -676,6 +679,7 @@ class ImportBase(Statement):
     # If an import replaces existing definitions, we construct dummy assignment
     # statements that assign the imported names to the names in the current scope,
     # for type checking purposes. Example:
+
     #
     #     x = 1
     #     from m import x   <-- add assignment representing "x = m.x"
@@ -798,12 +802,15 @@ class FuncBase(Node):
         # Can this function/method define variables or infer variables defined outside?
         # In particular, we set this in cases like:
         #     x = None
+
         #     def foo() -> None:
         #         global x
         #         x = 1
+
         # and
         #     class C:
         #         x = None
+
         #         def foo(self) -> None:
         #             self.x = 1
         self.def_or_infer_vars = False
@@ -1230,6 +1237,7 @@ class FuncDef(FuncItem, SymbolNode, Statement):
         # We're deliberating omitting arguments and storing only arg_names and
         # arg_kinds for space-saving reasons (arguments is not used in later
         # stages of mypy).
+
         # TODO: After a FuncDef is deserialized, the only time we use `arg_names`
         # and `arg_kinds` is when `type` is None and we need to infer a type. Can
         # we store the inferred type ahead of time?
@@ -1366,6 +1374,7 @@ class FuncDef(FuncItem, SymbolNode, Statement):
 # All types that are both SymbolNodes and FuncBases. See the FuncBase
 # docstring for the rationale.
 # See https://github.com/python/mypy/pull/13607#issuecomment-1236357236
+
 # TODO: we want to remove this at some point and just use `FuncBase` ideally.
 SYMBOL_FUNCBASE_TYPES: Final = (OverloadedFuncDef, FuncDef)
 
@@ -1566,9 +1575,11 @@ class Var(SymbolNode):
         # This is True for a variable that was declared on self with an explicit type:
         #     class C:
         #         def __init__(self) -> None:
+
         #             self.x: int
         # This case is important because this defines a new Var, even if there is one
         # present in a superclass (without explicit type this doesn't create a new Var).
+
         # See SemanticAnalyzer.analyze_member_lvalue() for details.
         self.explicit_self_type = False
         # If True, this is an implicit Var created due to module-level __getattr__.
@@ -1881,6 +1892,7 @@ class Block(Statement):
         # True if we can determine that this block is not executed during semantic
         # analysis. For example, this applies to blocks that are protected by
         # something like "if PY3:" when using Python 2. However, some code is
+
         # only considered unreachable during type checking and this is not true
         # in those cases.
         self.is_unreachable = is_unreachable
@@ -1947,6 +1959,7 @@ class AssignmentStmt(Statement):
     # Is this a final definition?
     # Final attributes can't be re-assigned once set, and can't be overridden
     # in a subclass. This flag is not set if an attempted declaration was found to
+
     # be invalid during semantic analysis. It is still set to `True` if
     # a final declaration overrides another final declaration (this is checked
     # during type checking when MROs are known).
@@ -2150,7 +2163,8 @@ class IfStmt(Statement):
     # empty else block and mark it permanently as unreachable to tell that the control flow
     # must always go through the if block.)
     unreachable_else: bool
-    # (Type checking may modify this flag repeatedly to indicate whether an actually available
+    # (Type checking may modify this flag repeatedly to indicate whether an actually
+    # available
     # or unavailable else block is unreachable, considering the current type information.)
 
     def __init__(self, expr: list[Expression], body: list[Block], else_body: Block | None) -> None:
@@ -2328,6 +2342,7 @@ class IntExpr(Expression):
 # How mypy uses StrExpr and BytesExpr:
 #
 # b'x' -> BytesExpr
+
 # 'x', u'x' -> StrExpr
 
 
@@ -2367,9 +2382,11 @@ class BytesExpr(Expression):
     # Note: we deliberately do NOT use bytes here because it ends up
     # unnecessarily complicating a lot of the result logic. For example,
     # we'd have to worry about converting the bytes into a format we can
+
     # easily serialize/deserialize to and from JSON, would have to worry
     # about turning the bytes into a human-readable representation in
     # error messages...
+
     #
     # It's more convenient to just store the human-readable representation
     # from the very start.
@@ -2474,6 +2491,7 @@ class RefExpr(Expression):
         # Does this define a new name with inferred type?
         #
         # For members, after semantic analysis, this does not take base
+
         # classes into consideration at all; the type checker deals with these.
         self.is_inferred_def = False
         # Is this expression appears as an rvalue of a valid type alias definition?
@@ -2769,6 +2787,7 @@ class OpExpr(Expression):
 # Expression subtypes that could represent the root of a valid type expression.
 #
 # May have an "as_type" attribute to hold the type for a type expression parsed
+
 # during the SemanticAnalyzer pass.
 MaybeTypeExpression = (IndexExpr, MemberExpr, NameExpr, OpExpr, StrExpr)
 
@@ -3002,6 +3021,7 @@ class TemplateStrExpr(Expression):
     # Each item is either:
     #   - a StrExpr (literal string segment), or
     #   - a tuple (value_expr, source_text, conversion, format_spec_expr)
+
     #     where conversion is str | None ("r", "s", "a", or None)
     #     and format_spec_expr is Expression | None
     items: list[Expression | tuple[Expression, str, str | None, Expression | None]]
@@ -3196,9 +3216,11 @@ class TypeApplication(Expression):
 # Variance of a type variable. For example, T in the definition of
 # List[T] is invariant, so List[int] is not a subtype of List[object],
 # and also List[object] is not a subtype of List[int].
+
 #
 # The T in Iterable[T] is covariant, so Iterable[int] is a subtype of
 # Iterable[object], but not vice versa.
+
 #
 # If T is contravariant in Foo[T], Foo[object] is a subtype of
 # Foo[int], but not vice versa.
@@ -3235,6 +3257,7 @@ class TypeVarLikeExpr(SymbolNode, Expression):
     # Variance of the type variable. Invariant is the default.
     # TypeVar(..., covariant=True) defines a covariant type variable.
     # TypeVar(..., contravariant=True) defines a contravariant type
+
     # variable.
     variance: int
     # Record instances and type aliases that appear bare/implicit in the default value
@@ -3634,8 +3657,11 @@ class TempNode(Expression):
     __slots__ = ("type", "no_rhs")
 
     type: mypy.types.Type
-    # Is this TempNode used to indicate absence of a right hand side in an annotated assignment?
-    # (e.g. for 'x: int' the rvalue is TempNode(AnyType(TypeOfAny.special_form), no_rhs=True))
+    # Is this TempNode used to indicate absence of a right hand side in an annotated
+    # assignment?
+    # (e.g. for 'x: int' the rvalue is TempNode(AnyType(TypeOfAny.special_form),
+
+    # no_rhs=True))
     no_rhs: bool
 
     def __init__(
@@ -3764,7 +3790,8 @@ class TypeInfo(SymbolNode):
     is_protocol: bool  # Is this a protocol class?
     runtime_protocol: bool  # Does this protocol support isinstance checks?
     # List of names of abstract attributes together with their abstract status.
-    # The abstract status must be one of `NOT_ABSTRACT`, `IS_ABSTRACT`, `IMPLICITLY_ABSTRACT`.
+    # The abstract status must be one of `NOT_ABSTRACT`, `IS_ABSTRACT`,
+    # `IMPLICITLY_ABSTRACT`.
     abstract_attributes: list[tuple[str, int]]
     deletable_attributes: list[str]  # Used by mypyc only
     # Does this type have concrete `__slots__` defined?
@@ -3774,32 +3801,47 @@ class TypeInfo(SymbolNode):
 
     # The attributes 'assuming' and 'assuming_proper' represent structural subtype matrices.
     #
-    # In languages with structural subtyping, one can keep a global subtype matrix like this:
+    # In languages with structural subtyping, one can keep a global subtype matrix like
+
+    # this:
     #   . A B C .
     #   A 1 0 0
+
     #   B 1 1 1
     #   C 1 0 1
     #   .
+
     # where 1 indicates that the type in corresponding row is a subtype of the type
     # in corresponding column. This matrix typically starts filled with all 1's and
-    # a typechecker tries to "disprove" every subtyping relation using atomic (or nominal) types.
+    # a typechecker tries to "disprove" every subtyping relation using atomic (or
+
+    # nominal) types.
     # However, we don't want to keep this huge global state. Instead, we keep the subtype
     # information in the form of list of pairs (subtype, supertype) shared by all Instances
-    # with given supertype's TypeInfo. When we enter a subtype check we push a pair in this list
-    # thus assuming that we started with 1 in corresponding matrix element. Such algorithm allows
-    # to treat recursive and mutually recursive protocols and other kinds of complex situations.
+
+    # with given supertype's TypeInfo. When we enter a subtype check we push a pair in
+    # this list
+    # thus assuming that we started with 1 in corresponding matrix element. Such
+
+    # algorithm allows
+    # to treat recursive and mutually recursive protocols and other kinds of complex
+    # situations.
+
     #
     # If concurrent/parallel type checking will be added in future,
     # then there should be one matrix per thread/process to avoid false negatives
+
     # during the type checking phase.
     assuming: list[tuple[mypy.types.Instance, mypy.types.Instance]]
     assuming_proper: list[tuple[mypy.types.Instance, mypy.types.Instance]]
     # Ditto for temporary 'inferring' stack of recursive constraint inference.
     # It contains Instances of protocol types that appeared as an argument to
     # constraints.infer_constraints(). We need 'inferring' to avoid infinite recursion for
+
     # recursive and mutually recursive protocols.
     #
     # We make 'assuming' and 'inferring' attributes here instead of passing they as kwargs,
+
     # since this would require to pass them in many dozens of calls. In particular,
     # there is a dependency infer_constraint -> is_subtype -> is_callable_subtype ->
     # -> infer_constraints.
@@ -3813,6 +3855,7 @@ class TypeInfo(SymbolNode):
     # If true, any unknown attributes should have type 'Any' instead
     # of generating a type error.  This would be true if there is a
     # base class with type 'Any', but other use cases may be
+
     # possible. This is similar to having __getattr__ that returns Any
     # (and __setattr__), but without the __getattr__ method.
     fallback_to_any: bool
@@ -3835,15 +3878,18 @@ class TypeInfo(SymbolNode):
     # Another type which this type will be treated as a subtype of,
     # even though it's not a subclass in Python.  The non-standard
     # `@_promote` decorator introduces this, and there are also
+
     # several builtin examples, in particular `int` -> `float`.
     _promote: list[mypy.types.ProperType]
 
     # This is used for promoting native integer types such as 'i64' to
     # 'int'. (_promote is used for the other direction.) This only
     # supports one-step promotions (e.g., i64 -> int, not
+
     # i64 -> int -> float, and this isn't used to promote in joins.
     #
     # This results in some unintuitive results, such as that even
+
     # though i64 is compatible with int and int is compatible with
     # float, i64 is *not* compatible with float.
     alt_promote: mypy.types.Instance | None
@@ -3851,6 +3897,7 @@ class TypeInfo(SymbolNode):
     # Representation of a Tuple[...] base class, if the class has any
     # (e.g., for named tuples). If this is not None, the actual Type
     # object used for this class is not an Instance but a TupleType;
+
     # the corresponding Instance is set as the fallback type of the
     # tuple type.
     tuple_type: mypy.types.TupleType | None
@@ -3875,9 +3922,11 @@ class TypeInfo(SymbolNode):
     # Store type alias representing this type (for named tuples and TypedDicts).
     # Although definitions of these types are stored in symbol tables as TypeInfo,
     # when a type analyzer will find them, it should construct a TupleType, or
+
     # a TypedDict type. However, we can't use the plain types, since if the definition
     # is recursive, this will create an actual recursive structure of types (i.e. as
     # internal Python objects) causing infinite recursions everywhere during type checking.
+
     # To overcome this, we create a TypeAlias node, that will point to these types.
     # We store this node in the `special_alias` attribute, because it must be the same node
     # in case we are doing multiple semantic analysis passes.
@@ -3886,7 +3935,8 @@ class TypeInfo(SymbolNode):
     # Shared type variable for typing.Self in this class (if used, otherwise None).
     self_type: mypy.types.TypeVarType | None
 
-    # Added if the corresponding class is directly decorated with `typing.dataclass_transform`
+    # Added if the corresponding class is directly decorated with
+    # `typing.dataclass_transform`
     dataclass_transform_spec: DataclassTransformSpec | None
 
     # Is set to `True` when class is decorated with `@typing.type_check_only`
@@ -3902,14 +3952,17 @@ class TypeInfo(SymbolNode):
     # Type variables whose defaults depend on defaults of type variables in other classes
     # and type aliases. We keep track of this to safely handle situations like this one:
     #     class C[T = D]: ...
+
     #     class D[S = C]: ...
     #     x: C
     # Since we apply fix_instance() eagerly, inferring a precise type is quite tricky.
+
     # Therefore, we infer the type of `x` as `C[D[Any]]` to avoid infinite recursion.
     # Keys are type variable full names.
     default_depends: dict[str, set[TypeAlias | TypeInfo]]
 
-    # If defn is TypedDictType, stores information needed for delayed validation of inheritance.
+    # If defn is TypedDictType, stores information needed for delayed validation of
+    # inheritance.
     typeddict_data: TypedDictData | None
 
     FLAGS: Final = [
@@ -4045,6 +4098,7 @@ class TypeInfo(SymbolNode):
             # Case 1:
             #
             # class MyEnum(Enum):
+
             #     @member
             #     def some(self): ...
             if isinstance(sym.node, Decorator):
@@ -4058,9 +4112,11 @@ class TypeInfo(SymbolNode):
             # Case 2:
             #
             # class MyEnum(Enum):
+
             #     x = 1
             #
             # Case 3:
+
             #
             # class MyEnum(Enum):
             #     class Other: ...
@@ -4366,12 +4422,15 @@ class TypeInfo(SymbolNode):
         # NOTE: ti.mro will be set in the fixup phase based on these
         # names.  The reason we need to store the mro instead of just
         # recomputing it from base classes has to do with a subtle
+
         # point about fine-grained incremental: the cache files might
         # not be loaded until after a class in the mro has changed its
         # bases, which causes the mro to change. If we recomputed our
+
         # mro, we would compute the *new* mro, which leaves us with no
         # way to detect that the mro has changed! Thus we need to make
         # sure to load the original mro so that once the class is
+
         # rechecked, it can tell that the mro has changed.
         ti._mro_refs = data["mro"]
         ti.tuple_type = (
@@ -4466,12 +4525,15 @@ class TypeInfo(SymbolNode):
         # NOTE: ti.mro will be set in the fixup phase based on these
         # names.  The reason we need to store the mro instead of just
         # recomputing it from base classes has to do with a subtle
+
         # point about fine-grained incremental: the cache files might
         # not be loaded until after a class in the mro has changed its
         # bases, which causes the mro to change. If we recomputed our
+
         # mro, we would compute the *new* mro, which leaves us with no
         # way to detect that the mro has changed! Thus, we need to make
         # sure to load the original mro so that once the class is
+
         # rechecked, it can tell that the mro has changed.
         ti._mro_refs = read_str_list(data)
         ti._promote = cast(list[mypy.types.ProperType], mypy.types.read_type_list(data))
@@ -4527,22 +4589,31 @@ class FakeInfo(TypeInfo):
     # types.py defines a single instance of this class, called types.NOT_READY.
     # This instance is used as a temporary placeholder in the process of de-serialization
     # of 'Instance' types. The de-serialization happens in two steps: In the first step,
+
     # Instance.type is set to NOT_READY. In the second step (in fixup.py) it is replaced by
     # an actual TypeInfo. If you see the assertion error below, then most probably something
-    # went wrong during the second step and an 'Instance' that raised this error was not fixed.
+    # went wrong during the second step and an 'Instance' that raised this error was not
+
+    # fixed.
     # Note:
     # 'None' is not used as a dummy value for two reasons:
+
     # 1. This will require around 80-100 asserts to make 'mypy --strict-optional mypy'
     #    pass cleanly.
-    # 2. If NOT_READY value is accidentally used somewhere, it will be obvious where the value
+    # 2. If NOT_READY value is accidentally used somewhere, it will be obvious where the
+
+    # value
     #    is from, whereas a 'None' value could come from anywhere.
     #
+
     # Additionally, this serves as a more general-purpose placeholder
     # for missing TypeInfos in a number of places where the excuses
     # for not being Optional are a little weaker.
+
     #
     # TypeInfo defines a __bool__ method that returns False for FakeInfo
     # so that it can be conveniently tested against in the same way that it
+
     # would be if things were properly optional.
     def __init__(self, msg: str) -> None:
         self.msg = msg
@@ -5215,6 +5286,7 @@ class SymbolTable(dict[str, SymbolTableNode]):
             # Skip __builtins__: it's a reference to the builtins
             # module that gets added to every module by
             # SemanticAnalyzerPass2.visit_file(), but it shouldn't be
+
             # accessed by users of the module.
             if key == "__builtins__" or value.no_serialize:
                 continue
@@ -5236,6 +5308,7 @@ class SymbolTable(dict[str, SymbolTableNode]):
             # Skip __builtins__: it's a reference to the builtins
             # module that gets added to every module by
             # SemanticAnalyzerPass2.visit_file(), but it shouldn't be
+
             # accessed by users of the module.
             if key == "__builtins__" or value.no_serialize:
                 continue
@@ -5279,7 +5352,9 @@ class DataclassTransformSpec:
         kw_only_default: bool | None = None,
         field_specifiers: tuple[str, ...] | None = None,
         # Specified outside of PEP 681:
-        # frozen_default was added to CPythonin https://github.com/python/cpython/pull/99958 citing
+        # frozen_default was added to CPythonin
+        # https://github.com/python/cpython/pull/99958 citing
+
         # positive discussion in typing-sig
         frozen_default: bool | None = None,
     ) -> None:
@@ -5520,6 +5595,7 @@ def local_definitions(
                     # This logic for plugin generated nodes preserves historical behavior.
                     # On one hand, we generally type-check plugin generated nodes, since
                     # some 3rd party plugins may rely on this behavior. On the other hand
+
                     # we skip nodes generated by mypy itself, these nodes are not added to
                     # the class AST (only to symbol table) as they often cut corners.
                     if symnode.plugin_generated and info and node not in info.defn.defs.body:

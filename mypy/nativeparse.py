@@ -232,6 +232,7 @@ def native_parse(
     # When source is None, the Rust extension would read the file directly via
     # fs::read_to_string (UTF-8), which ignores PEP 263 encoding declarations
     # (e.g. `# coding: ascii`). Read and decode here so decode errors surface
+
     # the same way build.py's get_source() handles them — as a CompileError
     # with "Cannot decode file: ..." (caught by the caller's wrap_context).
     if source is None:
@@ -1937,8 +1938,10 @@ def fix_function_overloads(state: State, stmts: list[Statement]) -> list[Stateme
             if isinstance(stmt, FuncDef):
                 # This is, strictly speaking, wrong: there might be a decorated
                 # implementation. However, it only affects the error message we show:
+
                 # ideally it's "already defined", but "implementation must come last"
                 # is also reasonable.
+
                 # TODO: can we get rid of this completely and just always emit
                 # "implementation must come last" instead?
                 last_unconditional_func_def = stmt.name
@@ -1951,6 +1954,7 @@ def fix_function_overloads(state: State, stmts: list[Statement]) -> list[Stateme
             # IfStmt only contains stmts relevant to current_overload.
             # Check if stmts are reachable and add them to current_overload,
             # otherwise skip IfStmt to allow subsequent overload
+
             # or function definitions.
             skipped_if_stmts.append(stmt)
             if if_block_with_overload is None:
@@ -1998,6 +2002,7 @@ def fix_function_overloads(state: State, stmts: list[Statement]) -> list[Stateme
             # If we have multiple decorated functions named "_" next to each, we want to treat
             # them as a series of regular FuncDefs instead of one OverloadedFuncDef because
             # most of mypy/mypyc assumes that all the functions in an OverloadedFuncDef are
+
             # related, but multiple underscore functions next to each other aren't necessarily
             # related
             last_unconditional_func_def = None
@@ -2118,6 +2123,7 @@ def _read_and_set_import_metadata(
     # Extract individual flags using bitwise operations
     # Bit 0: is_top_level
     # Bit 1: is_unreachable
+
     # Bit 2: is_mypy_only
     # Bit 3: omit from dependency discovery
     stmt.is_top_level = (flags & 0x01) != 0

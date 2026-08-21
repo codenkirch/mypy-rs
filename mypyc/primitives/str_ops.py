@@ -72,6 +72,7 @@ binary_op(
 # str1 += str2
 #
 # PyUnicode_Append makes an effort to reuse the LHS when the refcount
+
 # is 1. This is super dodgy but oh well, the interpreter does it.
 binary_op(
     name="+=",
@@ -576,7 +577,8 @@ str_range_check_op = custom_primitive_op(
     dependencies=[STR_EXTRA_OPS],
 )
 
-# str.__getitem__() as int - get character at index as int (ord value) - no bounds checking
+# str.__getitem__() as int - get character at index as int (ord value) - no bounds
+# checking
 str_get_item_unsafe_as_int_op = custom_primitive_op(
     name="str_get_item_unsafe_as_int",
     arg_types=[str_rprimitive, int64_rprimitive],

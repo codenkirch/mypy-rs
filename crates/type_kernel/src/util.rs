@@ -236,6 +236,7 @@ pub fn rust_bytes_to_human_readable_repr(b: &[u8]) -> String {
     // Python's repr(bytes) wraps in single quotes by default; it wraps in
     // double quotes only when the content has a ' but no ". Mirror that:
     // escape ' only when the outer wrapper is single (i.e. not the
+
     // has-single-and-not-double case), escape " only when outer is double.
     let outer_double = b.contains(&b'\'') && !b.contains(&b'"');
     let mut out = String::new();

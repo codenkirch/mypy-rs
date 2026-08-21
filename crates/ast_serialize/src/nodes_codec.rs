@@ -1,6 +1,8 @@
-//! Complete AST Node Codec & Serialization Engine (Phase 5, Component 1) for Issue #134.
+//! Complete AST Node Codec & Serialization Engine (Phase 5, Component 1) for Issue
+//! #134.
 //!
-//! Implements binary codec representation for AST Expression, Statement, and SymbolTable nodes.
+//! Implements binary codec representation for AST Expression, Statement, and
+//! SymbolTable nodes.
 
 use std::collections::HashMap;
 

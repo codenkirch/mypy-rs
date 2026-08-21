@@ -157,6 +157,7 @@ pub(crate) fn expanded_alias_target(
         // Build the substitution env from zip(alias_tvars, args),
         // mirroring _expand_once's `v.id: s ...}` mapping. If the arg
         // count mismatches, Python's zip truncates and leaves some
+
         // typevars unbound, which would leave TypeVar nodes in the
         // target that the predicate can safely treat as non-Any. The
         // exact flag is a defer (conservative).
@@ -233,9 +234,11 @@ pub(crate) fn has_any_type_inner(
 ) -> Option<bool> {
     // `seen` holds alias fullnames already visited on this descent,
     // mirroring BoolTypeQuery.seen_aliases (type_visitor.py:604-607):
+
     // a repeated alias short-circuits to the strategy default (false
     // for ANY_STRATEGY). This terminates recursive aliases like
     // `A = List[A]` that `expanded_alias_target`'s per-call chain
+
     // detection cannot see across the has_any_type recursion boundary.
     let mut seen: Vec<String> = Vec::new();
     has_any_type_inner_seen(typ, ignore_in_type_obj, aliases, &mut seen)
@@ -250,6 +253,7 @@ fn has_any_type_inner_seen(
     if let Type::TypeAliasType { type_ref, .. } = typ {
         // Python's BoolTypeQuery.visit_type_alias_type (type_visitor.py:598)
         // visits the substituted target and (for new-style aliases only)
+
         // the args. `expanded_alias_target` substitutes exactly like
         // TypeAliasType._expand_once; when the substitution defers we
         // defer the whole query (parity-safe).
@@ -366,6 +370,7 @@ fn children(typ: &Type) -> Vec<&Type> {
         // TypeVar families carry bounds/defaults/values that must be
         // queried: Python's BoolTypeQuery.visit_type_var / param_spec /
         // type_var_tuple visit upper_bound + default (only when
+
         // has_default()) + values/prefix. The no-default sentinel
         // (from_omitted_generics) is not a real Any and is skipped.
         // TypeVarTupleType's tuple_fallback is NOT visited by Python.
@@ -477,6 +482,7 @@ fn has_uninhabited_component_inner_seen(
     if let Type::TypeAliasType { type_ref, .. } = typ {
         // Python's BoolTypeQuery.visit_type_alias_type (type_visitor.py:598)
         // visits the substituted target and (for new-style aliases only)
+
         // the args. When the substitution defers we defer the whole query
         // (parity-safe).
         if seen.contains(type_ref) {
@@ -1510,6 +1516,7 @@ fn conditional_join_inner(
     // Re-use setops::trivial_join which handles the common cases:
     // - subtype check s <: t → return t
     // - subtype check t <: s → return s
+
     // - Instance right → return object
     match crate::setops::trivial_join(if_type, else_type, &ctx, resolver) {
         Some(crate::setops::SetOpResult::SameS) => encode_type(if_type),
@@ -1557,6 +1564,7 @@ fn conditional_join_inner(
             // Same-type Instance-Instance join with per-arg discriminators.
             // Per-arg reconstruction: disc 0 -> if_type.args[i], disc 1
             // -> else_type.args[i] (mirrors join.py:425-441). The
+
             // operands must be Instances to index args; defer otherwise.
             let (
                 Type::Instance { args: if_args, .. },
@@ -1781,6 +1789,7 @@ fn join_type_list_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option
             }) => {
                 // Per-arg reconstruction: disc 0 -> result.args[i],
                 // disc 1 -> item.args[i] (mirrors join.py:425-441).
+
                 // The operands must be Instances to index args;
                 // defer otherwise.
                 let (Type::Instance { args: r_args, .. }, Type::Instance { args: i_args, .. }) =
@@ -2034,6 +2043,7 @@ fn combined_context_inner(
     // proper_subtype=True preserves Any/alias items (Python's
     // _remove_redundant_union_items uses is_proper_subtype). Nested
     // union items flatten (step 1), single items fast-path (step 2),
+
     // aliases defer (flatten rejects them) -> Python get_proper_type.
     let ctx = SubtypeContext::new(false, false, false, true, true, true);
     let result = crate::setops::make_simplified_union(&items, &ctx, resolver, true)?;
@@ -2141,6 +2151,7 @@ fn any_type(type_of_any: i64, source_any: Option<Box<Type>>) -> Type {
 // ---------------------------------------------------------------------------
 // Issue #486: tuple-index / tuple-slice helpers (visit_tuple_index_helper,
 // visit_tuple_slice_helper, try_getting_int_literals)
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.checkexpr.try_getting_int_literals` — extract int literal values
@@ -2641,6 +2652,7 @@ mod tests {
     fn test_has_any_type_alias_expands_typevar_arg_any_true() {
         // A[T] = List[T], applied as A[Any]: the substitution must
         // replace T with Any so has_any_type answers true (B3b core).
+
         // The snapshot's alias_tvars declares T with raw_id 7;
         // the wire TypeAliasType node carries args=[Any].
         let mut resolver = empty_alias_resolver();
@@ -2688,6 +2700,7 @@ mod tests {
         // A[T] = List[T], applied A[int]: substitution yields List[int]
         // (no Any) and the old-style alias does not visit args, so the
         // answer is false (Python parity: visit_type_alias_type visits the
+
         // proper target only).
         let mut resolver = empty_alias_resolver();
         let tv = crate::aliases::AliasTvar {
@@ -2738,6 +2751,7 @@ mod tests {
         // New-style (PEP 695) alias A[T] = Callable[[T], int] applied
         // A[Any]: the target Callable[[Any], int] contains Any, so true
         // regardless of the args-visit; use an alias whose target has NO
+
         // typevars so only the args can carry Any.
         let mut resolver = empty_alias_resolver();
         let tv = crate::aliases::AliasTvar {
@@ -2806,6 +2820,7 @@ mod tests {
         // A[T] = List[T] applied with zero args: build_alias_env sees a
         // length mismatch? No, zip truncates, leaving T unbound. Python
         // leaves the TypeVar in the target (not Any), so has_any_type is
+
         // false. The Rust env maps nothing (zip over empty), the TypeVar
         // survives, and Instance[List[T]] has no Any -> false. This
         // matches Python's zip-truncate semantics.
@@ -2859,6 +2874,7 @@ mod tests {
         // no_args alias: target returned as-is (parity-safe, production
         // strips typevars). Chain-extension with the top-level args is not
         // needed; verify a no_args alias with a plain target answers
+
         // correctly.
         let mut resolver = empty_alias_resolver();
         resolver.insert(
@@ -2885,6 +2901,7 @@ mod tests {
         // A = List[A]: expanded_alias_target must detect the cycle and
         // defer, never looping. Python's get_proper_type also cannot
         // terminate on recursive aliases, and BoolTypeQuery's
+
         // seen_aliases set short-circuits to default, so defer is the
         // parity-safe answer.
         let mut resolver = empty_alias_resolver();
@@ -2915,6 +2932,7 @@ mod tests {
         // A[T] = List[T] applied A[int] where the env's TypeVar key does
         // not match (raw_id 7 vs declared 8): expand_type_inner leaves T
         // unbound -> the target keeps a TypeVar node. has_any_type only
+
         // traverses values/upper_bound/default of TypeVar (never the
         // bare node), so it answers false, matching Python (the T is
         // non-Any). This documents the non-deferring substitution path.
@@ -3042,6 +3060,7 @@ mod tests {
         // `T = TypeVar('T')`: default is the from_omitted_generics
         // sentinel (type_of_any=4), which is NOT a real Any. Python's
         // HasAnyType.visit_type_var only visits the default when
+
         // has_default() is true. The sentinel must be skipped (B3b
         // regression: it was treated as a real Any -> spurious true).
         for default in [
@@ -3138,6 +3157,7 @@ mod tests {
         // TypeVarTuple's tuple_fallback is NOT visited by Python
         // (visit_type_var_tuple visits upper_bound + default only). An
         // Any in tuple_fallback must not trigger a hit, and the sentinel
+
         // default must be skipped. Both directions of that bug are here.
         let tvt = Type::TypeVarTupleType {
             name: "Ts".to_string(),
@@ -3198,6 +3218,7 @@ mod tests {
         // A TypeVar with a genuine UninhabitedType default must be
         // detected through all_children (children() covers TypeVarType;
         // the sentinel filter only drops the no-default Any, never an
+
         // UninhabitedType default).
         let tv = Type::TypeVarType {
             name: "T".to_string(),
@@ -3372,9 +3393,11 @@ mod tests {
         // A = List[A]. The target cannot encode (alias target cannot cross
         // the wire), so build a self-referential chain by hand: A's
         // snapshot target references A itself. expanded_alias_target's
+
         // per-call chain detection trips first and defers (None), exactly
         // like has_any_type's recursive-alias test: Python's
         // get_proper_type cannot terminate recursive aliases either, and
+
         // BoolTypeQuery's seen_aliases short-circuits to default, so defer
         // is the parity-safe answer.
         let mut resolver = empty_alias_resolver();
@@ -3874,6 +3897,7 @@ mod tests {
         // B = A, A = Type[int]; the snapshot chain must be followed.
         // Nested-alias targets don't round-trip through Rust's write_type,
         // so craft the B->A edge bytes by hand (Python's Type.write encodes
+
         // nested aliases, matching the production snapshot path).
         let mut aliases = crate::aliases::TypeAliasResolver::new();
         {
@@ -4347,6 +4371,7 @@ mod tests {
         .unwrap();
         // make_simplified_union([special-any, str]): proper-subtype dedup
         // decides both directions (str <: Any is False under proper, Any <:
+
         // str is False), so both items survive as a 2-item union. The
         // special-form Any is not contagious, matching Python's
         // _remove_redundant_union_items with an empty resolver.
@@ -4510,6 +4535,7 @@ mod tests {
         // With a populated resolver, int <: object → join is object.
         // Here (empty resolver) nominal subtype cannot be confirmed, so
         // trivial_join defers and the union fallback is returned. This
+
         // documents the conservative behavior: the kernel only returns
         // a definite join when the resolver can prove the subtype chain.
         let if_t = make_instance("builtins.int", vec![]);
@@ -4541,6 +4567,7 @@ mod tests {
         // Equal Instances with an empty resolver: is_subtype(int,int) is
         // None (no TypeInfo snapshot), so trivial_join defers and the union
         // of both branches is returned. Python's join would return int;
+
         // the Rust kernel conservatively defers via the union fallback.
         let t = make_instance("builtins.int", vec![]);
         let out = conditional_join_inner(&t, &t, &empty_resolver()).unwrap();

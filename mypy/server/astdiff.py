@@ -127,9 +127,10 @@ def _set_native_astdiff_active(active: bool) -> None:
 # Snapshot representation of a symbol table node or type. The representation is
 # opaque -- the only supported operations are comparing for equality and
 # hashing (latter for type snapshots only). Snapshots can contain primitive
+
 # objects, nested tuples, lists and dictionaries and primitive objects (type
 # snapshots are immutable).
-#
+
 # For example, the snapshot of the 'int' type is ('Instance', 'builtins.int', ()).
 
 # Type snapshots are strict, they must be hashable and ordered (e.g. for Unions).
@@ -209,6 +210,7 @@ def snapshot_symbol_table(name_prefix: str, table: SymbolTable) -> dict[str, Sym
             # This is a cross-reference to another module.
             # If the reference is busted because the other module is missing,
             # the node will be a "stale_info" TypeInfo produced by fixup,
+
             # but that doesn't really matter to us here.
             result[name] = ("Moduleref", common)
         elif isinstance(node, TypeVarExpr):
@@ -305,6 +307,7 @@ def snapshot_definition(node: SymbolNode | None, common: SymbolSnapshot) -> Symb
         # Note that decorated methods are represented by Decorator instances in
         # a symbol table since we need to preserve information about the
         # decorated function (whether it's a class function, for
+
         # example). Top-level decorated functions, however, are represented by
         # the corresponding Var node, since that happens to provide enough
         # context.
@@ -335,9 +338,11 @@ def snapshot_definition(node: SymbolNode | None, common: SymbolSnapshot) -> Symb
             # Note that the structure of type variables is a part of the external interface,
             # since creating instances might fail, for example:
             #     T = TypeVar('T', bound=int)
+
             #     class C(Generic[T]):
             #         ...
             #     x: C[str] <- this is invalid, and needs to be re-checked if `T` changes.
+
             # An alternative would be to create both deps: <...> -> C, and <...> -> <C>,
             # but this currently seems a bit ad hoc.
             tuple(snapshot_type(tdef) for tdef in node.defn.type_vars),

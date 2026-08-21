@@ -1913,8 +1913,9 @@ mod tests {
 
     // stdlib version-gating regression tests: is_module_inline must
     // replicate FindModuleCache.find_module typeshed version checks.
-    // Modules outside Python version range must NOT resolve in typeshed.
-    // as NOT_FOUND when targeting 3.10, so the dependency walk skips it via
+    // Modules outside Python version range must NOT resolve in typeshed
+
+    // as NOT_FOUND. When targeting 3.10, the dependency walk skips it via
     // `include_only_if_resolvable` instead of including it as a phantom dep.
 
     fn dep_records_versioned(
@@ -1967,6 +1968,7 @@ mod tests {
         // `tomllib` is registered in typeshed with min version (3, 11). When
         // targeting 3.10, `is_module` must NOT look it up in typeshed, so it
         // resolves as NOT_FOUND and the import (an unreachable dependency) is
+
         // skipped — mirroring Python's `find_module` + `_typeshed_has_version`.
         let f = fs().file("/typeshed/stdlib/tomllib/__init__.pyi", "");
         let mut r = imp("tomllib", 1);
@@ -2079,6 +2081,7 @@ mod tests {
         // Resolving `pkg.a` then `pkg.b` against the same package exercises the
         // shared `initial_components` cache (the toplevel-components lookup
         // for `/lib/pkg` is computed once for `pkg.a` and reused for `pkg.b`).
+
         // The test passes as long as both ids resolve correctly; the cache
         // sharing is the mechanism under test.
         let f = fs()
@@ -2099,6 +2102,7 @@ mod tests {
         // Per-id `follow_untyped_imports` must take effect: the same untyped
         // package (no `py.typed` marker) on `package_path` resolves as
         // FOUND_WITHOUT_TYPE_HINTS without follow, and as FOUND with it, in
+
         // the same batched call. Inlined (not via the `resolve_many` helper)
         // because the helper passes `search` as `mypy_path`, which doesn't
         // trigger the non-stub-helper branch.

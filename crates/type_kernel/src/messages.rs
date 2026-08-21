@@ -438,6 +438,7 @@ fn format_type_inner(
         // The wire format carries type_ref but no resolved alias node.
         // messages.py checks `typ.is_recursive` and `typ.alias`.
         // Without the resolved alias, we can't determine is_recursive
+
         // or alias.name. Return None to defer to Python.
         let _ = (type_ref, args, py);
         return None;
@@ -481,6 +482,7 @@ fn format_type_inner(
                 // No resolver entry: the TypeInfo was likely created at
                 // runtime (e.g. intersect_instance_callable's fake type)
                 // after the resolver snapshot was built. Defer to Python
+
                 // so it can access itype.type.name directly.
                 s.name.clone()
             };
@@ -764,6 +766,7 @@ fn format_type_inner(
             // messages.py:2833: FunctionLike dispatch.
             //
             // is_type_obj(): `fallback.type.is_metaclass() and not Uninhabited ret`.
+
             // is_metaclass: has_base("builtins.type") || fullname == "abc.ABCMeta"
             // || (fallback_to_any and not precise).
             let is_type_obj = match fallback.as_ref() {
@@ -861,6 +864,7 @@ fn format_type_inner(
             // Use pretty_callable for complex signatures (messages.py:2852).
             // pretty_callable needs FuncDef/definition data not present in
             // the wire format, and renders named/optional/star args with a
+
             // `def (name: T, ...) -> R` shape. Defer to Python.
             if use_pretty_callable {
                 let needs_pretty = arg_kinds
@@ -938,6 +942,7 @@ fn format_type_inner(
             // messages.py:2869: typ.accept(TypeStrVisitor)
             // The wire Display impl handles UnboundType, but format_type_inner
             // delegates to TypeStrVisitor which renders differently from
+
             // format_type_inner for some cases. For unbound types, the
             // rendering is the same (name + "?"). Defer to Python to be safe.
             None
@@ -1892,9 +1897,11 @@ pub fn rust_for_function(name: String) -> Option<String> {
     rust_callable_name(name).map(|n| format!(" for {n}"))
 }
 
-// ── dmypy server helper (Issue #358) ──────────────────────────────────────────
+// ── dmypy server helper (Issue #358)
+// ───────────────
 
-/// `mypy/util.py:count_stats` — count errors, notes and error_files in a message list.
+/// `mypy/util.py:count_stats` — count errors, notes and error_files in a
+/// message list.
 ///
 /// Pure computation over a `list[str]`. Called from `dmypy_server.py` during
 /// `initialize_fine_grained` and `increment_output` to compute the daemon status
@@ -1919,9 +1926,11 @@ pub fn rust_count_stats(messages: Vec<String>) -> (i64, i64, i64) {
 // ---------------------------------------------------------------------------
 // Pure string-message generators (Issue #438)
 // ---------------------------------------------------------------------------
+
 // These mirror the message-body construction in mypy/messages.py for the
 // functions that take only pre-resolved strings/ints (no live Type). The
 // Python wrapper extracts the needed data from CallableType / context and
+
 // passes it here; if we return None, Python falls back to its own body.
 
 /// `mypy/messages.py:947` — too_few_arguments message body.
@@ -2363,7 +2372,8 @@ mod tests {
         assert_eq!(append_numbers_notes_inner(&Type::NoneType), None);
     }
 
-    // ── Issue #438: pure string-message generators ──────────────────────────
+    // ── Issue #438: pure string-message generators
+    // ──────────────────────────
 
     #[test]
     fn test_too_few_arguments_simple() {

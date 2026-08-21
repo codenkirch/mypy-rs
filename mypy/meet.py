@@ -187,6 +187,7 @@ def meet_types(s: Type, t: Type) -> ProperType:
                 # Encoded: Rust built a new type and serialized it in
                 # the wire format. Decode via read_type(ReadBuffer),
                 # then resolve wire-only `type_ref` strings to live
+
                 # TypeInfo via join._fixup_decoded_type. If any type_ref
                 # is missing, defer to Python.
                 decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
@@ -197,6 +198,7 @@ def meet_types(s: Type, t: Type) -> ProperType:
                     return fixed  # type: ignore[return-value]
                 # Fall through to Python.
             # disc == 2 (Object), 5 (Ancestor), 6 (SameTypeWithArgs)
+
             # are join-only results; meet_types never emits them. Fall
             # through to Python if Rust ever does.
         # Rust returned None (unsupported case) — fall through to Python.
@@ -275,9 +277,11 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
                 # This (ugly) special-casing is needed to support checking
                 # branches like this:
                 # x: Union[float, complex]
+
                 # if isinstance(x, int):
                 #     ...
                 # And assignments like this:
+
                 # x: float | None
                 # y: int | None
                 # x = y
@@ -495,6 +499,7 @@ def is_overlapping_types(
     # Stage 3d (M9) type-kernel seam: the native overlap check handles
     # alias-free, non-recursive cases; the active flag + resolver are owned
     # by `mypy.join` (shared with the subtype/meet seams) and read at call
+
     # time. Rust returns None for any case it cannot decide (TypeAliasType
     # expansion, live-TypeInfo needs, unported callable/parameter paths),
     # and we fall through to the pure-Python implementation below.
@@ -543,7 +548,7 @@ def is_overlapping_types(
     # We should also never encounter these types, but it's possible a few
     # have snuck through due to unrelated bugs. For now, we handle these
     # in the same way we handle 'Any'.
-    #
+
     # TODO: Replace these with an 'assert False' once we are more confident.
     illegal_types = (UnboundType, ErasedType, DeletedType)
     if isinstance(left, illegal_types) or isinstance(right, illegal_types):
@@ -566,12 +571,13 @@ def is_overlapping_types(
     # We check for complete overlaps next as a general-purpose failsafe.
     # If this check fails, we start checking to see if there exists a
     # *partial* overlap between types.
-    #
+
     # These checks will also handle the NoneType and UninhabitedType cases for us.
 
     # enums are sometimes expanded into an Union of Literals
     # when that happens we want to make sure we treat the two as overlapping
     # and crucially, we want to do that *fast* in case the enum is large
+
     # so we do it before expanding variants below to avoid O(n**2) behavior
     if (
         is_enum_overlapping_union(left, right)
@@ -598,12 +604,13 @@ def is_overlapping_types(
 
     # Now move on to checking multi-variant types like Unions. We also perform
     # the same logic if either type happens to be a TypeVar/ParamSpec/TypeVarTuple.
-    #
+
     # Handling the TypeVarLikes now lets us simulate having them bind to the corresponding
     # type -- if we deferred these checks, the "return-early" logic of the other
     # checks will prevent us from detecting certain overlaps.
-    #
-    # If both types are singleton variants (and are not TypeVarLikes), we've hit the base case:
+
+    # If both types are singleton variants (and are not TypeVarLikes), we've hit the
+    # base case:
     # we skip these checks to avoid infinitely recursing.
 
     def _is_overlapping_types(left: Type, right: Type) -> bool:
@@ -634,7 +641,7 @@ def is_overlapping_types(
     # Now that we've finished handling TypeVarLikes, we're free to end early
     # if one one of the types is None and we're running in strict-optional mode.
     # (None only overlaps with None in strict-optional mode).
-    #
+
     # We must perform this check after the TypeVarLike checks because
     # a TypeVar could be bound to None, for example.
 
@@ -642,10 +649,10 @@ def is_overlapping_types(
         return False
 
     # Next, we handle single-variant types that may be inherently partially overlapping:
-    #
+
     # - TypedDicts
     # - Tuples
-    #
+
     # If we cannot identify a partial overlap and end early, we degrade these two types
     # into their 'Instance' fallbacks.
 
@@ -668,7 +675,7 @@ def is_overlapping_types(
 
     # Next, we handle single-variant types that cannot be inherently partially overlapping,
     # but do require custom logic to inspect.
-    #
+
     # As before, we degrade into 'Instance' whenever possible.
 
     if isinstance(left, TypeType) and isinstance(right, TypeType):
@@ -806,15 +813,15 @@ def is_overlapping_types(
         if len(left_args) == len(right_args):
             # Note: we don't really care about variance here, since the overlapping check
             # is symmetric and since we want to return 'True' even for partial overlaps.
-            #
+
             # For example, suppose we have two types Wrapper[Parent] and Wrapper[Child].
             # It doesn't matter whether Wrapper is covariant or contravariant since
             # either way, one of the two types will overlap with the other.
-            #
+
             # Similarly, if Wrapper was invariant, the two types could still be partially
             # overlapping -- what if Wrapper[Parent] happened to contain only instances of
             # specifically Child?
-            #
+
             # Or, to use a more concrete example, List[Union[A, B]] and List[Union[B, C]]
             # would be considered partially overlapping since it's possible for both lists
             # to contain only instances of B at runtime.
@@ -828,7 +835,7 @@ def is_overlapping_types(
 
     # We ought to have handled every case by now: we conclude the
     # two types are not overlapping, either completely or partially.
-    #
+
     # Note: it's unclear however, whether returning False is the right thing
     # to do when inferring reachability -- see  https://github.com/python/mypy/issues/5529
 
@@ -881,6 +888,7 @@ def are_tuples_overlapping(
 
     # This algorithm works well if only one tuple is variadic, if both are
     # variadic we may get rare false negatives for overlapping prefix/suffix.
+
     # Also, this ignores empty unpack case, but it is probably consistent with
     # how we handle e.g. empty lists in overload overlaps.
     # TODO: write a more robust algorithm for cases where both types are variadic.
@@ -1199,6 +1207,7 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
                     # Rust re-serializes each met item as a wire Type
                     # carrying only a type_ref string; decode to live
                     # TypeInfo via the join_tuples fixup idiom. A missing
+
                     # ref (or an unset typeinfo map) returns None -> defer
                     # to Python rather than wiring a FakeInfo into the
                     # type graph.
@@ -1228,6 +1237,7 @@ class TypeMeetVisitor(TypeVisitor[ProperType]):
             # The only simple case we can handle if both tuples are variadic
             # is when their structure fully matches. Other cases are tricky because
             # a variadic item is effectively a union of tuples of all length, thus
+
             # potentially causing overlap between a suffix in `s` and a prefix
             # in `t` (see how this is handled in is_subtype() for details).
             # TODO: handle more cases (like when both prefix/suffix are shorter in s or t).
@@ -1448,8 +1458,8 @@ def meet_similar_callables(t: CallableType, s: CallableType) -> CallableType:
     for i in range(len(t.arg_types)):
         arg_types.append(safe_join(t.arg_types[i], s.arg_types[i]))
     # TODO in combine_similar_callables also applies here (names and kinds)
-    # The fallback type can be either 'function' or 'type'. The result should have 'function' as
-    # fallback only if both operands have it as 'function'.
+    # The fallback type can be either 'function' or 'type'. The result should have
+    # 'function' as fallback only if both operands have it as 'function'.
     if t.fallback.type.fullname != "builtins.function":
         fallback = t.fallback
     else:

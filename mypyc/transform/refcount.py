@@ -194,6 +194,7 @@ def insert_branch_inc_and_decrefs(
         # HAX: After we've checked against an error value the value we must not touch the
         #      refcount since it will be a null pointer. The correct way to do this would be
         #      to perform data flow analysis on whether a value can be null (or is always
+
         #      null).
         omitted: Iterable[Value]
         if isinstance(term, Branch) and term.op == Branch.IS_ERROR and i == 0:

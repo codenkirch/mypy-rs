@@ -110,6 +110,7 @@ fn is_type_obj(fallback: &Type, ret_type: &Type, resolver: &TypeResolver) -> boo
     // is_metaclass() checks if the TypeInfo or any of its MRO bases is
     // builtins.type or abc.ABCMeta. The snapshot stores metaclass_fullname
     // only when metaclass_type is set. We check if the fallback's type_ref
+
     // appears as a metaclass in any snapshot (i.e. its own
     // metaclass_fullname is set and it has builtins.type in its MRO).
     // Simplified: check if type_ref has builtins.type in its MRO.
@@ -853,6 +854,7 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
             // Defer to Python: analyze_none_member_access special-cases
             // `__bool__` -> Literal[False]; non-bool names recurse on
             // builtins.object.  Both need mx / named_type.  Returning
+
             // builtins.object unconditionally would mis-answer `__bool__`.
             None
         }
@@ -1282,6 +1284,7 @@ fn analyze_descriptor_access_inner(
         // Everything else deferred: the `not isinstance(...)` early return
         // hands back the *original* descriptor object (identity-preserving,
         // and it fires on every method-access call), and the Instance branch
+
         // needs checker state (has_readable_member, get_method, check_call).
         _ => None,
     }
@@ -1368,6 +1371,7 @@ fn check_self_arg_inner(
     // Pass 1: Instance special-case filtering.
     // Drop items where both selfarg and dispatched are Instances of the
     // same type but args don't overlap. Also defer if is_overlapping_types
+
     // cannot decide.
     let mut pass1 = Vec::with_capacity(items.len());
     for item in &items {

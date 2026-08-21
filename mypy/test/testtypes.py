@@ -371,6 +371,7 @@ class TypeOpsSuite(Suite):
     # IDEA: Add test cases for
     #   tuple types
     #   callable types
+
     #   multiple arguments
 
     def assert_expand(
@@ -923,7 +924,8 @@ class JoinSuite(Suite):
             self.assert_join(t, self.fx.anyt, self.fx.anyt)
 
     def test_mixed_truth_restricted_type_simple(self) -> None:
-        # make_simplified_union against differently restricted truthiness types drops restrictions.
+        # make_simplified_union against differently restricted truthiness types drops
+        # restrictions.
         true_a = true_only(self.fx.a)
         false_o = false_only(self.fx.o)
         u = make_simplified_union([true_a, false_o])
@@ -1114,6 +1116,7 @@ class JoinSuite(Suite):
         # The order in which we try joining two unions influences the
         # ordering of the items in the final produced unions. So, we
         # manually call 'assert_simple_join' and tune the output
+
         # after swapping the arguments here.
         self.assert_simple_join(
             UnionType([lit1, lit2]), UnionType([lit2, lit3]), UnionType([lit1, lit2, lit3])
@@ -1591,6 +1594,7 @@ class RemoveLastKnownValueSuite(Suite):
 # Stage 3a parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader produces the same `str(t)` as
 # the Python `TypeStrVisitor`. Gated by `TEST_NATIVE_TYPE_KERNEL=1` plus the
+
 # presence of the `type_kernel` extension; skipped otherwise. This exercises
 # the reader end-to-end (varint, tagged helpers, per-variant dispatch, and
 # the `Display` impl) but does not wire the reader into any production path.
@@ -2279,6 +2283,7 @@ class NativeFillTypevarsSuite(Suite):
         # Regression guard: the wire map can hold a stale object for the
         # fullname across fine-grained refreshes. The shim must still
         # return an Instance rooted at the live `typ`, never the stale
+
         # map entry (fine-grained.test::testConstructorSignatureChanged3).
         from mypy.typevars import fill_typevars
         from mypy.wirefixup import set_wire_typeinfo_map
@@ -2294,9 +2299,11 @@ class NativeFillTypevarsSuite(Suite):
 # Stage 3b parity suite: round-trips `mypy.types.Type` through the binary
 # wire format and asserts that the Rust reader, with a TypeInfo resolver
 # built from the live Python TypeInfo graph, produces the same `str(t)` as
+
 # the Python `TypeStrVisitor`. Gated by `TEST_NATIVE_TYPE_KERNEL=1` plus
 # the presence of the `type_kernel` extension; skipped otherwise. This
 # closes the Stage 3a deferred renderings (prefix-strip on builtins.*,
+
 # enum-literal `value_repr`, bytes-literal `value_repr`, the `[()]`
 # variadic-tuple branch) and proves the resolver protocol end-to-end.
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -2317,6 +2324,7 @@ class NativeTypeWireResolverSuite(Suite):
         # The fixture's TypeInfo graph: all TypeInfos reachable from the
         # fixture instances. build_native_resolver walks them into the
         # NativeTypeResolver pyclass (Rust-owned HashMaps, zero FFI per
+
         # lookup). No aliases in this fixture; pass [].
         type_infos = [
             self.fx.oi,
@@ -2994,6 +3002,7 @@ class NativeJoinInstanceSuite(Suite):
         # Instance with type args (M8g): join(G[A], G[A]) where T is
         # invariant. is_equivalent(A, A)=True, join_types(A, A)=A ->
         # Rust returns SameTypeWithArgs (disc 6) with arg_discs=[0]
+
         # (use s.args[0]=A). Shim reconstructs G[A].
         from mypy.join import join_types
 
@@ -3098,6 +3107,7 @@ class NativeSubtypeTupleSuite(Suite):
         # Unpack items are not handled by the fixed-tuple port; the result
         # must still match Python (variadic_tuple_subtype decides). The
         # async test asserts the *pure-Python* outcome is stable here:
+
         # (A,) <: (*tuple[A, ...],) via the infinite-union mapping is
         # True (the Rust path either decides it or defers, both correct).
         t1 = self._tup(self.fx.a)
@@ -3461,6 +3471,7 @@ class NativeMapTypeFromSupertypeSuite(Suite):
         # Call the Rust seam directly on the typevar-free hot path (B->A
         # frame mapping an object-typed type) and confirm it returns bytes,
         # i.e. the composite engages rather than deferring. The engine ships
+
         # only typevar-free expansions, so a generic-frame mapping would
         # legitimately defer (None).
         import type_kernel as _tk
@@ -3575,6 +3586,7 @@ class NativeTypeObjectTypeSuite(Suite):
         # class G(Generic[T]): def __init__(self, x: T) -> None. The bound
         # callable carries G's type variable; the seam must not defer on the
         # generic def. (bind_self strip happens before the wire, so the
+
         # signature passed in is already bound.)
         sig = CallableType(
             [self.fx.gt, self.fx.t],
@@ -3836,6 +3848,7 @@ class NativeContractLiteralsSuite(Suite):
         # `builtins.bool` is required for the bool contraction: the Rust
         # helper looks up the fallback snapshot for the Literal[True] /
         # Literal[False] items. The fixture scan above skips it because
+
         # `bool_type_info` does not end in "i", so add it explicitly
         # (mirrors production, where builtins.bool is always snapshotted).
         type_infos.append(self.fx.bool_type_info)
@@ -4977,6 +4990,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
                     # Short names too: `anal_type` resolves type args like
                     # `int` through `lookup_qualified(name)`, and the fixture
                     # has no module scope for the `int`/`str` short names to
+
                     # fall back to. Keying only the builtin fullnames above
                     # would leave every `UnboundType("int")` argument an
                     # unresolvable Any, hiding the golden-path values.
@@ -5883,6 +5897,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         # def f(x: Tuple[Unpack[Ts], A]); caller passes a one-item unpacked
         # tuple whose Unpack target is the same shape, plus a suffix B, so
         # formal_to_actual is [[0, 1]]. The first actual is the one-item
+
         # unpacked tuple reunified with the suffix; Rust expands callee to
         # [Unpack[Ts], A] with kinds [ARG_STAR, ARG_POS].
         fx = self.fx
@@ -5904,6 +5919,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         # A TypeAliasType in a callee formal cannot be reproduced by Rust
         # (no alias target on the wire), so `plan_for_formal` returns None
         # for the whole call and Python runs the pure body. Both paths
+
         # produce the same check_arg for the non-alias formal.
         from mypy.nodes import TypeAlias as TypeAliasNode
         from mypy.types import TypeAliasType as TypeAliasTypeCls
@@ -6800,6 +6816,7 @@ class NativeHasAnyTypeSuite(Suite):
         # Old-style generic alias with a dead typevar: A[T] = int,
         # applied A[Any]. Python's visit_type_alias_type visits only the
         # proper target (int) for old-style aliases, ignoring the args →
+
         # false. The Rust path must match (python_3_12 == False skips
         # args).
         tv = self._make_tvar("T", 3)
@@ -6813,6 +6830,7 @@ class NativeHasAnyTypeSuite(Suite):
         # Same dead typevar but new-style (PEP 695): Python visits *both*
         # the proper target and (for python_3_12 aliases) the args, so
         # A[Any] → true. The fixture must fabricate a PEP 695 alias via
+
         # `python_3_12_type_alias=True`.
         tv = self._make_tvar("T", 4)
         alias = self._make_alias("mod.A", self.fx.str_type, alias_tvars=[tv])
@@ -6858,6 +6876,7 @@ class NativeHasAnyTypeSuite(Suite):
         # A = List[A]: get_proper_type cannot terminate on the recursive
         # alias; the Rust path must not loop. The seen-set short-circuits
         # (mirroring BoolTypeQuery.seen_aliases) to the ANY_STRATEGY
+
         # default, which is False, the same answer Python's
         # visit_type_alias_type gives for a repeated alias.
         tv = self._make_tvar("T", 9)
@@ -6901,6 +6920,7 @@ class NativeHasAnyTypeSuite(Suite):
     def test_bare_typevar_no_default_false(self) -> None:
         # Plain `T = TypeVar('T')`: the default is the
         # from_omitted_generics sentinel, which is not a real Any.
+
         # Python's HasAnyType.visit_type_var only visits the default when
         # has_default() is true (B3b regression: the sentinel was treated
         # as a real Any, so plain typevars spuriously reported Any).
@@ -7357,6 +7377,7 @@ class NativeJoinCovariantArgsSuite(Suite):
         # join(G[Any], G[A]) where T is covariant. AnyType arg
         # short-circuits (join.py:131-135) -> G[Any]. Fires the Rust
         # AnyType-discard path (disc 4), shared with the invariant
+
         # branch.
         from mypy.join import join_types
 
@@ -7375,6 +7396,7 @@ class NativeJoinCovariantArgsSuite(Suite):
         # join(G[A], G[B]) where T is covariant, B <: A. The
         # recursive join_types(A, B) returns Ancestor(A) (the common
         # supertype), which the Rust covariant branch can't express as
+
         # an arg disc, so it defers. Python computes G[A]. The result
         # is identical to pure-Python JoinSuite.test_generics_covariant.
         from mypy.join import join_types
@@ -7386,6 +7408,7 @@ class NativeJoinCovariantArgsSuite(Suite):
         # join(G[A], G[D]) where T is covariant, A,D unrelated. The
         # recursive join_types(A, D) returns Ancestor(object), which
         # the Rust covariant branch can't express -> defers. Python
+
         # computes G[object].
         from mypy.join import join_types
 
@@ -7475,6 +7498,7 @@ class NativeJoinUnionSuite(Suite):
         # join(A, Union[D]) where D is unrelated to A. Neither A <: D
         # nor D <: A. The Rust path defers; Python computes
         # Union[A, D] via make_simplified_union. The result is the
+
         # same regardless of which path computed it.
         from mypy.join import join_types
 
@@ -7485,6 +7509,7 @@ class NativeJoinUnionSuite(Suite):
         # join(A, Union[object]). A <: object (an item) -> is_subtype(A,
         # Union[object])=True -> returns the union (SameT). Note: the
         # union is NOT collapsed to object here (join_types does not
+
         # apply get_proper_type to its result); callers that need the
         # collapsed form apply it themselves. Fires the Rust SameT path.
         from mypy.join import join_types
@@ -7496,6 +7521,7 @@ class NativeJoinUnionSuite(Suite):
         # join(Union[A], Union[B]). Both sides are unions; the Rust
         # pre-dispatch defers (needs merge/flatten). Python collapses
         # single-item unions via get_proper_type, so this reduces to
+
         # join(A, B) = A (B extends A). Result is identical.
         from mypy.join import join_types
 
@@ -7581,6 +7607,7 @@ class NativeJoinCallableSuite(Suite):
         # join(callable, function): the recursive join_types(fallback=
         # function, s=function) hits the Instance-Instance same-type path
         # -> SameS -> outer SameS (shim returns s=function). Fires the
+
         # Rust SameS path.
         from mypy.join import join_types
 
@@ -7591,6 +7618,7 @@ class NativeJoinCallableSuite(Suite):
         # join(callable, object): recursive join_types(function, object)
         # -> is_subtype(function, object)=True -> via_supertype(function,
         # object) -> function.bases=[object] -> join_instances_nominal(
+
         # object, object) -> Left -> Ancestor("builtins.object"). Fires
         # the Rust Ancestor path.
         from mypy.join import join_types
@@ -7602,6 +7630,7 @@ class NativeJoinCallableSuite(Suite):
         # join(callable, A): recursive join_types(function, A). Neither
         # is a subtype of the other. via_supertype(A, function) walks
         # A.bases=[object] -> join_instances_nominal(object, function)
+
         # -> is_subtype(function, object)=True -> via_supertype(function,
         # object) -> Ancestor("builtins.object"). Fires the Rust
         # Ancestor path.
@@ -7614,6 +7643,7 @@ class NativeJoinCallableSuite(Suite):
         # join(function, callable): s=function, t=callable. The Rust
         # pre-dispatch reaches visit_join(t=CallableType, s=function) ->
         # visit_callable_fallback(s=function, fallback=function) ->
+
         # recursive join_types(function, function) -> SameS. Fires the
         # Rust SameS path (shim returns s=function).
         from mypy.join import join_types
@@ -7624,6 +7654,7 @@ class NativeJoinCallableSuite(Suite):
     def test_object_with_callable_returns_object(self) -> None:
         # join(object, callable): s=object, t=callable. The recursive
         # join_types(function, object) -> Ancestor("builtins.object").
+
         # The outer callable fallback passes Ancestor through; the shim
         # returns Instance(object_typeinfo, []) = object = s. Fires the
         # Rust Ancestor path.
@@ -7636,6 +7667,7 @@ class NativeJoinCallableSuite(Suite):
         # join(A, callable): s=A, t=callable. The recursive
         # join_types(function, A) -> Ancestor("builtins.object"). Same
         # shape as test_callable_with_unrelated_instance_returns_object
+
         # but with s/t swapped. Fires the Rust Ancestor path.
         from mypy.join import join_types
 
@@ -7646,6 +7678,7 @@ class NativeJoinCallableSuite(Suite):
         # Both sides CallableType, similar but not equivalent (arg types
         # differ: (A, B) vs (A, A)). The Rust path now handles the
         # non-generic similar-but-not-equivalent case via
+
         # join_similar_callables (per-arg safe_meet, ret join, fallback
         # pick); the result matches the Python combine path.
         from mypy.join import join_types
@@ -7658,6 +7691,7 @@ class NativeJoinCallableSuite(Suite):
         # join(c, c) where c is a non-generic CallableType. Both sides
         # are structurally identical, so the Rust visit_callable_type
         # both-CallableType case fires and returns SameS (shim returns
+
         # s = c). The result is identical to the Python combine path.
         from mypy.join import join_types
 
@@ -7668,6 +7702,7 @@ class NativeJoinCallableSuite(Suite):
         # join(c, c) where c takes a builtins.object arg. Same as above
         # but the arg type is builtins.object (INSTANCE_OBJECT singleton
         # on the wire). Exercises the encoder's Instance builtin path
+
         # inside a CallableType.
         from mypy.join import join_types
 
@@ -7757,6 +7792,7 @@ class NativeJoinOverloadedSuite(Suite):
         # join(overloaded, function): the recursive join_types(
         # fallback=function, s=function) hits the Instance-Instance
         # same-type path -> SameS -> outer SameS (shim returns
+
         # s=function). Fires the Rust SameS path.
         from mypy.join import join_types
 
@@ -7767,6 +7803,7 @@ class NativeJoinOverloadedSuite(Suite):
         # join(overloaded, object): recursive join_types(function,
         # object) -> is_subtype(function, object)=True ->
         # via_supertype(function, object) -> function.bases=[object] ->
+
         # join_instances_nominal(object, object) -> Left ->
         # Ancestor("builtins.object"). Fires the Rust Ancestor path.
         from mypy.join import join_types
@@ -7777,9 +7814,11 @@ class NativeJoinOverloadedSuite(Suite):
     def test_overloaded_with_unrelated_instance_returns_object(self) -> None:
         # join(overloaded, A): recursive join_types(function, A).
         # Neither is a subtype of the other. via_supertype(A, function)
+
         # walks A.bases=[object] -> join_instances_nominal(object,
         # function) -> is_subtype(function, object)=True ->
         # via_supertype(function, object) -> Ancestor("builtins.object").
+
         # Fires the Rust Ancestor path.
         from mypy.join import join_types
 
@@ -7790,6 +7829,7 @@ class NativeJoinOverloadedSuite(Suite):
         # join(function, overloaded): s=function, t=overloaded. The Rust
         # pre-dispatch reaches visit_join(t=Overloaded, s=function) ->
         # visit_overloaded fallback -> recursive join_types(fallback=
+
         # function, s=function) -> SameS. Fires the Rust SameS path
         # (shim returns s=function).
         from mypy.join import join_types
@@ -7800,6 +7840,7 @@ class NativeJoinOverloadedSuite(Suite):
     def test_object_with_overloaded_returns_object(self) -> None:
         # join(object, overloaded): s=object, t=overloaded. The recursive
         # join_types(function, object) -> Ancestor("builtins.object").
+
         # The outer overloaded fallback passes Ancestor through; the
         # shim returns Instance(object_typeinfo, []) = object = s.
         # Fires the Rust Ancestor path.
@@ -7812,6 +7853,7 @@ class NativeJoinOverloadedSuite(Suite):
         # join(A, overloaded): s=A, t=overloaded. The recursive
         # join_types(function, A) -> Ancestor("builtins.object"). Same
         # shape as test_overloaded_with_unrelated_instance_returns_object
+
         # but with s/t swapped. Fires the Rust Ancestor path.
         from mypy.join import join_types
 
@@ -7822,6 +7864,7 @@ class NativeJoinOverloadedSuite(Suite):
         # s=CallableType, t=Overloaded. Both callable-like -> the Rust
         # pre-dispatch defers (both sides callable-like). Python computes
         # the both-FunctionLike case (is_similar_callables walk). The
+
         # result is identical regardless of which path computed it.
         from mypy.join import join_types
 
@@ -7836,6 +7879,7 @@ class NativeJoinOverloadedSuite(Suite):
         # Both sides Overloaded. The Rust pre-dispatch defers (both
         # callable-like) because the both-FunctionLike case needs
         # is_similar_callables + combine_similar_callables. Python
+
         # computes the result. The result is identical regardless of
         # which path computed it.
         from mypy.join import join_types
@@ -7910,6 +7954,7 @@ class NativeJoinTypeTypeSuite(Suite):
         # join(type[A], builtins.type): s=builtins.type, t=type[A].
         # visit_type_type case 2 (join.py:861-862): s is Instance with
         # fullname=="builtins.type" -> return self.s. Fires the Rust
+
         # SameS path (shim returns s=builtins.type).
         from mypy.join import join_types
 
@@ -7927,6 +7972,7 @@ class NativeJoinTypeTypeSuite(Suite):
         # join(type[A], type[A]) = type[A]. Both sides TypeType. Case 1
         # (join.py:855-860) fires the Rust encoder: it builds a new
         # TypeType wrapping join_types(t.item, s.item) and serializes it
+
         # via write_type; the shim decodes via read_type then resolves
         # wire-only type_refs to live TypeInfo via the fullname map.
         from mypy.join import join_types
@@ -7936,6 +7982,7 @@ class NativeJoinTypeTypeSuite(Suite):
     def test_type_type_with_different_type_type_returns_encoded(self) -> None:
         # join(type[A], type[B]) = type[A] (B <: A). Both sides TypeType.
         # Case 1 fires the Rust encoder; the recursive join_types(A, B)
+
         # returns Ancestor(a.A), setop_result_to_type reuses the fixed
         # s.item operand, and the shim resolves the decoded Instance's
         # type_ref via the fullname map.
@@ -8017,6 +8064,7 @@ class NativeJoinLiteralSuite(Suite):
         # join(Lit[1], Lit[2]) = A. Unequal literals. Case 1 else-branch
         # (join.py:843): join_types(s.fallback, t.fallback). The result
         # is A (both fallbacks are A), which is neither s nor t. Defers
+
         # to Python. The result is identical regardless of which path
         # computed it.
         from mypy.join import join_types
@@ -8039,17 +8087,21 @@ class NativeJoinLiteralSuite(Suite):
         # join(Lit[2], Instance(A, lkv=Lit[1])) = A. Here s=Lit[2],
         # t=Instance(A, lkv=Lit[1]). Dispatch: t.accept(visitor(s)) where
         # t=Instance, s=Lit[2]. visit_instance case 6 (join.py:536):
+
         # isinstance(s, LiteralType) -> join_types(t, s) (swap). This
         # reduces to join_types(Instance(A, lkv=Lit[1]), Lit[2]) which is
         # the mismatched-lkv case (case 5, join.py:847): join_types(s,
+
         # t.fallback). Defers to Python. The result is identical
         # regardless of which path computed it.
-        #
+
         # NOTE: Skipped because the defer chain reaches a same-type
         # Instance-Instance join (Instance(A,lkv=Lit[1]) vs Instance(A))
+
         # where the Rust SameS path returns s verbatim (including the
         # last_known_value) while Python strips it. This is a pre-
         # existing lkv-stripping gap in the M8f same-type path, not an
+
         # M8l regression. Tracking separately.
         from mypy.join import join_types
         from mypy.types import Instance
@@ -8139,6 +8191,7 @@ class NativeJoinTypeVarSuite(Suite):
         # join(T`1, S`2) = object (both upper_bounds are object, so the
         # bound join is object). visit_type_var case 2 (join.py:472):
         # s.id != t.id -> join_types(s.upper_bound, t.upper_bound).
+
         # The bound join is object (neither s nor t) -> defers. The
         # result is identical regardless of which path computed it.
         from mypy.join import join_types
@@ -8150,6 +8203,7 @@ class NativeJoinTypeVarSuite(Suite):
     ) -> None:
         # join(T`1 with bound=A, T`1 with bound=B) = T`1 with bound=join(A,B).
         # visit_type_var case 1 copy_modified branch (join.py:468-470):
+
         # s.id == t.id but upper_bounds differ -> copy_modified(
         # upper_bound=join_types(...)). Produces a new TypeVarType -> defers.
         from mypy.join import join_types
@@ -8182,6 +8236,7 @@ class NativeJoinTypeVarSuite(Suite):
         # join(int, T`1) = object. visit_type_var case 3 (join.py:474):
         # s is not a TypeVarType -> default(s). The default walks s's
         # fallback chain (join.py:869-888); for Instance(int) it returns
+
         # object_from_instance(int) = object. Defers to Python.
         from mypy.join import join_types
 
@@ -8281,6 +8336,7 @@ class NativeJoinTypedDictSuite(Suite):
         # join(A, TypedDict(fallback=A)) = A. visit_typeddict case 2
         # (join.py:832-833): s is Instance(A), t is TypedDictType with
         # fallback=A. Recursive: join_types(A, A) = A (SameS). Fires
+
         # the Rust SameS path (shim returns s=A).
         from mypy.join import join_types
         from mypy.types import TypedDictType
@@ -8292,6 +8348,7 @@ class NativeJoinTypedDictSuite(Suite):
         # join(object, TypedDict(fallback=A)) = object. visit_typeddict
         # case 2: s=object, t.fallback=A. Recursive: join_types(object,
         # A). A <: object, so the join is object. The Rust path returns
+
         # Ancestor("builtins.object"), which the shim reconstructs as
         # Instance(object). Defers to Python; result identical.
         from mypy.join import join_types
@@ -8304,6 +8361,7 @@ class NativeJoinTypedDictSuite(Suite):
         # join(A, TypedDict(fallback=object)) = object. visit_typeddict
         # case 2: s=A, t.fallback=object. Recursive: join_types(A,
         # object). A <: object, so the join is object. The Rust path
+
         # returns Ancestor("builtins.object"), passes through. Defers
         # to Python; result identical.
         from mypy.join import join_types
@@ -8316,12 +8374,15 @@ class NativeJoinTypedDictSuite(Suite):
         # join(TD1, TD2) = new TypedDictType. visit_typeddict case 1
         # (join.py:812-831): s is TypedDictType -> builds a new
         # TypedDictType via resolve_typeddict_item. Defers to Python.
+
         # The Rust path returns None (verified by the pure-Rust TDD
         # test join_typeddict_with_typeddict_defers). The Python
         # fallback calls create_anonymous_fallback (join.py:827)
+
         # which asserts fallback.type.typeddict_type is not None —
         # the TypeFixture's TypeInfo doesn't have typeddict_type set,
         # so Python crashes. Skipping: the Rust deferral is covered by
+
         # the pure-Rust test; the Python parity requires a full
         # TypedDict fixture not available in TypeFixture.
         import pytest
@@ -8341,6 +8402,7 @@ class NativeJoinTypedDictSuite(Suite):
         # join(TypeVar, TypedDict) = object. visit_typeddict case 3
         # (join.py:834-835): s is not Instance (TypeVarType) ->
         # default(s) walks s's fallback chain (TypeVar.upper_bound =
+
         # object -> object). Defers to Python; result identical.
         from mypy.join import join_types
         from mypy.types import TypedDictType
@@ -8414,6 +8476,7 @@ class NativeJoinTupleSuite(Suite):
         # join(A, Tuple(items, fallback=A)) = A. visit_tuple_type case 2
         # (join.py:774-775): s is Instance(A), t is TupleType with
         # partial_fallback=A (not builtins.tuple). tuple_fallback(t) ==
+
         # t.partial_fallback = A. Recursive: join_types(A, A) = A (SameS).
         # Fires the Rust SameS path (shim returns s=A).
         from mypy.join import join_types
@@ -8425,6 +8488,7 @@ class NativeJoinTupleSuite(Suite):
     def test_tuple_with_supertype_namedtuple_fallback_returns_object(self) -> None:
         # join(object, Tuple(items, fallback=A)) = object. visit_tuple_type
         # case 2: s=object, t.fallback=A. Recursive: join_types(object, A).
+
         # A <: object -> join is object. Rust returns
         # Ancestor("builtins.object"), shim reconstructs Instance(object).
         from mypy.join import join_types
@@ -8436,6 +8500,7 @@ class NativeJoinTupleSuite(Suite):
     def test_tuple_with_subtype_namedtuple_fallback_returns_object(self) -> None:
         # join(A, Tuple(items, fallback=object)) = object. visit_tuple_type
         # case 2: s=A, t.fallback=object. Recursive: join_types(A, object).
+
         # A <: object -> join is object. Rust returns
         # Ancestor("builtins.object"), passes through.
         from mypy.join import join_types
@@ -8448,6 +8513,7 @@ class NativeJoinTupleSuite(Suite):
         # join(tuple, Tuple(items, fallback=builtins.tuple)) = tuple.
         # visit_tuple_type case 2: s=Instance(builtins.tuple),
         # t.partial_fallback=builtins.tuple. tuple_fallback(t)
+
         # constructs Instance(builtins.tuple, [union(items)]) (not
         # partial_fallback). Rust defers; Python handles it. Result
         # identical regardless of which path computed it.
@@ -8463,6 +8529,7 @@ class NativeJoinTupleSuite(Suite):
         # join(Tuple1, Tuple2) = new TupleType. visit_tuple_type case 1
         # (join.py:753-773): s is TupleType -> builds a new TupleType
         # via join_tuples + InstanceJoiner. Now handled in Rust (Phase B1,
+
         # issue #587). Result identical to Python path.
         from mypy.join import join_types
         from mypy.types import TupleType
@@ -8658,9 +8725,11 @@ class NativeMeetSuite(Suite):
         # visit_type_type case 1 (meet.py:1412-1419): t and s both
         # TypeType with unrelated items. D and E have no subclass
         # relation, so is_proper_subtype(Type[D], Type[E]) is False
+
         # both ways and the Rust arm runs: meet(D, E) =
         # UninhabitedType -> wrapped in a fresh TypeType (not NoneType,
         # so not unwrapped) and encoded. Python computes
+
         # TypeType.make_normalized(UninhabitedType()) — the same
         # wrapped-bottom result.
         from mypy.types import TypeType
@@ -8675,9 +8744,11 @@ class NativeMeetSuite(Suite):
         # visit_union_type one-sided (meet.py:965-966): t is a Union,
         # s is an Instance unrelated to every item. D is unrelated to
         # both E and F, so the proper-subtype pre-check misses both
+
         # ways and the Rust one-sided arm runs: meets =
         # [meet(E, D), meet(F, D)] = [Bottom, Bottom], all dropped ->
         # make_simplified_union([]) -> UninhabitedType. Python's
+
         # visitor computes the same bottom.
         from mypy.types import UnionType
 
@@ -8893,6 +8964,7 @@ class NativeMeetTypeVarTupleSuite(Suite):
     def test_meet_type_var_same_id_different_ub_meets_bounds(self) -> None:
         # visit_type_var case 2 (meet.py:882): same id, different
         # upper_bound -> s.copy_modified(upper_bound=meet(s.ub, t.ub)).
+
         # Rust encodes the fresh TypeVar; its upper-bound meet goes
         # through fruit_to_type so a recursive Encoded result decodes.
         # meet(object, a) = a, so the new TypeVar's bound is a.
@@ -8963,9 +9035,11 @@ class NativeMeetTypeVarTupleSuite(Suite):
 # Stage 5 parity suite: exercises `mro::rust_linearize_hierarchy` through the
 # public `calculate_mro` entry. Each test builds a live TypeInfo graph with
 # explicit `bases` and empty `mro`, builds a `NativeTypeResolver` snapshot
+
 # from it, installs it via `_set_native_mro_resolver`, and asserts the MRO
 # `calculate_mro` assigns matches the expected C3 order. Gated by
 # `TEST_NATIVE_TYPE_KERNEL=1` plus the `type_kernel` extension; skipped
+
 # otherwise (the Python path is exercised by the existing suites).
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMroSuite(Suite):
@@ -9089,11 +9163,14 @@ class NativeMroSuite(Suite):
         # A : B, B : A  ->  cycle. Rust's `rust_linearize_hierarchy`
         # returns None (its cycle guard), so the shim would fall through
         # to Python. We test the Rust entry directly (NOT `calculate_mro`)
+
         # because Python's `linearize_hierarchy` has no cycle guard of its
         # own: it relies on `semanal.verify_base_classes` (nodes.py:2826)
+
         # to reject raw inheritance cycles before MRO runs, so a synthetic
         # cycle reaching `calculate_mro` would infinite-loop rather than
         # raise MroError. The Rust None keeps the production path safe:
+
         # a stale snapshot that reintroduces a cycle declines to Python,
         # which would have rejected the cycle at semantic-analysis time.
         import type_kernel as _type_kernel
@@ -9111,6 +9188,7 @@ class NativeMroSuite(Suite):
         # A baseless non-object class needs the `obj_type` callback
         # (mro.py:34) to synthesize a dummy `object` base. Rust has no
         # callback and returns None; Python uses `obj_type` to build the
+
         # mro. Here we pass `obj_type=lambda: Instance(self.oi, [])` so
         # Python completes the MRO as [cls, object].
         from mypy.mro import calculate_mro
@@ -9137,9 +9215,11 @@ class NativeMroSuite(Suite):
         # When `info.mro` is already set, `calculate_mro` re-assigns it
         # (idempotent) and re-runs the side effects, but the shim must not
         # call Rust (mro.py:31 short-circuit). To prove Rust is skipped, we
+
         # build the resolver with `cls.mro` empty (so the snapshot's mro is
         # empty and Rust WOULD walk the bases to [Cached, object]), then set
         # the live `cls.mro` to a cached [object] list. If the short-circuit
+
         # works, `linearize_hierarchy` returns the cached [object]; if Rust
         # were called instead, it would return [Cached, object] (different).
         from mypy.mro import calculate_mro
@@ -11591,6 +11671,7 @@ class NativeCheckMemberSuite(Suite):
         # Python baseline for the M20 seam tail:
         # map_instance_to_supertype -> expand_type_by_instance -> freeze
         # (checkmember.py:502-504). Runs with the native checkmember gate
+
         # off so it always exercises the pure-Python expand path.
         from mypy.expandtype import expand_type_by_instance
         from mypy.maptype import map_instance_to_supertype
@@ -11622,6 +11703,7 @@ class NativeCheckMemberSuite(Suite):
         # Structural parity for the M20 seam: decoded comes back from the wire
         # with a process-global builtins.function TypeInfo (see
         # instance_cache.function_type in mypy/typeops.py), which is not the
+
         # TypeFixture() TypeInfo under test. Comparing the whole CallableType
         # by __eq__ would then fail on fallback identity alone, so compare
         # every field except fallback and verify fallback by name only.
@@ -11748,6 +11830,7 @@ class NativeCheckMemberSuite(Suite):
 # ---------------------------------------------------------------------------
 # NativeCheckexprSuite — M8c: visit_yield_expr / visit_conditional_expr /
 # visit_star_expr ports to Rust (checkexpr_functions.rs)
+
 # ---------------------------------------------------------------------------
 
 
@@ -12355,6 +12438,7 @@ class NativeMergeTypevarsSuite(Suite):
 
 # NativeAnyCausesOverloadAmbiguitySuite: differential parity for the Rust
 # port of `any_causes_overload_ambiguity` (checkexpr.py:8233-8308).
+
 # Mirrors NativeCombineSignaturesSuite: toggle the checkexpr gate on/off and
 # assert the native and pure-Python paths agree on the same items/actuals.
 @skipUnless(
@@ -14834,6 +14918,7 @@ class NativeOverloadingOverloadsSuite(Suite):
         # The main never-match check reads the current strict_optional; the
         # unsafe check always runs under strict_optional=True. The
         # (None)->int / (str)->str pair is unsafely overlapping only outside
+
         # strict-optional (checker.py:1584-1595), so under apt flags the
         # native driver must keep it unflagged.
         none_type = NoneType()
@@ -14873,6 +14958,7 @@ class NativeAndOrConditionalMapsSuite(Suite):
         # Cache a bound NameExpr per variable name so common-key scenarios
         # share the same Expression/Var identity across both maps, matching
         # production where and/or_conditional_maps receives the same
+
         # narrowed expression object in both TypeMaps.
         self._keys: dict[str, NameExpr] = {}
         type_infos = []
@@ -15959,6 +16045,7 @@ class NativeSubtypesCallableSuite(Suite):
         # Same types, different positional names, no ignore_pos_arg_names
         # passed: `is_subtype` defaults the flag to False, so names must
         # match -> (False, False). This is the differentiated case the
+
         # native entry must decide identically.
         left = self._call_named(["x"], [self.fx.a], self.fx.a)
         right = self._call_named(["y"], [self.fx.a], self.fx.a)
@@ -15993,9 +16080,11 @@ class NativeSubtypesCallableSuite(Suite):
         # When either side carries `from_concatenate`, Python forces
         # strict_concatenate_check=True regardless of the option
         # (subtypes.py:1872-1875); the native engine must mirror the
+
         # resulting arg compatibility. A ParamSpec-prefixed callable
         # compared against a plain (A, B) callable: with
         # strict_concatenate_check True the prefix is matched literally,
+
         # so the fixed args must equal the prefix (A, B) — True here.
         # The differential (off, on) must agree.
         ps = ParamSpecType(
@@ -16041,6 +16130,7 @@ class NativeSubtypesCallableSuite(Suite):
     def test_callable_vs_overloaded_mismatched_arg(self) -> None:
         # f: (A) -> None <: overload[(B) -> None] when B <: A: the (B) ->
         # None item is satisfied via contravariance (A <: B needed... no:
+
         # contravariance requires B <: A, which holds) -> True. This
         # documents that `b` is a subtype of `a` (B(A)) in the fixture.
         left = self._call(self.fx.a, NoneType())
@@ -16051,6 +16141,7 @@ class NativeSubtypesCallableSuite(Suite):
     def test_type_guard_mismatch_false(self) -> None:
         # RIGHT has TypeGuard, LEFT does not: incompatible, False
         # (subtypes.py:922-925, guard set via CallableType.type_guard).
+
         # LEFT with the guard against a plain right falls through to the
         # return-type check only when the guard types are comparable.
         guarded = CallableType(

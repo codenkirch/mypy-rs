@@ -58,6 +58,7 @@ class Annotation:
         # If multiple annotations are generated for a single line, only report
         # the highest-priority ones. Some use cases generate multiple annotations,
         # and this can be used to reduce verbosity by hiding the lower-priority
+
         # ones.
         self.priority = priority
 

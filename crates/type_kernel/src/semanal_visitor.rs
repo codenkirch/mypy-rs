@@ -25,8 +25,10 @@
 //!   priority.
 //! - `is_init_only` — check whether a `Var` is a `dataclasses.InitVar` (Issue #391).
 //! - `erase_func_annotations` — erase type annotations from a `FuncDef` (Issue #391).
-//! - `get_deprecated` — extract deprecation string from a `CallExpr` decorator (Issue #391).
-//! - `get_name_repr_of_expr` — simplified textual representation of an expression (Issue #391).
+//! - `get_deprecated` — extract deprecation string from a `CallExpr` decorator (Issue
+//! #391).
+//! - `get_name_repr_of_expr` — simplified textual representation of an expression
+//! (Issue #391).
 
 use std::collections::HashSet;
 
@@ -939,6 +941,7 @@ pub(crate) fn rust_classify_member_resolution(
             // Missing name: get_module_symbol falls through to the re-export
             // visibility check, incomplete-namespace deferral, __getattr__
             // Var synthesis, or missing-module synthesis. All of those read
+
             // or mutate semantic state, so they stay in Python.
             return Ok((None, None));
         }
@@ -1211,6 +1214,7 @@ pub(crate) fn rust_lookup(
             // 2a. Class-body attributes always fall back: an inactive class
             // attribute falls through to later scopes, and only Python owns
             // `is_active_symbol_in_class_body` (and the `implicit_name`
+
             // self.x-assignment fallback).
             if type_names.contains(name.as_str())? {
                 return Ok(None);
@@ -1218,6 +1222,7 @@ pub(crate) fn rust_lookup(
             // 2b. Class attributes __qualname__ and __module__ are
             // synthesized by Python (`Var(name, self.str_type())`); reaching
             // here with a class scope guarantees the name is not in the
+
             // class namespace (2a would have fallen back).
             if name == "__qualname__" || name == "__module__" {
                 return Ok(Some(("synthesize_qualname".to_string(), None)));
@@ -1846,9 +1851,11 @@ fn can_be_type_alias_inner(
     // is_none_alias(rv) requires self -> defer.
     // We cannot determine it without the SemanticAnalyzer, so return None.
     // However, if we get here and none of the above matched, we try the
+
     // remaining checks. The is_none_alias check is skipped (returns None
     // only if we reach a path that would need it). To be safe, we defer
     // when the rvalue could be a none-alias (CallExpr with callee type(None)).
+
     // Actually, to keep it simple and correct, we just continue: the
     // remaining checks don't need is_none_alias.
     let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
@@ -2176,12 +2183,15 @@ pub(crate) fn rust_classify_setup_type_vars(
 // ---------------------------------------------------------------------------
 // Slice 1: leaf-actions shard for visit_list_expr / visit_set_expr /
 // visit_dict_expr / visit_template_str_expr (semanal.py:6274-6299).
+
 //
 // Pattern: Rust walks the expr items and mutates `StarExpr.valid = True`
 // directly, then calls `item.accept(semanal_self)` to recurse into the
+
 // Python visitor. The four Python methods become a single gate dispatch
 // into one of these helpers; if the helper returns `true` the Python
 // body was fully handled, otherwise Python falls back.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_list_expr` / `visit_set_expr` body. Sets
@@ -2276,6 +2286,7 @@ pub(crate) fn rust_visit_template_str_expr(
 // ---------------------------------------------------------------------------
 // Slice 2: leaf-actions shards for additional simple recurse-only visit_*
 // bodies (semanal.py). Same pattern as slice 1: Rust walks, Python falls
+
 // back on unexpected shapes.
 // ---------------------------------------------------------------------------
 
@@ -2389,9 +2400,11 @@ pub(crate) fn rust_visit_super_expr(
 // ---------------------------------------------------------------------------
 // Slice 3: leaf-actions shards for the simple statement-visit bodies.
 // Pattern: Rust sets the analyzer's `statement` slot (the same way the
+
 // Python body does `self.statement = s`), recurses via `accept`, and
 // returns true on the common path. The __all__-style branches stay in
 // Python by falling back (return false) when they would fire.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_raise_stmt` body — set statement slot, recurse
@@ -2449,6 +2462,7 @@ pub(crate) fn rust_visit_operator_assignment_stmt(
     // __all__ export branch (semanal.py:5953): the Python body visits lvalue
     // first, then checks `lvalue.kind == GDEF` — the kind is resolved during
     // the accept call, so the check must run AFTER the recursion. Handle
+
     // the branch here instead of deferring; add_exports is a plain Python
     // method call and cheap to forward.
     let nodes_mod = py.import("mypy.nodes")?;
@@ -2477,9 +2491,11 @@ pub(crate) fn rust_visit_operator_assignment_stmt(
 // ---------------------------------------------------------------------------
 // Slice 4: leaf-actions shards for block / if-stmt / del-stmt bodies.
 // Pattern: Rust adjusts the analyzer's block_depth list in place, marks
+
 // the statement slot, and recurses through `semanal.accept` /
 // `expression.accept`. Python keeps the reachability pre-pass (its own
 // options call) and the `fail` call-forward passes through PyO3.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_block` body. Skips unreachable blocks, bumps
@@ -2587,6 +2603,7 @@ pub(crate) fn rust_visit_del_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) ->
 // ---------------------------------------------------------------------------
 // Slice 5: leaf-actions shards for expression-stmt, break/continue,
 // global-decl, and match-stmt bodies.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_expression_stmt` body — set statement slot, recurse
@@ -2819,6 +2836,7 @@ pub(crate) fn rust_visit_while_stmt(py: Python<'_>, s: &PyAny, semanal: &PyAny) 
 // ---------------------------------------------------------------------------
 // Slice 7: leaf-actions shards for name-expr, star-expr, and the seven
 // pattern visitors. These are pure recursion + self.analyze_lvalue calls.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_name_expr` body — lookup the name and, when found,
@@ -2967,6 +2985,7 @@ pub(crate) fn rust_visit_class_pattern(
 // ---------------------------------------------------------------------------
 // Slice 8: leaf-actions shards for yield / yield-from / await / try. The
 // yield/await bodies check scope, flip the enclosing FuncDef's generator
+
 // flags, and recurse. Errors carry serious/blocker and sometimes a code.
 // ---------------------------------------------------------------------------
 
@@ -3158,9 +3177,11 @@ pub(crate) fn rust_visit_try_stmt(_py: Python<'_>, s: &PyAny, semanal: &PyAny) -
 // ---------------------------------------------------------------------------
 // Slice 9: leaf-actions shards for op / index / cast / type_form /
 // assert_type / reveal / type_application. These drive expr recursion and
+
 // a single `self.anal_type` call per type slot, mirroring the Python
 // bodies; the `anal_type` machinery (with its full placeholder/deferral
 // flow) stays in Python.
+
 // ---------------------------------------------------------------------------
 
 /// `mypy.semanal.visit_op_expr` body — recurse left, then for `and`/`or`
@@ -3233,6 +3254,7 @@ pub(crate) fn rust_visit_index_expr(
     // refers_to_class_or_function(base) OR the else-branch both recurse
     // the index; the type-application branch is the only deviation and
     // we already handled it above. Use the existing helper to detect the
+
     // class/function case so we can call analyze_type_application.
     let refers_class_fn = rust_refers_to_class_or_function(py, base)?;
     if refers_class_fn {
@@ -3335,6 +3357,7 @@ pub(crate) fn rust_visit_type_application(
 // ---------------------------------------------------------------------------
 // Slice 10: leaf-actions shards for the list/set comprehension visitors
 // (async-for-outside-coroutine check + generator recurse).
+
 // ---------------------------------------------------------------------------
 
 /// Shared check for `any(expr.generator.is_async)` outside a coroutine,
@@ -3344,6 +3367,7 @@ fn check_async_comp_for(semanal: &PyAny, generator: &PyAny, ctx: &PyAny) -> PyRe
     // any(is_async) over the generator's index/unpacked is_async flags.
     // The GeneratorExpr/DictionaryComprehension node stores is_async as a
     // list-of-bool aligned with the for clauses; mirror `any(...)` by
+
     // scanning the `is_async` attribute on either the expr (dict comp)
     // or expr.generator (list/set comp) — callers pass the node whose
     // `.is_async` is a list.
@@ -3416,6 +3440,7 @@ pub(crate) fn rust_visit_set_comprehension(
 // ---------------------------------------------------------------------------
 // Slice 11: leaf-actions shards for dictionary comprehension,
 // generator expression, and lambda visitors. These use `self.enter(expr)`
+
 // and `self.inside_except_star_block_set(False, entering_loop=False)`
 // context managers, mirrored here via `__enter__` / `__exit__`.
 // ---------------------------------------------------------------------------

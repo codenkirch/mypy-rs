@@ -9,6 +9,7 @@ from mypy.modules_state import modules_state
 # Native type-kernel gate for find_shallow_matching_overload_item.
 # When type_kernel extension is available and _native_plugin_helpers_active
 # is True, the Rust path runs; otherwise the pure-Python implementation below
+
 # is used. Rust returns None for unsupported cases (star actuals), falling
 # through to the Python path.
 
@@ -105,7 +106,7 @@ def _get_argument(call: CallExpr, name: str) -> Expression | None:
     """Return the expression for the specific argument."""
     # To do this we use the CallableType of the callee to find the FormalArgument,
     # then walk the actual CallExpr looking for the appropriate argument.
-    #
+
     # Note: I'm not hard-coding the index so that in the future we can support other
     # attrib and class makers.
     callee_type = _get_callee_type(call)
@@ -204,7 +205,8 @@ def _get_callee_type(call: CallExpr) -> CallableType | None:
     if isinstance(callee_node, RefExpr):
         callee_node = callee_node.node
 
-    # Some decorators may be using typing.dataclass_transform, which is itself a decorator, so we
+    # Some decorators may be using typing.dataclass_transform, which is itself a
+    # decorator, so we
     # need to unwrap them to get at the true callee
     if isinstance(callee_node, Decorator):
         callee_node = callee_node.func
@@ -466,7 +468,8 @@ def add_attribute_to_class(
     return node
 
 
-# We keep the unused `api` parameter, to avoid breaking 3rd party dataclass-like plugins.
+# We keep the unused `api` parameter, to avoid breaking 3rd party dataclass-like
+# plugins.
 def deserialize_and_fixup_type(data: str | JsonDict, api: SemanticAnalyzerPluginInterface) -> Type:
     typ = deserialize_type(data)
     assert modules_state.node_fixer is not None

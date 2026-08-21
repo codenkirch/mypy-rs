@@ -106,12 +106,15 @@ def get_cfg(blocks: list[BasicBlock], *, use_yields: bool = False) -> CFG:
         # Errors can occur anywhere inside a block, which means that
         # we can't assume that the entire block has executed before
         # jumping to the error handler. In our CFG construction, we
+
         # model this as saying that a block can jump to its error
         # handler or the error handlers of any of its normal
         # successors (to represent an error before that next block
+
         # completes). This works well for analyses like "must
         # defined", where it implies that registers assigned in a
         # block may be undefined in its error handler, but is in
+
         # general not a precise representation of reality; any
         # analyses that require more fidelity must wait until after
         # exception insertion.

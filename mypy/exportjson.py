@@ -100,6 +100,7 @@ def convert_symbol_table(self: SymbolTable, cfg: Config) -> Json:
         # Skip __builtins__: it's a reference to the builtins
         # module that gets added to every module by
         # SemanticAnalyzerPass2.visit_file(), but it shouldn't be
+
         # accessed by users of the module.
         if key == "__builtins__" or value.no_serialize:
             continue

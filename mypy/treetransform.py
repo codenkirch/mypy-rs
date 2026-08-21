@@ -142,6 +142,7 @@ class TransformVisitor(NodeVisitor[Node]):
         # These are uninitialized placeholder nodes used temporarily for nested
         # functions while we are transforming a top-level function. This maps an
         # untransformed node to a placeholder (which will later become the
+
         # transformed node).
         self.func_placeholder_map: dict[FuncDef, FuncDef] = {}
 
@@ -183,9 +184,11 @@ class TransformVisitor(NodeVisitor[Node]):
         # These contortions are needed to handle the case of recursive
         # references inside the function being transformed.
         # Set up placeholder nodes for references within this function
+
         # to other functions defined inside it.
         # Don't create an entry for this function itself though,
         # since we want self-references to point to the original
+
         # function if this is the top-level node we are transforming.
         init = FuncMapInitializer(self)
         for stmt in node.body.body:
@@ -214,6 +217,7 @@ class TransformVisitor(NodeVisitor[Node]):
             # There is a placeholder definition for this function. Replace
             # the attributes of the placeholder with those form the transformed
             # function. We know that the classes will be identical (otherwise
+
             # this wouldn't work).
             result = self.func_placeholder_map[node]
             replace_object_state(result, new)

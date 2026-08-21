@@ -61,6 +61,7 @@ def dunder_attr_slot(cl: ClassIR, fn: FuncIR, emitter: Emitter) -> str:
 # We maintain a table from dunder function names to struct slots they
 # correspond to and functions that generate a wrapper (if necessary)
 # and return the function name to stick in the slot.
+
 # TODO: Add remaining dunder methods
 SlotGenerator = Callable[[ClassIR, FuncIR, Emitter], str]
 SlotTable = Mapping[str, tuple[str, SlotGenerator]]
@@ -232,6 +233,7 @@ def generate_class_reuse(
     # Not exported: the free-instance slot is only read/written by the class's
     # own setup/dealloc code, which lives in the defining group. Exporting it
     # also trips a C diagnostic under `Py_GIL_DISABLED`, where `CPyThreadLocal`
+
     # expands to `__thread` and can't legally appear inside the exports struct.
     context.declarations[name] = HeaderDeclaration(f"CPyThreadLocal {struct_name} *{name};")
 
@@ -271,7 +273,8 @@ def generate_class(cl: ClassIR, module: str, emitter: Emitter) -> None:
         if not cl.is_acyclic:
             fields["tp_traverse"] = f"(traverseproc){name_prefix}_traverse"
             fields["tp_clear"] = f"(inquiry){name_prefix}_clear"
-    # Populate .tp_finalize and generate a finalize method only if __del__ is defined for this class.
+    # Populate .tp_finalize and generate a finalize method only if __del__ is defined
+    # for this class.
     del_method = next((e.method for e in cl.vtable_entries if e.name == "__del__"), None)
     if del_method:
         fields["tp_finalize"] = f"(destructor){finalize_name}"
@@ -316,6 +319,7 @@ def generate_class(cl: ClassIR, module: str, emitter: Emitter) -> None:
     # Since our types aren't allocated using type() we need to
     # populate these fields ourselves if we want them to have correct
     # values. PyType_Ready will inherit the offsets from tp_base but
+
     # that isn't what we want.
 
     # XXX: there is no reason for the __weakref__ stuff to be mixed up with __dict__
@@ -934,8 +938,10 @@ def generate_dealloc_for_class(
         emitter.emit_line("PyObject *type, *value, *traceback;")
         emitter.emit_line("PyErr_Fetch(&type, &value, &traceback);")
         emitter.emit_line("int res = PyObject_CallFinalizerFromDealloc((PyObject *)self);")
-        # CPython interpreter uses PyErr_WriteUnraisable: https://docs.python.org/3/c-api/exceptions.html#c.PyErr_WriteUnraisable
+        # CPython interpreter uses PyErr_WriteUnraisable:
+        # https://docs.python.org/3/c-api/exceptions.html#c.PyErr_WriteUnraisable
         # However, the message is slightly different due to the way mypyc compiles classes.
+
         # CPython interpreter prints: Exception ignored in: <function F.__del__ at 0x100aed940>
         # mypyc prints: Exception ignored in: <slot wrapper '__del__' of 'F' objects>
         emitter.emit_line("if (PyErr_Occurred() != NULL) {")
@@ -1222,6 +1228,7 @@ def generate_setter(cl: ClassIR, attr: str, rtype: RType, emitter: Emitter) -> N
         # Borrow the unboxed value: emit_inc_ref below takes the single owned
         # reference, matching the borrowed-then-incref pattern of the other two
         # branches. Without borrow=True, emit_unbox already creates a new
+
         # reference for refcounted unboxed types (e.g. CPyTagged boxed ints,
         # tuples with refcounted fields), so the emit_inc_ref would double the
         # reference and leak the stored value on every set via this setter.
@@ -1340,7 +1347,8 @@ def generate_coroutine_setup(
         emitter.emit_line("}")
 
     if cl.coroutine_name:
-        # Callable class generated for a coroutine. It stores its function wrapper as an attribute.
+        # Callable class generated for a coroutine. It stores its function wrapper as an
+        # attribute.
         wrapper_name = emit_instance(cl.methods["__call__"], cl.coroutine_name)
         struct_name = cl.struct_name(emitter.names)
         attr = emitter.attr(CPYFUNCTION_NAME)

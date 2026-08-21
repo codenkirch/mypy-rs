@@ -1,6 +1,9 @@
-# This file must have the same content for mypyc/build_setup.py and lib-rt/build_setup.py,
+# This file must have the same content for mypyc/build_setup.py and
+# lib-rt/build_setup.py,
 # it exists to work around absence of support for per-file compile flags in setuptools.
-# The version in mypyc/ is the source of truth, and should be copied to lib-rt if modified.
+
+# The version in mypyc/ is the source of truth, and should be copied to lib-rt if
+# modified.
 
 import os
 import platform

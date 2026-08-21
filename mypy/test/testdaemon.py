@@ -87,6 +87,7 @@ def run_cmd(input: str) -> tuple[int, str]:
     # Prepend (not replace) so the Rust extension dirs on PYTHONPATH
     # (ast_serialize, module_resolver) survive into the dmypy subprocess.
     # Overwriting here drops them, and the venv's PyPI `ast-serialize` stub
+
     # (which has no `parse`) shadows the missing Rust extension.
     env["PYTHONPATH"] = PREFIX + os.pathsep + env.get("PYTHONPATH", "")
     try:

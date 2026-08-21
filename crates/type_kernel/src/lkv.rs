@@ -28,6 +28,7 @@ fn lkv_translate_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResu
     // --- Leaf types: TypeTranslator defaults are identity ---
     // AnyType, NoneType, UninhabitedType, ErasedType, DeletedType,
     // TypeVarType, ParamSpecType, TypeVarTupleType, PartialType, UnboundType
+
     // — all return `t` unchanged.
     if is_instance(obj, refs.any_type)
         || is_instance(obj, refs.none_type)
@@ -49,6 +50,7 @@ fn lkv_translate_one(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResu
     // --- Instance: the core override ---
     // Python:
     //   if not t.last_known_value and not t.args:
+
     //       return t
     //   return t.copy_modified(args=[a.accept(self) for a in t.args],
     //                          last_known_value=None)
@@ -149,10 +151,13 @@ fn lkv_visit_union(py: Python<'_>, obj: &PyAny, refs: &TypeRefs<'_>) -> PyResult
     }
 
     // Python logic:
-    //   instances = [item for item in new.items if isinstance(get_proper_type(item), Instance)]
+    //   instances = [item for item in new.items if isinstance(get_proper_type(item),
+    //   Instance)]
+
     //   if len(instances) > 1:
     //       ... group by fullname, merge groups >1 via make_simplified_union ...
     //   return new  (if <=1 instance)
+
     //
     // We replicate the dedup: collect proper-type Instance items with no args,
     // group by fullname, and call make_simplified_union for groups with >1.

@@ -81,7 +81,8 @@ except ImportError:
     _rust_check_namedtuple_field_name = None  # type: ignore[assignment]
     _HAS_RUST_NAMEDTUPLE = False
 
-# Matches "_prohibited" in typing.py, but adds __annotations__, which works at runtime but can't
+# Matches "_prohibited" in typing.py, but adds __annotations__, which works at runtime
+# but can't
 # easily be supported in a static checker.
 NAMEDTUPLE_PROHIBITED_NAMES: Final = (
     "__new__",
@@ -409,6 +410,7 @@ class NamedTupleAnalyzer:
                 # Even if rename=False, we pretend that it is True.
                 # At runtime namedtuple creation would throw an error;
                 # applying the rename logic means we create a more sensible
+
                 # namedtuple.
                 new_name = f"_{i}"
                 processed_items.append(new_name)
@@ -479,7 +481,8 @@ class NamedTupleAnalyzer:
         # Actual signature should return OrderedDict[str, Union[types]]
         ordereddictype = self.api.named_type("builtins.dict", [strtype, implicit_any])
         fallback = self.api.named_type("builtins.tuple", [implicit_any])
-        # Note: actual signature should accept an invariant version of Iterable[UnionType[types]].
+        # Note: actual signature should accept an invariant version of
+        # Iterable[UnionType[types]].
         # but it can't be expressed. 'new' and 'len' should be callable types.
         iterable_type = self.api.named_type_or_none("typing.Iterable", [implicit_any])
         function_type = self.api.named_type("builtins.function")
@@ -522,6 +525,7 @@ class NamedTupleAnalyzer:
         # We can't share Vars between fields and method arguments, since they
         # have different full names (the latter are normally used as local variables
         # in functions, so their full names are set to short names when generated methods
+
         # are analyzed).
         vars = [Var(item, typ) for item, typ in zip(items, types)]
 

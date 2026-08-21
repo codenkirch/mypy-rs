@@ -40,6 +40,7 @@ class TestEmitClass(unittest.TestCase):
         # Regression: detect_undefined_bitmap used to mutate cl.bitmap_attrs
         # in place, so under separate=True (one SCC per group) a shared base
         # class would accumulate duplicate entries as each subclass's SCC
+
         # walked into it, growing the emitted struct between builds.
         base = ClassIR("Base", "mod")
         base.attributes = {"i": int32_rprimitive}

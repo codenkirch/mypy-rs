@@ -38,7 +38,8 @@ pub(crate) fn remove_path_prefix(path: &str, prefix: Option<&str>) -> String {
     }
 }
 
-/// Format error tuples into default string representation (simplifying path, line, col, code).
+/// Format error tuples into default string representation
+/// (simplifying path, line, col, code).
 #[allow(clippy::type_complexity)]
 #[pyfunction]
 pub fn rust_format_messages_default(

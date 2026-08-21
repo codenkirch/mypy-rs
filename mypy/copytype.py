@@ -33,6 +33,7 @@ from mypy.type_visitor import TypeVisitor  # ruff: isort: skip
 # Stage 7: native copy_type shim (parity-only). The wire Type enum is
 # Clone, so copy_type is trivially clone(). The Python visitor's purpose
 # (shallow copy for truthiness mutation) is preserved by round-tripping
+
 # through the wire format, which produces a structurally identical copy.
 try:
     from librt.internal import ReadBuffer as _CopyReadBuffer, WriteBuffer as _CopyWriteBuffer

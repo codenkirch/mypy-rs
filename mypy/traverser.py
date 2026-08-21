@@ -105,6 +105,7 @@ from mypy.visitor import NodeVisitor
 # Routes has_return_statement, has_str_expression, has_yield_expression,
 # has_yield_from_expression, has_await_expression through the AST
 # wire-format (mypy/astwire.py) into the Rust type_kernel extension.
+
 # Also imports count functions for all_* collectors (parity validation).
 
 # Rust traverses the serialized tree; falls back to pure-Python on error.
@@ -1242,6 +1243,7 @@ def all_yield_from_expressions(node: Node) -> list[tuple[YieldFromExpr, bool]]:
 # ---------------------------------------------------------------------------
 # Issue #541: remaining seekers (structural, wire-format backed).
 # These functions do not have pre-existing pure-Python collectors in
+
 # traverser.py. Each uses the Rust extension for the structural walk
 # and falls back to a pure-Python implementation on ImportError or
 # runtime error.

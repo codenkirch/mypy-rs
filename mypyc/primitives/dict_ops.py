@@ -99,7 +99,8 @@ dict_set_item_op = method_op(
 )
 
 # dict[key] = value (exact dict only, no subclasses)
-# NOTE: this is currently for internal use only, and not used for CallExpr specialization
+# NOTE: this is currently for internal use only, and not used for CallExpr
+# specialization
 exact_dict_set_item_op = custom_op(
     arg_types=[dict_rprimitive, object_rprimitive, object_rprimitive],
     return_type=c_int_rprimitive,
@@ -185,6 +186,7 @@ method_op(
 # dict.setdefault(key, empty tuple/list/set)
 # The third argument marks the data type of the second argument.
 #     1: list    2: dict    3: set
+
 # Other number would lead to an error.
 dict_setdefault_spec_init_op = custom_op(
     arg_types=[dict_rprimitive, object_rprimitive, c_int_rprimitive],

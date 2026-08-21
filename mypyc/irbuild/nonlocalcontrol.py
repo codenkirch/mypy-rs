@@ -98,6 +98,7 @@ class GeneratorNonlocalControl(BaseNonlocalControl):
         # Raise a StopIteration containing a field for the value that
         # should be returned. Before doing so, create a new block
         # without an error handler set so that the implicitly thrown
+
         # StopIteration isn't caught by except blocks inside of the
         # generator function.
         builder.builder.push_error_handler(None)
@@ -106,9 +107,11 @@ class GeneratorNonlocalControl(BaseNonlocalControl):
         # Skip creating a traceback frame when we raise here, because
         # we don't care about the traceback frame and it is kind of
         # expensive since raising StopIteration is an extremely common
+
         # case.  Also we call a special internal function to set
         # StopIteration instead of using RaiseStandardError because
         # the obvious thing doesn't work if the value is a tuple
+
         # (???).
 
         true, false = BasicBlock(), BasicBlock()

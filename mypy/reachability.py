@@ -94,6 +94,7 @@ def infer_reachability_of_if_statement(s: IfStmt, options: Options) -> None:
             # Make sure else body always exists and is marked as
             # unreachable so the type checker always knows that
             # all control flow paths will flow through the if
+
             # statement body.
             if not s.else_body:
                 s.else_body = Block([])
@@ -232,6 +233,7 @@ def consider_sys_version_info(expr: Expression, pyversion: tuple[int, ...]) -> i
     # Cases supported:
     # - sys.version_info[<int>] <compare_op> <int>
     # - sys.version_info[:<int>] <compare_op> <tuple_of_n_ints>
+
     # - sys.version_info <compare_op> <tuple_of_1_or_2_ints>
     #   (in this case <compare_op> must be >, >=, <, <=, but cannot be ==, !=)
     if not isinstance(expr, ComparisonExpr):
@@ -281,6 +283,7 @@ def consider_sys_platform(expr: Expression, platform: str) -> int:
     # Cases supported:
     # - sys.platform == 'linux'
     # - sys.platform != 'win32'
+
     # - sys.platform.startswith('win')
     if isinstance(expr, ComparisonExpr):
         # Let's not yet support chained comparisons.

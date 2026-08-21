@@ -333,18 +333,23 @@ def transform_import(builder: IRBuilder, node: Import) -> None:
     # Imports (not from imports!) are processed in an odd way so they can be
     # table-driven and compact. Here's how it works:
     #
+
     # Import nodes are divided in groups (in the prebuild visitor). Each group
     # consists of consecutive Import nodes:
     #
+
     #   import mod         <| group #1
     #   import mod2         |
     #
+
     #   def foo() -> None:
     #       import mod3    <- group #2 (*)
     #
+
     #   import mod4        <| group #3
     #   import mod5         |
     #
+
     # Every time we encounter the first import of a group, build IR to import
     # all modules in the group. Native same-group imports are handled individually,
     # while non-native imports use a table-driven helper for compactness.
@@ -693,6 +698,7 @@ def transform_try_except(
     # The error handler catches the error and then checks it
     # against the except clauses. We compile the error handler
     # itself with an error handler so that it can properly restore
+
     # the *old* exc_info if an exception occurs.
     # The exception chaining will be done automatically when the
     # exception is raised, based on the exception in exc_info.
@@ -828,7 +834,8 @@ def try_finally_body(
     builder: IRBuilder, finally_block: BasicBlock, finally_body: GenFunc, old_exc: Value
 ) -> tuple[BasicBlock, FinallyNonlocalControl]:
     cleanup_block = BasicBlock()
-    # Compile the finally block with the nonlocal control flow overridden to restore exc_info
+    # Compile the finally block with the nonlocal control flow overridden to restore
+    # exc_info
     builder.builder.push_error_handler(cleanup_block)
     finally_control = FinallyNonlocalControl(builder.nonlocal_control[-1], old_exc)
     builder.nonlocal_control.append(finally_control)
@@ -978,7 +985,9 @@ def transform_try_finally_stmt_async(
 
     # After finally, we need to handle exceptions carefully:
     # 1. If finally raised a new exception, it's in the error indicator - let it propagate
-    # 2. If finally didn't raise, check if we need to reraise the original from sys.exc_info()
+    # 2. If finally didn't raise, check if we need to reraise the original from
+
+    # sys.exc_info()
     # 3. If there was a return, return that value
     # 4. Otherwise, normal exit
 
@@ -1049,6 +1058,7 @@ def transform_try_stmt(builder: IRBuilder, t: TryStmt) -> None:
     # Our compilation strategy for try/except/else/finally is to
     # treat try/except/else and try/finally as separate language
     # constructs that we compile separately. When we have a
+
     # try/except/else/finally, we treat the try/except/else as the
     # body of a try/finally block.
     if t.is_star:
@@ -1103,6 +1113,7 @@ def transform_with(
     # This is basically a straight transcription of the Python code in PEP 343.
     # I don't actually understand why a bunch of it is the way it is.
     # We could probably optimize the case where the manager is compiled by us,
+
     # but that is not our common case at all, so.
 
     al = "a" if is_async else ""
@@ -1256,8 +1267,10 @@ def emit_yield(builder: IRBuilder, val: Value, line: int) -> Value:
     retval = builder.coerce(val, builder.ret_types[-1], line)
 
     cls = builder.fn_info.generator_class
-    # Create a new block for the instructions immediately following the yield expression, and
+    # Create a new block for the instructions immediately following the yield
+    # expression, and
     # set the next label so that the next time '__next__' is called on the generator object,
+
     # the function continues at the new block.
     next_block = BasicBlock()
     next_label = len(cls.continuation_blocks)
@@ -1291,6 +1304,7 @@ def emit_yield_from_or_await(
         # This is a generated native generator class, and we can use a fast path.
         # This allows two optimizations:
         # 1) No need to call CPy_GetCoro() or iter() since for native generators
+
         #    it just returns the generator object (implemented here).
         # 2) Instead of calling next(), call generator helper method directly,
         #    since next() just calls __next__ which calls the helper method.
@@ -1310,6 +1324,7 @@ def emit_yield_from_or_await(
         # Second fast path optimization: call helper directly (see also comment above).
         #
         # Calling a generated generator, so avoid raising StopIteration by passing
+
         # an extra PyObject ** argument to helper where the stop iteration value is stored.
         fast_path = True
         obj = builder.read(iter_reg, line)

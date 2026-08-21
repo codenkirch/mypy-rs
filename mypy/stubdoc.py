@@ -241,6 +241,7 @@ class DocStringParser:
             # We thought we were after the colon of an "arg_name: arg_type"
             # stanza, so we were expecting an "arg_type" now. However, we ended
             # up with "arg_name::" (with two colons). That's a C++ type name,
+
             # not an argument name followed by a Python type. This function
             # signature is malformed / invalid.
             self.reset()
@@ -328,6 +329,7 @@ class DocStringParser:
                     # Error cases:
                     # - / shows up more than once
                     # - / shows up after *
+
                     # - / shows up before any arguments
                     self.reset()
                     return
@@ -415,7 +417,8 @@ def infer_sig_from_docstring(docstr: str | None, name: str) -> list[FunctionSig]
         """return true if function argument names are unique"""
         return len(sig.args) == len({arg.name for arg in sig.args})
 
-    # Return only signatures that have unique argument names. Mypy fails on non-unique arg names.
+    # Return only signatures that have unique argument names. Mypy fails on non-unique
+    # arg names.
     return [sig for sig in sigs if is_unique_args(sig)]
 
 

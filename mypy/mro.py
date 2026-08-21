@@ -10,9 +10,11 @@ from mypy.typestate import type_state
 # Stage 5 type-kernel seam: when the `type_kernel` Rust extension is
 # importable and `Options.native_type_kernel` is set, route the pure C3
 # linearization through Rust. The Rust path returns `None` for any case it
+
 # does not handle (cycles, a base missing from the snapshot, the `obj_type`
 # callback edge at mro.py:34, or an inconsistent merge), in which case we
 # fall back to the pure-Python implementation. This is the strangler-fig
+
 # per-call gate, mirroring `erasetype.py` (Stage 1), `subtypes.py` (Stage
 # 3c), and `argmap.py` (Stage 4): no behavior change unless the option is
 # set, and even then unsupported cases degrade gracefully.
@@ -27,6 +29,7 @@ except ImportError:
 # Module-level flag + resolver + fullname map, set by the build manager
 # from `Options.native_type_kernel` at the start of each build. The hot path
 # reads these without an options lookup per call. When `_native_mro_active`
+
 # is True but `_native_mro_resolver` or `_native_mro_typeinfo_map` is None,
 # the shim falls through to Python (the resolver isn't wired yet, e.g. in
 # tests that only set the flag).
@@ -102,6 +105,7 @@ def _rust_or_python_mro(
             # A fullname was missing from the map (stale resolver); fall
             # through to the pure-Python path, which rebuilds from the live
             # graph.
+
         # Rust declined (cycle, missing base, obj_type edge, inconsistent
         # merge); fall through to Python, which raises the real MroError on
         # inconsistency.

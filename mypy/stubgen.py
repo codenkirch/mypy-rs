@@ -183,7 +183,8 @@ except ImportError:
 # Common ways of naming package containing vendored modules.
 VENDOR_PACKAGES: Final = ["packages", "vendor", "vendored", "_vendor", "_vendored_packages"]
 
-# Avoid some file names that are unnecessary or likely to cause trouble (\n for end of path).
+# Avoid some file names that are unnecessary or likely to cause trouble (\n for end of
+# path).
 BLACKLIST: Final = [
     "/six.py\n",  # Likely vendored six; too dynamic for us to handle
     "/vendored/",  # Vendored packages
@@ -928,9 +929,11 @@ class ASTStubGenerator(BaseStubGenerator, mypy.traverser.TraverserVisitor):
                 # namedtuple(typename, fields), NamedTuple(typename, fields) calls can
                 # be used as a base class. The first argument is a string literal that
                 # is usually the same as the class name.
+
                 #
                 # Note:
                 # A call-based named tuple as a base class cannot be safely converted to
+
                 # a class-based NamedTuple definition because class attributes defined
                 # in the body of the class inheriting from the named tuple call are not
                 # namedtuple fields at runtime.

@@ -1,6 +1,7 @@
 //! Complete AST Node Definitions & Visitor Engine (Phase 8, Module 4) for Issue #140.
 //!
-//! Provides native Rust representations, serialization handlers, and visitor interfaces for all 77 Mypy AST node classes.
+//! Provides native Rust representations, serialization handlers, and visitor interfaces
+//! for all 77 Mypy AST node classes.
 
 use std::collections::HashMap;
 

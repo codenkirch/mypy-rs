@@ -623,6 +623,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #347: checker narrowing helpers. narrow_declared_type is already
     // registered via meet::rust_narrow_declared_type (the authoritative
     // meet.py seam); the other four defer (None) and exist only as
+
     // entry-points so Python can call through the gate.
     module.add_function(wrap_pyfunction!(checker_stmts::rust_narrow_type, module)?)?;
     module.add_function(wrap_pyfunction!(
@@ -1395,6 +1396,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // analyze_type_with_type_info: the decision front (tuple-with-args,
     // librt.vecs.vec, named-tuple/TypedDict tails, types.NoneType, plain
     // Instance). Rust returns a branch tag from raw node facts; Python
+
     // applies the side effects and builds the result objects for the two
     // tags it executes inline, the rest re-run the body. None defers.
     module.add_function(wrap_pyfunction!(
@@ -1416,6 +1418,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // instantiate_type_alias: normalize a TypeAlias node + type args.
     // Deferral-based seam: any path that would emit an error or call
     // set_any_tvars returns None and the Python shim falls back. The
+
     // no_args / max_tv_count==0 success paths (eager Instance) and the
     // plain TypeAliasType success path are returned as a branch tag +
     // argument wire blobs for the shim to rebuild live objects.
@@ -1433,6 +1436,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // visit_unbound_type_nonoptional: the decision front (placeholder /
     // node-None / ParamSpec / TypeVar / TypeVarTuple families). Rust
     // returns a branch tag from raw node facts; Python applies the side
+
     // effects and builds the result objects. None defers to pure Python.
     module.add_function(wrap_pyfunction!(
         typeanal_unbound2::rust_classify_unbound_front,
@@ -1441,6 +1445,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // try_analyze_special_unbound_type: the special-form dispatch classifier
     // (builtins.None / Any / Final / Tuple / Union / Optional / Callable /
     // Type / TypeForm / ClassVar / Never / Annotated / Required /
+
     // NotRequired / ReadOnly). Rust returns a branch tag from scalar facts;
     // Python applies the side effects and builds the result objects. None
     // defers to pure Python for the branches needing recursive analysis.

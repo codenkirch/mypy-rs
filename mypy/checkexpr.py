@@ -222,6 +222,7 @@ from mypy.visitor import ExpressionVisitor
 # Native type_kernel seam for standalone checkexpr functions (Stage 9).
 # Gates: _native_checkexpr_active enables scalar-returning functions.
 # Rust returns None for TypeAliasType (no alias target on the wire);
+
 # Python falls back to get_proper_type + the pure-Python visitor.
 try:
     from librt.internal import (
@@ -336,6 +337,7 @@ _native_checkexpr_active: bool = False
 # Stage 9 checkcall gate: when active, generic callable solving
 # (normalize + map + infer + solve + apply) routes through the Rust kernel.
 # Rust returns None for ParamSpec/TypeVarTuple/UnpackType/TypeAliasType
+
 # cases, so Python falls back to the full `infer_function_type_arguments` path.
 _native_checkcall_active: bool = False
 
@@ -360,6 +362,7 @@ def _set_native_checkexpr_resolver(resolver: Any) -> None:
 # Stage 4 plugin-hook snapshot: a Rust `PluginHookRegistry` holding
 # DefaultPlugin's hook fullnames, keyed by hook-method kind. See
 # `plugin_call_hook_known_absent` and `plugin_hook_known_absent`.
+
 # Installed per build by BuildManager (None when user plugins present).
 _native_plugin_hook_registry: Any = None
 _native_plugin_hook_has_user_plugins: bool = False
@@ -971,11 +974,13 @@ ArgChecker: _TypeAlias = Callable[
 # Maximum nesting level for math union in overloads, setting this to large values
 # may cause performance issues. The reason is that although union math algorithm we use
 # nicely captures most corner cases, its worst case complexity is exponential,
+
 # see https://github.com/python/mypy/pull/5255#discussion_r196896335 for discussion.
 MAX_UNIONS: Final = 5
 
 
-# Types considered safe for comparisons with --strict-equality due to known behaviour of __eq__.
+# Types considered safe for comparisons with --strict-equality due to known behaviour of
+# __eq__.
 # NOTE: All these types are subtypes of AbstractSet.
 OVERLAPPING_TYPES_ALLOWLIST: Final = [
     "builtins.set",
@@ -1072,6 +1077,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Temporary overrides for expression types. This is currently
         # used by the union math in overloads.
         # TODO: refactor this to use a pattern similar to one in
+
         # multiassign_from_union, or maybe even combine the two?
         self.type_overrides: dict[Expression, Type] = {}
         self.strfrm_checker = StringFormatterChecker(self.chk, self.msg)
@@ -1079,6 +1085,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Callee in a call expression is in some sense both runtime context and
         # type context, because we support things like C[int](...). Store information
         # on whether current expression is a callee, to give better error messages
+
         # related to type context.
         self.is_callee = False
         type_state.infer_polymorphic = not self.chk.options.old_type_inference
@@ -1230,6 +1237,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # In test cases might 'types' may not be available.
             # Fall back to a dummy 'object' type instead to
             # avoid a crash.
+
             # Make a copy so that we don't set extra_attrs (below) on a shared instance.
             result = self.named_type("builtins.object").copy_modified()
         module_attrs: dict[str, Type] = {}
@@ -1365,6 +1373,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # * Call to a method on object that has a full name (see
             #   method_fullname() for details on supported objects);
             #   get_method_hook() and get_method_signature_hook() will
+
             #   be invoked for these.
             if (
                 not fullname
@@ -1646,6 +1655,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Having an optional key not explicitly declared by a ** unpacked open
                 # TypedDict is unsafe, it may be an (incompatible) subtype at runtime.
                 # TODO: catch the cases where a declared key is overridden by a subsequent
+
                 # ** item without it (and not again overridden with complete ** item).
                 self.msg.non_required_keys_absent_with_star(absent_keys, last_open_star_found)
         return result, always_present_keys
@@ -1697,6 +1707,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Always present keys override previously found values. This is done
                 # to support use cases like `Config({**defaults, **overrides})`, where
                 # some `overrides` types are narrower that types in `defaults`, and
+
                 # former are too wide for `Config`.
                 if result[key]:
                     first = result[key][0]
@@ -2585,6 +2596,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # This is tricky: return type may contain its own type variables, like in
         # def [S] (S) -> def [T] (T) -> tuple[S, T], so we need to update their ids
         # to avoid possible id clashes if this call itself appears in a generic
+
         # function body.
         ret_type = get_proper_type(callee.ret_type)
         if isinstance(ret_type, CallableType) and ret_type.variables:
@@ -2610,6 +2622,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Give precise constructor signature for situations like this:
             #     class Shape[*Ts](tuple[*Ts]): ...
             #     Shape((1, 2))
+
             # The argument type is the same as return type, but with builtins.tuple fallback.
             if isinstance(arg_type, TupleType):
                 assert isinstance(callee.ret_type, ProperType)
@@ -2648,6 +2661,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Collect arg types and formal-to-actual mapping for Rust.
                 # Accept each arg with its formal type as context (mirroring
                 # infer_arg_types_in_context) so lambdas keep parameter/return
+
                 # narrowing; bare accept() degrades them to Any.
                 try:
                     # arg_context[ai] = callee.arg_types[fi] for non-star actuals.
@@ -2661,6 +2675,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # A lambda arg whose context depends on a callee type
                     # variable needs Python's two-pass lambda inference:
                     # args are accepted before the solve, so its body would
+
                     # otherwise be checked against the bare variable. Defer.
                     lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
                     callee_var_ids = {v.id for v in callee.variables}
@@ -2696,6 +2711,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                             # Deserialize may return None when a type_ref cannot
                             # be resolved to a live TypeInfo; in that case defer
                             # to Python's generic-call inference below. The
+
                             # isinstance also narrows None out of the union.
                             if isinstance(resolved_callee, CallableType):  # type: ignore[misc]
                                 callee = resolved_callee
@@ -2823,6 +2839,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         # The wire format has no line/column/special_sig;
                         # the Rust round-trip defaults them. Restore from
                         # the pre-edit callee to match copy_modified
+
                         # (freshen-seam style; special_sig affects
                         # downstream protocol/tuple error paths).
                         # from_type_type rides the wire (issue #388).
@@ -2935,6 +2952,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Pretend we're calling the typevar's upper bound,
             # i.e. its constructor (a poor approximation for reality,
             # but better than AnyType...), but replace the return type
+
             # with typevar.
             callee = self.analyze_type_type_callee(get_proper_type(item.upper_bound), context)
             return self.replace_type_type_callee_ret_type(callee, item)
@@ -3024,6 +3042,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # When the outer context for a function call is known to be recursive,
                 # we solve type constraints inferred from arguments using unions instead
                 # of joins. This is a bit arbitrary, but in practice it works for most
+
                 # cases. A cleaner alternative would be to switch to single bin type
                 # inference, but this is a lot of work.
                 old = self.infer_more_unions_for_recursive_type(ctx)
@@ -3049,6 +3068,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # The return type may have references to type metavariables that
         # we are inferring right now. We must consider them as indeterminate
         # and they are not potential results; thus we replace them with the
+
         # special ErasedType type. On the other hand, class type variables are
         # valid results.
         erased_ctx = replace_meta_vars(ctx, ErasedType())
@@ -3057,6 +3077,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # If both the context and the return type are optional, unwrap the optional,
             # since in 99% cases this is what a user expects. In other words, we replace
             #     Optional[T] <: Optional[int]
+
             # with
             #     T <: int
             # while the former would infer T <: Optional[int].
@@ -3065,12 +3086,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             #
             # TODO: Instead of this hack and the one below, we need to use outer and
             # inner contexts at the same time. This is however not easy because of two
+
             # reasons:
             #   * We need to support constraints like [1 <: 2, 2 <: X], i.e. with variables
             #     on both sides. (This is not too hard.)
+
             #   * We need to update all the inference "infrastructure", so that all
             #     variables in an expression are inferred at the same time.
             #     (And this is hard, also we need to be careful with lambdas that require
+
             #     two passes.)
         proper_ret = get_proper_type(ret_type)
         if (
@@ -3081,24 +3105,31 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Another special case: the return type is a type variable. If it's unrestricted,
             # we could infer a too general type for the type variable if we use context,
             # and this could result in confusing and spurious type errors elsewhere.
+
             #
             # So we give up and just use function arguments for type inference, with just two
             # exceptions:
+
             #
             # 1. If the context is a generic instance type, actually use it as context, as
             #    this *seems* to usually be the reasonable thing to do.
+
             #
             #    See also github issues #462 and #360.
             #
+
             # 2. If the context is some literal type, we want to "propagate" that information
             #    down so that we infer a more precise type for literal expressions. For example,
             #    the expression `3` normally has an inferred type of `builtins.int`: but if it's
+
             #    in a literal context like below, we want it to infer `Literal[3]` instead.
             #
             #        def expects_literal(x: Literal[3]) -> None: pass
+
             #        def identity(x: T) -> T: return x
             #
             #        expects_literal(identity(3))  # Should type-check
+
             # TODO: we may want to add similar exception if all arguments are lambdas, since
             # in this case external context is almost everything we have.
             if not is_generic_instance(ctx) and not is_literal_type_like(ctx):
@@ -3139,6 +3170,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Disable type errors during type inference. There may be errors
             # due to partial available context information at this time, but
             # these errors can be safely ignored as the arguments will be
+
             # inferred again later.
             with self.msg.filter_errors():
                 arg_types = self.infer_arg_types_in_context(
@@ -3159,6 +3191,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Stage 20 (#382): pass-1 type-argument inference through the
             # Rust kernel. Rust returns None for ParamSpec/TypeVarTuple
             # variables, UnpackType formals, TypeAliasType/UnboundType
+
             # actuals and other deferred branches, so the whole call falls
             # back to Python. Pass 2 (multi-pass inference, below) always
             # stays in Python.
@@ -3224,6 +3257,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # HACK: Infer str key type for dict(...) with keyword args. The type system
                 #       can't represent this so we special case it, as this is a pretty common
                 #       thing. This doesn't quite work with all possible subclasses of dict
+
                 #       if they shuffle type variables around, as we assume that there is a 1-1
                 #       correspondence with dict type variables. This is a marginal issue and
                 #       a little tricky to fix so it's left unfixed for now.
@@ -3253,6 +3287,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # If the regular two-phase inference didn't work, try inferring type
                 # variables while allowing for polymorphic solutions, i.e. for solutions
                 # potentially involving free variables.
+
                 # TODO: support the similar inference for return type context.
                 poly_inferred_args, free_vars = infer_function_type_arguments(
                     callee_type,
@@ -3389,9 +3424,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # This is an exception from the usual logic where we put generic Callable
                     # arguments in the second pass. If we have a non-generic actual, it is
                     # likely to infer good constraints, for example if we have:
+
                     #   def run(Callable[P, None], *args: P.args, **kwargs: P.kwargs) -> None: ...
                     #   def test(x: int, y: int) -> int: ...
                     #   run(test, 1, 2)
+
                     # we will use `test` for inference, since it will allow to infer also
                     # argument *names* for P <: [x: int, y: int].
                     if isinstance(p_actual, Instance):
@@ -3569,7 +3606,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         # TODO(jukka): We could return as soon as we find an error if messages is None.
 
-        # Collect dict of all actual arguments matched to formal arguments, with occurrence count
+        # Collect dict of all actual arguments matched to formal arguments, with
+        # occurrence count
         all_actuals: dict[int, int] = {}
         for actuals in formal_to_actual:
             for a in actuals:
@@ -3739,9 +3777,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Native seam: Rust derives the per-formal argument-expansion
         # plan (callee_arg_types/kinds and actual_types/kinds, or a
         # too-many/too-few decision) from the wire data; the shim
+
         # reports the count errors and drives the ArgTypeExpander +
         # check_arg loop exactly as the pure-Python body below. Rust
         # returns None (or the decoder fails) on a case it cannot
+
         # reproduce (TypeAliasType, non-tuple unpack target, wire
         # decode failure), falling back to the pure-Python body.
         if (
@@ -3809,9 +3849,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Checking the case that we have more than one item but the first argument
             # is an unpack, so this would be something like:
             # [Tuple[Unpack[Ts]], int]
+
             #
             # In this case we have to check everything together, we do this by re-unifying
             # the suffices to the tuple, e.g. a single actual like
+
             # Tuple[Unpack[Ts], int]
             expanded_tuple = False
             actual_kinds = [arg_kinds[a] for a in actuals]
@@ -3980,6 +4022,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Native overload dispatch: Rust returns the first-match target index
         # for the no-Any, no-union-arg, no-star-actual, non-generic-target path.
         # We re-run check_call on the chosen target inside filter_errors and
+
         # trust it only when it produces no new errors; otherwise Python flow
         # proceeds unchanged.
         native_idx: int | None = None
@@ -4022,8 +4065,10 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Step 2: If the arguments contain a union, we try performing union math first,
         #         instead of picking the first matching overload.
         #         This is because picking the first overload often ends up being too greedy:
+
         #         for example, when we have a fallback alternative that accepts an unrestricted
-        #         typevar. See https://github.com/python/mypy/issues/4063 for related discussion.
+        #         typevar. See https://github.com/python/mypy/issues/4063 for related
+        #         discussion.
         erased_targets: list[CallableType] | None = None
         inferred_types: list[Type] | None = None
         unioned_result: tuple[Type, Type] | None = None
@@ -4058,6 +4103,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # Note that we use `combine_function_signatures` instead of just returning
                     # a union of inferred callables because for example a call
                     # Union[int -> int, str -> str](Union[int, str]) is invalid and
+
                     # we don't want to introduce internal inconsistencies.
                     unioned_result = (
                         make_simplified_union(returns, context.line, context.column),
@@ -4100,9 +4146,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Step 4: Failure. At this point, we know there is no match. We fall back to trying
         #         to find a somewhat plausible overload target using the erased types
         #         so we can produce a nice error message.
+
         #
         #         For example, suppose the user passes a value of type 'List[str]' into an
         #         overload with signatures f(x: int) -> int and f(x: List[int]) -> List[int].
+
         #
         #         Neither alternative matches, but we can guess the user probably wants the
         #         second one.
@@ -4116,6 +4164,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Pick the first plausible erased target as the fallback
             # TODO: Adjust the error message here to make it clear there was no match.
             #       In order to do this, we need to find a clean way of associating
+
             #       a note with whatever error message 'self.check_call' will generate.
             #       In particular, the note's line and column numbers need to be the same
             #       as the error's.
@@ -4189,6 +4238,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # ParamSpec can be expanded in a lot of different ways. We may try
                     # to expand it here instead, but picking an impossible overload
                     # is safe: it will be filtered out later.
+
                     # Unlike other var-args signatures, ParamSpec produces essentially
                     # a fixed signature, so there's no need to push them to the top.
                     matches.append(typ)
@@ -4524,6 +4574,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # The wire format cannot carry line/column/definition/
                     # fallback/special_sig; restore from the pre-merge
                     # first callable like the check_callable_call
+
                     # calibration path. from_type_type rides the wire
                     # (issue #388).
                     first = callables[0]
@@ -4537,12 +4588,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Note: we are assuming here that if a user uses some TypeVar 'T' in
         # two different functions, they meant for that TypeVar to mean the
         # same thing.
+
         #
         # This function will make sure that all instances of that TypeVar 'T'
         # refer to the same underlying TypeVarType objects to simplify the union-ing
+
         # logic below.
         #
         # (If the user did *not* mean for 'T' to be consistently bound to the
+
         # same type in their overloads, well, their code is probably too
         # confusing and ought to be re-written anyways.)
         callables, variables = merge_typevars_in_callables_by_name(callables)
@@ -4556,6 +4610,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # We fall back to Callable[..., Union[<returns>]] if the functions do not have
             # the exact same signature. The only exception is if one arg is optional and
             # the other is positional: in that case, we continue unioning (and expect a
+
             # positional arg).
             # TODO: Enhance the merging logic to handle a wider variety of signatures.
             if len(new_kinds) != len(target.arg_kinds):
@@ -4886,7 +4941,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             if is_named_instance(proper_left_type, "builtins.dict"):
                 # This is a special case for `dict | TypedDict`.
                 # 1. Find `dict | TypedDict` case
-                # 2. Switch `dict.__or__` to `TypedDict.__ror__` (the same from both runtime and typing perspective)
+                # 2. Switch `dict.__or__` to `TypedDict.__ror__` (the same from both
+
+                # runtime and typing perspective)
                 proper_right_type = get_proper_type(self.accept(e.right))
                 if isinstance(proper_right_type, TypedDictType):
                     use_reverse = USE_REVERSE_ALWAYS
@@ -4957,9 +5014,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             if operator == "in" or operator == "not in":
                 # This case covers both iterables and containers, which have different meanings.
                 # For a container, the in operator calls the __contains__ method.
-                # For an iterable, the in operator iterates over the iterable, and compares each item one-by-one.
-                # We allow `in` for a union of containers and iterables as long as at least one of them matches the
-                # type of the left operand, as the operation will simply return False if the union's container/iterator
+                # For an iterable, the in operator iterates over the iterable, and
+
+                # compares each item one-by-one.
+                # We allow `in` for a union of containers and iterables as long as at
+                # least one of them matches the
+
+                # type of the left operand, as the operation will simply return False if
+                # the union's container/iterator
                 # type doesn't match the left operand.
 
                 # If the right operand has partial type, look it up without triggering
@@ -4995,6 +5057,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         # Container item type for strict type overlap checks. Note: we need to only
                         # check for nominal type, because a usual "Unsupported operands for in"
                         # will be reported for types incompatible with __contains__().
+
                         # See testCustomContainsCheckStrictEquality for an example.
                         cont_type = self.chk.analyze_container_item_type(item_type)
 
@@ -5155,6 +5218,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Native seam: Rust reruns the branch-for-branch decision tree on
         # wire types and returns Some(bool), or None to defer. The
         # recursion guard `(left, right) in seen_types` and the
+
         # AbstractSet/Mapping/list-tuple item recursion use live type
         # identities the wire cannot carry, so Rust defers there and the
         # pure-Python body (with the live guard) runs unchanged.
@@ -5213,6 +5277,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Also flag non-overlapping literals in situations like:
             #    x: Literal['a', 'b']
             #    if x == 'c':
+
             #        ...
             left = try_getting_literal(left)
             right = try_getting_literal(right)
@@ -5221,12 +5286,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # We are inside a function that contains type variables with value restrictions in
             # its signature. In this case we just suppress all strict-equality checks to avoid
             # false positives for code like:
+
             #
             #     T = TypeVar('T', str, int)
             #     def f(x: T) -> T:
+
             #         if x == 0:
             #             ...
             #         return x
+
             #
             # TODO: find a way of disabling the check only for types resulted from the expansion.
             return False
@@ -5465,9 +5533,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # STEP 2a:
         # We figure out in which order Python will call the operator methods. As it
         # turns out, it's not as simple as just trying to call __op__ first and
+
         # __rop__ second.
         #
         # We store the determined order inside the 'variants_raw' variable,
+
         # which records tuples containing the method, base type, and the argument.
 
         plan = _try_native_operator_plan(
@@ -5486,6 +5556,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # When we do "A() + A()", for example, Python will only call the __add__ method,
             # never the __radd__ method.
             #
+
             # This is the case even if the __add__ method is completely missing and the __radd__
             # method is defined.
 
@@ -5511,9 +5582,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # When we do "A() + B()" where B is a subclass of A, we'll actually try calling
             # B's __radd__ method first, but ONLY if B explicitly defines or overrides the
             # __radd__ method.
+
             #
             # This mechanism lets subclasses "refine" the expected outcome of the operation, even
             # if they're located on the RHS.
+
             #
             # As a special case, the alt_promote check makes sure that we don't use the
             # __radd__ method of int if the LHS is a native int type.
@@ -5534,6 +5607,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # STEP 3:
         # We now filter out all non-existent operators. The 'variants' list contains
         # all operator methods that are actually present, in the order that Python
+
         # attempts to invoke them.
 
         variants = [(na, op, obj, arg) for (na, op, obj, arg) in variants_raw if op is not None]
@@ -5541,6 +5615,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # STEP 4:
         # We now try invoking each one. If an operation succeeds, end early and return
         # the corresponding result. Otherwise, return the result and errors associated
+
         # with the first entry.
 
         errors = []
@@ -5640,9 +5715,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Note: We want to pass in the original 'arg' for 'left_expr' and 'right_expr'
             # whenever possible so that plugins and similar things can introspect on the original
             # node if possible.
+
             #
             # We don't do the same for the base expression because it could lead to weird
             # type inference errors -- e.g. see 'testOperatorDoubleUnionSum'.
+
             # TODO: Can we use `type_overrides_set()` here?
             right_variants = [(right_type, arg)]
             right_type = get_proper_type(right_type)
@@ -5708,6 +5785,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # We use the current type context to guide the type inference of
         # the left operand. We also use the left operand type to guide the type
         # inference of the right operand so that expressions such as
+
         # '[1] or []' are inferred correctly.
         ctx = self.type_context[-1]
         left_type = self.accept(e.left, ctx)
@@ -5946,6 +6024,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Only take the Rust path for fixed (non-variadic) tuples.
             # Rust's variadic index result (middle + suffix unions) does
             # not yet match Python (see #486: `args[1]` on
+
             # `tuple[str, *tuple[int, ...], str, float]` must be `int | str`);
             # defer variadic indexing to the pure-Python helper.
             try:
@@ -6014,6 +6093,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Rust's tuple_slice output uses the tuple's own partial_fallback
             # as result fallback, while Python's TupleType.slice defaults to
             # self.named_type("builtins.tuple"). For plain builtins.tuple
+
             # tuples these agree; subclass tuples (Tup2Class, NameTuple) get
             # a plain-tuple result from Python, so defer them.
             try:
@@ -6025,6 +6105,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Only take the Rust path when every present bound is a
                 # single int literal. A non-literal or multi-value bound
                 # (e.g. `tup[n:]` with a Var, or `tup[L1|L2]`) makes Python
+
                 # route to nonliteral_tuple_index_helper / homogeneous
                 # variadic results that Rust cannot reproduce; defer.
                 ok = True
@@ -6389,6 +6470,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # If this is a generic alias, we set all variables to `Any`.
         # For example:
         #     A = List[Tuple[T, T]]
+
         #     x = A() <- same as List[Tuple[Any, Any]], see PEP 484.
         disallow_any = self.chk.options.disallow_any_generics and self.is_callee
         item, _ = set_any_tvars(
@@ -6504,9 +6586,11 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # If we have a class object in runtime context, then the available type
                 # variables are those of the class, we don't include additional variables
                 # of the constructor. So that with
+
                 #     class C(Generic[T]):
                 #         def __init__(self, f: Callable[[S], T], x: S) -> None
                 # C[int] is valid
+
                 # C[int, str] is invalid (although C as a callable has 2 type variables)
                 # Note: various logic below and in applytype.py relies on the fact that
                 # class type variables appear *before* constructor variables.
@@ -6522,6 +6606,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     # e.g. expression tuple[X, Y]
                     # - want the type of the expression i.e. a function with that as its return type
                     # - tp is type of tuple (note it won't have params as we are only called
+
                     #   with generic callable type)
                     # - tuple[X, Y]() takes a single arg that is a tuple containing an X and a Y
                     return CallableType(
@@ -6639,6 +6724,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Translate into type checking a generic function call.
         # Used for list and set expressions, as well as for tuples
         # containing star expressions that don't refer to a
+
         # Tuple. (Note: "lst" stands for list-set-tuple. :-)
         tv = TypeVarType(
             "T",
@@ -6712,6 +6798,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # NOTE: it's possible for the context to have a different
         # number of items than e.  In that case we use those context
         # items that match a position in e, and we'll worry about type
+
         # mismatches later.
 
         unpack_in_context = False
@@ -6732,6 +6819,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 # Special handling for star expressions.
                 # TODO: If there's a context, and item.expr is a
                 # TupleExpr, flatten it, so we can benefit from the
+
                 # context?  Counterargument: Why would anyone write
                 # (1, *(2, 3)) instead of (1, 2, 3) except in a test?
                 if unpack_in_context:
@@ -6883,6 +6971,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # if the dict literal doesn't match TypedDict, check_typeddict_call_with_dict reports
         # an error, but returns the TypedDict type that matches the literal it found
         # that would cause a second error when that TypedDict type is returned upstream
+
         # to avoid the second error, we always return TypedDict type that was requested
         typeddict_contexts, exhaustive = self.find_typeddict_context(self.type_context[-1], e)
         if typeddict_contexts:
@@ -7069,6 +7158,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # The context may have function type variables in it. We replace them
         # since these are the type variables we are ultimately trying to infer;
         # they must be considered as indeterminate. We use ErasedType since it
+
         # does not affect type inference results (it is for purposes like this
         # only).
         if not self.chk.options.old_type_inference:
@@ -7157,6 +7247,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Mypy explicitly allows supertype upper bounds (and no upper bound at all)
             # for annotating self-types. However, if such an annotation is used for
             # checking super() we will still get an error. So to be consistent, we also
+
             # allow such imprecise annotations for use with super(), where we fall back
             # to the current class MRO instead. This works only from inside a method.
             if method is not None and is_self_type_like(
@@ -7307,7 +7398,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         )
 
     def visit_generator_expr(self, e: GeneratorExpr) -> Type:
-        # If any of the comprehensions use async for, the expression will return an async generator
+        # If any of the comprehensions use async for, the expression will return an
+        # async generator
         # object, or await is used anywhere but in the leftmost sequence.
         if (
             any(e.is_async)
@@ -7448,6 +7540,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # When no context is provided, compute each branch individually, and
             # use the union of the results as artificial context. Important for:
             # - testUnificationDict
+
             # - testConditionalExpressionWithEmpty
             ctx_if_type = self.analyze_cond_branch(
                 if_map, e.if_expr, context=ctx, allow_none_return=allow_none_return
@@ -7618,6 +7711,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # Deeply nested generic calls can deteriorate performance dramatically.
             # Although in most cases caching makes little difference, in worst case
             # it avoids exponential complexity.
+
             # We cannot use cache inside lambdas, because they skip immediate type
             # context, and use enclosing one, see infer_lambda_type_using_context().
             # TODO: consider using cache for more expression kinds.
@@ -7793,16 +7887,19 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # NOTE: Whether `yield from` accepts an `async def` decorated
         # with `@types.coroutine` (or `@asyncio.coroutine`) depends on
         # whether the generator containing the `yield from` is itself
+
         # thus decorated.  But it accepts a generator regardless of
         # how it's decorated.
         return_type = self.chk.return_types[-1]
         # TODO: What should the context for the sub-expression be?
         # If the containing function has type Generator[X, Y, ...],
         # the context should be Generator[X, Y, T], where T is the
+
         # context of the 'yield from' itself (but it isn't known).
         subexpr_type = get_proper_type(self.accept(e.expr))
 
-        # Check that the expr is an instance of Iterable and get the type of the iterator produced
+        # Check that the expr is an instance of Iterable and get the type of the
+        # iterator produced
         # by __iter__.
         if isinstance(subexpr_type, AnyType):
             iter_type: Type = AnyType(TypeOfAny.from_another_any, source_any=subexpr_type)
@@ -7901,6 +7998,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                         # Inline TypeChecker.set_inferred_type(),
                         # without the lvalue.  (This doesn't really do
                         # much, since the value attribute is defined
+
                         # to have type Any in the typeshed stub.)
                         var.type = typ
                         var.is_inferred = True
@@ -8044,6 +8142,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             # NOTE: Will never need to lookup type vars in this scope because
             #       SemanticAnalyzer.try_parse_as_type_expression() will have
             #       already recognized any type var referenced in a NameExpr.
+
             #       String annotations (which may also reference type vars)
             #       can't be resolved in the TypeChecker pass anyway.
             TypeVarLikeScope(),  # empty scope
@@ -8127,12 +8226,15 @@ def is_async_def(t: Type) -> bool:
     # In check_func_def(), when we see a function decorated with
     # `@typing.coroutine` or `@async.coroutine`, we change the
     # return type to typing.AwaitableGenerator[...], so that its
+
     # type is compatible with either Generator or Awaitable.
     # But for the check here we need to know whether the original
     # function (before decoration) was an `async def`.  The
+
     # AwaitableGenerator type conveniently preserves the original
     # type as its 4th parameter (3rd when using 0-origin indexing
     # :-), so that we can recover that information here.
+
     # (We really need to see whether the original, undecorated
     # function was an `async def`, which is orthogonal to its
     # decorations.)
@@ -8185,6 +8287,7 @@ def is_duplicate_mapping(
         # Multiple actuals can map to the same formal if they both come from
         # varargs (*args and **kwargs); in this case at runtime it is possible
         # that here are no duplicates. We need to allow this, as the convention
+
         # f(..., *args, **kwargs) is common enough.
         and not (
             len(mapping) == 2
@@ -8320,9 +8423,11 @@ def arg_approximate_similarity(actual: Type, formal: Type) -> bool:
     # Issue #432: port the whole decision to Rust when the kernel is active
     # and a resolver is installed. Rust defers (returns None) on TypeAliasType
     # (unexpandable on the wire), TypeVarTuple erasure, Overloaded erasure,
+
     # and snapshot-missing / unsupported is_subtype pairs; those fall through
     # to the pure-Python implementation below. The resolver guard (not None)
     # is mandatory: parallel workers never build a resolver, so the gate must
+
     # check it even when the kernel is active.
     if (
         _native_checkexpr_resolver is not None
@@ -8463,6 +8568,7 @@ def any_causes_overload_ambiguity(
                 # Note: if an actual maps to multiple formals of differing types within
                 # a single callable, then we know at least one of those formals must be
                 # a different type then the formal(s) in some other callable.
+
                 # So it's safe to just append everything to the same list.
                 for formal in formals:
                     matching_formals.append(matched_callable.arg_types[formal])

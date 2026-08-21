@@ -442,6 +442,7 @@ function_op(
 # Codepoint case conversion. When the Unicode uppercase/lowercase of a
 # codepoint expands to multiple codepoints (e.g. U+00DF uppercases to "SS",
 # U+FB01 to "FI"), returns the input unchanged so the signature stays
+
 # i32 -> i32; callers needing full Unicode case conversion should use
 # str.upper() / .lower() instead. Negative inputs are returned unchanged.
 function_op(

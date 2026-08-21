@@ -141,12 +141,15 @@ class Options:
         # PEP 420 namespace packages
         # This allows definitions of packages without __init__.py and allows packages to span
         # multiple directories. This flag affects both import discovery and the association of
+
         # input files/modules/packages to the relevant file and fully qualified module name.
         self.namespace_packages = True
         # Use current directory and MYPYPATH to determine fully qualified module names of files
         # passed by automatically considering their subdirectories as packages. This is only
         # relevant if namespace packages are enabled, since otherwise examining __init__.py's is
-        # sufficient to determine module names for files. As a possible alternative, add a single
+
+        # sufficient to determine module names for files. As a possible alternative, add
+        # a single
         # top-level __init__.py to your packages.
         self.explicit_package_bases = False
         # File names, directory names or subpaths to avoid checking
@@ -329,12 +332,14 @@ class Options:
         # Disable the memory optimization of freeing ASTs when
         # possible. This isn't exposed as a command line option
         # because it is intended for software integrating with
+
         # mypy. (Like mypyc.)
         self.preserve_asts = False
 
         # If True, function and class docstrings will be extracted and retained.
         # This isn't exposed as a command line option
         # because it is intended for software integrating with
+
         # mypy. (Like stubgen.)
         self.include_docstrings = False
 
@@ -390,15 +395,18 @@ class Options:
         # If True, use the native module resolver. Backed by the
         # `module_resolver` Rust extension when importable; the Python
         # `FindModuleCache._find_module` path is the fallback. The daemon
+
         # and parallel mode force this on regardless; Bazel stays on the
         # Python resolver (see `FindModuleCache._native_gate_active`).
         self.native_resolver = True
         # If True, route `erase_type`, `is_subtype`, `join_types`,
         # `meet_types`, and `make_simplified_union` through the
         # `type_kernel` Rust extension when importable, with per-call
+
         # fallback to the pure-Python visitors for any type class Rust
         # does not handle. Stage 3c of the type-kernel migration;
         # default on after full-suite parity (testtypes, testsubtypes,
+
         # testcheck) was proven green. Use `--no-native-type-kernel`
         # to force the pure-Python path for differential testing.
         self.native_type_kernel = True
@@ -568,15 +576,18 @@ class Options:
         # Config precedence is as follows:
         #  1. Concrete section names: foo.bar.baz
         #  2. "Unstructured" glob patterns: foo.*.baz, in the order
+
         #     they appear in the file (last wins)
         #  3. "Well-structured" wildcard patterns: foo.bar.*, in specificity order.
 
         # Since structured configs inherit from structured configs above them in the hierarchy,
         # we need to process per-module configs in a careful order.
         # We have to process foo.* before foo.bar.* before foo.bar,
+
         # and we need to apply *.bar to foo.bar but not to foo.bar.*.
         # To do this, process all well-structured glob configs before non-glob configs and
         # exploit the fact that foo.* sorts earlier ASCIIbetically (unicodebetically?)
+
         # than foo.bar.*.
         # (A section being "processed last" results in its config "winning".)
         # Unstructured glob configs are stored and are all checked for each module.
@@ -591,6 +602,7 @@ class Options:
         # We (for ease of implementation) treat unstructured glob
         # sections as used if any real modules use them or if any
         # concrete config sections use them. This means we need to
+
         # track which get used while constructing.
         self._unused_configs = set(unstructured_glob_keys)
 
@@ -623,6 +635,7 @@ class Options:
         # If not, search for glob paths at all the parents. So if we are looking for
         # options for foo.bar.baz, we search foo.bar.baz.*, foo.bar.*, foo.*,
         # in that order, looking for an entry.
+
         # This is technically quadratic in the length of the path, but module paths
         # don't actually get all that long.
         options = self

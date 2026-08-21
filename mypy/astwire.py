@@ -46,6 +46,7 @@ _NODE_TAGS: dict[type, int] = {}
 
 # Wire-format-only tags for expression types that have no Final[Tag]
 # in nodes.py. Range 150-159 is unused by the cache format (reserved:
+
 # 50-79 symbols, 80-149 types). These are local to the astwire
 # format and never written to/read from the mypy metadata cache.
 ASTWIRE_CAST_EXPR: int = 150

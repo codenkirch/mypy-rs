@@ -89,21 +89,27 @@ from mypyc.transform.uninit import insert_uninit_checks
 # All the modules being compiled are divided into "groups". A group
 # is a set of modules that are placed into the same shared library.
 # Two common configurations are that every module is placed in a group
+
 # by itself (fully separate compilation) and that every module is
 # placed in the same group (fully whole-program compilation), but we
 # support finer-grained control of the group as well.
+
 #
 # In fully whole-program compilation, we will generate N+1 extension
 # modules: one shim per module and one shared library containing all
+
 # the actual code.
 # In fully separate compilation, we (unfortunately) will generate 2*N
 # extension modules: one shim per module and also one library containing
+
 # each module's actual code. (This might be fixable in the future,
 # but allows a clean separation between setup of the export tables
 # (see generate_export_table) and running module top levels.)
+
 #
 # A group is represented as a list of BuildSources containing all of
 # its modules along with the name of the group. (Which can be None
+
 # only if we are compiling only a single group with a single file in it
 # and not using shared libraries).
 Group = tuple[list[BuildSource], str | None]
@@ -150,6 +156,7 @@ class MypycPlugin(Plugin):
         # The config data we report is the group map entry for the module.
         # If the data is being used to check validity, we do additional checks
         # that the IR cache exists and matches the metadata cache and all
+
         # output source files exist and are up to date.
 
         id, path, is_check = ctx.id, ctx.path, ctx.is_check
@@ -182,6 +189,7 @@ class MypycPlugin(Plugin):
         # Check that all the source files are present and as
         # expected. The main situation where this would come up is the
         # user deleting the build directory without deleting
+
         # .mypy_cache, which we should handle gracefully.
         for path, hash in ir_data["src_hashes"].items():
             try:
@@ -372,6 +380,7 @@ def compile_ir_to_c(
             # Fully-cached group (e.g. pip's second setup.py invoke for
             # the wheel phase): no fresh IR was produced. Reuse the file
             # list recorded in any module's IR cache so the linker still
+
             # sees the previous run's outputs; empty content is a "do
             # not rewrite" sentinel for mypyc_build.
             ctext[group_name] = _load_cached_group_files(group_sources, result)
@@ -654,6 +663,7 @@ class GroupGenerator:
         # Optionally just include the runtime library c files to
         # reduce the number of compiler invocations needed.
         # Use <> form (only -I paths) so a shim file with the same
+
         # basename as a runtime file can't shadow it. Triggered by
         # mypyc/lower/int_ops.py vs lib-rt/int_ops.c on mypy self-compile.
         if self.compiler_options.include_runtime_files:
@@ -708,6 +718,7 @@ class GroupGenerator:
         # The external header file contains type declarations while
         # the internal contains declarations of functions and objects
         # (which are shared between shared libraries via dynamic
+
         # exports tables and not accessed directly.)
         ext_declarations = Emitter(self.context)
         ext_declarations.emit_line(f"#ifndef MYPYC_NATIVE{self.group_suffix}_H")
@@ -987,6 +998,7 @@ class GroupGenerator:
         # End of exec_<short_name>: only sets up capsules/module attributes.
         # Cross-group imports (populating `exports_<dep>` tables) are split
         # out into ensure_deps_<short_name>() below and run later, from the
+
         # shim's PyInit. See generate_shared_lib_init for details.
         emitter.emit_lines("return 0;", "fail:", "return -1;", "}")
 
@@ -994,6 +1006,7 @@ class GroupGenerator:
             # ensure_deps_<short>(): populates cross-group exports tables. Run
             # once, lazily, from the shim's PyInit just before invoking the
             # per-module init capsule. This defers cross-group imports out of
+
             # the shared-lib PyInit so they can't transitively trigger a
             # sibling package's __init__.py while another package __init__.py
             # is still mid-flight.
@@ -1019,6 +1032,7 @@ class GroupGenerator:
                 # ImportModuleLevel with fromlist returns the leaf via
                 # sys.modules (no dotted getattr walk), and fetching the
                 # `exports` capsule directly off that module bypasses
+
                 # PyCapsule_Import (which would redo the attribute walk).
                 emitter.emit_lines(
                     'tmp = PyImport_ImportModuleLevel("{}", NULL, NULL, _mypyc_fromlist, 0);'.format(
@@ -1527,6 +1541,7 @@ class GroupGenerator:
         # We declare two globals for each compiled module:
         # one used internally in the implementation of module init to cache results
         # and prevent infinite recursion in import cycles, and one used
+
         # by other modules to refer to it.
         if module_name in self.modules:
             internal_static_name = self.module_internal_static_name(module_name, emitter)

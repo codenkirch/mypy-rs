@@ -116,7 +116,8 @@ fn neg_ops(py: Python<'_>) -> PyResult<PyObject> {
     Ok(dict.into())
 }
 
-/// Build a set of operator method names. Mirrors `mypy.operators.op_methods_that_shortcut`.
+/// Build a set of operator method names. Mirrors
+/// `mypy.operators.op_methods_that_shortcut`.
 fn op_methods_that_shortcut(py: Python<'_>) -> PyResult<PyObject> {
     let set = PySet::empty(py)?;
     let items: &[&str] = &[

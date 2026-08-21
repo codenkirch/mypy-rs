@@ -400,6 +400,7 @@ class DataDrivenTestCase(pytest.Item):
         if isinstance(excinfo.value, SystemExit):
             # We assume that before doing exit() (which raises SystemExit) we've printed
             # enough context about what happened so that a stack trace is not useful.
+
             # In particular, uncaught exceptions during semantic analysis or type checking
             # call exit() and they already print out a stack trace.
             excrepr = excinfo.exconly()
@@ -448,7 +449,8 @@ class TestItem:
     data: list[str]
     # Start line: 1-based, inclusive, relative to testcase
     line: int
-    # End line: 1-based, exclusive, relative to testcase; not same as `line + len(test_item.data)` due to collapsing
+    # End line: 1-based, exclusive, relative to testcase; not same as `line +
+    # len(test_item.data)` due to collapsing
     end_line: int
 
     @property
@@ -593,9 +595,9 @@ def fix_cobertura_filename(line: str) -> str:
 
 
 ##
-#
+
 # pytest setup
-#
+
 ##
 
 

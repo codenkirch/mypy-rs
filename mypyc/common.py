@@ -56,7 +56,7 @@ MAX_SHORT_INT: Final = 2 ** (8 * int(SIZEOF_SIZE_T) - 2) - 1
 MIN_SHORT_INT: Final = -(MAX_SHORT_INT) - 1
 
 # Maximum value for a short tagged integer represented as a C integer literal.
-#
+
 # Note: Assume that the compiled code uses the same bit width as mypyc
 MAX_LITERAL_SHORT_INT: Final = MAX_SHORT_INT
 MIN_LITERAL_SHORT_INT: Final = -MAX_LITERAL_SHORT_INT - 1
@@ -64,6 +64,7 @@ MIN_LITERAL_SHORT_INT: Final = -MAX_LITERAL_SHORT_INT - 1
 # Description of the C type used to track the definedness of attributes and
 # the presence of argument default values that have types with overlapping
 # error values. Each tracked attribute/argument has a dedicated bit in the
+
 # relevant bitmap.
 BITMAP_TYPE: Final = "uint32_t"
 BITMAP_BITS: Final = 32
@@ -92,6 +93,7 @@ RUNTIME_C_FILES: Final = [
 # Python 3.12 introduced immortal objects, specified via a special reference count
 # value. The reference counts of immortal objects are normally not modified, but it's
 # not strictly wrong to modify them. See PEP 683 for more information, but note that
+
 # some details in the PEP are out of date.
 HAVE_IMMORTAL: Final = sys.version_info >= (3, 12)
 

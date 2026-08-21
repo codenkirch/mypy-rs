@@ -75,6 +75,7 @@ propagate_if_error_op = custom_primitive_op(
 # Catches a propagating exception and makes it the "currently
 # handled exception" (by sticking it into sys.exc_info()). Returns the
 # exception that was previously being handled, which must be restored
+
 # later.
 error_catch_op = custom_op(
     arg_types=[], return_type=exc_rtuple, c_function_name="CPy_CatchError", error_kind=ERR_NEVER

@@ -62,6 +62,7 @@ class RType:
     # This is the C undefined value for this type. It's used for initialization
     # if there's no value yet, and for function return value on error/exception.
     #
+
     # TODO: This shouldn't be specific to C or a string
     c_undefined: str
     # If unboxed: does the unboxed version use reference counting?
@@ -71,21 +72,27 @@ class RType:
     # If True, error/undefined value overlaps with a valid value. To
     # detect an exception, PyErr_Occurred() must be used in addition
     # to checking for error value as the return value of a function.
+
     #
     # For example, no i64 value can be reserved for error value, so we
     # pick an arbitrary value (-113) to signal error, but this is
+
     # also a valid non-error value. The chosen value is rare as a
     # normal, non-error value, so most of the time we can avoid calling
     # PyErr_Occurred() when checking for errors raised by called
+
     # functions.
     #
     # This also means that if an attribute with this type might be
+
     # undefined, we can't just rely on the error value to signal this.
     # Instead, we add a bitfield to keep track whether attributes with
     # "error overlap" have a value. If there is no value, AttributeError
+
     # is raised on attribute read. Parameters with default values also
     # use the bitfield trick to indicate whether the caller passed a
     # value. (If we can determine that an attribute is "always defined",
+
     # we never raise an AttributeError and don't need the bitfield
     # entry.)
     error_overlap = False
@@ -308,15 +315,19 @@ class RPrimitive(RType):
 # Used to represent arbitrary objects and dynamically typed (Any)
 # values. There are various ops that let you perform generic, runtime
 # checked operations on these (that match Python semantics). See the
+
 # ops in mypyc.primitives.misc_ops, including py_getattr_op,
 # py_call_op, and many others.
 #
+
 # If there is no more specific RType available for some value, we fall
 # back to using this type.
 #
+
 # NOTE: Even though this is very flexible, this type should be used as
 # little as possible, as generic ops are typically slow. Other types,
 # including other primitive types and RInstance, are usually much
+
 # faster.
 object_rprimitive: Final = RPrimitive("builtins.object", is_unboxed=False, is_refcounted=True)
 
@@ -334,12 +345,15 @@ object_non_refcounted_rprimitive: Final = RPrimitive(
 # Arbitrary-precision integer (corresponds to Python 'int'). Small
 # enough values are stored unboxed, while large integers are
 # represented as a tagged pointer to a Python 'int' PyObject. The
+
 # lowest bit is used as the tag to decide whether it is a signed
 # unboxed value (shifted left by one) or a PyObject * pointing to an
 # 'int' object. Pointers have the least significant bit set.
+
 #
 # The undefined/error value is the null pointer (1 -- only the least
 # significant bit is set)).
+
 #
 # This cannot represent a subclass of int. An instance of a subclass
 # of int is coerced to the corresponding 'int' value.
@@ -1365,6 +1379,7 @@ def check_native_int_range(rtype: RPrimitive, n: int) -> bool:
 # Buffers for vec item types that have a packed representation
 #
 # Note that the 'items' fields are variable-length arrays, and mypyc IR isn't
+
 # able to represent these, so the field type is omitted for now.
 
 VecI64BufObject = RStruct(

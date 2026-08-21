@@ -15,9 +15,11 @@ from mypyc.primitives.registry import CFunctionDescription
 # Description for building int comparison ops
 #
 # Fields:
+
 #   binary_op_variant: identify which IntOp to use when operands are short integers
 #   c_func_description: the C function to call when operands are tagged integers
 #   c_func_negated: whether to negate the C function call's result
+
 #   c_func_swap_operands: whether to swap lhs and rhs when call the function
 class IntComparisonOpDescription(NamedTuple):
     binary_op_variant: int

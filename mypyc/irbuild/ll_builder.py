@@ -216,6 +216,7 @@ DictEntry = tuple[Value | None, Value]
 # If the number of items is less than the threshold when initializing
 # a list, we would inline the generate IR using SetMem and expanded
 # for-loop. Otherwise, we would call `list_build_op` for larger lists.
+
 # TODO: The threshold is a randomly chosen number which needs further
 #       study on real-world projects for a better balance.
 LIST_BUILDING_EXPANSION_THRESHOLD = 10
@@ -971,6 +972,7 @@ class LowLevelIRBuilder:
         # We aggregate values that need to go into *args and **kwargs
         # in these lists. Once all arguments are processed (in the
         # happiest case), or we encounter an ARG_STAR/ARG_STAR2 or a
+
         # nullable arg, then we create the list and/or dict.
         star_values: list[Value] = []
         star2_keys: list[Value] = []
@@ -1175,7 +1177,8 @@ class LowLevelIRBuilder:
         Return the return value if successful. Return None if a non-vectorcall
         API should be used instead.
         """
-        # We can do this if all args are positional or named (no *args or **kwargs, not optional).
+        # We can do this if all args are positional or named (no *args or **kwargs, not
+        # optional).
         if arg_kinds is None or all(
             not kind.is_star() and not kind.is_optional() for kind in arg_kinds
         ):
@@ -2069,6 +2072,7 @@ class LowLevelIRBuilder:
         # If the length of the list is less than the threshold,
         # LIST_BUILDING_EXPANSION_THRESHOLD, we directly expand the
         # for-loop and inline the SetMem operation, which is faster
+
         # than list_build_op, however generates more code.
         result_list = self.call_c(new_list_op, length, line)
         if not values:

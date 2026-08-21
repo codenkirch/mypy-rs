@@ -167,6 +167,7 @@ def generate_native_function(
             # Always emit labels for GetAttr error checks since the emit code that
             # generates them will add instructions between the branch and the
             # next label, causing the label to be wrongly removed. A better
+
             # solution would be to change the IR so that it adds a basic block
             # in between the calls.
             is_problematic_op = isinstance(terminator, Branch) and any(
@@ -604,6 +605,7 @@ class FunctionEmitterVisitor(OpVisitor[None]):
         # Use method_decl (not get_method) because under separate compilation the
         # FuncIR body may live in a different group — only its declaration is
         # visible here, and a decl is all we need to emit a direct C call
+
         # (the symbol resolves through that group's exports table).
         method_decl = rtype.class_ir.method_decl(name)
 
@@ -855,6 +857,7 @@ class FunctionEmitterVisitor(OpVisitor[None]):
             # In the general case create a copy of the struct with a single
             # item modified.
             #
+
             # TODO: Can we do better if only a subset of fields are initialized?
             # TODO: Make this less verbose in the common case
             # TODO: Support tuples (or use RStruct for tuples)?

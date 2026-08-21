@@ -34,9 +34,11 @@ except ImportError:
 # Stage 4 type-kernel seam: when the `type_kernel` Rust extension is
 # importable and `Options.native_type_kernel` is set, route the pure
 # positional/named branches of `map_actuals_to_formals` through Rust. The
+
 # Rust path returns `None` for any call with an ARG_STAR or ARG_STAR2 actual
 # (those branches need the `actual_arg_type` callback, which is deferred),
 # in which case we fall back to the pure-Python implementation. This is the
+
 # strangler-fig per-call gate, mirroring `erasetype.py` (Stage 1) and
 # `subtypes.py` (Stage 3c): no behavior change unless the option is set.
 try:
@@ -191,6 +193,7 @@ def map_actuals_to_formals(
         # Assume the ambiguous kwargs will fill the remaining arguments.
         #
         # TODO: If there are also tuple varargs, we might be missing some potential
+
         #       matches if the tuple was short enough to not match everything.
         unmatched_formals = [
             fi
@@ -307,6 +310,7 @@ class ArgTypeExpander:
             # Stage 4 seam: the structural branches (tuple *args item indexing,
             # TypedDict **kwargs key carving) are pure structure, so Rust
             # resolves them and this shim executes the decision against our
+
             # own Type objects. Rust returns None for anything needing
             # `is_subtype` (Iterable/Mapping unpacking) or an undecodable
             # blob; fall through to Python then.
@@ -369,6 +373,7 @@ class ArgTypeExpander:
                     # We cannot properly unpack anything other
                     # than `Iterable` type with `*`.
                     # Just return `Any`, other parts of code would raise
+
                     # a different error for improper use.
                     return AnyType(TypeOfAny.from_error)
             elif isinstance(actual_type, TupleType):

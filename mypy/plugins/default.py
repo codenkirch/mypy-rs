@@ -136,6 +136,7 @@ DEFAULT_CALL_HOOK_FULLNAMES: Final[frozenset[str]] = frozenset(
 # The default plugin's complete hook surface, keyed by hook-method kind.
 # Each set must exactly over-approximate the names the corresponding
 # DefaultPlugin hook body matches, or the known-absent gate would be able
+
 # to skip a real hook. get_metaclass_hook / get_base_class_hook are NOT
 # overridden by DefaultPlugin (they inherit the base no-op), so they
 # contribute no names.
@@ -302,6 +303,7 @@ class DefaultPlugin(Plugin):
         # These dataclass and attrs hooks run in the main semantic analysis pass
         # and only tag known dataclasses/attrs classes, so that the second
         # hooks (in get_class_decorator_hook_2) can detect dataclasses/attrs classes
+
         # in the MRO.
         if fullname in dataclass_makers:
             return dataclass_tag_callback
@@ -563,6 +565,7 @@ def typed_dict_setdefault_callback(ctx: MethodContext) -> Type:
             # The signature_callback above can't always infer the right signature
             # (e.g. when the expression is a variable that happens to be a Literal str)
             # so we need to handle the check ourselves here and make sure the provided
+
             # default can be assigned to all key-value pairs we're updating.
             if not is_subtype(default_type, value_type):
                 ctx.api.msg.typeddict_setdefault_arguments_inconsistent(

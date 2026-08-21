@@ -501,6 +501,7 @@ fn count_non_extension_handlers(node: &AstNode, count: &mut i64) {
         // ClassDef slots: name, _fullname, defs, type_args, type_vars,
         // base_type_exprs, removed_base_type_exprs, info, metaclass,
         // decorators, keywords, analyzed, ...
+
         // `defs` is the 3rd slot (index 2) — a Block.
         if let Some(ChildField::Node(defs)) = node.children.get(2) {
             count_bare_funcs_in_block(defs, count);
@@ -588,9 +589,11 @@ fn is_literal_handler(func: &AstNode) -> bool {
     // FuncItem slots include `body` — we need to find the Block.
     // FuncDef inherits from FuncItem, which has slots: arguments,
     // arg_names, arg_kinds, min_args, max_pos, type_args, body, ...
+
     // `body` is at index 6 in FuncItem's own slots. But FuncBase has
     // 12 slots before FuncItem's. So body is at index 12+6 = 18.
     // That's fragile — instead, scan all child fields for a Block node
+
     // (the body is the Block child of a FuncDef).
     let body = find_body_block(func);
     match body {

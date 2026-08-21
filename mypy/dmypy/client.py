@@ -669,9 +669,12 @@ def request(
             while not final:
                 response = receive(client)
                 final = bool(response.pop("final", False))
-                # Display debugging output written to stdout/stderr in the server process for convenience.
+                # Display debugging output written to stdout/stderr in the server
+                # process for convenience.
                 # This should not be confused with "out" and "err" fields in the response.
-                # Those fields hold the output of the "check" command, and are handled in check_output().
+
+                # Those fields hold the output of the "check" command, and are handled
+                # in check_output().
                 stdout = response.pop("stdout", None)
                 if stdout:
                     sys.stdout.write(stdout)

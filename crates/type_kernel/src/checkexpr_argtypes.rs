@@ -93,6 +93,7 @@ fn check_argument_types_plan_inner(
     // ZIP: mypy `for i, actuals in enumerate(formal_to_actual)` and
     // indexes callee.arg_types[i] / callee.arg_kinds[i]. If the wire
     // callable does not have an entry for a formal the Python body
+
     // would raise; defer on that mismatch (incl. arg_kinds shorter
     // than arg_types).
     if callee_arg_types.len() != callee_arg_kinds.len() {
@@ -203,6 +204,7 @@ fn plan_for_formal(
                                 // Heterogeneous tuples are desugared
                                 // earlier: get_proper_type gives an
                                 // Instance, Python asserts its item
+
                                 // type exists on the wire.
                                 let item_type = args.first()?;
                                 // Python: `[item] * (len(actuals) -
@@ -523,6 +525,7 @@ mod tests {
         // A TypeAliasType cannot cross the wire (write_type refuses it),
         // so the seam seal is on serialization; the internal guard that
         // would otherwise expand the alias also refuses, so a Rust-side
+
         // decision never fabricates an alias expansion.
         let alias = Type::TypeAliasType {
             args: vec![],

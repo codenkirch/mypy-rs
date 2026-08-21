@@ -87,6 +87,7 @@ def _install_native_resolvers_patch() -> None:
         # Stage 3e typeops helpers (parity-only). Install the resolver so
         # the typeops shim can call rust_make_simplified_union,
         # rust_is_simple_literal, rust_true_only, rust_false_only,
+
         # rust_true_or_false. Gated behind the same env var as expand.
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS"):
             try:
@@ -116,6 +117,7 @@ def _install_native_resolvers_patch() -> None:
                 # Type-returning functions (remove_dups, type_vars_as_args,
                 # callable_with_ellipsis, split_with_prefix_and_suffix,
                 # flatten_nested_unions, flatten_nested_tuples) lose
+
                 # truthiness flags on wire round-trip. Separate gate.
                 if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_VISITOR_TYPES"):
                     from mypy.types import _set_native_visitor_types_active
@@ -132,6 +134,7 @@ def _install_native_resolvers_patch() -> None:
         # Stage 9 standalone checker/checkexpr functions (parity-only).
         # Scalar-returning functions use _native_checker_active /
         # _native_checkexpr_active. Type-returning functions
+
         # (flatten_types_if_tuple, try_getting_literal) use the types
         # gate since wire round-trip loses truthiness flags.
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_CHECKEXPR"):
@@ -175,6 +178,7 @@ def _install_native_resolvers_patch() -> None:
         # Stage 6c small pure modules batch (parity-only).
         # apply_generic_arguments needs the resolver + typeinfo_map
         # (shares the subtype/expand resolvers). has_no_typevars needs
+
         # no resolver. Both gated behind the APPLYTYPE env var.
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_APPLYTYPE"):
             try:
@@ -196,6 +200,7 @@ def _install_native_resolvers_patch() -> None:
         # Stage 16 (#209): semanal visitor helpers (parity-only).
         # Activates the PyO3-on-live-objects gate for refers_to_fullname,
         # is_trivial_body, find_duplicate, is_valid_replacement,
+
         # is_same_symbol, names_modified_in_lvalue, etc.
         if os.environ.get("MYPY_NATIVE_PARITY_INSTALL_SEMANAL_VISITOR"):
             try:

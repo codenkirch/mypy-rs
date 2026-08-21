@@ -262,6 +262,7 @@ class _TypeRefFixer(TypeTranslator):
         # The wire format drops CallableType.definition (only used for
         # error messages); re-link it so messages render `f(self)` and
         # self-typevar solving sees the original argument. Match the
+
         # containing class's symbol table by name + arity, mirroring
         # fixup.py's FuncDef/OverloadedFuncDef linking.
         if result.definition is None and not self.missing:
@@ -378,9 +379,11 @@ class _TypeRefFixer(TypeTranslator):
         # The wire never carries a live alias node, so a decoded
         # TypeAliasType has alias=None and type_ref only. Fixing it up
         # is impossible (there is nothing to resolve the type_ref to),
+
         # and leaking an unfixed alias breaks is_recursive()/str() with
         # an AssertionError or prints "<alias (unfixed)>". Defer to the
         # pure-Python visitor instead, mirroring expand's _needs_python
+
         # contract for nodes a kernel round-trip cannot carry.
         self.missing = True
         return t

@@ -140,8 +140,11 @@ def instantiate_generator_class(builder: IRBuilder) -> Value:
         builder.add(SetAttr(generator_reg, NEXT_LABEL_ATTR_NAME, zero, fitem.line))
     else:
         # Get the current environment register. If the current function is nested, then the
-        # generator class gets instantiated from the callable class' '__call__' method, and hence
+        # generator class gets instantiated from the callable class' '__call__' method,
+        # and hence
+
         # we use the callable class' environment register. Otherwise, we use the original
+
         # function's environment register.
         if builder.fn_info.is_nested:
             curr_env_reg = builder.fn_info.callable_class.curr_env_reg

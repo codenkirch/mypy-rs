@@ -584,6 +584,7 @@ class PolyTranslator(TypeTranslator):
             # We need this special-casing to preserve the possibility to store a
             # generic function in an instance type. Things like
             #     forall T . Foo[[x: T], T]
+
             # are not really expressible in current type system, but this looks like
             # a useful feature, so let's keep it.
             param_spec_index = next(

@@ -77,6 +77,7 @@ coro_op = custom_op(
 # Do obj.send(value), or a next(obj) if second arg is None.
 # (This behavior is to match the PEP 380 spec for yield from.)
 # Like next_raw_op, don't swallow StopIteration,
+
 # but also don't propagate an error.
 # Can return NULL: see next_op.
 send_op = custom_op(
@@ -89,9 +90,11 @@ send_op = custom_op(
 # This is sort of unfortunate but oh well: yield_from_except performs most of the
 # error handling logic in `yield from` operations. It returns a bool and passes
 # a value by address.
+
 # If the bool is true, then a StopIteration was received and we should return.
 # If the bool is false, then the value should be yielded.
 # The normal case is probably that it signals an exception, which gets
+
 # propagated.
 # Op used for "yield from" error handling.
 # See comment in CPy_YieldFromErrorHandle for more information.
@@ -359,9 +362,11 @@ log_trace_event = custom_primitive_op(
 # Mark object as immortal -- it won't be freed via reference counting, as
 # the reference count won't be updated any longer. Immortal objects support
 # fast concurrent read-only access from multiple threads when using free
+
 # threading, since this eliminates contention from concurrent reference count
 # updates.
 #
+
 # Needs at least Python 3.14.
 set_immortal_op = custom_primitive_op(
     name="set_immmortal",

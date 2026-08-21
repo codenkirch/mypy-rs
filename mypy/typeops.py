@@ -455,6 +455,7 @@ def type_object_type_from_function(
     # We first need to record all non-trivial (explicit) self types in __init__,
     # since they will not be available after we bind them. Note, we use explicit
     # self-types only in the defining class, similar to __new__ (but not exactly the same,
+
     # see comment in class_callable below). This is mostly useful for annotating library
     # classes such as subprocess.Popen.
     if not is_new and not info.is_newtype:
@@ -465,12 +466,15 @@ def type_object_type_from_function(
     # The __init__ method might come from a generic superclass 'def_info'
     # with type variables that do not map identically to the type variables of
     # the class 'info' being constructed. For example:
+
     #
     #   class A(Generic[T]):
     #       def __init__(self, x: T) -> None: ...
+
     #   class B(A[List[T]]):
     #      ...
     #
+
     # We need to map B's __init__ to the type (List[T]) -> None.
     signature = bind_self(
         signature,
@@ -515,6 +519,7 @@ def class_callable(
     # #492 follow-up native seam: Rust makes the ret_type decision and
     # combines the type variables (pure once the two resolver-backed subtype
     # booleans are known). Python computes those booleans (already native)
+
     # and rebuilds the live CallableType so non-wire fields survive.
     # instance_type MUST stay the live fill_typevars(info) result.
     if _HAS_TYPE_KERNEL and _native_typeops_active:
@@ -593,6 +598,7 @@ def class_callable(
         # We used to only use the explicit return type of __new__() when it was a subtype
         # of the current class. As a result, we may now have a situation like this:
         #     class C:
+
         #         def __new__(cls) -> C: ...
         #     class D(C): ...
         # So we need to ignore the explicit annotation when creating constructor type for D.
@@ -641,6 +647,7 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
     # Native composite seam (#492 family): the whole body below is one Rust
     # call — fill_typevars(sub_info), the TupleType fallback, the maptype
     # up-promotion, and the final expand_type_by_instance. Defer to Python
+
     # when `typ` cannot cross the wire (definition-bearing callables,
     # recursive aliases) or when the resolver is unavailable.
     if (
@@ -663,6 +670,7 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
                     # The wire format does not carry line/column; decoded
                     # types default to line -1. Preserve the input type's
                     # location so derived contexts report errors at the
+
                     # call site instead of a phantom line 0/-1 (mirrors the
                     # expand_type_by_instance seam).
                     if isinstance(decoded, ProperType):
@@ -683,11 +691,13 @@ def map_type_from_supertype(typ: Type, sub_info: TypeInfo, super_info: TypeInfo)
     # Map the type of self to supertype. This gets us a description of the
     # supertype type variables in terms of subtype variables, i.e. t[t1, ...]
     # so that any type variables in tN are to be interpreted in subtype
+
     # context.
     inst_type = map_instance_to_supertype(inst_type, super_info)
     # Finally expand the type variables in type with those in the previously
     # constructed type. Note that both type and inst_type may have type
     # variables, but in type they are interpreted in supertype context while
+
     # in inst_type they are interpreted in subtype context. This works even if
     # the names of type variables in supertype and subtype overlap.
     return expand_type_by_instance(typ, inst_type)
@@ -766,6 +776,7 @@ def bind_self(
         # The signature is of the form 'def foo(*args, ...)'.
         # In this case we shouldn't drop the first arg,
         # since func will be absorbed by the *args.
+
         # TODO: infer bounds on the type of *args?
 
         # In the case of **kwargs we should probably emit an error, but
@@ -777,9 +788,11 @@ def bind_self(
     # #492 native seam: for a non-generic CallableType the whole strip path
     # is one Rust call that decides the case is handled. The decoded result
     # is only a "handled" signal; the final object is built through
+
     # copy_modified on the live object so non-wire fields (special_sig,
     # from_type_type, definition, line/column) survive the roundtrip. Rust
     # defers (None) on variables / star-args / empty args, so the typevar
+
     # path below is untouched.
     if (
         not func.variables
@@ -804,7 +817,9 @@ def bind_self(
         except (AssertionError, NotImplementedError, ValueError):
             pass
     # Having a def __call__(self: Callable[...], ...) can cause infinite recursion. Although
-    # this special-casing looks not very principled, there is nothing meaningful we can infer
+    # this special-casing looks not very principled, there is nothing meaningful we can
+    # infer
+
     # from such definition, since it is inherently indefinitely recursive.
     allow_callable = func.name is None or not func.name.startswith("__call__ of")
     if func.variables and supported_self_type(
@@ -1074,8 +1089,11 @@ def make_simplified_union(
 def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[Type]:
     from mypy.subtypes import is_proper_subtype
 
-    # The first pass through this loop, we check if later items are subtypes of earlier items.
-    # The second pass through this loop, we check if earlier items are subtypes of later items
+    # The first pass through this loop, we check if later items are subtypes of earlier
+    # items.
+    # The second pass through this loop, we check if earlier items are subtypes of later
+
+    # items
     # (by reversing the remaining items)
     for _direction in range(2):
         new_items: list[Type] = []
@@ -1101,6 +1119,7 @@ def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[
                 # This is an optimisation for unions with many LiteralType
                 # We've already checked for exact duplicates. This means that any super type of
                 # the LiteralType must be a super type of its fallback. If we've gone through
+
                 # the expensive loop below and found no super type for a previous LiteralType
                 # with the same fallback, we can skip doing that work again and just add the type
                 # to new_items
@@ -1625,6 +1644,7 @@ def try_expanding_sum_type_to_union(typ: Type, target_fullname: str | None) -> T
             # Wire serialization drops can_be_true/can_be_false. The
             # expanded result feeds true_only/false_only/make_simplified_union
             # which rely on these flags for narrowing. Defer to Python
+
             # when the input carries mutated truthiness.
             if not _has_mutated_truthiness(typ):
                 result = _type_kernel.rust_try_expanding_sum_type_to_union(
@@ -1676,6 +1696,7 @@ def try_contracting_literals_in_union(types: Sequence[Type]) -> list[ProperType]
     # Native seam: bool + enum contraction runs in Rust, mirroring the
     # pure-Python body below. Reads `enum_members` from the resolver
     # snapshot; defers (None) when the fallback fullname has no snapshot or
+
     # an item cannot be serialized (e.g. TypeAliasType). Callers flatten
     # nested unions before invoking, so item types are all proper.
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
@@ -1726,6 +1747,7 @@ def coerce_to_literal(typ: Type) -> Type:
     # Native seam: union mapping, last-known-value extraction, and the
     # single-member-enum -> LiteralType conversion all run in Rust. Enum
     # members are read live (resolver-installed live TypeInfo map), so the
+
     # native path never uses a stale snapshot. Defers when the live info map
     # is unavailable, or on a TypeAliasType (no wire target).
     if (

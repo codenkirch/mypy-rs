@@ -135,6 +135,7 @@ class NodeStripVisitor(TraverserVisitor, SplittingVisitor):
             # Type variable binder binds type variables before the type is analyzed,
             # this causes unanalyzed_type to be modified in place. We needed to revert this
             # in order to get the state exactly as it was before semantic analysis.
+
             # See also #4814.
             assert isinstance(node.type, CallableType)
             node.type.variables = ()

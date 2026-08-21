@@ -1,6 +1,7 @@
 # Configuration file for the Sphinx documentation builder.
 #
 # This file only contains a selection of the most common options. For a full
+
 # list see the documentation:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html
 
@@ -25,6 +26,7 @@ author = "mypyc team"
 # The version info for the project you're documenting, acts as replacement for
 # |version| and |release|, also used in various other places throughout the
 # built documents.
+
 #
 # The short X.Y version.
 version = mypy_version.split("-")[0]

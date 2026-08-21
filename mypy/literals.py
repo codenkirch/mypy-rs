@@ -61,39 +61,51 @@ from mypy.visitor import ExpressionVisitor
 # [Note Literals and literal_hash]
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
+
 # Mypy uses the term "literal" to refer to any expression built out of
 # the following:
 #
+
 # * Plain literal expressions, like `1` (integer, float, string, etc.)
 #
 # * Compound literal expressions, like `(lit1, lit2)` (list, dict,
+
 #   set, or tuple)
 #
 # * Operator expressions, like `lit1 + lit2`
+
 #
 # * Variable references, like `x`
 #
+
 # * Member references, like `lit.m`
 #
 # * Index expressions, like `lit[0]`
+
 #
 # A typical "literal" looks like `x[(i,j+1)].m`.
 #
+
 # An expression that is a literal has a `literal_hash`, with the
 # following properties.
 #
+
 # * `literal_hash` is a Key: a tuple containing basic data types and
 #   possibly other Keys. So it can be used as a key in a dictionary
 #   that will be compared by value (as opposed to the Node itself,
+
 #   which is compared by identity).
 #
 # * Two expressions have equal `literal_hash`es if and only if they
+
 #   are syntactically equal expressions. (NB: Actually, we also
 #   identify as equal expressions like `3` and `3.0`; is this a good
 #   idea?)
+
 #
 # * The elements of `literal_hash` that are tuples are exactly the
 #   subexpressions of the original expression (e.g. the base and index
+
 #   of an index expression, or the operands of an operator expression).
 
 

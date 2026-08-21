@@ -92,10 +92,12 @@ def compile_new_format_re(custom_spec: bool) -> Pattern[str]:
     instead of just not matching.
     """
 
-    # Field (optional) is an integer/identifier possibly followed by several .attr and [index].
+    # Field (optional) is an integer/identifier possibly followed by several .attr and
+    # [index].
     field = r"(?P<field>(?P<key>[^.[!:]*)([^:!]+)?)"
 
-    # Conversion (optional) is ! followed by one of letters for forced repr(), str(), or ascii().
+    # Conversion (optional) is ! followed by one of letters for forced repr(), str(), or
+    # ascii().
     conversion = r"(?P<conversion>![^:])?"
 
     # Format specification (optional) follows its own mini-language:
@@ -128,9 +130,11 @@ NUMERIC_TYPES_NEW: Final = {"b", "d", "o", "e", "E", "f", "F", "g", "G", "n", "x
 # Stage 6b type-kernel seam: when the `type_kernel` Rust extension is
 # importable and `Options.native_type_kernel` is set, the pure parsing
 # functions (`parse_conversion_specifiers`, `find_non_escaped_targets`,
+
 # `parse_format_value`) route through Rust. Rust returns parsed specifier
 # data as tuples; Python constructs `ConversionSpecifier` objects from
 # them. Error codes are returned as integers so Python can call `msg.fail()`
+
 # with the appropriate message (Rust has no access to the message builder).
 # This is the strangler-fig per-call gate, same pattern as erasetype.
 try:

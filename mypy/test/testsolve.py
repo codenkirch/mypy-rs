@@ -96,6 +96,7 @@ class SolveSuite(Suite):
         # self.assert_solve([self.fx.t],
         #                   [self.subc(self.fx.t, self.fx.anyt),
         #                    self.subc(self.fx.t, self.fx.a)],
+
         #                   [self.fx.anyt])
         # TODO: figure out what this should be after changes to meet(any, X)
 

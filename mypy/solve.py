@@ -74,6 +74,7 @@ def _set_native_solve_active(active: bool) -> None:
 
 # TypeInfo resolver for the Rust path, installed by
 # `_build_native_resolvers` alongside the subtype/join resolvers.
+
 # `rust_solve_one` needs it to build `Instance` types (Object/Ancestor
 # setop results) and run `is_subtype`. None until a resolver is installed.
 _native_solve_resolver: Any = None
@@ -462,6 +463,7 @@ def solve_iteratively(
         # Update the (transitive) bounds from graph if there is a solution.
         # This is needed to guarantee solutions will never contradict the initial
         # constraints. For example, consider {T <: S, T <: A, S :> B} with A :> B.
+
         # If we would not update the uppers/lowers from graph, we would infer T = A, S = B
         # which is not correct.
         for l, u in graph.copy():
@@ -509,7 +511,8 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
 
     candidate: Type | None = None
 
-    # Filter out previous results of failed inference, they will only spoil the current pass...
+    # Filter out previous results of failed inference, they will only spoil the current
+    # pass...
     new_uppers = []
     for u in uppers:
         pu = get_proper_type(u)
@@ -579,10 +582,13 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
     else:
         # The order of lowers is non-deterministic.
         # We attempt to sort lowers because joins are non-associative. For instance:
+
         # join(join(int, str), int | str) == join(object, int | str) == object
         # join(int, join(str, int | str)) == join(int, int | str)    == int | str
-        # Note that joins in theory should be commutative, but in practice some bugs mean this is
-        # also a source of non-deterministic type checking results.
+        # Note that joins in theory should be commutative, but in practice some
+
+        # bugs mean this is also a source of non-deterministic type checking
+        # results.
         sorted_lowers = sorted(lowers, key=_join_sorted_key)
         if sorted_lowers:
             bottom = join_type_list(sorted_lowers)
@@ -759,10 +765,13 @@ def transitive_closure(
     remaining = set(constraints)
     while remaining:
         c = remaining.pop()
-        # Note that ParamSpec constraint P <: Q may be considered linear only if Q has no prefix,
-        # for cases like P <: Concatenate[T, Q] we should consider this non-linear and put {P} and
-        # {T, Q} into separate SCCs. Similarly, Ts <: Tuple[*Us] considered linear, while
-        # Ts <: Tuple[*Us, U] is non-linear.
+        # Note that ParamSpec constraint P <: Q may be considered linear only if Q
+        # has no prefix,
+        # for cases like P <: Concatenate[T, Q] we should consider this non-linear
+
+        # and put {P} and
+        # {T, Q} into separate SCCs. Similarly, Ts <: Tuple[*Us] considered linear,
+        # while Ts <: Tuple[*Us, U] is non-linear.
         is_linear, target_id = find_linear(c)
         if is_linear and target_id in tvars:
             assert target_id is not None
