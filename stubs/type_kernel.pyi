@@ -374,7 +374,6 @@ __all__ = [
     "rust_find_self_type",
     "rust_check_vec_type_args",
     "IdMapper",
-    "rust_serialize_type",
 ]
 
 class NativeTypeResolver:
@@ -400,7 +399,6 @@ def shallow_erase_type_for_equality(typ: Type) -> ProperType | None: ...
 def rust_constant_fold_expr(
     expr: Expression, cur_mod_id: str
 ) -> int | bool | float | complex | str | None: ...
-def rust_serialize_type(typ: Type) -> bytes: ...
 def rust_read_cache_meta(blob: bytes) -> dict[str, Any] | None: ...
 def rust_read_cache_meta_ex(blob: bytes) -> dict[str, Any] | None: ...
 def read_type_to_str(data: bytes) -> str: ...
@@ -420,6 +418,8 @@ def rust_is_subtype(
     ignore_promotions: bool,
     proper_subtype: bool,
     strict_optional: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
 def rust_trivial_join(
@@ -1742,3 +1742,312 @@ class RustBuildSourceSet:
     @property
     def source_paths(self) -> set[str]: ...
     def is_source(self, file: Any) -> bool: ...
+
+def rust_adjust_tuple(
+    left_bytes: bytes,
+    r_bytes: bytes,
+) -> Any: ...
+def rust_analyze_unbound_without_info(
+    is_var_any: bool,
+    allow_type_any: bool,
+    is_type_instance: bool,
+    is_type_type_any: bool,
+    unbound_tvar: Any,
+    allow_unbound_tvars: bool,
+    is_enum_member: bool,
+    defining_literal: Any,
+) -> Any: ...
+def rust_any_causes_overload_ambiguity(
+    resolver: NativeTypeResolver,
+    items_bytes: list[bytes],
+    return_types_bytes: list[bytes],
+    arg_types_bytes: list[bytes],
+    arg_kinds: Any,
+    arg_names: Any,
+    strict_optional: bool,
+) -> Any: ...
+def rust_are_related_types(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    proper_subtype: bool,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_are_tuples_overlapping(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    strict_optional: bool,
+    ignore_promotions: bool,
+    overlap_for_overloads: Any,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_are_typed_dicts_overlapping(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    strict_optional: bool,
+    ignore_promotions: bool,
+    overlap_for_overloads: Any,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_builtin_item_type(
+    t_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_check_argument_types_plan(
+    arg_type_blobs: Any,
+    arg_kinds: Any,
+    formal_to_actual: Any,
+    callee_bytes: bytes,
+) -> Any: ...
+def rust_check_arguments(
+    resolver: NativeTypeResolver,
+    callee_bytes: bytes,
+    arg_types_bytes: bytes,
+    arg_kinds: Any,
+    formal_to_actual: Any,
+    strict_optional: bool,
+    allow_abstract_call: bool,
+) -> Any: ...
+def rust_check_call_expr_callable_name(
+    object_type_bytes: bytes,
+    callable_name: Any,
+    member: Any,
+    has_object_type: bool,
+) -> Any: ...
+def rust_classify_type_expression(
+    node_tags: Any,
+    str_value: Any,
+    str_isidentifier: Any,
+    str_has_quotes: Any,
+    str_has_open_bracket: Any,
+    str_is_whitespace: Any,
+    str_nontype_regex_match: Any,
+    index_base_kind: Any,
+    index_leftmost_is_name: Any,
+    index_node_is_var: Any,
+    index_var_is_special: Any,
+    op_is_pipe: Any,
+) -> Any: ...
+def rust_classify_type_with_info(
+    fullname: Any,
+    args_len: Any,
+    tuple_type_not_none: Any,
+    special_alias_not_none: Any,
+    typeddict_type_not_none: Any,
+) -> Any: ...
+def rust_classify_unbound_front(
+    node_kind: Any,
+    placeholder_becomes_typeinfo: Any,
+    final_iteration: Any,
+    allow_placeholder: bool,
+    has_hook: bool,
+    tvar_def_exists: Any,
+    tvar_def_in_allowed: Any,
+    tvar_def_erased: Any,
+    placeholder_in_tvar_params: Any,
+    allow_unbound_tvars: bool,
+    defining_alias: Any,
+    defining_literal: Any,
+    param_spec_name_set: Any,
+    allow_param_spec_literals: bool,
+    has_args: bool,
+    alias_type_params_names: Any,
+    tname: Any,
+    allow_type_var_tuple: int,
+    nesting_level: Any,
+) -> Any: ...
+def rust_clean_up_bases(
+    fullname: Any,
+    in_protocol_names: Any,
+    has_args: bool,
+) -> Any: ...
+def rust_create_errors(
+    error_tuples: Any,
+) -> Any: ...
+def rust_dangerous_comparison(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    original_container_bytes: bytes | None,
+    python_seen: Any,
+    prefer_literal: Any,
+    identity_check: Any,
+    strict_equality_for_none: bool,
+    unreachable_suppressed: Any,
+    has_custom_eq_left: bool,
+    has_custom_eq_right: bool,
+    strict_optional: bool,
+    abstract_set_ref: Any,
+    abstract_map_ref: Any,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_detach_callable(
+    typ_bytes: bytes,
+    class_type_vars_bytes: bytes,
+) -> Any: ...
+def rust_equality_value_info(
+    t_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_expand_callable_variants(
+    type_bytes: bytes,
+    strict_optional: bool,
+) -> Any: ...
+def rust_expand_tuple_if_possible(
+    tup_bytes: bytes,
+    target: Any,
+) -> Any: ...
+def rust_extract_meta_info(
+    typ: Any,
+) -> Any: ...
+def rust_find_isinstance_join() -> Any: ...
+def rust_find_possibly_undefined(
+    node: Any,
+    type_map: Any,
+    options: Any,
+    names: Any,
+) -> Any: ...
+def rust_get_possible_variants(
+    typ_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_get_property_type(
+    t: Any,
+) -> Any: ...
+def rust_infer_value_type() -> Any: ...
+def rust_instantiate_type_alias(
+    node: Any,
+    arg_blobs: Any,
+    no_args: Any,
+    empty_tuple_index: Any,
+) -> Any: ...
+def rust_is_classmethod_node(
+    node: Any,
+) -> Any: ...
+def rust_is_enum_overlapping_union(
+    x_bytes: bytes,
+    y_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_is_equality_ambiguous_for_narrowing(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_is_literal_in_union(
+    x_bytes: bytes,
+    y_bytes: bytes,
+) -> Any: ...
+def rust_is_more_general_arg_prefix(
+    t_bytes: bytes,
+    s_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_is_node_static(
+    node: Any,
+) -> Any: ...
+def rust_is_none_object_overlap(
+    t1_bytes: bytes,
+    t2_bytes: bytes,
+) -> Any: ...
+def rust_is_object(
+    t_bytes: bytes,
+) -> Any: ...
+def rust_is_overlapping_erased_types(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    ignore_promotions: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_is_same_arg_prefix(
+    t_bytes: bytes,
+    s_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_is_tuple(
+    t_bytes: bytes,
+) -> Any: ...
+def rust_is_unsafe_overlapping_overload_signatures(
+    signature: Any,
+    other: Any,
+    class_type_vars: Any,
+    partial_only: Any,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_merge_typevars_in_callables_by_name(
+    types_bytes: list[bytes],
+    start_raw_id: Any,
+    strict_optional: bool,
+) -> Any: ...
+def rust_namedtuple_prohibited_names() -> Any: ...
+def rust_narrow_type() -> Any: ...
+def rust_overload_can_never_match(
+    signature_bytes: bytes,
+    other_bytes: bytes,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_partial_type_inference() -> Any: ...
+def rust_partition_equality_ambiguous_types(
+    current_bytes: bytes,
+    target_bytes: bytes,
+    is_identity: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_process_start_options(
+    flags: Any,
+    allow_sources: bool,
+) -> Any: ...
+def rust_remove_path_prefix(
+    path: Any,
+    prefix: Any,
+) -> Any: ...
+def rust_report_internal_error(
+    file: Any,
+    line: Any,
+    show_traceback: Any,
+    mypy_version: Any,
+) -> Any: ...
+def rust_serialize_fields(
+    fields: Any,
+) -> Any: ...
+def rust_should_dispatch_union_call(
+    object_type_bytes: bytes,
+    callable_name: Any,
+    member: Any,
+) -> Any: ...
+def rust_sort_within_context(
+    errors: Any,
+) -> Any: ...
+def rust_supported_self_type(
+    type_bytes: bytes,
+    resolver: NativeTypeResolver,
+    allow_callable: bool,
+    allow_instances: bool,
+) -> Any: ...
+def rust_transform_copy(
+    node: Any,
+) -> Any: ...
+def rust_try_contracting_literals_in_union(
+    type_list_bytes: bytes,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_type_object_type_from_function(
+    signature_bytes: bytes,
+    info: Any,
+    def_info: Any,
+    fallback_bytes: bytes,
+    is_new: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
+def rust_yield_nonoverlapping_types(
+    nonoverlapping_types: Any,
+    unreachable_lines: Any,
+) -> Any: ...
