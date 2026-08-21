@@ -374,7 +374,6 @@ __all__ = [
     "rust_find_self_type",
     "rust_check_vec_type_args",
     "IdMapper",
-    "rust_serialize_type",
 ]
 
 class NativeTypeResolver:
