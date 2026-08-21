@@ -3142,8 +3142,9 @@ mod tests {
                     extra_attrs: None,
                 },
             ],
-            is_protocol: false,
             uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
         };
         let back = round_trip(&t);
         assert_eq!(collect_refs(&back), vec!["a.A", "b.B"]);
