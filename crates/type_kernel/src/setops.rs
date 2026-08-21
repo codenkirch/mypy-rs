@@ -1573,6 +1573,182 @@ fn pick_fallback(s_fallback: &Type, t_fallback: &Type) -> Type {
     t_fallback.clone()
 }
 
+/// `safe_meet` (join.py:1057-1074): per-arg meet for
+/// `join_similar_callables`. Args are met (contravariant).
+/// - Non-UnpackType pair: meet_types.
+/// - Both UnpackType: meet the inner types; if the meet is a definite
+///   Bottom, wrap as `Instance(tuple_fallback, [Bottom])` per
+///   join.py:1064-1068 (the tuple fallback type comes from the unpacked
+///   side: TypeVarTupleType.tuple_fallback, TupleType.partial_fallback,
+///   or Instance(builtins.tuple)).
+/// - Mixed UnpackType / non: `UninhabitedType(ambiguous=False)`.
+///
+/// Returns None only if the inner meet defers.
+fn safe_meet(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
+    let t_unpack = matches!(t, Type::UnpackType { .. });
+    let s_unpack = matches!(s, Type::UnpackType { .. });
+    if !t_unpack && !s_unpack {
+        return fruit_to_type(meet_types(t, s, ctx, resolver)?, t, s);
+    }
+    if t_unpack && s_unpack {
+        let t_inner = match t {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => unreachable!(),
+        };
+        let s_inner = match s {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => unreachable!(),
+        };
+        let fallback_ref = match t_inner {
+            Type::TypeVarTupleType { tuple_fallback, .. } => {
+                if let Type::Instance { type_ref, .. } = tuple_fallback.as_ref() {
+                    type_ref.clone()
+                } else {
+                    return None;
+                }
+            }
+            Type::TupleType {
+                partial_fallback, ..
+            } => {
+                if let Type::Instance { type_ref, .. } = partial_fallback.as_ref() {
+                    type_ref.clone()
+                } else {
+                    return None;
+                }
+            }
+            Type::Instance { type_ref, .. } => type_ref.clone(),
+            _ => return None,
+        };
+        let met = fruit_to_type(
+            meet_types(t_inner, s_inner, ctx, resolver)?,
+            t_inner,
+            s_inner,
+        )?;
+        if matches!(met, Type::UninhabitedType { .. }) {
+            return Some(Type::UnpackType {
+                typ: Box::new(Type::Instance {
+                    type_ref: fallback_ref,
+                    args: vec![met],
+                    last_known_value: None,
+                    extra_attrs: None,
+                }),
+            });
+        }
+        return Some(Type::UnpackType { typ: Box::new(met) });
+    }
+    // Mixed: join.py:1073-1074 -> UninhabitedType().
+    Some(Type::UninhabitedType { ambiguous: false })
+}
+
+/// `join_similar_callables` (join.py:1086-1119): non-equivalent similar
+/// callables. Per-arg safe_meet, ret join, instance_type join, fallback
+/// pick. Returns Encoded(new CallableType) or None (defer).
+//
+// Called with the (t, self.s) operand order from join.py:622; the
+// operands are passed through in that frame, and the field handling
+// mirrors `combine_similar_callables`' callsite (s=left, t=right).
+#[allow(clippy::too_many_arguments)]
+fn join_similar_callables_impl(
+    s: &Type,
+    t: &Type,
+    s_arg_types: &[Type],
+    t_arg_types: &[Type],
+    s_ret_type: &Type,
+    t_ret_type: &Type,
+    s_fallback: &Type,
+    t_fallback: &Type,
+    s_instance_type: &Option<Box<Type>>,
+    t_instance_type: &Option<Box<Type>>,
+    s_arg_names: &[Option<String>],
+    t_arg_names: &[Option<String>],
+    s_arg_kinds: &[i64],
+    t_arg_kinds: &[i64],
+    t_variables: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<SetOpResult> {
+    let mut new_arg_types = Vec::with_capacity(t_arg_types.len());
+    for (ta, sa) in t_arg_types.iter().zip(s_arg_types.iter()) {
+        new_arg_types.push(safe_meet(ta, sa, ctx, resolver)?);
+    }
+    // join.py:627-630: if any arg is NoneType/UninhabitedType, Python
+    // returns join_types(t.fallback, self.s) instead of the joined
+    // callable. That fallback join cannot be reproduced here without
+    // recursing into the visitor with a half-built operand, so defer.
+    if new_arg_types
+        .iter()
+        .any(|tp| matches!(tp, Type::NoneType | Type::UninhabitedType { .. }))
+    {
+        return None;
+    }
+    let new_ret = setop_result_to_type(
+        join_types(t_ret_type, s_ret_type, ctx, resolver),
+        t_ret_type,
+        s_ret_type,
+    )?;
+    let new_instance_type = match (s_instance_type, t_instance_type) {
+        (Some(si), Some(ti)) => Some(Box::new(setop_result_to_type(
+            join_types(ti.as_ref(), si.as_ref(), ctx, resolver),
+            ti.as_ref(),
+            si.as_ref(),
+        )?)),
+        _ => None,
+    };
+    let new_arg_names = combine_arg_names(t_arg_names, s_arg_names, t_arg_kinds, s_arg_kinds);
+    let new_fallback = pick_fallback(s_fallback, t_fallback);
+    let (
+        arg_kinds,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type,
+        type_guard,
+        type_is,
+    ) = extract_callable_invariants(t);
+    // join.py:626-635: the caller sets from_type_type=True on the result
+    // unless either operand is an abstract type object (is_type_obj &&
+    // type_object().is_abstract); then it keeps t's flag (copy_modified).
+    // min_len>0 (both generic) is deferred before this impl is reached,
+    // so match_generic_callables is a no-op and t.variables is preserved.
+    let t_abstract = callable_is_abstract_type_obj(t, resolver)?;
+    let s_abstract = callable_is_abstract_type_obj(s, resolver)?;
+    let new_from_type_type = if t_abstract || s_abstract {
+        from_type_type
+    } else {
+        true
+    };
+    // join.py:1108 sets `name=None` on the result, which is a
+    // copy_modified on the live right operand `t`, so `t.definition`
+    // survives and `pretty_callable` renders `def <right_operand_name>`.
+    // The wire cannot carry `definition`; the Python shim restores it
+    // from the live `t` after fixup. The wire `name` stays None to
+    // match the pure result exactly (only `definition` differs, and the
+    // shim repairs that).
+    let new_callable = Type::CallableType {
+        fallback: Box::new(new_fallback),
+        instance_type: new_instance_type,
+        is_ellipsis_args,
+        implicit,
+        is_bound,
+        from_concatenate,
+        imprecise_arg_kinds,
+        unpack_kwargs,
+        from_type_type: new_from_type_type,
+        arg_types: new_arg_types,
+        arg_kinds,
+        arg_names: new_arg_names,
+        ret_type: Box::new(new_ret),
+        name: None,
+        variables: t_variables.to_vec(),
+        type_guard,
+        type_is,
+    };
+    encode_callable(new_callable)
+}
+
 /// `combine_similar_callables` (join.py:1097-1120): is_equivalent path.
 /// Per-arg safe_join, ret join, instance_type join, fallback pick.
 /// Returns Encoded(new CallableType) or None (defer).
@@ -1751,6 +1927,71 @@ pub(crate) fn is_type_obj_callable(t: &Type, resolver: &TypeResolver) -> bool {
     resolver.get(type_ref).is_some_and(|snap| {
         snap.has_base("builtins.type") || snap.fullname == "abc.ABCMeta" || snap.fallback_to_any
     })
+}
+
+/// Whether a CallableType is an abstract type object, when the callee of
+/// join_similar_callables decides whether to force `from_type_type=True`
+/// on the result (join.py:631-635): true iff `is_type_obj()` AND
+/// `type_object().is_abstract`. `is_type_obj` (types.py:2473-2476):
+/// `fallback` is a metaclass (`is_metaclass`) and `ret_type` is not
+/// UninhabitedType. `type_object()` (types.py:2505-2508):
+/// `get_instance_type(force_fallback=True).type`: prefer the
+/// `instance_type` field, else unwrap `ret_type` (TypeVar upper_bound,
+/// TupleType partial_fallback, TypedDictType/LiteralType fallback) to an
+/// Instance. Returns None when the chain cannot produce a live
+/// meta-TypeInfo, in which case the caller defers to Python.
+fn callable_is_abstract_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
+    let Type::CallableType {
+        fallback,
+        instance_type,
+        ret_type,
+        ..
+    } = t
+    else {
+        return None;
+    };
+    if matches!(ret_type.as_ref(), Type::UninhabitedType { .. }) {
+        return Some(false);
+    }
+    let Type::Instance { type_ref, .. } = fallback.as_ref() else {
+        return None;
+    };
+    let snap = resolver.get(type_ref)?;
+    let is_metaclass =
+        snap.has_base("builtins.type") || snap.fullname == "abc.ABCMeta" || snap.fallback_to_any;
+    if !is_metaclass {
+        return Some(false);
+    }
+    // type_object(): get_instance_type(force_fallback=True).
+    let mut ret = if let Some(inst) = instance_type {
+        inst.as_ref().clone()
+    } else {
+        get_proper_type_local(ret_type.as_ref())?
+    };
+    match &ret {
+        Type::TypeVarType { upper_bound, .. } => ret = get_proper_type_local(upper_bound.as_ref())?,
+        Type::TupleType {
+            partial_fallback, ..
+        } => ret = get_proper_type_local(partial_fallback.as_ref())?,
+        Type::TypedDictType { fallback, .. } => ret = get_proper_type_local(fallback.as_ref())?,
+        Type::LiteralType { fallback, .. } => ret = get_proper_type_local(fallback.as_ref())?,
+        _ => {}
+    }
+    let Type::Instance { type_ref, .. } = &ret else {
+        return None;
+    };
+    Some(resolver.get(type_ref)?.is_abstract)
+}
+
+/// `get_proper_type` (types.py:3985-4011) for the wire format. The wire
+/// cannot expand a `TypeAliasType` (the alias target is a live node, not
+/// serialized), so it defers (None) exactly where Python's
+/// `get_proper_type` would resolve the alias.
+fn get_proper_type_local(typ: &Type) -> Option<Type> {
+    match typ {
+        Type::TypeAliasType { .. } => None,
+        _ => Some(typ.clone()),
+    }
 }
 
 /// `TypeJoinVisitor.visit_*` leaf methods (join.py:344-374), Rust
@@ -1966,15 +2207,35 @@ fn visit_join(
                         resolver,
                     );
                 }
-                // Non-equivalent similar callables need `join_similar_callables`
-                // (join.py:622) whose caller (join.py:631-635) sets
-                // `from_type_type=True` on the result to suppress the
+                // Non-equivalent similar callables need
+                // `join_similar_callables` (join.py:622-637). The caller's
+                // fallback-join (join.py:628-629, when an arg meets to
+                // NoneType/UninhabitedType) cannot be reproduced here
+                // without recursing into the visitor with a half-built
+                // operand, so the Rust impl defers (returns None) in that
+                // case and Python runs the original path. The
+                // `from_type_type` force (join.py:630-636, suppress the
                 // abstract-instantiation error when concrete class objects
-                // infer as their common abstract superclass. The Rust
-                // port does not replicate that logic, and the
-                // join_similar_callables path also uses safe_meet (not
-                // safe_join) for arg types, which is not yet ported. Defer.
-                None
+                // join to their abstract superclass) is replicated.
+                join_similar_callables_impl(
+                    s,
+                    t,
+                    s_arg_types,
+                    arg_types,
+                    s_ret_type,
+                    ret_type,
+                    s_fallback,
+                    fallback,
+                    s_instance_type,
+                    instance_type,
+                    s_arg_names,
+                    arg_names,
+                    s_arg_kinds,
+                    arg_kinds,
+                    variables,
+                    ctx,
+                    resolver,
+                )
             } else if let Type::Overloaded { .. } = s {
                 // join.py:583-585: s is Overloaded -> swap so the
                 // visit_overloaded walk runs with self.s=callable
@@ -5921,8 +6182,11 @@ mod tests {
         // join(callable(B, object), callable(A, object)) where B <: A.
         // is_similar_callables=True (same arg count, same min_args,
         // same is_var_arg). is_equivalent=False (B <: A but not A <: B).
-        // join_similar_callables sets from_type_type=True (join.py:668)
-        // which is not in the wire format. Deferred to Python.
+        // The Rust port (join_similar_callables_impl) handles it:
+        // per-arg safe_meet(B, A) = B (A is a supertype of B, so the
+        // meet is the more specific B), ret join(object, object) =
+        // object, from_type_type=True (neither operand is an abstract
+        // type object). Result is an encoded CallableType, not None.
         let o = snap("builtins.object", "object");
         let a = snap_with_bases("a.A", "A", &["builtins.object"]);
         let b = snap_with_bases("a.B", "B", &["a.A", "builtins.object"]);
@@ -5938,7 +6202,10 @@ mod tests {
             vec![instance("a.A", vec![])],
             instance("builtins.object", vec![]),
         );
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert!(matches!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Encoded(_))
+        ));
     }
 
     #[test]
@@ -5984,8 +6251,11 @@ mod tests {
         // is_similar_callables=True (same arity). is_equivalent=False:
         // is_subtype(T, object)=True (TypeVar upper_bound <: object),
         // but is_subtype(object, T)=False (Instance not <: TypeVar).
-        // join_similar_callables sets from_type_type=True (join.py:668)
-        // which is not in the wire format. Deferred to Python.
+        // The Rust port handles it: safe_meet(T, object) = T (meet of
+        // a TypeVar with its upper bound is the TypeVar), ret join(T,
+        // object) = object, from_type_type=True (no abstract operands).
+        // Result is an encoded CallableType, not None. The deferred
+        // case is the one where args meet to NoneType/UninhabitedType.
         let o = snap("builtins.object", "object");
         let func = snap_with_bases("builtins.function", "function", &["builtins.object"]);
         let r = make_resolver(vec![o, func]);
@@ -6003,7 +6273,10 @@ mod tests {
             vec![instance("builtins.object", vec![])],
             instance("builtins.object", vec![]),
         );
-        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+        assert!(matches!(
+            join_types(&s, &t, &ctx(true), &r),
+            Some(SetOpResult::Encoded(_))
+        ));
     }
 
     #[test]
