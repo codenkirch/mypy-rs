@@ -369,6 +369,7 @@ __all__ = [
     "rust_check_namedtuple_field_name",
     "rust_verify_requiredness_compatibility",
     "rust_verify_field_against_closed_bases",
+    "rust_verify_type_refs",
     "rust_validate_instance",
     "rust_detect_diverging_alias",
     "rust_find_self_type",
@@ -1372,6 +1373,7 @@ def rust_verify_requiredness_compatibility(
 def rust_verify_field_against_closed_bases(
     field_name: str, closed_bases: Any, primary_source_base: Any
 ) -> list[str]: ...
+def rust_verify_type_refs(data: bytes, valid_refs: list[str]) -> bool: ...
 
 # Issue #578: typeanal_queries functions (live PyO3 objects)
 def rust_validate_instance(t: Any, fail: Any, indexed: bool) -> bool | None: ...
