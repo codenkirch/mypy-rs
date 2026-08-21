@@ -1869,7 +1869,7 @@ def rust_create_errors(
 def rust_dangerous_comparison(
     left_bytes: bytes,
     right_bytes: bytes,
-    original_container_bytes: bytes,
+    original_container_bytes: bytes | None,
     python_seen: Any,
     prefer_literal: Any,
     identity_check: Any,
@@ -1980,7 +1980,7 @@ def rust_is_unsafe_overlapping_overload_signatures(
     resolver: NativeTypeResolver,
 ) -> Any: ...
 def rust_merge_typevars_in_callables_by_name(
-    types_bytes: bytes,
+    types_bytes: list[bytes],
     start_raw_id: Any,
     strict_optional: bool,
 ) -> Any: ...
