@@ -195,7 +195,7 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded, data)
+    return fixup_wire_type(decoded)
 
 
 def is_recursive_pair(s: Type, t: Type) -> bool:
@@ -452,11 +452,11 @@ def type_object_type_from_function(
         except (AssertionError, NotImplementedError, ValueError):
             pass
 
-    # Record non-trivial (explicit) self types in __init__ before binding,
-    # since they won't be available after. Use explicit self-types only in
-    # the defining class, similar to __new__ (but not exactly the same,
-    # see comment in class_callable below). Useful for library classes
-    # such as subprocess.Popen.
+    # We first need to record all non-trivial (explicit) self types in __init__,
+    # since they will not be available after we bind them. Note, we use explicit
+    # self-types only in the defining class, similar to __new__ (but not exactly the same,
+    # see comment in class_callable below). This is mostly useful for annotating library
+    # classes such as subprocess.Popen.
     if not is_new and not info.is_newtype:
         orig_self_types = [get_self_type(it, def_info) for it in signature.items]
     else:
@@ -803,9 +803,9 @@ def bind_self(
                     )
         except (AssertionError, NotImplementedError, ValueError):
             pass
-    # A def __call__(self: Callable[...], ...) can cause infinite recursion.
-    # This special-casing looks unprincipled, but there is nothing
-    # meaningful to infer from such a definition; it is inherently recursive.
+    # Having a def __call__(self: Callable[...], ...) can cause infinite recursion. Although
+    # this special-casing looks not very principled, there is nothing meaningful we can infer
+    # from such definition, since it is inherently indefinitely recursive.
     allow_callable = func.name is None or not func.name.startswith("__call__ of")
     if func.variables and supported_self_type(
         self_param_type, allow_callable=allow_callable, allow_instances=not ignore_instances

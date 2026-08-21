@@ -73,9 +73,8 @@ def copy_type(t: ProperType) -> ProperType:
             if result is not None:
                 from mypy.wirefixup import fixup_wire_type
 
-                raw = bytes(result)
-                rbuf = _CopyReadBuffer(raw)
-                decoded = fixup_wire_type(_copy_read_type(rbuf), raw)
+                rbuf = _CopyReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_copy_read_type(rbuf))
                 if decoded is not None:
                     return cast(ProperType, decoded)
         except (AssertionError, NotImplementedError, TypeError, ValueError):

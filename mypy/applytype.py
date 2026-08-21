@@ -359,8 +359,7 @@ def apply_generic_arguments(
                     state.strict_optional,
                 )
                 if result is not None:
-                    raw = bytes(result)
-                    decoded = read_type(_ReadBuffer(raw))
+                    decoded = read_type(_ReadBuffer(bytes(result)))
                     # Clear instance_cache primitives after read_type so
                     # NOT_READY singletons cannot leak into later builds.
                     from mypy.types import instance_cache
@@ -385,7 +384,7 @@ def apply_generic_arguments(
                             fixup_wire_type,
                         )
 
-                        fixed = fixup_wire_type(decoded, raw)
+                        fixed = fixup_wire_type(decoded)
                         if fixed is not None:
                             assert isinstance(get_proper_type(fixed), CallableType)
                             # Any residual fake TypeInfo crashes later

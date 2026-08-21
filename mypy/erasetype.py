@@ -163,7 +163,7 @@ def _deserialize_type(data: bytes) -> Type | None:
     """
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_read_type(_ReadBuffer(data)), data)
+    return fixup_wire_type(_read_type(_ReadBuffer(data)))
 
 
 def erase_type(typ: Type) -> ProperType:

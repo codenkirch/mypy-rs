@@ -9269,9 +9269,8 @@ def replace_implicit_first_type(sig: FunctionLike, new: Type) -> FunctionLike:
             new_data = _serialize_semanal_type(new)
             result = _rust_replace_implicit_first_type(data, new_data)
             if result is not None:
-                raw = bytes(result)
-                buf = _SemanalReadBuffer(raw)
-                decoded = fixup_wire_type(_semanal_read_type(buf), raw)
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
                 if decoded is not None:
                     return cast(FunctionLike, decoded)
         except (AssertionError, NotImplementedError):
@@ -9451,9 +9450,8 @@ def make_any_non_explicit(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_explicit(data)
             if result is not None:
-                raw = bytes(result)
-                buf = _SemanalReadBuffer(raw)
-                decoded = fixup_wire_type(_semanal_read_type(buf), raw)
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
                 _clear_instance_cache_after_read()
                 if decoded is not None:
                     return decoded
@@ -9479,9 +9477,8 @@ def make_any_non_unimported(t: Type) -> Type:
             data = _serialize_semanal_type(t)
             result = _rust_make_any_non_unimported(data)
             if result is not None:
-                raw = bytes(result)
-                buf = _SemanalReadBuffer(raw)
-                decoded = fixup_wire_type(_semanal_read_type(buf), raw)
+                buf = _SemanalReadBuffer(bytes(result))
+                decoded = fixup_wire_type(_semanal_read_type(buf))
                 _clear_instance_cache_after_read()
                 if decoded is not None:
                     return decoded

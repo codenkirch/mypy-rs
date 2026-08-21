@@ -3429,8 +3429,7 @@ def _serialize_typeanal_type(t: Type) -> bytes:
 
 
 def _typeanal_decode(result: bytes) -> Type | None:
-    raw = bytes(result)
-    buf = _TypeanalReadBuffer(raw)
+    buf = _TypeanalReadBuffer(bytes(result))
     decoded = _typeanal_read_type(buf)
     # Clear instance_cache primitives after read_type so NOT_READY
     # singletons cannot leak into later builds (mirrors applytype).
@@ -3441,7 +3440,7 @@ def _typeanal_decode(result: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    fixed = fixup_wire_type(decoded, raw)
+    fixed = fixup_wire_type(decoded)
     if fixed is None:
         return None
     # Any residual fake TypeInfo crashes later serialization, so defer.

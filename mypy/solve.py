@@ -551,16 +551,14 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
                 if kind == 0 and blob is not None:
                     from mypy.wirefixup import fixup_wire_type
 
-                    raw = bytes(blob)
-                    decoded = read_type(_ReadBuffer(raw))
-                    return fixup_wire_type(decoded, raw)
+                    decoded = read_type(_ReadBuffer(bytes(blob)))
+                    return fixup_wire_type(decoded)
                 if kind == 1:
                     if blob is not None:
                         from mypy.wirefixup import fixup_wire_type
 
-                        raw = bytes(blob)
-                        decoded = read_type(_ReadBuffer(raw))
-                        return fixup_wire_type(decoded, raw)
+                        decoded = read_type(_ReadBuffer(bytes(blob)))
+                        return fixup_wire_type(decoded)
                     return None
                 # kind == 2: no bounds at all, ambiguous Never.
                 candidate = UninhabitedType()

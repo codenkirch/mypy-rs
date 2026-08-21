@@ -156,7 +156,7 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded, data)
+    return fixup_wire_type(decoded)
 
 
 class InstanceJoiner:
@@ -414,8 +414,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 # then resolve wire-only `type_ref` strings to live
                 # TypeInfo via the fullname -> TypeInfo map. If any
                 # type_ref is missing, defer to Python.
-                raw = bytes(encoded)
-                decoded = read_type(_ReadBuffer(raw))
+                decoded = read_type(_ReadBuffer(bytes(encoded)))
                 from mypy.types import instance_cache
                 from mypy.wirefixup import fixup_wire_type
 
@@ -426,7 +425,7 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 instance_cache.bool_type = None
                 instance_cache.object_type = None
                 instance_cache.function_type = None
-                fixed = fixup_wire_type(decoded, raw)
+                fixed = fixup_wire_type(decoded)
                 if fixed is not None:
                     # Rust-built callable joins (combine_similar_callables
                     # / join_similar_callables) encode a fresh wire

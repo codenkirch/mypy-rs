@@ -87,10 +87,9 @@ T = TypeVar("T")
 JsonDict: _TypeAlias = dict[str, Any]
 
 # Valid expressions that can be contained inside Literal[...].
-#
-# Literals can contain bytes and enum-values: we special-case both
-# and store the value as a string. We rely on the fallback type also
-# stored with the Literal to determine how a string is being used.
+# Literals can contain bytes and enum-values: we special-case both and
+# store the value as a string, relying on the fallback type to say how
+# the string is used.
 #
 # TODO: confirm that we're happy with representing enums (and the
 # other types) in the manner described above.
@@ -1362,8 +1361,8 @@ class AnyType(ProperType):
     ) -> None:
         super().__init__(line, column)
         self.type_of_any = type_of_any
-        # If this Any was created from interacting with another Any, record
-        # the source and use it in reports.
+        # If this Any was created from interacting with another Any,
+        # record the source and use it in reports.
         self.source_any = source_any
         if source_any and source_any.source_any:
             self.source_any = source_any.source_any
@@ -4725,11 +4724,10 @@ def _native_copy_modified(t: Type, changes: dict[str, Any]) -> Type | None:
         _native_truthiness_in_flight = False
     if result is None:
         return None
-    raw = bytes(result)
-    decoded = _deserialize_type_from_visitor(raw)
+    decoded = _deserialize_type_from_visitor(bytes(result))
     from mypy.wirefixup import fixup_wire_type
 
-    fixed = fixup_wire_type(decoded, raw)
+    fixed = fixup_wire_type(decoded)
     if fixed is None:
         return None
     return fixed

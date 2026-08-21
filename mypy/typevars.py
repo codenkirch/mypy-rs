@@ -59,7 +59,7 @@ def _native_decode_well_formed(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    fixed = fixup_wire_type(decoded, data)
+    fixed = fixup_wire_type(decoded)
     if fixed is None or not check_no_fake_info(fixed):
         return None
     return fixed

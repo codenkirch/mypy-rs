@@ -189,11 +189,10 @@ def meet_types(s: Type, t: Type) -> ProperType:
                 # then resolve wire-only `type_ref` strings to live
                 # TypeInfo via join._fixup_decoded_type. If any type_ref
                 # is missing, defer to Python.
-                raw = bytes(encoded)
-                decoded = read_type(join._ReadBuffer(raw))  # type: ignore[attr-defined]
+                decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
                 from mypy.wirefixup import fixup_wire_type
 
-                fixed = fixup_wire_type(decoded, raw)
+                fixed = fixup_wire_type(decoded)
                 if fixed is not None:
                     return fixed  # type: ignore[return-value]
                 # Fall through to Python.
@@ -246,8 +245,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
         except (AssertionError, NotImplementedError):
             encoded = None
         if encoded is not None:
-            raw = bytes(encoded)
-            decoded = read_type(join._ReadBuffer(raw))  # type: ignore[attr-defined]
+            decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
             from mypy.types import instance_cache
             from mypy.wirefixup import fixup_wire_type
 
@@ -258,7 +256,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
             instance_cache.bool_type = None
             instance_cache.object_type = None
             instance_cache.function_type = None
-            fixed = fixup_wire_type(decoded, raw)
+            fixed = fixup_wire_type(decoded)
             if fixed is not None:
                 return fixed
             # Fall through to Python.
