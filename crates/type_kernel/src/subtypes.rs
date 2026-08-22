@@ -953,8 +953,16 @@ fn visit_instance_noninstance_right(
     // TypeVarTupleType right (subtypes.py:617-620): tuple[Any, ...] is
     // like Any for tuples. Map left to the typevar's tuple_fallback and
     // require the mapped first arg to be Any (stays False if proper).
-    if let Type::TypeVarTupleType { .. } = right {
-        return visit_instance_variadic_right(left, right, ctx, resolver, left_ref);
+    // Only engages when left is an Instance with a "builtins.tuple" base;
+    // other lefts (e.g. TypeVarTupleType itself, subtypes.py:2600-2603)
+    // keep deferring through the helper's None path.
+    if let Type::Instance {
+        type_ref: left_ref, ..
+    } = left
+    {
+        if matches!(right, Type::TypeVarTupleType { .. }) {
+            return visit_instance_variadic_right(left, right, ctx, resolver, left_ref);
+        }
     }
     // TypeType right (subtypes.py:784-795): when left is `builtins.type`
     // (non-proper) recurse against Any; when left's type is a metaclass
@@ -2263,9 +2271,10 @@ mod tests {
     }
 
     #[test]
-    fn instance_left_typevartuple_right_defers() {
-        // Instance <: TypeVarTupleType needs variadic-slice
-        // reconstruction, not ported -> defer (subtypes.py:617-620).
+    fn instance_left_typevartuple_right_is_false() {
+        // Instance <: TypeVarTupleType: has_base("builtins.tuple") guard
+        // fails for a.A, so the variadic branch does not apply and the
+        // visit_instance tail answers False (subtypes.py:736-741, 683).
         let r = make_resolver(vec![snap("a.A", "A")]);
         let left = instance("a.A", vec![]);
         let right = Type::TypeVarTupleType {
@@ -2278,7 +2287,7 @@ mod tests {
             default: Box::new(Type::UninhabitedType { ambiguous: false }),
             min_len: 0,
         };
-        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(false));
     }
 
     #[test]
