@@ -3675,7 +3675,10 @@ mod tests {
             can_be_true: false,
             can_be_false: false,
         };
-        assert_eq!(erase_return_self_types_wire(&union, &self_t).unwrap(), union);
+        assert_eq!(
+            erase_return_self_types_wire(&union, &self_t).unwrap(),
+            union
+        );
         assert_eq!(
             erase_return_self_types_wire(&Type::NoneType, &self_t).unwrap(),
             Type::NoneType
