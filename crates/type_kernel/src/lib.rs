@@ -72,6 +72,7 @@ mod constant_fold;
 mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
+mod constraints_select;
 mod copymodified;
 mod covers_at_runtime;
 mod dangerous_comparison;
@@ -556,6 +557,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         constraints_helpers::rust_is_similar_constraints,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_select::rust_any_constraints,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_select::rust_repack_callable_args,
         module
     )?)?;
     // Issue #474: pure constraint-list filtering functions.

@@ -246,6 +246,100 @@ def _try_native_is_similar_constraints(x: list[Constraint], y: list[Constraint])
     return _type_kernel.rust_is_similar_constraints(x_buf.getvalue(), y_buf.getvalue())
 
 
+def _try_native_any_constraints(
+    options: Sequence[list[Constraint] | None], *, eager: bool
+) -> list[Constraint] | None:
+    """Route any_constraints through the Rust kernel, deferring on unsupported input.
+
+    Requires a NativeTypeResolver snapshot (installed by the build manager
+    per SCC): the internal helpers need is_same_type / is_subtype with
+    resolved Instance refs. The kernel returns fully serialized result
+    constraints; origins are re-mapped onto the live type variables from
+    the input options because the wire round-trip drops meta_level identity
+    (c.f. solve.py:706-719 for the same concern).
+    """
+    if _native_constraints_resolver is None:
+        return None
+    live_vars: list[TypeVarLikeType] = []
+    for option in options:
+        if option is None:
+            continue
+        for c in option:
+            if c.origin_type_var not in live_vars:
+                live_vars.append(c.origin_type_var)
+    buf = _WriteBuffer()
+    from mypy.cache import write_int_bare  # type: ignore[attr-defined]
+
+    write_int_bare(buf, len(options))
+    for option in options:
+        if option is None:
+            write_int_bare(buf, -1)  # marker: None option
+        else:
+            _write_option(buf, option)
+    raw = _type_kernel.rust_any_constraints(
+        buf.getvalue(), eager, _native_constraints_resolver
+    )
+    if raw is None:
+        raise NotImplementedError("kernel deferred any_constraints")
+    from mypy.cache import read_int
+
+    result: list[Constraint] = []
+    for blob in raw:
+        data = _ReadBuffer(bytes(blob))
+        origin = _fix_wire_type(data)
+        if not isinstance(origin, (TypeVarType, ParamSpecType, TypeVarTupleType)):
+            raise NotImplementedError("origin not a type variable")
+        op = read_int(data)
+        target = _fix_wire_type(data)
+        if target is None:
+            raise NotImplementedError("target unresolvable on wire")
+        live = [
+            v
+            for v in live_vars
+            if type(v) is type(origin)
+            and v.id.raw_id == origin.id.raw_id
+            and v.id.namespace == origin.id.namespace
+        ]
+        if len(live) != 1:
+            raise NotImplementedError("origin id not resolvable in options")
+        result.append(Constraint(live[0], op, target))
+    return result
+
+
+def _try_native_repack_callable_args(
+    callable: CallableType, tuple_type: TypeInfo
+) -> list[Type] | None:
+    """Route repack_callable_args through the Rust kernel, deferring on unsupported input."""
+    if _native_constraints_resolver is None:
+        return None
+    callable_buf = _WriteBuffer()
+    callable.write(callable_buf)
+    raw = _type_kernel.rust_repack_callable_args(
+        callable_buf.getvalue(), _native_constraints_resolver
+    )
+    if raw is None:
+        raise NotImplementedError("kernel deferred repack_callable_args")
+    # One blob per repacked type; fix up each Instance ref individually so
+    # the returned types carry live TypeInfos (read_type_list would leave
+    # type_ref strings behind).
+    out: list[Type] = []
+    for blob in raw:
+        item = _fix_wire_type(_ReadBuffer(bytes(blob)))
+        if item is None:
+            raise NotImplementedError("repacked arg unresolvable on wire")
+        # The star normalization emits `Instance(builtins.tuple, [*args: X])`;
+        # re-wrap with the live `tuple_type` TypeInfo (the wire carries only
+        # fullnames), matching `UnpackType(Instance(tuple_type, [star_type]))`.
+        if isinstance(item, UnpackType) and isinstance(
+            get_proper_type(item.type), Instance
+        ):
+            tp = get_proper_type(item.type)
+            if isinstance(tp, Instance) and tp.type.fullname == "builtins.tuple":
+                item = UnpackType(Instance(tuple_type, tp.args))
+        out.append(item)
+    return out
+
+
 def _try_native_filter_imprecise_kinds(cs: list[Constraint]) -> list[Constraint] | None:
     """Route filter_imprecise_kinds through the Rust kernel, deferring on unsupported input."""
     buf = _WriteBuffer()
@@ -858,6 +952,13 @@ def any_constraints(options: list[list[Constraint] | None], *, eager: bool) -> l
     constraint and is ignored.  Ignore empty constraint lists if eager
     is true -- they are always trivially satisfiable.
     """
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_any_constraints(options, eager=eager)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if eager:
         valid_options = [option for option in options if option]
     else:
@@ -1876,6 +1977,13 @@ def repack_callable_args(callable: CallableType, tuple_type: TypeInfo) -> list[T
     list with unpack in the middle, and prefix/suffix on the sides (as they would appear
     in e.g. a TupleType).
     """
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_repack_callable_args(callable, tuple_type)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if ARG_STAR not in callable.arg_kinds:
         return callable.arg_types
     star_index = callable.arg_kinds.index(ARG_STAR)
