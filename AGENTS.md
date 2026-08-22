@@ -388,6 +388,24 @@ including:
   (gate-off vs gate-on differential on the result string and captured
   fail/note messages, plus a direct seam call proving engagement from the
   scalar facts), and pure decision unit tests in `typeanal_special.rs`.
+- `rust_join_instances` — mirrors
+  `InstanceJoiner.join_instances` (join.py:208-303): same-type
+  args-less (fresh Instance when LKV present), same-type with args
+  (via `visit_instance_with_args`; covariant/invariant per-arg join +
+  upper-bound check), variadic single-arg (`tuple[X, ...]` rewrap),
+  and different-type args-less nominal join (promote-aware
+  `join_instances_via_supertype`), with the Python `seen_instances`
+  guard mirrored by a Rust-side `(type_ref, encoded-args)` seen Vec
+  and `object_from_instance` fallback on a hit. Defers (None) for
+  ParamSpec type vars, TypeVarTuple multi-arg / prefix/suffix splits,
+  `type_var.values` non-empty, `fallback_to_any`, different-type with
+  args, and any pair already on the Python `seen_instances` stack
+  (checked before the shim call so the Python guard still wins).
+  Gated by `_native_join_active` (per-call inline gate in
+  `InstanceJoiner.join_instances`) and covered by
+  `NativeJoinInstancesSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential across the handled paths, plus a direct seam
+  call and a pre-seeded `seen_instances` recursion-guard test).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

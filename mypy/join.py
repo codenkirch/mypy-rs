@@ -206,6 +206,88 @@ class InstanceJoiner:
         self.seen_instances: list[tuple[Instance, Instance]] = []
 
     def join_instances(self, t: Instance, s: Instance) -> ProperType:
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_join_active
+            and _native_join_resolver is not None
+            and (t, s) not in self.seen_instances
+            and (s, t) not in self.seen_instances
+        ):
+            try:
+                result = _type_kernel.rust_join_instances(
+                    _serialize_type(t),
+                    _serialize_type(s),
+                    state.strict_optional,
+                    _native_join_resolver,
+                )
+            except (AssertionError, NotImplementedError, ValueError, AttributeError):
+                result = None
+            if result is not None:
+                # Disc identical to rust_join_types: 0/1 return s/t,
+                # 2=Object, 5=Ancestor, 6=SameTypeWithArgs (arg_discs
+                # 0/1 pick s.args/t.args[i]), 7=Encoded.
+                disc, fullname, arg_discs, encoded = result
+                if disc == 0:
+                    return s
+                elif disc == 1:
+                    return t
+                elif disc == 2:
+                    return object_or_any_from_type(t)
+                elif disc == 3:
+                    return UninhabitedType() if state.strict_optional else NoneType()
+                elif disc == 4:
+                    return AnyType(TypeOfAny.special_form)
+                elif disc == 7:
+                    decoded = read_type(_ReadBuffer(bytes(encoded)))
+                    from mypy.types import instance_cache
+                    from mypy.wirefixup import fixup_wire_type
+
+                    # Clear instance_cache primitives so NOT_READY
+                    # singletons cannot leak (mirrors _typeanal_decode).
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    fixed = fixup_wire_type(decoded)
+                    if fixed is not None:
+                        return fixed
+                    # Fall through to Python.
+                elif disc == 5:
+                    if _native_join_typeinfo_map is not None and fullname in _native_join_typeinfo_map:
+                        return Instance(_native_join_typeinfo_map[fullname], [])
+                    # Fall through to Python.
+                elif disc == 6:
+                    if _native_join_typeinfo_map is None or fullname not in _native_join_typeinfo_map:
+                        # Fall through to Python.
+                        pass
+                    else:
+                        type_info = _native_join_typeinfo_map[fullname]
+                        s_args = s.args if isinstance(s, Instance) else []
+                        t_args = t.args if isinstance(t, Instance) else []
+                        new_args: list[Type] = []
+                        for i, ad in enumerate(arg_discs):
+                            if ad == 0:
+                                new_args.append(s_args[i])
+                            elif ad == 1:
+                                new_args.append(t_args[i])
+                            elif ad == 4:
+                                # AnyType(from_another_any, source):
+                                # pick the AnyType side.
+                                src = (
+                                    t_args[i]
+                                    if isinstance(get_proper_type(t_args[i]), AnyType)
+                                    else s_args[i]
+                                )
+                                new_args.append(
+                                    AnyType(
+                                        TypeOfAny.from_another_any,
+                                        cast(AnyType, get_proper_type(src)),
+                                    )
+                                )
+                        return Instance(type_info, new_args)
+            # Rust returned None (unsupported case) — fall through to
+            # Python, which re-runs the seen-guard + full body.
         if (t, s) in self.seen_instances or (s, t) in self.seen_instances:
             return object_from_instance(t)
 

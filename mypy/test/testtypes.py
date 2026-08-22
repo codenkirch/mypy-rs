@@ -19645,3 +19645,178 @@ class NativeSolveOneSuite(Suite):
 
     def test_subtype_bottom_top(self) -> None:
         self._assert_par([self.fx.a], [self.fx.a, self.fx.b])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinInstancesSuite(Suite):
+    """Parity for the Rust `InstanceJoiner.join_instances` port
+    (join.py:208-303, setops.rs `join_instances_core`).
+
+    The seam is the new `rust_join_instances` pyfunction, wired into
+    `InstanceJoiner.join_instances` (the args-less, same-type-with-args,
+    variadic-single-arg, and different-args-less nominal paths). Toggling
+    the join gate off vs on must agree on the resulting ProperType for the
+    same Instance pair; a direct seam call proves the Rust engagement.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self._set_active = _set_native_join_active
+        self._set_resolver = _set_native_join_resolver
+        self._set_map = _set_native_join_typeinfo_map
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._typeinfo_map = {info.fullname: info for info in type_infos}
+        self._set_resolver(self._resolver)
+        self._set_map(self._typeinfo_map)
+        set_wire_typeinfo_map(self._typeinfo_map)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _native_result(self, t: Instance, s: Instance) -> ProperType:
+        from mypy.join import InstanceJoiner
+
+        return self._with_gate(
+            True, lambda: InstanceJoiner().join_instances(t, s)
+        )  # type: ignore[return-value]
+
+    def _reference_result(self, t: Instance, s: Instance) -> ProperType:
+        from mypy.join import InstanceJoiner
+
+        return self._with_gate(
+            False, lambda: InstanceJoiner().join_instances(t, s)
+        )  # type: ignore[return-value]
+
+    def _assert_parity(self, t: Instance, s: Instance) -> None:
+        res = self._native_result(t, s)
+        ref = self._reference_result(t, s)
+        assert_equal(res, ref)
+
+    def test_same_type_args_less(self) -> None:
+        # join.py:215, no args -> Instance(A, []) = A for both orders.
+        self._assert_parity(self.fx.a, self.fx.a)
+
+    def test_same_type_different_vars_returns_object(self) -> None:
+        # join_instances_via_supertype with t/s unrelated -> object.
+        self._assert_parity(self.fx.a, self.fx.d)
+
+    def test_same_type_covariant_args_join(self) -> None:
+        # G[A] vs G[B], T covariant -> G[A] (A is the supertype of B).
+        self._assert_parity(self.fx.ga, self.fx.gb)
+
+    def test_same_type_covariant_args_join_reversed(self) -> None:
+        self._assert_parity(self.fx.gb, self.fx.ga)
+
+    def test_same_type_invariant_unequal_args_returns_object(self) -> None:
+        # TypeFixture(INVARIANT): G[A] vs G[B], T invariant ->
+        # is_equivalent(A, B) false -> object.
+        inv_fx = TypeFixture(INVARIANT)
+        inv_infos = []
+        for name in dir(inv_fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(inv_fx, name)
+            if _is_type_info(value):
+                inv_infos.append(value)
+        inv_infos.extend([inv_fx.str_type_info, inv_fx.bool_type_info])
+        inv_resolver = _type_kernel.build_native_resolver(inv_infos, [])
+        inv_map = {info.fullname: info for info in inv_infos}
+
+        from mypy.join import _set_native_join_resolver as _set_res
+        from mypy.wirefixup import set_wire_typeinfo_map as _set_wire_map
+
+        prev_res = self._resolver
+        prev_map = self._typeinfo_map
+        _set_res(inv_resolver)
+        _set_wire_map(inv_map)
+        self._resolver = inv_resolver
+        self._typeinfo_map = inv_map
+        try:
+            self._assert_parity(inv_fx.ga, inv_fx.gb)
+        finally:
+            _set_res(prev_res)
+            _set_wire_map(prev_map)
+            self._resolver = prev_res
+            self._typeinfo_map = prev_map
+
+    def test_same_type_with_any_arg(self) -> None:
+        # G[A] vs G[Any] -> G[Any] via the AnyType arg path (disc 4).
+        self._assert_parity(self.fx.ga, self.fx.gdyn)
+
+    def test_same_type_with_any_arg_reversed(self) -> None:
+        self._assert_parity(self.fx.gdyn, self.fx.ga)
+
+    def test_multi_arg_same_base(self) -> None:
+        # H[A, B] vs H[A, B], single variance -> same.
+        self._assert_parity(self.fx.hab, self.fx.hab)
+
+    def test_literal_lkv_is_dropped(self) -> None:
+        # Same type with a literal last_known_value: join_instances
+        # builds Instance(A, []) without LKV (join.py:281 path).
+        from mypy.types import LiteralType
+
+        lit_a = Instance(self.fx.ai, [], last_known_value=LiteralType(1, self.fx.a))
+        lit_b = Instance(self.fx.ai, [], last_known_value=LiteralType(2, self.fx.a))
+        self._assert_parity(lit_a, lit_b)
+
+    def test_nominal_ancestor(self) -> None:
+        # B <: A -> join(B, A) = A via join_instances_via_supertype.
+        self._assert_parity(self.fx.b, self.fx.a)
+        self._assert_parity(self.fx.a, self.fx.b)
+
+    def test_seen_guard_routes_to_python_object(self) -> None:
+        # Python's seen_instances already contains (A, A): the shim
+        # must NOT engage (the pair is on the Python stack) and the
+        # pure-Python guard returns object_from_instance(A) = object.
+        from mypy.join import InstanceJoiner
+
+        j = InstanceJoiner()
+        j.seen_instances.append((self.fx.a, self.fx.a))
+        res = j.join_instances(self.fx.a, self.fx.a)
+        assert res == self.fx.o, f"expected object, got {res}"
+        # Fresh joiner: Rust engages and returns A.
+        j2 = InstanceJoiner()
+        assert j2.join_instances(self.fx.a, self.fx.a) == self.fx.a
+
+    def test_seam_engages(self) -> None:
+        # Direct seam call: rust_join_instances returns a disc tuple for
+        # A vs A (args-less same-type). None would mean Rust defers.
+        from mypy.join import InstanceJoiner, _serialize_type
+
+        result = _type_kernel.rust_join_instances(
+            _serialize_type(self.fx.a),
+            _serialize_type(self.fx.a),
+            False,
+            self._resolver,
+        )
+        assert result is not None, f"rust_join_instances(A, A) deferred: {result!r}"
+        disc = result[0]
+        assert disc in (0, 1), f"expected SameS/SameT for A vs A, got disc {disc}"

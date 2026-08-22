@@ -4672,6 +4672,267 @@ pub(crate) fn rust_meet_types(
     meet_types(&s, &t, &ctx, resolver.resolver()).map(discriminator)
 }
 
+/// `InstanceJoiner.join_instances` (join.py:208-303), full Rust port
+/// behind a new seam with a real recursion guard.
+///
+/// Python's `InstanceJoiner` keeps a `seen_instances` list and returns
+/// `object_from_instance(t)` when a pair recurs. The args-less nominal
+/// join (`join_instances_via_supertype`) has no type-arg recursion, so
+/// its cycles are structural only; the recursive-with-args cases
+/// (`equal types with args`, `TypeVarTupleType` rewrap) go through
+/// `join_types` → `visit_instance` → `join_instances` and can cycle
+/// via generic args. This port passes a `seen` set of
+/// `(type_ref, args-bytes)` pairs through that recursion so Rust stops
+/// the cycle exactly where Python does.
+///
+/// Handled (returns a `SetOpResult`, encoded to a `DiscriminatorOut`
+/// the Python shim decodes):
+/// - Same type, both args-less → SameS/SameT (or Encoded fresh
+///   Instance when both carry a last_known_value).
+/// - Same type with args (non-variadic) → `visit_instance_with_args`
+///   (AnyType args, invariant is_equivalent, covariant bound check).
+/// - Different type, both args-less → the nominal
+///   `join_instances_via_supertype` walk.
+/// - Same variadic type with a single TypeVarTuple argument → the
+///   tuple-fallback rewrap (join.py:230-241 end-state).
+///
+/// Defers (returns `None`, Python runs the pure body):
+/// - ParamSpec type vars (kind=1) — needs `type_var.upper_bound`
+///   (join.py:242-246, the not-is_equivalent → upper_bound result) and
+///   the snapshot has no upper_bound for ParamSpec kinds.
+/// - TypeVarTuple item-extension (`new_type` tuple-of-multiple-items:
+///   `args.extend(new_type.items); continue`) — the joined middle
+///   fallback is only available as snapshot bytes; the continuation
+///   defers conservatively.
+/// - Variadic instances with prefix/suffix > 0 or multiple TypeVarTuple
+///   args (needs `split_with_prefix_and_suffix`).
+/// - Different types with args (needs `expand_type_by_instance`).
+/// - `type_var.values` non-empty (snapshot has no values field).
+/// - Ambiguous-Uninhabited args are handled; non-ambiguous rewrap of
+///   Instance(tuple) stays (it mirrors the Instance-tuple rewrap).
+/// - All the fallbacks `visit_instance_with_args` already defers on.
+///
+/// The recursion guard uses encoded arg-bytes (not decoded args) so a
+/// recursive Instance of the same type with equal args hits the guard
+/// exactly as Python's `(t, s) in seen_instances` (which compares by
+/// Instance equality, i.e. type + args + lkv + extra_attrs). lkv /
+/// extra_attrs are dropped from the key (conservative: walks a cyclic
+/// pair one extra level before the guard fires).
+fn join_instances_core(
+    t: &Type,
+    s: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    seen: &mut Vec<(String, Vec<u8>)>,
+) -> Option<SetOpResult> {
+    let (t_ref, t_args, t_lkv) = match t {
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            ..
+        } => (type_ref.as_str(), args.as_slice(), last_known_value),
+        _ => return None,
+    };
+    let (s_ref, s_args, s_lkv) = match s {
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            ..
+        } => (type_ref.as_str(), args.as_slice(), last_known_value),
+        _ => return None,
+    };
+
+    // join.py:209-210: the seen guard. Python stores (t, s) and returns
+    // object_from_instance(t) when the pair (or its mirror) is already
+    // on the stack.
+    if t_args.is_empty() && s_args.is_empty() {
+        if seen.iter().any(|(r, _)| r == t_ref) || seen.iter().any(|(r, _)| r == s_ref) {
+            // Args-less seen hit: both types are on the stack. Return
+            // object_from_instance(t) exactly like Python.
+            return object_from_instance_result(t_ref, resolver);
+        }
+    } else {
+        // Encode the arg lists once for the guard key. Unwritable args
+        // (e.g. TypeAliasType) defer.
+        let mut t_buf = WriteBuffer::new();
+        wire::write_type_list(&mut t_buf, t_args).ok()?;
+        let mut s_buf = WriteBuffer::new();
+        wire::write_type_list(&mut s_buf, s_args).ok()?;
+        let t_enc = (t_ref.to_string(), t_buf.into_bytes());
+        let s_enc = (s_ref.to_string(), s_buf.into_bytes());
+        if seen.contains(&t_enc) || seen.contains(&s_enc) {
+            // Python's object_from_instance(t): always Instance
+            // (builtins.object) for a well-formed instance; fall back to
+            // a bare fullname Instance blob (the shim fixups type_ref).
+            return object_from_instance_result(t_ref, resolver);
+        }
+        seen.push(t_enc);
+        seen.push(s_enc);
+    }
+
+    // fallback_to_any deferral (same as visit_instance_join): the
+    // promote loop and via_supertype need Python-side _promote lists.
+    if resolver.get(t_ref).is_some_and(|s| s.fallback_to_any)
+        || resolver.get(s_ref).is_some_and(|s| s.fallback_to_any)
+    {
+        return None;
+    }
+
+    let result = if t_ref == s_ref {
+        // join.py:215-241: same base type, combine type arguments.
+        if t_args.is_empty() && s_args.is_empty() {
+            // Both args-less: fresh Instance(type, []) (join.py:281).
+            if !t_lkv.is_some() {
+                SetOpResult::SameT
+            } else if !s_lkv.is_some() {
+                SetOpResult::SameS
+            } else {
+                // Both LKV: fresh Instance without LKV.
+                let fresh = Type::Instance {
+                    type_ref: t_ref.to_string(),
+                    args: Vec::new(),
+                    last_known_value: None,
+                    extra_attrs: None,
+                };
+                let mut wbuf = WriteBuffer::new();
+                wire::write_type(&mut wbuf, &fresh).ok()?;
+                SetOpResult::Encoded(wbuf.into_bytes())
+            }
+        } else {
+            let snap = resolver.get(t_ref)?;
+            if snap.has_type_var_tuple_type {
+                // join.py:218-241: variadic instance. Numeric prefix /
+                // suffix from the snapshot; the resolve of
+                // split_with_prefix_and_suffix uses them.
+                let prefix = snap.type_var_tuple_prefix.unwrap_or(0);
+                let suffix = snap.type_var_tuple_suffix.unwrap_or(0);
+                // Simplified: only the single-argument form
+                // (TupleType rewrapped as one arg) is handled. Defer
+                // prefix/suffix splits and multi-arg forms.
+                if prefix == 0 && suffix == 0 && t_args.len() == 1 && s_args.len() == 1 {
+                    // join.py:230-241: join the rewrapped TupleType args
+                    // and rewrap the result.
+                    let r = join_types(&t_args[0], &s_args[0], ctx, resolver)?;
+                    let new_type = materialize_join(&t_args[0], &s_args[0], r, resolver)?;
+                    match &new_type {
+                        Type::Instance { type_ref: tr, .. } if tr == "builtins.tuple" => {
+                            // join.py:235-237: Tuple[X, Y, Z] join ->
+                            // Instance(tuple) -> UnpackType(new_type).
+                            let mut wbuf = WriteBuffer::new();
+                            wire::write_type(
+                                &mut wbuf,
+                                &Type::UnpackType {
+                                    typ: Box::new(new_type),
+                                },
+                            )
+                            .ok()?;
+                            SetOpResult::Encoded(wbuf.into_bytes())
+                        }
+                        Type::TupleType { items, .. } if items.len() == 1 => {
+                            // join.py:238-241: single-item TupleType ->
+                            // UnpackType(tuple[item]) if the item is
+                            // Instance(tuple); else Instance(tuple, [i]).
+                            if let Type::UnpackType { typ } = &items[0] {
+                                if let Type::Instance { type_ref: tr, .. } = typ.as_ref() {
+                                    if tr == "builtins.tuple" {
+                                        let mut wbuf = WriteBuffer::new();
+                                        wire::write_type(&mut wbuf, typ.as_ref()).ok()?;
+                                        return Some(SetOpResult::Encoded(wbuf.into_bytes()));
+                                    }
+                                }
+                            }
+                            let result = Type::Instance {
+                                type_ref: t_ref.to_string(),
+                                args: items.clone(),
+                                last_known_value: None,
+                                extra_attrs: None,
+                            };
+                            let mut wbuf = WriteBuffer::new();
+                            wire::write_type(&mut wbuf, &result).ok()?;
+                            SetOpResult::Encoded(wbuf.into_bytes())
+                        }
+                        _ => return None,
+                    }
+                } else {
+                    // Prefix/suffix split or multi-arg: defer.
+                    return None;
+                }
+            } else {
+                // join.py:241-290: non-variadic same-type with args.
+                visit_instance_with_args(t_ref, s_args, t_args, ctx, resolver)?
+            }
+        }
+    } else {
+        // join.py:292-300: different base types. Args-present defers
+        // (via_supertype needs expand_type_by_instance). Args-less
+        // runs the nominal walk.
+        if !t_args.is_empty() || !s_args.is_empty() {
+            return None;
+        }
+        let proper_ctx = SubtypeContext {
+            proper_subtype: true,
+            ..*ctx
+        };
+        // join.py:292-295: t <: s? -> join_instances_via_supertype(t, s).
+        // JoinResult::Left means the first arg (t) won -> SameT.
+        let t_is_subtype = is_subtype(t, s, &proper_ctx, resolver)?;
+        let result_ref = if t_is_subtype {
+            join_instances_nominal(t_ref, s_ref, ctx, resolver)?
+        } else {
+            join_instances_nominal(s_ref, t_ref, ctx, resolver)?
+        };
+        match result_ref {
+            JoinResult::Left => {
+                if t_is_subtype {
+                    SetOpResult::SameT
+                } else {
+                    SetOpResult::SameS
+                }
+            }
+            JoinResult::Ancestor(fullname) => SetOpResult::Ancestor(fullname),
+            JoinResult::Object => SetOpResult::Object,
+        }
+    };
+    Some(result)
+}
+
+/// `object_from_instance`-as-SetOpResult: the seen-guard fallback
+/// (join.py:210 `object_from_instance(t)`). Always the last MRO entry
+/// (`builtins.object` in a sane graph); the shim maps the fullname
+/// through the typeinfo map.
+fn object_from_instance_result(t_ref: &str, resolver: &TypeResolver) -> Option<SetOpResult> {
+    let snap = resolver.get(t_ref)?;
+    let fullname = snap.mro.last()?;
+    Some(SetOpResult::Ancestor(fullname.clone()))
+}
+
+/// `#[pyfunction]` entry for `join_instances` (join.py:208-303).
+///
+/// The Python-side shim (`mypy/join.py` `_try_native_join_instances`)
+/// calls this with serialized `t`/`s` Instance blobs plus the
+/// `NativeTypeResolver` pyclass and `strict_optional`. Returns `None`
+/// (Python `None`) when Rust doesn't handle the case;
+/// `Some((disc, fullname, arg_discs, encoded))` otherwise — the same
+/// `DiscriminatorOut` shape as `rust_join_types` (0=SameS, 1=SameT,
+/// 2=Object, 3=Bottom, 4=Any, 5=Ancestor, 6=SameTypeWithArgs,
+/// 7=Encoded).
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_join_instances(
+    t_bytes: &[u8],
+    s_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<DiscriminatorOut> {
+    let t = decode_type(t_bytes)?;
+    let s = decode_type(s_bytes)?;
+    let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
+    let mut seen: Vec<(String, Vec<u8>)> = Vec::new();
+    join_instances_core(&t, &s, &ctx, resolver.resolver(), &mut seen).map(discriminator)
+}
+
 /// `#[pyfunction]` entry for `join_tuples` (join.py:680-785).
 ///
 /// Joins two wire-format `TupleType` values, handling variadic entries
