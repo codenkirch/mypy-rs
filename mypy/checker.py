@@ -467,6 +467,7 @@ def _set_native_checker_stmts_active(active: bool) -> None:
 # #387: NativeTypeResolver shared with the checker narrowing kernel.
 # Installed/cleared per build by BuildManager.
 _native_checker_resolver: Any = None
+_checker_decode_count: list[int] = [0]
 
 
 def _set_native_checker_resolver(resolver: Any) -> None:
@@ -789,6 +790,7 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     """Decode wire bytes from the checker kernel, resolving type_ref to live
     TypeInfo via wirefixup. Mirrors erasetype._deserialize_type.
     """
+    _checker_decode_count[0] += 1
     from mypy.wirefixup import fixup_wire_type
 
     t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))

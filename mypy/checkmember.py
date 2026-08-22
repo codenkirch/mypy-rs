@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any, Final, TypeVar, cast
 
+import copy
+
 from mypy import message_registry, state
 from mypy.checker_shared import TypeCheckerSharedApi
 from mypy.erasetype import erase_typevars
@@ -200,6 +202,23 @@ _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
 }
 
 
+# bytes -> fixed Type cache for checkmember deserialize, split into
+# freeze/non-freeze pools: freeze callers (bind_self_fast and friends)
+# mutate CallableType.variables in place and share nothing with member path.
+_deser_caches: dict[bool, dict[bytes, Type]] = {False: {}, True: {}}
+_deser_cache_hits: dict[bool, list[int]] = {False: [0], True: [0]}
+_deser_cache_misses: dict[bool, list[int]] = {False: [0], True: [0]}
+
+
+def _clear_deser_cache() -> None:
+    for cache in _deser_caches.values():
+        cache.clear()
+    for hits in _deser_cache_hits.values():
+        hits[0] = 0
+    for misses in _deser_cache_misses.values():
+        misses[0] = 0
+
+
 def _serialize_type_for_checkmember(t: Type) -> bytes:
     key = id(t)
     if _wire_cache_enabled():
@@ -222,13 +241,28 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
     return result
 
 
-def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
+def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Type | None:
     """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
+    ``freeze`` selects the cache pool: callers that run
+    ``freeze_all_type_vars`` on the result (bind_self_fast and friends)
+    must not share objects with member-access callers, whose returned
+    non-frozen objects the freeze would mutate in place.
     """
     from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type, canonicalize_fresh_vars
+
+    _hits = _deser_cache_hits[freeze]
+    _dc = _deser_caches[freeze].get(data)
+    if _dc is not None:
+        _hits[0] += 1
+        # Shallow copy: callers mutate top-level line/column on the
+        # decoded object; identical bytes must not cross-contaminate
+        # call sites that apply different values.
+        return copy.copy(_dc)
+
+    _deser_cache_misses[freeze][0] += 1
 
     decoded = _checkmember_read_type(_CheckMemberReadBuffer(data))
     # Clear instance_cache primitives after read_type so NOT_READY
@@ -243,6 +277,8 @@ def _deserialize_type_for_checkmember(data: bytes) -> Type | None:
         # Wire round-trip loses fresh meta-var identity; re-unify
         # occurrences before returning (mirrors expandtype.py:463-467).
         fixed = canonicalize_fresh_vars(fixed)
+    if fixed is not None:
+        _deser_caches[freeze][data] = fixed
     return fixed
 
 
@@ -1391,7 +1427,7 @@ def expand_without_binding(
                     next_raw_id, changed, wire_bytes = result
                     if changed:
                         TypeVarId.next_raw_id = next_raw_id
-                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
                     if decoded is not None:
                         freeze_all_type_vars(decoded)
                         return _restore_definition(typ, decoded)
@@ -1445,7 +1481,7 @@ def expand_and_bind_callable(
                     next_raw_id, changed, wire_bytes = result
                     if changed:
                         TypeVarId.next_raw_id = next_raw_id
-                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
                     if decoded is not None:
                         freeze_all_type_vars(decoded)
                         return _restore_definition(functype, decoded)
@@ -1579,7 +1615,7 @@ def check_self_arg(
                 if changed:
                     from mypy.types import TypeVarId
                     TypeVarId.next_raw_id = next_raw_id
-                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
                 if decoded is not None:
                     if isinstance(decoded, ProperType):
                         decoded.line = context.line
@@ -2078,7 +2114,7 @@ def add_class_tvars(
                 next_raw_id, changed, wire_bytes = result
                 if changed:
                     TypeVarId.next_raw_id = next_raw_id
-                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes), freeze=True)
                 if decoded is not None:
                     freeze_all_type_vars(decoded)
                     return _restore_definition(t, decoded)

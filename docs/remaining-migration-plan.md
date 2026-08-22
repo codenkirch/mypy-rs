@@ -342,6 +342,35 @@ revert). The remaining ~2.1x type-check gap vs Python (29s native vs
 kernel-ported hot paths, not a single gate: toggling any one gate off
 kept type_check in the 94-253s range.
 
+Measured 2026-08-22 (same harness, fresh `.so`, cold cache): the
+isolated-seam differential (each gate toggled off via a temporary
+`EXPERIMENT_NO_*` env switch in `build.py`, one self-check per toggle,
+exit=1 due to hard-exit patch on 3.14, stats still valid):
+
+- Python baseline (kernel off): type_check 13.07s, semanal 3.96s.
+- Native full: type_check 27.10s, semanal 6.65s.
+- `EXPERIMENT_NO_CHECKMEMBER`: 23.68s (-3.4s).
+- `EXPERIMENT_NO_CHECKEXPR`: 24.51s (-2.6s).
+- `EXPERIMENT_NO_TYPEOPS`: 26.50s (-0.6s).
+- subtype/join/expand/map/solve/constraints/checker/checkcall: ~0.
+- All checker gates off: 19.35s (semanal unchanged 6.67s).
+- All 28 extra gates off too (`EXPERIMENT_NO_ALL_EXTRA`): type_check
+  17.78s, semanal 4.06s (semanal gap fully explained by the semanal /
+  semanal_visitor seams, ~2.6s).
+
+Conclusion: with *every* seam off, type_check still runs +4.7s over
+Python (17.78 vs 13.07). Measured components of that residual:
+`_build_native_resolvers` walk+update+mapfill totals 2.0s across 537
+SCC calls (max 12ms), `fixup_wire_type` only 3ms. The remaining ~2.7s
+is wire serialize/deserialize invoked by the Python-side callers even
+when no Rust seam decides. So the native kernel is net slower on
+self-check not because of any single port, but because resolver
+snapshot upkeep (2.0s) plus residual wire traffic (~2.7s) outweigh the
+per-call Rust savings. Fix direction: make `_build_native_resolvers`
+incremental across SCCs (only update newly-seen TypeInfos, not the
+full 537x walk), and cut residual wire traffic in the not-seam-gated
+Python callers.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):

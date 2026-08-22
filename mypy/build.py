@@ -907,6 +907,9 @@ class BuildManager:
 
         _clear_type_wire_cache()
         _set_type_wire_cache_enabled(False)
+        from mypy.checkmember import _clear_deser_cache
+
+        _clear_deser_cache()
         # Propagate the type-kernel gate to the erasetype module flag, which
         # the hot-path `erase_type()` reads without an options lookup per call.
         from mypy.erasetype import _set_native_erase_active
@@ -1383,16 +1386,25 @@ class BuildManager:
         aliases = self._collect_aliases()
         if self._native_resolver is None:
             resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+            # Grow the accumulated fullname -> TypeInfo map with this
+            # call's infos. First call: everything is new.
+            for info in type_infos:
+                self._native_typeinfo_map[info.fullname] = info
         else:
             resolver = self._native_resolver
-            resolver.update(type_infos, aliases)
-        # Grow the accumulated fullname -> TypeInfo map with this call's
-        # (already-seen + new) infos. Overwriting with the same stable
-        # TypeInfo objects is a no-op for the new entries; the deletions
-
-        # the daemon needs are handled by `_clear_native_resolvers`.
-        for info in type_infos:
-            self._native_typeinfo_map[info.fullname] = info
+            # Feed `update` only fullnames not yet snapshotted, plus
+            # `builtins.*` (re-snapshotted every call: promotion lists
+            # grow). The Rust `update` skips seen fullnames.
+            new_infos: list[TypeInfo] = []
+            pending: list[TypeInfo] = []
+            for info in type_infos:
+                if info.fullname not in self._native_typeinfo_map:
+                    new_infos.append(info)
+                    pending.append(info)
+                    self._native_typeinfo_map[info.fullname] = info
+                elif info.fullname.startswith("builtins."):
+                    pending.append(info)
+            resolver.update(pending, aliases)
         self._native_resolver = resolver
         typeinfo_map = self._native_typeinfo_map
         # Stage 3c resolvers wired: the subtype/join kernels now defer
@@ -1489,6 +1501,12 @@ class BuildManager:
             return
         self._native_resolver = None
         self._native_typeinfo_map = {}
+        # The accumulated typeinfo map is re-created for the new build;
+        # wire decodes resolved against the old map must not survive.
+        # Cleared here (per-manager reset), not by the per-SCC None reset.
+        from mypy.checkmember import _clear_deser_cache
+
+        _clear_deser_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
@@ -1564,6 +1582,17 @@ class BuildManager:
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
+            from mypy.checkmember import (
+                _deser_cache_hits,
+                _deser_cache_misses,
+            )
+            from mypy.checker import _checker_decode_count
+
+            for freeze, hits in _deser_cache_hits.items():
+                self.stats[f"deser_cache_hits_{freeze}"] = hits[0]
+            for freeze, misses in _deser_cache_misses.items():
+                self.stats[f"deser_cache_misses_{freeze}"] = misses[0]
+            self.stats["checker_decodes"] = _checker_decode_count[0]
             lines = ["Stats:"]
             for key, value in sorted(self.stats_summary().items()):
                 fmt = ".3f" if isinstance(value, float) else "d"
