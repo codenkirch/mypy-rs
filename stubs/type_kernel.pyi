@@ -68,6 +68,7 @@ __all__ = [
     "rust_trivial_join",
     "rust_trivial_meet",
     "rust_join_types",
+    "rust_join_instances",
     "rust_meet_types",
     "rust_object_or_any_from_type",
     "rust_combine_similar_callables",
@@ -468,6 +469,9 @@ def rust_trivial_meet(
 ) -> int | None: ...
 def rust_join_types(
     left: bytes, right: bytes, strict_optional: bool, resolver: NativeTypeResolver
+) -> tuple[int, str | None, list[int], bytes] | None: ...
+def rust_join_instances(
+    t: bytes, s: bytes, strict_optional: bool, resolver: NativeTypeResolver
 ) -> tuple[int, str | None, list[int], bytes] | None: ...
 def rust_meet_types(
     left: bytes, right: bytes, strict_optional: bool, resolver: NativeTypeResolver
