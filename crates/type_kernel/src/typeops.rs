@@ -1213,9 +1213,15 @@ fn fill_typevars_with_any_inner(py: Python<'_>, typ: &PyAny) -> Option<Type> {
     }
     let bytes = serialize_type_to_bytes(py, tt)?;
     let tuple = decode_type(&bytes)?;
-    let erased =
-        crate::erase_typevars::erase_typevars_inner(&tuple, Some(&ids), &any_type(TYPE_OF_ANY_SPECIAL_FORM))?;
-    let Type::TupleType { items, implicit, .. } = tuple else {
+    let erased = crate::erase_typevars::erase_typevars_inner(
+        &tuple,
+        Some(&ids),
+        &any_type(TYPE_OF_ANY_SPECIAL_FORM),
+    )?;
+    let Type::TupleType {
+        items, implicit, ..
+    } = tuple
+    else {
         return None;
     };
     if matches!(erased, Type::TupleType { .. }) {
