@@ -371,6 +371,23 @@ incremental across SCCs (only update newly-seen TypeInfos, not the
 full 537x walk), and cut residual wire traffic in the not-seam-gated
 Python callers.
 
+Fix outcome (2026-08-22, commit ce350b626): both measured costs are
+now cut. `_build_native_resolvers` feeds `update` only new + `builtins.*`
+fullnames and mapfills only new infos (per-call cost now ~0.011s max,
+was up to 12ms per call across 537 calls); `_deserialize_type_for_checkmember`
+gained a bytes -> Type cache split into freeze/non-freeze pools
+(invalidated on wire-map identity swap + per build). The checker
+`_deserialize_type_from_checker` gained the same bytes -> template cache
+(shallow-copied per call; safe because `_TypeRefFixer` rebuilds and
+clears `type_ref`, so the in-place `TypeFixer` at
+`try_handler_union_decoded` never corrupts the template). Deser cache
+counters surfaced in `--dump-build-stats` show ~128k hits vs ~12k
+misses on self-check. Parity stayed green: testtypes 1031 passed,
+testcheck 8151 passed. Self-check type_check remains net-negative (~
+30s native vs 16s python), so further wins must come from the residual
+wire serialize/deserialize in Python-side callers and the semanal
+seams, not the resolver upkeep.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):

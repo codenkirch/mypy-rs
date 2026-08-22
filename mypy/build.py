@@ -908,8 +908,10 @@ class BuildManager:
         _clear_type_wire_cache()
         _set_type_wire_cache_enabled(False)
         from mypy.checkmember import _clear_deser_cache
+        from mypy.checker import _clear_checker_deser_cache
 
         _clear_deser_cache()
+        _clear_checker_deser_cache()
         # Propagate the type-kernel gate to the erasetype module flag, which
         # the hot-path `erase_type()` reads without an options lookup per call.
         from mypy.erasetype import _set_native_erase_active
@@ -1505,8 +1507,10 @@ class BuildManager:
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
         from mypy.checkmember import _clear_deser_cache
+        from mypy.checker import _clear_checker_deser_cache
 
         _clear_deser_cache()
+        _clear_checker_deser_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
