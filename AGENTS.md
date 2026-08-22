@@ -406,6 +406,23 @@ including:
   `NativeJoinInstancesSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential across the handled paths, plus a direct seam
   call and a pre-seeded `seen_instances` recursion-guard test).
+- `rust_function_type` / `rust_callable_type` (issue #747) — mirrors
+  `mypy.typeops.function_type` (typeops.py:1422-1482) and
+  `mypy.typeops.callable_type` (typeops.py:1485-1509). The
+  `function_type` seam classifies the node (typed passthrough,
+  broken-overload dummy, or FuncItem self-binding) and the
+  `callable_type` seam builds the `CallableType` from a live `FuncItem`
+  (`arg_names`/`arg_kinds`/`info`/`has_self_or_cls_argument`/`is_class`,
+  plus an optional serialized `ret_type`). For the self-binding arm Rust
+  rebuilds the args via `fill_typevars_inner` and wraps the first in
+  `TypeType` for classmethods/`__new__`. FuncDef and LambdaExpr callers
+  both restore the non-wire line/column/name/definition via
+  `copy_modified`. The checkexpr lambda callback
+  (`checkexpr.py:visit_lambda_expr`) gates on `_native_checkexpr_active`
+  and defers on wire decode or fixup failure. Covered by
+  `NativeFunctionTypeSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential on `str()`/line/column/definition plus direct seam
+  calls proving engagement, including a lambda-with-`ret_type` case).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

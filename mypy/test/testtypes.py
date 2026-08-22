@@ -5384,6 +5384,41 @@ class NativeFunctionTypeSuite(Suite):
         finally:
             self._set_active(True)
 
+    def test_lambda_expr_callable_type(self) -> None:
+        # LambdaExpr is a FuncItem with no .type; the checkexpr lambda
+        # caller passes an explicit ret_type. rust_callable_type must
+        # mirror `callable_type` including the ret_type substitution.
+        from mypy.nodes import Block, LambdaExpr, ReturnStmt
+
+        lam_body = Block([ReturnStmt(NameExpr("x"))])
+        lam = LambdaExpr(
+            arguments=[],
+            body=lam_body,
+            typ=None,
+        )
+        lam.arg_names = ["x"]
+        lam.arg_kinds = [ARG_POS]
+        # lambda (x): x with info unset -> all-Any args; ret_type = fx.a.
+        lam.line = 5
+        lam.column = 7
+        from mypy.typeops import callable_type
+
+        off = self._with_gate(False, lambda: callable_type(lam, self.fx.function, self.fx.a))
+        on = self._with_gate(True, lambda: callable_type(lam, self.fx.function, self.fx.a))
+        assert_equal(str(on), str(off), "callable_type(lambda) str parity")
+        assert_equal(on.line, off.line, "callable_type(lambda) line parity")
+        assert_equal(on.column, off.column, "callable_type(lambda) column parity")
+        assert_equal(on.implicit, off.implicit, "callable_type(lambda) implicit parity")
+        assert_equal(on.name, "<lambda>", "callable_type(lambda) uses LAMBDA_NAME")
+        assert_equal(str(on.ret_type), str(self.fx.a), "callable_type(lambda) ret_type")
+        # Direct seam call proves native engagement for the lambda path.
+        from mypy.typeops import _serialize_type
+
+        result = _type_kernel.rust_callable_type(
+            lam, _serialize_type(self.fx.function), _serialize_type(self.fx.a)
+        )
+        assert result is not None, "Rust callable_type did not engage for lambda"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
