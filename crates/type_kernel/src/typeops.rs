@@ -15,6 +15,8 @@
 //! call behind `Options.native_type_kernel`. `None` means "Rust doesn't handle
 //! this, let Python decide".
 
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 use pyo3::IntoPy;
@@ -37,6 +39,8 @@ const ARG_STAR2: i64 = 4;
 const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
 /// `TypeOfAny.from_error` = 5 (types.py:293).
 const TYPE_OF_ANY_FROM_ERROR: i64 = 5;
+/// `TypeOfAny.special_form` = 6 (types.py:297).
+const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
 
 // ---------------------------------------------------------------------------
 // Wire codec helpers
@@ -1143,6 +1147,99 @@ fn fill_typevars_inner(py: Python<'_>, typ: &PyAny) -> Option<Type> {
 #[pyfunction]
 pub(crate) fn rust_fill_typevars(py: Python<'_>, typ: &PyAny) -> Option<Vec<u8>> {
     let t = fill_typevars_inner(py, typ)?;
+    encode_type(&t)
+}
+
+/// `mypy.typevars.fill_typevars_with_any` (typevars.py:129-138): build the
+/// class instance type with every type parameter replaced by
+/// `AnyType(special_form)`. For very large generics this avoids building the
+/// full tvar objects in Python; the result Instance carries only Anys.
+///
+/// Mirrors the Python body (`erased_vars`, typevartuples.py:28-36):
+/// * `TypeVarType` / `ParamSpecType` erasure is a plain `AnyType`.
+/// * `TypeVarTupleType` erasure needs `tuple_fallback.copy_modified(args=[Any])`
+///   wrapped in `UnpackType`, which needs the live `tuple_fallback` TypeInfo;
+///   this port defers (`None`) on that kind.
+/// * A meta `TypeVarId` (`raw_id < 0`, types.py:495-504) is deferred the same
+///   way the sibling `rust_fill_typevars` treats it.
+/// * The `tuple_type` erasure runs through `erase_typevars_inner` with the
+///   tvar-id set; any case that visitor cannot decide (TypeAlias/UnboundType,
+///   named-tuple unpack normalization) propagates the defer. Python's
+///   `copy_modified(fallback=inst)` only fires when the erased tuple is still
+///   a `TupleType`; the visitor's `Tuple[*Ts] -> tuple[X, ...]` normalization
+///   to an Instance matches that predicate exactly.
+fn fill_typevars_with_any_inner(py: Python<'_>, typ: &PyAny) -> Option<Type> {
+    let type_ref: String = typ.getattr("fullname").ok()?.extract().ok()?;
+    let defn = typ.getattr("defn").ok()?;
+    let tvars = defn
+        .getattr("type_vars")
+        .ok()?
+        .downcast::<pyo3::types::PyList>()
+        .ok()?;
+    let mut args = Vec::with_capacity(tvars.len());
+    // Ids of the class's own type parameters, for the tuple_type erasure
+    // (mirrors `tv.id for tv in typ.defn.type_vars}`).
+    let mut ids: HashSet<(i64, String)> = HashSet::with_capacity(tvars.len());
+    for item in tvars.iter() {
+        let id = item.getattr("id").ok()?;
+        let raw_id: i64 = id.getattr("raw_id").and_then(|v| v.extract()).ok()?;
+        let namespace: String = id.getattr("namespace").and_then(|v| v.extract()).ok()?;
+        if raw_id < 0 {
+            // Meta type variable: erasure is inference-dependent, defer.
+            return None;
+        }
+        ids.insert((raw_id, namespace));
+        match item.get_type().name().unwrap_or("").to_string().as_str() {
+            // TypeVarType / ParamSpecType erasure is a plain AnyType
+            // (erased_vars, typevartuples.py:28-36).
+            "TypeVarType" | "ParamSpecType" => args.push(any_type(TYPE_OF_ANY_SPECIAL_FORM)),
+            // TypeVarTupleType erasure needs the live tuple_fallback
+            // TypeInfo for `UnpackType(copy_modified(args=[Any]))`; defer.
+            _ => return None,
+        }
+    }
+    let inst = Type::Instance {
+        type_ref,
+        args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    // `typ.tuple_type` present: rebuild the tuple with `inst` as its
+    // (partial) fallback, but only when the erased tuple is still a
+    // TupleType (typevars.py:132-138).
+    let tt = typ.getattr("tuple_type").ok()?;
+    if tt.is_none() {
+        return Some(inst);
+    }
+    let bytes = serialize_type_to_bytes(py, tt)?;
+    let tuple = decode_type(&bytes)?;
+    let erased = crate::erase_typevars::erase_typevars_inner(
+        &tuple,
+        Some(&ids),
+        &any_type(TYPE_OF_ANY_SPECIAL_FORM),
+    )?;
+    let Type::TupleType {
+        items, implicit, ..
+    } = tuple
+    else {
+        return None;
+    };
+    if matches!(erased, Type::TupleType { .. }) {
+        return Some(Type::TupleType {
+            partial_fallback: Box::new(inst),
+            items,
+            implicit,
+        });
+    }
+    Some(inst)
+}
+
+/// `#[pyfunction]` entry for `fill_typevars_with_any` (typevars.py:129-138).
+/// Takes the live `TypeInfo`, returns encoded `Instance`/`TupleType` bytes
+/// or `None` (defer to Python).
+#[pyfunction]
+pub(crate) fn rust_fill_typevars_with_any(py: Python<'_>, typ: &PyAny) -> Option<Vec<u8>> {
+    let t = fill_typevars_with_any_inner(py, typ)?;
     encode_type(&t)
 }
 
