@@ -128,6 +128,23 @@ def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
 
 def fill_typevars_with_any(typ: TypeInfo) -> Instance | TupleType:
     """Apply a correct number of Any's as type arguments to a type."""
+    # Native seam: Rust builds the erased Instance (and the named-tuple
+    # variant) on the live `typ`; a decoded TupleType proves Rust ran the
+    # tuple-erasure predicate, so its fallback carries the erased args.
+    if _HAS_TYPE_KERNEL and _native_typevars_active:
+        try:
+            result = _type_kernel.rust_fill_typevars_with_any(typ)
+            if result is not None:
+                decoded = _native_decode_well_formed(bytes(result))
+                if decoded is not None:
+                    if isinstance(decoded, TupleType):
+                        inst = Instance(typ, decoded.partial_fallback.args)
+                        if typ.tuple_type is not None:
+                            return typ.tuple_type.copy_modified(fallback=inst)
+                    elif isinstance(decoded, Instance):
+                        return Instance(typ, decoded.args)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     inst = Instance(typ, erased_vars(typ.defn.type_vars, TypeOfAny.special_form))
     if typ.tuple_type is None:
         return inst
