@@ -18,7 +18,9 @@ use pyo3::prelude::*;
 
 use crate::subtypes::map_instance_to_supertype as subtypes_map;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{
+    read_type, read_type_list, write_type, write_type_list, ReadBuffer, Type, WriteBuffer,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -112,6 +114,19 @@ pub(crate) fn rust_class_derivation_paths(
     Ok(result)
 }
 
+/// Decode a LIST_GEN-wrapped wire list of types, returning the items.
+fn decode_type_list(bytes: &[u8]) -> Option<Vec<Type>> {
+    let mut buf = ReadBuffer::new(bytes);
+    read_type_list(&mut buf).ok()
+}
+
+/// Encode a LIST_GEN-wrapped wire list of types.
+fn encode_type_list(items: &[Type]) -> Option<Vec<u8>> {
+    let mut buf = WriteBuffer::new();
+    write_type_list(&mut buf, items).ok()?;
+    Some(buf.into_bytes())
+}
+
 // ---------------------------------------------------------------------------
 // 2. rust_map_instance_to_supertype — single supertype mapping
 // ---------------------------------------------------------------------------
@@ -173,6 +188,91 @@ pub(crate) fn rust_map_instance_to_supertype(
     } else {
         Ok(None)
     }
+}
+
+// ---------------------------------------------------------------------------
+// 2b. rust_map_instance_to_supertypes — whole per-member loop
+// ---------------------------------------------------------------------------
+
+/// Whole per-member loop of `mypy/maptype.py:map_instance_to_supertypes`
+/// (maptype.py:179-196).
+///
+/// `items_wire` is a LIST_GEN wire list of member types (the frontier
+/// `types` list of `map_instance_to_supertypes`). For each member, applies
+/// the supertype mapping via the type map
+/// (`subtypes::map_instance_to_supertype`, mirroring
+/// `map_instance_to_supertype(instance, superclass)`) and collects the
+/// mapped result wire-encoded.
+///
+/// Each member carries its own frame (its `type_ref` and args): in a
+/// multi-level derivation path the frontier after the first step holds
+/// intermediate base instances whose typevars are bound to their *own*
+/// frame, so the member's own `type_ref`/`args` are the correct `left`
+/// side of the mapping (the original `instance` is only the first member).
+///
+/// Returns `Ok(Some((encoded_results, flags)))` where `encoded_results`
+/// is a LIST_GEN wire list of wire-encoded `Instance` blobs for the
+/// members Rust mapped, and `flags` is a parallel `Vec<bool>` over the
+/// INPUT members (true = mapped, false = deferred so the shim re-runs
+/// that member individually in Python). Also returns `Some` (empty
+/// results, all flags false) when the whole list must defer, but `None`
+/// when the input cannot be decoded at all (the shim falls through to the
+/// pure-Python loop).
+///
+/// Each member is mapped independently so a single unsupported member
+/// (TypeAlias, definition-carrying Callable, ParamSpec-carrying instance,
+/// variadic) defers only itself; supported members still engage.
+/// TypeVarTuple/TypeVarTuple-carrying frames defer through
+/// `subtypes_map`'s own guards.
+#[pyfunction]
+pub(crate) fn rust_map_instance_to_supertypes(
+    resolver: &NativeTypeResolver,
+    items_wire: Vec<u8>,
+    supertype_ref: String,
+) -> PyResult<Option<(Vec<u8>, Vec<bool>)>> {
+    let items = match decode_type_list(&items_wire) {
+        Some(items) => items,
+        None => return Ok(None),
+    };
+    let mut results: Vec<Type> = Vec::with_capacity(items.len());
+    let mut flags: Vec<bool> = Vec::with_capacity(items.len());
+    for item in &items {
+        let Type::Instance {
+            type_ref: member_ref,
+            args,
+            ..
+        } = item
+        else {
+            // Non-Instance member (e.g. a CallableType / TypeAliasType /
+            // ParamSpec member): Python re-runs it individually.
+            flags.push(false);
+            continue;
+        };
+        if let Some(mapped_args) =
+            subtypes_map(member_ref, args, &supertype_ref, resolver.resolver())
+        {
+            let inst = Type::Instance {
+                type_ref: supertype_ref.clone(),
+                args: mapped_args,
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            results.push(inst);
+            flags.push(true);
+        } else {
+            // Mapping failed: Python re-runs this member.
+            flags.push(false);
+        }
+    }
+    if results.is_empty() {
+        // Nothing mapped; the shim re-runs the whole list in Python.
+        return Ok(Some((Vec::new(), flags)));
+    }
+    let encoded = match encode_type_list(&results) {
+        Some(encoded) => encoded,
+        None => return Ok(None),
+    };
+    Ok(Some((encoded, flags)))
 }
 
 // ---------------------------------------------------------------------------
@@ -239,5 +339,155 @@ pub(crate) fn rust_map_instance_to_direct_supertypes(
         Ok(None)
     } else {
         Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    fn snapshot(fullname: &str, bases: Vec<Type>) -> TypeInfoSnapshot {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.rsplit('.').next().unwrap_or(fullname).to_string(),
+            type_vars: vec!["T".to_string()],
+            ..Default::default()
+        };
+        s.bases = bases.iter().map(|b| encode_type(b).unwrap()).collect();
+        s
+    }
+
+    fn inst(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn tvar(namespace: &str, raw_id: i64) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: namespace.to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            values: vec![],
+            upper_bound: Box::new(inst("builtins.object", vec![])),
+            default: Box::new(inst("builtins.object", vec![])),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn map_loop(
+        items: Vec<Type>,
+        supertype_ref: &str,
+        resolver: &TypeResolver,
+    ) -> Option<(Vec<Type>, Vec<bool>)> {
+        let items_wire = encode_type_list(&items).unwrap();
+        let mut buf = ReadBuffer::new(&items_wire);
+        let decoded = read_type_list(&mut buf).ok()?;
+        let mut results = Vec::new();
+        let mut flags = Vec::new();
+        for item in &decoded {
+            let Type::Instance { type_ref, args, .. } = item else {
+                flags.push(false);
+                continue;
+            };
+            if let Some(mapped) = subtypes_map(type_ref, args, supertype_ref, resolver) {
+                results.push(inst(supertype_ref, mapped));
+                flags.push(true);
+            } else {
+                flags.push(false);
+            }
+        }
+        Some((results, flags))
+    }
+
+    #[test]
+    fn per_member_loop_maps_direct_base() {
+        // class B(A[T]); B[T`1]. Members map B->A via the class tvar.
+        let b = snapshot("m.B", vec![inst("m.A", vec![tvar("m.B", 1)])]);
+        let mut resolver = TypeResolver::new();
+        resolver.insert("m.B".to_string(), b);
+        resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
+        let items = vec![inst("m.B", vec![inst("m.X", vec![])])];
+        let (results, flags) = map_loop(items, "m.A", &resolver).unwrap();
+        assert_eq!(flags, vec![true]);
+        assert_eq!(results, vec![inst("m.A", vec![inst("m.X", vec![])])]);
+    }
+
+    #[test]
+    fn per_member_loop_maps_each_member_in_own_frame() {
+        // Two members, each in its own frame (multi-level path frontier).
+        let b = snapshot("m.B", vec![inst("m.A", vec![tvar("m.B", 1)])]);
+        let mut resolver = TypeResolver::new();
+        resolver.insert("m.B".to_string(), b);
+        resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
+        let items = vec![
+            inst("m.B", vec![inst("m.X", vec![])]),
+            inst("m.B", vec![inst("m.Y", vec![])]),
+        ];
+        let (results, flags) = map_loop(items, "m.A", &resolver).unwrap();
+        assert_eq!(flags, vec![true, true]);
+        assert_eq!(
+            results,
+            vec![
+                inst("m.A", vec![inst("m.X", vec![])]),
+                inst("m.A", vec![inst("m.Y", vec![])]),
+            ]
+        );
+    }
+
+    #[test]
+    fn per_member_loop_defers_non_instance_member_only() {
+        // A Callable member (e.g. a definition-carrying callable) defers
+        // itself; the Instance member still maps.
+        let b = snapshot("m.B", vec![inst("m.A", vec![tvar("m.B", 1)])]);
+        let mut resolver = TypeResolver::new();
+        resolver.insert("m.B".to_string(), b);
+        resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
+        let items_wire = encode_type_list(&[
+            inst("m.B", vec![inst("m.X", vec![])]),
+            Type::CallableType {
+                fallback: Box::new(inst("builtins.function", vec![])),
+                instance_type: None,
+                is_ellipsis_args: false,
+                implicit: false,
+                is_bound: false,
+                from_concatenate: false,
+                imprecise_arg_kinds: false,
+                unpack_kwargs: false,
+                from_type_type: false,
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                ret_type: Box::new(inst("m.X", vec![])),
+                name: None,
+                variables: vec![],
+                type_guard: None,
+                type_is: None,
+            },
+        ])
+        .unwrap();
+        let mut buf = ReadBuffer::new(&items_wire);
+        let decoded = read_type_list(&mut buf).unwrap();
+        let (results, flags) = map_loop(decoded, "m.A", &resolver).unwrap();
+        assert_eq!(flags, vec![true, false]);
+        assert_eq!(results, vec![inst("m.A", vec![inst("m.X", vec![])])]);
+    }
+
+    #[test]
+    fn per_member_loop_all_defer_returns_empty() {
+        // No member maps (missing base): results empty, all flags false
+        // (the shim re-runs the whole list in Python).
+        let mut resolver = TypeResolver::new();
+        resolver.insert("m.A".to_string(), snapshot("m.A", vec![]));
+        let items = vec![inst("m.B", vec![inst("m.X", vec![])])];
+        let (results, flags) = map_loop(items, "m.A", &resolver).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(flags, vec![false]);
     }
 }
