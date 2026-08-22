@@ -78,6 +78,195 @@ pub(crate) fn rust_freshen_function_type_vars(
     }
 }
 
+/// `id_rewrite` (join.py:1142-1148): per-pair id-rewrite on a callable's
+/// declared type variables, mirroring `update_callable_ids[:the body]`
+/// (join.py:1142-1150). The fixture variables (`vars`) and the `expanded`
+/// result are assembled by the caller (`update_callable_ids_core`).
+fn id_rewrite(expanded: Type, new_vars: Vec<Type>) -> Type {
+    match expanded {
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            from_type_type,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables: _,
+            type_guard,
+            type_is,
+        } => Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            from_type_type,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables: new_vars,
+            type_guard,
+            type_is,
+        },
+        _ => unreachable!("id_rewrite: non-CallableType"),
+    }
+}
+
+/// Fresh id holders + `expand_type(c, tv_map)`, the two halves of
+/// `update_callable_ids` (join.py:1142-1150).
+///
+/// `base` is the callable's declared `variables` (the reader's snapshot),
+/// `operand` the full callable (`&Type::CallableType`). Returns
+/// `(expanded, new_vars)`. Defers on variants the expand path cannot
+/// handle (ParamSpec vars, is_bound, Unpack args) so the caller falls
+/// through to Python.
+fn update_callable_ids_core(
+    base: &[Type],
+    operand: &Type,
+    new_ids: &[(i64, i64)],
+) -> Option<(Type, Vec<Type>)> {
+    // The exchange map mirrors the env byte layout consumed by
+    // `decode_env` (expandtype.rs): each entry is
+    // (raw_id, meta_level, namespace, Type).
+    let mut tvmap: HashMap<EnvKey, Type> = HashMap::with_capacity(base.len());
+    let mut new_vars: Vec<Type> = Vec::with_capacity(base.len());
+    for (v, (raw_id, _meta_level)) in base.iter().zip(new_ids.iter()) {
+        if !matches!(v, Type::TypeVarType { .. }) {
+            return None;
+        }
+        let Type::TypeVarType {
+            raw_id: old_raw_id,
+            meta_level: old_meta_level,
+            namespace,
+            ..
+        } = v
+        else {
+            unreachable!("TypeVarType matched above");
+        };
+        let old_key = (*old_raw_id, *old_meta_level, namespace.clone());
+        let fresh = set_typevar_id(v.clone(), *raw_id);
+        tvmap.insert(old_key, fresh.clone());
+        new_vars.push(fresh);
+    }
+    let expanded = expand_type_inner(operand, &tvmap, false)?;
+    Some((expanded, new_vars))
+}
+
+/// Set a TypeVarType's `raw_id` to the fresh `TypeVarId.new(meta_level=0)`
+/// id (join.py:1110-1120). `copy_modified(id=...)` replaces the whole id,
+/// so the fresh id's namespace (`""`) and meta_level (0) win over the old
+/// id's. Mirrors `TypeVarLikeType.copy_modified(id=...)`.
+fn set_typevar_id(t: Type, raw_id: i64) -> Type {
+    match t {
+        Type::TypeVarType {
+            name,
+            fullname,
+            raw_id: _,
+            namespace: _,
+            values,
+            upper_bound,
+            default,
+            variance,
+            meta_level: _,
+        } => Type::TypeVarType {
+            name,
+            fullname,
+            raw_id,
+            namespace: String::new(),
+            values,
+            upper_bound,
+            default,
+            variance,
+            meta_level: 0,
+        },
+        _ => unreachable!("set_typevar_id: non-TypeVarType"),
+    }
+}
+
+/// `#[pyfunction]` entry for `rust_match_generic_callables` (the
+/// `match_generic_callables` id-renumbering used before joining/meeting
+/// similar callables, join.py:1110-1120).
+///
+/// `num_vars` = `max(len(t.variables), len(s.variables))`: one shared
+/// batch of fresh `TypeVarId.new(meta_level=0)` ids is allocated and
+/// passed to BOTH operands (join.py:1117-1120 allocates a single
+/// `new_ids` list shared by both `update_callable_ids` calls), so the
+/// renumbered operands share one id space. `start_raw_id` is the current
+/// `TypeVarId.next_raw_id`.
+///
+/// Returns `(next_raw_id, t_wire, s_wire)`: the advanced
+/// `TypeVarId.next_raw_id` and the two rewired callables (each the
+/// `expand_type(c, tv_map)` result, re-`variables`-ed).
+/// `None` (Python `None`) defers the whole call to the pure-Python body.
+#[pyfunction]
+#[allow(clippy::type_complexity)]
+pub(crate) fn rust_match_generic_callables(
+    num_vars: usize,
+    start_raw_id: i64,
+    t_bytes: &[u8],
+    s_bytes: &[u8],
+) -> PyResult<Option<(i64, Vec<u8>, Vec<u8>)>> {
+    if num_vars == 0 {
+        return Ok(None);
+    }
+    let (t, s) = match (
+        read_type(&mut ReadBuffer::new(t_bytes), None),
+        read_type(&mut ReadBuffer::new(s_bytes), None),
+    ) {
+        (Ok(t), Ok(s)) => (t, s),
+        _ => return Ok(None),
+    };
+    let (
+        Type::CallableType {
+            variables: t_vars, ..
+        },
+        Type::CallableType {
+            variables: s_vars, ..
+        },
+    ) = (&t, &s)
+    else {
+        return Ok(None);
+    };
+    let mut new_ids: Vec<(i64, i64)> = Vec::with_capacity(num_vars);
+    let mut next_raw_id = start_raw_id;
+    for _ in 0..num_vars {
+        // match_generic_callables allocates `TypeVarId.new(meta_level=0)`
+        // (join.py:1117), so the fresh ids carry meta_level 0.
+        new_ids.push((next_raw_id, 0));
+        next_raw_id += 1;
+    }
+    let (t_expanded, t_vars_out) = match update_callable_ids_core(t_vars, &t, &new_ids) {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+    let (s_expanded, s_vars_out) = match update_callable_ids_core(s_vars, &s, &new_ids) {
+        Some(pair) => pair,
+        None => return Ok(None),
+    };
+    let t_wire = match encode_type(&id_rewrite(t_expanded, t_vars_out)) {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    let s_wire = match encode_type(&id_rewrite(s_expanded, s_vars_out)) {
+        Some(w) => w,
+        None => return Ok(None),
+    };
+    Ok(Some((next_raw_id, t_wire, s_wire)))
+}
+
 /// Mirror `freshen_function_type_vars` (expandtype.py:413-432) on the
 /// wire `Type` graph. The input comes from a wire round-trip, so every
 /// node is already proper. Fresh ids are allocated from `next_raw_id` and
@@ -549,4 +738,184 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     let mut wbuf = WriteBuffer::new();
     write_type(&mut wbuf, typ).ok()?;
     Some(wbuf.into_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A generic callable `def f(tv: tv) -> tv`, mirroring
+    /// `NativeJoinCallableIdsSuite._generic`.
+    fn generic(t: &Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![t.clone()],
+            arg_kinds: vec![1], // ARG_POS
+            arg_names: vec![None],
+            ret_type: Box::new(t.clone()),
+            name: None,
+            variables: vec![t.clone()],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn tvar(name: &str, raw_id: i64, meta_level: i64) -> Type {
+        Type::TypeVarType {
+            name: name.to_string(),
+            fullname: name.to_string(),
+            raw_id,
+            namespace: String::new(),
+            values: Vec::new(),
+            upper_bound: Box::new(Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 4, // from_omitted_generics
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level,
+        }
+    }
+
+    fn decode(bytes: &[u8]) -> Type {
+        read_type(&mut ReadBuffer::new(bytes), None).expect("valid wire type")
+    }
+
+    #[test]
+    fn renumbers_shared_batch() {
+        // Both operands must share the same fresh ids (join.py:1117-1120).
+        let t = generic(&tvar("T", 1, 0));
+        let s = generic(&tvar("U", 2, 0));
+        let (next, t_wire, s_wire) = rust_match_generic_callables(
+            1,
+            100,
+            &encode_type(&t).unwrap(),
+            &encode_type(&s).unwrap(),
+        )
+        .unwrap()
+        .expect("engages");
+        assert_eq!(next, 101);
+        let t_out = decode(&t_wire);
+        let s_out = decode(&s_wire);
+        let Type::CallableType {
+            variables: t_vars, ..
+        } = &t_out
+        else {
+            panic!()
+        };
+        let Type::CallableType {
+            variables: s_vars, ..
+        } = &s_out
+        else {
+            panic!()
+        };
+        // Both first variables get the same fresh id.
+        assert_eq!(t_vars[0], tvar("T", 100, 0));
+        assert_eq!(s_vars[0], tvar("U", 100, 0));
+    }
+
+    #[test]
+    fn renumbers_mixed_arity() {
+        // t: [T], s: [U, V]. Shared batch of 2: T -> id A, U -> id A,
+        // V -> id A+1.
+        let t = generic(&tvar("T", 1, 0));
+        let s = Type::CallableType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.function".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![tvar("U", 2, 0), tvar("V", 3, 0)],
+            arg_kinds: vec![1, 1],
+            arg_names: vec![None, None],
+            ret_type: Box::new(tvar("U", 2, 0)),
+            name: None,
+            variables: vec![tvar("U", 2, 0), tvar("V", 3, 0)],
+            type_guard: None,
+            type_is: None,
+        };
+        let (next, t_wire, s_wire) = rust_match_generic_callables(
+            2,
+            50,
+            &encode_type(&t).unwrap(),
+            &encode_type(&s).unwrap(),
+        )
+        .unwrap()
+        .expect("engages");
+        assert_eq!(next, 52);
+        let t_out = decode(&t_wire);
+        let s_out = decode(&s_wire);
+        let Type::CallableType {
+            arg_types: t_args, ..
+        } = &t_out
+        else {
+            panic!()
+        };
+        let Type::CallableType {
+            variables: s_vars,
+            arg_types: s_args,
+            ..
+        } = &s_out
+        else {
+            panic!()
+        };
+        // T and U both get id 50; V gets 51.
+        assert_eq!(t_args[0], tvar("T", 50, 0));
+        assert_eq!(s_args[0], tvar("U", 50, 0));
+        assert_eq!(s_vars[1], tvar("V", 51, 0));
+    }
+
+    #[test]
+    fn non_callable_defers() {
+        let not_callable = Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let result = rust_match_generic_callables(
+            1,
+            0,
+            &encode_type(&not_callable).unwrap(),
+            &encode_type(&not_callable).unwrap(),
+        )
+        .unwrap();
+        assert!(result.is_none(), "non-CallableType defers");
+    }
+
+    #[test]
+    fn zero_vars_defers() {
+        // Python never calls for min_len == 0 (short-circuits first); the
+        // seam still defers instead of mis-behaving.
+        let result = rust_match_generic_callables(0, 0, b"", b"").unwrap();
+        assert!(result.is_none(), "num_vars == 0 defers");
+    }
 }
