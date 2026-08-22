@@ -212,6 +212,7 @@ fn set_typevar_id(t: Type, raw_id: i64) -> Type {
 /// `expand_type(c, tv_map)` result, re-`variables`-ed).
 /// `None` (Python `None`) defers the whole call to the pure-Python body.
 #[pyfunction]
+#[allow(clippy::type_complexity)]
 pub(crate) fn rust_match_generic_callables(
     num_vars: usize,
     start_raw_id: i64,
