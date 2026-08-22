@@ -868,9 +868,7 @@ fn variadic_tuple_subtype(
     let Some(right_unpack_index) = find_unpack_in_list(right_items) else {
         return Some(None);
     };
-    let Some(right_unpack) = right_items.get(right_unpack_index) else {
-        return None;
-    };
+    let right_unpack = right_items.get(right_unpack_index)?;
     let Type::UnpackType { typ: r_unpack } = right_unpack else {
         return None;
     };
@@ -947,7 +945,7 @@ fn variadic_tuple_subtype(
                 }
                 if !all_subtypes(
                     &left_items[..left_prefix],
-                    &right_prefix_types,
+                    right_prefix_types,
                     ctx,
                     resolver,
                 )? {
@@ -955,7 +953,7 @@ fn variadic_tuple_subtype(
                 }
                 if !all_subtypes(
                     &left_items[left_items.len() - left_suffix..],
-                    &right_suffix_types,
+                    right_suffix_types,
                     ctx,
                     resolver,
                 )? {
@@ -1058,11 +1056,11 @@ fn find_unpack_in_list(items: &[Type]) -> Option<usize> {
 
 /// `split_with_prefix_and_suffix` (types.py:4904-4925): split a slice
 /// into prefix / middle / suffix by counts.
-fn split_with_prefix_and_suffix<'a>(
-    items: &'a [Type],
+fn split_with_prefix_and_suffix(
+    items: &[Type],
     prefix: usize,
     suffix: usize,
-) -> Option<(&'a [Type], &'a [Type], &'a [Type])> {
+) -> Option<(&[Type], &[Type], &[Type])> {
     if items.len() < prefix + suffix {
         return None;
     }
