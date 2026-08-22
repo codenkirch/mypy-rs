@@ -704,6 +704,32 @@ pub(crate) fn callables_compatible(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    callables_compatible_with_ignore_return(
+        left,
+        right,
+        ignore_pos_arg_names,
+        strict_concatenate,
+        ctx,
+        resolver,
+        false, // ignore_return
+    )
+}
+
+/// Extended entry: same as `callables_compatible`, plus `ignore_return` for
+/// the `find_matching_overload_items` seam (`ignore_return=True` mirrors the
+/// Python `is_callable_compatible(...)` call in constraints.py:1950, where
+/// the template's return type is indeterminate). The other call sites keep
+/// `ignore_return=False`, matching `visit_callable_type` and the wire seam.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn callables_compatible_with_ignore_return(
+    left: &Type,
+    right: &Type,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    ignore_return: bool,
+) -> Option<bool> {
     // Both sides must be plain CallableType. `Parameters` (either side) defers:
     // the wire format drops `Parameters.is_ellipsis_args`, which the Python
     // `are_parameters_compatible` reads.
@@ -769,7 +795,7 @@ pub(crate) fn callables_compatible(
         ctx.proper_subtype,
         ignore_pos_arg_names,
         strict_concatenate,
-        false, // ignore_return
+        ignore_return,
         false, // check_args_covariantly
         resolver,
     )

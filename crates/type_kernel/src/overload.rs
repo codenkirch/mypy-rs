@@ -275,3 +275,99 @@ pub fn rust_check_overload_call(
 fn is_named(kind: i64) -> bool {
     kind == ARG_NAMED || kind == ARG_NAMED_OPT
 }
+
+/// Whether a wire `Type` is a TypeVarTuple/ParamSpec variant (or a
+/// TypeVarType with a non-zero meta_level). The wire round-trip cannot
+/// preserve the identity of these, so Python must always match them.
+fn is_variadic_tvar(t: &Type) -> bool {
+    match t {
+        Type::TypeVarTupleType { .. } | Type::ParamSpecType { .. } => true,
+        Type::TypeVarType { meta_level, .. } => *meta_level != 0,
+        _ => false,
+    }
+}
+
+/// `mypy.constraints.find_matching_overload_items` (constraints.py:1941).
+///
+/// Runs the native callable-compat engine (`callable_compat::callables_compatible`
+/// with `ignore_return=True` and `is_proper_subtype=False`, exactly the
+/// `is_callable_compatible(is_compat=is_subtype, ignore_return=True)` the
+/// Python frame calls per item) for every `(item, template)` pair and returns
+/// the indices of the matching items. Returns `None` to defer the whole call
+/// to Python when:
+///
+///   * the template is not a plain `CallableType` (an `Overloaded` /
+///     `Parameters` / unwrappable template stays Python-side);
+///   * the item list is empty (Python then falls back to `items.copy()`);
+///   * any item is a wire-unserializable variadic / meta TypeVar shape
+///     (`TypeVarTupleType`, `ParamSpecType`, non-meta `TypeVarType`), whose
+///     identity a wire round-trip cannot preserve (`is_variadic_tvar`);
+///   * any item the engine cannot decide (generic `variables`, `UnpackType`,
+///     `unpack_kwargs`, resolver misses) — all-or-nothing between the items,
+///     mirroring the engine's own per-pair deferral contract.
+///
+/// The caller maps the returned indices back onto its live `CallableType`
+/// items, preserving object identity the constraint solver relies on.
+///
+/// The `strict_optional` flag is threaded through the subtype context used
+/// by the engine's nested `is_subtype` calls, matching Python where
+/// `is_callable_compatible` inherits it from the running state — but only
+/// when `strict_optional` is the active setting (`state.strict_optional`);
+/// otherwise the whole call defers so error messages cannot diverge.
+#[pyfunction]
+pub fn rust_find_matching_overload_items(
+    _py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    items_wire: Vec<&[u8]>,
+    template_wire: &[u8],
+    strict_optional: bool,
+) -> Option<Vec<i64>> {
+    if items_wire.is_empty() {
+        return None;
+    }
+    let template = match decode_type(template_wire) {
+        Some(t @ Type::CallableType { .. }) => t,
+        Some(_) | None => return None,
+    };
+
+    // `has_variadic_arg` mirrors the wire round-trip's identity loss for
+    // TypeVarTuple/ParamSpec/meta TypeVar shapes; template-side unpack
+    // variants defer through the engine's own `any_unpack_anywhere`.
+    let mut matched: Vec<i64> = Vec::new();
+    for (idx, blob) in items_wire.iter().enumerate() {
+        let item = match decode_type(blob) {
+            Some(t @ Type::CallableType { .. }) => t,
+            Some(_) | None => return None,
+        };
+        if has_variadic_arg(&item) {
+            return None;
+        }
+        let ctx = subtypes::SubtypeContext::new(false, false, false, false, false, strict_optional);
+        let res = resolver.resolver();
+        match crate::callable_compat::callables_compatible_with_ignore_return(
+            &item, &template, false, // ignore_pos_arg_names
+            false, // strict_concatenate
+            &ctx, res, true, // ignore_return: template return is indeterminate
+        ) {
+            Some(true) => matched.push(idx as i64),
+            Some(false) => {}
+            None => return None, // uncertain -> defer the whole call
+        }
+    }
+    Some(matched)
+}
+
+/// Walks a callable's argument/return types for a wire-unserializable
+/// TypeVarTuple/ParamSpec variant, or a non-meta TypeVarType. Defers the
+/// whole item list so matching cannot drop or misorder items whose identity
+/// the wire round-trip cannot preserve.
+fn has_variadic_arg(t: &Type) -> bool {
+    match t {
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            ..
+        } => arg_types.iter().any(is_variadic_tvar) || is_variadic_tvar(ret_type),
+        _ => false,
+    }
+}

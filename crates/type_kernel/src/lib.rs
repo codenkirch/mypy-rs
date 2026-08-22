@@ -639,6 +639,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        overload::rust_find_matching_overload_items,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checker_stmts::rust_type_requires_usage,
         module
     )?)?;

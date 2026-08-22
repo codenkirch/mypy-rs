@@ -18935,3 +18935,264 @@ class NativeEraseReturnSelfSuite(Suite):
         self._assert_engages(union, self.fx.a)
         self._assert_par(self.fx.nonet, self.fx.a)
         self._assert_engages(self.fx.nonet, self.fx.a)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindMatchingOverloadSuite(Suite):
+    """Parity tests for the Rust `find_matching_overload_items` port.
+
+    `mypy.constraints.find_matching_overload_items` (constraints.py:1941)
+    runs `is_callable_compatible(item, template, is_compat=is_subtype,
+    ignore_return=True)` per overload item (each natively in the subtype
+    kernel) and collects every matching item. The Rust driver
+    (`overload.rs::rust_find_matching_overload_items`) runs the native
+    callable-compat engine with ignore_return=True for every pair in one
+    call and returns the matched item indices; the Python shim maps them
+    back onto the live items, or falls back to `items.copy()` when no
+    item matches.
+
+    Differential harness: runs the public function with the
+    `_native_constraints_active` gate on (resolver installed) and off
+    (pure Python), and asserts the returned item lists are equal
+    (compared by `str(item)` after the wire round-trip). Covers single
+    and multiple matches, the no-match -> all-items fallback, and the
+    deferred variadic shapes (TypeVarTuple / ParamSpec items), which do
+    not engage the kernel.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Start with the gate off so fixtures never leak a stale resolver.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _callable(
+        self, arg_types: list[Type], ret_type: Type | None = None
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            ret_type if ret_type is not None else AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+
+    def _overloaded(self, items: list[CallableType]) -> Overloaded:
+        return Overloaded(items)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _result(self, overloaded: Overloaded, template: CallableType, native: bool) -> list[str]:
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            find_matching_overload_items,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        try:
+            return [str(item) for item in find_matching_overload_items(overloaded, template)]
+        finally:
+            self._set_active(False)
+
+    def _assert_par(self, overloaded: Overloaded, template: CallableType) -> None:
+        native = self._result(overloaded, template, native=True)
+        python = self._result(overloaded, template, native=False)
+        assert_equal(
+            native,
+            python,
+            f"find_matching_overload_items parity for overload={overloaded!r} "
+            f"template={template!r}: native={native!r} python={python!r}",
+        )
+
+    def test_single_match(self) -> None:
+        # One item is callable-compatible (with return ignored): it matches.
+        overloaded = self._overloaded(
+            [self._callable([self.fx.a]), self._callable([self.fx.b])]
+        )
+        self._assert_par(overloaded, self._callable([self.fx.a], self.fx.b))
+
+    def test_multiple_matches(self) -> None:
+        # Both items are callable-compatible: both match (plural collection).
+        overloaded = self._overloaded(
+            [self._callable([self.fx.a], self.fx.a), self._callable([self.fx.a], self.fx.b)]
+        )
+        self._assert_par(overloaded, self._callable([self.fx.a]))
+
+    def test_no_match_falls_back_to_all(self) -> None:
+        # No item is compatible (`D` is unrelated to `A` / `B`):
+        # backward-compat falls back to all items (`items.copy()`),
+        # which the native result must reproduce.
+        overloaded = self._overloaded(
+            [self._callable([self.fx.a]), self._callable([self.fx.b])]
+        )
+        self._assert_par(overloaded, self._callable([self.fx.d]))
+
+    def test_deferral_on_resolver_miss(self) -> None:
+        # The seam without a resolver installed returns None (pure Python).
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            find_matching_overload_items,
+        )
+
+        self._set_active(True)
+        _set_native_constraints_resolver(None)
+        try:
+            overloaded = self._overloaded(
+                [self._callable([self.fx.a]), self._callable([self.fx.b])]
+            )
+            result = find_matching_overload_items(overloaded, self._callable([self.fx.a]))
+            assert_equal(len(result), 1)
+        finally:
+            self._set_active(False)
+
+    def test_partial_match(self) -> None:
+        # Only the second item is compatible: the first is skipped.
+        overloaded = self._overloaded(
+            [self._callable([self.fx.a]), self._callable([self.fx.b], self.fx.c)]
+        )
+        self._assert_par(overloaded, self._callable([self.fx.b]))
+
+    def test_return_ignored(self) -> None:
+        # The template's return type is indeterminate: only the arguments
+        # decide the match (ignore_return=True), so a mismatched return
+        # still matches.
+        overloaded = self._overloaded(
+            [self._callable([self.fx.a], self.fx.a), self._callable([self.fx.a], self.fx.b)]
+        )
+        self._assert_par(overloaded, self._callable([self.fx.a], self.fx.c))
+
+    def test_typevartuple_item_defers(self) -> None:
+        # A TypeVarTuple item cannot round-trip identity: Rust defers the
+        # whole call, Python falls back to its own loop and returns
+        # `items.copy()` (the item is not compatible with the template).
+        tvt = TypeVarTupleType(
+            "Ts", "mod.Ts", TypeVarId(1), self.fx.o, self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        item = self._callable([UnpackType(tvt)], self.fx.a)
+        overloaded = self._overloaded([item, self._callable([self.fx.a])])
+        self._assert_par(overloaded, self._callable([self.fx.a]))
+
+    def test_paramspec_item_defers(self) -> None:
+        # A ParamSpec item cannot round-trip identity: Rust defers the
+        # whole call, Python falls back to its own loop.
+        pspec = ParamSpecType(
+            "P", "mod.P", TypeVarId(1), 0, self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        item = self._callable([pspec], self.fx.a)
+        overloaded = self._overloaded([item, self._callable([self.fx.a])])
+        self._assert_par(overloaded, self._callable([self.fx.a]))
+
+    def test_meta_typevar_item_defers(self) -> None:
+        # A meta type var (meta_level=1) cannot round-trip identity: Rust
+        # defers the whole call.
+        meta_t = TypeVarType(
+            "T", "mod.T", TypeVarId(1, meta_level=1), [], self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        item = self._callable([meta_t], self.fx.a)
+        overloaded = self._overloaded([item, self._callable([self.fx.a])])
+        self._assert_par(overloaded, self._callable([self.fx.a]))
+
+    def test_variadic_only_matches(self) -> None:
+        # The variadic item alone cannot decide: Rust defers even though
+        # the non-variadic item would not match (Python returns all items).
+        tvt = TypeVarTupleType(
+            "Ts", "mod.Ts", TypeVarId(1), self.fx.o, self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        item = self._callable([UnpackType(tvt)], self.fx.a)
+        overloaded = self._overloaded([item, self._callable([self.fx.b])])
+        self._assert_par(overloaded, self._callable([self.fx.c]))
+
+    def _native_indices(
+        self, items: Sequence[CallableType], template: CallableType
+    ) -> list[int] | None:
+        """Direct seam call: serialize items + template and ask the Rust
+        kernel for the matched item indices (None = deferred)."""
+        items_wire = [self._bytes_of(item) for item in items]
+        return _type_kernel.rust_find_matching_overload_items(
+            self.resolver,
+            items_wire,
+            self._bytes_of(template),
+            True,  # strict_optional
+        )
+
+    def test_engages_and_returns_indices(self) -> None:
+        # Both items are (return-ignored) compatible, so both indices come
+        # back as plain ints. Regression guard for the shim's index mapping:
+        # the seam returns ints, not serialized index blobs.
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            find_matching_overload_items,
+        )
+
+        items = [self._callable([self.fx.a]), self._callable([self.fx.a], self.fx.b)]
+        result = self._native_indices(items, self._callable([self.fx.a]))
+        assert_equal(result, [0, 1])
+        self._set_active(True)
+        _set_native_constraints_resolver(self.resolver)
+        try:
+            matched = find_matching_overload_items(self._overloaded(items), self._callable([self.fx.a]))
+            assert_equal(matched, items)
+        finally:
+            self._set_active(False)
+
+    def test_engages_no_match_falls_back(self) -> None:
+        # Engages with an empty match list: the shim then falls back to
+        # `items.copy()`, matching the Python fallback exactly. `D` is
+        # unrelated to `A` / `B`, so neither item is compatible.
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            find_matching_overload_items,
+        )
+
+        items = [self._callable([self.fx.a]), self._callable([self.fx.b])]
+        result = self._native_indices(items, self._callable([self.fx.d]))
+        assert_equal(result, [])
+        self._set_active(True)
+        _set_native_constraints_resolver(self.resolver)
+        try:
+            matched = find_matching_overload_items(self._overloaded(items), self._callable([self.fx.d]))
+            assert_equal(matched, items)
+        finally:
+            self._set_active(False)
+
+    def test_engages_deferral_on_variadic_item(self) -> None:
+        # A TypeVarTuple item cannot round-trip: the seam returns None
+        # (whole call deferred to Python).
+        tvt = TypeVarTupleType(
+            "Ts", "mod.Ts", TypeVarId(1), self.fx.o, self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        items = [self._callable([UnpackType(tvt)], self.fx.a), self._callable([self.fx.a])]
+        result = self._native_indices(items, self._callable([self.fx.a]))
+        assert result is None

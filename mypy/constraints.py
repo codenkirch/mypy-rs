@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Final, TypeGuard, cast
 
+import mypy.state
 import mypy.subtypes
 import mypy.typeops
 
@@ -1921,21 +1922,10 @@ def neg_op(op: int) -> int:
 
 def find_matching_overload_item(overloaded: Overloaded, template: CallableType) -> CallableType:
     """Disambiguate overload item against a template."""
-    items = overloaded.items
-    for item in items:
-        # Return type may be indeterminate in the template, so ignore it when performing a
-        # subtype check.
-        if mypy.subtypes.is_callable_compatible(
-            item,
-            template,
-            is_compat=mypy.subtypes.is_subtype,
-            is_proper_subtype=False,
-            ignore_return=True,
-        ):
-            return item
+    matches = find_matching_overload_items(overloaded, template)
     # Fall back to the first item if we can't find a match. This is totally arbitrary --
     # maybe we should just bail out at this point.
-    return items[0]
+    return matches[0]
 
 
 def find_matching_overload_items(
@@ -1943,6 +1933,13 @@ def find_matching_overload_items(
 ) -> list[CallableType]:
     """Like find_matching_overload_item, but return all matches, not just the first."""
     items = overloaded.items
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            native_result = _try_native_find_matching_overload_items(items, template)
+            if native_result is not None:
+                return native_result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     res = []
     for item in items:
         # Return type may be indeterminate in the template, so ignore it when performing a
@@ -1960,6 +1957,47 @@ def find_matching_overload_items(
         # it maintains backward compatibility.
         res = items.copy()
     return res
+
+
+def _try_native_find_matching_overload_items(
+    items: Sequence[CallableType], template: CallableType
+) -> list[CallableType] | None:
+    """Route find_matching_overload_items through the Rust kernel.
+
+    Rust runs the native `is_callable_compatible` (ignore_return=True,
+    is_proper_subtype=False) per (item, template) pair and returns the
+    matched item indices. Those are mapped back onto the live items so
+    object identity is preserved. Requires a NativeTypeResolver snapshot
+    (installed by the build manager per SCC); Rust defers (`None`) on
+    variadic / meta TypeVar shapes and on pairs the engine cannot decide,
+    in which case the caller falls back to the pure-Python loop.
+    """
+    if _native_constraints_resolver is None:
+        return None
+    template_buf = _WriteBuffer()
+    template.write(template_buf)
+    items_buf = []
+    for item in items:
+        item_buf = _WriteBuffer()
+        item.write(item_buf)
+        items_buf.append(item_buf.getvalue())
+    raw = _type_kernel.rust_find_matching_overload_items(
+        _native_constraints_resolver,
+        items_buf,
+        template_buf.getvalue(),
+        mypy.state.state.strict_optional,
+    )
+    if raw is None:
+        raise NotImplementedError("kernel deferred find_matching_overload_items")
+    if not raw:
+        # Rust decided nothing matched: Python falls back to all items
+        # (constraints.py:1955-1958) to keep backward compatibility.
+        return items.copy()
+
+    result: list[CallableType] = []
+    for index in raw:
+        result.append(items[index])
+    return result
 
 
 def get_tuple_fallback_from_unpack(unpack: UnpackType) -> TypeInfo:

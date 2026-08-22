@@ -382,6 +382,7 @@ __all__ = [
     "rust_detect_diverging_alias",
     "rust_find_self_type",
     "rust_check_vec_type_args",
+    "rust_find_matching_overload_items",
     "IdMapper",
 ]
 
@@ -681,6 +682,12 @@ def rust_check_overload_call(
     arg_names: list[str | None] | None,
     strict_optional: bool,
 ) -> int | None: ...
+def rust_find_matching_overload_items(
+    resolver: NativeTypeResolver,
+    items_bytes: list[bytes],
+    template_bytes: bytes,
+    strict_optional: bool,
+) -> list[int] | None: ...
 def rust_is_typed_callable(type_bytes: bytes) -> bool | None: ...
 def rust_is_private(node_name: str) -> bool: ...
 def rust_is_operator_method(fullname: str | None) -> bool: ...
