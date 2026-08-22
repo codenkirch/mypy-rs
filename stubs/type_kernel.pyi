@@ -64,6 +64,7 @@ __all__ = [
     "read_type_to_str_with_native_resolver",
     "rust_is_subtype",
     "rust_subtype_tvar_tuple_right",
+    "rust_variadic_tuple_subtype",
     "rust_trivial_join",
     "rust_trivial_meet",
     "rust_join_types",
@@ -425,6 +426,12 @@ def rust_is_subtype(
 ) -> bool | None: ...
 
 def rust_subtype_tvar_tuple_right(
+    left: bytes,
+    right: bytes,
+    proper_subtype: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
+def rust_variadic_tuple_subtype(
     left: bytes,
     right: bytes,
     proper_subtype: bool,

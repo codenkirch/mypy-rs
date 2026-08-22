@@ -533,17 +533,11 @@ pub(crate) fn is_subtype(
             ..
         } = right
         {
-            // subtypes.py:1004-1005: variadic unpack handling.
-            // Defer to Python when variadic (TypeVarTuple or *tuple[X, ...]
-            // unpacks present).
-            if left_items
-                .iter()
-                .any(|t| matches!(t, Type::UnpackType { .. }))
-                || right_items
-                    .iter()
-                    .any(|t| matches!(t, Type::UnpackType { .. }))
-            {
-                return None;
+            // subtypes.py:1004-1005: variadic unpack handling first.
+            // Decides when the right side has a variadic unpack; `None`
+            // falls through to the fixed-length logic below.
+            if let Some(decided) = variadic_tuple_subtype(left, right, ctx, resolver)? {
+                return Some(decided);
             }
             // Length check (subtypes.py:1006).
             if left_items.len() != right_items.len() {
@@ -843,6 +837,257 @@ pub(crate) fn is_subtype(
     visit_instance_nominal(
         left_ref, left_args, right, right_ref, right_args, ctx, resolver,
     )
+}
+
+/// `variadic_tuple_subtype` (subtypes.py:1086-1166), Rust port.
+///
+/// Check subtyping between two potentially variadic tuples. The right
+/// side must have an UnpackType (variadic unpack); returns `None` when
+/// it cannot decide (unsupported shape or a recursive `is_subtype`
+/// deferral), in which case the caller falls through to the fixed-length
+/// logic.
+fn variadic_tuple_subtype(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Option<bool>> {
+    let Type::TupleType {
+        items: left_items, ..
+    } = left
+    else {
+        return None;
+    };
+    let Type::TupleType {
+        items: right_items, ..
+    } = right
+    else {
+        return None;
+    };
+    // right_unpack_index = find_unpack_in_list(right.items).
+    let Some(right_unpack_index) = find_unpack_in_list(right_items) else {
+        return Some(None);
+    };
+    let right_unpack = right_items.get(right_unpack_index)?;
+    let Type::UnpackType { typ: r_unpack } = right_unpack else {
+        return None;
+    };
+    // get_proper_type(right_unpack.type) must be a builtins.tuple
+    // Instance (subtypes.py:1095-1098); else this case is handled by the
+    // caller and answers False.
+    let right_unpacked = match get_proper_type_or_defer(r_unpack.as_ref(), resolver)? {
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+            args.first().cloned()?
+        }
+        _ => return Some(None),
+    };
+    let right_prefix = right_unpack_index;
+    let right_suffix = right_items.len() - right_unpack_index - 1;
+    let left_unpack_index = find_unpack_in_list(left_items);
+    // Simple case: left is fixed. Find the mapping to the right
+    // (subtypes.py:1109-1124).
+    if left_unpack_index.is_none() {
+        if left_items.len() < right_prefix + right_suffix {
+            return Some(None);
+        }
+        let (prefix, middle, suffix) =
+            split_with_prefix_and_suffix(left_items, right_prefix, right_suffix)?;
+        let right_prefix_items = &right_items[..right_prefix];
+        for (li, ri) in prefix.iter().zip(right_prefix_items.iter()) {
+            match is_subtype(li, ri, ctx, resolver) {
+                Some(true) => {}
+                Some(false) => return Some(None),
+                None => return None,
+            }
+        }
+        if right_suffix > 0 {
+            let right_suffix_items = &right_items[right_items.len() - right_suffix..];
+            for (li, ri) in suffix.iter().zip(right_suffix_items.iter()) {
+                match is_subtype(li, ri, ctx, resolver) {
+                    Some(true) => {}
+                    Some(false) => return Some(None),
+                    None => return None,
+                }
+            }
+        }
+        for li in middle {
+            match is_subtype(li, &right_unpacked, ctx, resolver) {
+                Some(true) => {}
+                Some(false) => return Some(None),
+                None => return None,
+            }
+        }
+        return Some(Some(true));
+    }
+    // Both sides have a variadic unpack.
+    if left_items.len() < right_items.len() {
+        return Some(None);
+    }
+    let left_prefix = left_unpack_index.unwrap();
+    let left_suffix = left_items.len() - left_prefix - 1;
+    let left_unpack = &left_items[left_prefix];
+    let Type::UnpackType { typ: l_unpack } = left_unpack else {
+        return None;
+    };
+    let left_unpacked = match get_proper_type_or_defer(l_unpack.as_ref(), resolver)? {
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+            args.first().cloned()?
+        }
+        _ => {
+            // *Ts unpack can't be split except if all mapped to tops.
+            if is_top_type(&right_unpacked, ctx)? {
+                let (right_prefix_types, middle, right_suffix_types) =
+                    split_with_prefix_and_suffix(right_items, left_prefix, left_suffix)?;
+                for ri in middle {
+                    if !is_top_type(ri, ctx)? && !matches!(ri, Type::UnpackType { .. }) {
+                        return Some(None);
+                    }
+                }
+                if !all_subtypes(
+                    &left_items[..left_prefix],
+                    right_prefix_types,
+                    ctx,
+                    resolver,
+                )? {
+                    return Some(None);
+                }
+                if !all_subtypes(
+                    &left_items[left_items.len() - left_suffix..],
+                    right_suffix_types,
+                    ctx,
+                    resolver,
+                )? {
+                    return Some(None);
+                }
+                return Some(Some(true));
+            }
+            return Some(None);
+        }
+    };
+    // Asymptotic case: both unpacks must be subtypes.
+    match is_subtype(&left_unpacked, &right_unpacked, ctx, resolver) {
+        Some(true) => {}
+        Some(false) => return Some(None),
+        None => return None,
+    }
+    // Finite overlaps: for each overlap, build the left representation
+    // with `overlap` copies of left_item in the middle and check it
+    // against the right (subtypes.py:1152-1165).
+    let max_overlap = {
+        let rp = right_prefix as isize - left_prefix as isize;
+        let rs = right_suffix as isize - left_suffix as isize;
+        rp.max(0).max(rs.max(0)) as usize
+    };
+    for overlap in 0..=max_overlap {
+        let mut repr_items: Vec<Type> = Vec::with_capacity(left_prefix + overlap + left_suffix);
+        repr_items.extend_from_slice(&left_items[..left_prefix]);
+        for _ in 0..overlap {
+            repr_items.push(left_unpacked.clone());
+        }
+        if left_suffix > 0 {
+            let start = left_items.len() - left_suffix;
+            repr_items.extend_from_slice(&left_items[start..]);
+        }
+        let mut left_repr = left.clone();
+        if let Type::TupleType { items, .. } = &mut left_repr {
+            *items = repr_items;
+        }
+        match is_subtype(&left_repr, right, ctx, resolver) {
+            Some(true) => {}
+            Some(false) => return Some(None),
+            None => return None,
+        }
+    }
+    Some(Some(true))
+}
+
+/// `rust_variadic_tuple_subtype` (subtypes.py:1086-1166), PyO3 seam.
+///
+/// Returns `Some(true)` when the Rust port decides True; `None` when it
+/// cannot (no right unpack, unsupported shape, or a recursive
+/// `is_subtype` deferral) so the caller falls through to the
+/// fixed-length logic exactly like the Python short-circuit
+/// (subtypes.py:1064-1065).
+#[pyfunction]
+#[allow(dead_code)]
+pub(crate) fn rust_variadic_tuple_subtype(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    proper_subtype: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let ctx = SubtypeContext::with_callable_flags(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        false, // ignore_promotions
+        proper_subtype,
+        false, // strict_optional
+        false, // ignore_pos_arg_names
+        false, // strict_concatenate
+    );
+    variadic_tuple_subtype(&left, &right, &ctx, resolver.resolver())?
+}
+
+/// `is_top_type` (subtypes.py:1168-1171): top types are any AnyType
+/// under non-proper subtype, or `builtins.object` instances.
+fn is_top_type(typ: &Type, ctx: &SubtypeContext) -> Option<bool> {
+    if !ctx.proper_subtype && matches!(typ, Type::AnyType { .. }) {
+        return Some(true);
+    }
+    if let Type::Instance { type_ref, .. } = typ {
+        return Some(type_ref == "builtins.object");
+    }
+    Some(false)
+}
+
+/// `find_unpack_in_list` (types.py:5002-5009): index of the first
+/// UnpackType item, or None. Variadic middle args arrive as UnpackType.
+fn find_unpack_in_list(items: &[Type]) -> Option<usize> {
+    for (i, item) in items.iter().enumerate() {
+        if matches!(item, Type::UnpackType { .. }) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `split_with_prefix_and_suffix` (types.py:4904-4925): split a slice
+/// into prefix / middle / suffix by counts.
+fn split_with_prefix_and_suffix(
+    items: &[Type],
+    prefix: usize,
+    suffix: usize,
+) -> Option<(&[Type], &[Type], &[Type])> {
+    if items.len() < prefix + suffix {
+        return None;
+    }
+    if suffix == 0 {
+        Some((&items[..prefix], &items[prefix..], &items[items.len()..]))
+    } else {
+        let end = items.len() - suffix;
+        Some((&items[..prefix], &items[prefix..end], &items[end..]))
+    }
+}
+
+/// `_all_subtypes` helper: all left items subtype the corresponding
+/// right items (subtypes.py:638-639).
+fn all_subtypes(
+    lefts: &[Type],
+    rights: &[Type],
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<bool> {
+    for (li, ri) in lefts.iter().zip(rights.iter()) {
+        match is_subtype(li, ri, ctx, resolver) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(true)
 }
 
 /// `SubtypeVisitor.visit_instance` tail (subtypes.py:680-710), Rust port:
