@@ -154,6 +154,8 @@ __all__ = [
     "rust_select_trivial",
     "rust_exclude_non_meta_vars",
     "rust_is_similar_constraints",
+    "rust_any_constraints",
+    "rust_repack_callable_args",
     "rust_classify_call",
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
@@ -748,6 +750,12 @@ def rust_infer_constraints_full(
 def rust_select_trivial(options_bytes: bytes) -> bytes | None: ...
 def rust_exclude_non_meta_vars(option_bytes: bytes) -> bytes | None: ...
 def rust_is_similar_constraints(x_bytes: bytes, y_bytes: bytes) -> bool | None: ...
+def rust_any_constraints(
+    options_bytes: bytes, eager: bool, resolver: NativeTypeResolver
+) -> list[bytes] | None: ...
+def rust_repack_callable_args(
+    callable_bytes: bytes, resolver: NativeTypeResolver
+) -> list[bytes] | None: ...
 def rust_filter_imprecise_kinds(constraints_bytes: bytes) -> bytes | None: ...
 def rust_infer_directed_arg_constraints(
     resolver: NativeTypeResolver,

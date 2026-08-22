@@ -17941,3 +17941,248 @@ class NativeCombineSimilarCallablesSuite(Suite):
         t = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
         s = CallableType([self.fx.b], [ARG_POS], [None], self.fx.a, self.fx.function)
         self._assert_parity(t, s)
+
+
+class NativeAnyConstraintsSuite(Suite):
+    """Parity tests for `rust_any_constraints`.
+
+    Differential harness: runs `any_constraints` on the same option list with
+    the native gate on (resolver installed) and off (pure Python), and asserts
+    the results are equal. Constraint.__eq__ compares (type_var, op, target)
+    and UnionType.__eq__ compares the item frozenset, so the wire round-trip
+    recomposes exactly what the Python body builds.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import Constraint, _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.Constraint = Constraint
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _tvar(
+        self,
+        name: str,
+        raw_id: int,
+        upper_bound: Type,
+        *,
+        meta_level: int = 0,
+        values: list[Type] | None = None,
+    ) -> TypeVarType:
+        return TypeVarType(
+            name,
+            name,
+            TypeVarId(raw_id, meta_level=meta_level),
+            values if values is not None else [],
+            upper_bound,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _result(
+        self, options: Sequence[list[Constraint] | None], eager: bool, native: bool
+    ) -> list[Any]:
+        from mypy.constraints import (
+            any_constraints,
+            _set_native_constraints_resolver,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return any_constraints(list(options), eager=eager)
+
+    def _assert_par(
+        self, options: Sequence[list[Constraint] | None], eager: bool = False
+    ) -> None:
+        native = self._result(options, eager, native=True)
+        python = self._result(options, eager, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_all_any_targets_skips_op(self) -> None:
+        # is_same_constraint: both targets Any -> op check skipped.
+        self._assert_par(
+            [
+                [self.Constraint(self.fx.t, 0, AnyType(TypeOfAny.special_form))],
+                [self.Constraint(self.fx.t, 1, AnyType(TypeOfAny.special_form))],
+            ],
+            eager=True,
+        )
+
+    def test_trivial_with_merge_union(self) -> None:
+        # select_trivial + merge_with_any: option2 is trivial, merge the
+        # target with Any into a union.
+        anyt = AnyType(TypeOfAny.special_form)
+        self._assert_par(
+            [
+                [self.Constraint(self.fx.t, 0, anyt)],
+                [self.Constraint(self.fx.t, 0, self.fx.a)],
+            ],
+            eager=True,
+        )
+
+    def test_len_one_option_passthrough(self) -> None:
+        self._assert_par([[self.Constraint(self.fx.t, 0, self.fx.a)]])
+
+    def test_empty_option(self) -> None:
+        self._assert_par([[]])
+        self._assert_par([None])
+        self._assert_par([])
+
+    def test_none_option_with_present(self) -> None:
+        self._assert_par([None, [self.Constraint(self.fx.t, 0, self.fx.a)]])
+
+    def test_mixed_origins_is_similar(self) -> None:
+        # is_similar_constraints with differing raw ids in the same
+        # namespace: NoRelation -> options are not merged, and no unified
+        # constraint is produced.
+        self._assert_par(
+            [
+                [self.Constraint(self.fx.t, 0, self.fx.a)],
+                [self.Constraint(self.fx.s, 0, self.fx.a)],
+            ],
+            eager=True,
+        )
+
+    def test_values_satisfiable(self) -> None:
+        # filter_satisfiable via the values branch: t1 has values and the
+        # target is a subtype of one of them.
+        t1 = self._tvar("t1", 12, self.fx.o, values=[self.fx.a, self.fx.b])
+        self._assert_par(
+            [[self.Constraint(t1, 0, self.fx.a)], [self.Constraint(t1, 0, self.fx.b)]],
+            eager=True,
+        )
+
+    def test_meta_exclusion(self) -> None:
+        # exclude_non_meta_vars with a non-meta (meta_level=0) origin.
+        self._assert_par(
+            [
+                [self.Constraint(self.fx.t, 0, self.fx.a)],
+                [self.Constraint(self.fx.t, 0, self.fx.b)],
+            ],
+            eager=True,
+        )
+
+    def test_eager_false_branch(self) -> None:
+        self._assert_par(
+            [
+                [self.Constraint(self.fx.t, 0, self.fx.a)],
+                [self.Constraint(self.fx.t, 0, self.fx.b)],
+            ],
+            eager=False,
+        )
+
+
+class NativeRepackCallableArgsSuite(Suite):
+    """Parity tests for `rust_repack_callable_args`.
+
+    Differential harness: runs `repack_callable_args` with the native gate
+    on and off, and asserts the returned arg-type lists are equal. Exercises
+    the ARG_STAR present/absent branches and the unpack normalization.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+    ) -> CallableType:
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            [None] * len(arg_types),
+            AnyType(TypeOfAny.special_form),
+            self.fx.function,
+        )
+
+    def _result(self, callable: CallableType, native: bool) -> list[Any]:
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            repack_callable_args,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return repack_callable_args(callable, self.fx.std_tuplei)
+
+    def _assert_par(self, callable: CallableType) -> None:
+        native = self._result(callable, native=True)
+        python = self._result(callable, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_no_star(self) -> None:
+        # ARG_STAR absent -> callable.arg_types passes through.
+        self._assert_par(
+            self._callable([self.fx.a, self.fx.b], [ARG_POS, ARG_POS])
+        )
+
+    def test_star_plain(self) -> None:
+        # *args: A -> UnpackType(Instance(builtins.tuple, [A])).
+        self._assert_par(
+            self._callable([self.fx.a, self.fx.b], [ARG_POS, ARG_STAR])
+        )
+
+    def test_star_unpack_tuple(self) -> None:
+        # *args: *tuple[A, B] -> unpack with the tuple prefix spliced and
+        # the rest as a suffix.
+        star = UnpackType(
+            TupleType(
+                [UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])), self.fx.b],
+                self.fx.std_tuple,
+            )
+        )
+        self._assert_par(self._callable([star], [ARG_STAR]))
+
+    def test_prefix_and_star(self) -> None:
+        self._assert_par(
+            self._callable(
+                [self.fx.a, self.fx.b, self.fx.c], [ARG_POS, ARG_STAR, ARG_POS]
+            )
+        )
