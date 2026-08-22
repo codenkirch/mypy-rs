@@ -4078,14 +4078,22 @@ mod tests {
     fn test_is_duplicate_mapping_single_false() {
         let kinds = vec![ARG_POS];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0], &[make_instance("int", vec![])], &kinds),
+            is_duplicate_mapping_inner(
+                &[0],
+                &[make_instance("int", vec![])],
+                &kinds,
+                &Default::default()
+            ),
             Some(false)
         );
     }
 
     #[test]
     fn test_is_duplicate_mapping_empty_false() {
-        assert_eq!(is_duplicate_mapping_inner(&[], &[], &[]), Some(false));
+        assert_eq!(
+            is_duplicate_mapping_inner(&[], &[], &[], &Default::default()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -4093,7 +4101,7 @@ mod tests {
         let kinds = vec![ARG_STAR, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(false)
         );
     }
@@ -4104,7 +4112,7 @@ mod tests {
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(false)
         );
     }
@@ -4115,7 +4123,7 @@ mod tests {
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_typeddict()];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4125,7 +4133,7 @@ mod tests {
         let kinds = vec![ARG_POS, ARG_POS];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4141,7 +4149,7 @@ mod tests {
         let kinds = vec![ARG_POS, ARG_POS];
         let types = vec![make_instance("int", vec![]), alias];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4156,14 +4164,20 @@ mod tests {
         };
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), alias];
-        assert_eq!(is_duplicate_mapping_inner(&[0, 1], &types, &kinds), None);
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
+            None
+        );
     }
 
     #[test]
     fn test_is_duplicate_mapping_out_of_range_defers() {
         let kinds = vec![ARG_POS];
         let types = vec![make_instance("int", vec![])];
-        assert_eq!(is_duplicate_mapping_inner(&[0, 5], &types, &kinds), None);
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 5], &types, &kinds, &Default::default()),
+            None
+        );
     }
 
     // -- method_fullname --

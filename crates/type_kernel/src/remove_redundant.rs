@@ -373,7 +373,7 @@ mod tests {
         let mut i = snap("builtins.int", "int");
         i.has_base.insert("builtins.object".to_string());
         i.mro.push("builtins.object".to_string());
-        let mut r = test_resolver(vec![snap("builtins.object", "object"), i]);
+        let r = test_resolver(vec![snap("builtins.object", "object"), i]);
         let ctx = SubtypeContext::new(false, false, false, true, true, true);
         let items = vec![
             instance("builtins.int", vec![]),

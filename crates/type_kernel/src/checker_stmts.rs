@@ -1180,7 +1180,7 @@ mod tests {
     #[test]
     fn type_requires_usage_alias_defers() {
         assert_eq!(
-            type_requires_usage_inner(&type_alias(), &TypeResolver::new()),
+            type_requires_usage_inner(&type_alias(), &TypeResolver::new(), &Default::default()),
             None
         );
     }
@@ -1196,7 +1196,10 @@ mod tests {
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Await".to_string(), snap);
         let t = instance("mod.Await");
-        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(1));
+        assert_eq!(
+            type_requires_usage_inner(&t, &resolver, &Default::default()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1209,7 +1212,10 @@ mod tests {
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Await".to_string(), snap);
         let t = instance("mod.Await");
-        assert_eq!(type_requires_usage_inner(&t, &resolver), None);
+        assert_eq!(
+            type_requires_usage_inner(&t, &resolver, &Default::default()),
+            None
+        );
     }
 
     #[test]
@@ -1221,7 +1227,10 @@ mod tests {
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Plain".to_string(), snap);
         let t = instance("mod.Plain");
-        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(2));
+        assert_eq!(
+            type_requires_usage_inner(&t, &resolver, &Default::default()),
+            Some(2)
+        );
     }
 
     #[test]
@@ -1239,7 +1248,10 @@ mod tests {
         resolver.insert("mod.Base".to_string(), base);
         resolver.insert("mod.Sub".to_string(), sub);
         let t = instance("mod.Sub");
-        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(1));
+        assert_eq!(
+            type_requires_usage_inner(&t, &resolver, &Default::default()),
+            Some(1)
+        );
     }
 
     #[test]
