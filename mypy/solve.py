@@ -551,11 +551,13 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
                 result = None
             if result is not None:
                 kind, blob = result
-                if kind == 0 and blob is not None:
-                    from mypy.wirefixup import fixup_wire_type
+                if kind == 0:
+                    if blob is not None:
+                        from mypy.wirefixup import fixup_wire_type
 
-                    decoded = read_type(_ReadBuffer(bytes(blob)))
-                    return fixup_wire_type(decoded)
+                        decoded = read_type(_ReadBuffer(bytes(blob)))
+                        return fixup_wire_type(decoded)
+                    return None
                 if kind == 1:
                     if blob is not None:
                         from mypy.wirefixup import fixup_wire_type
@@ -563,10 +565,18 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
                         decoded = read_type(_ReadBuffer(bytes(blob)))
                         return fixup_wire_type(decoded)
                     return None
-                # kind == 2: no bounds at all, ambiguous Never.
-                candidate = UninhabitedType()
-                candidate.ambiguous = True
-                return candidate
+                if kind == 2:
+                    # No bounds at all, ambiguous Never.
+                    candidate = UninhabitedType()
+                    candidate.ambiguous = True
+                    return candidate
+                # kind == 3: Any-absorption. Source_any is the Any side (or
+                # None via LITERAL_NONE), so build AnyType only when real.
+                from mypy.wirefixup import decode_source_any
+
+                source_any = decode_source_any(_ReadBuffer(bytes(blob)))
+                if source_any is not None:
+                    return AnyType(TypeOfAny.from_another_any, source_any=source_any)
 
     bottom: Type | None = None
     top: Type | None = None

@@ -34,15 +34,16 @@ fn encode_type(t: &Type) -> Option<Vec<u8>> {
 }
 
 /// `(kind, bytes)`:
-/// * `kind=0` solved; `bytes` holds the encoded candidate Type.
-/// * `kind=1` no solution or no lower bound; `bytes` is empty (candidate
-///   is the folded upper bound, or Python's `None` when `bytes` is
-///   absent).
+/// * `kind=0` solved; `bytes` holds the encoded candidate Type (`None`
+///   bytes = the Python body's final `None`).
+/// * `kind=1` no lower bound; `bytes` holds the folded upper bound (or
+///   no solution/`None` when `bytes` is absent).
 /// * `kind=2` ambiguous `UninhabitedType` (no bounds at all);
 ///   `bytes` empty. The shim returns `UninhabitedType(ambiguous=True)`
 ///   mirroring solve.py:276-281.
-/// * Any-absorption defers to Python entirely (the `from_another_any`
-///   source identity lives there), so no Any flag is on the wire.
+/// * `kind=3` AnyType absorption (top or bottom is `AnyType`); `bytes`
+///   holds the encoded `AnyType(from_another_any, source_any=<Any>)`.
+///   `source_any` is the Any side itself (solve.py:604-607).
 type SolveOut = (i64, Option<Vec<u8>>);
 
 /// `solve_one` (solve.py:263-329), Rust subset.
@@ -54,7 +55,9 @@ type SolveOut = (i64, Option<Vec<u8>>);
 ///   `UnionType.__init__` flattening.
 /// * `join_type_list` sorted by `_join_sorted_key` (non-infer_unions).
 /// * `meet_types` fold over uppers.
-/// * Any-absorption (any side is `AnyType`), deferred to Python.
+/// * Any-absorption (solve.py:604-607): either bound is a proper
+///   `AnyType` -> `AnyType(TypeOfAny.from_another_any, source_any=<the
+///   Any side>`).
 /// * `is_subtype(bottom, top)` selection (bottom wins when it is a
 ///   subtype of top; else no solution).
 #[allow(dead_code)]
@@ -106,19 +109,36 @@ pub(crate) fn solve_one_inner(
         });
     }
 
+    // Any-absorption (solve.py:604-607): `source_any` is the AnyType
+    // side itself (one of top/bottom is a real AnyType; the fold
+    // results carry Any positions from the input, never fold-produced).
     let p_top = top.as_ref();
     let p_bottom = bottom.as_ref();
-    if matches!(p_top, Some(Type::AnyType { .. })) || matches!(p_bottom, Some(Type::AnyType { .. }))
+    if matches!(p_bottom, Some(Type::AnyType { .. })) || matches!(p_top, Some(Type::AnyType { .. }))
     {
-        // Any-absorption defers to Python: the source AnyType identity
-        // (from_another_any) is a live object the wire cannot preserve;
-        // the shim computes `AnyType(from_another_any, source_any)`.
-        return None;
+        let source = if matches!(p_top, Some(Type::AnyType { .. })) {
+            top.clone()?
+        } else {
+            bottom.clone()?
+        };
+        let missing_import_name = match &source {
+            Type::AnyType {
+                missing_import_name,
+                ..
+            } => missing_import_name.clone(),
+            _ => None,
+        };
+        let any = Type::AnyType {
+            type_of_any: 7, // TypeOfAny.from_another_any
+            source_any: Some(Box::new(source)),
+            missing_import_name,
+        };
+        return Some((3, encode_type(&any)));
     }
 
     match (bottom, top) {
-        (None, Some(top_t)) => Some((1, encode_type(&top_t))),
-        (None, None) => Some((1, None)),
+        (None, Some(top_t)) => Some((0, Some(encode_type(&top_t)?))),
+        (None, None) => Some((0, None)),
         (Some(bottom_t), None) => {
             let bytes = encode_type(&bottom_t)?;
             Some((0, Some(bytes)))
@@ -130,9 +150,9 @@ pub(crate) fn solve_one_inner(
                 Some((0, Some(bytes)))
             } else {
                 // Not a subtype: solve_one returns None (unbound). The
-                // kind=1/no-blob signal maps to exactly that, so no defer
+                // kind=0/no-blob signal maps to exactly that, so no defer
                 // is needed (the Python re-run would compute the same).
-                Some((1, None))
+                Some((0, None))
             }
         }
     }
@@ -291,11 +311,10 @@ fn any_type_from(source: Type) -> Type {
 }
 
 /// `#[pyfunction]` entry for `solve_one`. The Python-side shim
-/// (mypy/solve.py) calls this after `get_proper_type` expansion and the
-/// ambiguous-upper filter, with serialized `lowers`/`uppers` blob lists,
-/// `infer_unions`, and `strict_optional`. Returns `None` (Python `None`)
-/// when Rust doesn't handle the case; `Some((kind, bytes))` otherwise
-/// (see `SolveOut`).
+/// (mypy/solve.py) calls this after the ambiguous-upper filter, with
+/// serialized `lowers`/`uppers` blob lists, `infer_unions`, and
+/// `strict_optional`. Returns `None` (Python `None`) when Rust doesn't
+/// handle the case; `Some((kind, bytes))` otherwise (see `SolveOut`).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_solve_one(
@@ -1002,15 +1021,15 @@ fn solve_one_for_dependent(
     )
     .ok_or(())?;
     match out {
-        (0, Some(bytes)) | (1, Some(bytes)) => {
+        (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
             let typ = decode_type(&bytes).ok_or(())?;
             if wire_unsafe_solution(&typ) {
                 return Err(());
             }
             Ok(Some(typ))
         }
-        // kind=1 no-bytes: no solution (Python returns None).
-        (1, None) => Ok(None),
+        // No-blob kinds: no solution (Python returns None).
+        (0, None) | (1, None) => Ok(None),
         // kind=2: ambiguous Never.
         _ => Ok(Some(Type::UninhabitedType { ambiguous: true })),
     }
@@ -1366,15 +1385,15 @@ fn solve_constraints_native(
             )
             .ok_or(())?;
             match out {
-                (0, Some(bytes)) | (1, Some(bytes)) => {
+                (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
                     let typ = decode_type(&bytes).ok_or(())?;
                     if wire_unsafe_solution(&typ) {
                         return Err(());
                     }
                     Some(typ)
                 }
-                // kind=1 no-blob: no solution (Python returns None).
-                (1, None) => None,
+                // No-blob kinds: no solution (Python returns None).
+                (0, None) | (1, None) => None,
                 // kind=2: ambiguous Never.
                 _ => Some(Type::UninhabitedType { ambiguous: true }),
             }
@@ -1877,7 +1896,7 @@ mod tests {
         let r = make_resolver(vec![]);
         let up = instance("a.A", vec![]);
         let out = solve_one_inner(&[], std::slice::from_ref(&up), false, true, &r).unwrap();
-        assert_eq!(out.0, 1);
+        assert_eq!(out.0, 0);
         let bytes = out.1.unwrap();
         assert_eq!(decode_type(&bytes).unwrap(), up);
     }
@@ -1904,12 +1923,12 @@ mod tests {
 
     #[test]
     fn non_subtype_returns_none_with_bounds() {
-        // A and B unrelated -> candidate = None (kind=1, no bytes).
+        // A and B unrelated -> candidate = None (kind=0, no bytes).
         let r = make_resolver(vec![snap("a.A"), snap("a.B")]);
         let lo = instance("a.A", vec![]);
         let up = instance("a.B", vec![]);
         let out = solve_one_inner(&[lo], &[up], false, true, &r).unwrap();
-        assert_eq!(out.0, 1);
+        assert_eq!(out.0, 0);
         assert!(out.1.is_none());
     }
 
@@ -2126,5 +2145,122 @@ mod tests {
         let (lin, id) = find_linear(&c);
         assert!(!lin);
         assert_eq!(id, None);
+    }
+
+    #[test]
+    fn any_top_with_bottom_returns_from_another_any() {
+        // Uppers = [Any], lowers = [A] -> Any(from_another_any, Any).
+        // Top is the Any side, so the source is the Any itself
+        // (solve.py:604-607), never the lower.
+        let r = make_resolver(vec![snap("a.A")]);
+        let lo = instance("a.A", vec![]);
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let out = solve_one_inner(&[lo], &[any.clone()], false, true, &r).unwrap();
+        assert_eq!(out.0, 3);
+        let bytes = out.1.unwrap();
+        let decoded = decode_type(&bytes).unwrap();
+        let Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } = decoded
+        else {
+            panic!("expected AnyType, got {decoded:?}");
+        };
+        assert_eq!(type_of_any, 7); // TypeOfAny.from_another_any
+        assert_eq!(*source_any.unwrap(), any);
+        assert_eq!(missing_import_name, None);
+    }
+
+    #[test]
+    fn any_bottom_with_top_returns_from_another_any() {
+        // Uppers = [B], lowers = [Any] -> Any(from_another_any, Any).
+        // Bottom is the Any side, so the source is the Any itself.
+        let r = make_resolver(vec![snap("a.B")]);
+        let up = instance("a.B", vec![]);
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let out = solve_one_inner(&[any.clone()], &[up], false, true, &r).unwrap();
+        assert_eq!(out.0, 3);
+        let decoded = decode_type(&out.1.unwrap()).unwrap();
+        let Type::AnyType { source_any, .. } = decoded else {
+            panic!("expected AnyType, got {decoded:?}");
+        };
+        assert_eq!(*source_any.unwrap(), any);
+    }
+
+    #[test]
+    fn any_top_and_any_bottom_keep_any_source_and_missing_import() {
+        // Both sides Any -> Any(from_another_any, <the Any side>) with
+        // the source's missing_import_name carried over (AnyType.__init__
+        // types.py:1386-1392).
+        let r = make_resolver(vec![]);
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: Some("mod.thing".to_string()),
+        };
+        let out = solve_one_inner(&[any.clone()], &[any.clone()], false, true, &r).unwrap();
+        assert_eq!(out.0, 3);
+        let decoded = decode_type(&out.1.unwrap()).unwrap();
+        let Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } = decoded
+        else {
+            panic!("expected AnyType, got {decoded:?}");
+        };
+        assert_eq!(type_of_any, 7);
+        assert_eq!(*source_any.unwrap(), any);
+        assert_eq!(missing_import_name.as_deref(), Some("mod.thing"));
+    }
+
+    #[test]
+    fn any_side_unrelated_bottom_delegates_only_after_absorption() {
+        // Any in a lower position absorbs even when the upper is
+        // unrelated (no subtype check runs).
+        let r = make_resolver(vec![snap("a.A"), snap("a.B")]);
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let up = instance("a.B", vec![]);
+        let out = solve_one_inner(&[any.clone()], &[up], false, true, &r).unwrap();
+        assert_eq!(out.0, 3);
+        let decoded = decode_type(&out.1.unwrap()).unwrap();
+        let Type::AnyType { source_any, .. } = decoded else {
+            panic!("expected AnyType, got {decoded:?}");
+        };
+        assert_eq!(*source_any.unwrap(), any);
+    }
+
+    #[test]
+    fn top_only_without_any_solves_to_top() {
+        // Uppers = [A], no lowers -> candidate = A (kind=0 with bytes).
+        let r = make_resolver(vec![snap("a.A")]);
+        let up = instance("a.A", vec![]);
+        let out = solve_one_inner(&[], &[up.clone()], false, true, &r).unwrap();
+        assert_eq!(out.0, 0);
+        assert_eq!(decode_type(&out.1.unwrap()).unwrap(), up);
+    }
+
+    #[test]
+    fn non_subtype_pair_is_no_solution() {
+        // A and B unrelated -> solve_one returns None (kind=0, no bytes).
+        let r = make_resolver(vec![snap("a.A"), snap("a.B")]);
+        let lo = instance("a.A", vec![]);
+        let up = instance("a.B", vec![]);
+        let out = solve_one_inner(&[lo], &[up], false, true, &r).unwrap();
+        assert_eq!(out.0, 0);
+        assert!(out.1.is_none());
     }
 }

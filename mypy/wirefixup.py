@@ -26,6 +26,7 @@ from typing import Any
 
 from mypy.nodes import FakeInfo
 from mypy.types import (
+    AnyType,
     CallableType,
     Instance,
     Parameters,
@@ -37,6 +38,8 @@ from mypy.types import (
     TypeVarTupleType,
     TypeVarType,
     get_proper_type,
+    read_int,
+    read_str_opt,
 )
 
 # type_visitor needs to be imported after types
@@ -98,6 +101,29 @@ def fixup_wire_type(typ: Type) -> Type | None:
     # None) must not leave NOT_READY singletons leaking into later calls.
     fixup_instance_cache()
     return None if fixer.missing else result
+
+
+def decode_source_any(data: ReadBuffer) -> Type | None:
+    """Read a wire AnyType blob for `solve_one` kind=3 (Any-absorption).
+
+    Structurally mirrors `AnyType.read` (types.py:1463-1473) up to and
+    including `END_TAG`, returning just the `source_any` Type (the Rust
+    seam emits `AnyType(from_another_any, source_any=...)`, whose own
+    `type_of_any`/`missing_import_name` are canonical). Returns None for
+    `LITERAL_NONE` so the Python shim skips the `from_another_any`
+    construction and falls through to the pure-Python body instead.
+    """
+    from mypy.types import ANY_TYPE, LITERAL_NONE, read_tag
+
+    tag = read_tag(data)
+    if tag == LITERAL_NONE:
+        return None
+    assert tag == ANY_TYPE
+    # Delegate to `AnyType.read`, which consumes the remaining
+    # `source_any`/`type_of_any`/`missing_import_name`/`END_TAG` fields
+    # without a leading class tag.
+    source_any_type = AnyType.read(data)
+    return source_any_type.source_any
 
 
 def fixup_instance_cache() -> None:
