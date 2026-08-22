@@ -67,6 +67,21 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
     }
 }
 
+/// Resolving variant of `get_proper_or_none`: expands a `TypeAliasType`
+/// through the alias resolver (chain-resolving, argument-substituting).
+/// Returns an owned expanded type, or `None` to defer (missing snapshot,
+/// cycle, undecodable target, unsupported substitution). Used only by
+/// seams whose Python mirror calls `get_proper_type` on the value.
+fn get_proper_or_expand(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<Type> {
+    match typ {
+        Type::TypeAliasType { .. } => {
+            let (target, _, _) = expanded_alias_target(typ, aliases)?;
+            Some(target)
+        }
+        _ => Some(typ.clone()),
+    }
+}
+
 /// Expand a `TypeAliasType` wire node to its frozen `target` snapshot
 /// (B3a). This is a *shape-only* expansion: the target is decoded as-is
 /// and the alias's type arguments are NOT substituted. That is parity-safe
@@ -99,6 +114,52 @@ pub(crate) fn expand_alias_shape(
         }
         seen.push(type_ref.clone());
         let snap = aliases.get(&type_ref)?;
+        let mut buf = ReadBuffer::new(&snap.target);
+        current = read_type(&mut buf, None).ok()?;
+    }
+}
+
+/// Follow an alias chain to its **raw** snapshot target, without
+/// substituting the alias's type arguments (unlike `expanded_alias_target`).
+/// Returns the first non-alias wire type: for `B = A`, `A = list[A]`, the
+/// chain resolves to `list[A]` with no typevar left behind. Used by the
+/// union-expansion seams, where the result feeds `make_simplified_union` /
+/// `_remove_redundant_union_items` and structural parity is what matters;
+/// substituting into a generic target is both unnecessary there and
+/// wrong for chains of different arities (it leaves a phantom typevar).
+///
+/// This RAW expansion is only valid when the alias needs no argument
+/// substitution: a root `TypeAliasType` with empty `args` and a chain of
+/// snapshots with empty `alias_tvars`. Any substitution requirement
+/// (e.g. `Second[str]` where `Second = Node[List[int], List[T]]`) means
+/// Python's `_expand_once` substitution must run, so we defer (return
+/// `None`) and let the caller fall back to Python.
+/// Returns `None` to defer on a missing snapshot, an alias cycle, or a
+/// substitution-requiring alias.
+pub(crate) fn expand_alias_target_raw(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Type> {
+    let mut current = typ.clone();
+    let mut seen: Vec<String> = Vec::new();
+    loop {
+        let type_ref = match &current {
+            Type::TypeAliasType { type_ref, args } => {
+                if !args.is_empty() {
+                    return None;
+                }
+                type_ref.clone()
+            }
+            _ => return Some(current),
+        };
+        if seen.contains(&type_ref) {
+            return None;
+        }
+        seen.push(type_ref.clone());
+        let snap = aliases.get(&type_ref)?;
+        if !snap.alias_tvars.is_empty() {
+            return None;
+        }
         let mut buf = ReadBuffer::new(&snap.target);
         current = read_type(&mut buf, None).ok()?;
     }
@@ -843,15 +904,18 @@ pub(crate) fn is_async_def_inner(typ: &Type) -> Option<bool> {
 ///     are not TypedDicts (a non-TypedDict `**kwargs` cannot be matched
 ///     with certainty).
 ///
-/// `actual_types` each carry a serialized type; we resolve each through
-/// `get_proper_or_none` so a `TypeAliasType` actual defers (None), since
-/// the wire format has no alias target.
+/// `actual_types` each carry a serialized type; each non-star actual is
+/// resolved through `get_proper_or_none` so a `TypeAliasType` actual
+/// expands via the alias resolver (mirroring Python's
+/// `isinstance(get_proper_type(actual_types[m]), TypedDictType)`). An
+/// unexpandable alias defers (None).
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn rust_is_duplicate_mapping(
     mapping: Vec<i64>,
     actual_types: Vec<Vec<u8>>,
     actual_kinds: Vec<i64>,
+    resolver: &NativeTypeResolver,
 ) -> PyResult<Option<bool>> {
     let mut types = Vec::with_capacity(mapping.len());
     for &idx in &mapping {
@@ -863,13 +927,19 @@ pub(crate) fn rust_is_duplicate_mapping(
             None => return Ok(None),
         }
     }
-    Ok(is_duplicate_mapping_inner(&mapping, &types, &actual_kinds))
+    Ok(is_duplicate_mapping_inner(
+        &mapping,
+        &types,
+        &actual_kinds,
+        resolver.alias_resolver(),
+    ))
 }
 
 fn is_duplicate_mapping_inner(
     mapping: &[i64],
     actual_types: &[Type],
     actual_kinds: &[i64],
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<bool> {
     // `mapping` with one entry (or fewer) cannot be a duplicate.
     if mapping.len() <= 1 {
@@ -894,7 +964,7 @@ fn is_duplicate_mapping_inner(
             all_non_typeddict_star2 = false;
             break;
         }
-        let proper = get_proper_or_none(&actual_types[i])?;
+        let proper = get_proper_or_expand(&actual_types[i], aliases)?;
         if matches!(proper, Type::TypedDictType { .. }) {
             all_non_typeddict_star2 = false;
             break;
@@ -4008,14 +4078,22 @@ mod tests {
     fn test_is_duplicate_mapping_single_false() {
         let kinds = vec![ARG_POS];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0], &[make_instance("int", vec![])], &kinds),
+            is_duplicate_mapping_inner(
+                &[0],
+                &[make_instance("int", vec![])],
+                &kinds,
+                &Default::default()
+            ),
             Some(false)
         );
     }
 
     #[test]
     fn test_is_duplicate_mapping_empty_false() {
-        assert_eq!(is_duplicate_mapping_inner(&[], &[], &[]), Some(false));
+        assert_eq!(
+            is_duplicate_mapping_inner(&[], &[], &[], &Default::default()),
+            Some(false)
+        );
     }
 
     #[test]
@@ -4023,7 +4101,7 @@ mod tests {
         let kinds = vec![ARG_STAR, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(false)
         );
     }
@@ -4034,7 +4112,7 @@ mod tests {
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(false)
         );
     }
@@ -4045,7 +4123,7 @@ mod tests {
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), make_typeddict()];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4055,7 +4133,7 @@ mod tests {
         let kinds = vec![ARG_POS, ARG_POS];
         let types = vec![make_instance("int", vec![]), make_instance("str", vec![])];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4071,7 +4149,7 @@ mod tests {
         let kinds = vec![ARG_POS, ARG_POS];
         let types = vec![make_instance("int", vec![]), alias];
         assert_eq!(
-            is_duplicate_mapping_inner(&[0, 1], &types, &kinds),
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
             Some(true)
         );
     }
@@ -4086,14 +4164,20 @@ mod tests {
         };
         let kinds = vec![ARG_STAR2, ARG_STAR2];
         let types = vec![make_instance("int", vec![]), alias];
-        assert_eq!(is_duplicate_mapping_inner(&[0, 1], &types, &kinds), None);
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 1], &types, &kinds, &Default::default()),
+            None
+        );
     }
 
     #[test]
     fn test_is_duplicate_mapping_out_of_range_defers() {
         let kinds = vec![ARG_POS];
         let types = vec![make_instance("int", vec![])];
-        assert_eq!(is_duplicate_mapping_inner(&[0, 5], &types, &kinds), None);
+        assert_eq!(
+            is_duplicate_mapping_inner(&[0, 5], &types, &kinds, &Default::default()),
+            None
+        );
     }
 
     // -- method_fullname --

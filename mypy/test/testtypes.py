@@ -5147,6 +5147,327 @@ class NativeTryGettingLiteralSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAliasExpansionSuite(Suite):
+    """Parity suite for TypeAliasType expansion in kernel seams (alias slice).
+
+    Four seams previously deferred to Python on a `TypeAliasType` because
+    the wire carries only `type_ref`; each now expands the alias through
+    the native resolver's alias snapshot (chain-resolving,
+    argument-substituting) and decides:
+
+    - `rust_make_simplified_union` (mypy.typeops) expands alias items
+      before the flatten/dedup/contract pipeline, mirroring
+      `flatten_nested_unions`' per-item `get_proper_type`.
+    - `rust_remove_redundant_union_items` (mypy.typeops) expands each
+      item up front, mirroring the Python loop's `get_proper_type(ti)`.
+    - `rust_is_duplicate_mapping` (mypy.checkexpr) expands the `**kwargs`
+      actuals through `get_proper_or_expand` when checking whether every
+      mapped actual is a non-TypedDict `**kwargs`.
+    - `rust_type_requires_usage` (mypy.checker) expands the type before
+      the `typing.Coroutine` instance dispatch, mirroring
+      `get_proper_type(typ)`.
+
+    Each test toggles the owning gate off (pure Python) and on (Rust
+    seam) and asserts an equal produced type string, then proves the
+    Rust seam actually engages (non-None) on the alias input.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_resolver, _set_native_checker_stmts_active
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._base_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.type_typei,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in self._base_infos})
+        self._resolver = _type_kernel.build_native_resolver(self._base_infos, [])
+        self._resolver.set_live_typeinfo_map(
+            {info.fullname: info for info in self._base_infos}
+        )
+        _set_native_typeops_resolver(self._resolver)
+        _set_native_checkexpr_resolver(self._resolver)
+        _set_native_checker_resolver(self._resolver)
+        _set_native_typeops_active(True)
+        _set_native_checkexpr_active(True)
+        _set_native_checker_stmts_active(True)
+
+    def _rebuild_resolver(self, aliases: list[Any], extra_infos: list[Any] | None = None) -> None:
+        from mypy.checker import _set_native_checker_resolver
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+        from mypy.typeops import _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        infos = self._base_infos + (extra_infos or [])
+        set_wire_typeinfo_map({info.fullname: info for info in infos})
+        self._resolver = _type_kernel.build_native_resolver(infos, aliases)
+        self._resolver.set_live_typeinfo_map({info.fullname: info for info in infos})
+        _set_native_typeops_resolver(self._resolver)
+        _set_native_checkexpr_resolver(self._resolver)
+        _set_native_checker_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_resolver, _set_native_checker_stmts_active
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+        _set_native_checker_stmts_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _make_alias(
+        self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
+    ) -> TypeAlias:  # type: ignore[name-defined]
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],  # type: ignore[arg-type]
+        )
+
+    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:  # type: ignore[name-defined]
+        return TypeAliasType(alias, [])
+
+    def _with_typeops_gate(
+        self, active: bool, fn: Callable[[], object]
+    ) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _with_checkexpr_gate(
+        self, active: bool, fn: Callable[[], object]
+    ) -> object:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkexpr_active(True)
+
+    def _with_checker_gate(
+        self, active: bool, fn: Callable[[], object]
+    ) -> object:
+        from mypy.checker import _set_native_checker_stmts_active
+
+        _set_native_checker_stmts_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checker_stmts_active(True)
+
+    def test_union_simplify_alias_of_a(self) -> None:
+        # A = A, then Union[A-alias, A]: the alias item expands to A, which
+        # dedups against the second A, collapsing the union to A.
+        from mypy.typeops import _serialize_type_list, make_simplified_union
+
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._rebuild_resolver([alias])
+        u = UnionType.make_union([self._alias_type(alias), self.fx.a])
+        off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
+        on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
+        assert_equal(str(on), str(off), "make_simplified_union alias parity")
+        assert_equal(str(on), str(self.fx.a), "alias of A must collapse the union")
+        # The Rust seam must decide on the alias input, not defer.
+        rusted = _type_kernel.rust_make_simplified_union(
+            _serialize_type_list([self._alias_type(alias), self.fx.a]),
+            0,
+            -1,
+            False,
+            True,
+            False,
+            True,
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on alias union simplification"
+
+    def test_union_simplify_alias_dedups_subtype(self) -> None:
+        # Sub = A (proper subclass via MRO), then B = Sub: the alias item
+        # expands to `Sub`, which is a proper subtype of A, so
+        # Union[B-alias, A] must collapse to A exactly like Python.
+        from mypy.typeops import _serialize_type_list, make_simplified_union
+
+        sub = self.fx.make_type_info(
+            "mod.Sub", mro=[self.fx.ai, self.fx.oi], bases=[Instance(self.fx.ai, [])]
+        )
+        alias = self._make_alias("mod.TB", Instance(sub, []))
+        self._rebuild_resolver([alias], extra_infos=[sub])
+        u = UnionType.make_union([self._alias_type(alias), self.fx.a])
+        off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
+        on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
+        assert_equal(str(on), str(off), "make_simplified_union subtype parity")
+        assert_equal(str(on), "A", "alias to Sub must collapse against A")
+        rusted = _type_kernel.rust_make_simplified_union(
+            _serialize_type_list([self._alias_type(alias), self.fx.a]),
+            0,
+            -1,
+            False,
+            True,
+            False,
+            True,
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on alias subtype"
+
+    def test_union_simplify_nested_alias_flatten(self) -> None:
+        # B = A, A = list[A]: the chain must resolve to list[A], which
+        # stays as the union's single item (no duplicate to collapse).
+        from mypy.typeops import _serialize_type_list, make_simplified_union
+
+        alias_a = self._make_alias("mod.TA", self.fx.a)
+        alias_b = self._make_alias("mod.TB", Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([alias_a, alias_b])
+        u = UnionType.make_union([self._alias_type(alias_b), self.fx.a])
+        off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
+        on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
+        assert_equal(str(on), str(off), "nested-alias make_simplified_union parity")
+        rusted = _type_kernel.rust_make_simplified_union(
+            _serialize_type_list([self._alias_type(alias_b), self.fx.a]),
+            0,
+            -1,
+            False,
+            True,
+            False,
+            True,
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on nested alias flatten"
+
+    def test_remove_redundant_alias_of_a_dedups(self) -> None:
+        # Union[A-alias, A] through the redundant-union pass: both items
+        # expand to A, so the second is a duplicate.
+        from mypy.typeops import _remove_redundant_union_items, _serialize_type_list
+
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._rebuild_resolver([alias])
+        items = [self._alias_type(alias), self.fx.a]
+        off = self._with_typeops_gate(
+            False, lambda: _remove_redundant_union_items(items, False)
+        )
+        on = self._with_typeops_gate(
+            True, lambda: _remove_redundant_union_items(items, False)
+        )
+        assert_equal(str(on), str(off), "remove_redundant alias parity")
+        assert on == [self.fx.a], f"alias of A must dedup, got {on!r}"
+        rusted = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items),
+            False,
+            True,
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on remove_redundant alias"
+
+    def test_remove_redundant_alias_subtype(self) -> None:
+        # B = list[A]: alias + object; the alias's proper form is a proper
+        # subtype of object, so it must be removed.
+        from mypy.typeops import _remove_redundant_union_items, _serialize_type_list
+
+        alias = self._make_alias("mod.TB", Instance(self.fx.std_listi, [self.fx.a]))
+        self._rebuild_resolver([alias])
+        items = [self._alias_type(alias), self.fx.o]
+        off = self._with_typeops_gate(
+            False, lambda: _remove_redundant_union_items(items, False)
+        )
+        on = self._with_typeops_gate(
+            True, lambda: _remove_redundant_union_items(items, False)
+        )
+        assert_equal(str(on), str(off), "remove_redundant alias subtype parity")
+        assert on == [self.fx.o], f"alias to list[A] must be removed, got {on!r}"
+        rusted = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list(items),
+            False,
+            True,
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on remove_redundant alias subtype"
+
+    def test_is_duplicate_mapping_alias_value(self) -> None:
+        # Two **kwargs actuals where an alias to A (a non-TypedDict) is
+        # among them: the check is disabled (all non-TypedDict), so the
+        # result is False; the alias expands to A rather than deferring.
+        from mypy.checkexpr import _serialize_type_for_checkexpr, is_duplicate_mapping
+
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._rebuild_resolver([alias])
+        items = [self._alias_type(alias), self.fx.a]
+        off = self._with_checkexpr_gate(
+            False,
+            lambda: is_duplicate_mapping([0, 1], items, [ARG_STAR2, ARG_STAR2]),
+        )
+        on = self._with_checkexpr_gate(
+            True,
+            lambda: is_duplicate_mapping([0, 1], items, [ARG_STAR2, ARG_STAR2]),
+        )
+        assert_equal(str(on), str(off), "is_duplicate_mapping alias parity")
+        assert on is False, "two non-TypedDict **kwargs must not duplicate"
+        rusted = _type_kernel.rust_is_duplicate_mapping(
+            [0, 1],
+            [
+                _serialize_type_for_checkexpr(self._alias_type(alias)),
+                _serialize_type_for_checkexpr(self.fx.a),
+            ],
+            [int(ARG_STAR2.value), int(ARG_STAR2.value)],
+            self._resolver,
+        )
+        assert rusted is not None, "Rust deferred on is_duplicate_mapping alias"
+
+    def test_type_requires_usage_alias_to_coroutine(self) -> None:
+        # A = Coroutine: the alias expands to typing.Coroutine and the note
+        # code fires; the plain instance (no __await__) stays a no-op.
+        from mypy.checker import (
+            _serialize_type_for_checker,
+            _try_native_type_requires_usage,
+        )
+
+        # Hand-build a typing.Coroutine TypeInfo: three typevars (YieldT,
+        # SendT, ReturnT) so it is a coroutine-shaped instance.
+        coro = self.fx.make_type_info(
+            "typing.Coroutine", typevars=["T_co", "T_contra", "T_ret"]
+        )
+        alias = self._make_alias(
+            "mod.TCoroutine", Instance(coro, [self.fx.anyt, self.fx.o, self.fx.o])
+        )
+        self._rebuild_resolver([alias])
+        # End-to-end shim: the note code fires only when the checker gate and
+        # resolver are installed, and the alias is expanded to Coroutine.
+        off = self._with_checker_gate(
+            False, lambda: _try_native_type_requires_usage(self._alias_type(alias))
+        )
+        on = self._with_checker_gate(
+            True, lambda: _try_native_type_requires_usage(self._alias_type(alias))
+        )
+        assert off is None, f"gate-off shim must defer, got {off!r}"
+        assert on is not None and on[0] == "Are you missing an await?", f"got {on!r}"
+        # Direct seam call proves the Rust expansion actually fired.
+        rusted = _type_kernel.rust_type_requires_usage(
+            _serialize_type_for_checker(self._alias_type(alias)), self._resolver
+        )
+        assert rusted is not None, "Rust deferred on alias to Coroutine"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFunctionTypeSuite(Suite):
     """Parity for the Rust `function_type`/`callable_type` port (mypy.typeops).
 

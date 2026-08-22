@@ -8291,11 +8291,15 @@ def is_non_empty_tuple(t: Type) -> bool:
 def is_duplicate_mapping(
     mapping: list[int], actual_types: list[Type], actual_kinds: list[ArgKind]
 ) -> bool:
-    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = [_serialize_type_for_checkexpr(actual_types[m]) for m in mapping]
             result = _rust_is_duplicate_mapping(
-                mapping, type_bytes, [int(k.value) for k in actual_kinds]
+                mapping, type_bytes, [int(k.value) for k in actual_kinds], _native_checkexpr_resolver
             )
             if result is not None:
                 return result
