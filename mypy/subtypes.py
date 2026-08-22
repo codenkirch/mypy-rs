@@ -66,11 +66,11 @@ from mypy.types import (
     TypeVisitor,
     UnboundType,
     UninhabitedType,
+    UnionType,
+    UnpackType,
     _serialize_with_taint_check,
     _type_wire_cache,
     _wire_cache_enabled,
-    UnionType,
-    UnpackType,
     find_unpack_in_list,
     flatten_nested_unions,
     get_proper_type,
@@ -961,6 +961,30 @@ class SubtypeVisitor(TypeVisitor[bool]):
 
     def visit_parameters(self, left: Parameters) -> bool:
         if isinstance(self.right, Parameters):
+            # Native `are_parameters_compatible` seam (Stage 3c/M8c). Returns
+            # None for shapes the engine cannot decide (generic parameters,
+            # meet_types merge, nested is_subtype deferral); else Python fallback.
+            if (
+                _HAS_TYPE_KERNEL
+                and _native_subtype_active
+                and _native_subtype_resolver is not None
+            ):
+                try:
+                    result = _type_kernel.rust_are_parameters_compatible(
+                        _serialize_type(left),
+                        _serialize_type(self.right),
+                        False,  # is_proper_subtype
+                        self.subtype_context.ignore_pos_arg_names,
+                        False,  # allow_partial_overlap
+                        False,  # strict_concatenate_check
+                        state.strict_optional,
+                        self.proper_subtype,  # nested comparisons
+                        _native_subtype_resolver,
+                    )
+                except (AssertionError, NotImplementedError):
+                    result = None
+                if result is not None:
+                    return result
             return are_parameters_compatible(
                 left,
                 self.right,
