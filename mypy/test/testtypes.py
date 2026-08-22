@@ -6680,6 +6680,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
                     "builtins.function": SymbolTableNode(MDEF, fx.functioni),
                     "builtins.int": SymbolTableNode(MDEF, int_info),
                     "builtins.str": SymbolTableNode(MDEF, fx.str_type_info),
+                    "builtins.bool": SymbolTableNode(MDEF, fx.bool_type_info),
                     # Short names too: `anal_type` resolves type args like
                     # `int` through `lookup_qualified(name)`, and the fixture
                     # has no module scope for the `int`/`str` short names to
@@ -6815,6 +6816,9 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
             "not_in_required": True,
             "not_in_notrequired": True,
             "not_in_readonly": True,
+            "not_in_literal": True,
+            "not_in_unpack": True,
+            "allow_unpack": False,
         }
         defaults.update(facts)
         result = _rust_classify_special_unbound(
@@ -6834,6 +6838,9 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
             defaults["not_in_required"],
             defaults["not_in_notrequired"],
             defaults["not_in_readonly"],
+            defaults["not_in_literal"],
+            defaults["not_in_unpack"],
+            defaults["allow_unpack"],
         )
         assert result is not None, "Rust try_analyze_special_unbound did not engage"
 
@@ -7153,8 +7160,79 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
         self._assert_par("mod.SomeName")
 
     def test_literal_defers(self) -> None:
-        # Literal -> Rust returns None (defer); Python runs analyze_literal_type.
-        self._assert_par("typing.Literal", [UnboundType("int")])
+        # Literal -> TAG_LITERAL_DEFER; the shim runs analyze_literal_type.
+        # An unresolved Instance arg (plain `int` through the harness
+        # lookup) is rejected as an invalid parameter -> error Any.
+        self._assert_par("typing.Literal", [UnboundType("int")], expected="Any")
+        self._assert_engages(fullname="typing.Literal", not_in_literal=False)
+
+    def test_literal_gold(self) -> None:
+        # String-form literal arg (Literal["a"] in real code) -> a real
+        # LiteralType this time; the shim still routes analyze_literal_type.
+        arg = UnboundType("a", original_str_expr="a", original_str_fallback="builtins.str")
+        self._assert_par("typing.Literal", [arg], expected="Literal['a']")
+        self._assert_engages(fullname="typing_extensions.Literal", not_in_literal=False)
+
+    def test_literal_arity_error(self) -> None:
+        # Bare Literal -> "at least one parameter" + error Any.
+        self._assert_par("typing.Literal", expected="Any")
+        self._assert_engages(fullname="typing.Literal", not_in_literal=False)
+
+    def test_typeguard_bool(self) -> None:
+        # TypeGuard filters into the bool-alias branch; the arg is analyzed
+        # for its errors but the result is builtins.bool.
+        self._assert_par("typing.TypeGuard", [UnboundType("int")], expected="builtins.bool")
+        self._assert_engages(fullname="typing.TypeGuard")
+
+    def test_typeguard_arity_error(self) -> None:
+        self._assert_par(
+            "typing.TypeGuard",
+            [UnboundType("int"), UnboundType("str")],
+            expected="builtins.bool",
+        )
+        self._assert_engages(fullname="typing.TypeGuard")
+
+    def test_typeis_bool(self) -> None:
+        self._assert_par(
+            "typing_extensions.TypeIs", [UnboundType("int")], expected="builtins.bool"
+        )
+        self._assert_engages(fullname="typing_extensions.TypeIs")
+
+    def test_unpack_arg_err(self) -> None:
+        # Unpack with arity != 1 -> from_error Any; classified in Rust.
+        self._assert_par(
+            "typing.Unpack",
+            [UnboundType("int"), UnboundType("str")],
+            allow_unpack=True,
+            expected="Any",
+        )
+        self._assert_engages(
+            fullname="typing.Unpack", arg_count=2, not_in_unpack=False, allow_unpack=True
+        )
+
+    def test_unpack_pos_err(self) -> None:
+        # Unpack in a non-variadic position -> from_error Any.
+        self._assert_par("typing.Unpack", [UnboundType("int")], expected="Any")
+        self._assert_engages(
+            fullname="typing.Unpack", arg_count=1, not_in_unpack=False, allow_unpack=False
+        )
+
+    def test_unpack_gold(self) -> None:
+        # Unpack[int] in a variadic position: the gold path mutates
+        # allow_type_var_tuple around anal_type, so the classifier defers
+        # (None) and both gates run the full Python body -> parity only.
+        self._assert_par(
+            "typing.Unpack",
+            [UnboundType("int")],
+            allow_unpack=True,
+            expected="*builtins.int",
+        )
+
+    def test_self_defer_parity(self) -> None:
+        # Self has no pure decision surface (needs the live api.type /
+        # api.type.self_type, and the args-error falls through to the gold
+        # body): the classifier defers and both gates run the full body.
+        self._assert_par("typing_extensions.Self")
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnalyzeTypeWithInfoSuite(Suite):

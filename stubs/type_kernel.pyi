@@ -1658,6 +1658,9 @@ def rust_classify_special_unbound(
     not_in_required: bool,
     not_in_notrequired: bool,
     not_in_readonly: bool,
+    not_in_literal: bool,
+    not_in_unpack: bool,
+    allow_unpack: bool,
 ) -> int | None: ...
 
 # mypy/semanal.py — decorator/semanal-visitor helpers.
