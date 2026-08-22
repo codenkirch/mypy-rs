@@ -25,6 +25,7 @@ use pyo3::prelude::*;
 
 use crate::setops::{flatten_nested_unions, union_make_union};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::visitor::split_with_prefix_and_suffix_inner;
 use crate::wire::{
     read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
 };
@@ -166,22 +167,78 @@ pub(crate) fn expand_type_by_instance_core(
         return None;
     }
     let snap = resolver.get(type_ref)?;
-    // TypeVarTuple branch (expandtype.py:302-316) stays in Python.
-    if snap.has_type_var_tuple_type {
-        return None;
-    }
     // Python fast path (expandtype.py:298-299) returns `typ` unchanged
     // when the instance has no args and no TVT.
-    if args.is_empty() {
+    if args.is_empty() && !snap.has_type_var_tuple_type {
         return Some(typ.clone());
     }
-    let raw_ids = &snap.type_var_raw_ids;
-    // Python `zip` truncates to the shorter; any unbound tvar makes
-    // submission incomplete, so defer (the length mismatch is legal).
-    if raw_ids.len() != args.len() {
-        return None;
-    }
     let mut env = HashMap::with_capacity(args.len());
+    if snap.has_type_var_tuple_type {
+        // TypeVarTuple branch (expandtype.py:389-406): middle args bind
+        // the single variadic tvar as a TupleType; prefix/suffix bind the
+        // ordinary tvars pairwise (tvars_* vs args_*).
+        let tvars = &snap.type_vars_with_variance;
+        let raw_ids = &snap.type_var_raw_ids;
+        if tvars.len() != raw_ids.len() {
+            // Parallel arrays out of sync -> cannot key the env.
+            return None;
+        }
+        let prefix = snap.type_var_tuple_prefix.unwrap_or(0);
+        let suffix = snap.type_var_tuple_suffix.unwrap_or(0);
+        // Python split_with_prefix_and_suffix on defn.type_vars never
+        // pads (extend finds no UnpackType in a tvar list), so the
+        // middle must be non-empty or Python raises IndexError.
+        if prefix + suffix > tvars.len() {
+            return None;
+        }
+        if args.len() < prefix + suffix {
+            // After split's extend, args still has fewer than
+            // prefix+suffix items -> slice below would underflow.
+            return None;
+        }
+        let (_args_prefix, args_middle, _args_suffix) =
+            split_with_prefix_and_suffix_inner(args, prefix, suffix);
+        // tvars_middle[0] must be the single TypeVarTuple
+        // (expandtype.py:389-390).
+        let (_, _, tvt_kind) = tvars[prefix];
+        if tvt_kind != 2 {
+            return None;
+        }
+        let tvt_raw_id = raw_ids[prefix];
+        let tvt_fallback = decode_type(snap.type_var_tuple_fallback.as_ref()?)?;
+        // Bind tvar.id: TupleType(args_middle, tvar.tuple_fallback)
+        // (expandtype.py:390-391).
+        env.insert(
+            (tvt_raw_id, 0, String::new()),
+            Type::TupleType {
+                partial_fallback: Box::new(tvt_fallback),
+                items: args_middle,
+                implicit: false,
+            },
+        );
+        // Bind prefix/suffix ordinary tvars
+        // (expandtype.py:392-405): zip(tvars_prefix, args_prefix) and
+        // zip(tvars_suffix, args_suffix).
+        if args.len() < prefix || args.len() < suffix {
+            return None;
+        }
+        for i in 0..prefix {
+            let raw_id = raw_ids[i];
+            if raw_id >= 0 {
+                env.insert((raw_id, 0, String::new()), args[i].clone());
+            }
+        }
+        for j in 0..suffix {
+            let raw_id = raw_ids[tvars.len() - suffix + j];
+            let arg = &args[args.len() - suffix + j];
+            if raw_id >= 0 {
+                env.insert((raw_id, 0, String::new()), arg.clone());
+            }
+        }
+        return expand_type_with_env(typ, &env, strict_optional);
+    }
+    // Non-variadic: fast path + binding (expandtype.py:407-409).
+    let raw_ids = &snap.type_var_raw_ids;
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, String::new()), arg.clone());
     }
@@ -542,9 +599,57 @@ pub(crate) fn expand_type_inner(
         }
 
         // Deferred variants: ParamSpecType (prefix merging too complex for
-        // this stage) and TypeVarTupleType (Python raises NotImplementedError
-        // for non-trivial replacements).
-        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => None,
+        // this stage).
+        Type::ParamSpecType { .. } => None,
+
+        // TypeVarTupleType (expandtype.py:703-715): expand the replacement
+        // if bound; Any/Uninhabited build tuple_fallback[args=[repl]];
+        // other bindings defer (Python raises NotImplementedError).
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default,
+            min_len,
+        } => {
+            let key = (*raw_id, 0, namespace.clone());
+            match env.get(&key) {
+                Some(repl @ (Type::AnyType { .. } | Type::UninhabitedType { .. })) => {
+                    let fallback = tuple_fallback.as_ref();
+                    let new_fallback = if let Type::Instance {
+                        type_ref,
+                        last_known_value,
+                        extra_attrs,
+                        ..
+                    } = fallback
+                    {
+                        Type::Instance {
+                            type_ref: type_ref.clone(),
+                            args: vec![repl.clone()],
+                            last_known_value: last_known_value.clone(),
+                            extra_attrs: extra_attrs.clone(),
+                        }
+                    } else {
+                        return None;
+                    };
+                    Some(new_fallback)
+                }
+                Some(_) => None,
+                None => Some(Type::TypeVarTupleType {
+                    tuple_fallback: tuple_fallback.clone(),
+                    name: name.clone(),
+                    fullname: fullname.clone(),
+                    raw_id: *raw_id,
+                    namespace: namespace.clone(),
+                    upper_bound: upper_bound.clone(),
+                    default: default.clone(),
+                    min_len: *min_len,
+                }),
+            }
+        }
     }
 }
 
@@ -951,5 +1056,204 @@ mod tests {
         let out = expand_type_inner(&typ, &env, false).unwrap();
         assert!(matches!(out, Type::Instance { ref args, .. } if matches!(
             args.as_slice(), [Type::TypeVarType { .. }])));
+    }
+
+    fn tuple_instance() -> Type {
+        instance("builtins.tuple", vec![any()])
+    }
+
+    fn type_var_tuple(raw_id: i64) -> Type {
+        Type::TypeVarTupleType {
+            tuple_fallback: Box::new(tuple_instance()),
+            name: "Ts".to_string(),
+            fullname: "__main__.Ts".to_string(),
+            raw_id,
+            namespace: String::new(),
+            upper_bound: Box::new(any()),
+            default: Box::new(any()),
+            min_len: 0,
+        }
+    }
+
+    fn snap_with_tvt(
+        fullname: &str,
+        prefix: usize,
+        suffix: usize,
+        fallback: Option<Vec<u8>>,
+        raw_ids: Vec<i64>,
+        tvars: Vec<(String, i64, i64)>,
+    ) -> TypeInfoSnapshot {
+        TypeInfoSnapshot {
+            fullname: fullname.to_owned(),
+            name: fullname.to_owned(),
+            has_type_var_tuple_type: true,
+            type_var_tuple_prefix: Some(prefix),
+            type_var_tuple_suffix: Some(suffix),
+            type_var_tuple_fallback: fallback,
+            type_var_raw_ids: raw_ids,
+            type_vars_with_variance: tvars,
+            ..Default::default()
+        }
+    }
+
+    fn encode(t: &Type) -> Vec<u8> {
+        let mut wbuf = WriteBuffer::new();
+        write_type(&mut wbuf, t).unwrap();
+        wbuf.into_bytes()
+    }
+
+    #[test]
+    fn etbi_variadic_binds_tvt_to_tuple_type() {
+        // tuple[A, *Ts, B] applied to tuple[int, str, float, bytes]:
+        // prefix=1, suffix=1; middle args [str, float] bind *Ts as
+        // Tuple[str, float] (expandtype.py:390-391).
+        let fallback = encode(&tuple_instance());
+        let snap = snap_with_tvt(
+            "foo.Pair",
+            1,
+            1,
+            Some(fallback),
+            vec![10, 42, 11], // T, *Ts, B raw ids
+            vec![
+                ("T".to_string(), 0, 0),
+                ("Ts".to_string(), 0, 2),
+                ("B".to_string(), 0, 0),
+            ],
+        );
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Pair".to_string(), snap);
+        // typ = tuple[Unpack[Ts]] referencing *Ts as a TypeVarTupleType
+        // with raw_id 42, applied to the variadic Pair instance; the
+        // expansion must replace *Ts with Tuple[str, float].
+        let typ = Type::TupleType {
+            partial_fallback: Box::new(tuple_instance()),
+            items: vec![Type::UnpackType {
+                typ: Box::new(type_var_tuple(42)),
+            }],
+            implicit: false,
+        };
+        let instance_typ = instance(
+            "foo.Pair",
+            vec![
+                Type::LiteralType {
+                    value: crate::wire::LiteralValue::Int(1),
+                    fallback: Box::new(instance("builtins.int", vec![])),
+                },
+                Type::LiteralType {
+                    value: crate::wire::LiteralValue::Str("a".to_string()),
+                    fallback: Box::new(instance("builtins.str", vec![])),
+                },
+                Type::LiteralType {
+                    value: crate::wire::LiteralValue::Str("b".to_string()),
+                    fallback: Box::new(instance("builtins.str", vec![])),
+                },
+                Type::LiteralType {
+                    value: crate::wire::LiteralValue::Int(2),
+                    fallback: Box::new(instance("builtins.int", vec![])),
+                },
+            ],
+        );
+        let out = expand_type_by_instance_core(&typ, &instance_typ, &resolver, false)
+            .expect("variadic expansion must not defer");
+        match out {
+            Type::TupleType { items, .. } => {
+                // expand_unpack splices the middle items directly
+                // (expandtype.py:382-390): *Ts = Tuple[str, float]
+                // expands to [str, float].
+                assert_eq!(items.len(), 2);
+            }
+            _ => panic!("expected TupleType with spliced middle"),
+        }
+    }
+
+    #[test]
+    fn etbi_variadic_missing_fallback_defers() {
+        // No fallback -> cannot build the exact TupleType; must defer.
+        let snap = snap_with_tvt(
+            "foo.Pair",
+            1,
+            1,
+            None,
+            vec![10, 42, 11],
+            vec![
+                ("T".to_string(), 0, 0),
+                ("Ts".to_string(), 0, 2),
+                ("B".to_string(), 0, 0),
+            ],
+        );
+        let mut resolver = TypeResolver::new();
+        resolver.insert("foo.Pair".to_string(), snap);
+        let typ = Type::TupleType {
+            partial_fallback: Box::new(tuple_instance()),
+            items: vec![Type::UnpackType {
+                typ: Box::new(type_var_tuple(42)),
+            }],
+            implicit: false,
+        };
+        let instance_typ = instance("foo.Pair", vec![any(), any(), any(), any()]);
+        assert!(expand_type_by_instance_core(&typ, &instance_typ, &resolver, false).is_none());
+    }
+
+    #[test]
+    fn expand_type_var_tuple_any_builds_fallback() {
+        // visit_type_var_tuple (expandtype.py:703-715): *Ts = Any
+        // replaces the TypeVarTupleType node with
+        // tuple_fallback[args=[Any]].
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), any())]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert!(matches!(args.as_slice(), [Type::AnyType { .. }]));
+            }
+            _ => panic!("expected tuple fallback Instance"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_uninhabited_builds_fallback() {
+        // *Ts = Never replaces the node with
+        // tuple_fallback[args=[UninhabitedType]].
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (7, 0, String::new()),
+            Type::UninhabitedType { ambiguous: false },
+        )]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert!(matches!(args.as_slice(), [Type::UninhabitedType { .. }]));
+            }
+            _ => panic!("expected tuple fallback Instance"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_unbound_keeps_tvt() {
+        // Unmatched *Ts stays a TypeVarTupleType copy (no deferral).
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::TypeVarTupleType { raw_id, .. } => assert_eq!(raw_id, 7),
+            _ => panic!("expected TypeVarTupleType"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_tuple_binding_defers() {
+        // A non-Any/non-Never binding (e.g. a TupleType) is not
+        // representable here; Python raises NotImplementedError, so the
+        // seam defers to the pure-Python caller.
+        let typ = type_var_tuple(7);
+        let tuple_repl = Type::TupleType {
+            partial_fallback: Box::new(tuple_instance()),
+            items: vec![any()],
+            implicit: false,
+        };
+        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), tuple_repl)]);
+        assert!(expand_type_inner(&typ, &env, false).is_none());
     }
 }

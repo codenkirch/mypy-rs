@@ -93,6 +93,14 @@ pub(crate) struct TypeInfoSnapshot {
     pub type_var_tuple_prefix: Option<usize>,
     /// `TypeInfo.type_var_tuple_suffix` (nodes.py:3896). subtypes.py:575.
     pub type_var_tuple_suffix: Option<usize>,
+    /// `TypeVarTupleType.tuple_fallback` of the class's variadic tvar,
+    /// serialized as a wire-format `Instance` blob (types.py:991-1001),
+    /// or `None` when the class is not variadic / the fallback is
+    /// unreadable. expandtype.rs uses it to build the TupleType that
+    /// binds a TypeVarTuple in `expand_type_by_instance`
+    /// (expandtype.py:390: `TupleType(list(args_middle),
+    /// tvar.tuple_fallback)`).
+    pub type_var_tuple_fallback: Option<Vec<u8>>,
     /// `(name, variance, kind)` for each `defn.type_vars` entry.
     /// variance: 0=INVARIANT, 1=COVARIANT, 2=CONTRAVARIANT,
     /// 3=VARIANCE_NOT_READY (nodes.py:3146). kind: 0=TypeVarType,
@@ -371,6 +379,25 @@ fn read_opt_usize_attr(obj: &PyAny, attr: &str) -> Option<usize> {
     v.extract::<usize>().ok()
 }
 
+/// Read the `TypeVarTupleType.tuple_fallback` of the class's variadic
+/// type var, serialized to wire bytes, or `None` when the class is not
+/// variadic / the fallback is unreadable. Walks `defn.type_vars` and
+/// picks the `TypeVarTupleType` entry (expandtype.py:389-390 reads
+/// `tvars_middle[0]` as the TypeVarTuple).
+fn read_type_var_tuple_fallback(py: Python<'_>, obj: &PyAny) -> Option<Vec<u8>> {
+    let defn = obj.getattr("defn").ok()?;
+    let tvars = defn.getattr("type_vars").ok()?;
+    let list = tvars.downcast::<PyList>().ok()?;
+    for item in list.iter() {
+        if item.get_type().name().unwrap_or("") == "TypeVarTupleType" {
+            let fallback = item.getattr("tuple_fallback").ok()?;
+            return serialize_type_to_bytes(py, fallback);
+        }
+    }
+    None
+}
+
+/// Read `TypeVarId.raw_id` per `defn.type_vars` entry, parallel to
 /// Read `TypeVarId.raw_id` per `defn.type_vars` entry, parallel to
 /// `read_type_vars_with_variance`. Used by `expand_type_by_instance` to
 /// key the substitution env: class type vars bind `(raw_id, 0, "")`.
@@ -628,6 +655,13 @@ pub(crate) fn build_resolver(py: Python<'_>, type_infos: &PyAny) -> PyResult<PyO
         match suffix {
             Some(s) => snap_dict.set_item("type_var_tuple_suffix", s)?,
             None => snap_dict.set_item("type_var_tuple_suffix", py.None())?,
+        }
+
+        // type_var_tuple_fallback: Option[Instance] -> Option[wire bytes].
+        let tvf = read_type_var_tuple_fallback(py, item);
+        match &tvf {
+            Some(b) => snap_dict.set_item("type_var_tuple_fallback", PyBytes::new(py, b))?,
+            None => snap_dict.set_item("type_var_tuple_fallback", py.None())?,
         }
 
         // type_vars_with_variance: Vec<(name, variance, kind, upper_bound)>.
@@ -1042,6 +1076,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
     let tuple_type = read_opt_type_bytes(py, item, "tuple_type");
     let type_var_tuple_prefix = read_opt_usize_attr(item, "type_var_tuple_prefix");
     let type_var_tuple_suffix = read_opt_usize_attr(item, "type_var_tuple_suffix");
+    let type_var_tuple_fallback = read_type_var_tuple_fallback(py, item);
     let type_vars_with_variance_full = read_type_vars_with_variance(py, item);
     let type_vars_with_variance: Vec<(String, i64, i64)> = type_vars_with_variance_full
         .iter()
@@ -1079,6 +1114,7 @@ fn snapshot_type_info(py: Python<'_>, item: &PyAny, fullname: &str) -> Option<Ty
         tuple_type,
         type_var_tuple_prefix,
         type_var_tuple_suffix,
+        type_var_tuple_fallback,
         type_vars_with_variance,
         type_var_upper_bounds,
         type_var_raw_ids,
