@@ -13020,6 +13020,130 @@ class NativeAnyCausesOverloadAmbiguitySuite(Suite):
         )
 
 
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeCoversAtRuntimeSuite(Suite):
+    """Parity tests for `rust_covers_at_runtime` (mypy.subtypes.covers_at_runtime).
+
+    Toggles the native subtype gate on/off and asserts the Rust seam agrees
+    with the pure-Python oracle on the same item/supertype pairs. The seam
+    returns a bare bool; deferral means the Python body runs and both paths
+    observe the same result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        self._wire_map = set_wire_typeinfo_map
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._wire_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def assert_par(self, item: Type, supertype: Type) -> None:
+        """Assert the native seam matches the pure-Python oracle."""
+        from mypy.subtypes import covers_at_runtime
+
+        self._set_active(False)
+        try:
+            expected = covers_at_runtime(item, supertype)
+        finally:
+            self._set_active(True)
+        actual = covers_at_runtime(item, supertype)
+        assert actual == expected, f"rust {actual!r} != py {expected!r}"
+
+    def assert_engages(self, item: Type, supertype: Type) -> bool:
+        """Call the seam directly to prove the Rust path engages."""
+        result = _type_kernel.rust_covers_at_runtime(
+            self._bytes_of(item),
+            self._bytes_of(supertype),
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, f"seam did not engage for {item!r}, {supertype!r}"
+        return result
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def test_erased_proper_subtype_covers(self) -> None:
+        # erase(B) <: A -> True: isinstance(b, A) holds at runtime.
+        self.assert_par(self.fx.b, self.fx.a)
+        # G[B] erases to plain G (type args ignored at runtime), which is
+        # a subtype of object.
+        self.assert_par(self.fx.gb, self.fx.o)
+        self.assert_par(self.fx.a, self.fx.o)
+
+    def test_unrelated_do_not_cover(self) -> None:
+        # B and D unrelated: isinstance checks are not always-true.
+        self.assert_par(self.fx.b, self.fx.d)
+        self.assert_par(self.fx.a, self.fx.b)
+        self.assert_par(self.fx.o, self.fx.a)
+
+    def test_any_item(self) -> None:
+        # Any erases to Any; the proper subtype check is False for a
+        # non-Any supertype but True for an Any supertype.
+        self.assert_par(self.fx.anyt, self.fx.a)
+        self.assert_par(self.fx.a, self.fx.anyt)
+
+    def test_typed_dict_covers_dict(self) -> None:
+        # Special case: isinstance(x, dict) selects TypedDicts from unions.
+        dict_info = self.fx.make_type_info("builtins.dict", mro=[self.fx.oi])
+        dict_type = Instance(dict_info, [])
+        td = TypedDictType({"x": self.fx.a}, {"x"}, set(), dict_type)
+        self.assert_par(td, dict_type)
+
+    def test_type_var_covers_upper_bound(self) -> None:
+        # A TypeVar whose upper bound is covered -> True.
+        self.assert_par(self.fx.t, self.fx.o)
+
+    def test_type_obj_supertype(self) -> None:
+        # Type[list] keeps its type-args; the erased item does not cover it.
+        item = self.fx.a
+        type_obj = CallableType([], [], [], self.fx.a, self.fx.type_type)
+        self.assert_par(item, type_obj)
+
+    def test_native_int_covers_int(self) -> None:
+        # mypyc native ints are covered by builtins.int.
+        int_info = self.fx.make_type_info("builtins.int", mro=[self.fx.oi])
+        i64_info = self.fx.make_type_info("mypy_extensions.i64", mro=[int_info])
+        item = Instance(i64_info, [])
+        sup = Instance(int_info, [])
+        self.assert_par(item, sup)
+
+    def test_seam_engages(self) -> None:
+        # The direct seam call returns a decided bool, proving the Rust
+        # path engages rather than deferring (None).
+        assert self.assert_engages(self.fx.b, self.fx.a) is True
+        assert self.assert_engages(self.fx.b, self.fx.d) is False
+
+
 # NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
