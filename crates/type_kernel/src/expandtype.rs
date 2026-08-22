@@ -599,9 +599,57 @@ pub(crate) fn expand_type_inner(
         }
 
         // Deferred variants: ParamSpecType (prefix merging too complex for
-        // this stage) and TypeVarTupleType (Python raises NotImplementedError
-        // for non-trivial replacements).
-        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => None,
+        // this stage).
+        Type::ParamSpecType { .. } => None,
+
+        // TypeVarTupleType (expandtype.py:703-715): expand the replacement
+        // if bound; Any/Uninhabited build tuple_fallback[args=[repl]];
+        // other bindings defer (Python raises NotImplementedError).
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            name,
+            fullname,
+            raw_id,
+            namespace,
+            upper_bound,
+            default,
+            min_len,
+        } => {
+            let key = (*raw_id, 0, namespace.clone());
+            match env.get(&key) {
+                Some(repl @ (Type::AnyType { .. } | Type::UninhabitedType { .. })) => {
+                    let fallback = tuple_fallback.as_ref();
+                    let new_fallback = if let Type::Instance {
+                        type_ref,
+                        last_known_value,
+                        extra_attrs,
+                        ..
+                    } = fallback
+                    {
+                        Type::Instance {
+                            type_ref: type_ref.clone(),
+                            args: vec![repl.clone()],
+                            last_known_value: last_known_value.clone(),
+                            extra_attrs: extra_attrs.clone(),
+                        }
+                    } else {
+                        return None;
+                    };
+                    Some(new_fallback)
+                }
+                Some(_) => None,
+                None => Some(Type::TypeVarTupleType {
+                    tuple_fallback: tuple_fallback.clone(),
+                    name: name.clone(),
+                    fullname: fullname.clone(),
+                    raw_id: *raw_id,
+                    namespace: namespace.clone(),
+                    upper_bound: upper_bound.clone(),
+                    default: default.clone(),
+                    min_len: *min_len,
+                }),
+            }
+        }
     }
 }
 
@@ -1144,5 +1192,68 @@ mod tests {
         };
         let instance_typ = instance("foo.Pair", vec![any(), any(), any(), any()]);
         assert!(expand_type_by_instance_core(&typ, &instance_typ, &resolver, false).is_none());
+    }
+
+    #[test]
+    fn expand_type_var_tuple_any_builds_fallback() {
+        // visit_type_var_tuple (expandtype.py:703-715): *Ts = Any
+        // replaces the TypeVarTupleType node with
+        // tuple_fallback[args=[Any]].
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), any())]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert!(matches!(args.as_slice(), [Type::AnyType { .. }]));
+            }
+            _ => panic!("expected tuple fallback Instance"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_uninhabited_builds_fallback() {
+        // *Ts = Never replaces the node with
+        // tuple_fallback[args=[UninhabitedType]].
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::from([(
+            (7, 0, String::new()),
+            Type::UninhabitedType { ambiguous: false },
+        )]);
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert!(matches!(args.as_slice(), [Type::UninhabitedType { .. }]));
+            }
+            _ => panic!("expected tuple fallback Instance"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_unbound_keeps_tvt() {
+        // Unmatched *Ts stays a TypeVarTupleType copy (no deferral).
+        let typ = type_var_tuple(7);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let out = expand_type_inner(&typ, &env, false).unwrap();
+        match out {
+            Type::TypeVarTupleType { raw_id, .. } => assert_eq!(raw_id, 7),
+            _ => panic!("expected TypeVarTupleType"),
+        }
+    }
+
+    #[test]
+    fn expand_type_var_tuple_tuple_binding_defers() {
+        // A non-Any/non-Never binding (e.g. a TupleType) is not
+        // representable here; Python raises NotImplementedError, so the
+        // seam defers to the pure-Python caller.
+        let typ = type_var_tuple(7);
+        let tuple_repl = Type::TupleType {
+            partial_fallback: Box::new(tuple_instance()),
+            items: vec![any()],
+            implicit: false,
+        };
+        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), tuple_repl)]);
+        assert!(expand_type_inner(&typ, &env, false).is_none());
     }
 }
