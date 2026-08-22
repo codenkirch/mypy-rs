@@ -35,6 +35,23 @@ pub(crate) fn covers_at_runtime_inner(
     let item = get_proper_or_none(item)?;
     let supertype = get_proper_or_none(supertype)?;
 
+    // Defer tuple-shaped operands: Python erases with erase_instances=True
+    // (subtypes.py:780) which the Rust kernel has no flag for, so Rust
+    // answers Some(false) where Python answers True (testReverseBinaryOperator4).
+    if matches!(item, Type::TupleType { .. }) || matches!(supertype, Type::TupleType { .. }) {
+        return None;
+    }
+    if let Type::Instance { type_ref, .. } = item {
+        if type_ref == "builtins.tuple" {
+            return None;
+        }
+    }
+    if let Type::Instance { type_ref, .. } = supertype {
+        if type_ref == "builtins.tuple" {
+            return None;
+        }
+    }
+
     // subtypes.py:2524-2526: runtime type checks ignore type arguments,
     // so erase the supertype unless it is a type-object (a `Type[cls]`
     // check is exact on `cls`, not on its erased form).
