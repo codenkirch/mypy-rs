@@ -955,7 +955,6 @@ fn visit_instance_noninstance_right(
     // require the mapped first arg to be Any (stays False if proper).
     if let Type::TypeVarTupleType { .. } = right {
         return visit_instance_variadic_right(left, right, ctx, resolver, left_ref);
-
     }
     // TypeType right (subtypes.py:784-795): when left is `builtins.type`
     // (non-proper) recurse against Any; when left's type is a metaclass
