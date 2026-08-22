@@ -18784,3 +18784,154 @@ class NativeRemoveTrivialSuite(Suite):
 
         decoded = read_type_list(_RB(bytes(result)))
         assert_equal(len(decoded), 1)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEraseReturnSelfSuite(Suite):
+    """Parity for the Rust `erase_return_self_types` port (mypy.subtypes).
+
+    `erase_return_self_types` rewrites a function-like type whose return
+    type equals `self_type` so the return becomes `Any` (dropping
+    self-referential `-> Self` returns). The Rust port implements the same
+    structural `Instance.__eq__` match on the wire format; the Python shim
+    decodes the result through the shared wirefixup path, so live TypeInfo
+    identity is restored. Toggling the subtype gate off (pure Python) and
+    on (Rust seam) must produce identical results, and a direct seam call
+    proves the Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active = _set_native_subtype_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, typ: Type, self_type: Instance) -> None:
+        from mypy.subtypes import erase_return_self_types
+
+        off = self._with_gate(False, lambda: erase_return_self_types(typ, self_type))
+        on = self._with_gate(True, lambda: erase_return_self_types(typ, self_type))
+        assert_equal(str(on), str(off), f"erase_return_self_types parity {typ}")
+
+    def _assert_engages(self, typ: Type, self_type: Instance) -> None:
+        from mypy.subtypes import _serialize_type
+
+        result = _type_kernel.rust_erase_return_self_types(
+            _serialize_type(typ), _serialize_type(self_type)
+        )
+        assert result is not None, f"Rust erase_return_self_types did not engage for {typ}"
+
+    def test_callable_returning_self(self) -> None:
+        from mypy.subtypes import erase_return_self_types
+
+        c = CallableType(
+            [self.fx.a], [ARG_POS], [None], Instance(self.fx.ai, []), self.fx.function
+        )
+        self._assert_par(c, self.fx.a)
+        result = self._with_gate(True, lambda: erase_return_self_types(c, self.fx.a))
+        assert isinstance(result, CallableType)
+        assert isinstance(result.ret_type, AnyType)
+        assert_equal(str(result), "def (A) -> Any")
+        self._assert_engages(c, self.fx.a)
+
+    def test_callable_returning_non_self(self) -> None:
+        from mypy.subtypes import erase_return_self_types
+
+        c = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function
+        )
+        self._assert_par(c, self.fx.a)
+        result = self._with_gate(True, lambda: erase_return_self_types(c, self.fx.a))
+        assert isinstance(result, CallableType)
+        assert_equal(str(result.ret_type), "B")
+        self._assert_engages(c, self.fx.a)
+
+    def test_generic_self_instance(self) -> None:
+        # Callable[[], G[A]] with self G[A] erases: the type args
+        # participate in the Instance equality.
+        from mypy.subtypes import erase_return_self_types
+
+        self_type = self.fx.ga
+        c = CallableType(
+            [self.fx.a], [ARG_POS], [None], Instance(self.fx.gi, [self.fx.a]), self.fx.function
+        )
+        self._assert_par(c, self_type)
+        result = self._with_gate(True, lambda: erase_return_self_types(c, self_type))
+        assert isinstance(result, CallableType)
+        assert isinstance(result.ret_type, AnyType)
+        self._assert_engages(c, self_type)
+
+    def test_generic_self_args_differ_unchanged(self) -> None:
+        # Callable[[], G[B]] with self G[A]: args differ, so no erase.
+        from mypy.subtypes import erase_return_self_types
+
+        self_type = self.fx.ga
+        c = CallableType(
+            [self.fx.a], [ARG_POS], [None], Instance(self.fx.gi, [self.fx.b]), self.fx.function
+        )
+        self._assert_par(c, self_type)
+        result = self._with_gate(True, lambda: erase_return_self_types(c, self_type))
+        assert isinstance(result, CallableType)
+        assert_equal(str(result.ret_type), "G[B]")
+        self._assert_engages(c, self_type)
+
+    def test_overloaded_mixed(self) -> None:
+        # One item returns self (erased to Any), one does not; the
+        # Overloaded is rebuilt with the erased item.
+        from mypy.subtypes import erase_return_self_types
+        from mypy.types import Overloaded
+
+        c1 = CallableType([], [], [], Instance(self.fx.ai, []), self.fx.function)
+        c2 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function
+        )
+        overloaded = Overloaded([c1, c2])
+        self._assert_par(overloaded, self.fx.a)
+        result = self._with_gate(True, lambda: erase_return_self_types(overloaded, self.fx.a))
+        assert isinstance(result, Overloaded)
+        assert isinstance(result.items[0].ret_type, AnyType)
+        assert_equal(str(result.items[1].ret_type), "B")
+        self._assert_engages(overloaded, self.fx.a)
+
+    def test_bare_instance_unchanged(self) -> None:
+        # A bare Instance == self_type is not function-like: Python returns
+        # it unchanged (subtypes.py:2773), Rust engages and clones it.
+        from mypy.subtypes import erase_return_self_types
+
+        self._assert_par(self.fx.a, self.fx.a)
+        result = self._with_gate(True, lambda: erase_return_self_types(self.fx.a, self.fx.a))
+        assert_equal(str(result), "A")
+        self._assert_engages(self.fx.a, self.fx.a)
+
+    def test_union_and_none_unchanged(self) -> None:
+        from mypy.subtypes import erase_return_self_types
+        from mypy.types import UnionType
+
+        union = UnionType([self.fx.a, self.fx.b])
+        self._assert_par(union, self.fx.a)
+        result = self._with_gate(True, lambda: erase_return_self_types(union, self.fx.a))
+        assert_equal(str(result), "A | B")
+        self._assert_engages(union, self.fx.a)
+        self._assert_par(self.fx.nonet, self.fx.a)
+        self._assert_engages(self.fx.nonet, self.fx.a)

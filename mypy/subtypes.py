@@ -136,6 +136,11 @@ def _native_variance_member_active() -> bool:
     )
 
 
+def _native_erase_return_self_types_active() -> bool:
+    """Guard for the `erase_return_self_types` seam."""
+    return _HAS_TYPE_KERNEL and _native_subtype_active
+
+
 def _native_infer_variance_member(
     typ: Type, self_type: Type, object_type: Instance, tvar: TypeVarType
 ) -> int | None:
@@ -2762,6 +2767,17 @@ def erase_return_self_types(typ: Type, self_type: Instance) -> Type:
     """If a typ is function-like and returns self_type, replace return type with Any."""
     proper_type = get_proper_type(typ)
     if isinstance(proper_type, CallableType):
+        if _native_erase_return_self_types_active():
+            try:
+                result = _type_kernel.rust_erase_return_self_types(
+                    _serialize_type(proper_type), _serialize_type(self_type)
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                decoded = _deserialize_type(bytes(result))
+                if decoded is not None:
+                    return decoded
         ret = get_proper_type(proper_type.ret_type)
         if isinstance(ret, Instance) and ret == self_type:
             return proper_type.copy_modified(ret_type=AnyType(TypeOfAny.implementation_artifact))
