@@ -1300,8 +1300,38 @@ def combine_arg_names(
     return new_names
 
 
+def _try_native_object_from_instance(instance: Instance) -> Instance | None:
+    """Try `object_from_instance` in Rust; None defers to Python.
+
+    The kernel reads the instance's TypeInfo MRO from the resolver and
+    returns the last entry (`builtins.object` in a sane graph), which the
+    shim resolves to a live TypeInfo via the fullname -> TypeInfo map. Any
+    wire-format failure (unsupported variant, missing resolver snapshot
+    or typeinfo map) falls through to None so the pure-Python body runs
+    unchanged (strangler-fig per-call gate).
+    """
+    try:
+        result = _type_kernel.rust_object_from_instance(
+            _serialize_type(instance), _native_join_resolver
+        )
+    except (AssertionError, NotImplementedError, ValueError, AttributeError):
+        return None
+    if result is None:
+        return None
+    if _native_join_typeinfo_map is None:
+        return None
+    type_info = _native_join_typeinfo_map.get(result)
+    if type_info is None:
+        return None
+    return Instance(type_info, [])
+
+
 def object_from_instance(instance: Instance) -> Instance:
     """Construct the type 'builtins.object' from an instance type."""
+    if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
+        res = _try_native_object_from_instance(instance)
+        if res is not None:
+            return res
     # Use the fact that 'object' is always the last class in the mro.
     res = Instance(instance.type.mro[-1], [])
     return res

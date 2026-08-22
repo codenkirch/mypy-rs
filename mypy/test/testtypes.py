@@ -17811,6 +17811,115 @@ class NativeObjectOrAnyFromTypeSuite(Suite):
         self._assert_parity(self.fx.ts)
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeObjectFromInstanceSuite(Suite):
+    """Parity for the Rust `object_from_instance` port (join.py:1303,
+    joinfns.rs).
+
+    Toggling the join gate off vs on must agree on the constructed
+    `builtins.object` Instance for the same input Instances, asserting
+    equality of fullname AND the produced `Instance` (line/column are
+    dropped by the wire round-trip, so the comparison uses the
+    `assert_equal` type comparison). The direct seam call proves the
+    Rust engagement.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self._set_active = _set_native_join_active
+        self._set_resolver = _set_native_join_resolver
+        self._set_map = _set_native_join_typeinfo_map
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._typeinfo_map = {info.fullname: info for info in type_infos}
+        self._set_resolver(self._resolver)
+        self._set_map(self._typeinfo_map)
+        set_wire_typeinfo_map(self._typeinfo_map)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _native_result(self, instance: Instance) -> Instance:
+        from mypy.join import object_from_instance
+
+        return self._with_gate(True, lambda: object_from_instance(instance))  # type: ignore[return-value]
+
+    def _reference_result(self, instance: Instance) -> Instance:
+        from mypy.join import object_from_instance
+
+        return self._with_gate(False, lambda: object_from_instance(instance))  # type: ignore[return-value]
+
+    def _assert_parity(self, instance: Instance) -> None:
+        res = self._native_result(instance)
+        ref = self._reference_result(instance)
+        assert_equal(res, ref)
+
+    def test_object(self) -> None:
+        # object -> object (mro[-1]).
+        self._assert_parity(self.fx.o)
+
+    def test_simple_class(self) -> None:
+        # A (mro=[A, object]) -> object.
+        self._assert_parity(self.fx.a)
+
+    def test_subclass(self) -> None:
+        # B (mro=[B, A, object]) -> object.
+        self._assert_parity(self.fx.b)
+
+    def test_deep_hierarchy(self) -> None:
+        # E2 (mro=[E2, F2, F, object]) -> object.
+        self._assert_parity(self.fx.e2)
+
+    def test_generic_instance(self) -> None:
+        # G[A] -> object (args dropped).
+        self._assert_parity(self.fx.ga)
+
+    def test_str_instance(self) -> None:
+        # builtins.str -> object.
+        self._assert_parity(self.fx.str_type)
+
+    def test_bool_instance(self) -> None:
+        # builtins.bool -> object.
+        self._assert_parity(self.fx.bool_type)
+
+    def test_seam_engages(self) -> None:
+        # Direct seam call: rust_object_from_instance returns the
+        # builtins.object fullname for a serialized Instance.
+        from mypy.join import _serialize_type
+
+        result = _type_kernel.rust_object_from_instance(
+            _serialize_type(self.fx.a), self._resolver
+        )
+        assert result == "builtins.object", f"got {result!r}"
+
+
 class NativeCombineSimilarCallablesSuite(Suite):
     """Parity for the Rust `combine_similar_callables` port (joinfns.rs).
 

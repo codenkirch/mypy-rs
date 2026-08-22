@@ -71,6 +71,7 @@ __all__ = [
     "rust_meet_types",
     "rust_object_or_any_from_type",
     "rust_combine_similar_callables",
+    "rust_object_from_instance",
     "rust_narrow_declared_type",
     "rust_narrow_with_len",
     "rust_map_actuals_to_formals",
@@ -484,6 +485,7 @@ def rust_object_or_any_from_type(
 def rust_combine_similar_callables(
     t: bytes, s: bytes, strict_optional: bool, resolver: NativeTypeResolver
 ) -> bytes | None: ...
+def rust_object_from_instance(instance: bytes, resolver: NativeTypeResolver) -> str | None: ...
 def rust_join_sorted_key(t_bytes: bytes) -> int | None: ...
 def rust_narrow_declared_type(
     declared: bytes, narrowed: bytes, strict_optional: bool, resolver: NativeTypeResolver
