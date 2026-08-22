@@ -11,7 +11,9 @@ use pyo3::prelude::*;
 
 use crate::subtypes::{map_instance_to_supertype, CONTRAVARIANT, COVARIANT};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
-use crate::visitor::{find_unpack_in_list_inner, flatten_nested_tuples_inner};
+use crate::visitor::{
+    find_unpack_in_list_inner, flatten_nested_tuples_inner, split_with_prefix_and_suffix_inner,
+};
 use crate::wire::{
     read_int, read_type, write_int, write_type, ReadBuffer, Type, WireError, WriteBuffer,
 };
@@ -475,7 +477,14 @@ fn visit_instance_tail_native(
     Some(vec![])
 }
 
-/// Port of `visit_tuple_type` (constraints.py:1436).
+/// Port of `visit_tuple_type` (constraints.py:1731-1835).
+///
+/// Covers the variadic cases the earlier port deferred: template-with-Unpack
+/// against a varlength `tuple[X, ...]` instance, template-with-Unpack against
+/// a `TupleType` actual (via `build_constraints_for_simple_unpack`), and a
+/// template without Unpack against an actual with an internal Unpack (the
+/// `Tuple[T, S, U] <: tuple[X, *tuple[Y, ...], Z]` split). The named-tuple
+/// early return and the per-item/fallback tail match constraints.py:1813-1831.
 fn visit_tuple_native(
     template: &Type,
     actual: &Type,
@@ -500,23 +509,200 @@ fn visit_tuple_native(
     // Actual is a TupleType or a varlength tuple instance.
     let mut res = Vec::new();
     if unpack_index >= 0 {
-        // Template has an Unpack; the exact handling needs the variadic mapping
-        // machinery. Defer.
-        return None;
+        if is_varlength {
+            // Template has an Unpack and the actual is a variable-length tuple
+            // (constraints.py:1742-1768). Map the actual up to builtins.tuple
+            // and constrain the unpacked type against the mapped instance.
+            let unpack_type = &template_items[unpack_index as usize];
+            let unmapped_inner = match unpack_type {
+                Type::UnpackType { typ } => typ.as_ref(),
+                _ => return None,
+            };
+            // get_proper_type(rhs) — TypeAliasType needs alias expansion.
+            if matches!(unmapped_inner, Type::TypeAliasType { .. }) {
+                return None;
+            }
+            let actual_args = match actual {
+                Type::Instance { args, .. } => args,
+                _ => return None,
+            };
+            let mapped = map_instance_to_supertype(
+                get_type_ref(actual)?,
+                actual_args,
+                "builtins.tuple",
+                resolver,
+            )?;
+            if mapped.len() != 1 {
+                return None;
+            }
+            let mapped_instance = Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: mapped.clone(),
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            match unmapped_inner {
+                Type::TypeVarTupleType { .. } => {
+                    res.push(Constraint {
+                        origin_type_var: unmapped_inner.clone(),
+                        op: direction,
+                        target: mapped_instance.clone(),
+                    });
+                }
+                Type::Instance { type_ref, .. } if type_ref == "builtins.tuple" => {
+                    res.extend(push_inner(
+                        unmapped_inner.clone(),
+                        mapped_instance.clone(),
+                        direction,
+                        resolver,
+                    )?);
+                }
+                _ => return None,
+            }
+            // Constrain the non-unpack template items against the mapped arg:
+            // `ti <: X` for every `ti` in Tuple[T, *Ts, S] <: tuple[X, ...].
+            let mapped_arg = mapped.first()?.clone();
+            for (i, ti) in template_items.iter().enumerate() {
+                if i as i64 == unpack_index {
+                    continue;
+                }
+                res.extend(push_inner(
+                    ti.clone(),
+                    mapped_arg.clone(),
+                    direction,
+                    resolver,
+                )?);
+            }
+            return Some(res);
+        }
+        // Template has an Unpack and the actual is a fixed TupleType: the
+        // simple-unpack inference port (constraints.py:1770-1776).
+        if let Type::TupleType { items: a_items, .. } = actual {
+            res.extend(simple_unpack_native(
+                template_items,
+                a_items,
+                direction,
+                resolver,
+            )?);
+        } else {
+            return None;
+        }
+        // Only the fallback-vs-fallback constraint is appended here: the
+        // per-item loop is skipped because actual_items/template_items stay
+        // empty after the unpack branch (constraints.py:1774-1831).
+        if let (
+            Type::TupleType {
+                partial_fallback: t_fb,
+                ..
+            },
+            Type::TupleType {
+                partial_fallback: a_fb,
+                ..
+            },
+        ) = (template, actual)
+        {
+            res.extend(push_inner(
+                t_fb.as_ref().clone(),
+                a_fb.as_ref().clone(),
+                direction,
+                resolver,
+            )?);
+        }
+        return Some(res);
     }
+    // Template has no Unpack.
     let (a_items, t_items) = match actual {
         Type::TupleType { items: ai, .. } => (ai, template_items),
         _ => return Some(vec![]), // varlength instance with no template unpack
     };
-    // Actual tuple with an internal Unpack: the simple-unpack inference path.
-    if find_unpack_in_list_inner(a_items) >= 0 {
-        return None;
+    // Actual tuple with an internal Unpack: the split-based inference path
+    // (constraints.py:1778-1804).
+    let a_unpack_index = find_unpack_in_list_inner(a_items);
+    if a_unpack_index < 0 {
+        return visit_tuple_tail_native(
+            template,
+            actual,
+            t_items.to_vec(),
+            a_items.to_vec(),
+            direction,
+            resolver,
+        );
     }
+    let a_unpack = &a_items[a_unpack_index as usize];
+    let a_unpacked = match a_unpack {
+        Type::UnpackType { typ } => typ.as_ref(),
+        _ => return None,
+    };
+    if a_items.len() + 1 > t_items.len() {
+        // Actual and template lengths are incompatible: no per-item
+        // constraints, but the fallback tail still runs.
+        return visit_tuple_tail_native(
+            template,
+            actual,
+            Vec::new(),
+            Vec::new(),
+            direction,
+            resolver,
+        );
+    }
+    // The actual-unpack middle only constrains when the unpacked is a
+    // homogenous `*tuple[X, ...]` instance; get_proper_type(a_unpack.type)
+    // may expand a TypeAliasType (defer).
+    let a_unpacked = match a_unpacked {
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+        Type::TypeAliasType { .. } => return None,
+        Type::TupleType { .. } => return None,
+        _ => None,
+    };
+    let a_prefix_len = a_unpack_index as usize;
+    let a_suffix_len = a_items.len() - a_unpack_index as usize - 1;
+    let (t_prefix, t_middle, t_suffix) =
+        split_with_prefix_and_suffix_inner(t_items, a_prefix_len, a_suffix_len);
+    let mut actual_items: Vec<Type> = a_items[..a_prefix_len].to_vec();
+    if a_suffix_len > 0 {
+        actual_items.extend_from_slice(&a_items[a_items.len() - a_suffix_len..]);
+    }
+    let mut template_items: Vec<Type> = t_prefix;
+    template_items.extend_from_slice(&t_suffix);
+    if let Some(a_mid_args) = a_unpacked {
+        // Tuple[T, S, U] <: tuple[X, *tuple[Y, ...], Z]: T <: X, S <: Y,
+        // U <: Z.
+        let mid_arg = a_mid_args.first()?;
+        for tm in t_middle {
+            res.extend(push_inner(tm, mid_arg.clone(), direction, resolver)?);
+        }
+    }
+    // Fall through to the equal-length per-item + fallback tail; the
+    // middle constraints above must be preserved.
+    res.extend(visit_tuple_tail_native(
+        template,
+        actual,
+        template_items,
+        actual_items,
+        direction,
+        resolver,
+    )?);
+    Some(res)
+}
 
-    // Named-tuple early return (constraints.py:1518-1526): if both are named
+/// Per-item + fallback tail of `visit_tuple_type` (constraints.py:1813-1831),
+/// shared by the plain and actual-has-Unpack paths. The caller passes
+/// pre-computed (template, actual) item lists for the non-plain paths; the
+/// fallback-pair constraint is always appended.
+#[allow(clippy::too_many_arguments)]
+fn visit_tuple_tail_native(
+    template: &Type,
+    actual: &Type,
+    template_items: Vec<Type>,
+    actual_items: Vec<Type>,
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    let mut res = Vec::new();
+    // Named-tuple early return (constraints.py:1814-1821): if both are named
     // tuples, constrain only the fallbacks and return immediately, skipping
     // the per-item constraints.
-    if a_items.len() == t_items.len() {
+    if actual_items.len() == template_items.len() {
         if let (
             Type::TupleType {
                 partial_fallback: t_fb,
@@ -537,20 +723,18 @@ fn visit_tuple_native(
                 _ => false,
             };
             if is_named {
-                res = push_inner(
+                return push_inner(
                     t_fb.as_ref().clone(),
                     a_fb.as_ref().clone(),
                     direction,
                     resolver,
-                )?;
-                return Some(res);
+                );
             }
         }
     }
-
     // Per-item constraints for equal-length tuples.
-    if a_items.len() == t_items.len() {
-        for (t_i, a_i) in t_items.iter().zip(a_items.iter()) {
+    if actual_items.len() == template_items.len() {
+        for (t_i, a_i) in template_items.iter().zip(actual_items.iter()) {
             res.extend(push_inner(t_i.clone(), a_i.clone(), direction, resolver)?);
         }
     }
@@ -574,6 +758,253 @@ fn visit_tuple_native(
         )?);
     }
     Some(res)
+}
+
+/// Port of `build_constraints_for_simple_unpack` (constraints.py:2050-2143).
+///
+/// Infers constraints between two lists of types with a variadic item in the
+/// template. Only callable when a variadic item is present in the template;
+/// defers (None) when the template has no Unpack or any constraint step hits
+/// an unresolvable shape. Mirrors the Python source exactly:
+///
+/// 1. If the actual has no Unpack: if the template prefix+suffix exceeds the
+///    actual length, return fast (TypeVarTuple -> empty TupleType target;
+///    else empty); otherwise constrain template prefix/suffix against the
+///    actual prefix/suffix and the template Unpack against the actual middle.
+/// 2. If the actual has an Unpack: constrain the common prefix/suffix only,
+///    then handle the template Unpack against the actual middle.
+fn simple_unpack_native(
+    template_args: &[Type],
+    actual_args: &[Type],
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    let template_unpack = find_unpack_in_list_inner(template_args);
+    if template_unpack < 0 {
+        return None;
+    }
+    let template_prefix = template_unpack as usize;
+    let template_suffix = template_args.len() - template_prefix - 1;
+
+    let mut t_unpack: Option<&Type> = None;
+    let mut res = Vec::new();
+
+    let actual_unpack = find_unpack_in_list_inner(actual_args);
+    if actual_unpack < 0 {
+        // Template has an Unpack, actual has none.
+        if template_prefix + template_suffix > actual_args.len() {
+            // These can't be subtypes of each-other, return fast. If the
+            // unpacked is a TypeVarTuple, set it to empty to improve error
+            // messages; otherwise return the empty list.
+            let t_unpack_item = &template_args[template_unpack as usize];
+            let inner = match t_unpack_item {
+                Type::UnpackType { typ } => typ.as_ref(),
+                _ => return None,
+            };
+            return match inner {
+                Type::TypeVarTupleType { .. } => Some(vec![Constraint {
+                    origin_type_var: inner.clone(),
+                    op: direction,
+                    target: Type::TupleType {
+                        partial_fallback: inner_tvt_fallback(inner)?,
+                        items: Vec::new(),
+                        implicit: false,
+                    },
+                }]),
+                _ => Some(vec![]),
+            };
+        }
+        // Otherwise constrain the template prefix/suffix against the actual
+        // and the template Unpack against the actual middle.
+        let (start, middle, end) =
+            split_with_prefix_and_suffix_inner(actual_args, template_prefix, template_suffix);
+        for (t, a) in template_args[..template_prefix].iter().zip(start.iter()) {
+            res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+        }
+        if template_suffix > 0 {
+            for (t, a) in template_args[template_args.len() - template_suffix..]
+                .iter()
+                .zip(end.iter())
+            {
+                res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+            }
+        }
+        // Constraint(s) for the variadic item when possible. `t_unpack` is
+        // set from the template item (constraints.py:2079).
+        t_unpack = Some(&template_args[template_unpack as usize]);
+        let inner = match t_unpack.unwrap() {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => return None,
+        };
+        match inner {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                let inner_arg = args.first()?;
+                // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
+                res.extend(constrain_homogeneous_middle(
+                    &middle, inner_arg, direction, resolver,
+                )?);
+            }
+            Type::TypeVarTupleType { .. } => {
+                let target = Type::TupleType {
+                    partial_fallback: inner_tvt_fallback(inner)?,
+                    items: middle,
+                    implicit: false,
+                };
+                res.push(Constraint {
+                    origin_type_var: inner.clone(),
+                    op: direction,
+                    target,
+                });
+            }
+            _ => return None,
+        }
+        return Some(res);
+    }
+    // Actual has an Unpack: constrain the common prefix/suffix first, then
+    // the template Unpack against the actual middle.
+    let actual_prefix = actual_unpack as usize;
+    let actual_suffix = actual_args.len() - actual_prefix - 1;
+    let common_prefix = std::cmp::min(template_prefix, actual_prefix);
+    let common_suffix = std::cmp::min(template_suffix, actual_suffix);
+    if actual_prefix >= template_prefix && actual_suffix >= template_suffix {
+        // Only case where we can guarantee there will be no partial overlap
+        // (note partial overlap is OK for variadic tuples, handled below).
+        t_unpack = Some(&template_args[template_unpack as usize]);
+    }
+    let (start, middle, end) =
+        split_with_prefix_and_suffix_inner(actual_args, common_prefix, common_suffix);
+    for (t, a) in template_args[..common_prefix].iter().zip(start.iter()) {
+        res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+    }
+    if common_suffix > 0 {
+        for (t, a) in template_args[template_args.len() - common_suffix..]
+            .iter()
+            .zip(end.iter())
+        {
+            res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+        }
+    }
+    if let Some(tu) = t_unpack {
+        let inner = match tu {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => return None,
+        };
+        match inner {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                let inner_arg = args.first()?;
+                // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
+                res.extend(constrain_homogeneous_middle(
+                    &middle, inner_arg, direction, resolver,
+                )?);
+            }
+            Type::TypeVarTupleType { .. } => {
+                let target = Type::TupleType {
+                    partial_fallback: inner_tvt_fallback(inner)?,
+                    items: middle,
+                    implicit: false,
+                };
+                res.push(Constraint {
+                    origin_type_var: inner.clone(),
+                    op: direction,
+                    target,
+                });
+            }
+            _ => {}
+        }
+    } else if actual_unpack >= 0 {
+        // A special case for a variadic tuple unpack, we simply infer
+        // T <: X from Tuple[..., *tuple[T, ...], ...] <:
+        // Tuple[..., *tuple[X, ...], ...] (constraints.py:2131-2142).
+        let actual_unpack_type = &actual_args[actual_unpack as usize];
+        let a_unpacked = match actual_unpack_type {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => return None,
+        };
+        // Only an *tuple[A, ...] actual unpack produces constraints. A
+        // TypeVarTuple actual unpack yields nothing (constraints.py:2137).
+        let a_inner_args = match a_unpacked {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+            Type::TypeAliasType { .. } => return None, // needs alias expansion
+            _ => None,
+        };
+        let t_unpack_item = &template_args[template_unpack as usize];
+        let t_inner = match t_unpack_item {
+            Type::UnpackType { typ } => typ.as_ref(),
+            _ => return None,
+        };
+        let t_inner_args = match t_inner {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+            Type::TypeAliasType { .. } => return None,
+            _ => None,
+        };
+        if let (Some(t_args), Some(a_args)) = (t_inner_args, a_inner_args) {
+            if let (Some(t_arg), Some(a_arg)) = (t_args.first(), a_args.first()) {
+                res.extend(push_inner(
+                    t_arg.clone(),
+                    a_arg.clone(),
+                    direction,
+                    resolver,
+                )?);
+            } else {
+                // Empty tuple args: Python would IndexError on args[0]; defer.
+                return None;
+            }
+        }
+    }
+    Some(res)
+}
+
+/// Homogeneous `*tuple[T, ...]` middle inference, shared by both branches of
+/// `build_constraints_for_simple_unpack` (constraints.py:2118-2128): a
+/// non-Unpack middle item constrains `T <: X`, an internal `*tuple[A, ...]`
+/// constrains `T <: A`. Non-tuple internal Unpack items are silently skipped.
+fn constrain_homogeneous_middle(
+    middle: &[Type],
+    inner_arg: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+) -> Option<Vec<Constraint>> {
+    let mut res = Vec::new();
+    for a in middle {
+        match a {
+            Type::UnpackType { typ } => {
+                // *tuple[T, ...] <: *tuple[A, ...].
+                let a_inner = match typ.as_ref() {
+                    Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                        args.first().cloned()
+                    }
+                    Type::TypeAliasType { .. } => return None,
+                    _ => None,
+                };
+                if let Some(a_arg) = a_inner {
+                    res.extend(push_inner(
+                        inner_arg.clone(),
+                        a_arg.clone(),
+                        direction,
+                        resolver,
+                    )?);
+                }
+            }
+            non_unpack => {
+                res.extend(push_inner(
+                    inner_arg.clone(),
+                    non_unpack.clone(),
+                    direction,
+                    resolver,
+                )?);
+            }
+        }
+    }
+    Some(res)
+}
+
+/// `TypeVarTupleType.tuple_fallback` clone (types.py:991-1001). The wire
+/// type carries the fallback as an Instance.
+fn inner_tvt_fallback(inner: &Type) -> Option<Box<Type>> {
+    match inner {
+        Type::TypeVarTupleType { tuple_fallback, .. } => Some(tuple_fallback.clone()),
+        _ => None,
+    }
 }
 
 /// Port of `visit_typeddict_type` (constraints.py:1542).
