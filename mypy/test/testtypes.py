@@ -68,7 +68,18 @@ from mypy.nodes import (
 from mypy.options import Options
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
-from mypy.subtypes import is_more_precise, is_proper_subtype, is_same_type, is_subtype
+from mypy.subtypes import (
+    IS_CLASSVAR,
+    IS_CLASS_OR_STATIC,
+    IS_EXPLICIT_SETTER,
+    IS_SETTABLE,
+    IS_VAR,
+    get_member_flags,
+    is_more_precise,
+    is_proper_subtype,
+    is_same_type,
+    is_subtype,
+)
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.traverser import (
@@ -12866,6 +12877,209 @@ class NativeMergeTypevarsSuite(Suite):
             [self._bytes_of(call1)], TypeVarId.next_raw_id, True
         )
         assert res is None
+
+
+# NativeGetMemberFlagsSuite: differential parity for the Rust port of
+# `get_member_flags` (subtypes.py:1773-1812). Toggles the subtype gate
+# on/off, asserting native and pure-Python paths agree (live PyO3 reads).
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeGetMemberFlagsSuite(Suite):
+    """Parity tests for `rust_get_member_flags` (mypy.subtypes.get_member_flags).
+
+    Builds TypeInfos with methods, properties, classvars, and extra attrs in
+    the unit-test SymbolTable style, then runs `get_member_flags` with the
+    native subtype gate on (Rust kernel reading the live node graph) and off
+    (pure Python), asserting identical result sets.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _build_info(self, name: str) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = name
+        info = TypeInfo(SymbolTable(), defn, name)
+        info.mro = [info, self.fx.oi]
+        return info
+
+    def _make_method(
+        self, name: str, *, is_classmethod: bool = False, is_staticmethod: bool = False
+    ) -> Decorator:
+        from mypy.nodes import Block
+
+        fd = FuncDef(name, [], Block([]))
+        v = Var(name)
+        v.is_classmethod = is_classmethod
+        v.is_staticmethod = is_staticmethod
+        return Decorator(fd, [], v)
+
+    def _make_property(
+        self, name: str, *, settable: bool = False, setter_type: CallableType | None = None
+    ) -> OverloadedFuncDef:
+        from mypy.nodes import Block, OverloadedFuncDef
+
+        dec = Decorator(FuncDef(name, [], Block([])), [], Var(name))
+        dec.var.is_property = True
+        dec.var.is_settable_property = settable
+        dec.var.setter_type = setter_type
+        o = OverloadedFuncDef([dec])
+        o.is_property = True
+        return o
+
+    def assert_par(self, name: str, itype: Instance, class_obj: bool = False) -> None:
+        """Assert the native seam matches the pure-Python oracle."""
+        from mypy.subtypes import get_member_flags
+
+        self._set_active(False)
+        try:
+            expected = get_member_flags(name, itype, class_obj=class_obj)
+        finally:
+            self._set_active(True)
+        actual = get_member_flags(name, itype, class_obj=class_obj)
+        assert actual == expected, f"rust {actual!r} != py {expected!r}"
+
+    def test_regular_method_empty(self) -> None:
+        info = self._build_info("M1")
+        info.names["f"] = SymbolTableNode(MDEF, self._make_method("f"))
+        itype = Instance(info, [])
+        self.assert_par("f", itype)
+        assert get_member_flags("f", itype) == set()
+
+    def test_classmethod_flag(self) -> None:
+        info = self._build_info("M2")
+        info.names["cm"] = SymbolTableNode(MDEF, self._make_method("cm", is_classmethod=True))
+        itype = Instance(info, [])
+        self.assert_par("cm", itype)
+        assert get_member_flags("cm", itype) == {IS_CLASS_OR_STATIC}
+
+    def test_staticmethod_flag(self) -> None:
+        info = self._build_info("M3")
+        info.names["sm"] = SymbolTableNode(MDEF, self._make_method("sm", is_staticmethod=True))
+        itype = Instance(info, [])
+        self.assert_par("sm", itype)
+        assert get_member_flags("sm", itype) == {IS_CLASS_OR_STATIC}
+
+    def test_settable_property_with_setter_type(self) -> None:
+        info = self._build_info("M4")
+        st = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function
+        )
+        prop = self._make_property("p", settable=True, setter_type=st)
+        info.names["p"] = SymbolTableNode(MDEF, prop)
+        itype = Instance(info, [])
+        self.assert_par("p", itype)
+        assert get_member_flags("p", itype) == {
+            IS_VAR,
+            IS_SETTABLE,
+            IS_EXPLICIT_SETTER,
+        }
+
+    def test_settable_property_without_setter_type(self) -> None:
+        info = self._build_info("M5")
+        prop = self._make_property("p", settable=True)
+        info.names["p"] = SymbolTableNode(MDEF, prop)
+        itype = Instance(info, [])
+        self.assert_par("p", itype)
+        assert get_member_flags("p", itype) == {IS_VAR, IS_SETTABLE}
+
+    def test_property_is_var(self) -> None:
+        info = self._build_info("M6")
+        prop = self._make_property("p")
+        info.names["p"] = SymbolTableNode(MDEF, prop)
+        itype = Instance(info, [])
+        self.assert_par("p", itype)
+        assert get_member_flags("p", itype) == {IS_VAR}
+
+    def test_classvar_attr(self) -> None:
+        info = self._build_info("M7")
+        v = Var("cv", self.fx.a)
+        v.is_classvar = True
+        info.names["cv"] = SymbolTableNode(MDEF, v)
+        itype = Instance(info, [])
+        self.assert_par("cv", itype)
+        assert get_member_flags("cv", itype) == {IS_VAR, IS_SETTABLE, IS_CLASSVAR}
+
+    def test_dunder_setattr_only(self) -> None:
+        info = self._build_info("M8")
+        info.names["__setattr__"] = SymbolTableNode(
+            MDEF, self._make_method("__setattr__")
+        )
+        itype = Instance(info, [])
+        self.assert_par("missing", itype)
+        assert get_member_flags("missing", itype) == {IS_SETTABLE}
+
+    def test_extra_attrs_immutable(self) -> None:
+        from mypy.types import ExtraAttrs
+
+        info = self._build_info("M9")
+        itype = Instance(info, [])
+        itype.extra_attrs = ExtraAttrs({"x": self.fx.a}, immutable={"x"})
+        self.assert_par("x", itype)
+        assert get_member_flags("x", itype) == set()
+
+    def test_extra_attrs_mutable(self) -> None:
+        from mypy.types import ExtraAttrs
+
+        info = self._build_info("M10")
+        itype = Instance(info, [])
+        itype.extra_attrs = ExtraAttrs({"x": self.fx.a}, immutable=set())
+        self.assert_par("x", itype)
+        assert get_member_flags("x", itype) == {IS_SETTABLE}
+
+    def test_final_var(self) -> None:
+        info = self._build_info("M11")
+        v = Var("fv", self.fx.a)
+        v.is_final = True
+        info.names["fv"] = SymbolTableNode(MDEF, v)
+        itype = Instance(info, [])
+        self.assert_par("fv", itype)
+        assert get_member_flags("fv", itype) == {IS_VAR}
+
+    def test_direct_seam_engages(self) -> None:
+        # Direct proof that the Rust kernel is engaged: a classmethod
+        # member classifies to {IS_CLASS_OR_STATIC} through the kernel.
+        info = self._build_info("M12")
+        info.names["cm"] = SymbolTableNode(MDEF, self._make_method("cm", is_classmethod=True))
+        itype = Instance(info, [])
+        raw = _type_kernel.rust_get_member_flags(
+            itype.type,
+            "cm",
+            False,
+            itype.extra_attrs,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert raw is not None, "rust_get_member_flags returned None (deferred)"
+        assert sorted(raw) == [IS_CLASS_OR_STATIC]
 
 
 # NativeAnyCausesOverloadAmbiguitySuite: differential parity for the Rust
