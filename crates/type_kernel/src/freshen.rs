@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use crate::expandtype::{expand_type_inner, make_type_normalized, EnvKey};
+use crate::expandtype::{expand_type_inner, make_type_normalized, result_has_typevar, EnvKey};
 use crate::setops::{union_item_can_be_false, union_item_can_be_true};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
@@ -46,6 +46,108 @@ pub(crate) fn rust_freshen_all_functions_type_vars(
     }
     let wire = encode_type(&result)?;
     Some((next_raw_id, true, wire))
+}
+
+/// `#[pyfunction]` entry for `freshen_function_type_vars`
+/// (expandtype.py:413-432). Takes the current `TypeVarId.next_raw_id` and a
+/// serialized `Type`, and returns `(next_raw_id, wire_bytes)` with fresh
+/// meta-level-1 type variables substituted, or `None` (Python `None`) when
+/// Rust cannot handle the case so the caller falls through to the pure-Python
+/// function. The Python shim advances `TypeVarId.next_raw_id` (same contract
+/// as the freshen-all seam).
+///
+/// Deferred (return None):
+///   * CallableType with a ParamSpecType variable (same deferral as the
+///     freshen-all path and the expand path).
+#[pyfunction]
+pub(crate) fn rust_freshen_function_type_vars(
+    start_raw_id: i64,
+    callee_bytes: &[u8],
+) -> PyResult<Option<(i64, Vec<u8>)>> {
+    let callee = match read_type(&mut ReadBuffer::new(callee_bytes), None) {
+        Ok(t) => t,
+        Err(_) => return Ok(None),
+    };
+    let mut next_raw_id = start_raw_id;
+    match freshen_function_type_vars(&callee, &mut next_raw_id) {
+        Some(result) => match encode_type(&result) {
+            Some(wire) => Ok(Some((next_raw_id, wire))),
+            None => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Mirror `freshen_function_type_vars` (expandtype.py:413-432) on the
+/// wire `Type` graph. The input comes from a wire round-trip, so every
+/// node is already proper. Fresh ids are allocated from `next_raw_id` and
+/// advanced (mirrors Python's global `TypeVarId.next_raw_id`). Returns
+/// `None` for deferred cases.
+fn freshen_function_type_vars(callee: &Type, next_raw_id: &mut i64) -> Option<Type> {
+    match callee {
+        Type::CallableType { variables, .. } if variables.is_empty() => Some(callee.clone()),
+        Type::CallableType { .. } => {
+            // Non-typevar variables (ParamSpec) need prefix handling
+            // (mirrors the freshen-all/expand deferral).
+            if variables_have_non_typevar(callee) {
+                return None;
+            }
+            // Build the tvmap with fresh meta-level-1 ids and expand the
+            // defaults (expandtype.py:419-423).
+            let mut tvmap: HashMap<EnvKey, Type> = HashMap::new();
+            let mut tvs: Vec<Type> = Vec::new();
+            for v in variables_of(callee).iter() {
+                let mut fresh = fresh_type_var(v, *next_raw_id);
+                *next_raw_id += 1;
+                if tvar_has_default(&fresh) {
+                    let new_default = expand_type_inner(tvar_default(&fresh), &tvmap, true)?;
+                    fresh = set_typevar_default(fresh, new_default);
+                }
+                tvmap.insert(var_env_key(v), fresh.clone());
+                tvs.push(fresh);
+            }
+            // expand_type(callee, tvmap) then copy_modified(variables=tvs).
+            let expanded = expand_type_inner(callee, &tvmap, true)?;
+            if result_has_typevar(&expanded) {
+                // A surviving TypeVar would lose identity on the wire
+                // round-trip; defer to Python which preserves it.
+                return None;
+            }
+            Some(set_callable_variables(expanded, tvs))
+        }
+        Type::Overloaded { items } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                let freshened = freshen_function_type_vars(item, next_raw_id)?;
+                // Python asserts each Overloaded item is a CallableType.
+                if !matches!(freshened, Type::CallableType { .. }) {
+                    return None;
+                }
+                new_items.push(freshened);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+        _ => None,
+    }
+}
+
+/// True if the callable's `variables` include a non-TypeVarType entry
+/// (ParamSpec / TypeVarTuple).
+fn variables_have_non_typevar(callee: &Type) -> bool {
+    let Type::CallableType { variables, .. } = callee else {
+        return false;
+    };
+    variables
+        .iter()
+        .any(|v| !matches!(v, Type::TypeVarType { .. }))
+}
+
+/// The callable's declared `variables`.
+fn variables_of(callee: &Type) -> &[Type] {
+    let Type::CallableType { variables, .. } = callee else {
+        return &[];
+    };
+    variables
 }
 
 /// Mirror `TypeTranslator` (type_visitor.py:181-340) with the

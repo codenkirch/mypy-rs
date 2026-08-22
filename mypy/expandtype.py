@@ -84,6 +84,20 @@ def _needs_python(typ: Type) -> bool:
             stack.append(p.fallback)
         elif isinstance(p, TypeAliasType):
             return True
+        elif isinstance(p, (ParamSpecType, TypeVarTupleType)):
+            # TypeVarTuple/ParamSpec always defer: the Rust remove_trivial
+            # dedups structurally and can drop distinct unresolved
+            # `Unpack[tuple[Never, ...]]` items, corrupting union results.
+            return True
+        elif isinstance(p, TypeVarType):
+            # Fresh (meta) type variables lose identity across the wire
+            # round-trip, so Rust dedup could merge distinct fresh vars.
+            if p.id.meta_level > 0 or p.has_default():
+                return True
+        elif isinstance(p, UnpackType):
+            # Walk through Unpack: `Unpack[tuple[Never, ...]]` nests a
+            # TypeVarTupleType only inside the wrapped type.
+            stack.append(p.type)
         elif isinstance(p, Instance):
             stack.extend(p.args)
         elif isinstance(p, UnionType):
@@ -415,6 +429,56 @@ def freshen_function_type_vars(callee: F) -> F:
     if isinstance(callee, CallableType):
         if not callee.is_generic():
             return callee
+        # Stage 3c type-kernel seam (mirrors expand_type's strangler-fig
+        # contract): Rust returns None on deferred cases (ParamSpec vars,
+        # unresolvable TypeInfos); `canonicalize_fresh_vars` re-unifies ids.
+        if (
+            _HAS_TYPE_KERNEL
+            and _native_expand_type_active
+            and _native_expand_type_resolver is not None
+            and not _needs_python(callee)
+        ):
+            try:
+                result = _type_kernel.rust_freshen_function_type_vars(
+                    TypeVarId.next_raw_id, _serialize_type(callee)
+                )
+                if result is not None:
+                    next_raw_id, serialized = result
+                    TypeVarId.next_raw_id = next_raw_id
+                    decoded = read_type(_ReadBuffer(bytes(serialized)))
+                    from mypy.wirefixup import fixup_wire_type
+
+                    fixed = fixup_wire_type(decoded)
+                    # The wire format drops line/column; preserve the input type's
+                    # location so derived contexts report errors at the
+                    # call site instead of a phantom line 0/-1.
+                    if fixed is not None and isinstance(fixed, ProperType):
+                        fixed.line = callee.line
+                        fixed.column = callee.column
+                        if isinstance(fixed, CallableType):
+                            fixed.fallback.line = fixed.line
+                    # Clear the process-global primitive decode singletons
+                    # after a read so NOT_READY Instances cannot leak into
+                    # later builds (see expand_type).
+                    from mypy.types import instance_cache
+
+                    instance_cache.int_type = None
+                    instance_cache.str_type = None
+                    instance_cache.bool_type = None
+                    instance_cache.object_type = None
+                    instance_cache.function_type = None
+                    if fixed is not None:
+                        from mypy.wirefixup import canonicalize_fresh_vars
+
+                        # Wire round-trip loses fresh meta-var identity;
+                        # re-unify occurrences before returning.
+                        fixed = canonicalize_fresh_vars(fixed)
+                        return cast(F, fixed)
+            except (AssertionError, NotImplementedError, ValueError, AttributeError):
+                # Defer to Python: semanal TypeInfo-not-fixed asserts,
+                # unserializable variants, failed wire reads, FakeInfo
+                # attribute access.
+                pass
         tvs = []
         tvmap: dict[TypeVarId, Type] = {}
         for v in callee.variables:
@@ -989,10 +1053,54 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
         * Remove everything else if there is an `object`
         * Remove strict duplicate types
     """
+    # Stage 3c type-kernel seam: try the Rust remove_trivial path. Rust
+    # returns None for read/write failures, then we fall through to the
+    # pure-Python loop (the strangler-fig per-call contract).
+    types_list = list(types)
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_expand_type_active
+        and not any(_needs_python(t) for t in types_list)
+    ):
+        try:
+            from mypy.types import read_type_list, write_type_list
+
+            buf = _WriteBuffer()
+            write_type_list(buf, types_list)
+            result = _type_kernel.rust_remove_trivial(
+                buf.getvalue(), state.strict_optional
+            )
+            if result is not None:
+                from mypy.wirefixup import fixup_wire_type
+
+                decoded = read_type_list(_ReadBuffer(bytes(result)))
+                # Clear the process-global primitive decode singletons
+                # after a read so NOT_READY Instances cannot leak into
+                # later builds (see expand_type).
+                from mypy.types import instance_cache
+
+                instance_cache.int_type = None
+                instance_cache.str_type = None
+                instance_cache.bool_type = None
+                instance_cache.object_type = None
+                instance_cache.function_type = None
+                fixed_types: list[Type] = []
+                for item in decoded:
+                    fixed = fixup_wire_type(item)
+                    if fixed is None:
+                        break
+                    fixed_types.append(fixed)
+                else:
+                    return fixed_types
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            # Defer to Python: semanal TypeInfo-not-fixed asserts,
+            # unserializable variants, failed wire reads, FakeInfo
+            # attribute access.
+            pass
     removed_none = False
     new_types = []
     all_types = set()
-    for t in types:
+    for t in types_list:
         p_t = get_proper_type(t)
         if isinstance(p_t, UninhabitedType):
             continue

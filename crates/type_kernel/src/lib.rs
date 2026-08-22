@@ -251,6 +251,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        freshen::rust_freshen_function_type_vars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(expandtype::rust_remove_trivial, module)?)?;
+    module.add_function(wrap_pyfunction!(
         typeops::rust_make_simplified_union,
         module
     )?)?;
