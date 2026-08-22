@@ -228,8 +228,14 @@ pub(crate) fn rust_match_generic_callables(
         (Ok(t), Ok(s)) => (t, s),
         _ => return Ok(None),
     };
-    let (Type::CallableType { variables: t_vars, .. }, Type::CallableType { variables: s_vars, .. }) =
-        (&t, &s)
+    let (
+        Type::CallableType {
+            variables: t_vars, ..
+        },
+        Type::CallableType {
+            variables: s_vars, ..
+        },
+    ) = (&t, &s)
     else {
         return Ok(None);
     };
@@ -798,14 +804,29 @@ mod tests {
         // Both operands must share the same fresh ids (join.py:1117-1120).
         let t = generic(&tvar("T", 1, 0));
         let s = generic(&tvar("U", 2, 0));
-        let (next, t_wire, s_wire) = rust_match_generic_callables(1, 100, &encode_type(&t).unwrap(), &encode_type(&s).unwrap())
-            .unwrap()
-            .expect("engages");
+        let (next, t_wire, s_wire) = rust_match_generic_callables(
+            1,
+            100,
+            &encode_type(&t).unwrap(),
+            &encode_type(&s).unwrap(),
+        )
+        .unwrap()
+        .expect("engages");
         assert_eq!(next, 101);
         let t_out = decode(&t_wire);
         let s_out = decode(&s_wire);
-        let Type::CallableType { variables: t_vars, .. } = &t_out else { panic!() };
-        let Type::CallableType { variables: s_vars, .. } = &s_out else { panic!() };
+        let Type::CallableType {
+            variables: t_vars, ..
+        } = &t_out
+        else {
+            panic!()
+        };
+        let Type::CallableType {
+            variables: s_vars, ..
+        } = &s_out
+        else {
+            panic!()
+        };
         // Both first variables get the same fresh id.
         assert_eq!(t_vars[0], tvar("T", 100, 0));
         assert_eq!(s_vars[0], tvar("U", 100, 0));
@@ -840,14 +861,31 @@ mod tests {
             type_guard: None,
             type_is: None,
         };
-        let (next, t_wire, s_wire) = rust_match_generic_callables(2, 50, &encode_type(&t).unwrap(), &encode_type(&s).unwrap())
-            .unwrap()
-            .expect("engages");
+        let (next, t_wire, s_wire) = rust_match_generic_callables(
+            2,
+            50,
+            &encode_type(&t).unwrap(),
+            &encode_type(&s).unwrap(),
+        )
+        .unwrap()
+        .expect("engages");
         assert_eq!(next, 52);
         let t_out = decode(&t_wire);
         let s_out = decode(&s_wire);
-        let Type::CallableType { arg_types: t_args, .. } = &t_out else { panic!() };
-        let Type::CallableType { variables: s_vars, arg_types: s_args, .. } = &s_out else { panic!() };
+        let Type::CallableType {
+            arg_types: t_args, ..
+        } = &t_out
+        else {
+            panic!()
+        };
+        let Type::CallableType {
+            variables: s_vars,
+            arg_types: s_args,
+            ..
+        } = &s_out
+        else {
+            panic!()
+        };
         // T and U both get id 50; V gets 51.
         assert_eq!(t_args[0], tvar("T", 50, 0));
         assert_eq!(s_args[0], tvar("U", 50, 0));
