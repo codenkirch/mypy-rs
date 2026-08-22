@@ -228,6 +228,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        joinfns::rust_object_from_instance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         argmap::rust_map_actuals_to_formals,
         module
     )?)?;

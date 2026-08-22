@@ -127,6 +127,30 @@ pub(crate) fn rust_object_or_any_from_type(
     encode_type(&result)
 }
 
+/// `object_from_instance` (join.py:1303-1307): construct the type
+/// `builtins.object` from an instance type. Uses the fact that `object`
+/// is always the last class in the MRO; the resolver snapshot's `mro`
+/// is the full C3 linearization, so `mro[-1]` is `builtins.object` in a
+/// sane graph (mirrors `IndexSet` in the Python mro).
+///
+/// Returns the `builtins.object` TypeInfo fullname; `None` (defer to
+/// Python) when the instance's TypeInfo snapshot is missing from the
+/// resolver or the MRO is empty. The Python shim builds the `Instance`
+/// from the decoded fullname via the live TypeInfo map, so identity and
+/// fixup semantics stay identical to the pure-Python construction.
+#[pyfunction]
+pub(crate) fn rust_object_from_instance(
+    instance_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<String> {
+    let typ = decode_type(instance_bytes)?;
+    let Type::Instance { type_ref, .. } = typ else {
+        return None;
+    };
+    let snap = resolver.resolver().get(&type_ref)?;
+    Some(snap.mro.last()?.clone())
+}
+
 /// `match_generic_callables` (join.py:1110-1120): when both callables are
 /// generic, renumber the type variables so both share the same id space.
 /// `min_len == 0` is a no-op (Python returns the inputs unchanged). The
@@ -258,4 +282,97 @@ pub(crate) fn rust_combine_similar_callables(
     let t = decode_type(t_bytes)?;
     let s = decode_type(s_bytes)?;
     combine_similar_callables_core(&t, &s, strict_optional, resolver.resolver())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::typeinfo::TypeInfoSnapshot;
+    use crate::wire::Type;
+
+    fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
+        let mut r = TypeResolver::new();
+        for s in snaps {
+            r.insert(s.fullname.clone(), s);
+        }
+        r
+    }
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    /// Snapshot whose mro is `fullname` followed by `builtins.object`
+    /// (mirrors the Python TypeFixture where object is in every mro).
+    fn snap(fullname: &str) -> TypeInfoSnapshot {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        if fullname != "builtins.object" {
+            s.mro.push("builtins.object".to_string());
+        }
+        s
+    }
+
+    /// Core of `rust_object_from_instance`: last mro entry, or None.
+    fn object_from_instance_core(typ: &Type, resolver: &TypeResolver) -> Option<String> {
+        let Type::Instance { type_ref, .. } = typ else {
+            return None;
+        };
+        let snap = resolver.get(type_ref)?;
+        snap.mro.last().cloned()
+    }
+
+    #[test]
+    fn object_from_instance_returns_object_for_simple_class() {
+        // A (mro=[A, object]) -> object.
+        let r = make_resolver(vec![snap("a.A"), snap("builtins.object")]);
+        assert_eq!(
+            object_from_instance_core(&instance("a.A"), &r).as_deref(),
+            Some("builtins.object")
+        );
+    }
+
+    #[test]
+    fn object_from_instance_returns_object_for_object() {
+        // object (mro=[object]) -> object.
+        let r = make_resolver(vec![snap("builtins.object")]);
+        assert_eq!(
+            object_from_instance_core(&instance("builtins.object"), &r).as_deref(),
+            Some("builtins.object")
+        );
+    }
+
+    #[test]
+    fn object_from_instance_missing_snapshot_defers() {
+        // Snapshot absent from resolver -> None (defer to Python).
+        let r = make_resolver(vec![]);
+        assert_eq!(object_from_instance_core(&instance("a.A"), &r), None);
+    }
+
+    #[test]
+    fn object_from_instance_non_instance_defers() {
+        // Non-Instance -> None (Python handles via default()).
+        let r = make_resolver(vec![snap("builtins.object")]);
+        assert_eq!(object_from_instance_core(&Type::NoneType, &r), None);
+    }
+
+    #[test]
+    fn object_from_instance_empty_mro_defers() {
+        // Snapshot with empty mro -> None (sane graphs always have
+        // object at mro[-1], so this is defensive only).
+        let r = make_resolver(vec![TypeInfoSnapshot {
+            fullname: "a.Empty".to_string(),
+            ..Default::default()
+        }]);
+        assert_eq!(object_from_instance_core(&instance("a.Empty"), &r), None);
+    }
 }
