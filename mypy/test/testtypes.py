@@ -3102,6 +3102,162 @@ class NativeJoinTypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMatchGenericCallablesSuite(Suite):
+    """Parity suite for the Rust `match_generic_callables` id-renumbering
+    port (join.py:1152-1180, freshen.rs).
+
+    With the native join gate on, `match_generic_callables` routes
+    through the kernel: Rust allocates one shared batch of fresh
+    meta-level-0 ids (`TypeVarId.new(meta_level=0)`) passed to BOTH
+    operands, renumbers each operand's variables, and expands the body
+    via `expand_type` (join.py:1171-1173).
+
+    Every test runs a gate-off vs gate-on differential and asserts the
+    results render identically; the Rust seam must also engage (direct
+    kernel call) for the portable cases.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
+        import mypy.join
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            return fn()
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def _generic(self, tv: TypeVarType) -> CallableType:
+        """A generic callable: `def f(tv: tv) -> tv`."""
+        return CallableType(
+            [tv], [ARG_POS], [None], tv, self.fx.function, variables=[tv]
+        )
+
+    def test_match_generic_callables_renumbers(self) -> None:
+        # def f(t: T) -> T: join(f, f) must renumber T to a fresh id so
+        # the two operands share one id space.
+        from mypy.join import match_generic_callables
+
+        c = self._generic(self.fx.t)
+        before = TypeVarId.next_raw_id
+        tc, sc = self._with_gate(True, lambda: match_generic_callables(c, c))
+        # Fresh ids were allocated (t and s both get T'raw_id fresh).
+        assert tc.variables[0].id.raw_id >= before
+        assert sc.variables[0].id.raw_id == tc.variables[0].id.raw_id
+        assert tc.variables[0].id.meta_level == 0
+        assert tc.arg_types[0].id == tc.variables[0].id
+        assert sc.arg_types[0].id == sc.variables[0].id
+        assert_equal(str(tc), str(sc))
+
+    def test_match_generic_callables_mixed_arity(self) -> None:
+        # t has 1 var, s has 2: both renumbered into the same id range.
+        from mypy.join import match_generic_callables
+
+        t = self._generic(self.fx.t)
+        s2 = TypeVarType(
+            "U", "U", TypeVarId(3), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        s2b = TypeVarType(
+            "V", "V", TypeVarId(4), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        s = CallableType(
+            [s2, s2b], [ARG_POS, ARG_POS], [None, None], s2, self.fx.function, variables=[s2, s2b]
+        )
+        t_out, s_out = match_generic_callables(t, s)
+        # BOTH operands share the same fresh-id batch (join.py:1117-1120
+        # passes one `new_ids` list to both `update_callable_ids` calls):
+        # t's T and s's U both get the first fresh id, s's V the second.
+        assert t_out.variables[0].id.raw_id == s_out.variables[0].id.raw_id
+        assert s_out.variables[1].id.raw_id == s_out.variables[0].id.raw_id + 1
+        assert t_out.arg_types[0].id == t_out.variables[0].id
+        assert s_out.arg_types[0].id == s_out.variables[0].id
+        # str renders names, not ids; assert id equality on the ret types.
+        assert t_out.ret_type.id == s_out.ret_type.id
+
+    def test_match_generic_callables_min_len_zero_noop(self) -> None:
+        from mypy.join import match_generic_callables
+
+        # A non-generic callable: min_len == 0 short-circuits to the
+        # unchanged operands (join.py:1169-1170).
+        non_generic = self.fx.callable(self.fx.a, self.fx.b)
+        t_out, s_out = match_generic_callables(non_generic, non_generic)
+        assert t_out is non_generic
+        assert s_out is non_generic
+
+    def test_match_generic_callables_gate_off_differential(self) -> None:
+        from mypy.join import match_generic_callables
+
+        c = self._generic(self.fx.t)
+        off = self._with_gate(False, lambda: match_generic_callables(c, c))
+        on = self._with_gate(True, lambda: match_generic_callables(c, c))
+        assert_equal(str(on[0]), str(off[0]))
+        assert_equal(str(on[1]), str(off[1]))
+
+    def test_match_generic_callables_param_spec_defers(self) -> None:
+        from mypy.join import match_generic_callables
+
+        # ParamSpec variables keep the Python path (Rust cannot rebuild
+        # ParamSpec prefix identity); the differential must still agree.
+        p = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        c = CallableType(
+            [p], [ARG_POS], [None], self.fx.a, self.fx.function, variables=[p]
+        )
+        off = self._with_gate(False, lambda: match_generic_callables(c, c))
+        on = self._with_gate(True, lambda: match_generic_callables(c, c))
+        assert_equal(str(on[0]), str(off[0]))
+        assert_equal(str(on[1]), str(off[1]))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstanceSuite(Suite):
     """Parity suite for the Rust `visit_instance` nominal join (Stage 3c M8f).
 

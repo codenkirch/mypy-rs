@@ -1149,6 +1149,39 @@ def update_callable_ids(c: CallableType, ids: list[TypeVarId]) -> CallableType:
     return expand_type(c, tv_map).copy_modified(variables=tvs)
 
 
+def _try_native_match_generic_callables(
+    t: CallableType, s: CallableType
+) -> tuple[CallableType, CallableType] | None:
+    """Try `match_generic_callables` id-renumbering in Rust; None defers.
+
+    Serializes both callables and calls the kernel once; the kernel
+    allocates one shared batch of fresh meta-level-0 ids (join.py:1117
+    passes the same `new_ids` list to both `update_callable_ids` calls).
+    Any wire-format failure falls through to None so the pure-Python
+    body runs unchanged (strangler-fig per-call gate).
+    """
+    try:
+        result = _type_kernel.rust_match_generic_callables(
+            max(len(t.variables), len(s.variables)),
+            TypeVarId.next_raw_id,
+            _serialize_type(t),
+            _serialize_type(s),
+        )
+        if result is None:
+            return None
+        next_raw_id, t_wire, s_wire = result
+        TypeVarId.next_raw_id = next_raw_id
+        t_fixed = _deserialize_type(bytes(t_wire))
+        s_fixed = _deserialize_type(bytes(s_wire))
+        if t_fixed is None or s_fixed is None:
+            return None
+        if not isinstance(t_fixed, CallableType) or not isinstance(s_fixed, CallableType):
+            return None
+        return t_fixed, s_fixed
+    except (AssertionError, NotImplementedError, ValueError, AttributeError):
+        return None
+
+
 def match_generic_callables(t: CallableType, s: CallableType) -> tuple[CallableType, CallableType]:
     # The case where we combine/join/meet similar callables, situation where both are
     # generic
@@ -1164,6 +1197,10 @@ def match_generic_callables(t: CallableType, s: CallableType) -> tuple[CallableT
     # added to
 
     # type variables, and it worked relatively well.
+    if _HAS_TYPE_KERNEL and _native_join_active and _native_join_resolver is not None:
+        res = _try_native_match_generic_callables(t, s)
+        if res is not None:
+            return res
     max_len = max(len(t.variables), len(s.variables))
     min_len = min(len(t.variables), len(s.variables))
     if min_len == 0:
