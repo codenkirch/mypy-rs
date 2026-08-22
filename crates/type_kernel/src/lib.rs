@@ -95,6 +95,7 @@ mod maptype;
 mod meet;
 mod message_registry;
 mod messages;
+mod messages_find_overlaps;
 mod modulefinder;
 mod mro;
 mod operators;
@@ -792,6 +793,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         messages::rust_append_invariance_notes,
+        module
+    )?)?;
+    // Issue #749: find_type_overlaps (messages.py:3055-3079).
+    module.add_function(wrap_pyfunction!(
+        messages_find_overlaps::rust_find_type_overlaps,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

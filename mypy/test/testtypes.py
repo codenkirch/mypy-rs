@@ -11237,6 +11237,135 @@ class NativeMessagesSuite(Suite):
         )
         self.assertIsNotNone(actual, "rust pretty_callable deferred on a plain callable")
         assert_equal(actual, expected, "pretty_callable mismatch")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFindTypeOverlapsSuite(Suite):
+    """Parity tests for the Rust find_type_overlaps port (mypy.messages).
+
+    find_type_overlaps(*types) returns the set of fullnames whose short
+    names collide across the given types (plus the typing.* injections for
+    TYPES_FOR_UNIMPORTED_HINTS). The Rust seam (rust_find_type_overlaps)
+    decodes the wire blobs and computes the same set; the Python body stays
+    untouched and runs when the gate is off or the seam defers.
+
+    Each test compares the pure-Python result (gate off) with the seam
+    result (gate on) and asserts they are identical.
+    """
+
+    def setUp(self) -> None:
+        from mypy.messages import _set_native_messages_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_messages_active
+        self._set_active(True)
+        self._buf = _WriteBuffer()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        self._buf = _WriteBuffer()
+        t.write(self._buf)
+        return self._buf.getvalue()
+
+    def _dup_a(self) -> Instance:
+        # A realistic TypeInfo for class A in module other: defn.name "A"
+        # (short name), fullname "other.A". make_type_info("other.A") cannot
+        # produce this shape, so build the TypeInfo directly.
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        class_def = ClassDef("A", Block([]), None, [])
+        class_def.fullname = "other.A"
+        info = TypeInfo(SymbolTable(), class_def, "other")
+        info.mro = [info]
+        info.bases = []
+        return Instance(info, [])
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def assert_overlap_par(self, *types: Type) -> None:
+        from mypy.messages import find_type_overlaps
+
+        off = self._with_gate(False, lambda: find_type_overlaps(*types))
+        on = self._with_gate(True, lambda: find_type_overlaps(*types))
+        assert_equal(on, off, f"find_type_overlaps parity {types}")
+        assert_equal(set(on), set(off), f"find_type_overlaps set parity {types}")
+
+    def _assert_engages(self, *types: Type) -> None:
+        result = _type_kernel.rust_find_type_overlaps(
+            [self._bytes_of(t) for t in types]
+        )
+        assert result is not None, f"rust find_type_overlaps did not engage for {types}"
+
+    def test_overlapping_pair(self) -> None:
+        # Two classes with the same short name in different modules.
+        self.assert_overlap_par(self.fx.a, self._dup_a())
+        self._assert_engages(self.fx.a, self._dup_a())
+
+    def test_disjoint_pair(self) -> None:
+        # Different short names, no overlap.
+        self.assert_overlap_par(self.fx.a, self.fx.b)
+
+    def test_three_types_one_overlap(self) -> None:
+        # A collides with another A; C is disjoint; only A fullnames return.
+        self.assert_overlap_par(self.fx.a, self._dup_a(), self.fx.c)
+        self._assert_engages(self.fx.a, self._dup_a(), self.fx.c)
+
+    def test_no_overlap(self) -> None:
+        # Three disjoint names: empty set.
+        self.assert_overlap_par(self.fx.a, self.fx.b, self.fx.c)
+
+    def test_typing_injection(self) -> None:
+        # `List` also in TYPES_FOR_UNIMPORTED_HINTS: typing.List is injected
+        # into the short-name group when a user List collides.
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        class_def = ClassDef("List", Block([]), None, [])
+        class_def.fullname = "m.List"
+        info = TypeInfo(SymbolTable(), class_def, "m")
+        info.mro = [info]
+        info.bases = []
+        lst2 = Instance(info, [])
+        self.assert_overlap_par(lst2, lst2)
+        self._assert_engages(lst2)
+
+    def test_typevar_scoped_name(self) -> None:
+        # Same short TypeVar name, different namespaces: both scoped names
+        # are returned.
+        id1 = TypeVarId(1, namespace="mod1")
+        id2 = TypeVarId(2, namespace="mod2")
+        tv1 = TypeVarType("T", "T", id1, [], self.fx.o, self.fx.o)
+        tv2 = TypeVarType("T", "T", id2, [], self.fx.o, self.fx.o)
+        self.assert_overlap_par(tv1, tv2)
+        self._assert_engages(tv1, tv2)
+
+    def test_union_inner_overlap(self) -> None:
+        # Overlap nested inside a union arg is detected.
+        u = UnionType.make_union([self.fx.a, self._dup_a()])
+        self.assert_overlap_par(u)
+        self._assert_engages(u)
+
+    def test_alias_defers_to_python(self) -> None:
+        # TypeAliasType: the wire carries no alias node, so the Rust seam
+        # defers and the pure-Python body runs (gate-on == gate-off).
+        from mypy.messages import find_type_overlaps
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.TA", "mod", -1, -1)
+        alias_type = TypeAliasType(alias, [])
+        # The seam must decline (None) on the alias wire form.
+        assert _type_kernel.rust_find_type_overlaps(
+            [self._bytes_of(alias_type)]
+        ) is None, "rust should defer on TypeAliasType"
+        off = self._with_gate(False, lambda: find_type_overlaps(alias_type))
+        on = self._with_gate(True, lambda: find_type_overlaps(alias_type))
+        assert_equal(on, off, "alias find_type_overlaps parity")
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCheckPatternSuite(Suite):
     """Parity tests for the M22 checkpattern Rust helpers.

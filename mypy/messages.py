@@ -3058,6 +3058,15 @@ def find_type_overlaps(*types: Type) -> set[str]:
     This is used to ensure that distinct types with the same short name are printed
     with their fullname.
     """
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        try:
+            raw = _type_kernel.rust_find_type_overlaps(
+                [_serialize_type_for_messages(t) for t in types]
+            )
+            if raw is not None:
+                return set(raw)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     d: dict[str, set[str]] = {}
     for type in types:
         for t in collect_all_named_types(type):
