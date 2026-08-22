@@ -2518,6 +2518,20 @@ def restrict_subtype_away(t: Type, s: Type, *, consider_runtime_isinstance: bool
 
 def covers_at_runtime(item: Type, supertype: Type) -> bool:
     """Will isinstance(item, supertype) always return True at runtime?"""
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            from mypy.state import state
+
+            result = _type_kernel.rust_covers_at_runtime(
+                _serialize_type(item),
+                _serialize_type(supertype),
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     item = get_proper_type(item)
     supertype = get_proper_type(supertype)
 

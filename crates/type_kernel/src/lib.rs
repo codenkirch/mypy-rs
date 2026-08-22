@@ -73,6 +73,7 @@ mod constraints;
 mod constraints_filter;
 mod constraints_helpers;
 mod copymodified;
+mod covers_at_runtime;
 mod dangerous_comparison;
 mod dataclasses;
 mod detach_callable;
@@ -2646,6 +2647,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // checker.conditional_types (the isinstance/equality narrowing split).
     module.add_function(wrap_pyfunction!(
         cond_types::rust_conditional_types,
+        module
+    )?)?;
+
+    // Issue #745: subtypes.covers_at_runtime (runtime isinstance coverage).
+    module.add_function(wrap_pyfunction!(
+        covers_at_runtime::rust_covers_at_runtime,
         module
     )?)?;
 

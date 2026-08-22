@@ -47,7 +47,7 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// `get_proper_type` for the wire format. Expands `TypeAliasType` by
 /// returning `None` (defer) since the wire format has no alias target.
 /// For all other types, returns the type as-is (they are already proper).
-fn get_proper_or_none(typ: &Type) -> Option<&Type> {
+pub(crate) fn get_proper_or_none(typ: &Type) -> Option<&Type> {
     match typ {
         Type::TypeAliasType { .. } => None,
         _ => Some(typ),
@@ -201,7 +201,7 @@ fn custom_special_method_on_snap(
 /// `CallableType.is_type_obj()` (types.py:2358) =
 /// `fallback.type.is_metaclass() and not isinstance(get_proper_type(ret_type),
 /// UninhabitedType)`. `is_metaclass` checks MRO for `builtins.type`.
-fn is_type_obj(
+pub(crate) fn is_type_obj(
     fallback: &Type,
     ret_type: &Type,
     from_concatenate: bool,
