@@ -15526,6 +15526,236 @@ class NativeCallableArgConstraintsSuite(Suite):
         self._assert_par(template, actual, direction=SUPERTYPE_OF)
 
 
+class NativeTupleConstraintsSuite(Suite):
+    """Parity tests for the Rust `visit_tuple_type` constraint port.
+
+    Differential harness: runs `infer_constraints` with the native
+    constraint-builder gate on (resolver + wire map installed) and off
+    (pure Python ConstraintBuilderVisitor), asserting the two constraint
+    lists are equal. Covers the variadic paths from
+    `visit_tuple_type` (constraints.py:1731-1835) and
+    `build_constraints_for_simple_unpack` (constraints.py:2050-2143):
+    template-Unpack vs varlength tuple, template-Unpack vs fixed
+    TupleType, template without Unpack vs actual with internal Unpack,
+    fixed-vs-fixed, and the named-tuple fallback early return.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Safe fallbacks so a failed differential never crosses suites.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _tup(self, *items: Type) -> TupleType:
+        return TupleType(list(items), self.fx.std_tuple)
+
+    def _tup_tvt(self, tvt: TypeVarTupleType) -> TupleType:
+        # A TypeVarTupleType in item position must be wrapped in UnpackType
+        # to form a variadic tuple (PEP 646).
+        return self._tup(UnpackType(tvt))
+
+    def _constraints(
+        self, template: Type, actual: Type, direction: int, native: bool
+    ) -> list[Any]:
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            infer_constraints,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_constraints(template, actual, direction)
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._constraints(template, actual, direction, native=True)
+        python = self._constraints(template, actual, direction, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        # Direct seam call proving the Rust port runs (returns constraint
+        # blobs) rather than deferring to the pure-Python visitor.
+        raw = _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            self._bytes_of(template),
+            self._bytes_of(actual),
+            direction,
+            False,
+            False,
+        )
+        assert raw is not None, (
+            f"Rust seam must engage for template={template!r} actual={actual!r}"
+        )
+
+    # --- Template has an Unpack, actual is a varlength tuple ---
+
+    def test_unpack_template_varlength_tuple_tvt(self) -> None:
+        # Tuple[*Ts] <: tuple[X, ...] via map_instance_to_supertype.
+        template = self._tup_tvt(self.fx.ts)
+        actual = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_unpack_template_varlength_tuple_homogeneous(self) -> None:
+        # Tuple[*tuple[T, ...]] <: tuple[X, ...].
+        template = self._tup(UnpackType(Instance(self.fx.std_tuplei, [self.fx.t])))
+        actual = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_unpack_template_varlength_tuple_prefix_suffix(self) -> None:
+        # Tuple[T, *Ts, U] <: tuple[X, ...]: T <: X and U <: X in addition
+        # to the packet constraint.
+        template = self._tup(self.fx.t, UnpackType(self.fx.ts), self.fx.u)
+        actual = Instance(self.fx.std_tuplei, [self.fx.a])
+        self._assert_par(template, actual)
+
+    # --- Template has an Unpack, actual is a fixed TupleType ---
+
+    def test_unpack_template_fixed_tuple_tvt(self) -> None:
+        # Tuple[*Ts] <: (X, Y).
+        template = self._tup_tvt(self.fx.ts)
+        actual = self._tup(self.fx.a, self.fx.b)
+        self._assert_par(template, actual)
+
+    def test_unpack_template_fixed_tuple_simple(self) -> None:
+        # Tuple[T, *Ts, U] <: (X, Y, Z, W): T <: X, Ts <: (Y, Z), U <: W.
+        template = self._tup(self.fx.t, UnpackType(self.fx.ts), self.fx.u)
+        actual = self._tup(self.fx.a, self.fx.b, self.fx.c, self.fx.d)
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_unpack_template_fixed_tuple_homogeneous(self) -> None:
+        # Tuple[T, *tuple[S, ...], U] <: (X, Y, Z, W).
+        template = self._tup(
+            self.fx.t, UnpackType(Instance(self.fx.std_tuplei, [self.fx.s])), self.fx.u
+        )
+        actual = self._tup(self.fx.a, self.fx.b, self.fx.c, self.fx.d)
+        self._assert_par(template, actual)
+
+    def test_unpack_template_fixed_tuple_too_short(self) -> None:
+        # Tuple[T, *Ts, U] <: (X): prefix+suffix exceed the actual length,
+        # fast-return path.
+        template = self._tup(self.fx.t, UnpackType(self.fx.ts), self.fx.u)
+        actual = self._tup(self.fx.a)
+        self._assert_par(template, actual)
+
+    # --- Template without Unpack, actual has an internal Unpack ---
+
+    def test_fixed_template_actual_internal_unpack(self) -> None:
+        # Tuple[T, S, U] <: (X, *tuple[Y, ...], Z): T <: X, S <: Y, U <: Z.
+        template = self._tup(self.fx.t, self.fx.s, self.fx.u)
+        actual = self._tup(
+            self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self.fx.b])), self.fx.c
+        )
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_fixed_template_actual_trailing_internal_unpack(self) -> None:
+        # Tuple[T, S, U] <: (*tuple[X, ...], Y): the compatible split
+        # branch (template len == actual len - 1, unpack at the front)
+        # constrains the middle template items against the unpack arg.
+        template = self._tup(self.fx.t, self.fx.s, self.fx.u)
+        actual = self._tup(
+            UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])), self.fx.b
+        )
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_fixed_template_actual_trailing_internal_unpack_supertypes(self) -> None:
+        template = self._tup(self.fx.t, self.fx.s, self.fx.u)
+        actual = self._tup(
+            UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])), self.fx.b
+        )
+        self._assert_par(template, actual, direction=SUPERTYPE_OF)
+
+    def test_fixed_template_actual_internal_unpack_tvt(self) -> None:
+        # Tuple[T, S, U] <: (X, *Ts, Z): the middle is a TypeVarTuple and
+        # yields no constraints, the split prefix/suffix still constrain.
+        template = self._tup(self.fx.t, self.fx.s, self.fx.u)
+        actual = self._tup(self.fx.a, UnpackType(self.fx.ts), self.fx.b)
+        self._assert_par(template, actual)
+
+    def test_fixed_template_actual_internal_unpack_too_short(self) -> None:
+        # Tuple[T, S] <: (X, *tuple[Y, ...], Z): actual length exceeds
+        # template, no per-item constraints but the fallback tail runs.
+        template = self._tup(self.fx.t, self.fx.s)
+        actual = self._tup(
+            self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self.fx.b])), self.fx.c
+        )
+        self._assert_par(template, actual)
+
+    # --- Fixed template vs fixed actual ---
+
+    def test_fixed_equal_length(self) -> None:
+        template = self._tup(self.fx.t, self.fx.s)
+        actual = self._tup(self.fx.a, self.fx.b)
+        self._assert_par(template, actual)
+
+    def test_fixed_equal_length_supertypes(self) -> None:
+        template = self._tup(self.fx.t, self.fx.s)
+        actual = self._tup(self.fx.a, self.fx.b)
+        self._assert_par(template, actual, direction=SUPERTYPE_OF)
+
+    def test_fixed_equal_length_any_item(self) -> None:
+        template = self._tup(self.fx.t, self.fx.s)
+        actual = self._tup(AnyType(TypeOfAny.special_form), self.fx.b)
+        self._assert_par(template, actual)
+
+    def test_fixed_length_mismatch(self) -> None:
+        template = self._tup(self.fx.t, self.fx.s, self.fx.u)
+        actual = self._tup(self.fx.a, self.fx.b)
+        self._assert_par(template, actual)
+
+    # --- Template is a TupleType, actual is not ---
+
+    def test_template_tuple_actual_any(self) -> None:
+        # infer_against_any over the template items.
+        template = self._tup(self.fx.t, self.fx.s)
+        actual = AnyType(TypeOfAny.special_form)
+        self._assert_par(template, actual)
+
+    def test_template_tuple_actual_instance(self) -> None:
+        # Unrelated instance, not a varlength tuple: no constraints.
+        template = self._tup(self.fx.t)
+        actual = self.fx.a
+        self._assert_par(template, actual)
+
+    def test_template_tuple_actual_varlength_list(self) -> None:
+        # A list is not a tuple subtype through builtins.tuple; no
+        # constraints.
+        template = self._tup(self.fx.t)
+        actual = Instance(self.fx.std_listi, [self.fx.a])
+        self._assert_par(template, actual)
+
+
 class _FakeNode:
     """Minimal stand-in for a MypyFile with `.names` for builtins tests."""
 
