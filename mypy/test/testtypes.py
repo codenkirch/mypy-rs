@@ -38,6 +38,7 @@ from mypy.nodes import (
     INVARIANT,
     MDEF,
     ArgKind,
+    Argument,
     BytesExpr,
     CallExpr,
     Context,
@@ -45,6 +46,7 @@ from mypy.nodes import (
     DictExpr,
     EllipsisExpr,
     Expression,
+    FuncBase,
     FuncDef,
     IndexExpr,
     IntExpr,
@@ -53,6 +55,7 @@ from mypy.nodes import (
     MypyFile,
     NameExpr,
     OpExpr,
+    OverloadedFuncDef,
     PlaceholderNode,
     SetExpr,
     SliceExpr,
@@ -4478,6 +4481,245 @@ class NativeTryGettingLiteralSuite(Suite):
     def test_uninhabited(self) -> None:
         self._assert_par(self.fx.uninhabited)
         self._assert_engages(self.fx.uninhabited)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFunctionTypeSuite(Suite):
+    """Parity for the Rust `function_type`/`callable_type` port (mypy.typeops).
+
+    `function_type` either returns the func's typed FunctionLike, or builds
+    a `CallableType` from the FuncItem's signature (binding self/cls), or a
+    dummy `Overloaded([CallableType])` for a broken overload. The Rust port
+    mirrors all three branches; the Python shim restores the non-wire
+    line/column/definition via `copy_modified`. Toggling the typeops gate
+    off (pure Python) and on (Rust seam) must produce identical `str()` and
+    identical line/column/definition state. Direct seam calls prove the
+    Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active = _set_native_typeops_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], FunctionLike]) -> FunctionLike:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, func: FuncBase) -> None:
+        from mypy.typeops import function_type
+
+        off = self._with_gate(False, lambda: function_type(func, self.fx.function))
+        on = self._with_gate(True, lambda: function_type(func, self.fx.function))
+        assert_equal(str(on), str(off), f"function_type(str) parity {func.name}")
+        assert_equal(on.line, off.line, f"function_type(line) parity {func.name}")
+        assert_equal(on.column, off.column, f"function_type(column) parity {func.name}")
+        if isinstance(on, CallableType) and isinstance(off, CallableType):
+            assert_equal(on.implicit, off.implicit, f"function_type(implicit) {func.name}")
+            if isinstance(func, FuncDef):
+                assert_equal(
+                    on.definition,
+                    off.definition,
+                    f"function_type(definition) parity {func.name}",
+                )
+
+    def _assert_engages(self, func: FuncBase) -> None:
+        from mypy.typeops import _serialize_type
+
+        result = _type_kernel.rust_function_type(func, _serialize_type(self.fx.function))
+        assert result is not None, f"Rust function_type did not engage for {func.name}"
+
+    def _func_def(
+        self,
+        name: str = "f",
+        arguments: Sequence[Argument] | None = None,
+        typ: FunctionLike | None = None,
+    ) -> FuncDef:
+        return FuncDef(name, list(arguments) if arguments is not None else None, None, typ)
+
+    def test_untyped_func_def_no_self(self) -> None:
+        # Plain def f(): -> dummy CallableType via callable_type: all-Any args.
+        fn = self._func_def()
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_func_def_with_args(self) -> None:
+        # def f(x: int, y: str = "", *args, **kwargs): with no .type set.
+        a = Var("x")
+        b = Var("y")
+        c = Var("args")
+        d = Var("kwargs")
+        fn = self._func_def(
+            "f",
+            [
+                Argument(a, self.fx.a, None, ARG_POS),
+                Argument(b, self.fx.b, None, ARG_OPT),
+                Argument(c, None, None, ARG_STAR),
+                Argument(d, None, None, ARG_STAR2),
+            ],
+        )
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_method_with_self_binds_self(self) -> None:
+        # Method: info set + has_self_or_cls_argument -> fill_typevars(info).
+        fn = self._func_def("method")
+        fn.info = self.fx.ai
+        fn.arg_names = ["self"]
+        fn.arg_kinds = [ARG_POS]
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_classmethod_binds_cls_as_type(self) -> None:
+        # @classmethod: is_class=True -> self_type is TypeType(Instance(A)).
+        fn = self._func_def("cm")
+        fn.info = self.fx.ai
+        fn.is_class = True
+        fn.arg_names = ["cls"]
+        fn.arg_kinds = [ARG_POS]
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_staticmethod_no_self_binding(self) -> None:
+        # @staticmethod inside a class: has_self_or_cls_argument False
+        # (is_static True, name != "__new__") -> all-Any args.
+        fn = self._func_def("sm")
+        fn.info = self.fx.ai
+        fn.is_static = True
+        fn.arg_names = ["x"]
+        fn.arg_kinds = [ARG_POS]
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_new_method_binds_cls(self) -> None:
+        # __new__: has_self_or_cls_argument True even when static.
+        fn = self._func_def("__new__")
+        fn.info = self.fx.ai
+        fn.is_static = True
+        fn.arg_names = ["cls"]
+        fn.arg_kinds = [ARG_POS]
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_typed_func_def_returns_type(self) -> None:
+        # A typed FuncDef: func.type truthy -> returned unchanged.
+        typ = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            ["x", "y"],
+            self.fx.a,
+            self.fx.function,
+            name="f",
+            line=7,
+            column=9,
+        )
+        fn = self._func_def("f", typ=typ)
+        self._assert_par(fn)
+        self._assert_engages(fn)
+
+    def test_overloaded_func_def_types(self) -> None:
+        # A valid typed overload: func.type is an Overloaded -> returned
+        # unchanged (passthrough).
+        item = FuncDef("g")
+        item.info = self.fx.ai
+        item.arg_names = ["x"]
+        item.arg_kinds = [ARG_POS]
+        overloaded = OverloadedFuncDef([item])
+        overloaded.type = Overloaded(
+            [
+                CallableType(
+                    [self.fx.a],
+                    [ARG_POS],
+                    ["x"],
+                    self.fx.a,
+                    self.fx.function,
+                    name="g",
+                )
+            ]
+        )
+        self._assert_par(overloaded)
+        self._assert_engages(overloaded)
+
+    def test_broken_overload_dummy(self) -> None:
+        # A broken overload whose type is set to a (dummy) CallableType:
+        # Python returns `func.type` UNCHANGED (the `if func.type:`
+        # passthrough fires first). Rust must mirror the passthrough.
+        item = FuncDef("g")
+        item.info = self.fx.ai
+        item.arg_names = ["x"]
+        item.arg_kinds = [ARG_POS]
+        overloaded = OverloadedFuncDef([item])
+        overloaded.type = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            ["x"],
+            self.fx.a,
+            self.fx.function,
+            name="g",
+        )
+        self._assert_par(overloaded)
+        self._assert_engages(overloaded)
+
+    def test_untyped_overload_dummy(self) -> None:
+        # OverloadedFuncDef with NO type: Python builds the dummy
+        # `Overloaded([CallableType([Any, Any], [ARG_STAR, ARG_STAR2], ...,
+        # is_ellipsis_args=True)])` with line=func.line and no name.
+        item = FuncDef("h")
+        item.info = self.fx.ai
+        item.arg_names = ["x", "y"]
+        item.arg_kinds = [ARG_POS, ARG_OPT]
+        overloaded = OverloadedFuncDef([item])
+        self.assertIsNone(overloaded.type)
+        self._assert_par(overloaded)
+        self._assert_engages(overloaded)
+        from mypy.typeops import function_type
+
+        result = self._with_gate(True, lambda: function_type(overloaded, self.fx.function))
+        assert isinstance(result, Overloaded)
+        assert isinstance(result.items[0], CallableType)
+        assert_equal(result.items[0].is_ellipsis_args, True)
+        assert_equal(result.items[0].arg_kinds, [ARG_STAR, ARG_STAR2])
+        assert_equal(result.items[0].line, overloaded.line)
+
+    def test_invalid_type_defers(self) -> None:
+        # func.type truthy but not a FunctionLike (e.g. a Defn): Rust
+        # defers (returns None) and the Python body's assert decides.
+        from mypy.typeops import _serialize_type
+
+        fn = self._func_def("f")
+        fn.type = fn  # type: ignore[assignment]  # a Defn, not a FunctionLike
+        result = _type_kernel.rust_function_type(fn, _serialize_type(self.fx.function))
+        assert result is None, f"Rust should defer for invalid func.type, got {result!r}"
+        import pytest
+
+        self._set_active(False)
+        try:
+            with pytest.raises(AssertionError):
+                from mypy.typeops import function_type
+
+                function_type(fn, self.fx.function)
+        finally:
+            self._set_active(True)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

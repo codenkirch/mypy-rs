@@ -1376,6 +1376,42 @@ def erase_to_union_or_bound(typ: TypeVarType) -> ProperType:
 
 
 def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
+    # #747 seam: Rust mirrors the whole body (typed passthrough, callable_type
+    # self-binding, broken-overload dummy). Passthrough returns `func.type`
+    # live; built arms restore line/column/definition via copy_modified.
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_function_type(func, _serialize_type(fallback))
+            if result is not None:
+                is_passthrough, wire_bytes = result
+                if is_passthrough:
+                    # Typed passthrough: same as `if func.type: return func.type`.
+                    assert isinstance(func.type, FunctionLike)
+                    return func.type
+                decoded = _deserialize_type(bytes(wire_bytes))
+                if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
+                    # callable_type arm: Python passes fdef.line/column and
+                    # definition=fdef for FuncDef (error-message naming).
+                    definition: SymbolNode | None = (
+                        func if isinstance(func, FuncDef) else None
+                    )
+                    return decoded.copy_modified(
+                        line=func.line,
+                        column=func.column,
+                        name=func.name,
+                        implicit=True,
+                        definition=definition,
+                    )
+                elif isinstance(decoded, Overloaded):  # type: ignore[misc]
+                    # Broken overload: rebuild the inner dummy with the
+                    # overload's line; Python builds it with no name, so do
+                    # not copy func.name here.
+                    item = decoded.items[0].copy_modified(
+                        line=func.line, implicit=False
+                    )
+                    return Overloaded([item])
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if func.type:
         assert isinstance(func.type, FunctionLike)
         return func.type
