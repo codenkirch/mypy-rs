@@ -4399,6 +4399,137 @@ class NativeContractLiteralsSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRemoveRedundantUnionItemsSuite(Suite):
+    """Parity for the Rust `_remove_redundant_union_items` port (mypy.typeops).
+
+    The Python body runs two passes over flattened union items: forward,
+    then reversed, dropping UninhabitedType, exact duplicates, and items
+    that are proper subtypes of an earlier item. The Rust port mirrors the
+    passes on the wire with the same `SubtypeContext` (ignore_promotions,
+    proper_subtype). Toggling the typeops gate off (pure Python) and on
+    (Rust seam) must produce identical results, and a direct seam call
+    proves the Rust function engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.o_info = self.fx.oi
+        self.a_info = self.fx.ai
+        self.b_info = self.fx.bi
+        self.c_info = self.fx.ci
+        self.int_info = self.fx.make_type_info("builtins.int", mro=[self.fx.oi])
+        # A subclass of A for the `str(b)` naming, mirroring other suites.
+        self._resolver = _type_kernel.build_native_resolver(
+            [self.o_info, self.a_info, self.b_info, self.c_info, self.int_info], []
+        )
+        set_wire_typeinfo_map(
+            {
+                info.fullname: info
+                for info in (
+                    self.o_info,
+                    self.a_info,
+                    self.b_info,
+                    self.c_info,
+                    self.int_info,
+                )
+            }
+        )
+        self._live_map = {
+            info.fullname: info
+            for info in (self.o_info, self.a_info, self.b_info, self.c_info, self.int_info)
+        }
+        self._resolver.set_live_typeinfo_map(dict(self._live_map))
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _strs(self, items: Sequence[Type]) -> list[str]:
+        from mypy.typeops import _remove_redundant_union_items
+
+        return [str(x) for x in _remove_redundant_union_items(list(items), False)]
+
+    def _strs_erased(self, items: Sequence[Type]) -> list[str]:
+        from mypy.typeops import _remove_redundant_union_items
+
+        return [str(x) for x in _remove_redundant_union_items(list(items), True)]
+
+    def _assert_par(self, items: Sequence[Type], label: str) -> None:
+        off = self._with_gate(False, lambda: self._strs(items))
+        on = self._with_gate(True, lambda: self._strs(items))
+        assert_equal(on, off, f"_remove_redundant_union_items parity {label}")
+
+    def test_exact_duplicate_dropped(self) -> None:
+        items = [self.fx.a, self.fx.a]
+        self._assert_par(items, "exact duplicate")
+        # Also reverse the input order; both passes collapse the dup.
+        self._assert_par(list(reversed(items)), "exact duplicate reversed")
+        assert_equal(self._with_gate(True, lambda: self._strs(items)), ["A"])
+
+    def test_uninhabited_dropped(self) -> None:
+        items = [self.fx.a, self.fx.uninhabited, self.fx.a]
+        self._assert_par(items, "uninhabited")
+        assert_equal(self._with_gate(True, lambda: self._strs(items)), ["A"])
+
+    def _int(self) -> Instance:
+        return Instance(self.int_info, [])
+
+    def test_subtype_removed(self) -> None:
+        # int is a proper subtype of object, so only object survives.
+        items = [self._int(), self.fx.o]
+        self._assert_par(items, "int vs object")
+        # Reversed order: object first, int later.
+        self._assert_par([self.fx.o, self._int()], "object vs int")
+        assert_equal(self._with_gate(True, lambda: self._strs(items)), ["builtins.object"])
+
+    def test_literal_dup_same_fallback(self) -> None:
+        # Two literals sharing a fallback are never duplicates of each
+        # other (different values), so both survive.
+        items = [self.fx.lit1, self.fx.lit2]
+        self._assert_par(items, "literal same fallback")
+        assert_equal(self._with_gate(True, lambda: self._strs(items)), ["Literal[1]", "Literal[2]"])
+
+    def test_two_pass_reversal(self) -> None:
+        # Pass 1 forward: [int, object] keeps both (object is not a subtype
+        # of int). Pass 2 reversed drops int as a subtype of object.
+        # Same result structurally for reversed input.
+        items = [self._int(), self.fx.o]
+        self._assert_par(items, "two-pass forward")
+        self._assert_par([self.fx.o, self._int()], "two-pass reversed")
+        assert_equal(self._with_gate(True, lambda: self._strs(items)), ["builtins.object"])
+
+    def test_seam_engages(self) -> None:
+        from mypy.typeops import _serialize_type_list
+
+        r = _type_kernel.rust_remove_redundant_union_items(
+            _serialize_type_list([self.fx.a, self.fx.a]),
+            False,
+            True,
+            self._resolver,
+        )
+        assert r is not None, "Rust _remove_redundant_union_items did not engage"
+        assert len(r) > 0
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTryGettingLiteralSuite(Suite):
     """Parity for the Rust `try_getting_literal` port (mypy.checkexpr).
 

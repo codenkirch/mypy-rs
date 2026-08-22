@@ -111,6 +111,7 @@ mod plugin_helpers;
 mod plugin_hooks;
 mod reachability;
 mod refs;
+mod remove_redundant;
 mod semanal_algebra;
 mod semanal_bases;
 mod semanal_classprop;
@@ -2669,11 +2670,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
-    // infer_variance member-direction analysis (mypy.subtypes). The shim
+// infer_variance member-direction analysis (mypy.subtypes). The shim
     // keeps the variance loop, per-member this computes the co/contra flip
     // bitmask or defers (None) to the pure-Python member body.
     module.add_function(wrap_pyfunction!(
         infer_variance::rust_infer_variance_member,
+        module
+    )?)?;
+
+    // typeops._remove_redundant_union_items (two-pass union dedup).
+    module.add_function(wrap_pyfunction!(
+        remove_redundant::rust_remove_redundant_union_items,
         module
     )?)?;
 

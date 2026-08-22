@@ -198,6 +198,31 @@ def _deserialize_type(data: bytes) -> Type | None:
     return fixup_wire_type(decoded)
 
 
+def _deserialize_type_list(data: bytes) -> list[Type] | None:
+    """Deserialize wire bytes to a list of Types, fixing type_ref strings.
+
+    Returns None if any type_ref cannot be resolved to a live TypeInfo
+    (so the caller defers to Python).
+    """
+    from mypy.types import instance_cache, read_type_list
+    from mypy.wirefixup import fixup_wire_type
+
+    decoded = read_type_list(_ReadBuffer(data))
+    # Same NOT_READY-singleton hygiene as _deserialize_type.
+    instance_cache.int_type = None
+    instance_cache.str_type = None
+    instance_cache.bool_type = None
+    instance_cache.object_type = None
+    instance_cache.function_type = None
+    result: list[Type] = []
+    for item in decoded:
+        fixed = fixup_wire_type(item)
+        if fixed is None:
+            return None
+        result.append(fixed)
+    return result
+
+
 def is_recursive_pair(s: Type, t: Type) -> bool:
     """Is this a pair of recursive types?
 
@@ -1087,6 +1112,25 @@ def make_simplified_union(
 
 
 def _remove_redundant_union_items(items: list[Type], keep_erased: bool) -> list[Type]:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+        and not any(_has_mutated_truthiness(item) for item in items)
+    ):
+        try:
+            result = _type_kernel.rust_remove_redundant_union_items(
+                _serialize_type_list(items),
+                keep_erased,
+                state.strict_optional,
+                _native_typeops_resolver,
+            )
+            if result is not None:
+                decoded = _deserialize_type_list(bytes(result))
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     from mypy.subtypes import is_proper_subtype
 
     # The first pass through this loop, we check if later items are subtypes of earlier
