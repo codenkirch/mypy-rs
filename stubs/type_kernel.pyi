@@ -206,6 +206,7 @@ __all__ = [
     "rust_replace_implicit_first_type",
     "rust_infer_function_type_arguments",
     "rust_callables_compatible",
+    "rust_are_parameters_compatible",
     "rust_is_overlapping_types",
     "rust_refers_to_fullname",
     "rust_refers_to_class_or_function",
@@ -1060,6 +1061,17 @@ def rust_callables_compatible(
     ignore_pos_arg_names: bool,
     strict_concatenate: bool,
     strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
+def rust_are_parameters_compatible(
+    left_bytes: bytes,
+    right_bytes: bytes,
+    is_proper_subtype: bool,
+    ignore_pos_arg_names: bool,
+    allow_partial_overlap: bool,
+    strict_concatenate_check: bool,
+    strict_optional: bool,
+    nested_proper_subtype: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
 def rust_is_overlapping_types(

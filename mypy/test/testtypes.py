@@ -72,8 +72,8 @@ from mypy.options import Options
 from mypy.plugins.common import find_shallow_matching_overload_item
 from mypy.state import state
 from mypy.subtypes import (
-    IS_CLASSVAR,
     IS_CLASS_OR_STATIC,
+    IS_CLASSVAR,
     IS_EXPLICIT_SETTER,
     IS_SETTABLE,
     IS_VAR,
@@ -135,6 +135,7 @@ from mypy.types import (
     LiteralType,
     NoneType,
     Overloaded,
+    Parameters,
     ParamSpecFlavor,
     ParamSpecType,
     ProperType,
@@ -2370,7 +2371,7 @@ class NativeFillTypevarsWithAnySuite(Suite):
         return fixup_wire_type(decoded)
 
     def _pure_python(self, info: TypeInfo) -> Instance | TupleType:
-        from mypy.typevars import _set_native_typevars_active, fill_typevars_with_any
+        from mypy.typevars import fill_typevars_with_any
 
         self._set_native_typevars_active(False)
         try:
@@ -3545,9 +3546,7 @@ class NativeVariadicTupleRightSuite(Suite):
     def _assert_par(self, left: Type, right: Type, *, proper: bool = False) -> None:
         # Differential: gate off (pure Python) vs on (Rust seam) must
         # agree on the decision string.
-        from mypy.subtypes import _set_native_subtype_active
-        from mypy.subtypes import is_proper_subtype
-        from mypy.subtypes import is_subtype as _is
+        from mypy.subtypes import _set_native_subtype_active, is_proper_subtype, is_subtype as _is
 
         def run() -> str:
             if proper:
@@ -3665,9 +3664,7 @@ class NativeVariadicTupleSubtypeSuite(Suite):
     def _assert_par(self, left: Type, right: Type, *, proper: bool = False) -> None:
         # Differential: gate off (pure Python) vs on (Rust seam) must
         # agree on the decision string.
-        from mypy.subtypes import _set_native_subtype_active
-        from mypy.subtypes import is_proper_subtype
-        from mypy.subtypes import is_subtype as _is
+        from mypy.subtypes import _set_native_subtype_active, is_proper_subtype, is_subtype as _is
 
         def run() -> str:
             if proper:
@@ -15526,6 +15523,195 @@ class NativeCallableArgConstraintsSuite(Suite):
         self._assert_par(template, actual, direction=SUPERTYPE_OF)
 
 
+class NativeAreParametersCompatibleSuite(Suite):
+    """Parity for the Rust `are_parameters_compatible` seam.
+
+    Differential harness: runs `is_subtype` on `Parameters` pairs with the
+    native subtype gate on (resolver installed) and off (pure Python), and
+    asserts identical results. The gate-on path routes through
+    `SubtypeVisitor.visit_parameters` (subtypes.py:962), which fast-paths
+    to the Rust seam. Also covers the meet overlap entry
+    (`mypy.meet.is_overlapping_types` on `Parameters` pairs, which routes
+    through the same engine with an overlap is_compat). Rust returns `None`
+    (Python fallthrough) for any shape the engine cannot decide (generic
+    parameters, meet_types merge, nested is_subtype/overlap deferral), so
+    every assertion matches the pure-Python result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # The subtype/join gates are shared by the seam; off by default so a
+        # failed differential never leaks into the next suite.
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        set_wire_typeinfo_map(None)
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _parameters(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: list[str | None],
+        is_ellipsis_args: bool = False,
+        imprecise_arg_kinds: bool = False,
+        variables: list[TypeVarLikeType] | None = None,
+    ) -> Parameters:
+        return Parameters(
+            arg_types,
+            arg_kinds,
+            arg_names,
+            is_ellipsis_args=is_ellipsis_args,
+            imprecise_arg_kinds=imprecise_arg_kinds,
+            variables=variables,
+        )
+
+    def _assert_subtype_par(self, left: Parameters, right: Parameters) -> None:
+        """Differential: `is_subtype` on Parameters, gate-on vs gate-off.
+
+        Routes through `SubtypeVisitor.visit_parameters` (subtypes.py:962),
+        which fast-paths to the Rust seam when the gate is on and differs
+        from the pure-Python `are_parameters_compatible` only via that seam.
+        """
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        python = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        native = is_subtype(left, right)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _assert_overlap_par(self, left: Parameters, right: Parameters) -> None:
+        """Differential: `is_overlapping_types` on Parameters, gate-on vs off."""
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        python = is_overlapping_types(left, right)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        native = is_overlapping_types(left, right)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_simple_positional(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_POS], [None])
+        right = self._parameters([self.fx.a], [ARG_POS], [None])
+        self._assert_subtype_par(left, right)
+        self._assert_overlap_par(left, right)
+
+    def test_supertype_left_more_general(self) -> None:
+        # left (A) is more general than right (B): A <: B false, B <: A true.
+        left = self._parameters([self.fx.a], [ARG_POS], [None])
+        right = self._parameters([self.fx.b], [ARG_POS], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_incompatible_types(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_POS], [None])
+        right = self._parameters([self.fx.b], [ARG_POS], [None])
+        self._assert_overlap_par(left, right)
+
+    def test_name_mismatch(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_NAMED], ["x"])
+        right = self._parameters([self.fx.a], [ARG_NAMED], ["y"])
+        self._assert_subtype_par(left, right)
+
+    def test_pos_arg_names_ignored(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_POS], ["x"])
+        right = self._parameters([self.fx.a], [ARG_POS], ["y"])
+        self._assert_subtype_par(left, right)
+
+    def test_optional_vs_required(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_OPT], [None])
+        right = self._parameters([self.fx.a], [ARG_POS], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_ellipsis_args(self) -> None:
+        # `Callable[..., X]`: **Any then *Any (trivial params) — right is a
+        # supertype of everything (non-proper subtype check).
+        left = self._parameters([self.fx.a], [ARG_POS], [None])
+        right = self._parameters(
+            [AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.special_form)],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            is_ellipsis_args=True,
+        )
+        self._assert_subtype_par(left, right)
+
+    def test_trivial_vararg_suffix(self) -> None:
+        # right = (*Any) — supertype of all-positional-left callables.
+        left = self._parameters([self.fx.a, self.fx.b], [ARG_POS, ARG_POS], [None, None])
+        right = self._parameters([AnyType(TypeOfAny.special_form)], [ARG_STAR], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_right_star_vs_left_positional(self) -> None:
+        left = self._parameters([self.fx.a, self.fx.b], [ARG_POS, ARG_POS], [None, None])
+        right = self._parameters([self.fx.a], [ARG_STAR], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_right_kwargs_vs_left_named(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_NAMED], ["x"])
+        right = self._parameters([self.fx.a], [ARG_STAR2], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_left_required_no_right_match(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_NAMED], ["x"])
+        right = self._parameters([self.fx.o], [ARG_STAR2], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_generic_parameters_defer(self) -> None:
+        # Variables non-empty: the engine defers, Python answers identically.
+        left = self._parameters([self.fx.t], [ARG_POS], [None], variables=[self.fx.t])
+        right = self._parameters([self.fx.a], [ARG_POS], [None])
+        self._assert_subtype_par(left, right)
+
+    def test_overlap_partial(self) -> None:
+        left = self._parameters([self.fx.a], [ARG_OPT], [None])
+        right = self._parameters([self.fx.b], [ARG_OPT], [None])
+        self._assert_overlap_par(left, right)
+
+    def test_overlap_extras(self) -> None:
+        # Extra optional arg on the right, allow_partial_overlap: compatible.
+        left = self._parameters([self.fx.a], [ARG_POS], [None])
+        right = self._parameters([self.fx.a, self.fx.b], [ARG_POS, ARG_OPT], [None, None])
+        self._assert_overlap_par(left, right)
+
+
 class _FakeNode:
     """Minimal stand-in for a MypyFile with `.names` for builtins tests."""
 
@@ -18076,7 +18262,6 @@ class NativeInferVarianceSuite(Suite):
     def _run_variance_gated_with(
         self, member_factory: Callable[[TypeInfo], Type], on: bool
     ) -> tuple[bool, int]:
-        from mypy.nodes import VARIANCE_NOT_READY
         from mypy.subtypes import infer_variance
 
         info = self._make_class()
@@ -18230,7 +18415,6 @@ class NativeObjectOrAnyFromTypeSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
 
         self.fx = TypeFixture()
         type_infos = []
@@ -18455,7 +18639,6 @@ class NativeCombineSimilarCallablesSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.join import _set_native_join_active, _set_native_join_resolver
 
         self.fx = TypeFixture(INVARIANT)
         type_infos = []
@@ -18634,8 +18817,8 @@ class NativeAnyConstraintsSuite(Suite):
         self, options: Sequence[list[Constraint] | None], eager: bool, native: bool
     ) -> list[Any]:
         from mypy.constraints import (
-            any_constraints,
             _set_native_constraints_resolver,
+            any_constraints,
         )
 
         self._set_active(native)
@@ -19133,8 +19316,9 @@ class NativeRemoveTrivialSuite(Suite):
         write_type_list(buf, [Instance(self.fx.ai, []), Instance(self.fx.ai, [])])
         result = _type_kernel.rust_remove_trivial(buf.getvalue(), True)
         assert result is not None, "rust_remove_trivial returned None"
-        from mypy.types import read_type_list
         from librt.internal import ReadBuffer as _RB
+
+        from mypy.types import read_type_list
 
         decoded = read_type_list(_RB(bytes(result)))
         assert_equal(len(decoded), 1)
@@ -19562,7 +19746,6 @@ class NativeSolveOneSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture(INVARIANT)
