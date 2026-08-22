@@ -1820,6 +1820,20 @@ def get_member_flags(name: str, itype: Instance, class_obj: bool = False) -> set
     * IS_CLASS_OR_STATIC: set for methods decorated with @classmethod or
       with @staticmethod.
     """
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            result = _type_kernel.rust_get_member_flags(
+                itype.type,
+                name,
+                class_obj,
+                itype.extra_attrs,
+                state.strict_optional,
+                _native_subtype_resolver,
+            )
+            if result is not None:
+                return set(int(flag) for flag in result)
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     info = itype.type
     method = info.get_method(name)
     setattr_meth = info.get_method("__setattr__")

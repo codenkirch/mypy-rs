@@ -94,6 +94,7 @@ mod lennarrow;
 mod lkv;
 mod maptype;
 mod meet;
+mod member_flags;
 mod message_registry;
 mod messages;
 mod modulefinder;
@@ -188,6 +189,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_erased_instance, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        member_flags::rust_get_member_flags,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         subtypes::rust_try_restrict_literal_union,
         module
