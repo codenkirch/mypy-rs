@@ -84,6 +84,11 @@ def _needs_python(typ: Type) -> bool:
             stack.append(p.fallback)
         elif isinstance(p, TypeAliasType):
             return True
+        elif isinstance(p, TypeVarType):
+            # Fresh (meta) type variables lose identity across the wire
+            # round-trip, so Rust dedup could merge distinct fresh vars.
+            if p.id.meta_level > 0:
+                return True
         elif isinstance(p, Instance):
             stack.extend(p.args)
         elif isinstance(p, UnionType):
@@ -426,10 +431,12 @@ def freshen_function_type_vars(callee: F) -> F:
         ):
             try:
                 result = _type_kernel.rust_freshen_function_type_vars(
-                    _serialize_type(callee)
+                    TypeVarId.next_raw_id, _serialize_type(callee)
                 )
                 if result is not None:
-                    decoded = read_type(_ReadBuffer(bytes(result)))
+                    next_raw_id, serialized = result
+                    TypeVarId.next_raw_id = next_raw_id
+                    decoded = read_type(_ReadBuffer(bytes(serialized)))
                     from mypy.wirefixup import fixup_wire_type
 
                     fixed = fixup_wire_type(decoded)
@@ -1041,7 +1048,11 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
     # returns None for read/write failures, then we fall through to the
     # pure-Python loop (the strangler-fig per-call contract).
     types_list = list(types)
-    if _HAS_TYPE_KERNEL and _native_expand_type_active:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_expand_type_active
+        and not any(_needs_python(t) for t in types_list)
+    ):
         try:
             from mypy.types import read_type_list, write_type_list
 

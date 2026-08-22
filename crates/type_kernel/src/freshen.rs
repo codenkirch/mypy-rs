@@ -49,31 +49,29 @@ pub(crate) fn rust_freshen_all_functions_type_vars(
 }
 
 /// `#[pyfunction]` entry for `freshen_function_type_vars`
-/// (expandtype.py:413-432). Takes a serialized `Type` and returns the
-/// freshened wire-format type blob, or `None` (Python `None`) when Rust
-/// cannot handle the case so the caller falls through to the pure-Python
-/// function.
-///
-/// Unlike `rust_freshen_all_functions_type_vars` this does NOT
-/// consume `TypeVarId.next_raw_id` from Python: the fresh ids are
-/// allocated internally, so the caller discards them on the wire
-/// round-trip. The Python shim therefore runs `canonicalize_fresh_vars`
-/// on the decoded result to re-unify the meta-level-1 occurrences.
+/// (expandtype.py:413-432). Takes the current `TypeVarId.next_raw_id` and a
+/// serialized `Type`, and returns `(next_raw_id, wire_bytes)` with fresh
+/// meta-level-1 type variables substituted, or `None` (Python `None`) when
+/// Rust cannot handle the case so the caller falls through to the pure-Python
+/// function. The Python shim advances `TypeVarId.next_raw_id` (same contract
+/// as the freshen-all seam).
 ///
 /// Deferred (return None):
 ///   * CallableType with a ParamSpecType variable (same deferral as the
 ///     freshen-all path and the expand path).
-///   * A generic callable whose expansion leaves TypeVar-like nodes
-///     (the result would not survive a wire round-trip intact).
 #[pyfunction]
-pub(crate) fn rust_freshen_function_type_vars(callee_bytes: &[u8]) -> PyResult<Option<Vec<u8>>> {
+pub(crate) fn rust_freshen_function_type_vars(
+    start_raw_id: i64,
+    callee_bytes: &[u8],
+) -> PyResult<Option<(i64, Vec<u8>)>> {
     let callee = match read_type(&mut ReadBuffer::new(callee_bytes), None) {
         Ok(t) => t,
         Err(_) => return Ok(None),
     };
-    match freshen_function_type_vars(&callee) {
+    let mut next_raw_id = start_raw_id;
+    match freshen_function_type_vars(&callee, &mut next_raw_id) {
         Some(result) => match encode_type(&result) {
-            Some(wire) => Ok(Some(wire)),
+            Some(wire) => Ok(Some((next_raw_id, wire))),
             None => Ok(None),
         },
         None => Ok(None),
@@ -82,8 +80,10 @@ pub(crate) fn rust_freshen_function_type_vars(callee_bytes: &[u8]) -> PyResult<O
 
 /// Mirror `freshen_function_type_vars` (expandtype.py:413-432) on the
 /// wire `Type` graph. The input comes from a wire round-trip, so every
-/// node is already proper. Returns `None` for deferred cases.
-fn freshen_function_type_vars(callee: &Type) -> Option<Type> {
+/// node is already proper. Fresh ids are allocated from `next_raw_id` and
+/// advanced (mirrors Python's global `TypeVarId.next_raw_id`). Returns
+/// `None` for deferred cases.
+fn freshen_function_type_vars(callee: &Type, next_raw_id: &mut i64) -> Option<Type> {
     match callee {
         Type::CallableType { variables, .. } if variables.is_empty() => Some(callee.clone()),
         Type::CallableType { .. } => {
@@ -96,8 +96,9 @@ fn freshen_function_type_vars(callee: &Type) -> Option<Type> {
             // defaults (expandtype.py:419-423).
             let mut tvmap: HashMap<EnvKey, Type> = HashMap::new();
             let mut tvs: Vec<Type> = Vec::new();
-            for (next_raw_id, v) in (0_i64..).zip(variables_of(callee).iter()) {
-                let mut fresh = fresh_type_var(v, next_raw_id);
+            for v in variables_of(callee).iter() {
+                let mut fresh = fresh_type_var(v, *next_raw_id);
+                *next_raw_id += 1;
                 if tvar_has_default(&fresh) {
                     let new_default = expand_type_inner(tvar_default(&fresh), &tvmap, true)?;
                     fresh = set_typevar_default(fresh, new_default);
@@ -117,7 +118,7 @@ fn freshen_function_type_vars(callee: &Type) -> Option<Type> {
         Type::Overloaded { items } => {
             let mut new_items = Vec::with_capacity(items.len());
             for item in items {
-                let freshened = freshen_function_type_vars(item)?;
+                let freshened = freshen_function_type_vars(item, next_raw_id)?;
                 // Python asserts each Overloaded item is a CallableType.
                 if !matches!(freshened, Type::CallableType { .. }) {
                     return None;

@@ -551,8 +551,9 @@ def rust_remove_trivial(
     strict_optional: bool,
 ) -> bytes | None: ...
 def rust_freshen_function_type_vars(
+    start_raw_id: int,
     callee_bytes: bytes,
-) -> bytes | None: ...
+) -> tuple[int, bytes] | None: ...
 def rust_map_instance_to_supertype(
     resolver: NativeTypeResolver,
     instance_ref: str,
