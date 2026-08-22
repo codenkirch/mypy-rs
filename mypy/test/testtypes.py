@@ -18896,10 +18896,14 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         c = CallableType(
             [self.fx.t], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
         )
+        before = TypeVarId.next_raw_id
         result = self._freshen(c)
         assert_equal(len(result.variables), 1)
         assert result.variables[0].id.meta_level == 1, "fresh var not meta_level 1"
-        assert result.variables[0].id.raw_id != self.fx.t.id.raw_id
+        # Fresh ids come from the global counter (types.py:561-564), so a
+        # fresh id is >= the pre-call `next_raw_id`; comparing bare raw_ids
+        # with the fixture's T is fragile (fresh process starts at 1).
+        assert result.variables[0].id.raw_id >= before
         self._assert_par(c)
 
     def test_generic_occurrences_replaced(self) -> None:
