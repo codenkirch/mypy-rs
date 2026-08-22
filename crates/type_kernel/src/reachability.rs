@@ -22,7 +22,7 @@
 //! `mark_block_mypy_only`) stay in Python: they traverse and mutate the live
 //! AST graph, which is not a pure computation.
 
-use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple, PyType};
@@ -67,7 +67,7 @@ fn reverse_op(op: &str) -> Option<&'static str> {
 /// Generic over any type that implements `PartialEq` + `PartialOrd`.
 /// Works for `i64`, `String`, and `&[i64]` (lexicographic, matching Python
 /// tuple comparison).
-fn fixed_comparison<T: PartialEq + PartialOrd>(left: &T, op: &str, right: &T) -> u8 {
+fn fixed_comparison<T: PartialEq + PartialOrd + ?Sized>(left: &T, op: &str, right: &T) -> u8 {
     let rmap = |b: bool| if b { ALWAYS_TRUE } else { ALWAYS_FALSE };
     match op {
         "==" => rmap(left == right),
@@ -97,84 +97,131 @@ enum VersionInfoIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Cached context for reachability analysis
+// Cached class handles (built once per interpreter)
 // ---------------------------------------------------------------------------
 
-/// Holds cached PyO3 references to avoid repeated imports and attribute
-/// lookups during recursive condition inference.
+/// Native Python class handles pinned for the interpreter's lifetime.
+///
+/// Built once per interpreter instead of per call: the previous per-call
+/// construction did two module imports + 13 downcasts + a full `Options`
+/// extraction on every condition inference. Handles are shareable because
+/// `Py<T>: Send + Sync` (pyo3 `instance.rs`).
+struct ReachabilityClasses {
+    // Expression class types (mypy.nodes)
+    name_expr_cls: Py<PyType>,
+    member_expr_cls: Py<PyType>,
+    op_expr_cls: Py<PyType>,
+    unary_expr_cls: Py<PyType>,
+    comparison_expr_cls: Py<PyType>,
+    call_expr_cls: Py<PyType>,
+    int_expr_cls: Py<PyType>,
+    str_expr_cls: Py<PyType>,
+    tuple_expr_cls: Py<PyType>,
+    index_expr_cls: Py<PyType>,
+    slice_expr_cls: Py<PyType>,
+    // Pattern class types (mypy.patterns)
+    as_pattern_cls: Py<PyType>,
+    or_pattern_cls: Py<PyType>,
+}
+
+static CLASSES: OnceLock<ReachabilityClasses> = OnceLock::new();
+
+/// Shared minimal `Options` for entry points without an options argument
+/// (pattern inference, sys-attr / version-info extraction). A fresh
+/// `Options()` per leaf call was a measurable allocation; this one is built
+/// once and only read, never mutated.
+static DUMMY_OPTIONS: OnceLock<Py<PyAny>> = OnceLock::new();
+
+/// Fetch the cached class handles, building them on first use.
+fn get_classes(py: Python<'_>) -> PyResult<&'static ReachabilityClasses> {
+    if let Some(classes) = CLASSES.get() {
+        return Ok(classes);
+    }
+    let nodes_mod = py.import("mypy.nodes")?;
+    let patterns_mod = py.import("mypy.patterns")?;
+
+    let nodes_cls = |name: &str| -> PyResult<Py<PyType>> {
+        let cls: &PyType = nodes_mod.getattr(name)?.downcast()?;
+        Ok(cls.into())
+    };
+    let pattern_cls = |name: &str| -> PyResult<Py<PyType>> {
+        let cls: &PyType = patterns_mod.getattr(name)?.downcast()?;
+        Ok(cls.into())
+    };
+
+    let built = ReachabilityClasses {
+        name_expr_cls: nodes_cls("NameExpr")?,
+        member_expr_cls: nodes_cls("MemberExpr")?,
+        op_expr_cls: nodes_cls("OpExpr")?,
+        unary_expr_cls: nodes_cls("UnaryExpr")?,
+        comparison_expr_cls: nodes_cls("ComparisonExpr")?,
+        call_expr_cls: nodes_cls("CallExpr")?,
+        int_expr_cls: nodes_cls("IntExpr")?,
+        str_expr_cls: nodes_cls("StrExpr")?,
+        tuple_expr_cls: nodes_cls("TupleExpr")?,
+        index_expr_cls: nodes_cls("IndexExpr")?,
+        slice_expr_cls: nodes_cls("SliceExpr")?,
+        as_pattern_cls: pattern_cls("AsPattern")?,
+        or_pattern_cls: pattern_cls("OrPattern")?,
+    };
+    // A losing concurrent initializer drops its handles under the held GIL,
+    // which is safe; the installed set is equivalent either way.
+    let _ = CLASSES.set(built);
+    Ok(CLASSES.get().unwrap())
+}
+
+/// Fetch the shared dummy `Options`, building it on first use.
+fn dummy_options(py: Python<'_>) -> PyResult<&PyAny> {
+    if let Some(options) = DUMMY_OPTIONS.get() {
+        return Ok(options.as_ref(py));
+    }
+    let options = py.import("mypy.options")?.getattr("Options")?.call0()?;
+    let _ = DUMMY_OPTIONS.set(options.into());
+    Ok(DUMMY_OPTIONS.get().unwrap().as_ref(py))
+}
+
+// ---------------------------------------------------------------------------
+// Per-call context
+// ---------------------------------------------------------------------------
+
+/// Cheap per-call context: the expensive pieces (class handles, dummy
+/// `Options`) are cached statically, and live `Options` fields are read
+/// lazily, only when a branch needs them (mirroring the Python code, which
+/// reads `options.platform` / `options.always_true` / `options.always_false`
+/// only inside the branch that uses them).
 struct ReachabilityCtx<'py> {
-    #[allow(dead_code)]
     py: Python<'py>,
-    // Kept alive to pin the mypy.nodes module for the class references below.
-    #[allow(dead_code)]
-    nodes_mod: &'py PyModule,
-    // Expression class types
-    name_expr_cls: &'py PyType,
-    member_expr_cls: &'py PyType,
-    op_expr_cls: &'py PyType,
-    unary_expr_cls: &'py PyType,
-    comparison_expr_cls: &'py PyType,
-    call_expr_cls: &'py PyType,
-    int_expr_cls: &'py PyType,
-    str_expr_cls: &'py PyType,
-    tuple_expr_cls: &'py PyType,
-    index_expr_cls: &'py PyType,
-    slice_expr_cls: &'py PyType,
-    as_pattern_cls: &'py PyType,
-    or_pattern_cls: &'py PyType,
-    // Options data
-    pyversion: Vec<i64>,
-    platform: String,
-    always_true: HashSet<String>,
-    always_false: HashSet<String>,
+    classes: &'static ReachabilityClasses,
+    options: &'py PyAny,
+    pyversion: (i64, i64),
 }
 
 impl<'py> ReachabilityCtx<'py> {
-    fn new(py: Python<'py>, options: &PyAny) -> PyResult<Self> {
-        let nodes_mod = py.import("mypy.nodes")?;
-        let patterns_mod = py.import("mypy.patterns")?;
-
-        let name_expr_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
-        let member_expr_cls: &PyType = nodes_mod.getattr("MemberExpr")?.downcast()?;
-        let op_expr_cls: &PyType = nodes_mod.getattr("OpExpr")?.downcast()?;
-        let unary_expr_cls: &PyType = nodes_mod.getattr("UnaryExpr")?.downcast()?;
-        let comparison_expr_cls: &PyType = nodes_mod.getattr("ComparisonExpr")?.downcast()?;
-        let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
-        let int_expr_cls: &PyType = nodes_mod.getattr("IntExpr")?.downcast()?;
-        let str_expr_cls: &PyType = nodes_mod.getattr("StrExpr")?.downcast()?;
-        let tuple_expr_cls: &PyType = nodes_mod.getattr("TupleExpr")?.downcast()?;
-        let index_expr_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
-        let slice_expr_cls: &PyType = nodes_mod.getattr("SliceExpr")?.downcast()?;
-        let as_pattern_cls: &PyType = patterns_mod.getattr("AsPattern")?.downcast()?;
-        let or_pattern_cls: &PyType = patterns_mod.getattr("OrPattern")?.downcast()?;
-
-        // Extract options fields
-        let pyversion: Vec<i64> = options.getattr("python_version")?.extract()?;
-        let platform: String = options.getattr("platform")?.extract()?;
-        let always_true: HashSet<String> = options.getattr("always_true")?.extract()?;
-        let always_false: HashSet<String> = options.getattr("always_false")?.extract()?;
-
+    fn new(py: Python<'py>, options: &'py PyAny) -> PyResult<Self> {
+        let classes = get_classes(py)?;
+        let pyversion: (i64, i64) = options.getattr("python_version")?.extract()?;
         Ok(ReachabilityCtx {
             py,
-            nodes_mod,
-            name_expr_cls,
-            member_expr_cls,
-            op_expr_cls,
-            unary_expr_cls,
-            comparison_expr_cls,
-            call_expr_cls,
-            int_expr_cls,
-            str_expr_cls,
-            tuple_expr_cls,
-            index_expr_cls,
-            slice_expr_cls,
-            as_pattern_cls,
-            or_pattern_cls,
+            classes,
+            options,
             pyversion,
-            platform,
-            always_true,
-            always_false,
         })
+    }
+
+    /// `options.platform` — the target platform string, read lazily.
+    fn platform(&self) -> PyResult<&'py str> {
+        let platform = self.options.getattr("platform")?;
+        platform.downcast::<PyString>()?.to_str()
+    }
+
+    /// `options.always_true` / `options.always_false` — the name lists, read
+    /// lazily.
+    fn always_true(&self) -> PyResult<&'py PyAny> {
+        self.options.getattr("always_true")
+    }
+
+    fn always_false(&self) -> PyResult<&'py PyAny> {
+        self.options.getattr("always_false")
     }
 
     /// `is_sys_attr(expr, name)` — is `expr` a `sys.<name>` member expression?
@@ -182,21 +229,19 @@ impl<'py> ReachabilityCtx<'py> {
     /// Mirrors reachability.py:323-332. Checks that `expr` is a `MemberExpr`
     /// with `.name == name` and `.expr` is a `NameExpr` with `.name == "sys"`.
     fn is_sys_attr(&self, expr: &PyAny, name: &str) -> PyResult<bool> {
-        if !expr.is_instance(self.member_expr_cls)? {
+        if !expr.is_instance(self.classes.member_expr_cls.as_ref(self.py))? {
             return Ok(false);
         }
-        let member_name = expr.getattr("name")?;
-        let member_name_str: &str = member_name.downcast::<PyString>()?.to_str()?;
-        if member_name_str != name {
+        let member_name: String = expr.getattr("name")?.extract()?;
+        if member_name != name {
             return Ok(false);
         }
         let base = expr.getattr("expr")?;
-        if !base.is_instance(self.name_expr_cls)? {
+        if !base.is_instance(self.classes.name_expr_cls.as_ref(self.py))? {
             return Ok(false);
         }
-        let base_name = base.getattr("name")?;
-        let base_name_str: &str = base_name.downcast::<PyString>()?.to_str()?;
-        Ok(base_name_str == "sys")
+        let base_name: String = base.getattr("name")?.extract()?;
+        Ok(base_name == "sys")
     }
 
     /// `contains_int_or_tuple_of_ints(expr)` — extract int or tuple-of-ints.
@@ -209,16 +254,16 @@ impl<'py> ReachabilityCtx<'py> {
     /// the loop that follows already returns `None` if any item is not an
     /// `IntExpr`, which is the only case `literal()` would reject.
     fn contains_int_or_tuple_of_ints(&self, expr: &PyAny) -> PyResult<Option<IntOrTuple>> {
-        if expr.is_instance(self.int_expr_cls)? {
+        if expr.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
             let value: i64 = expr.getattr("value")?.extract()?;
             return Ok(Some(IntOrTuple::Int(value)));
         }
-        if expr.is_instance(self.tuple_expr_cls)? {
+        if expr.is_instance(self.classes.tuple_expr_cls.as_ref(self.py))? {
             let items = expr.getattr("items")?;
             let items_list = items.downcast::<PyList>()?;
             let mut result = Vec::with_capacity(items_list.len());
             for item in items_list.iter() {
-                if !item.is_instance(self.int_expr_cls)? {
+                if !item.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
                     return Ok(None);
                 }
                 let val: i64 = item.getattr("value")?.extract()?;
@@ -241,7 +286,7 @@ impl<'py> ReachabilityCtx<'py> {
         if self.is_sys_attr(expr, "version_info")? {
             return Ok(Some(VersionInfoIndex::Slice(None, None)));
         }
-        if !expr.is_instance(self.index_expr_cls)? {
+        if !expr.is_instance(self.classes.index_expr_cls.as_ref(self.py))? {
             return Ok(None);
         }
         let base = expr.getattr("base")?;
@@ -249,14 +294,14 @@ impl<'py> ReachabilityCtx<'py> {
             return Ok(None);
         }
         let index = expr.getattr("index")?;
-        if index.is_instance(self.int_expr_cls)? {
+        if index.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
             let val: i64 = index.getattr("value")?.extract()?;
             return Ok(Some(VersionInfoIndex::Index(val)));
         }
-        if index.is_instance(self.slice_expr_cls)? {
+        if index.is_instance(self.classes.slice_expr_cls.as_ref(self.py))? {
             let stride = index.getattr("stride")?;
             if !stride.is_none() {
-                if !stride.is_instance(self.int_expr_cls)? {
+                if !stride.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
                     return Ok(None);
                 }
                 let stride_val: i64 = stride.getattr("value")?.extract()?;
@@ -269,7 +314,7 @@ impl<'py> ReachabilityCtx<'py> {
                 if begin_index.is_none() {
                     None
                 } else {
-                    if !begin_index.is_instance(self.int_expr_cls)? {
+                    if !begin_index.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
                         return Ok(None);
                     }
                     Some(begin_index.getattr("value")?.extract::<i64>()?)
@@ -280,7 +325,7 @@ impl<'py> ReachabilityCtx<'py> {
                 if end_index.is_none() {
                     None
                 } else {
-                    if !end_index.is_instance(self.int_expr_cls)? {
+                    if !end_index.is_instance(self.classes.int_expr_cls.as_ref(self.py))? {
                         return Ok(None);
                     }
                     Some(end_index.getattr("value")?.extract::<i64>()?)
@@ -296,7 +341,7 @@ impl<'py> ReachabilityCtx<'py> {
     ///
     /// Mirrors reachability.py:182-223.
     fn consider_sys_version_info(&self, expr: &PyAny) -> PyResult<u8> {
-        if !expr.is_instance(self.comparison_expr_cls)? {
+        if !expr.is_instance(self.classes.comparison_expr_cls.as_ref(self.py))? {
             return Ok(TRUTH_VALUE_UNKNOWN);
         }
         let operators = expr.getattr("operators")?;
@@ -327,7 +372,11 @@ impl<'py> ReachabilityCtx<'py> {
         match (index, thing) {
             (Some(VersionInfoIndex::Index(idx)), Some(IntOrTuple::Int(thing_val))) => {
                 if (0..=1).contains(&idx) {
-                    let pyver_val = self.pyversion.get(idx as usize).copied().unwrap_or(0);
+                    let pyver_val = match idx {
+                        0 => self.pyversion.0,
+                        1 => self.pyversion.1,
+                        _ => 0,
+                    };
                     Ok(fixed_comparison(&pyver_val, &op, &thing_val))
                 } else {
                     Ok(TRUTH_VALUE_UNKNOWN)
@@ -337,10 +386,8 @@ impl<'py> ReachabilityCtx<'py> {
                 let lo = lo.unwrap_or(0);
                 let hi = hi.unwrap_or(2);
                 if 0 <= lo && lo < hi && hi <= 2 {
-                    let lo_us = lo as usize;
-                    let hi_us = hi as usize;
-                    let val: Vec<i64> =
-                        self.pyversion[lo_us..hi_us.min(self.pyversion.len())].to_vec();
+                    let vals = [self.pyversion.0, self.pyversion.1];
+                    let val: Vec<i64> = vals[lo as usize..hi as usize].to_vec();
                     if val.len() == thing_tuple.len()
                         || (val.len() > thing_tuple.len() && op != "==" && op != "!=")
                     {
@@ -361,7 +408,7 @@ impl<'py> ReachabilityCtx<'py> {
     ///
     /// Mirrors reachability.py:226-262.
     fn consider_sys_platform(&self, expr: &PyAny) -> PyResult<u8> {
-        if expr.is_instance(self.comparison_expr_cls)? {
+        if expr.is_instance(self.classes.comparison_expr_cls.as_ref(self.py))? {
             let operators = expr.getattr("operators")?;
             let operators_list = operators.downcast::<PyList>()?;
             if operators_list.len() > 1 {
@@ -378,14 +425,15 @@ impl<'py> ReachabilityCtx<'py> {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
             let right = operands_list.get_item(1)?;
-            if !right.is_instance(self.str_expr_cls)? {
+            if !right.is_instance(self.classes.str_expr_cls.as_ref(self.py))? {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
-            let right_value: String = right.getattr("value")?.extract()?;
-            Ok(fixed_comparison(&self.platform, &op_str, &right_value))
-        } else if expr.is_instance(self.call_expr_cls)? {
+            let right_value = right.getattr("value")?;
+            let right_str = right_value.downcast::<PyString>()?.to_str()?;
+            Ok(fixed_comparison(self.platform()?, &op_str, right_str))
+        } else if expr.is_instance(self.classes.call_expr_cls.as_ref(self.py))? {
             let callee = expr.getattr("callee")?;
-            if !callee.is_instance(self.member_expr_cls)? {
+            if !callee.is_instance(self.classes.member_expr_cls.as_ref(self.py))? {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
             let args = expr.getattr("args")?;
@@ -394,7 +442,7 @@ impl<'py> ReachabilityCtx<'py> {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
             let arg0 = args_list.get_item(0)?;
-            if !arg0.is_instance(self.str_expr_cls)? {
+            if !arg0.is_instance(self.classes.str_expr_cls.as_ref(self.py))? {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
             let callee_expr = callee.getattr("expr")?;
@@ -405,8 +453,9 @@ impl<'py> ReachabilityCtx<'py> {
             if callee_name != "startswith" {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
-            let arg_value: String = arg0.getattr("value")?.extract()?;
-            if self.platform.starts_with(&arg_value) {
+            let arg_value = arg0.getattr("value")?;
+            let arg_str = arg_value.downcast::<PyString>()?.to_str()?;
+            if self.platform()?.starts_with(arg_str) {
                 Ok(ALWAYS_TRUE)
             } else {
                 Ok(ALWAYS_FALSE)
@@ -420,13 +469,13 @@ impl<'py> ReachabilityCtx<'py> {
     ///
     /// Mirrors reachability.py:171-179.
     fn infer_pattern_value(&self, pattern: &PyAny) -> PyResult<u8> {
-        if pattern.is_instance(self.as_pattern_cls)? {
+        if pattern.is_instance(self.classes.as_pattern_cls.as_ref(self.py))? {
             let inner = pattern.getattr("pattern")?;
             if inner.is_none() {
                 return Ok(ALWAYS_TRUE);
             }
         }
-        if pattern.is_instance(self.or_pattern_cls)? {
+        if pattern.is_instance(self.classes.or_pattern_cls.as_ref(self.py))? {
             let patterns = pattern.getattr("patterns")?;
             let patterns_list = patterns.downcast::<PyList>()?;
             for p in patterns_list.iter() {
@@ -443,55 +492,53 @@ impl<'py> ReachabilityCtx<'py> {
     /// Mirrors reachability.py:108-168. Recursive for `not`, `and`, `or`.
     fn infer_condition_value(&self, expr: &PyAny) -> PyResult<u8> {
         // UnaryExpr with "not"
-        if expr.is_instance(self.unary_expr_cls)? {
-            let op: String = expr.getattr("op")?.extract()?;
-            if op == "not" {
+        if expr.is_instance(self.classes.unary_expr_cls.as_ref(self.py))? {
+            let op = expr.getattr("op")?;
+            let op_str = op.downcast::<PyString>()?.to_str()?;
+            if op_str == "not" {
                 let inner = expr.getattr("expr")?;
                 let positive = self.infer_condition_value(inner)?;
                 return Ok(inverted_truth(positive));
             }
         }
 
-        let mut name = String::new();
         let mut result = TRUTH_VALUE_UNKNOWN;
-
-        if expr.is_instance(self.name_expr_cls)? || expr.is_instance(self.member_expr_cls)? {
-            name = expr.getattr("name")?.extract()?;
-        } else if expr.is_instance(self.op_expr_cls)? {
-            let op: String = expr.getattr("op")?.extract()?;
-            if op != "or" && op != "and" {
+        let name: Option<&str> = if expr.is_instance(self.classes.name_expr_cls.as_ref(self.py))?
+            || expr.is_instance(self.classes.member_expr_cls.as_ref(self.py))?
+        {
+            let name_obj = expr.getattr("name")?;
+            Some(name_obj.downcast::<PyString>()?.to_str()?)
+        } else if expr.is_instance(self.classes.op_expr_cls.as_ref(self.py))? {
+            let op = expr.getattr("op")?;
+            let op_str = op.downcast::<PyString>()?.to_str()?;
+            if op_str != "or" && op_str != "and" {
                 return Ok(TRUTH_VALUE_UNKNOWN);
             }
             let left = self.infer_condition_value(expr.getattr("left")?)?;
             let right = self.infer_condition_value(expr.getattr("right")?)?;
-            let results = [left, right];
-            let results_set: HashSet<u8> = results.iter().copied().collect();
-            if op == "or" {
-                if results_set.contains(&ALWAYS_TRUE) {
+            let in_set = |v: u8, set: [u8; 2]| v == set[0] || v == set[1];
+            if op_str == "or" {
+                if left == ALWAYS_TRUE || right == ALWAYS_TRUE {
                     return Ok(ALWAYS_TRUE);
-                } else if results_set.contains(&MYPY_TRUE) {
+                } else if left == MYPY_TRUE || right == MYPY_TRUE {
                     return Ok(MYPY_TRUE);
                 } else if left == MYPY_FALSE && right == MYPY_FALSE {
                     return Ok(MYPY_FALSE);
-                } else if results_set
-                    .iter()
-                    .all(|&v| v == ALWAYS_FALSE || v == MYPY_FALSE)
+                } else if in_set(left, [ALWAYS_FALSE, MYPY_FALSE])
+                    && in_set(right, [ALWAYS_FALSE, MYPY_FALSE])
                 {
                     return Ok(ALWAYS_FALSE);
                 }
-            } else if op == "and" {
-                if results_set.contains(&ALWAYS_FALSE) {
-                    return Ok(ALWAYS_FALSE);
-                } else if results_set.contains(&MYPY_FALSE) {
-                    return Ok(MYPY_FALSE);
-                } else if left == ALWAYS_TRUE && right == ALWAYS_TRUE {
-                    return Ok(ALWAYS_TRUE);
-                } else if results_set
-                    .iter()
-                    .all(|&v| v == ALWAYS_TRUE || v == MYPY_TRUE)
-                {
-                    return Ok(MYPY_TRUE);
-                }
+            } else if left == ALWAYS_FALSE || right == ALWAYS_FALSE {
+                return Ok(ALWAYS_FALSE);
+            } else if left == MYPY_FALSE || right == MYPY_FALSE {
+                return Ok(MYPY_FALSE);
+            } else if left == ALWAYS_TRUE && right == ALWAYS_TRUE {
+                return Ok(ALWAYS_TRUE);
+            } else if in_set(left, [ALWAYS_TRUE, MYPY_TRUE])
+                && in_set(right, [ALWAYS_TRUE, MYPY_TRUE])
+            {
+                return Ok(MYPY_TRUE);
             }
             return Ok(TRUTH_VALUE_UNKNOWN);
         } else {
@@ -500,23 +547,46 @@ impl<'py> ReachabilityCtx<'py> {
             if result == TRUTH_VALUE_UNKNOWN {
                 result = self.consider_sys_platform(expr)?;
             }
-        }
+            None
+        };
 
         if result == TRUTH_VALUE_UNKNOWN {
-            if name == "PY2" {
-                result = ALWAYS_FALSE;
-            } else if name == "PY3" {
-                result = ALWAYS_TRUE;
-            } else if name == "MYPY" || name == "TYPE_CHECKING" {
-                result = MYPY_TRUE;
-            } else if self.always_true.contains(&name) {
-                result = ALWAYS_TRUE;
-            } else if self.always_false.contains(&name) {
-                result = ALWAYS_FALSE;
+            if let Some(name) = name {
+                if name == "PY2" {
+                    result = ALWAYS_FALSE;
+                } else if name == "PY3" {
+                    result = ALWAYS_TRUE;
+                } else if name == "MYPY" || name == "TYPE_CHECKING" {
+                    result = MYPY_TRUE;
+                } else if self.contains_name(self.always_true()?, name)? {
+                    result = ALWAYS_TRUE;
+                } else if self.contains_name(self.always_false()?, name)? {
+                    result = ALWAYS_FALSE;
+                }
             }
         }
 
         Ok(result)
+    }
+
+    /// `name in options.always_true/always_false` — membership over the
+    /// options list. `always_true`/`always_false` are plain `list[str]`, so
+    /// scan the `PyList` with borrowed string views instead of going through
+    /// `PySequence_Contains` (which allocates a new Python `str` per call).
+    /// Non-list containers fall back to the generic `in` operator.
+    fn contains_name(&self, container: &PyAny, name: &str) -> PyResult<bool> {
+        if let Ok(items) = container.downcast::<PyList>() {
+            for item in items.iter() {
+                if let Ok(s) = item.downcast::<PyString>() {
+                    if s.to_str()? == name {
+                        return Ok(true);
+                    }
+                }
+            }
+            Ok(false)
+        } else {
+            container.contains(name)
+        }
     }
 }
 
@@ -528,10 +598,10 @@ impl<'py> ReachabilityCtx<'py> {
 /// always true/false. Returns one of the truth-value constants
 /// (ALWAYS_TRUE=1, MYPY_TRUE=2, ALWAYS_FALSE=3, MYPY_FALSE=4, UNKNOWN=5).
 #[pyfunction]
-pub(crate) fn rust_infer_condition_value(
-    py: Python<'_>,
-    expr: &PyAny,
-    options: &PyAny,
+pub(crate) fn rust_infer_condition_value<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
+    options: &'py PyAny,
 ) -> PyResult<u8> {
     let ctx = ReachabilityCtx::new(py, options)?;
     ctx.infer_condition_value(expr)
@@ -540,8 +610,8 @@ pub(crate) fn rust_infer_condition_value(
 /// `mypy.reachability.infer_pattern_value` — infer truth value of a match
 /// pattern. Returns ALWAYS_TRUE=1 or TRUTH_VALUE_UNKNOWN=5.
 #[pyfunction]
-pub(crate) fn rust_infer_pattern_value(py: Python<'_>, pattern: &PyAny) -> PyResult<u8> {
-    let dummy_options = create_dummy_options(py)?;
+pub(crate) fn rust_infer_pattern_value<'py>(py: Python<'py>, pattern: &'py PyAny) -> PyResult<u8> {
+    let dummy_options = dummy_options(py)?;
     let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.infer_pattern_value(pattern)
 }
@@ -549,10 +619,10 @@ pub(crate) fn rust_infer_pattern_value(py: Python<'_>, pattern: &PyAny) -> PyRes
 /// `mypy.reachability.assert_will_always_fail` — whether an assert statement
 /// always fails. Returns `true` if the condition is ALWAYS_FALSE or MYPY_FALSE.
 #[pyfunction]
-pub(crate) fn rust_assert_will_always_fail(
-    py: Python<'_>,
-    stmt: &PyAny,
-    options: &PyAny,
+pub(crate) fn rust_assert_will_always_fail<'py>(
+    py: Python<'py>,
+    stmt: &'py PyAny,
+    options: &'py PyAny,
 ) -> PyResult<bool> {
     let ctx = ReachabilityCtx::new(py, options)?;
     let expr = stmt.getattr("expr")?;
@@ -563,9 +633,9 @@ pub(crate) fn rust_assert_will_always_fail(
 /// `mypy.reachability.consider_sys_version_info` — analyze a
 /// `sys.version_info` comparison. Returns a truth-value constant.
 #[pyfunction]
-pub(crate) fn rust_consider_sys_version_info(
-    py: Python<'_>,
-    expr: &PyAny,
+pub(crate) fn rust_consider_sys_version_info<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
     pyversion: (i64, i64),
 ) -> PyResult<u8> {
     let dummy_options = create_dummy_options_with_version(py, pyversion)?;
@@ -576,9 +646,9 @@ pub(crate) fn rust_consider_sys_version_info(
 /// `mypy.reachability.consider_sys_platform` — analyze a `sys.platform`
 /// comparison. Returns a truth-value constant.
 #[pyfunction]
-pub(crate) fn rust_consider_sys_platform(
-    py: Python<'_>,
-    expr: &PyAny,
+pub(crate) fn rust_consider_sys_platform<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
     platform: &str,
 ) -> PyResult<u8> {
     let dummy_options = create_dummy_options_with_platform(py, platform)?;
@@ -588,8 +658,12 @@ pub(crate) fn rust_consider_sys_platform(
 
 /// `mypy.reachability.is_sys_attr` — is `expr` a `sys.<name>` member expr?
 #[pyfunction]
-pub(crate) fn rust_is_sys_attr(py: Python<'_>, expr: &PyAny, name: &str) -> PyResult<bool> {
-    let dummy_options = create_dummy_options(py)?;
+pub(crate) fn rust_is_sys_attr<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
+    name: &str,
+) -> PyResult<bool> {
+    let dummy_options = dummy_options(py)?;
     let ctx = ReachabilityCtx::new(py, dummy_options)?;
     ctx.is_sys_attr(expr, name)
 }
@@ -598,11 +672,11 @@ pub(crate) fn rust_is_sys_attr(py: Python<'_>, expr: &PyAny, name: &str) -> PyRe
 /// from a `sys.version_info` expression. Returns `None`, an int, or a
 /// `(begin, end)` tuple of ints-or-None.
 #[pyfunction]
-pub(crate) fn rust_contains_sys_version_info(
-    py: Python<'_>,
-    expr: &PyAny,
+pub(crate) fn rust_contains_sys_version_info<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
 ) -> PyResult<Option<PyObject>> {
-    let dummy_options = create_dummy_options(py)?;
+    let dummy_options = dummy_options(py)?;
     let ctx = ReachabilityCtx::new(py, dummy_options)?;
     match ctx.contains_sys_version_info(expr)? {
         Some(VersionInfoIndex::Index(idx)) => Ok(Some(idx.into_py(py))),
@@ -626,11 +700,11 @@ pub(crate) fn rust_contains_sys_version_info(
 /// tuple-of-ints from an expression. Returns `None`, an int, or a tuple of
 /// ints.
 #[pyfunction]
-pub(crate) fn rust_contains_int_or_tuple_of_ints(
-    py: Python<'_>,
-    expr: &PyAny,
+pub(crate) fn rust_contains_int_or_tuple_of_ints<'py>(
+    py: Python<'py>,
+    expr: &'py PyAny,
 ) -> PyResult<Option<PyObject>> {
-    let dummy_options = create_dummy_options(py)?;
+    let dummy_options = dummy_options(py)?;
     let ctx = ReachabilityCtx::new(py, dummy_options)?;
     match ctx.contains_int_or_tuple_of_ints(expr)? {
         Some(IntOrTuple::Int(val)) => Ok(Some(val.into_py(py))),
@@ -666,14 +740,6 @@ pub(crate) fn rust_fixed_comparison(left: &PyAny, op: &str, right: &PyAny) -> Py
 // ---------------------------------------------------------------------------
 // Dummy Options helpers
 // ---------------------------------------------------------------------------
-
-/// Create a minimal `Options` object for helper functions that only need
-/// a subset of fields (pattern analysis, sys_attr checks, etc.).
-fn create_dummy_options(py: Python<'_>) -> PyResult<&PyAny> {
-    let options_cls = py.import("mypy.options")?.getattr("Options")?;
-    let options = options_cls.call0()?;
-    Ok(options)
-}
 
 fn create_dummy_options_with_version(py: Python<'_>, pyversion: (i64, i64)) -> PyResult<&PyAny> {
     let options_cls = py.import("mypy.options")?.getattr("Options")?;
