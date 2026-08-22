@@ -388,6 +388,18 @@ testcheck 8151 passed. Self-check type_check remains net-negative (~
 wire serialize/deserialize in Python-side callers and the semanal
 seams, not the resolver upkeep.
 
+Checker deser-cache outcome (2026-08-22, commit e0830ab69): the
+`_checker_deser_template` cache raw-bytes hit massively (128k hits vs
+12k misses on self-check) but the work-share measurement is unchanged
+(type_check 30.9s native vs 16.4s python, -88.4%, same as before
+within noise). Conclusion: `fixup_wire_type` decode cost was never the
+bottleneck; the residual is the serialize side (`_serialize_type_for_*
+` per seam call) plus the semanal seams, not deserialization. The two
+perf commits are kept (they cut real per-call costs and keep the
+hot-path decoders cheap) but further work-share gains must come from
+reducing serialize traffic or porting whole seam chains, not from more
+decode caching.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):
