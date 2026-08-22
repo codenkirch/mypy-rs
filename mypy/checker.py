@@ -618,16 +618,31 @@ def _try_native_get_coroutine_return_type(return_type: Type) -> Type | None:
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
     """Native fast path for type_requires_usage (parity-only).
 
-    Returns the note/code for the typing.Coroutine branch, or None to
-    defer to the pure-Python implementation.
+    Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
+    __await__ (UNUSED_AWAITABLE) branches, or None to defer to the
+    pure-Python implementation. The awaitable branch resolves
+    `proper_type.type.get("__await__")` through the resolver's member
+    snapshots, so it engages only when the checker resolver is installed.
     """
-    if not (_CHECKER_HAS_TYPE_KERNEL and _native_checker_stmts_active):
+    if not (
+        _CHECKER_HAS_TYPE_KERNEL
+        and _native_checker_stmts_active
+        and _native_checker_resolver is not None
+    ):
         return None
     try:
-        if _rust_type_requires_usage(_serialize_type_for_checker(typ)) == 0:
-            return ("Are you missing an await?", UNUSED_COROUTINE)
+        code = _rust_type_requires_usage(
+            _serialize_type_for_checker(typ), _native_checker_resolver
+        )
     except (AssertionError, NotImplementedError, ValueError):
-        pass
+        return None
+    if code == 0:
+        return ("Are you missing an await?", UNUSED_COROUTINE)
+    if code == 1:
+        return ("Are you missing an await?", UNUSED_AWAITABLE)
+    # code == 2: Rust decided no __await__ in the mro, so no note. Return
+    # None (no note) without re-running the pure-Python body; the
+    # pure-Python fallback would reach the identical conclusion.
     return None
 
 
