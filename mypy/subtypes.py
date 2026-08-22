@@ -90,12 +90,14 @@ try:
 
     from mypy.types import read_type as _read_type
 
+    _rust_infer_variance_member = _type_kernel.rust_infer_variance_member
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
     _ReadBuffer = None  # type: ignore[assignment,misc]
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _read_type = None  # type: ignore[assignment]
+    _rust_infer_variance_member = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
@@ -122,6 +124,43 @@ def _set_native_subtype_resolver(resolver: Any) -> None:
     """
     global _native_subtype_resolver
     _native_subtype_resolver = resolver
+
+
+def _native_variance_member_active() -> bool:
+    """Guard for the `infer_variance` member seam."""
+    return (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+        and _rust_infer_variance_member is not None
+    )
+
+
+def _native_infer_variance_member(
+    typ: Type, self_type: Type, object_type: Instance, tvar: TypeVarType
+) -> int | None:
+    """Run the Rust per-member `infer_variance` decision, or None to defer.
+
+    Serializes `typ` (the `find_member` result), the self type, and the
+    object Instance, plus the candidate typevar's raw_id. The Rust side
+    applies the wire subset of `erase_return_self_types`, `expand_type`,
+    and the two `is_subtype` calls and returns a co/contra flip bitmask.
+    """
+    if isinstance(typ, TypeAliasType):
+        # The wire subset defers TypeAliasType; skip serialization cost.
+        return None
+    try:
+        typ_bytes = _serialize_type(typ)
+        self_bytes = _serialize_type(self_type)
+        object_bytes = _serialize_type(object_type)
+    except Exception:
+        return None
+    try:
+        return _rust_infer_variance_member(
+            typ_bytes, self_bytes, object_bytes, tvar.id.raw_id, _native_subtype_resolver
+        )
+    except Exception:
+        return None
 
 
 _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
@@ -2644,6 +2683,19 @@ def infer_variance(info: TypeInfo, i: int) -> bool:
                 # This could probably be more lenient (e.g. allow self type be nested, don't
                 # require all type arguments to be identical to self_type), but this will
                 # hopefully cover the vast majority of such cases, including Self.
+                if _native_variance_member_active():
+                    # Native per-member decision: erase_return_self_types +
+                    # expand_type + 2x is_subtype folded into a co/contra mask.
+                    code = _native_infer_variance_member(typ, self_type, object_type, tvar)
+                    if code is not None:
+                        if code & 1:
+                            co = False
+                        if code & 2:
+                            contra = False
+                        if code & 2 and settable:
+                            co = False
+                        continue
+
                 typ = erase_return_self_types(typ, self_type)
 
                 typ2 = expand_type(typ, {tvar.id: object_type})

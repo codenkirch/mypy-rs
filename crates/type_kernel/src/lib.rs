@@ -89,6 +89,7 @@ mod expandtype;
 mod fixup;
 mod freshen;
 mod generators;
+mod infer_variance;
 mod lennarrow;
 mod lkv;
 mod maptype;
@@ -2653,6 +2654,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #745: subtypes.covers_at_runtime (runtime isinstance coverage).
     module.add_function(wrap_pyfunction!(
         covers_at_runtime::rust_covers_at_runtime,
+        module
+    )?)?;
+
+    // infer_variance member-direction analysis (mypy.subtypes). The shim
+    // keeps the variance loop, per-member this computes the co/contra flip
+    // bitmask or defers (None) to the pure-Python member body.
+    module.add_function(wrap_pyfunction!(
+        infer_variance::rust_infer_variance_member,
         module
     )?)?;
 

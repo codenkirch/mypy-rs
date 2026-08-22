@@ -16737,3 +16737,241 @@ class NativeSubtypesCallableSuite(Suite):
         )
         off, on = self._par(left, right)
         assert (off, on) == (True, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+def _build_native_variance_resolver(infos: list[TypeInfo]) -> Any:
+    """Build a `NativeTypeResolver` snapshot over the given live TypeInfos
+    (the class plus the fixture graph it subclasses) so the Rust subtype
+    and callable-compat seams resolve every type_ref the `infer_variance`
+    member types exercise."""
+    return _type_kernel.build_native_resolver(infos, [])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInferVarianceSuite(Suite):
+    """Parity tests for the Rust `infer_variance` member decision.
+
+    `infer_variance` mutates `info.defn.type_vars[i].variance` while
+    scanning members; the Python shim keeps that loop and routes each
+    member's algebra (erase_return_self_types wire subset, expand_type,
+    the two is_subtype calls) through `rust_infer_variance_member`,
+    deferring (None) to the pure-Python body when Rust cannot decide.
+    Each test runs the real `infer_variance` gate-off vs gate-on and
+    asserts the final variance and success flag agree. The direct seam
+    tests additionally prove the Rust decision engages and computes the
+    expected flip bitmask for known-variance fixtures.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_native_subtype_active = _set_native_subtype_active
+        self._set_native_subtype_resolver = _set_native_subtype_resolver
+        self._initial_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.gi,
+            self.fx.functioni,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.std_listi,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in self._initial_infos})
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_native_subtype_active(False)
+        self._set_native_subtype_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _make_class(self) -> TypeInfo:
+        """A `class C(Generic[T])` with variance NOT_READY and no members."""
+        from mypy.nodes import VARIANCE_NOT_READY
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        info = self.fx.make_type_info(
+            "C", mro=[self.fx.oi], typevars=["T"], variances=[VARIANCE_NOT_READY]
+        )
+        set_wire_typeinfo_map(
+            {i.fullname: i for i in self._initial_infos + [info]}
+        )
+        return info
+
+    def _add_var_member(self, info: TypeInfo, member_type: Type) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        v = Var("x")
+        v.type = member_type
+        v.info = info
+        info.names["x"] = SymbolTableNode(MDEF, v)
+
+    def _install_gate(self, info: TypeInfo, on: bool) -> None:
+        self._set_native_subtype_resolver(
+            None if not on else _build_native_variance_resolver(self._initial_infos + [info])
+        )
+        self._set_native_subtype_active(on)
+
+    def _assert_variance(self, member_type: Type, expected: int) -> None:
+        off_ok, off_v = self._run_variance_gated(member_type, False)
+        on_ok, on_v = self._run_variance_gated(member_type, True)
+        assert (off_ok, off_v) == (on_ok, on_v), (
+            f"gate-off {off_ok, off_v} != gate-on {on_ok, on_v}"
+        )
+        assert (off_ok, off_v) == (True, expected), f"expected {expected}, got {off_ok, off_v}"
+
+    def _run_variance_gated(
+        self, member_type: Type, on: bool
+    ) -> tuple[bool, int]:
+        return self._run_variance_gated_with(lambda info: member_type, on)
+
+    def _run_variance_gated_with(
+        self, member_factory: Callable[[TypeInfo], Type], on: bool
+    ) -> tuple[bool, int]:
+        from mypy.nodes import VARIANCE_NOT_READY
+        from mypy.subtypes import infer_variance
+
+        info = self._make_class()
+        self._add_var_member(info, member_factory(info))
+        self._install_gate(info, on)
+        try:
+            ok = infer_variance(info, 0)
+            return ok, info.defn.type_vars[0].variance
+        finally:
+            self._install_gate(info, False)
+
+    def test_member_t_covariant(self) -> None:
+        # Class with a settable Var x: T infers INVARIANT (a settable
+        # variable of type T neither covariant nor contravariant).
+        self._assert_variance(self.fx.t, INVARIANT)
+
+    def test_member_callable_contravariant(self) -> None:
+        # x: Callable[[T], None] infers CONTRAVARIANT (contravariant use).
+        c = CallableType([self.fx.t], [ARG_POS], [None], NoneType(), self.fx.function)
+        self._assert_variance(c, CONTRAVARIANT)
+
+    def test_member_callable_returning_t_invariant(self) -> None:
+        # x: Callable[[T], T] infers INVARIANT.
+        c = CallableType([self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function)
+        self._assert_variance(c, INVARIANT)
+
+    def test_member_self_return_deferral(self) -> None:
+        # A method returning the self type erases in Python (callable-form
+        # self return); the Rust subset must defer so Python decides.
+
+        def make_member(info: TypeInfo) -> Type:
+            from mypy.types import Instance
+
+            return CallableType(
+                [self.fx.t], [ARG_POS], [None], Instance(info, [self.fx.t]), self.fx.function
+            )
+
+        off_ok, off_v = self._run_variance_gated_with(make_member, False)
+        on_ok, on_v = self._run_variance_gated_with(make_member, True)
+        assert (off_ok, off_v) == (on_ok, on_v)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInferVarianceSeamSuite(Suite):
+    """Direct-seam tests for `rust_infer_variance_member`.
+
+    These prove the Rust module engages (does not always defer) and
+    returns the expected co/contra flip bitmask for known-variance
+    fixture classes, independent of the `infer_variance` loop.
+    """
+
+    def setUp(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.gi,
+            self.fx.functioni,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.std_listi,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._type_infos = type_infos
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        set_wire_typeinfo_map(None)
+
+    def _make_covariant_class(self) -> TypeInfo:
+        # Explicit COVARIANT so the Rust subtype seam (which reads the
+        # snapshot variance) can decide the C[T] vs C[object] checks.
+        from mypy.nodes import COVARIANT
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        info = self.fx.make_type_info(
+            "C", mro=[self.fx.oi], typevars=["T"], variances=[COVARIANT]
+        )
+        self._type_infos.append(info)
+        set_wire_typeinfo_map({i.fullname: i for i in self._type_infos})
+        return info
+
+    def _compute(self, info: TypeInfo, member_type: Type) -> int | None:
+        import mypy.subtypes as subtypes
+        from mypy.typevars import fill_typevars
+
+        resolver = _build_native_variance_resolver(self._type_infos)
+        subtypes._set_native_subtype_active(True)
+        subtypes._set_native_subtype_resolver(resolver)
+        try:
+            self_type = fill_typevars(info)
+            object_type = Instance(self.fx.oi, [])
+            tvar = info.defn.type_vars[0]
+            return subtypes._native_infer_variance_member(
+                member_type, self_type, object_type, tvar
+            )
+        finally:
+            subtypes._set_native_subtype_active(False)
+            subtypes._set_native_subtype_resolver(None)
+
+    def test_member_t_engages(self) -> None:
+        # x: T in a COVARIANT class: C[T] <: C[object] holds (no flip),
+        # C[object] <: C[T] fails -> contravariant flip (bit 2).
+        info = self._make_covariant_class()
+        v = Var("x")
+        v.type = self.fx.t
+        v.info = info
+        info.names["x"] = SymbolTableNode(MDEF, v)
+        result = self._compute(info, self.fx.t)
+        assert result == 2, f"expected contravariant-only flip, got {result}"
+
+    def test_member_callable_engages(self) -> None:
+        # x: Callable[[T], None]: C[T] vs C[object] only differs in the
+        # arg position (contravariant) -> bit 1 (covariant flip).
+        info = self._make_covariant_class()
+        c = CallableType([self.fx.t], [ARG_POS], [None], NoneType(), self.fx.function)
+        v = Var("x")
+        v.type = c
+        v.info = info
+        info.names["x"] = SymbolTableNode(MDEF, v)
+        result = self._compute(info, c)
+        assert result == 1, f"expected covariant-only flip, got {result}"
+
+    def test_callable_returning_t_invariant(self) -> None:
+        # x: Callable[[T], T]: both directions flip -> bit 3.
+        info = self._make_covariant_class()
+        c = CallableType([self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function)
+        v = Var("x")
+        v.type = c
+        v.info = info
+        info.names["x"] = SymbolTableNode(MDEF, v)
+        result = self._compute(info, c)
+        assert result == 3, f"expected both flips, got {result}"
