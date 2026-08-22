@@ -2024,6 +2024,12 @@ def rust_remove_path_prefix(
     path: Any,
     prefix: Any,
 ) -> Any: ...
+def rust_remove_redundant_union_items(
+    type_list_bytes: bytes,
+    keep_erased: bool,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> Any: ...
 def rust_report_internal_error(
     file: Any,
     line: Any,
