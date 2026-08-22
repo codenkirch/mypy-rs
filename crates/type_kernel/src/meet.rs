@@ -408,8 +408,43 @@ pub(crate) fn overlap(
 
     // 12. Parameters / CallableType / Literal (meet.py:639-703).
     if let (Type::Parameters(_), Type::Parameters(_)) = (&left, &right) {
-        // are_parameters_compatible not ported -> defer.
-        return None;
+        // are_parameters_compatible via the shared callable_compat engine,
+        // `is_compat = overlap` (meet.py:708-716, allow_partial_overlap);
+        // defers (None) on generic parameters / meet_types merge.
+        let (lf, rf) = (
+            crate::callable_compat::arg_list_from_type(&left)?,
+            crate::callable_compat::arg_list_from_type(&right)?,
+        );
+        if !lf.variables_empty || !rf.variables_empty {
+            return None;
+        }
+        let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> = &|l, r| {
+            overlap(
+                l,
+                r,
+                strict_optional,
+                ignore_promotions,
+                overlap_for_overloads,
+                res,
+                depth + 1,
+            )
+        };
+        return crate::callable_compat::are_parameters_compatible(
+            lf.arg_types,
+            lf.arg_kinds,
+            lf.arg_names,
+            lf.from_concatenate,
+            rf.arg_types,
+            rf.arg_kinds,
+            rf.arg_names,
+            rf.imprecise_arg_kinds,
+            rf.is_ellipsis_args,
+            is_compat,
+            false,                  // is_proper_subtype
+            !overlap_for_overloads, // ignore_pos_arg_names
+            true,                   // allow_partial_overlap
+            false,                  // strict_concatenate_check
+        );
     }
     if matches!(left, Type::Parameters(_)) || matches!(right, Type::Parameters(_)) {
         return Some(false);

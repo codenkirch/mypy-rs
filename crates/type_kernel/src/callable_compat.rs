@@ -419,6 +419,119 @@ fn are_args_compatible(
     is_compat(&right.typ, &left.typ)
 }
 
+/// Extract the arg list + parameter-list flags from either a `Parameters`
+/// or a `CallableType` wire type (both carry `arg_types`/`arg_kinds`/
+/// `arg_names`). Used by the `rust_are_parameters_compatible` seam, which
+/// serves the Python `Parameters`-`Parameters` paths (`visit_parameters`,
+/// the meet overlap branch) that previously were pure-Python.
+pub(crate) struct AnyArgList<'a> {
+    pub(crate) arg_types: &'a [Type],
+    pub(crate) arg_kinds: &'a [i64],
+    pub(crate) arg_names: &'a [Option<String>],
+    pub(crate) from_concatenate: bool,
+    pub(crate) is_ellipsis_args: bool,
+    pub(crate) imprecise_arg_kinds: bool,
+    pub(crate) variables_empty: bool,
+}
+
+pub(crate) fn arg_list_from_type(t: &Type) -> Option<AnyArgList<'_>> {
+    match t {
+        Type::CallableType {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            from_concatenate,
+            is_ellipsis_args,
+            imprecise_arg_kinds,
+            variables,
+            ..
+        } => Some(AnyArgList {
+            arg_types,
+            arg_kinds,
+            arg_names,
+            from_concatenate: *from_concatenate,
+            is_ellipsis_args: *is_ellipsis_args,
+            imprecise_arg_kinds: *imprecise_arg_kinds,
+            variables_empty: variables.is_empty(),
+        }),
+        Type::Parameters(p) => Some(AnyArgList {
+            arg_types: &p.arg_types,
+            arg_kinds: &p.arg_kinds,
+            arg_names: &p.arg_names,
+            // Wire drops Parameters.is_ellipsis_args/from_concatenate;
+            // is_ellipsis_args=True only coincides with Any star types
+            // (typeanal.py:2105), which are_trivial_parameters detects.
+            from_concatenate: false,
+            is_ellipsis_args: false,
+            imprecise_arg_kinds: p.imprecise_arg_kinds,
+            variables_empty: p.variables.is_empty(),
+        }),
+        _ => None,
+    }
+}
+
+/// `#[pyfunction]` seam mirroring `mypy.subtypes.are_parameters_compatible`
+/// (subtypes.py:1912-2105) for `Parameters`-vs-`Parameters` (or mixed
+/// `CallableType`) comparison. The Python shim uses this in
+/// `SubtypeVisitor.visit_parameters` (subtypes.py:962-971) and the meet
+/// overlap branch (meet.py:708-716): both currently run pure-Python because
+/// `rust_callables_compatible` requires both sides to be `CallableType`.
+/// Returns `None` (defer to Python) for anything the engine cannot decide.
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_are_parameters_compatible(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    is_proper_subtype: bool,
+    ignore_pos_arg_names: bool,
+    allow_partial_overlap: bool,
+    strict_concatenate_check: bool,
+    strict_optional: bool,
+    nested_proper_subtype: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let lf = arg_list_from_type(&left)?;
+    let rf = arg_list_from_type(&right)?;
+    // Generic `Parameters`/`CallableType` (variables non-empty) defer: the
+    // Python visit would unify via type inference first.
+    if !lf.variables_empty || !rf.variables_empty {
+        return None;
+    }
+    // Nested is_compat re-enters is_subtype through the caller's context,
+    // which carries the visitor's proper_subtype even though the top call
+    // hardcodes is_proper_subtype=False (subtypes.py:968-971).
+    let ctx = SubtypeContext::with_callable_flags(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        false, // ignore_promotions
+        nested_proper_subtype,
+        strict_optional,
+        ignore_pos_arg_names,
+        strict_concatenate_check,
+    );
+    let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> =
+        &|l, r| crate::subtypes::is_subtype(l, r, &ctx, resolver.resolver());
+    are_parameters_compatible(
+        lf.arg_types,
+        lf.arg_kinds,
+        lf.arg_names,
+        lf.from_concatenate,
+        rf.arg_types,
+        rf.arg_kinds,
+        rf.arg_names,
+        rf.imprecise_arg_kinds,
+        rf.is_ellipsis_args,
+        is_compat,
+        is_proper_subtype,
+        ignore_pos_arg_names,
+        allow_partial_overlap,
+        strict_concatenate_check,
+    )
+}
+
 /// `mypy.subtypes.are_parameters_compatible` (subtypes.py:1912-2105).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn are_parameters_compatible(

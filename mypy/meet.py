@@ -706,6 +706,30 @@ def is_overlapping_types(
         return _type_object_overlap(left, right) or _type_object_overlap(right, left)
 
     if isinstance(left, Parameters) and isinstance(right, Parameters):
+        # Native `are_parameters_compatible` seam (shared callable_compat
+        # engine, overlap is_compat). Returns None when the engine cannot
+        # decide; falls through to pure-Python.
+        if (
+            join._HAS_TYPE_KERNEL
+            and join._native_join_active
+            and join._native_join_resolver is not None
+        ):
+            try:
+                result = join._type_kernel.rust_are_parameters_compatible(  # type: ignore[attr-defined]
+                    join._serialize_type(left),
+                    join._serialize_type(right),
+                    False,  # is_proper_subtype
+                    not overlap_for_overloads,  # ignore_pos_arg_names
+                    True,  # allow_partial_overlap
+                    False,  # strict_concatenate_check
+                    state.strict_optional,
+                    False,  # nested overlap is non-proper
+                    join._native_join_resolver,
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                return result  # type: ignore[no-any-return]
         return are_parameters_compatible(
             left,
             right,
