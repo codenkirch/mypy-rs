@@ -3251,6 +3251,158 @@ class NativeVariadicTupleRightSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeVariadicTupleSubtypeSuite(Suite):
+    """Parity suite for the Rust `variadic_tuple_subtype` port
+    (subtypes.py:1086-1166).
+
+    Covers TupleType vs TupleType when the right side has a variadic
+    unpack. The Rust port returns `Some(Some(true))` when it
+    short-circuits True; it returns fall-through (`None` inner) when it
+    cannot (no right unpack, unsupported left shape, or a recursive
+    `is_subtype` deferral), so the caller runs the fixed-length logic
+    exactly like Python's `if self.variadic_tuple_subtype(left, right)`
+    (subtypes.py:1064-1065).
+
+    Gate-toggling (differential) plus a direct seam call
+    (`rust_variadic_tuple_subtype`) proving Rust engages.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _tup(self, *items: Type) -> TupleType:
+        return TupleType(list(items), self.fx.std_tuple)
+
+    def _var_tup(self, item: Type) -> TupleType:
+        # (*tuple[item, ...],): the variadic right side.
+        unpack = UnpackType(Instance(self.fx.std_tuplei, [item]))
+        return TupleType([unpack], self.fx.std_tuple)
+
+    def _engages(self, left: Type, right: Type, proper: bool = False) -> bool | None:
+        # Direct seam call: True when Rust decides short-circuit; None
+        # when it cannot (fall-through). Proves the port engages.
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_variadic_tuple_subtype(
+            _serialize_type(left),
+            _serialize_type(right),
+            proper,
+            self.resolver,
+        )
+
+    def _assert_par(self, left: Type, right: Type, *, proper: bool = False) -> None:
+        # Differential: gate off (pure Python) vs on (Rust seam) must
+        # agree on the decision string.
+        from mypy.subtypes import _set_native_subtype_active
+        from mypy.subtypes import is_proper_subtype
+        from mypy.subtypes import is_subtype as _is
+
+        def run() -> str:
+            if proper:
+                return str(is_proper_subtype(left, right))
+            return str(_is(left, right))
+
+        _set_native_subtype_active(False)
+        try:
+            off = run()
+        finally:
+            _set_native_subtype_active(True)
+        on = run()
+        assert_equal(on, off, f"subtype parity (variadic tuple) {left} vs {right}")
+
+    def test_fixed_left_vs_variadic_right_true(self) -> None:
+        # (A,) <: (*tuple[A, ...],) -> True (mapping selects length 1).
+        left = self._tup(self.fx.a)
+        right = self._var_tup(self.fx.a)
+        self._assert_par(left, right)
+        assert self._engages(left, right) is True
+
+    def test_fixed_left_any_vs_variadic_right_true(self) -> None:
+        # (A,) <: (*tuple[Any, ...],) -> True (Any item absorbs).
+        left = self._tup(self.fx.a)
+        right = self._var_tup(AnyType(TypeOfAny.special_form))
+        self._assert_par(left, right)
+        assert self._engages(left, right) is True
+
+    def test_fixed_left_unrelated_item_vs_variadic_false(self) -> None:
+        # (A,) !<: (*tuple[B, ...],) when A !<: B -> False.
+        left = self._tup(self.fx.a)
+        right = self._var_tup(self.fx.b)
+        self._assert_par(left, right)
+
+    def test_fixed_left_short_vs_prefix_suffix_false(self) -> None:
+        # (A,) !<: (x, *tuple[A, ...]) because prefix+suffix exceed the
+        # fixed left length (subtypes.py:1113-1114).
+        left = self._tup(self.fx.a)
+        right = TupleType(
+            [self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])), self.fx.a],
+            self.fx.std_tuple,
+        )
+        self._assert_par(left, right)
+
+    def test_fixed_left_matches_prefix_suffix_true(self) -> None:
+        # (A, A, A) <: (A, *tuple[A, ...], A) -> True (prefix/suffix
+        # consumed, middle maps to the infinite union item).
+        left = self._tup(self.fx.a, self.fx.a, self.fx.a)
+        right = TupleType(
+            [self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self.fx.a])), self.fx.a],
+            self.fx.std_tuple,
+        )
+        self._assert_par(left, right)
+        assert self._engages(left, right) is True
+
+    def test_both_variadic_same_item_true(self) -> None:
+        # (*tuple[A, ...],) <: (*tuple[A, ...],) -> True (asymptotic and
+        # all finite overlaps).
+        left = self._var_tup(self.fx.a)
+        right = self._var_tup(self.fx.a)
+        self._assert_par(left, right)
+        assert self._engages(left, right) is True
+
+    def test_both_variadic_unrelated_item_false(self) -> None:
+        # (*tuple[A, ...],) !<: (*tuple[B, ...],) when A !<: B -> False
+        # (asymptotic case fails).
+        left = self._var_tup(self.fx.a)
+        right = self._var_tup(self.fx.b)
+        self._assert_par(left, right)
+
+    def test_left_unpack_top_right(self) -> None:
+        # (*tuple[A, ...],) <: (*tuple[object, ...],) -> True via the
+        # top-type right path (object middle, subtypes.py:1137-1151).
+        left = self._var_tup(self.fx.a)
+        right = self._var_tup(self.fx.o)
+        self._assert_par(left, right)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
 
