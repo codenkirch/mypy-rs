@@ -69,6 +69,8 @@ __all__ = [
     "rust_trivial_meet",
     "rust_join_types",
     "rust_meet_types",
+    "rust_object_or_any_from_type",
+    "rust_combine_similar_callables",
     "rust_narrow_declared_type",
     "rust_narrow_with_len",
     "rust_map_actuals_to_formals",
@@ -471,6 +473,12 @@ def rust_meet_tuples(
 ) -> bytes | None: ...
 def rust_join_type_list(
     type_blobs: list[bytes], strict_optional: bool, resolver: NativeTypeResolver
+) -> bytes | None: ...
+def rust_object_or_any_from_type(
+    typ: bytes, resolver: NativeTypeResolver
+) -> bytes | None: ...
+def rust_combine_similar_callables(
+    t: bytes, s: bytes, strict_optional: bool, resolver: NativeTypeResolver
 ) -> bytes | None: ...
 def rust_join_sorted_key(t_bytes: bytes) -> int | None: ...
 def rust_narrow_declared_type(

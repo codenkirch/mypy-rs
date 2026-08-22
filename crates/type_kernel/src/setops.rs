@@ -1256,7 +1256,7 @@ fn visit_instance_meet_args(
 /// recursive `Encoded` results to Python. The meet-only per-arg path
 /// that must decode uses `fruit_to_type` (which has its own `Encoded`
 /// arm) instead.
-fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Type> {
+pub(crate) fn setop_result_to_type(r: Option<SetOpResult>, s: &Type, t: &Type) -> Option<Type> {
     match r? {
         SetOpResult::SameS => Some(s.clone()),
         SetOpResult::SameT => Some(t.clone()),
@@ -1522,7 +1522,7 @@ fn is_equivalent_callable(
 
 /// `combine_arg_names` (join.py:1123-1156): per-index, None if either is
 /// None or names differ. Preserves positional names when compatible.
-fn combine_arg_names(
+pub(crate) fn combine_arg_names(
     t_names: &[Option<String>],
     s_names: &[Option<String>],
     t_kinds: &[i64],
@@ -1550,7 +1550,12 @@ fn combine_arg_names(
 
 /// `safe_join` (join.py:1065-1072): join_types for non-UnpackType
 /// pairs. Both-UnpackType -> UnpackType(join). Mixed -> defer (None).
-fn safe_join(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) -> Option<Type> {
+pub(crate) fn safe_join(
+    t: &Type,
+    s: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Type> {
     let t_unpack = matches!(t, Type::UnpackType { .. });
     let s_unpack = matches!(s, Type::UnpackType { .. });
     if !t_unpack && !s_unpack {
@@ -1584,7 +1589,7 @@ fn safe_join(t: &Type, s: &Type, ctx: &SubtypeContext, resolver: &TypeResolver) 
 /// else s.fallback. The "t" here is the second operand (self.s in
 /// Python is the first arg; our s/t naming follows the Rust convention
 /// where s is the first arg to join_types).
-fn pick_fallback(s_fallback: &Type, t_fallback: &Type) -> Type {
+pub(crate) fn pick_fallback(s_fallback: &Type, t_fallback: &Type) -> Type {
     if let Type::Instance { type_ref, .. } = s_fallback {
         if type_ref == "builtins.function" {
             return s_fallback.clone();
@@ -1854,7 +1859,7 @@ fn combine_similar_callables(
 /// from a CallableType `t`. These are copied as-is to the result
 /// (join.py:1113-1119 copy_modified preserves them).
 #[allow(clippy::type_complexity)]
-fn extract_callable_invariants(
+pub(crate) fn extract_callable_invariants(
     t: &Type,
 ) -> (
     Vec<i64>,
