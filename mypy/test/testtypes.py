@@ -3403,6 +3403,151 @@ class NativeVariadicTupleSubtypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeByInstanceSuite(Suite):
+    """Parity for the Rust `expand_type_by_instance` TypeVarTuple branch
+    (mypy.expandtype, expandtype.py:391-406).
+
+    A variadic instance (`instance.type.has_type_var_tuple_type`) binds
+    its TypeVarTuple to a TupleType of the middle args and the prefix /
+    suffix args to their ordinary tvars. The Rust branch (expandtype.rs
+    `expand_type_by_instance_core`, with the new
+    `type_var_tuple_fallback` snapshot field) must produce the same
+    expansion as the pure-Python visitor. Toggling the gate off vs on
+    must agree on `str(expanded)`, and a direct seam call proves the Rust
+    engagement for the variadic prefix=1/suffix=1 case.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _register(self, info: TypeInfo) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._type_infos.append(info)
+        self._resolver.update(
+            [info],
+            [],
+        )
+        set_wire_typeinfo_map({i.fullname: i for i in self._type_infos})
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _expand(self, typ: Type, instance: Instance) -> Type:
+        from mypy.expandtype import expand_type_by_instance
+
+        return expand_type_by_instance(typ, instance)
+
+    def _assert_par(self, typ: Type, instance: Instance) -> None:
+        off = str(self._with_gate(False, lambda: self._expand(typ, instance)))
+        on = str(self._with_gate(True, lambda: self._expand(typ, instance)))
+        assert_equal(on, off, f"expand_type_by_instance parity {typ} inst {instance}")
+
+    def _variadic_info(self, name: str, prefix: int, suffix: int) -> TypeInfo:
+        # typevars ["T", "Ts", "B"] with TypeVarTuple at index 1 -> the
+        # wire snapshot reads prefix/suffix from the live TypeInfo (which
+        # must be set by hand, mirroring nodes.py).
+        info = self.fx.make_type_info(
+            name, mro=[self.fx.oi], typevars=["T", "Ts", "B"], typevar_tuple_index=1
+        )
+        info.type_var_tuple_prefix = prefix
+        info.type_var_tuple_suffix = suffix
+        return info
+
+    def test_seam_engages_variadic(self) -> None:
+        # Direct seam call: the variadic (prefix=1/suffix=1) expansion
+        # must engage (return bytes) rather than defer to Python.
+        from mypy.expandtype import _serialize_type
+
+        info = self._variadic_info("VPair", 1, 1)
+        self._register(info)
+        instance = Instance(
+            info,
+            [
+                self.fx.a,
+                UnpackType(Instance(self.fx.std_tuplei, [self.fx.b])),
+                self.fx.c,
+            ],
+        )
+        # typ = Tuple[Unpack[Ts]] references the size-2 middle.
+        typ = TupleType(
+            [UnpackType(Instance(self.fx.std_tuplei, [self.fx.b]))],
+            self.fx.std_tuple,
+        )
+        result = _type_kernel.rust_expand_type_by_instance(
+            self._resolver,
+            _serialize_type(typ),
+            _serialize_type(instance),
+            state.strict_optional,
+        )
+        assert result is not None, "Rust expand_type_by_instance did not engage for variadic"
+
+    def test_variadic_prefix_suffix_parity(self) -> None:
+        # VPair[T, *Ts, B] applied to VPair[A, *tuple[B, ...], C]:
+        # *Ts binds Tuple[B] (the middle item). Expanding a type that
+        # references *Ts must splice the middle tuple's items.
+        info = self._variadic_info("VPair", 1, 1)
+        self._register(info)
+        instance = Instance(
+            info,
+            [self.fx.a, UnpackType(Instance(self.fx.std_tuplei, [self.fx.b])), self.fx.c],
+        )
+        # typ references the TypeVarTuple *Ts via an UnpackType.
+        typ = TupleType(
+            [UnpackType(TypeVarTupleType("Ts", "VPair.Ts", TypeVarId(2), self.fx.o, self.fx.std_tuple, self.fx.anyt))],
+            self.fx.std_tuple,
+        )
+        self._assert_par(typ, instance)
+
+    def test_variadic_no_middle_bypasses(self) -> None:
+        # Variadic prefix=1/suffix=1 with exactly two args: middle is
+        # empty, so binding *Ts to an empty tuple must not assert in the
+        # Rust branch. Both gates must agree.
+        info = self._variadic_info("VPair", 1, 1)
+        self._register(info)
+        instance = Instance(info, [self.fx.a, self.fx.c])
+        typ = self.fx.a  # no tvar reference
+        off = str(self._with_gate(False, lambda: self._expand(typ, instance)))
+        on = str(self._with_gate(True, lambda: self._expand(typ, instance)))
+        assert_equal(on, off, "empty-middle variadic parity")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
 
