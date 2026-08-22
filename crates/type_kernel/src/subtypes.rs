@@ -853,15 +853,13 @@ fn variadic_tuple_subtype(
     resolver: &TypeResolver,
 ) -> Option<Option<bool>> {
     let Type::TupleType {
-        items: left_items,
-        ..
+        items: left_items, ..
     } = left
     else {
         return None;
     };
     let Type::TupleType {
-        items: right_items,
-        ..
+        items: right_items, ..
     } = right
     else {
         return None;
@@ -947,10 +945,20 @@ fn variadic_tuple_subtype(
                         return Some(None);
                     }
                 }
-                if !all_subtypes(&left_items[..left_prefix], &right_prefix_types, ctx, resolver)? {
+                if !all_subtypes(
+                    &left_items[..left_prefix],
+                    &right_prefix_types,
+                    ctx,
+                    resolver,
+                )? {
                     return Some(None);
                 }
-                if !all_subtypes(&left_items[left_items.len() - left_suffix..], &right_suffix_types, ctx, resolver)? {
+                if !all_subtypes(
+                    &left_items[left_items.len() - left_suffix..],
+                    &right_suffix_types,
+                    ctx,
+                    resolver,
+                )? {
                     return Some(None);
                 }
                 return Some(Some(true));
