@@ -6,8 +6,10 @@
 //! scalar outcome and Python formats the message.
 //!
 //! Deferred (return None) cases:
-//!   * `type_requires_usage` defers on `TypeAliasType` (the `__await__`
-//!     branch needs live `TypeInfo`, which the wire format does not carry).
+//!   * `type_requires_usage` defers on `TypeAliasType` (the alias target
+//!     is absent from the wire), and on the `__await__` branch when a
+//!     class in the mro is missing from the resolver (cannot distinguish
+//!     "absent" from "unknown").
 //!   * `is_unreachable_map` defers on any `TypeAliasType` value since
 //!     alias expansion could reveal an `UninhabitedType`.
 //!
@@ -46,35 +48,62 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 
 /// `mypy.checker.type_requires_usage`: the initial Instance dispatch.
 ///
-/// Mirrors checker.py:5222-5237. The Python implementation calls
+/// Mirrors checker.py:5822-5840. The Python implementation calls
 /// `get_proper_type`, so an alias defers here (no alias target on the wire).
-/// Only the `typing.Coroutine` branch is portable: the `__await__` branch
-/// needs live `TypeInfo`, so it stays Python-only.
+/// The `typing.Coroutine` branch is decided by fullname; the `__await__`
+/// branch mirrors `proper_type.type.get("__await__")` (a truthy
+/// `SymbolTableNode` in the mro), which the resolver's `member_info`
+/// snapshots carry. Defer (`None`) when any mro class is missing from the
+/// resolver (cannot distinguish "absent" from "unknown").
 ///
 /// Returns `Some(0)` when the note code UNUSED_COROUTINE applies,
-/// `None` to defer to Python.
+/// `Some(1)` when UNUSED_AWAITABLE applies, `None` to defer to Python.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_type_requires_usage(type_bytes: &[u8]) -> PyResult<Option<u8>> {
+pub(crate) fn rust_type_requires_usage(
+    type_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> PyResult<Option<u8>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(type_requires_usage_inner(&typ))
+    Ok(type_requires_usage_inner(&typ, resolver.resolver()))
 }
 
-fn type_requires_usage_inner(typ: &Type) -> Option<u8> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        Type::Instance { type_ref, .. } => {
-            if type_ref == "typing.Coroutine" {
-                Some(0)
-            } else {
-                None
-            }
-        }
-        _ => None,
+fn type_requires_usage_inner(typ: &Type, resolver: &TypeResolver) -> Option<u8> {
+    let Type::Instance { type_ref, .. } = typ else {
+        // TypeAliasType (needs alias expansion), and all non-Instance
+        // proper types, defer to the pure-Python body.
+        return None;
+    };
+    if type_ref == "typing.Coroutine" {
+        return Some(0);
     }
+    // `type.get("__await__") is not None` mirrors TypeInfo.get
+    // (nodes.py:4063): first mro class whose own `names` contains the
+    // name. Missing snapshot = defer (absent vs unknown).
+    match member_present_by_ref(resolver, type_ref, "__await__") {
+        Some(true) => Some(1),
+        Some(false) => Some(2),
+        None => None,
+    }
+}
+
+/// `TypeInfo.get(name)` (nodes.py:4063-4068): walk the mro, returning the
+/// first class whose own `names` dict contains `name`. Existence-only via
+/// the resolver snapshot's `member_info` (built from `SymbolTableNode`
+/// entries). Defer (`None`) when the class or any mro class is missing
+/// from the resolver.
+fn member_present_by_ref(resolver: &TypeResolver, type_ref: &str, name: &str) -> Option<bool> {
+    let snap = resolver.get(type_ref)?;
+    for base in &snap.mro {
+        let b = resolver.get(base)?;
+        if b.member_info.contains_key(name) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,18 +1127,102 @@ mod tests {
     #[test]
     fn type_requires_usage_coroutine() {
         let t = instance("typing.Coroutine");
-        assert_eq!(rust_type_requires_usage(&encode_type(&t)).unwrap(), Some(0));
+        let resolver = TypeResolver::new();
+        assert_eq!(
+            rust_type_requires_usage(
+                &encode_type(&t),
+                &mut NativeTypeResolver::new(
+                    resolver,
+                    crate::aliases::TypeAliasResolver::default(),
+                )
+            )
+            .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
     fn type_requires_usage_other_instance() {
+        // builtins.int has no __await__ and is not typing.Coroutine: the
+        // resolver must be present (else the mro walk cannot conclude).
+        let resolver = TypeResolver::new();
         let t = instance("builtins.int");
-        assert_eq!(rust_type_requires_usage(&encode_type(&t)).unwrap(), None);
+        assert_eq!(
+            rust_type_requires_usage(
+                &encode_type(&t),
+                &mut NativeTypeResolver::new(
+                    resolver,
+                    crate::aliases::TypeAliasResolver::default(),
+                )
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
     fn type_requires_usage_alias_defers() {
-        assert_eq!(type_requires_usage_inner(&type_alias()), None);
+        assert_eq!(
+            type_requires_usage_inner(&type_alias(), &TypeResolver::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn type_requires_usage_awaitable_mro() {
+        // A class whose own names carry __await__: UNUSED_AWAITABLE (1).
+        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
+        snap.fullname = "mod.Await".to_string();
+        snap.mro = vec!["mod.Await".to_string(), "builtins.object".to_string()];
+        snap.member_info
+            .insert("__await__".to_string(), (false, true));
+        let mut resolver = TypeResolver::new();
+        resolver.insert("mod.Await".to_string(), snap);
+        let t = instance("mod.Await");
+        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(1));
+    }
+
+    #[test]
+    fn type_requires_usage_awaitable_missing_class_defers() {
+        // mro references a class not in the resolver: cannot distinguish
+        // "no __await__" from "unknown", so defer to Python.
+        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
+        snap.fullname = "mod.Await".to_string();
+        snap.mro = vec!["mod.Await".to_string(), "builtins.object".to_string()];
+        let mut resolver = TypeResolver::new();
+        resolver.insert("mod.Await".to_string(), snap);
+        let t = instance("mod.Await");
+        assert_eq!(type_requires_usage_inner(&t, &resolver), None);
+    }
+
+    #[test]
+    fn type_requires_usage_awaitable_absent() {
+        // No __await__ anywhere in the resolved mro: decided absent (2).
+        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
+        snap.fullname = "mod.Plain".to_string();
+        snap.mro = vec!["mod.Plain".to_string()];
+        let mut resolver = TypeResolver::new();
+        resolver.insert("mod.Plain".to_string(), snap);
+        let t = instance("mod.Plain");
+        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(2));
+    }
+
+    #[test]
+    fn type_requires_usage_awaitable_inherited() {
+        // Subclass without __await__, base with it: mro walk finds it.
+        let mut base = crate::typeinfo::TypeInfoSnapshot::default();
+        base.fullname = "mod.Base".to_string();
+        base.mro = vec!["mod.Base".to_string(), "builtins.object".to_string()];
+        base.member_info
+            .insert("__await__".to_string(), (false, true));
+        let mut sub = crate::typeinfo::TypeInfoSnapshot::default();
+        sub.fullname = "mod.Sub".to_string();
+        sub.mro = vec!["mod.Sub".to_string(), "mod.Base".to_string()];
+        let mut resolver = TypeResolver::new();
+        resolver.insert("mod.Base".to_string(), base);
+        resolver.insert("mod.Sub".to_string(), sub);
+        let t = instance("mod.Sub");
+        assert_eq!(type_requires_usage_inner(&t, &resolver), Some(1));
     }
 
     #[test]

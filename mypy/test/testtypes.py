@@ -20266,3 +20266,166 @@ class NativeJoinInstancesSuite(Suite):
         assert result is not None, f"rust_join_instances(A, A) deferred: {result!r}"
         disc = result[0]
         assert disc in (0, 1), f"expected SameS/SameT for A vs A, got disc {disc}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeRequiresUsageSuite(Suite):
+    """Parity for the `rust_type_requires_usage` __await__ branch port.
+
+    `mypy.checker.TypeChecker.type_requires_usage` decides whether an
+    expression-statement's type requires a usage note: the
+    `typing.Coroutine` branch (UNUSED_COROUTINE) and the
+    `proper_type.type.get("__await__")` branch (UNUSED_AWAITABLE). The
+    Rust seam mirrors both on the wire type plus the resolver's member
+    snapshots; the awaitable branch is the newly-ported one (previously
+    deferred). Toggling the checker-stmts gate off (pure Python) and on
+    (Rust seam) must produce identical note/code results, and a direct
+    seam call proves the Rust function engages rather than silently
+    deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_resolver,
+            _set_native_checker_stmts_active,
+        )
+
+        self.fx = TypeFixture()
+
+        # A class with an __await__ method and one without; both with a
+        # mro through builtins.object so the resolver snapshot carries the
+        # member_info map (names).
+        self.awaitablei = self.fx.make_type_info("mod.AwaitableImpl", mro=[self.fx.oi])
+        self.plaini = self.fx.make_type_info("mod.Plain", mro=[self.fx.oi])
+        self.awaitablei.names["__await__"] = SymbolTableNode(MDEF, FuncDef("__await__"))
+        # Coroutine-like fullname: the typing.Coroutine branch keys on
+        # the Instance's type_ref, so build an info with that fullname.
+        self.coroi = self.fx.make_type_info("typing.Coroutine", mro=[self.fx.oi])
+
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(
+            [
+                self.fx.oi,
+                self.fx.str_type_info,
+                self.fx.bool_type_info,
+                self.awaitablei,
+                self.plaini,
+                self.coroi,
+            ]
+        )
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_checker_stmts_active
+        self._set_resolver = _set_native_checker_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+        self._set_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, typ: Type, label: str) -> None:
+        from mypy.checker import TypeChecker
+
+        chk = TypeChecker.__new__(TypeChecker)
+        off = self._with_gate(False, lambda: chk.type_requires_usage(typ))
+        on = self._with_gate(True, lambda: chk.type_requires_usage(typ))
+        assert_equal(on, off, f"type_requires_usage parity {label}")
+
+    def _assert_engages(self, typ: Type, expected_code: int) -> None:
+
+        self._assert_engages_with(typ, expected_code, self.resolver)
+
+    def _assert_engages_with(
+        self, typ: Type, expected_code: int, resolver: object
+    ) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_type_requires_usage(
+            _serialize_type_for_checker(typ), resolver
+        )
+        assert result == expected_code, (
+            f"rust_type_requires_usage({typ}) = {result!r}, "
+            f"expected {expected_code!r}"
+        )
+
+    def test_awaitable_class_returns_awaitable_note(self) -> None:
+        # Instance with __await__ in names -> UNUSED_AWAITABLE.
+        typ = Instance(self.awaitablei, [])
+        self._assert_par(typ, "awaitable")
+        self._assert_engages(typ, 1)
+
+    def test_plain_class_no_note(self) -> None:
+        # No __await__ anywhere in the mro -> Python returns None; the Rust
+        # conclusion (Some(false)) also yields no note, so the shim's None
+        # defers back into Python which agrees.
+        typ = Instance(self.plaini, [])
+        self._assert_par(typ, "plain")
+        # Direct seam: Some(false) -> the shim returns None, so the seam
+        # engages but produces no note. Assert the seam decided (Some)
+        # rather than deferring (None).
+        from mypy.checker import _serialize_type_for_checker
+
+        result = _type_kernel.rust_type_requires_usage(
+            _serialize_type_for_checker(typ), self.resolver
+        )
+        assert result is not None, "rust_type_requires_usage plain deferred"
+        assert result == 2
+
+    def test_coroutine_fullname_note(self) -> None:
+        # Instance whose type_ref is typing.Coroutine -> UNUSED_COROUTINE.
+        typ = Instance(self.coroi, [])
+        self._assert_par(typ, "coroutine")
+        self._assert_engages(typ, 0)
+
+    def test_awaitable_inherited_note(self) -> None:
+        # Subclass whose base has __await__: TypeInfo.get walks the mro.
+        subi = self.fx.make_type_info("mod.Sub", mro=[self.awaitablei, self.fx.oi])
+        type_infos = self.resolver_len_collect(subi)
+        sub_resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(sub_resolver)
+        try:
+            typ = Instance(subi, [])
+            self._assert_par(typ, "inherited awaitable")
+            self._assert_engages_with(typ, 1, sub_resolver)
+        finally:
+            self._set_resolver(self.resolver)
+
+    def test_alias_defers_to_python(self) -> None:
+        # TypeAliasType: the wire format carries no alias target, so Rust
+        # defers and Python expands via get_proper_type.
+        alias_typ = self.fx.non_rec_alias(Instance(self.plaini, []))
+        self._assert_par(alias_typ, "alias")
+
+    def resolver_len_collect(self, *extra: TypeInfo) -> list[TypeInfo]:
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(
+            [
+                self.fx.oi,
+                self.fx.str_type_info,
+                self.fx.bool_type_info,
+                self.awaitablei,
+                self.plaini,
+                self.coroi,
+            ]
+        )
+        type_infos.extend(extra)
+        return type_infos
