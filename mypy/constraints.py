@@ -312,6 +312,13 @@ def _try_native_repack_callable_args(
     """Route repack_callable_args through the Rust kernel, deferring on unsupported input."""
     if _native_constraints_resolver is None:
         return None
+    if ARG_STAR not in callable.arg_kinds:
+        return None
+    if isinstance(callable.arg_types[callable.arg_kinds.index(ARG_STAR)], UnpackType):
+        # Python returns the live star UnpackType untouched; a wire round-trip
+        # would rebuild it and break object identity downstream. Only the
+        # non-Unpack `*args: X` normalization takes the native path.
+        return None
     callable_buf = _WriteBuffer()
     callable.write(callable_buf)
     raw = _type_kernel.rust_repack_callable_args(
