@@ -27,7 +27,8 @@ use crate::setops::{flatten_nested_unions, union_make_union};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::visitor::split_with_prefix_and_suffix_inner;
 use crate::wire::{
-    read_int_bare, read_str_bare, read_type, write_type, ReadBuffer, Type, WriteBuffer,
+    read_int_bare, read_str_bare, read_type, read_type_list, write_type, write_type_list,
+    ReadBuffer, Type, WriteBuffer,
 };
 
 /// Key for the env: `(raw_id, meta_level, namespace)`. Mirrors
@@ -708,12 +709,12 @@ pub(crate) fn make_type_normalized(item: Type, is_type_form: bool) -> Type {
     }
 }
 
-/// `remove_trivial` (expandtype.py:845-872). Makes trivial simplifications
+/// `remove_trivial` (expandtype.py:984-1011). Makes trivial simplifications
 /// on a list of types without `is_subtype`: drop bottom types (honoring
 /// `strict_optional` for NoneType), short-circuit to a lone
 /// `builtins.object`, and drop strict duplicates (push-first-wins).
 /// The input comes from the wire format so every type is already proper.
-fn remove_trivial(types: &[Type], strict_optional: bool) -> Vec<Type> {
+pub(crate) fn remove_trivial(types: &[Type], strict_optional: bool) -> Vec<Type> {
     let mut removed_none = false;
     let mut new_types: Vec<Type> = Vec::new();
     for t in types {
@@ -741,6 +742,31 @@ fn remove_trivial(types: &[Type], strict_optional: bool) -> Vec<Type> {
         return vec![Type::NoneType];
     }
     vec![Type::UninhabitedType { ambiguous: false }]
+}
+
+/// `#[pyfunction]` entry for `remove_trivial` (expandtype.py:984-1011).
+/// Takes a wire-format type list (LIST_GEN tag) plus `strict_optional`;
+/// returns the simplified list as wire bytes. Returns `None` (Python
+/// `None`) only for read/write failure, in which case the caller defers
+/// to the pure-Python loop. Every input type is wire-proper, so the
+/// Python `get_proper_type` and the set-dedup on proper types map
+/// directly onto the structural `PartialEq` of the Rust `Type` enum.
+#[pyfunction]
+pub(crate) fn rust_remove_trivial(
+    types_bytes: &[u8],
+    strict_optional: bool,
+) -> PyResult<Option<Vec<u8>>> {
+    let mut buf = ReadBuffer::new(types_bytes);
+    let types = match read_type_list(&mut buf) {
+        Ok(types) => types,
+        Err(_) => return Ok(None),
+    };
+    let simplified = remove_trivial(&types, strict_optional);
+    let mut wbuf = WriteBuffer::new();
+    match write_type_list(&mut wbuf, &simplified) {
+        Ok(()) => Ok(Some(wbuf.into_bytes())),
+        Err(_) => Ok(None),
+    }
 }
 
 /// `expand_unpack` (expandtype.py:382-400). Expands an UnpackType whose

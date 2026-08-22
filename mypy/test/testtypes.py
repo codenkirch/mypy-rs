@@ -18186,3 +18186,318 @@ class NativeRepackCallableArgsSuite(Suite):
                 [self.fx.a, self.fx.b, self.fx.c], [ARG_POS, ARG_STAR, ARG_POS]
             )
         )
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFreshenFunctionTypeVarsSuite(Suite):
+    """Parity for the Rust `freshen_function_type_vars` port
+    (mypy.expandtype, expandtype.py:413-432).
+
+    Toggling the expand-type gate off vs on must agree on the freshened
+    result (fresh meta-level-1 variables replace the declared ones, and
+    defaults are expanded through the accumulating tvmap). A direct seam
+    call proves the Rust engagement for the generic case.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _freshen(self, c: CallableType) -> CallableType:
+        from mypy.expandtype import freshen_function_type_vars
+
+        result = freshen_function_type_vars(c)
+        assert isinstance(result, CallableType)  # type: ignore[misc]
+        return result
+
+    def _assert_par(self, c: CallableType) -> None:
+        off = str(self._with_gate(False, lambda: self._freshen(c)))
+        on = str(self._with_gate(True, lambda: self._freshen(c)))
+        assert_equal(on, off, f"freshen_function_type_vars parity {c}")
+
+    def test_non_generic_unchanged(self) -> None:
+        c = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        result = self._with_gate(True, lambda: self._freshen(c))
+        assert isinstance(result, CallableType)
+        # Python returns the caller's object unchanged (no copy).
+        assert result is c
+        self._assert_par(c)
+
+    def test_generic_fresh_ids(self) -> None:
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
+        )
+        result = self._freshen(c)
+        assert_equal(len(result.variables), 1)
+        assert result.variables[0].id.meta_level == 1, "fresh var not meta_level 1"
+        assert result.variables[0].id.raw_id != self.fx.t.id.raw_id
+        self._assert_par(c)
+
+    def test_generic_occurrences_replaced(self) -> None:
+        # The declared TypeVar must no longer appear anywhere after
+        # freshening: arg_types/ret_type carry the fresh meta-var.
+        c = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        result = self._freshen(c)
+        assert_equal(result.arg_types[0], result.variables[0])
+        assert_equal(result.ret_type, result.variables[0])
+        self._assert_par(c)
+
+    def test_generic_default_expansion(self) -> None:
+        # T2's default is T1; freshening must point the default at the
+        # fresh T1 (expand through the accumulating tvmap).
+        t2 = TypeVarType(
+            "T2", "T2", TypeVarId(11), [], self.fx.o, self.fx.t
+        )
+        c = CallableType(
+            [self.fx.t],
+            [ARG_POS],
+            [None],
+            t2,
+            self.fx.function,
+            variables=[self.fx.t, t2],
+        )
+        result = self._freshen(c)
+        assert_equal(len(result.variables), 2)
+        fresh_t1 = result.variables[0]
+        fresh_t2 = result.variables[1]
+        assert_equal(fresh_t2.default, fresh_t1)
+        # Default points at the fresh T1, so its id is the fresh one.
+        assert_equal(fresh_t2.default.id.raw_id, fresh_t1.id.raw_id)
+        self._assert_par(c)
+
+    def test_overloaded_generic(self) -> None:
+        from mypy.types import Overloaded
+
+        item1 = CallableType(
+            [self.fx.t], [ARG_POS], [None], self.fx.t, self.fx.function, variables=[self.fx.t]
+        )
+        item2 = CallableType(
+            [self.fx.a, self.fx.t],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.b,
+            self.fx.function,
+            variables=[self.fx.t],
+        )
+        ov = Overloaded([item1, item2])
+        from mypy.expandtype import freshen_function_type_vars
+
+        off = str(self._with_gate(False, lambda: freshen_function_type_vars(ov)))
+        on = str(self._with_gate(True, lambda: freshen_function_type_vars(ov)))
+        assert_equal(on, off, f"freshen overloaded parity {ov}")
+
+    def test_overloaded_non_generic(self) -> None:
+        from mypy.types import Overloaded
+
+        item1 = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        item2 = CallableType([self.fx.b], [ARG_POS], [None], self.fx.a, self.fx.function)
+        ov = Overloaded([item1, item2])
+        from mypy.expandtype import freshen_function_type_vars
+
+        result = self._with_gate(True, lambda: freshen_function_type_vars(ov))
+        # Python rebuilds a new Overloaded even when non-generic.
+        assert isinstance(result, Overloaded)
+        assert result is not ov
+        off = str(self._with_gate(False, lambda: freshen_function_type_vars(ov)))
+        on = str(self._with_gate(True, lambda: freshen_function_type_vars(ov)))
+        assert_equal(on, off, f"freshen non-generic overloaded parity {ov}")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRemoveTrivialSuite(Suite):
+    """Parity for the Rust `remove_trivial` port (mypy.expandtype,
+    expandtype.py:984-1011).
+
+    Toggling the expand-type gate off vs on must agree on the simplified
+    list for the same inputs, including the strict_optional-dependent
+    NoneType handling. A direct seam call proves the Rust engagement.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _remove(self, types: list[Type]) -> list[Type]:
+        from mypy.expandtype import remove_trivial
+
+        return remove_trivial(types)
+
+    def _remove_so(self, types: list[Type], strict_optional: bool) -> list[Type]:
+        import mypy.state
+
+        old = mypy.state.state.strict_optional
+        mypy.state.state.strict_optional = strict_optional
+        try:
+            return self._remove(types)
+        finally:
+            mypy.state.state.strict_optional = old
+
+    def _assert_par(self, types: list[Type], strict_optional: bool = True) -> None:
+        off = str(self._with_gate(False, lambda: self._remove_so(types, strict_optional)))
+        on = str(self._with_gate(True, lambda: self._remove_so(types, strict_optional)))
+        assert_equal(on, off, f"remove_trivial parity {types} so={strict_optional}")
+
+    def test_empty(self) -> None:
+        assert_equal(self._remove_so([], True), [UninhabitedType()])
+        self._assert_par([])
+
+    def test_only_uninhabited(self) -> None:
+        types = [UninhabitedType()]
+        assert_equal(self._remove_so(types, True), [UninhabitedType()])
+        self._assert_par(types)
+
+    def test_none_strict_optional_true(self) -> None:
+        import mypy.state
+
+        old = mypy.state.state.strict_optional
+        mypy.state.state.strict_optional = True
+        try:
+            result = self._remove([NoneType()])
+            assert_equal(result, [NoneType()])
+        finally:
+            mypy.state.state.strict_optional = old
+        self._assert_par([NoneType()], strict_optional=True)
+
+    def test_none_strict_optional_false(self) -> None:
+        import mypy.state
+
+        old = mypy.state.state.strict_optional
+        mypy.state.state.strict_optional = False
+        try:
+            result = self._remove([NoneType()])
+            assert_equal(result, [NoneType()])  # removed_none -> [NoneType()]
+        finally:
+            mypy.state.state.strict_optional = old
+        self._assert_par([NoneType()], strict_optional=False)
+
+    def test_object_shortcuts(self) -> None:
+        # object anywhere (not just first) -> [object] immediately, even
+        # after a removed UninhabitedType before it.
+        types = [UninhabitedType(), Instance(self.fx.oi, [])]
+        result = self._remove_so(types, True)
+        assert_equal(len(result), 1)
+        assert isinstance(result[0], Instance), f"expected Instance, got {result[0]!r}"
+        assert result[0].type.fullname == "builtins.object"  # type: ignore[union-attr]
+        self._assert_par(types)
+
+    def test_duplicates_dropped(self) -> None:
+        types = [
+            Instance(self.fx.ai, []),
+            Instance(self.fx.ai, []),  # exact duplicate
+            Instance(self.fx.bi, []),
+        ]
+        result = self._remove_so(types, True)
+        assert_equal(len(result), 2)
+        assert result[0].type.fullname == "A"  # type: ignore[union-attr]
+        assert result[1].type.fullname == "B"  # type: ignore[union-attr]
+        self._assert_par(types)
+
+    def test_mixed(self) -> None:
+        types = [
+            UninhabitedType(),
+            NoneType(),
+            Instance(self.fx.ai, []),
+            Instance(self.fx.ai, []),
+            Instance(self.fx.bi, []),
+        ]
+        # strict_optional=True keeps the NoneType.
+        result = self._remove_so(types, True)
+        assert_equal(len(result), 3)
+        self._assert_par(types, strict_optional=True)
+        # strict_optional=False drops it (removed_none), leaving A and B.
+        result_so = self._remove_so(types, False)
+        assert_equal(len(result_so), 2)
+        self._assert_par(types, strict_optional=False)
+
+    def test_removed_none_empty_result(self) -> None:
+        # Only NoneType with strict_optional=False: removed_none with no
+        # new_types -> [NoneType()] (the Python fallback).
+        self._assert_par([NoneType()], strict_optional=False)
+
+    def test_seam_engages(self) -> None:
+        buf = _WriteBuffer()
+        from mypy.types import write_type_list
+
+        write_type_list(buf, [Instance(self.fx.ai, []), Instance(self.fx.ai, [])])
+        result = _type_kernel.rust_remove_trivial(buf.getvalue(), True)
+        assert result is not None, "rust_remove_trivial returned None"
+        from mypy.types import read_type_list
+        from librt.internal import ReadBuffer as _RB
+
+        decoded = read_type_list(_RB(bytes(result)))
+        assert_equal(len(decoded), 1)
