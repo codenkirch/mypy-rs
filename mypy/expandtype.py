@@ -84,11 +84,20 @@ def _needs_python(typ: Type) -> bool:
             stack.append(p.fallback)
         elif isinstance(p, TypeAliasType):
             return True
+        elif isinstance(p, (ParamSpecType, TypeVarTupleType)):
+            # TypeVarTuple/ParamSpec always defer: the Rust remove_trivial
+            # dedups structurally and can drop distinct unresolved
+            # `Unpack[tuple[Never, ...]]` items, corrupting union results.
+            return True
         elif isinstance(p, TypeVarType):
             # Fresh (meta) type variables lose identity across the wire
             # round-trip, so Rust dedup could merge distinct fresh vars.
-            if p.id.meta_level > 0:
+            if p.id.meta_level > 0 or p.has_default():
                 return True
+        elif isinstance(p, UnpackType):
+            # Walk through Unpack: `Unpack[tuple[Never, ...]]` nests a
+            # TypeVarTupleType only inside the wrapped type.
+            stack.append(p.type)
         elif isinstance(p, Instance):
             stack.extend(p.args)
         elif isinstance(p, UnionType):
