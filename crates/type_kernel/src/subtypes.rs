@@ -47,7 +47,7 @@ fn get_proper_type_or_defer<'a>(typ: &'a Type, _resolver: &'a TypeResolver) -> O
     }
 }
 
-fn any_type(type_of_any: i64) -> Type {
+fn any_type_of(type_of_any: i64) -> Type {
     Type::AnyType {
         type_of_any,
         source_any: None,
@@ -468,7 +468,7 @@ pub(crate) fn is_subtype(
                         if ctx.proper_subtype {
                             return Some(false);
                         }
-                        any_type(ANY_SPECIAL_FORM)
+                        any_type_of(ANY_SPECIAL_FORM)
                     }
                 };
                 // subtypes.py:962-966: for builtins.tuple with Any iter
@@ -1983,6 +1983,111 @@ pub(crate) fn rust_is_erased_instance(t_bytes: &[u8]) -> Option<bool> {
     is_erased_instance(&t)
 }
 
+/// `erase_return_self_types` (subtypes.py:2761-2774): if a type is
+/// function-like and returns `self_type`, replace the return type with
+/// `Any`.
+///
+/// Mirrors the Python exactly:
+///
+/// * `CallableType` whose proper return type is an `Instance == self_type`
+///   becomes `Any(implementation_artifact)` (all other fields preserved).
+/// * `Overloaded` heads erase each item recursively (each item is a
+///   `CallableType`).
+/// * Any other head (incl. a bare `Instance == self_type`, which is NOT
+///   function-like) is returned unchanged.
+///
+/// The wire format carries proper types only, so the `get_proper_type`
+/// calls in Python are no-ops here: the Python shim serializes after
+/// `get_proper_type`, and a `TypeAliasType` head defers (`None`).
+///
+/// Returns `Some(bytes)` of the round-tripped result, or `None` to defer
+/// to Python: a non-wire-readable head (`TypeAliasType`, ParamSpec /
+/// TypeVarTuple / meta TypeVar inside `variables`, an `ErasedType`-casting
+/// subtree, or any `read_type` failure). The Python shim decodes the
+/// result through the shared wirefixup path, so live TypeInfo identity is
+/// restored. No object identity is carried across the wire: the caller
+/// only relies on equality, and `Overloaded`/`CallableType` equality is
+/// structural.
+fn erase_return_self_types_wire(typ: &Type, self_type: &Type) -> Option<Type> {
+    match typ {
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            from_type_type,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            if !match ret_type.as_ref() {
+                Type::Instance { .. } => ret_type.as_ref() == self_type,
+                Type::TypeAliasType { .. } => return None,
+                _ => false,
+            } {
+                return Some(typ.clone());
+            }
+            Some(Type::CallableType {
+                fallback: fallback.clone(),
+                instance_type: instance_type.clone(),
+                is_ellipsis_args: *is_ellipsis_args,
+                implicit: *implicit,
+                is_bound: *is_bound,
+                from_concatenate: *from_concatenate,
+                imprecise_arg_kinds: *imprecise_arg_kinds,
+                unpack_kwargs: *unpack_kwargs,
+                from_type_type: *from_type_type,
+                arg_types: arg_types.clone(),
+                arg_kinds: arg_kinds.clone(),
+                arg_names: arg_names.clone(),
+                ret_type: Box::new(Type::AnyType {
+                    type_of_any: 8, // TypeOfAny.implementation_artifact
+                    source_any: None,
+                    missing_import_name: None,
+                }),
+                name: name.clone(),
+                variables: variables.clone(),
+                type_guard: type_guard.clone(),
+                type_is: type_is.clone(),
+            })
+        }
+        Type::Overloaded { items } => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(erase_return_self_types_wire(item, self_type)?);
+            }
+            Some(Type::Overloaded { items: out })
+        }
+        _ => Some(typ.clone()),
+    }
+}
+
+/// `#[pyfunction]` entry for `erase_return_self_types`.
+///
+/// Returns `Some(bytes)` when the head is wire-handled (the shim decodes
+/// it back to a live `Type`); `None` defers to the pure-Python body.
+#[pyfunction]
+pub(crate) fn rust_erase_return_self_types(
+    typ_bytes: &[u8],
+    self_type_bytes: &[u8],
+) -> Option<Vec<u8>> {
+    let typ = decode_type(typ_bytes)?;
+    let self_type = decode_type(self_type_bytes)?;
+    let result = erase_return_self_types_wire(&typ, &self_type)?;
+    let mut buf = WriteBuffer::new();
+    wire::write_type(&mut buf, &result).ok()?;
+    Some(buf.into_bytes())
+}
+
 /// `try_restrict_literal_union` (subtypes.py:2264-2282): return the
 /// items of `t` (a UnionType) excluding any occurrence of `s`, iff
 /// every item and `s` are simple literals. Otherwise return `None`.
@@ -2371,7 +2476,7 @@ mod tests {
 
     fn any_type() -> Type {
         Type::AnyType {
-            type_of_any: 0,
+            type_of_any: 8, // TypeOfAny.implementation_artifact
             source_any: None,
             missing_import_name: None,
         }
@@ -3486,6 +3591,94 @@ mod tests {
         assert_eq!(
             is_subtype(&left, &Type::NoneType, &ctx_nominal(), &r),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn erase_return_self_types_callable_ret_self_becomes_any() {
+        // Callable[[], C] -> Callable[[], Any] (subtypes.py:2764-2768).
+        let self_t = instance("mod.C", vec![]);
+        let c = callable_type(vec![], instance("mod.C", vec![]), None);
+        let result = erase_return_self_types_wire(&c, &self_t).unwrap();
+        match result {
+            Type::CallableType { ret_type, .. } => assert_eq!(*ret_type, any_type()),
+            other => panic!("expected erased CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_return_self_types_callable_ret_non_self_unchanged() {
+        // Callable[[], int] with self C stays Callable[[], int].
+        let self_t = instance("mod.C", vec![]);
+        let ret = instance("builtins.int", vec![]);
+        let c = callable_type(vec![], ret.clone(), None);
+        let result = erase_return_self_types_wire(&c, &self_t).unwrap();
+        assert_eq!(result, c);
+    }
+
+    #[test]
+    fn erase_return_self_types_generic_self_instance_matches() {
+        // Callable[[], C[T]] with self C[T] erases (same type_ref + args).
+        let self_t = instance("mod.C", vec![any_type()]);
+        let c = callable_type(vec![], instance("mod.C", vec![any_type()]), None);
+        let result = erase_return_self_types_wire(&c, &self_t).unwrap();
+        match result {
+            Type::CallableType { ret_type, .. } => assert_eq!(*ret_type, any_type()),
+            other => panic!("expected erased CallableType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_return_self_types_bare_instance_unchanged() {
+        // A bare Instance == self_type is NOT function-like; Python
+        // returns it unchanged (subtypes.py:2773).
+        let self_t = instance("mod.C", vec![]);
+        let bare = instance("mod.C", vec![]);
+        let result = erase_return_self_types_wire(&bare, &self_t).unwrap();
+        assert_eq!(result, bare);
+    }
+
+    #[test]
+    fn erase_return_self_types_overloaded_recurses() {
+        // Overloaded([()->C, (int)->int]) with self C: first item erased
+        // to Any, second unchanged.
+        let self_t = instance("mod.C", vec![]);
+        let c1 = callable_type(vec![], instance("mod.C", vec![]), None);
+        let c2 = callable_type(vec![], instance("builtins.int", vec![]), None);
+        let ov = Type::Overloaded {
+            items: vec![c1, c2],
+        };
+        let result = erase_return_self_types_wire(&ov, &self_t).unwrap();
+        match result {
+            Type::Overloaded { items } => {
+                assert_eq!(items.len(), 2);
+                match &items[0] {
+                    Type::CallableType { ret_type, .. } => assert_eq!(**ret_type, any_type()),
+                    other => panic!("expected erased item, got {other:?}"),
+                }
+                assert_eq!(
+                    items[1],
+                    callable_type(vec![], instance("builtins.int", vec![]), None)
+                );
+            }
+            other => panic!("expected Overloaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn erase_return_self_types_non_function_unchanged() {
+        // Union [A, B], NoneType pass through unchanged.
+        let self_t = instance("mod.C", vec![]);
+        let union = Type::UnionType {
+            items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+            can_be_true: false,
+            can_be_false: false,
+        };
+        assert_eq!(erase_return_self_types_wire(&union, &self_t).unwrap(), union);
+        assert_eq!(
+            erase_return_self_types_wire(&Type::NoneType, &self_t).unwrap(),
+            Type::NoneType
         );
     }
 }
