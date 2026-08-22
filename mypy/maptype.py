@@ -17,6 +17,8 @@ from mypy.types import (
     get_proper_type,
     has_type_vars,
     read_type,
+    read_type_list,
+    write_type_list,
 )
 
 # Stage 3c type-kernel seam: when type_kernel is importable and a resolver
@@ -176,6 +178,79 @@ def map_instance_to_supertype(instance: Instance, superclass: TypeInfo) -> Insta
     return map_instance_to_supertypes(instance, superclass)[0]
 
 
+def _native_map_step_frontier(
+    members: list[Instance], supertype: TypeInfo
+) -> list[Instance] | None:
+    """Try the Rust whole per-member supertype-mapping loop; None defers
+    to the pure-Python step.
+
+    Serializes the frontier `members` as one wire list and calls
+    `rust_map_instance_to_supertypes` once for the whole step (instead of
+    one Python->Rust round trip per member). Members Rust cannot map are
+    marked by the parallel fallback flags and re-run individually in
+    Python (`map_instance_to_direct_supertypes`), so a single unsupported
+    member (TypeAlias/definition-carrying Callable/ParamSpec nested in a
+    member) never blocks the supported members.
+    """
+    if not (
+        _HAS_TYPE_KERNEL
+        and _native_map_active
+        and _native_map_resolver is not None
+        and supertype.fullname != "builtins.tuple"
+    ):
+        return None
+    if not members:
+        return []
+    # Members whose wire round-trip cannot carry them defer per-member;
+    # the rest go to Rust in one call.
+    supported_idx = [i for i, m in enumerate(members) if not _needs_python(m)]
+    if not supported_idx:
+        return None
+    supported = [members[i] for i in supported_idx]
+    try:
+        buf = _WriteBuffer()
+        write_type_list(buf, supported)  # type: ignore[arg-type]
+        result = _type_kernel.rust_map_instance_to_supertypes(
+            _native_map_resolver,
+            buf.getvalue(),
+            supertype.fullname,
+        )
+        if result is None:
+            return None
+        encoded_results, flags = result
+        if len(flags) != len(supported):
+            # Parallel arrays out of sync: defer the whole step.
+            return None
+        mapped: list[Instance] = []
+        if bytes(encoded_results):
+            decoded_all = read_type_list(_ReadBuffer(bytes(encoded_results)))
+            from mypy.wirefixup import fixup_wire_type
+
+            for decoded in decoded_all:
+                fixed = fixup_wire_type(decoded)
+                if not isinstance(fixed, Instance):  # type: ignore[misc]
+                    return None
+                mapped.append(fixed)
+        # Reassemble by index: supported members that Rust mapped take the
+        # decoded results in order; everything else re-runs in Python.
+        out: list[Instance] = []
+        mapped_iter = iter(mapped)
+        pos = 0
+        for i, member in enumerate(members):
+            if i in supported_idx:
+                if flags[pos]:
+                    out.append(next(mapped_iter))
+                else:
+                    out.extend(map_instance_to_direct_supertypes(member, supertype))
+                pos += 1
+            else:
+                out.extend(map_instance_to_direct_supertypes(member, supertype))
+        return out
+    except (AssertionError, NotImplementedError, ValueError):
+        # All defer to the pure-Python step.
+        return None
+
+
 def map_instance_to_supertypes(instance: Instance, supertype: TypeInfo) -> list[Instance]:
     # FIX: Currently we should only have one supertype per interface, so no
     #      need to return an array
@@ -183,10 +258,17 @@ def map_instance_to_supertypes(instance: Instance, supertype: TypeInfo) -> list[
     for path in class_derivation_paths(instance.type, supertype):
         types = [instance]
         for sup in path:
-            a: list[Instance] = []
-            for t in types:
-                a.extend(map_instance_to_direct_supertypes(t, sup))
-            types = a
+            # Stage 3c type-kernel seam: one Rust call maps the whole
+            # frontier `types`; unmappable members fall back per-member.
+            # If the step defers (None), keep the pure-Python loop.
+            expanded = _native_map_step_frontier(types, sup)
+            if expanded is None:
+                a: list[Instance] = []
+                for t in types:
+                    a.extend(map_instance_to_direct_supertypes(t, sup))
+                types = a
+            else:
+                types = expanded
         result.extend(types)
     if result:
         return result

@@ -295,6 +295,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        maptype::rust_map_instance_to_supertypes,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         maptype::rust_class_derivation_paths,
         module
     )?)?;

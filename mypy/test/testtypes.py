@@ -4267,6 +4267,200 @@ class NativeMapTypeFromSupertypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMapInstanceToSupertypesSuite(Suite):
+    """Parity for the Rust whole per-member supertype-mapping loop
+    (mypy.maptype.map_instance_to_supertypes, maptype.py:179-196).
+
+    The inner per-member loop of each derivation-path step (`for t in
+    types: map_instance_to_direct_supertypes(t, sup)`) runs in Rust in
+    one call (rust_map_instance_to_supertypes). Members Rust cannot map
+    (wire-unsupported args: TypeAlias / definition-carrying Callable /
+    ParamSpec, or a variadic frame) defer per-member to Python. The
+    differential (gate off = pure-Python loop, gate on = Rust whole-step
+    loop with per-member fallback) must agree on the mapped frontier.
+    """
+
+    def setUp(self) -> None:
+        from mypy.maptype import _set_native_map_active, _set_native_map_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._type_infos = type_infos
+        _set_native_map_active(True)
+        _set_native_map_resolver(self._resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+
+    def tearDown(self) -> None:
+        from mypy.maptype import _set_native_map_active, _set_native_map_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_map_active(False)
+        _set_native_map_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _map(self, instance: Instance, supertype: TypeInfo) -> list[Instance]:
+        from mypy.maptype import map_instance_to_supertypes
+
+        return map_instance_to_supertypes(instance, supertype)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.maptype import _set_native_map_active
+
+        _set_native_map_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_map_active(True)
+
+    def _assert_par(self, instance: Instance, supertype: TypeInfo) -> None:
+        off = self._with_gate(False, lambda: self._map(instance, supertype))
+        on = self._with_gate(True, lambda: self._map(instance, supertype))
+        assert_equal(
+            [str(x) for x in on],
+            [str(x) for x in off],
+            f"map_instance_to_supertypes parity {instance} -> {supertype}",
+        )
+
+    def test_parity_direct_non_generic(self) -> None:
+        # B <: A, no typevars on either side: [B] maps to [A].
+        self._assert_par(self.fx.b, self.fx.ai)
+
+    def test_parity_multi_level(self) -> None:
+        # D <: C <: B <: A: a multi-level derivation path maps to A.
+        self._assert_par(self.fx.d, self.fx.ai)
+
+    def test_parity_generic_supertype(self) -> None:
+        # G[T] <: object: mapping G[A] to builtins.object gives object
+        # (all type vars dropped, no substitution needed).
+        self._assert_par(Instance(self.fx.gi, [self.fx.a]), self.fx.oi)
+
+    def test_parity_same_class_returns_input(self) -> None:
+        # instance.type == superclass: identity, both gates agree.
+        self._assert_par(self.fx.a, self.fx.ai)
+
+    def test_full_member_list_maps_all(self) -> None:
+        # Multi-member frontier, all supported: the seam maps every
+        # member in one Rust call; gate-off is the per-member loop.
+        # G[A]/G[B] drop the typevar, same as Python path in Rust.
+        from mypy.maptype import _native_map_step_frontier, map_instance_to_direct_supertypes
+
+        members = [
+            Instance(self.fx.gi, [self.fx.a]),
+            Instance(self.fx.gi, [self.fx.b]),
+        ]
+        off = [m for mem in members for m in map_instance_to_direct_supertypes(mem, self.fx.oi)]
+        on = self._with_gate(
+            True, lambda: _native_map_step_frontier(members, self.fx.oi)
+        )
+        assert on is not None
+        assert_equal(
+            [str(x) for x in on],
+            [str(x) for x in off],
+            "full member list frontier parity",
+        )
+
+    def test_mixed_supported_unsupported_members(self) -> None:
+        # Mixes a supported member with an alias-carrying member
+        # (TypeAlias is wire-unsupported): the alias member defers
+        # per-member to Python; G[A] still maps through Rust.
+        from mypy.maptype import _native_map_step_frontier, map_instance_to_direct_supertypes
+
+        alias, _ = self.fx.def_alias_1(self.fx.a)
+        members: list[Instance] = [
+            Instance(self.fx.gi, [self.fx.a]),
+            Instance(self.fx.gi, [alias]),
+        ]
+        off = [m for mem in members for m in map_instance_to_direct_supertypes(mem, self.fx.oi)]
+        on = self._with_gate(
+            True, lambda: _native_map_step_frontier(members, self.fx.oi)
+        )
+        assert on is not None
+        assert_equal(
+            [str(x) for x in on],
+            [str(x) for x in off],
+            "mixed member frontier parity",
+        )
+
+    def test_per_member_deferral_sentinel(self) -> None:
+        # Per-member deferral sentinel: Rust returns a parallel flags
+        # Vec (true = mapped, false = re-run in Python). A GV[Ts] member
+        # (variadic frame) defers, so flags[0] false; G[A] maps, true.
+        import type_kernel as _tk
+
+        from mypy.maptype import _WriteBuffer
+        from mypy.types import write_type_list
+
+        members = [
+            Instance(self.fx.gvi, [self.fx.a, self.fx.b]),
+            Instance(self.fx.gi, [self.fx.a]),
+        ]
+        buf = _WriteBuffer()
+        write_type_list(buf, members)  # type: ignore[arg-type]
+        result = _tk.rust_map_instance_to_supertypes(
+            self._resolver,
+            buf.getvalue(),
+            self.fx.oi.fullname,
+        )
+        assert result is not None, "Rust rust_map_instance_to_supertypes did not engage"
+        encoded_results, flags = result
+        assert flags == [False, True], f"per-member deferral flags {flags}"
+        assert bytes(encoded_results)
+
+    def test_mixed_variadic_member_parity(self) -> None:
+        # Frontier with a variadic-frame member: Rust defers the GV
+        # member per-member via the sentinel flag, and the shim re-runs
+        # it in Python. Gate-off and gate-on map to the same frontier.
+        from mypy.maptype import _native_map_step_frontier, map_instance_to_direct_supertypes
+
+        members = [
+            Instance(self.fx.gvi, [self.fx.a, self.fx.b]),
+            Instance(self.fx.gi, [self.fx.a]),
+        ]
+        off = [m for mem in members for m in map_instance_to_direct_supertypes(mem, self.fx.oi)]
+        on = self._with_gate(
+            True, lambda: _native_map_step_frontier(members, self.fx.oi)
+        )
+        assert on is not None
+        assert_equal(
+            [str(x) for x in on],
+            [str(x) for x in off],
+            "variadic-member frontier parity",
+        )
+
+    def test_seam_engages_full_member_list(self) -> None:
+        # Direct seam call: a two-member frontier engages the Rust
+        # whole-step loop (returns bytes + flags) rather than deferring.
+        import type_kernel as _tk
+
+        from mypy.maptype import _WriteBuffer
+        from mypy.types import write_type_list
+
+        members = [
+            Instance(self.fx.gi, [self.fx.a]),
+            Instance(self.fx.gi, [self.fx.b]),
+        ]
+        buf = _WriteBuffer()
+        write_type_list(buf, members)  # type: ignore[arg-type]
+        result = _tk.rust_map_instance_to_supertypes(
+            self._resolver,
+            buf.getvalue(),
+            self.fx.oi.fullname,
+        )
+        assert result is not None, "Rust rust_map_instance_to_supertypes did not engage"
+        encoded_results, flags = result
+        assert flags == [True, True]
+        assert bytes(encoded_results)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeObjectTypeSuite(Suite):
     """Parity for the Rust `type_object_type_from_function` composite seam
     (mypy.typeops.type_object_type_from_function, issue #492 family).

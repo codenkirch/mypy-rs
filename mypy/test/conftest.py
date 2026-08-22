@@ -294,6 +294,8 @@ _NATIVE_GATE_GLOBALS: list[tuple[str, str]] = [
     ("mypy.join", "_native_join_active"),
     ("mypy.join", "_native_join_resolver"),
     ("mypy.join", "_native_join_typeinfo_map"),
+    ("mypy.maptype", "_native_map_active"),
+    ("mypy.maptype", "_native_map_resolver"),
     ("mypy.messages", "_native_messages_active"),
     ("mypy.messages", "_native_messages_resolver"),
     ("mypy.messages", "_native_suggestions_active"),
