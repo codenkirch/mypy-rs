@@ -16,6 +16,7 @@
 //! this, let Python decide".
 
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 use pyo3::IntoPy;
 
 use crate::typeinfo::{
@@ -34,6 +35,8 @@ const ARG_STAR: i64 = 2;
 const ARG_STAR2: i64 = 4;
 /// `TypeOfAny.unannotated` = 1 (types.py:276).
 const TYPE_OF_ANY_UNANNOTATED: i64 = 1;
+/// `TypeOfAny.from_error` = 5 (types.py:293).
+const TYPE_OF_ANY_FROM_ERROR: i64 = 5;
 
 // ---------------------------------------------------------------------------
 // Wire codec helpers
@@ -48,6 +51,15 @@ fn encode_type(t: &Type) -> Option<Vec<u8>> {
     let mut buf = WriteBuffer::new();
     wire::write_type(&mut buf, t).ok()?;
     Some(buf.into_bytes())
+}
+
+/// Build a wire `AnyType` with one of the `TypeOfAny` constants above.
+fn any_type(type_of_any: i64) -> Type {
+    Type::AnyType {
+        type_of_any,
+        source_any: None,
+        missing_import_name: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1988,6 +2000,220 @@ fn collect_list(ts: &[Type], include_all: bool, out: &mut Vec<Type>) -> Option<(
         collect_type_vars(t, include_all, out)?;
     }
     Some(())
+}
+
+// ---------------------------------------------------------------------------
+// function_type / callable_type (typeops.py:1378-1429)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeops.function_type` (typeops.py:1378-1402) plus its helper
+/// `callable_type` (typeops.py:1405-1429). Mirrors the caller-visible
+/// behavior:
+///
+///   * `func.type` set -> that FunctionLike (asserted), returned unchanged.
+///   * `FuncItem` with no type -> `callable_type(func, fallback, ret_type)`
+///     (below), which binds the self/cls parameter.
+///   * `OverloadedFuncDef` with no type -> a dummy
+///     `CallableType([Any, Any], [ARG_STAR, ARG_STAR2], [None, None],
+///     Any, fallback, line=func.line, is_ellipsis_args=True)` wrapped in
+///     `Overloaded([dummy])` (a broken or not-yet-typed overload).
+///
+/// The self/cls binding in `callable_type` (typeops.py:1409-1413):
+///
+///   self_type = fill_typevars(info)
+///   if fdef.is_class or fdef.name == "__new__":
+///       self_type = TypeType.make_normalized(self_type)
+///   args = [self_type] + [Any(unannotated)] * (len(arg_names) - 1)
+///
+/// `TypeType.make_normalized` (types.py:3927-3942) builds `TypeType(item)`
+/// directly when `item` is not a Union (it is an Instance from
+/// `fill_typevars`, so the Union re-distribution never fires).
+///
+/// The wire round-trip drops line/column (both rebuild at the default -1)
+/// and cannot carry the `definition` node; the Python shim restores
+/// `line` / `column` / `definition` on a rebuilt live CallableType so
+/// error messages keep naming the function (missing-self note,
+/// messages.py:3683 asserts on `definition`). `implicit=True` is
+/// wire-carryable (flag bit 2).
+///
+/// Deferral conditions (Rust returns `None`, Python runs the original body):
+///   * `func.type` is set to something the wire cannot represent exactly
+///     (a non-CallableType/Overloaded FunctionLike, or any invalid value).
+///   * the `info`/`arg_names`/`arg_kinds` reads fail, or the two lists
+///     disagree in length (this includes the tangent where the self-arm
+///     self branch is semantically skipped, left exactly as Python).
+///   * the self-arm needs `fill_typevars(info)` (named tuples return a
+///     `TupleType`; tuple_type decode failure defers the whole call).
+fn function_type_inner(py: Python<'_>, func: &PyAny, fallback: &Type) -> Option<(bool, Type)> {
+    // Classify by the Python class of the whole node, not the type value.
+    let func_cls = match func.get_type().name() {
+        Ok(n) => n.to_string(),
+        Err(_) => return None,
+    };
+    let is_overloaded_func_def = func_cls.ends_with("OverloadedFuncDef");
+    let astype = match func.getattr("type").ok()? {
+        a if a.is_none() => None,
+        a => Some(a),
+    };
+    match (is_overloaded_func_def, astype) {
+        // `func.type` truthy -> passthrough: Python asserts FunctionLike and
+        // returns it unchanged (FuncItem or OverloadedFuncDef, CallableType or
+        // Overloaded; the dummy only fires when func.type is None).
+        (_, Some(astype)) => {
+            let cls = astype.get_type().name().ok()?.to_string();
+            if !cls.ends_with("CallableType") && !cls.ends_with("Overloaded") {
+                return None;
+            }
+            Some((true, decode_astype(py, astype)?))
+        }
+        // OverloadedFuncDef with no type: broken -> the dummy.
+        (true, None) => Some((
+            false,
+            Type::Overloaded {
+                items: vec![dummy_callable(fallback)],
+            },
+        )),
+        // FuncItem with no type -> callable_type (self-binding).
+        (false, None) => callable_type_inner(py, func, fallback).map(|t| (false, t)),
+    }
+}
+/// `fn dummy_callable`: build the wire dummy for a broken overload.
+fn dummy_callable(fallback: &Type) -> Type {
+    let any = Type::AnyType {
+        type_of_any: TYPE_OF_ANY_FROM_ERROR,
+        source_any: None,
+        missing_import_name: None,
+    };
+    let fallback = fallback.clone();
+    Type::CallableType {
+        fallback: Box::new(fallback),
+        instance_type: None,
+        is_ellipsis_args: true,
+        implicit: false,
+        is_bound: false,
+        from_concatenate: false,
+        imprecise_arg_kinds: false,
+        unpack_kwargs: false,
+        from_type_type: false,
+        arg_types: vec![any.clone(), any],
+        arg_kinds: vec![ARG_STAR, ARG_STAR2],
+        arg_names: vec![None, None],
+        ret_type: Box::new(Type::AnyType {
+            type_of_any: TYPE_OF_ANY_FROM_ERROR,
+            source_any: None,
+            missing_import_name: None,
+        }),
+        name: None,
+        variables: Vec::new(),
+        type_guard: None,
+        type_is: None,
+    }
+}
+
+/// `fn callable_type_inner`: `callable_type` body (typeops.py:1405-1429).
+fn callable_type_inner(py: Python<'_>, fdef: &PyAny, fallback: &Type) -> Option<Type> {
+    let arg_names = {
+        let v = fdef.getattr("arg_names").ok()?;
+        let list = v.downcast::<PyList>().ok()?;
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            out.push(item.extract::<Option<String>>().ok()?);
+        }
+        out
+    };
+    let arg_kinds = {
+        let v = fdef.getattr("arg_kinds").ok()?;
+        let list = v.downcast::<PyList>().ok()?;
+        let mut out = Vec::with_capacity(list.len());
+        for item in list.iter() {
+            // mypy.nodes.ArgKind is an IntEnum; read the enum value.
+            out.push(item.getattr("value").ok()?.extract::<i64>().ok()?);
+        }
+        out
+    };
+    if arg_names.len() != arg_kinds.len() {
+        return None;
+    }
+    let info = fdef.getattr("info").ok()?;
+    let has_self = fdef
+        .getattr("has_self_or_cls_argument")
+        .ok()?
+        .is_true()
+        .ok()?;
+    let arg_name_count = arg_names.len();
+    // Self branch (typeops.py:1409-1413): filler + TypeType normalization.
+    let args = if info.is_true().ok()? && has_self && arg_name_count > 0 {
+        let self_type = fill_typevars_inner(py, info)?;
+        let self_type = if read_bool_attr(fdef, "is_class")?
+            || fdef.getattr("name").ok()?.extract::<String>().ok()? == "__new__"
+        {
+            Type::TypeType {
+                item: Box::new(self_type),
+                is_type_form: false,
+            }
+        } else {
+            self_type
+        };
+        let mut args = vec![self_type];
+        args.extend(std::iter::repeat_n(
+            any_type(TYPE_OF_ANY_UNANNOTATED),
+            arg_name_count - 1,
+        ));
+        args
+    } else {
+        std::iter::repeat_n(any_type(TYPE_OF_ANY_UNANNOTATED), arg_name_count).collect()
+    };
+    // `ret_type or AnyType(...)`: ret_type is always None from the export
+    // (rust_function_type); the checkexpr lambda caller passes a ret_type but
+    // calls callable_type directly, so it never reaches this Rust port.
+    let ret_type = any_type(TYPE_OF_ANY_UNANNOTATED);
+    let name: Option<String> = fdef.getattr("name").ok()?.extract().ok()?;
+    Some(Type::CallableType {
+        fallback: Box::new(fallback.clone()),
+        instance_type: None,
+        is_ellipsis_args: false,
+        implicit: true,
+        is_bound: false,
+        from_concatenate: false,
+        imprecise_arg_kinds: false,
+        unpack_kwargs: false,
+        from_type_type: false,
+        arg_types: args,
+        arg_kinds,
+        arg_names,
+        ret_type: Box::new(ret_type),
+        name,
+        variables: Vec::new(),
+        type_guard: None,
+        type_is: None,
+    })
+}
+
+/// `fn decode_astype`: serialize the live CallableType through Python's
+/// WriteBuffer then decode it into the wire Type. This is exactly the
+/// python `_serialize_type` pattern (keeps any `instance_type` / `is_bound`
+/// / `from_type_type` state the Python body would carry over).
+fn decode_astype(py: Python<'_>, astype: &PyAny) -> Option<Type> {
+    let bytes = serialize_type_to_bytes(py, astype)?;
+    decode_type(&bytes)
+}
+
+/// `rust_function_type`, the exported seam entry point.
+///
+/// `fallback_wire` is the serialized live `builtins.function` Instance (the
+/// shim always passes it). Decodes, runs the port, re-encodes, returns
+/// `None` when anything defers. Line/column/definition are NOT
+/// wire-carryable; the Python shim restores them via `copy_modified`.
+#[pyfunction]
+pub(crate) fn rust_function_type(
+    py: Python<'_>,
+    func: &PyAny,
+    fallback_wire: &[u8],
+) -> Option<(bool, Vec<u8>)> {
+    let fallback = decode_type(fallback_wire)?;
+    let (is_passthrough, t) = function_type_inner(py, func, &fallback)?;
+    let bytes = encode_type(&t)?;
+    Some((is_passthrough, bytes))
 }
 
 // ---------------------------------------------------------------------------
