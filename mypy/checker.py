@@ -60,6 +60,7 @@ the orchestration between various type-checking phases and passes is done in `bu
 
 from __future__ import annotations
 
+import copy
 import itertools
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence, Set as AbstractSet
@@ -467,6 +468,15 @@ def _set_native_checker_stmts_active(active: bool) -> None:
 # #387: NativeTypeResolver shared with the checker narrowing kernel.
 # Installed/cleared per build by BuildManager.
 _native_checker_resolver: Any = None
+_checker_decode_count: list[int] = [0]
+# bytes -> decoded Type template cache (decode+fixup is expensive).
+# Callers get a shallow copy so the in-place TypeFixer at
+# try_handler_union_decoded never corrupts the shared template.
+_checker_deser_template: dict[bytes, Type] = {}
+
+
+def _clear_checker_deser_cache() -> None:
+    _checker_deser_template.clear()
 
 
 def _set_native_checker_resolver(resolver: Any) -> None:
@@ -789,10 +799,18 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     """Decode wire bytes from the checker kernel, resolving type_ref to live
     TypeInfo via wirefixup. Mirrors erasetype._deserialize_type.
     """
+    _checker_decode_count[0] += 1
+    cached = _checker_deser_template.get(b)
+    if cached is not None:
+        # Shallow copy: copy_modified callers (detach_callable) replace
+        # top-level fields; TypeFixer at try_handler_union_decoded mutates
+        # in place, so the shared template must never be handed out raw.
+        return copy.copy(cached)
     from mypy.wirefixup import fixup_wire_type
 
     t = fixup_wire_type(_checker_read_type(_CheckerReadBuffer(b)))
     assert t is not None, "checker wire decode produced unresolvable type_ref"
+    _checker_deser_template[b] = t
     return t
 
 

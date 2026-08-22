@@ -44,11 +44,38 @@ import mypy.type_visitor  # ruff: isort: skip
 from mypy.type_visitor import TypeTranslator
 
 _wire_typeinfo_map: dict[str, Any] | None = None
+_last_real_map: dict[str, Any] | None = None
 
 
 def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
-    """Install the fullname -> TypeInfo map shared by all wire-round-trip paths."""
-    global _wire_typeinfo_map
+    """Install the fullname -> TypeInfo map shared by all wire-round-trip paths.
+
+    Invalidate the checkmember deserialize cache only when a real map
+    replaces a *different* real map: a brand-new TypeInfo map can resolve
+    the same wire bytes to different live TypeInfo objects (parity tests
+    build fresh TypeInfos per case).  ``None`` resets (saved in
+    ``_last_real_map`` so they never erase the accumulated map identity)
+    are only semanal-side gates clearing the resolver snapshot; the
+    accumulated map itself is stable and growing (never re-created), so
+    cached resolutions stay valid across SCCs and clear on the SCC cycle
+    would destroy the hit rate.  The daemon path re-creates the map;
+    ``BuildManager._clear_native_resolvers`` calls ``_clear_deser_cache``
+    explicitly for that.
+    """
+    global _wire_typeinfo_map, _last_real_map
+    if typeinfo_map is None:
+        _wire_typeinfo_map = None
+        return
+    if _last_real_map is not None and typeinfo_map is not _last_real_map:
+        # A brand-new map identity (parity tests per case, daemon
+        # rechecks): cached decodes from the previous map must not
+        # survive, they would resolve into stale TypeInfo objects.
+        from mypy.checkmember import _clear_deser_cache
+        from mypy.checker import _clear_checker_deser_cache
+
+        _clear_deser_cache()
+        _clear_checker_deser_cache()
+    _last_real_map = typeinfo_map
     _wire_typeinfo_map = typeinfo_map
 
 
@@ -180,7 +207,10 @@ class _FreshVarCanonicalizer(TypeTranslator):
 
 def canonicalize_fresh_vars(typ: Type) -> Type:
     """Re-unify fresh meta-var occurrences by id (wire-path identity repair)."""
-    return typ.accept(_FreshVarCanonicalizer())
+    from mypy.types import instance_cache  # noqa: F401  (import side effect)
+
+    result = typ.accept(_FreshVarCanonicalizer())
+    return result
 
 
 class _TypeRefFixer(TypeTranslator):
