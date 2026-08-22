@@ -950,14 +950,12 @@ fn visit_instance_noninstance_right(
             Some(_) => return Some(false),
         }
     }
-    // TypeVarTupleType right (subtypes.py:617-620) needs
-    // `map_instance_to_supertype` against the typevar's variadic
-    // tuple_fallback and a first-arg check; rare for Instance-left on
+    // TypeVarTupleType right (subtypes.py:617-620): tuple[Any, ...] is
+    // like Any for tuples. Map left to the typevar's tuple_fallback and
+    // require the mapped first arg to be Any (stays False if proper).
+    if let Type::TypeVarTupleType { .. } = right {
+        return visit_instance_variadic_right(left, right, ctx, resolver, left_ref);
 
-    // production corpora and not exercised by the deferred ports' parity
-    // suite. Defer to Python.
-    if matches!(right, Type::TypeVarTupleType { .. }) {
-        return None;
     }
     // TypeType right (subtypes.py:784-795): when left is `builtins.type`
     // (non-proper) recurse against Any; when left's type is a metaclass
@@ -1020,6 +1018,61 @@ fn visit_instance_noninstance_right(
     // Anything else: Python's `else: return False` (subtypes.py:683).
     // Includes NoneType, UninhabitedType, DeletedType, TypedDictType,
     // ParamSpecType, UnpackType, LiteralType (no lkv).
+    Some(false)
+}
+
+/// `visit_instance` TypeVarTupleType-right branch (subtypes.py:617-620).
+///
+/// `tuple[Any, ...]` is like `Any` in the world of tuples. Rust ports
+/// the Python body exactly:
+/// * `left.type.has_base("builtins.tuple")`: a left Instance whose MRO
+///   reaches `builtins.tuple` tuples-compatible. The TypeInfo snapshot
+///   carries a `has_base` set, mirroring Python's `TypeInfo.has_base`.
+/// * Map the left to the typevar's own `tuple_fallback.type` via
+///   `map_instance_to_supertype` (Rust-ported subset) and check the
+///   mapped first arg for `AnyType` (proper type; the mapped args are
+///   already concrete `Instance` args, so skip alias expansion).
+/// * Result: `not proper_subtype`.
+///
+/// Deferral is precomputed: `tuple_fallback` is an inline `Instance`
+/// record in the wire `TypeVarTupleType`, and the snapshot lookup /
+/// map are pure resolver operations; anything missing (snapshot miss,
+/// map failure) returns `None` so the Python fallback stays correct.
+fn visit_instance_variadic_right(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+    left_ref: &str,
+) -> Option<bool> {
+    let Type::TypeVarTupleType { tuple_fallback, .. } = right else {
+        return None;
+    };
+    let Type::Instance {
+        type_ref: fb_ref, ..
+    } = tuple_fallback.as_ref()
+    else {
+        return None;
+    };
+    // subtypes.py:617-620: has_base("builtins.tuple") guard.
+    if !resolver.get(left_ref)?.has_base("builtins.tuple") {
+        return Some(false);
+    }
+    // subtypes.py:619: map_instance_to_supertype(left, tf_fb.type).
+    let (left_ref, left_args) = match left {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return None,
+    };
+    let mapped = map_instance_to_supertype(left_ref, left_args, fb_ref, resolver)?;
+    let first = match mapped.first() {
+        Some(t) => t,
+        None => return Some(false),
+    };
+    // subtypes.py:620: isinstance(get_proper_type(mapped.args[0]), AnyType).
+    let mapped_first = get_proper_type_or_defer(first, resolver)?;
+    if matches!(mapped_first, Type::AnyType { .. }) {
+        return Some(!ctx.proper_subtype);
+    }
     Some(false)
 }
 
@@ -1504,12 +1557,10 @@ fn visit_instance_nominal(
     }
     let mut nominal = true;
     for (i, (_tvar_name, variance, kind)) in right_tvars.iter().enumerate() {
-        // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else
-        // branch (subtypes.py:691-696) treats them as COVARIANT, but
-        // the arg shapes (CallableType with ParamSpec prefix, TupleType
+        // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else branch
+        // (subtypes.py:691-696) treats them as COVARIANT, but the arg shapes
+        // hit unsupported variants in the recursive is_subtype. Defer.
 
-        // for variadic middle) hit unsupported variants in the
-        // recursive is_subtype. Defer to Python.
         if *kind != 0 {
             return None;
         }
@@ -2006,6 +2057,42 @@ pub(crate) fn rust_is_subtype(
         strict_concatenate,
     );
     is_subtype(&left, &right, &ctx, resolver.resolver())
+}
+
+/// `#[pyfunction]` entry for the TypeVarTupleType-right branch of
+/// `visit_instance` (subtypes.py:617-620). The Python parity suite calls
+/// this directly with serialized operands to prove the Rust seam engages
+/// (returns `Some(bool)`) for the portable path and defers cleanly
+/// (`None`) when the left target's snapshot is missing.
+///
+/// The shim in `mypy/subtypes.py` routes the actual subtype check
+/// through this only when `left` is an `Instance` and `right` is a
+/// `TypeVarTupleType`; all flags default to the non-proper subtype
+/// context, matching the `visit_instance` call the function ports.
+#[pyfunction]
+#[allow(dead_code)]
+pub(crate) fn rust_subtype_tvar_tuple_right(
+    left_bytes: &[u8],
+    right_bytes: &[u8],
+    proper_subtype: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let left = decode_type(left_bytes)?;
+    let right = decode_type(right_bytes)?;
+    let Type::Instance { type_ref, .. } = &left else {
+        return None;
+    };
+    let ctx = SubtypeContext::with_callable_flags(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        false, // ignore_promotions
+        proper_subtype,
+        false, // strict_optional
+        false, // ignore_pos_arg_names
+        false, // strict_concatenate
+    );
+    visit_instance_variadic_right(&left, &right, &ctx, resolver.resolver(), type_ref.as_str())
 }
 
 #[cfg(test)]

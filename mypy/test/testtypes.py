@@ -3116,6 +3116,141 @@ class NativeSubtypeTupleSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeVariadicTupleRightSuite(Suite):
+    """Parity suite for the Rust TypeVarTupleType-right subtype port.
+
+    `mypy/subtypes.py` `visit_instance` treats a TypeVarTupleType on the
+    right of an Instance-left subtype check as an `Any`-like tuple
+    (subtypes.py:617-620): map the left to the typevar's own
+    `tuple_fallback` and answer `not proper_subtype` when the mapped
+    first arg is Any. The Rust `visit_instance_variadic_right` ports
+    this exactly using the wire-carried `tuple_fallback` and the
+    TypeInfo snapshot's `has_base("builtins.tuple")`.
+
+    Gate-toggling (differential) plus a direct seam call proving the
+    Rust function engages for the portable path and defers cleanly
+    (`None`) when the left target's snapshot is missing.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _tvt(self, fallback: Instance | None = None) -> TypeVarTupleType:
+        # Mirrors `_bound_tvt` (testtypes.py:4527): a TypeVarTuple whose
+        # `tuple_fallback` defaults to the fixture's `tuple[Any]`.
+        return TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(1),
+            self.fx.o,
+            fallback if fallback is not None else self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics) if fallback is None else fallback.args[0],
+        )
+
+    def _tup_any(self) -> Instance:
+        # tuple[Any, ...]: an Instance whose TypeInfo's MRO reaches
+        # builtins.tuple (has_base set includes it).
+        return self.fx.std_tuple
+
+    def _tup_int(self) -> Instance:
+        # tuple[int, ...]: same TypeInfo but an int argument, so the
+        # mapped first arg is not Any.
+        return Instance(self.fx.std_tuplei, [self.fx.a])
+
+    def _tup_arg_any(self, typ: Instance, proper: bool = False) -> bool:
+        # Direct seam call proving the Rust function engages for the
+        # portable path (mirrors the Native*Suites' _assert_engages).
+        from mypy.subtypes import _serialize_type
+
+        left = _serialize_type(typ)
+        right = _serialize_type(self._tvt())
+        result = _type_kernel.rust_subtype_tvar_tuple_right(
+            left, right, proper, self.resolver
+        )
+        assert result is not None, "Rust seam must engage for the variadic path"
+        return result
+
+    def _assert_par(self, left: Type, right: Type, *, proper: bool = False) -> None:
+        # Differential: gate off (pure Python) vs on (Rust seam) must
+        # agree on the decision string.
+        from mypy.subtypes import _set_native_subtype_active
+        from mypy.subtypes import is_proper_subtype
+        from mypy.subtypes import is_subtype as _is
+
+        def run() -> str:
+            if proper:
+                return str(is_proper_subtype(left, right))
+            return str(_is(left, right))
+
+        _set_native_subtype_active(False)
+        try:
+            off = run()
+        finally:
+            _set_native_subtype_active(True)
+        on = run()
+        assert_equal(on, off, f"subtype parity (right=TypeVarTuple) {left} vs {right}")
+
+    def test_instance_left_variadic_right_any_then_true(self) -> None:
+        # tuple[Any, ...] <: tuple[*Ts] -> True via the Any-mapped first
+        # arg (not proper_subtype).
+        left = self._tup_any()
+        right = self._tvt()
+        self._assert_par(left, right)
+        assert self._tup_arg_any(left)
+
+    def test_variadic_right_proper_subtype_false(self) -> None:
+        # Under proper_subtype the Any-mapped first arg yields False.
+        left = self._tup_any()
+        right = self._tvt()
+        self._assert_par(left, right, proper=True)
+        assert not self._tup_arg_any(left, proper=True)
+
+    def test_left_non_tuple_base_false(self) -> None:
+        # A non-tuple Instance (e.g. list[int]) has no builtins.tuple
+        # base -> False, and the seam engages (returns bool, not None).
+        left = Instance(self.fx.gi, [self.fx.a])
+        right = self._tvt()
+        self._assert_par(left, right)
+        assert self._tup_arg_any(left) is False
+
+    def test_erased_any_keeps_false(self) -> None:
+        # tuple[int, ...] vs the variadic target: mapped first arg is
+        # int, not Any -> False.
+        left = self._tup_int()
+        right = self._tvt()
+        self._assert_par(left, right)
+        assert self._tup_arg_any(left) is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
 
