@@ -228,6 +228,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        joinfns::rust_object_from_instance,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         joinfns::rust_combine_similar_callables,
         module
     )?)?;
@@ -260,6 +264,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         freshen::rust_freshen_function_type_vars,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        freshen::rust_match_generic_callables,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(expandtype::rust_remove_trivial, module)?)?;
