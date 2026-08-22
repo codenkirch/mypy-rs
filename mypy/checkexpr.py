@@ -238,6 +238,7 @@ try:
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
         rust_check_argument_count as _rust_check_argument_count,
+        rust_callable_type as _rust_callable_type,
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
@@ -322,6 +323,7 @@ except ImportError:
     _rust_check_overload_call = None  # type: ignore[assignment]
     _rust_dangerous_comparison = None  # type: ignore[assignment]
     _rust_check_argument_count = None  # type: ignore[assignment]
+    _rust_callable_type = None  # type: ignore[assignment]
     _rust_check_argument_types_plan = None  # type: ignore[assignment]
     _rust_check_callable_call = None  # type: ignore[assignment]
     _rust_try_getting_int_literals = None  # type: ignore[assignment]
@@ -7119,6 +7121,23 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             fallback = self.named_type("builtins.function")
             self.chk.return_types.pop()
             self.in_lambda_expr = old_in_lambda
+            # callable_type seam on the lambda FuncItem: Rust mirrors the
+            # self-binding + ret_type assembly; line/column/name are not
+            # wire-carryable, restore them on the live object.
+            if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+                try:
+                    ret_bytes = _serialize_type_for_checkexpr(ret_type)
+                    result = _rust_callable_type(
+                        e, _serialize_type_for_checkexpr(fallback), ret_bytes
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_from_checkexpr(bytes(result))
+                        if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
+                            return decoded.copy_modified(
+                                line=e.line, column=e.column, name=e.name, implicit=True
+                            )
+                except (AssertionError, NotImplementedError, ValueError):
+                    pass
             return callable_type(e, fallback, ret_type)
         else:
             # Type context available.

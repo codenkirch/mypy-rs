@@ -2171,7 +2171,7 @@ fn function_type_inner(py: Python<'_>, func: &PyAny, fallback: &Type) -> Option<
             },
         )),
         // FuncItem with no type -> callable_type (self-binding).
-        (false, None) => callable_type_inner(py, func, fallback).map(|t| (false, t)),
+        (false, None) => callable_type_inner(py, func, fallback, None).map(|t| (false, t)),
     }
 }
 /// `fn dummy_callable`: build the wire dummy for a broken overload.
@@ -2207,8 +2207,19 @@ fn dummy_callable(fallback: &Type) -> Type {
     }
 }
 
-/// `fn callable_type_inner`: `callable_type` body (typeops.py:1405-1429).
-fn callable_type_inner(py: Python<'_>, fdef: &PyAny, fallback: &Type) -> Option<Type> {
+/// `fn callable_type_inner`: `callable_type` body (typeops.py:1485-1509).
+///
+/// `ret_type` mirrors the Python `ret_type or AnyType(...)` default: the
+/// `rust_function_type` export always passes `None` (its wrapper builds the
+/// final value), while `rust_callable_type` passes the caller's explicit
+/// `ret_type` (the checkexpr lambda callback never supplies one explicitly,
+/// but the shim serializes the live value when present).
+fn callable_type_inner(
+    py: Python<'_>,
+    fdef: &PyAny,
+    fallback: &Type,
+    ret_type: Option<&Type>,
+) -> Option<Type> {
     let arg_names = {
         let v = fdef.getattr("arg_names").ok()?;
         let list = v.downcast::<PyList>().ok()?;
@@ -2260,10 +2271,10 @@ fn callable_type_inner(py: Python<'_>, fdef: &PyAny, fallback: &Type) -> Option<
     } else {
         std::iter::repeat_n(any_type(TYPE_OF_ANY_UNANNOTATED), arg_name_count).collect()
     };
-    // `ret_type or AnyType(...)`: ret_type is always None from the export
-    // (rust_function_type); the checkexpr lambda caller passes a ret_type but
-    // calls callable_type directly, so it never reaches this Rust port.
-    let ret_type = any_type(TYPE_OF_ANY_UNANNOTATED);
+    // `ret_type or AnyType(...)`: encoded ret_type or Any when not passed.
+    let ret_type = ret_type
+        .cloned()
+        .unwrap_or_else(|| any_type(TYPE_OF_ANY_UNANNOTATED));
     let name: Option<String> = fdef.getattr("name").ok()?.extract().ok()?;
     Some(Type::CallableType {
         fallback: Box::new(fallback.clone()),
@@ -2311,6 +2322,29 @@ pub(crate) fn rust_function_type(
     let (is_passthrough, t) = function_type_inner(py, func, &fallback)?;
     let bytes = encode_type(&t)?;
     Some((is_passthrough, bytes))
+}
+
+/// `rust_callable_type`: `mypy.typeops.callable_type` (typeops.py:1485-1509)
+/// on a live `FuncItem` with an optional explicit `ret_type`.
+///
+/// Mirrors the same body as `callable_type_inner` but takes the caller's
+/// `ret_type` wire bytes (`None` bytes mean defer / no explicit ret_type).
+/// Used by the checkexpr lambda callback which passes the inferred return
+/// type; `rust_function_type` uses this body with `None`.
+#[pyfunction]
+pub(crate) fn rust_callable_type(
+    py: Python<'_>,
+    fdef: &PyAny,
+    fallback_wire: &[u8],
+    ret_type_wire: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let fallback = decode_type(fallback_wire)?;
+    let ret_type = match ret_type_wire {
+        Some(bytes) => Some(decode_type(bytes)?),
+        None => None,
+    };
+    let t = callable_type_inner(py, fdef, &fallback, ret_type.as_ref())?;
+    encode_type(&t)
 }
 
 // ---------------------------------------------------------------------------
