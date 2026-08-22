@@ -90,6 +90,7 @@ mod fixup;
 mod freshen;
 mod generators;
 mod infer_variance;
+mod joinfns;
 mod lennarrow;
 mod lkv;
 mod maptype;
@@ -217,6 +218,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // Issue #494: variadic-tuple join/meet cores.
     module.add_function(wrap_pyfunction!(setops::rust_join_tuples, module)?)?;
     module.add_function(wrap_pyfunction!(setops::rust_meet_tuples, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        joinfns::rust_object_or_any_from_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        joinfns::rust_combine_similar_callables,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         argmap::rust_map_actuals_to_formals,
         module

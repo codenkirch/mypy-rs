@@ -159,6 +159,48 @@ def _deserialize_type(data: bytes) -> Type | None:
     return fixup_wire_type(decoded)
 
 
+def _try_native_object_or_any_from_type(typ: ProperType) -> Type | None:
+    """Try `object_or_any_from_type` in Rust; None defers to Python.
+
+    Serializes the proper type, calls the kernel, and deserializes the
+    result. Any wire-format failure (unsupported variant, missing
+    resolver snapshot, decode error) falls through to None so the
+    pure-Python body runs unchanged (strangler-fig per-call gate).
+    """
+    try:
+        result = _type_kernel.rust_object_or_any_from_type(
+            _serialize_type(typ), _native_join_resolver
+        )
+    except (AssertionError, NotImplementedError, ValueError, AttributeError):
+        return None
+    if result is None:
+        return None
+    return _deserialize_type(bytes(result))
+
+
+def _try_native_combine_similar_callables(
+    t: CallableType, s: CallableType
+) -> Type | None:
+    """Try `combine_similar_callables` in Rust; None defers to Python.
+
+    The kernel returns None for the both-generic case (Rust cannot
+    replicate `TypeVarId.new`'s global counter) and for per-arg joins it
+    cannot decide; the caller then runs the pure-Python body.
+    """
+    try:
+        result = _type_kernel.rust_combine_similar_callables(
+            _serialize_type(t),
+            _serialize_type(s),
+            state.strict_optional,
+            _native_join_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError, AttributeError):
+        return None
+    if result is None:
+        return None
+    return _deserialize_type(bytes(result))
+
+
 class InstanceJoiner:
     def __init__(self) -> None:
         self.seen_instances: list[tuple[Instance, Instance]] = []
@@ -1191,6 +1233,14 @@ def safe_meet(t: Type, s: Type) -> Type:
 
 
 def combine_similar_callables(t: CallableType, s: CallableType) -> CallableType:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_join_active
+        and _native_join_resolver is not None
+    ):
+        res = _try_native_combine_similar_callables(t, s)
+        if res is not None:
+            return res
     t, s = match_generic_callables(t, s)
     arg_types: list[Type] = []
     for i in range(len(t.arg_types)):
@@ -1258,6 +1308,14 @@ def object_from_instance(instance: Instance) -> Instance:
 
 
 def object_or_any_from_type(typ: ProperType) -> ProperType:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_join_active
+        and _native_join_resolver is not None
+    ):
+        res = _try_native_object_or_any_from_type(typ)
+        if res is not None:
+            return res
     # Similar to object_from_instance() but tries hard for all types.
     # TODO: find a better way to get object, or make this more reliable.
     if isinstance(typ, Instance):

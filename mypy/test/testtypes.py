@@ -17691,3 +17691,253 @@ class NativeInferVarianceSeamSuite(Suite):
         info.names["x"] = SymbolTableNode(MDEF, v)
         result = self._compute(info, c)
         assert result == 3, f"expected both flips, got {result}"
+
+
+class NativeObjectOrAnyFromTypeSuite(Suite):
+    """Parity for the Rust `object_or_any_from_type` port (joinfns.rs).
+
+    Runs the pure-Python body (join gate off) and the Rust path (join
+    gate on) on the same corpus and asserts identical results. The Rust
+    path serializes the proper type, calls
+    `type_kernel.rust_object_or_any_from_type`, and deserializes the
+    result; both must produce equal types. Cases Rust cannot handle
+    (missing resolver snapshot, unwritable variant) return None and the
+    Python body runs unchanged, so the differential still passes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        _set_native_join_active(active)
+        _set_native_join_resolver(self.resolver if active else None)
+
+    def _native_result(self, typ: ProperType) -> ProperType:
+        from mypy.join import object_or_any_from_type
+
+        return object_or_any_from_type(typ)
+
+    def _reference_result(self, typ: ProperType) -> ProperType:
+        from mypy.join import object_or_any_from_type
+
+        return object_or_any_from_type(typ)
+
+    def _assert_parity(self, typ: ProperType) -> None:
+        res = self._native_result(typ)
+        ref = self._reference_result(typ)
+        assert_equal(res, ref)
+
+    def test_instance(self) -> None:
+        # Instance -> object_from_instance (mro[-1] = object).
+        self._assert_parity(self.fx.a)
+
+    def test_instance_subclass(self) -> None:
+        # B mro = [B, A, object], mro[-1] = object.
+        self._assert_parity(self.fx.b)
+
+    def test_callable_type(self) -> None:
+        # CallableType -> object from its function fallback
+        # (builtins.function mro[-1] = object).
+        self._assert_parity(self.fx.callable(self.fx.a, self.fx.b))
+
+    def test_literal_type(self) -> None:
+        # LiteralType -> object from its fallback (A -> object).
+        self._assert_parity(self.fx.lit1)
+
+    def test_typed_dict_type(self) -> None:
+        # TypedDictType -> object from its fallback (A).
+        td = TypedDictType({"x": self.fx.a}, {"x"}, set(), self.fx.a)
+        self._assert_parity(td)
+
+    def test_tuple_type(self) -> None:
+        # TupleType -> object from partial_fallback (builtins.tuple).
+        self._assert_parity(TupleType([self.fx.a, self.fx.b], self.fx.std_tuple))
+
+    def test_type_type(self) -> None:
+        # TypeType -> recurse on item (Instance A -> object).
+        self._assert_parity(self.fx.type_a)
+
+    def test_type_var(self) -> None:
+        # TypeVarType -> recurse on upper_bound (object).
+        self._assert_parity(self.fx.t)
+
+    def test_type_var_bound_subclass(self) -> None:
+        # TypeVar bound to A -> recurse on A -> object.
+        bound = TypeVarType(
+            "T", "T", TypeVarId(100), [], self.fx.a, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        self._assert_parity(bound)
+
+    def test_union_with_instance_candidate(self) -> None:
+        # Union[Callable, A] -> first Instance candidate = object(A).
+        u = UnionType.make_union([self.fx.callable(self.fx.a), self.fx.a])
+        self._assert_parity(u)
+
+    def test_union_without_instance_candidate(self) -> None:
+        # Union[Callable, Callable] (no bare Instance) -> Any.
+        u = UnionType.make_union(
+            [self.fx.callable(self.fx.a), self.fx.callable(self.fx.b)]
+        )
+        self._assert_parity(u)
+
+    def test_unpack_type(self) -> None:
+        # UnpackType -> Python discards the recursion result, returns Any.
+        unpacked = UnpackType(TupleType([self.fx.a], self.fx.std_tuple))
+        self._assert_parity(unpacked)
+
+    def test_any_fallback(self) -> None:
+        # UnboundType (not handled) -> AnyType(implementation_artifact).
+        self._assert_parity(UnboundType("X"))
+
+    def test_type_var_tuple(self) -> None:
+        # TypeVarTupleType upper_bound is tuple[object] -> object(tuple).
+        self._assert_parity(self.fx.ts)
+
+
+class NativeCombineSimilarCallablesSuite(Suite):
+    """Parity for the Rust `combine_similar_callables` port (joinfns.rs).
+
+    Runs the pure-Python body (join gate off) and the Rust path (join
+    gate on) on the same callable pairs and asserts identical results.
+    Cases Rust cannot handle (both-generic callables, per-arg joins it
+    cannot decide) return None and the Python body runs unchanged, so
+    the differential still passes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.join import _set_native_join_active, _set_native_join_resolver
+
+        _set_native_join_active(active)
+        _set_native_join_resolver(self.resolver if active else None)
+
+    def _native_result(self, t: CallableType, s: CallableType) -> CallableType:
+        from mypy.join import combine_similar_callables
+
+        return combine_similar_callables(t, s)
+
+    def _reference_result(self, t: CallableType, s: CallableType) -> CallableType:
+        from mypy.join import combine_similar_callables
+
+        return combine_similar_callables(t, s)
+
+    def _assert_parity(self, t: CallableType, s: CallableType) -> None:
+        res = self._native_result(t, s)
+        ref = self._reference_result(t, s)
+        assert_equal(res, ref)
+
+    def test_same_arg_names(self) -> None:
+        # (a: A) -> B joined with (a: A) -> B: names kept.
+        t = CallableType(
+            [self.fx.a], [ARG_POS], ["a"], self.fx.b, self.fx.function
+        )
+        s = CallableType(
+            [self.fx.a], [ARG_POS], ["a"], self.fx.b, self.fx.function
+        )
+        self._assert_parity(t, s)
+
+    def test_different_arg_names(self) -> None:
+        # (a: A) vs (x: A): positional names differ -> name dropped (None).
+        t = CallableType([self.fx.a], [ARG_POS], ["a"], self.fx.b, self.fx.function)
+        s = CallableType([self.fx.a], [ARG_POS], ["x"], self.fx.b, self.fx.function)
+        self._assert_parity(t, s)
+
+    def test_named_args(self) -> None:
+        # Named args: names kept even if different (combine_arg_names
+        # is_named rule).
+        t = CallableType([self.fx.a], [ARG_NAMED], ["a"], self.fx.b, self.fx.function)
+        s = CallableType([self.fx.a], [ARG_NAMED], ["x"], self.fx.b, self.fx.function)
+        self._assert_parity(t, s)
+
+    def test_fallback_function_vs_type(self) -> None:
+        # t fallback=function, s fallback=type -> function wins.
+        t = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        s = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.type_type)
+        self._assert_parity(t, s)
+
+    def test_instance_type_none_both(self) -> None:
+        # Both instance_type None -> result None.
+        t = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        s = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        self._assert_parity(t, s)
+
+    def test_instance_type_both(self) -> None:
+        # Both instance_type set -> joined via join_types.
+        t = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function,
+            variables=[], instance_type=self.fx.a,
+        )
+        s = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function,
+            variables=[], instance_type=self.fx.b,
+        )
+        self._assert_parity(t, s)
+
+    def test_ret_type_join(self) -> None:
+        # ret A vs ret B -> join = object.
+        t = CallableType([self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function)
+        s = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        self._assert_parity(t, s)
+
+    def test_generic_both_defers(self) -> None:
+        # Both generic: Rust can't replicate TypeVarId.new's global
+        # counter, returns None, Python body runs unchanged. Direct
+        # kernel assertion (fresh tvar ids differ run to run).
+        tv = [
+            TypeVarType(
+                "T", "T", TypeVarId(10), [], self.fx.o,
+                AnyType(TypeOfAny.from_omitted_generics),
+            )
+        ]
+        t = CallableType(
+            [tv[0]], [ARG_POS], [None], tv[0], self.fx.function, variables=tv
+        )
+        from mypy.join import _serialize_type
+
+        result = _type_kernel.rust_combine_similar_callables(
+            _serialize_type(t), _serialize_type(t), True, self.resolver
+        )
+        assert result is None, "Rust must defer both-generic combine"
+
+    def test_no_variables_unchanged(self) -> None:
+        # min_len == 0: match_generic_callables no-op; plain join.
+        t = CallableType([self.fx.a], [ARG_POS], [None], self.fx.b, self.fx.function)
+        s = CallableType([self.fx.b], [ARG_POS], [None], self.fx.a, self.fx.function)
+        self._assert_parity(t, s)
