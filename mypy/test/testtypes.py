@@ -18896,10 +18896,14 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         c = CallableType(
             [self.fx.t], [ARG_POS], [None], self.fx.b, self.fx.function, variables=[self.fx.t]
         )
+        before = TypeVarId.next_raw_id
         result = self._freshen(c)
         assert_equal(len(result.variables), 1)
         assert result.variables[0].id.meta_level == 1, "fresh var not meta_level 1"
-        assert result.variables[0].id.raw_id != self.fx.t.id.raw_id
+        # Fresh ids come from the global counter (types.py:561-564), so a
+        # fresh id is >= the pre-call `next_raw_id`; comparing bare raw_ids
+        # with the fixture's T is fragile (fresh process starts at 1).
+        assert result.variables[0].id.raw_id >= before
         self._assert_par(c)
 
     def test_generic_occurrences_replaced(self) -> None:
@@ -19546,3 +19550,98 @@ class NativeFindMatchingOverloadSuite(Suite):
         items = [self._callable([UnpackType(tvt)], self.fx.a), self._callable([self.fx.a])]
         result = self._native_indices(items, self._callable([self.fx.a]))
         assert result is None
+
+
+class NativeSolveOneSuite(Suite):
+    """Parity for the Rust `solve_one` decision subcases (solve.rs).
+
+    Runs the pure-Python body (solve gate off) and the Rust path (solve
+    gate on) on the same lower/upper bound sets and asserts identical
+    results. Cases Rust cannot handle (single-bound no-ops, unwire-safe
+    bounds) stay in Python, so the differential still passes.
+    """
+
+    def setUp(self) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_solve_active(False)
+        _set_native_solve_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _set_active(self, active: bool) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+
+        _set_native_solve_active(active)
+        _set_native_solve_resolver(self.resolver if active else None)
+
+    def _assert_par(self, lowers: list[Type], uppers: list[Type]) -> None:
+        from mypy.solve import solve_one
+
+        self._set_active(False)
+        ref = solve_one(lowers, uppers)
+        self._set_active(True)
+        res = solve_one(lowers, uppers)
+        assert_equal(res, ref)
+
+    def test_infer_unions_true(self) -> None:
+        from mypy.state import state
+
+        state.infer_unions = True
+        try:
+            self._assert_par([self.fx.a, self.fx.b], [])
+        finally:
+            state.infer_unions = False
+
+    def test_infer_unions_false(self) -> None:
+        self._assert_par([self.fx.a, self.fx.b], [])
+
+    def test_ambig_never_filtered_upper(self) -> None:
+        from mypy.types import UninhabitedType
+
+        amb = UninhabitedType()
+        amb.ambiguous = True
+        self._assert_par([self.fx.a], [amb, self.fx.b])
+
+    def test_uninhabited_lower(self) -> None:
+        from mypy.types import UninhabitedType
+
+        nb = UninhabitedType()
+        self._assert_par([nb], [self.fx.a])
+
+    def test_single_bound_defer(self) -> None:
+        # Single-bound no-ops stay in Python for identity; parity holds.
+        self._assert_par([self.fx.a], [])
+        self._assert_par([], [self.fx.a])
+
+    def test_any_upper_absorbed(self) -> None:
+        from mypy.types import AnyType
+
+        anyt = AnyType(TypeOfAny.special_form)
+        self._assert_par([self.fx.a], [anyt])
+
+    def test_any_lower_absorbed(self) -> None:
+        from mypy.types import AnyType
+
+        anyt = AnyType(TypeOfAny.special_form)
+        self._assert_par([anyt], [self.fx.b])
+
+    def test_subtype_bottom_top(self) -> None:
+        self._assert_par([self.fx.a], [self.fx.a, self.fx.b])
