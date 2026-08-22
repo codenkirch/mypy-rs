@@ -618,7 +618,7 @@ def _try_native_get_coroutine_return_type(return_type: Type) -> Type | None:
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
     """Native fast path for type_requires_usage (parity-only).
 
-    Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
+Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
     __await__ (UNUSED_AWAITABLE) branches, or None to defer to the
     pure-Python implementation. The awaitable branch resolves
     `proper_type.type.get("__await__")` through the resolver's member

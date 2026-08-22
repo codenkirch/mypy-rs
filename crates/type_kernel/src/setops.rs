@@ -3390,8 +3390,9 @@ fn is_enum_fallback(t: &Type, resolver: &TypeResolver) -> bool {
 /// `flatten_nested_unions` (types.py:4267-4300): recursively expand
 /// UnionType items into a flat list. TypeAliasType is NOT expanded
 /// (the wire format carries only `type_ref`, not the live `TypeAlias`
-/// target needed for `_expand_once`); if one is present, return `None`
-/// so the caller defers to Python.
+/// target needed for `_expand_once`); the boundary pyfunction expands
+/// aliases first. If a TypeAliasType is present, return `None` so the
+/// caller defers to Python.
 pub(crate) fn flatten_nested_unions(items: &[Type]) -> Option<Vec<Type>> {
     let mut flat = Vec::with_capacity(items.len());
     for t in items {

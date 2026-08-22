@@ -220,6 +220,7 @@ pub fn rust_check_overload_call(
                     mapping_for_formal.clone(),
                     dup_types,
                     dup_kinds,
+                    resolver,
                 )
                 .ok()
                 .flatten()

@@ -678,6 +678,7 @@ def rust_is_duplicate_mapping(
     mapping: list[int],
     actual_types: list[bytes],
     actual_kinds: list[int],
+    resolver: NativeTypeResolver,
 ) -> bool | None: ...
 def rust_check_overload_call(
     resolver: NativeTypeResolver,

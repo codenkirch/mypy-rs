@@ -29,6 +29,7 @@ use pyo3::types::{PyBytes, PyList, PyTuple};
 
 use crate::astwire::{decode_node, AstNode};
 use crate::callable_compat::is_type_obj;
+use crate::checkexpr_functions::expanded_alias_target;
 use crate::erase_typevars::{erase_typevars_inner, make_any};
 use crate::meet::overlap;
 use crate::setops::{make_simplified_union, union_make_union};
@@ -49,8 +50,9 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// `mypy.checker.type_requires_usage`: the initial Instance dispatch.
 ///
 /// Mirrors checker.py:5822-5840. The Python implementation calls
-/// `get_proper_type`, so an alias defers here (no alias target on the wire).
-/// The `typing.Coroutine` branch is decided by fullname; the `__await__`
+/// `get_proper_type`, so a `TypeAliasType` is expanded via the alias
+/// resolver (chain-resolving) before the Instance dispatch. The
+/// `typing.Coroutine` branch is decided by fullname; the `__await__`
 /// branch mirrors `proper_type.type.get("__await__")` (a truthy
 /// `SymbolTableNode` in the mro), which the resolver's `member_info`
 /// snapshots carry. Defer (`None`) when any mro class is missing from the
@@ -68,13 +70,28 @@ pub(crate) fn rust_type_requires_usage(
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(type_requires_usage_inner(&typ, resolver.resolver()))
+    // The `__await__` branch needs `TypeResolver` member snapshots; the
+    // TypeAliasType expansion needs the alias resolver map.
+    Ok(type_requires_usage_inner(
+        &typ,
+        resolver.resolver(),
+        resolver.alias_resolver(),
+    ))
 }
 
-fn type_requires_usage_inner(typ: &Type, resolver: &TypeResolver) -> Option<u8> {
+fn type_requires_usage_inner(
+    typ: &Type,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<u8> {
     let Type::Instance { type_ref, .. } = typ else {
-        // TypeAliasType (needs alias expansion), and all non-Instance
-        // proper types, defer to the pure-Python body.
+        // A TypeAliasType expands via the alias resolver chain,
+        // mirroring Python's `get_proper_type`. Other non-Instance
+        // proper types (and unexpandable aliases) defer.
+        if let Type::TypeAliasType { .. } = typ {
+            let (target, _, _) = expanded_alias_target(typ, aliases)?;
+            return type_requires_usage_inner(&target, resolver, aliases);
+        }
         return None;
     };
     if type_ref == "typing.Coroutine" {

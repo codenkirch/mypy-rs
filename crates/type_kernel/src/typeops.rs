@@ -421,6 +421,10 @@ pub(crate) fn rust_make_simplified_union(
     let mut buf = ReadBuffer::new(items_bytes);
     let items = wire::read_type_list(&mut buf).ok()?;
     let _ = (line, column, keep_erased, handle_recursive);
+    // Step 1 mirror (typeops.py:1057): expand each alias item to its
+    // chain-resolved raw target (flatten_nested_unions parity; arg
+    // substitution skipped); missing snapshot or cycle defers.
+    let expanded = expand_alias_items(&items, resolver.alias_resolver())?;
     // Match Python's _remove_redundant_union_items which calls
     // is_proper_subtype, reading state.strict_optional live
     // (subtypes.py:575 passes it to _is_subtype). proper_subtype=True
@@ -430,8 +434,31 @@ pub(crate) fn rust_make_simplified_union(
     // --no-strict-optional drops NoneType items (None <: T is true then).
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
     let result =
-        setops::make_simplified_union(&items, &ctx, resolver.resolver(), contract_literals)?;
+        setops::make_simplified_union(&expanded, &ctx, resolver.resolver(), contract_literals)?;
     encode_type(&result)
+}
+
+/// Expand `TypeAliasType` items through the alias resolver, mirroring the
+/// per-item `get_proper_type` in Python's `flatten_nested_unions`
+/// (types.py:4981-4999). A `TypeAliasType` item is replaced by its
+/// chain-resolved raw target (no argument substitution; see
+/// `expand_alias_target_raw`); all other items pass through unchanged (the
+/// wire `UnionType` flattening is handled by `setops::flatten_nested_unions`).
+/// Returns `None` (defer) when any alias cannot be expanded.
+fn expand_alias_items(
+    items: &[Type],
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Vec<Type>> {
+    let mut out = Vec::with_capacity(items.len());
+    for t in items {
+        if let Type::TypeAliasType { .. } = t {
+            let target = crate::checkexpr_functions::expand_alias_target_raw(t, aliases)?;
+            out.push(target);
+        } else {
+            out.push(t.clone());
+        }
+    }
+    Some(out)
 }
 
 /// `#[pyfunction]` entry for `simple_literal_type`. Returns encoded fallback

@@ -270,8 +270,23 @@ pub(crate) fn rust_remove_redundant_union_items(
 ) -> Option<Vec<u8>> {
     let mut buf = ReadBuffer::new(items_bytes);
     let items = wire::read_type_list(&mut buf).ok()?;
+    // Python computes `proper_ti = get_proper_type(ti)` per item
+    // (typeops.py:1148): an alias-backed item dedups as its expanded
+    // target. Expand alias items up front (raw target); defer on `?`.
+    let mut current = Vec::with_capacity(items.len());
+    for ti in items {
+        match ti {
+            Type::TypeAliasType { .. } => {
+                let target = crate::checkexpr_functions::expand_alias_target_raw(
+                    &ti,
+                    resolver.alias_resolver(),
+                )?;
+                current.push(target);
+            }
+            _ => current.push(ti),
+        }
+    }
     let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    let mut current = items;
     for _direction in 0..2 {
         current = remove_redundant_pass(&current, &ctx, resolver.resolver(), keep_erased)?;
         if current.len() <= 1 {
