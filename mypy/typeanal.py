@@ -309,7 +309,11 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         )
 
     def visit_unbound_type_nonoptional(self, t: UnboundType, defining_literal: bool) -> Type:
-        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+        if (
+            _TYPEANAL_HAS_KERNEL
+            and _native_typeanal_active
+            and self._native_unbound_front_eligible(t)
+        ):
             result = self._native_visit_unbound_front(t, defining_literal)
             if result is not None:
                 return result
@@ -552,6 +556,37 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 return self.analyze_unbound_type_without_type_info(t, sym, defining_literal)
         else:  # sym is None
             return AnyType(TypeOfAny.special_form)
+
+    def _native_unbound_front_eligible(self, t: UnboundType) -> bool:
+        """Pre-check the unbound-front hub (the #789 pattern).
+
+        `rust_classify_unbound_front` defers for every non-placeholder
+        special kind (Var, TypeAlias, TypeInfo, ...) yet the shim still
+        pays lookup + ~20 scalar extractions + a PyO3 call per type.
+        Return False for the always-defer kinds so the caller runs the
+        pure-Python body directly (no duplicate lookup: the body below
+        does its own). Staying native for the decidable kinds keeps the
+        Rust classifier engaged.
+        """
+        sym = self.lookup_qualified(t.name, t)
+        if sym is None:
+            # SYM_NONE: the Rust front decides it (some special forms are
+            # handled there), so stay on the native path.
+            return True
+        node = sym.node
+        if node is None:
+            return True
+        if isinstance(node, (ParamSpecExpr, TypeVarExpr, TypeVarTupleExpr)):
+            return True
+        # Mirror the shim's .args/.kwargs re-resolution: the base symbol's
+        # node kind governs, not the `X.args` lookup result.
+        if t.name.endswith((".args", ".kwargs")):
+            base = self.lookup_qualified(t.name.rsplit(".", 1)[0], t)
+            if base is not None and isinstance(base.node, ParamSpecExpr):
+                return True
+        if isinstance(node, PlaceholderNode):
+            return True
+        return False
 
     def _native_visit_unbound_front(
         self, t: UnboundType, defining_literal: bool
