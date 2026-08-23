@@ -20009,6 +20009,153 @@ class NativeIsSubtypeBatchSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsSubtypeAliasSuite(Suite):
+    """Parity for `TypeAliasType` expansion in `rust_is_subtype`.
+
+    Previously both `rust_is_subtype` and `rust_is_subtype_batch` deferred
+    to Python whenever a `TypeAliasType` appeared in either operand,
+    because the wire carries only `type_ref` (the fullname), not the
+    alias target. Now `expand_aliases` walks the type tree, looks up
+    each alias in the `TypeAliasResolver`, substitutes type-var args via
+    `expand_type_inner`, and recurses until no alias remains, mirroring
+    `get_proper_type` (types.py:4032). The gate-off / gate-on
+    differential must produce identical booleans; each test asserts the
+    pair (off, on) equal.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        self._base_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(self._base_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _clear_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _clear_subtype_batch()
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _make_alias(
+        self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
+    ) -> TypeAlias:  # type: ignore[name-defined]
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],
+        )
+
+    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:  # type: ignore[name-defined]
+        return TypeAliasType(alias, [])
+
+    def _rebuild_resolver(self, aliases: list[Any], extra_infos: list[Any] | None = None) -> None:
+        from mypy.subtypes import _set_native_subtype_resolver
+
+        infos = self._base_infos + (extra_infos or [])
+        self.resolver = _type_kernel.build_native_resolver(infos, aliases)
+        _set_native_subtype_resolver(self.resolver)
+
+    def _par(self, left: Type, right: Type) -> tuple[bool, bool]:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        off = is_subtype(left, right)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        on = is_subtype(left, right)
+        return off, on
+
+    def test_alias_to_union_subtype(self) -> None:
+        # TA = Union[int, str]; A <: TA and TA <: object.
+        alias = self._make_alias("mod.TA", UnionType.make_union([self.fx.a, self.fx.b]))
+        self._rebuild_resolver([alias])
+        alias_t = self._alias_type(alias)
+        # B <: Union[A, B] -> True (B is a member).
+        off, on = self._par(self.fx.b, alias_t)
+        assert (off, on) == (True, True)
+        # A <: Union[A, B] -> True (A is a member).
+        off, on = self._par(self.fx.a, alias_t)
+        assert (off, on) == (True, True)
+
+    def test_alias_in_union_item(self) -> None:
+        # TA = A; Union[TA, B] <: object -> True.
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._rebuild_resolver([alias])
+        alias_t = self._alias_type(alias)
+        u = UnionType.make_union([alias_t, self.fx.b])
+        off, on = self._par(u, self.fx.o)
+        assert (off, on) == (True, True)
+
+    def test_alias_to_instance(self) -> None:
+        # TA = A; B <: TA when B is a subclass of A.
+        alias = self._make_alias("mod.TA", self.fx.a)
+        self._rebuild_resolver([alias])
+        alias_t = self._alias_type(alias)
+        # B <: A in the fixture (B(A)) -> True.
+        off, on = self._par(self.fx.b, alias_t)
+        assert (off, on) == (True, True)
+        # A <: B is False; A <: TA is A <: A -> True.
+        off, on = self._par(alias_t, self.fx.b)
+        assert (off, on) == (False, False)
+
+    def test_generic_alias_args(self) -> None:
+        # TA = List[T]; TA[A] <: List[A] -> True (substitution yields
+        # identical args). The invariant fixture makes List[A] <:
+        # List[object] False in pure Python too.
+        T = TypeVarType(
+            "T", "T", TypeVarId(1), [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+        )
+        from mypy.types import Instance as InstanceType
+
+        list_t = InstanceType(self.fx.std_listi, [T])
+        alias = self._make_alias("mod.TA", list_t, alias_tvars=[T])
+        self._rebuild_resolver([alias])
+        alias_a = TypeAliasType(alias, [self.fx.a])
+        # List[A] <: List[A] -> True after substitution.
+        off, on = self._par(alias_a, InstanceType(self.fx.std_listi, [self.fx.a]))
+        assert (off, on) == (True, True)
+
+    def test_alias_not_in_resolver_defers(self) -> None:
+        # An alias whose TypeAlias is not in the resolver defers to
+        # Python (expand_aliases returns None); both paths must agree.
+        from mypy.nodes import TypeAlias
+
+        alias = self._make_alias("mod.Missing", self.fx.a)
+        alias_t = TypeAliasType(alias, [])
+        off, on = self._par(self.fx.b, alias_t)
+        assert off == on
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 def _build_native_variance_resolver(infos: list[TypeInfo]) -> Any:
     """Build a `NativeTypeResolver` snapshot over the given live TypeInfos
     (the class plus the fixture graph it subclasses) so the Rust subtype

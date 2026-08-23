@@ -1196,12 +1196,8 @@ fn visit_instance_noninstance_right(
         }
     }
     // TypeVarTupleType right (subtypes.py:617-620): tuple[Any, ...] is
-    // like Any for tuples. Map left to the typevar's tuple_fallback and
-    // require the mapped first arg to be Any (stays False if proper).
-
-    // Only engages when left is an Instance with a "builtins.tuple" base;
-    // other lefts (e.g. TypeVarTupleType itself, subtypes.py:2600-2603)
-    // keep deferring through the helper's None path.
+    // like Any for tuples: map left to tuple_fallback and require the
+    // mapped first arg to be Any (stays False if proper).
     if let Type::Instance {
         type_ref: left_ref, ..
     } = left
@@ -1893,6 +1889,224 @@ fn check_type_parameter(
     }
 }
 
+/// `get_proper_type` for `TypeAliasType` (types.py:4032-4050): expand
+/// every alias in a `Type` tree by looking up the `alias_resolver`,
+/// substituting type-var args via `expand_type_inner`, and recursing
+/// until no `TypeAliasType` remains. Returns `None` (defer to Python)
+/// when the alias is missing from the resolver, the alias is variadic
+/// (`tvar_tuple_index` set), or any child expansion defers.
+fn expand_aliases(
+    typ: &Type,
+    alias_resolver: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+) -> Option<Type> {
+    expand_aliases_depth(typ, alias_resolver, strict_optional, 0)
+}
+
+fn expand_aliases_depth(
+    typ: &Type,
+    alias_resolver: &crate::aliases::TypeAliasResolver,
+    strict_optional: bool,
+    depth: u32,
+) -> Option<Type> {
+    if depth > 50 {
+        return None;
+    }
+    match typ {
+        Type::TypeAliasType { args, type_ref } => {
+            let snap = alias_resolver.get(type_ref)?;
+            if snap.tvar_tuple_index.is_some() {
+                return None;
+            }
+            let expanded_args: Vec<Type> = args
+                .iter()
+                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<_>>()?;
+            if snap.no_args {
+                let target = decode_type(&snap.target)?;
+                if let Type::Instance { type_ref, .. } = &target {
+                    return Some(Type::Instance {
+                        type_ref: type_ref.clone(),
+                        args: expanded_args,
+                        last_known_value: None,
+                        extra_attrs: None,
+                    });
+                }
+                return expand_aliases_depth(&target, alias_resolver, strict_optional, depth + 1);
+            }
+            let mut env: std::collections::HashMap<crate::expandtype::EnvKey, Type> =
+                std::collections::HashMap::new();
+            for (tvar, arg) in snap.alias_tvars.iter().zip(expanded_args.iter()) {
+                env.insert(
+                    (tvar.raw_id, tvar.meta_level, tvar.namespace.clone()),
+                    arg.clone(),
+                );
+            }
+            let target = decode_type(&snap.target)?;
+            let substituted = crate::expandtype::expand_type_inner(&target, &env, strict_optional)?;
+            expand_aliases_depth(&substituted, alias_resolver, strict_optional, depth + 1)
+        }
+        Type::Instance {
+            type_ref,
+            args,
+            last_known_value,
+            extra_attrs,
+        } => {
+            if args.is_empty() {
+                return Some(typ.clone());
+            }
+            let new_args = args
+                .iter()
+                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::Instance {
+                type_ref: type_ref.clone(),
+                args: new_args,
+                last_known_value: last_known_value.clone(),
+                extra_attrs: extra_attrs.clone(),
+            })
+        }
+        Type::UnionType {
+            items,
+            uses_pep604_syntax,
+            can_be_true,
+            can_be_false,
+        } => {
+            let new_items = items
+                .iter()
+                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::UnionType {
+                items: new_items,
+                uses_pep604_syntax: *uses_pep604_syntax,
+                can_be_true: *can_be_true,
+                can_be_false: *can_be_false,
+            })
+        }
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            from_type_type,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            let fb = expand_aliases_depth(fallback, alias_resolver, strict_optional, depth + 1)?;
+            let it = match instance_type {
+                Some(it) => Some(Box::new(expand_aliases_depth(
+                    it,
+                    alias_resolver,
+                    strict_optional,
+                    depth + 1,
+                )?)),
+                None => None,
+            };
+            let ats: Vec<Type> = arg_types
+                .iter()
+                .map(|a| expand_aliases_depth(a, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<_>>()?;
+            let rt = Box::new(expand_aliases_depth(
+                ret_type,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+            )?);
+            let tg = match type_guard {
+                Some(tg) => Some(Box::new(expand_aliases_depth(
+                    tg,
+                    alias_resolver,
+                    strict_optional,
+                    depth + 1,
+                )?)),
+                None => None,
+            };
+            let ti = match type_is {
+                Some(ti) => Some(Box::new(expand_aliases_depth(
+                    ti,
+                    alias_resolver,
+                    strict_optional,
+                    depth + 1,
+                )?)),
+                None => None,
+            };
+            Some(Type::CallableType {
+                fallback: Box::new(fb),
+                instance_type: it,
+                is_ellipsis_args: *is_ellipsis_args,
+                implicit: *implicit,
+                is_bound: *is_bound,
+                from_concatenate: *from_concatenate,
+                imprecise_arg_kinds: *imprecise_arg_kinds,
+                unpack_kwargs: *unpack_kwargs,
+                from_type_type: *from_type_type,
+                arg_types: ats,
+                arg_kinds: arg_kinds.clone(),
+                arg_names: arg_names.clone(),
+                ret_type: rt,
+                name: name.clone(),
+                variables: variables.clone(),
+                type_guard: tg,
+                type_is: ti,
+            })
+        }
+        Type::Overloaded { items } => {
+            let new_items = items
+                .iter()
+                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Type::Overloaded { items: new_items })
+        }
+        Type::TupleType {
+            items,
+            partial_fallback,
+            implicit,
+        } => {
+            let new_items = items
+                .iter()
+                .map(|i| expand_aliases_depth(i, alias_resolver, strict_optional, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            let fb = Box::new(expand_aliases_depth(
+                partial_fallback,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+            )?);
+            Some(Type::TupleType {
+                items: new_items,
+                partial_fallback: fb,
+                implicit: *implicit,
+            })
+        }
+        Type::TypeType { item, is_type_form } => {
+            let new_item = Box::new(expand_aliases_depth(
+                item,
+                alias_resolver,
+                strict_optional,
+                depth + 1,
+            )?);
+            Some(Type::TypeType {
+                item: new_item,
+                is_type_form: *is_type_form,
+            })
+        }
+        // Leaf types and unsupported variants: clone as-is. The
+        // TypeAliasType early-return in `is_subtype` catches anything we
+        // miss here.
+        _ => Some(typ.clone()),
+    }
+}
+
 /// Decode a wire-format `Type` blob via `wire::read_type`. Returns
 /// `None` on any read failure (truncated input, unknown tag).
 fn decode_type(bytes: &[u8]) -> Option<Type> {
@@ -2404,6 +2618,8 @@ pub(crate) fn rust_is_subtype(
 ) -> Option<bool> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
+    let left = expand_aliases(&left, resolver.alias_resolver(), strict_optional)?;
+    let right = expand_aliases(&right, resolver.alias_resolver(), strict_optional)?;
     let ctx = SubtypeContext::with_callable_flags(
         ignore_type_params,
         ignore_declared_variance,
@@ -2452,12 +2668,29 @@ pub(crate) fn rust_is_subtype_batch(
         ignore_pos_arg_names,
         strict_concatenate,
     );
-    let resolver = resolver.resolver();
+    let alias_resolver = resolver.alias_resolver();
+    let type_resolver = resolver.resolver();
     let mut out = Vec::with_capacity(pairs_bytes.len() / 2);
     let (chunks, remainder) = pairs_bytes.as_chunks::<2>();
     for [a, b] in chunks {
         let answer = match (decode_type(a), decode_type(b)) {
-            (Some(left), Some(right)) => is_subtype(&left, &right, &ctx, resolver),
+            (Some(left), Some(right)) => {
+                let left = match expand_aliases(&left, alias_resolver, strict_optional) {
+                    Some(t) => t,
+                    None => {
+                        out.push(-1);
+                        continue;
+                    }
+                };
+                let right = match expand_aliases(&right, alias_resolver, strict_optional) {
+                    Some(t) => t,
+                    None => {
+                        out.push(-1);
+                        continue;
+                    }
+                };
+                is_subtype(&left, &right, &ctx, type_resolver)
+            }
             _ => None,
         };
         out.push(match answer {
@@ -3836,5 +4069,260 @@ mod tests {
             &mut NativeTypeResolver::from_resolver(r),
         );
         assert_eq!(got, vec![1, -1]);
+    }
+
+    // --- expand_aliases unit tests ---
+
+    use crate::aliases::{AliasTvar, TypeAliasResolver, TypeAliasSnapshot};
+
+    fn encode_for_alias(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, t).expect("encode type");
+        buf.into_bytes()
+    }
+
+    fn make_alias_resolver(snaps: Vec<TypeAliasSnapshot>) -> TypeAliasResolver {
+        let mut r = TypeAliasResolver::new();
+        for s in snaps {
+            r.insert(s.fullname.clone(), s);
+        }
+        r
+    }
+
+    fn alias_snap(fullname: &str, target: Vec<u8>) -> TypeAliasSnapshot {
+        TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target,
+            ..Default::default()
+        }
+    }
+
+    fn alias_type(args: Vec<Type>, type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args,
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn alias_tvar_fn(name: &str, raw_id: i64) -> AliasTvar {
+        AliasTvar {
+            name: name.to_string(),
+            raw_id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_expand_aliases_simple_no_args() {
+        // A = str; TypeAliasType(A, []) -> Instance(str, [])
+        let target = instance("builtins.str", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(vec![], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(result, Some(instance("builtins.str", vec![])));
+    }
+
+    #[test]
+    fn test_expand_aliases_no_args_with_explicit_args() {
+        // A = List (no_args=True); A[int] -> List[int]
+        let target = instance("builtins.list", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(vec![instance("builtins.int", vec![])], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_generic_substitution() {
+        // A = List[T]; A[int] -> List[int]
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: 1,
+            meta_level: 0,
+        };
+        let target = instance("builtins.list", vec![tvar]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            alias_tvars: vec![alias_tvar_fn("T", 1)],
+            no_args: false,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(vec![instance("builtins.int", vec![])], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.int", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_missing_in_resolver_defers() {
+        // Alias not in resolver -> None (defer to Python)
+        let ar = make_alias_resolver(vec![]);
+        let input = alias_type(vec![], "mod.Missing");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_expand_aliases_variadic_defers() {
+        // tvar_tuple_index set -> None (variadic, defer)
+        let target = instance("builtins.tuple", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            tvar_tuple_index: Some(0),
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = alias_type(vec![], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_expand_aliases_in_union_item() {
+        // Union[A, B] where A = str -> Union[str, B]
+        let target = instance("builtins.str", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = Type::UnionType {
+            items: vec![
+                alias_type(vec![], "mod.A"),
+                instance("builtins.int", vec![]),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: false,
+        };
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(Type::UnionType {
+                items: vec![
+                    instance("builtins.str", vec![]),
+                    instance("builtins.int", vec![]),
+                ],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_in_instance_args() {
+        // List[A] where A = str -> List[str]
+        let target = instance("builtins.str", vec![]);
+        let snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&target),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![snap]);
+        let input = instance("builtins.list", vec![alias_type(vec![], "mod.A")]);
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(
+            result,
+            Some(instance(
+                "builtins.list",
+                vec![instance("builtins.str", vec![])]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_recursive_chain() {
+        // A = B; B = str; A -> str
+        let str_target = instance("builtins.str", vec![]);
+        let b_snap = TypeAliasSnapshot {
+            fullname: "mod.B".to_string(),
+            target: encode_for_alias(&str_target),
+            no_args: true,
+            ..Default::default()
+        };
+        let a_snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&alias_type(vec![], "mod.B")),
+            no_args: true,
+            ..Default::default()
+        };
+        let ar = make_alias_resolver(vec![a_snap, b_snap]);
+        let input = alias_type(vec![], "mod.A");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(result, Some(instance("builtins.str", vec![])));
+    }
+
+    #[test]
+    fn test_expand_aliases_leaf_passthrough() {
+        // Non-alias types pass through unchanged
+        let ar = make_alias_resolver(vec![]);
+        assert_eq!(
+            expand_aliases(&Type::NoneType, &ar, true),
+            Some(Type::NoneType)
+        );
+        assert_eq!(expand_aliases(&any_type(), &ar, true), Some(any_type()));
+        assert_eq!(
+            expand_aliases(&instance("builtins.str", vec![]), &ar, true),
+            Some(instance("builtins.str", vec![]))
+        );
+    }
+
+    #[test]
+    fn test_expand_aliases_depth_cap() {
+        // Chain of 60 aliases exceeds the depth cap (50) -> None
+        let mut snaps = Vec::new();
+        for i in 0..60 {
+            let next = if i == 59 {
+                instance("builtins.str", vec![])
+            } else {
+                alias_type(vec![], &format!("mod.A{}", i + 1))
+            };
+            snaps.push(TypeAliasSnapshot {
+                fullname: format!("mod.A{i}"),
+                target: encode_for_alias(&next),
+                no_args: true,
+                ..Default::default()
+            });
+        }
+        let ar = make_alias_resolver(snaps);
+        let input = alias_type(vec![], "mod.A0");
+        let result = expand_aliases(&input, &ar, true);
+        assert_eq!(result, None);
     }
 }
