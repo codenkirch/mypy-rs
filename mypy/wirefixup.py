@@ -8,10 +8,10 @@ TypeInfo objects before the result can re-enter the type graph, or
 FakeInfo.__getattribute__ raises AssertionError downstream.
 
 This module provides the shared `_TypeRefFixer` (a TypeTranslator that
-resolves type_ref strings to live TypeInfo) and `fixup_wire_type` (the
-convenience entry point). The fixer defers to Python (returns None) when
-any type_ref is absent from the fullname -> TypeInfo map, so callers
-can fall back gracefully.
+resolves type_ref strings to live TypeInfo/TypeAlias) and `fixup_wire_type`
+(the convenience entry point). The fixer defers to Python (returns None)
+when any type_ref is absent from the fullname -> TypeInfo / -> TypeAlias
+maps, so callers can fall back gracefully.
 
 The fixer mutates Instances in place. This is intentional: wire compact
 tags (INSTANCE_STR etc.) return shared cached Instance objects, so
@@ -48,6 +48,7 @@ from mypy.type_visitor import TypeTranslator
 
 _wire_typeinfo_map: dict[str, Any] | None = None
 _last_real_map: dict[str, Any] | None = None
+_wire_alias_map: dict[str, Any] | None = None
 
 
 def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
@@ -82,11 +83,30 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
     _wire_typeinfo_map = typeinfo_map
 
 
-def fixup_wire_type(typ: Type) -> Type | None:
-    """Resolve type_ref strings in a wire-decoded Type to live TypeInfo.
+def set_wire_alias_map(alias_map: dict[str, Any] | None) -> None:
+    """Install the fullname -> TypeAlias map for resolved decoded aliases.
+
+    Mirrors `set_wire_typeinfo_map`: the map lives for the lifetime of the
+    resolver it was derived from (per-build in the daemon, per-case in the
+    parity suites), so it is cleared only by an explicit ``None`` (build
+    teardown / suite teardown), never by the per-SCC resolver resets.
+    """
+    global _wire_alias_map
+    _wire_alias_map = alias_map
+
+
+def fixup_wire_type(typ: Type, *, resolve_aliases: bool = False) -> Type | None:
+    """Resolve type_ref strings in a wire-decoded Type to live objects.
 
     Returns None if the typeinfo map is unset or any Instance's type_ref
-    is absent, so the caller can defer to Python.
+    is absent, so the caller can defer to Python. Decoded TypeAliasTypes
+    resolve through the alias map (see ``set_wire_alias_map``) only when
+    ``resolve_aliases`` is set: the alias-scoped consumers (the typeanal
+    passthrough seam) want the decoded alias re-linked to its live
+    TypeAlias node, while every other seam must keep its previous
+    defer-on-alias behavior (a decoded alias whose args carry live
+    typevars must not be frozen into the graph by, e.g., checkmember's
+    self-arg path).
     """
     if _wire_typeinfo_map is None:
         # No typeinfo map (erasetype/typeops seam): cannot resolve
@@ -94,7 +114,8 @@ def fixup_wire_type(typ: Type) -> Type | None:
         # must never leak into the type graph via a later read_type.
         fixup_instance_cache()
         return None
-    fixer = _TypeRefFixer(_wire_typeinfo_map)
+    alias_map = _wire_alias_map if resolve_aliases else None
+    fixer = _TypeRefFixer(_wire_typeinfo_map, alias_map)
     result = typ.accept(fixer)
     # Also fixup shared instance_cache singletons that read_type may
     # have populated with NOT_READY instances: a failed fixup (returning
@@ -250,9 +271,12 @@ class _TypeRefFixer(TypeTranslator):
     caller can defer to Python.
     """
 
-    def __init__(self, typeinfo_map: dict[str, Any]) -> None:
+    def __init__(
+        self, typeinfo_map: dict[str, Any], alias_map: dict[str, Any] | None = None
+    ) -> None:
         super().__init__()
         self.typeinfo_map = typeinfo_map
+        self.alias_map = alias_map
         self.missing = False
 
     def visit_instance(self, t: Instance, /) -> Type:
@@ -432,17 +456,23 @@ class _TypeRefFixer(TypeTranslator):
     def visit_type_alias_type(self, t: TypeAliasType, /) -> Type:
         if self.missing:
             return t
-        # The wire never carries a live alias node, so a decoded
-        # TypeAliasType has alias=None and type_ref only. Fixing it up
-        # is impossible (there is nothing to resolve the type_ref to),
-
-        # and leaking an unfixed alias breaks is_recursive()/str() with
-        # an AssertionError or prints "<alias (unfixed)>". Defer to the
-        # pure-Python visitor instead, mirroring expand's _needs_python
-
-        # contract for nodes a kernel round-trip cannot carry.
-        self.missing = True
-        return t
+        # Decoded aliases have alias=None and a type_ref string. Resolve
+        # the ref to a live TypeAlias when a map is installed (mirrors
+        # fixup.py); otherwise defer to Python (unfixed alias breaks str).
+        if t.type_ref is not None:
+            if self.alias_map is None:
+                self.missing = True
+                return t
+            alias = self.alias_map.get(t.type_ref)
+            if alias is None:
+                self.missing = True
+                return t
+            t.alias = alias
+            t.type_ref = None
+        args = [a.accept(self) for a in t.args]
+        if self.missing:
+            return t  # type: ignore[unreachable]
+        return t.copy_modified(args=args)
 
 
 class _FakeInfoGuard(mypy.type_visitor.TypeQuery[bool]):

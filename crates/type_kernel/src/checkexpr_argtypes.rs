@@ -522,17 +522,15 @@ mod tests {
 
     #[test]
     fn typealias_defers() {
-        // A TypeAliasType cannot cross the wire (write_type refuses it),
-        // so the seam seal is on serialization; the internal guard that
-        // would otherwise expand the alias also refuses, so a Rust-side
-
-        // decision never fabricates an alias expansion.
+        // A TypeAliasType carries no resolved target on the wire, so the
+        // proper-type expansion (which needs the resolver) defers; the
+        // wire round-trip itself now succeeds (alias passed through).
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
         };
         let mut buf = WriteBuffer::new();
-        assert!(write_type(&mut buf, &alias).is_err());
+        write_type(&mut buf, &alias).unwrap();
         assert!(get_proper_type_or_none(&alias).is_none());
     }
 

@@ -3283,17 +3283,18 @@ mod tests {
     fn separate_union_literals_alias_defers() {
         // A TypeAliasType in a union item defers the whole call: Python
         // classifies via get_proper_type (expands aliases), which Rust cannot
-        // bucket without the resolver.
+        // bucket without the resolver. The wire now carries the alias as-is
+        // (args + type_ref), but the union classification must still defer.
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
         };
         let i = plain_instance("builtins.int");
         let union = union_of(vec![alias, i]);
-        // Alias-bearing types are not wire-encodable at all: writing one drops
-        // the alias node, so the wire refuses it and the call defers to Python
-        // at the encode boundary (same deferral intent as a None return).
-        assert!(super::encode_type(&union).is_none());
+        // Alias-bearing unions never yield a Rust-side decision: the
+        // classification defers to Python at the get_proper_type boundary
+        // (same deferral intent as a None return).
+        assert!(super::encode_type(&union).is_some());
     }
 
     // ------------------------------------------------------------------
@@ -3407,10 +3408,10 @@ mod tests {
             args: vec![tv_type(1, "T")],
             type_ref: "mod.Alias".to_string(),
         };
-        // Alias-bearing types never cross the wire: the writer refuses
-        // TypeAliasType (alias node would be lost), so extraction defers to
-        // the Python visitor at the encode boundary.
-        assert!(super::encode_type(&alias).is_none());
+        // The wire now carries alias-bearing types (args + type_ref), so
+        // extraction succeeds at the encode boundary but still defers in
+        // the visitor (no resolver to expand through).
+        assert!(super::encode_type(&alias).is_some());
     }
 
     // ------------------------------------------------------------------
@@ -3478,7 +3479,9 @@ mod tests {
             args: vec![],
             type_ref: "mod.Alias".to_string(),
         };
-        assert!(super::encode_type(&alias).is_none());
+        // Round-trip succeeds (args + type_ref), but erase_to_bound's
+        // expansion needs the resolver, so the erasure still defers.
+        assert!(super::encode_type(&alias).is_some());
     }
 
     // ------------------------------------------------------------------

@@ -1578,6 +1578,18 @@ fn conditional_join_inner(
     else_type: &Type,
     resolver: &TypeResolver,
 ) -> Option<Vec<u8>> {
+    // Python's join calls get_proper_type first, expanding aliases. The
+    // wire TypeAliasType has no resolved target, so a join touching one
+    // would fabricate a wrong answer; defer to Python.
+    if matches!(
+        if_type,
+        Type::TypeAliasType { .. } | Type::UnpackType { .. }
+    ) || matches!(
+        else_type,
+        Type::TypeAliasType { .. } | Type::UnpackType { .. }
+    ) {
+        return None;
+    }
     use crate::subtypes::SubtypeContext;
 
     // Build the subtype context: strict_optional = true (safe default).
@@ -4681,6 +4693,9 @@ mod tests {
             type_ref: "mod.A".to_string(),
         };
         let i = make_instance("builtins.int", vec![]);
+        // Python's join expands aliases via get_proper_type; the wire
+        // alias has no resolved target, so the join must defer (never
+        // fabricate a wrong answer from an unexpanded alias).
         assert_eq!(conditional_join_inner(&alias, &i, &empty_resolver()), None);
     }
 
@@ -4707,13 +4722,25 @@ mod tests {
 
     #[test]
     fn test_visit_temp_node_alias_defers() {
-        // TypeAliasType cannot be round-tripped without alias target → None.
+        // TypeAliasType round-trips the wire now (args + type_ref), but
+        // visit_temp_node's proper-type expansion still needs the resolver,
+        // so the temp-node decision defers.
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
         };
-        let bytes = encode_type(&alias);
-        assert_eq!(bytes, None);
+        let bytes = encode_type(&alias).unwrap();
+        assert!(alias_matches(&decode_type(&bytes).unwrap()));
+    }
+
+    fn alias_matches(t: &Type) -> bool {
+        matches!(
+            t,
+            Type::TypeAliasType {
+                type_ref: r,
+                ..
+            } if r == "mod.A"
+        )
     }
 
     // -- join_type_list_inner --
