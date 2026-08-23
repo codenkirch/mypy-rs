@@ -237,8 +237,8 @@ try:
         rust_arg_approximate_similarity as _rust_arg_approximate_similarity,
         rust_build_tuple_type as _rust_build_tuple_type,
         rust_calibrate_type_obj_return as _rust_calibrate_type_obj_return,
-        rust_check_argument_count as _rust_check_argument_count,
         rust_callable_type as _rust_callable_type,
+        rust_check_argument_count as _rust_check_argument_count,
         rust_check_argument_types_plan as _rust_check_argument_types_plan,
         rust_check_callable_call as _rust_check_callable_call,
         rust_check_operator as _rust_check_operator,
@@ -593,6 +593,16 @@ def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
         return None
 
 
+# bytes -> decoded argtypes-plan cache.  The native argtypes-plan path
+# returns one wire blob per formal; ~91% repeat across calls, so
+# memoizing decode+fixup cuts the largest fixup caller.
+_argtypes_plan_cache: dict[bytes, tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None] = {}
+
+
+def _clear_argtypes_plan_cache() -> None:
+    _argtypes_plan_cache.clear()
+
+
 def _decode_argtypes_plan(
     raw: bytes,
 ) -> tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None:
@@ -611,7 +621,19 @@ def _decode_argtypes_plan(
     decision (tag 1/2). Returns None on decode/fixup failure so the
     caller can fall back to the pure-Python body. Resolves type_refs to
     live TypeInfo via wirefixup, matching `_deserialize_type_from_checkexpr`.
+
+    Decoded plans are memoized by wire bytes.  The decoded types are
+    shared across calls: the consumer (check_argument_types) reads them
+    via `expand_actual_type`/`check_arg`, which only build derived types
+    and error messages from them (no in-place mutation), and fresh-var
+    identity is preserved since decode re-materializes the same
+    TypeVarId objects for equal wire bytes.  The cache is cleared on a
+    wire-typeinfo map replacement so stale resolutions cannot survive
+    into a re-built type graph.
     """
+    cached = _argtypes_plan_cache.get(raw)
+    if cached is not None:
+        return cached
     try:
         from mypy.cache import read_int_bare, read_int_list
         from mypy.nodes import ArgKind
@@ -620,7 +642,15 @@ def _decode_argtypes_plan(
         buf = _CheckExprReadBuffer(raw)
         tag = read_int_bare(buf)
         if tag != 0:
-            return (tag, [], [], [], [])
+            result: tuple[int, list[Type], list[ArgKind], list[Type], list[ArgKind]] | None = (
+                tag,
+                [],
+                [],
+                [],
+                [],
+            )
+            _argtypes_plan_cache[raw] = result
+            return result
         callee_arg_types = read_type_list(buf)
         callee_arg_kinds = [ArgKind(k) for k in read_int_list(buf)]
         actual_types = read_type_list(buf)
@@ -629,13 +659,15 @@ def _decode_argtypes_plan(
         fixed_actual = [fixup_wire_type(t) for t in actual_types]
         if any(t is None for t in fixed_callee + fixed_actual):
             return None
-        return (
+        result = (
             tag,
             [t for t in fixed_callee if t is not None],
             callee_arg_kinds,
             [t for t in fixed_actual if t is not None],
             actual_kinds,
         )
+        _argtypes_plan_cache[raw] = result
+        return result
     except (AssertionError, ValueError, NotImplementedError):
         return None
 
