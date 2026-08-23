@@ -3463,6 +3463,11 @@ def native_analyze_type(
     """
     if not _TYPEANAL_HAS_KERNEL or not _native_typeanal_active:
         return None
+    # The Rust path always defers UnboundType/PlaceholderType (they need
+    # symbol lookup or deferral side effects). Skip the wire round-trip so
+    # the hot path does not serialize+decode for known-deferred inputs.
+    if isinstance(t, (UnboundType, PlaceholderType)):
+        return None
     try:
         payload = _serialize_typeanal_type(t)
         result = _rust_type_analyze(payload, allow_tuple_literal, allow_param_spec_literals, allow_unpack)

@@ -1878,6 +1878,48 @@ mod tests {
         };
         assert_eq!(unknown_unpack_inner(&unpacked), None);
     }
+
+    fn make_tuple(items: Vec<Type>, implicit: bool) -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items,
+            implicit,
+        }
+    }
+
+    #[test]
+    fn test_analyze_tuple_implicit_defers_without_tuple_literal() {
+        // visit_tuple_type: implicit && !allow_tuple_literal emits an
+        // error and returns Any(from_error); Rust must defer, not return
+        // the tuple unchanged.
+        let t = make_tuple(vec![make_instance("builtins.int", vec![])], true);
+        assert_eq!(analyze_type_inner(&t, false, false, false), None);
+        // When tuple literals are allowed, implicit tuples analyze fine.
+        let t2 = make_tuple(vec![make_instance("builtins.int", vec![])], true);
+        assert!(analyze_type_inner(&t2, true, false, false).is_some());
+        // Explicit tuples need no guard.
+        let t3 = make_tuple(vec![make_instance("builtins.int", vec![])], false);
+        assert!(analyze_type_inner(&t3, false, false, false).is_some());
+    }
+
+    #[test]
+    fn test_analyze_union_unpack_child_defers() {
+        // visit_union_type analyzes items with allow_unpack=False
+        // regardless of the outer flag, so an UnpackType child must
+        // defer to Python's error path.
+        let unpacked = Type::UnpackType {
+            typ: Box::new(make_instance("builtins.int", vec![])),
+        };
+        let t = make_union(vec![make_instance("builtins.str", vec![]), unpacked]);
+        assert_eq!(analyze_type_inner(&t, false, false, true), None);
+        // A union without Unpack children still analyzes (outer flag
+        // irrelevant for plain items).
+        let t2 = make_union(vec![
+            make_instance("builtins.str", vec![]),
+            make_instance("builtins.int", vec![]),
+        ]);
+        assert!(analyze_type_inner(&t2, false, false, true).is_some());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,25 +1993,24 @@ fn analyze_type_inner(
                 type_ref: type_ref.clone(),
                 args,
                 last_known_value: lkv,
-                extra_attrs: extra_attrs.as_ref().map(|ea| ExtraAttrs {
-                    attrs: ea
-                        .attrs
-                        .iter()
-                        .map(|(k, v)| {
-                            (
-                                k.clone(),
-                                analyze_type_inner(
-                                    v,
-                                    allow_tuple_literal,
-                                    allow_param_spec_literals,
-                                    allow_unpack,
-                                )
-                                .unwrap(),
-                            )
-                        })
-                        .collect(),
-                    immutable: ea.immutable.clone(),
-                    mod_name: ea.mod_name.clone(),
+                extra_attrs: extra_attrs.as_ref().and_then(|ea| {
+                    let mut attrs = std::collections::HashMap::with_capacity(ea.attrs.len());
+                    for (k, v) in &ea.attrs {
+                        attrs.insert(
+                            k.clone(),
+                            analyze_type_inner(
+                                v,
+                                allow_tuple_literal,
+                                allow_param_spec_literals,
+                                allow_unpack,
+                            )?,
+                        );
+                    }
+                    Some(ExtraAttrs {
+                        attrs,
+                        immutable: ea.immutable.clone(),
+                        mod_name: ea.mod_name.clone(),
+                    })
                 }),
             })
         }
@@ -2313,6 +2354,12 @@ fn analyze_type_inner(
             items,
             implicit,
         } => {
+            // visit_tuple_type errors on implicit tuples unless tuple
+            // literals are allowed and returns Any(from_error). Rust
+            // cannot reproduce that side effect, so defer.
+            if *implicit && !allow_tuple_literal {
+                return None;
+            }
             let partial_fallback = Box::new(analyze_type_inner(
                 partial_fallback,
                 allow_tuple_literal,
@@ -2385,12 +2432,11 @@ fn analyze_type_inner(
             can_be_true,
             can_be_false,
         } => {
-            let items = analyze_type_list(
-                items,
-                allow_tuple_literal,
-                allow_param_spec_literals,
-                allow_unpack,
-            )?;
+            // visit_union_type analyzes items with allow_unpack=False
+            // (anal_array default) regardless of the outer flag, so an
+            // UnpackType child defers to Python's error path.
+            let items =
+                analyze_type_list(items, allow_tuple_literal, allow_param_spec_literals, false)?;
             Some(Type::UnionType {
                 items,
                 uses_pep604_syntax: *uses_pep604_syntax,
