@@ -4,7 +4,8 @@
 //! Ports:
 //!   * `custom_special_method` (typeops.py:1555) — does a type have a
 //!     custom special method (e.g. `__eq__`) not inherited from
-//!     `builtins.` / `typing.`? Uses the `member_definers` snapshot field.
+//!     `builtins.` / `typing.`? Uses the `member_definers` snapshot
+//!     field and walks the snapshot MRO to match `TypeInfo.get`.
 //!   * `has_custom_eq_checks` (checker.py:9493) — thin wrapper calling
 //!     `custom_special_method` for `__eq__` and `__ne__`.
 //!   * `restrict_subtype_away` (subtypes.py:2363) — `t minus s` for
@@ -71,22 +72,7 @@ pub(crate) fn custom_special_method_inner(
 ) -> Option<bool> {
     let proper = get_proper_or_none(typ)?;
     match proper {
-        Type::Instance { type_ref, .. } => {
-            let snap = resolver.get(type_ref)?;
-            let (kind, definer) = snap.member_definers.get(name)?;
-            // Node must be FuncBase(0) / Decorator(1) / Var(2); the
-            // snapshot only stores those kinds, so any entry qualifies.
-            if *kind < 0 {
-                return Some(false);
-            }
-            // method.node.info.fullname.startswith(("builtins.", "typing."))
-            // -> NOT custom (returns False).
-            if definer.starts_with("builtins.") || definer.starts_with("typing.") {
-                Some(false)
-            } else {
-                Some(true)
-            }
-        }
+        Type::Instance { type_ref, .. } => instance_custom_special_method(type_ref, name, resolver),
         Type::UnionType { items, .. } => {
             if check_all {
                 // all(...) — short-circuit on first None or false.
@@ -135,18 +121,14 @@ pub(crate) fn custom_special_method_inner(
             ..
         } if is_type_obj(fallback, ret_type, *from_concatenate, resolver) => {
             // FunctionLike.is_type_obj(): look up on the metaclass
-            // (the fallback). For CallableType, `is_type_obj` means
-
-            // fallback.type.is_metaclass() and ret_type is not
-            // UninhabitedType. We recurse on the fallback Instance.
+            // (the fallback). `is_type_obj`: fallback.type.is_metaclass()
+            // and ret_type is not UninhabitedType; recurse on the fallback.
             custom_special_method_inner(fallback, name, check_all, resolver)
         }
         Type::Overloaded { items } => {
             // FunctionLike.is_type_obj(): all items agree, so check
             // items[0]. If it's a type obj, recurse on its fallback;
-            // otherwise defer (the Python path checks the fallback
-
-            // via `typ.fallback` which the wire Overloaded lacks).
+            // otherwise Python falls through to return False.
             if let Some(Type::CallableType {
                 fallback,
                 ret_type,
@@ -158,43 +140,53 @@ pub(crate) fn custom_special_method_inner(
                     return custom_special_method_inner(fallback, name, check_all, resolver);
                 }
             }
-            None
+            Some(false)
         }
         Type::TypeType { item, .. } => {
             if let Type::Instance { type_ref, .. } = item.as_ref() {
-                if let Some(snap) = resolver.get(type_ref) {
-                    if let Some(metaclass_fullname) = &snap.metaclass_fullname {
-                        // Look up __method__ on the metaclass for class
-                        // objects (typeops.py:1584-1586).
-                        if let Some(meta_snap) = resolver.get(metaclass_fullname) {
-                            return custom_special_method_on_snap(meta_snap, name, check_all);
-                        }
-                    }
+                if let Some(metaclass_fullname) = &resolver.get(type_ref)?.metaclass_fullname {
+                    // Look up __method__ on the metaclass for class objects
+                    // (typeops.py:1584-1586), recursing on the metaclass
+                    // Instance through the usual MRO walk.
+                    return instance_custom_special_method(metaclass_fullname, name, resolver);
                 }
             }
-            None
+            Some(false)
         }
         Type::AnyType { .. } => Some(true),
         _ => Some(false),
     }
 }
 
-/// Lookup `name` directly on a `TypeInfoSnapshot`'s `member_definers`.
-/// Used by the `TypeType` branch where we recurse on the metaclass.
-fn custom_special_method_on_snap(
-    snap: &crate::typeinfo::TypeInfoSnapshot,
+/// Instance branch of `custom_special_method` (typeops.py:1951-1956):
+/// `typ.type.get(name)` walks the MRO and the first class with a
+/// truthy `SymbolTableNode` decides (nodes.py:4063-4068). A method
+/// counts as custom iff its defining class (the snapshot's
+/// `member_definers` value, `node.info.fullname`) is not under
+/// `builtins.` / `typing.`.
+///
+/// Walk the snapshot MRO (same pattern as
+/// `dangerous_comparison.rs::instance_has_custom_eq_mro`, parameterized
+/// by `name`). `None` when the type's own snapshot or any ancestor's is
+/// missing; that safely defers to the Python fallback.
+pub(crate) fn instance_custom_special_method(
+    type_ref: &str,
     name: &str,
-    _check_all: bool,
+    resolver: &TypeResolver,
 ) -> Option<bool> {
-    let (kind, definer) = snap.member_definers.get(name)?;
-    if *kind < 0 {
-        return Some(false);
+    let snap = resolver.get(type_ref)?;
+    for ancestor in &snap.mro {
+        let ancestor_snap = resolver.get(ancestor)?;
+        let Some((_kind, definer)) = ancestor_snap.member_definers.get(name) else {
+            continue;
+        };
+        if definer.starts_with("builtins.") || definer.starts_with("typing.") {
+            return Some(false);
+        }
+        return Some(true);
     }
-    if definer.starts_with("builtins.") || definer.starts_with("typing.") {
-        Some(false)
-    } else {
-        Some(true)
-    }
+    // MRO exhausted: Python's tail also returns False.
+    Some(false)
 }
 
 /// Whether a `CallableType` is a type object. Mirrors
@@ -258,18 +250,11 @@ pub(crate) fn rust_custom_special_method(
 fn has_custom_eq_checks_inner(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
     // custom_special_method(t, "__eq__", check_all=False) or
     // custom_special_method(t, "__ne__", check_all=False)
-    // Defer (return None) when either call returns None, matching the
-
-    // Python `or` short-circuit: if __eq__ is None, the result is None
-    // (the `or` of None and bool is None in the parity contract).
     match custom_special_method_inner(typ, "__eq__", false, resolver) {
         Some(true) => Some(true),
-        None => None,
-        Some(false) => match custom_special_method_inner(typ, "__ne__", false, resolver) {
-            Some(true) => Some(true),
-            Some(false) => Some(false),
-            None => None,
-        },
+        // Python `or` short-circuits: `True or anything` is True (above),
+        // `False or x` evaluates x, and `None or x` evaluates x.
+        Some(false) | None => custom_special_method_inner(typ, "__ne__", false, resolver),
     }
 }
 
@@ -762,6 +747,9 @@ mod tests {
         let mut snap = TypeInfoSnapshot {
             fullname: type_ref.to_string(),
             name: type_ref.rsplit('.').next().unwrap_or(type_ref).to_string(),
+            // Real snapshots always include the class itself in the MRO
+            // (TypeInfo.get walks it, nodes.py:4063-4068).
+            mro: vec![type_ref.to_string()],
             ..Default::default()
         };
         snap.member_definers
@@ -776,6 +764,7 @@ mod tests {
             fullname: type_ref.to_string(),
             name: type_ref.rsplit('.').next().unwrap_or(type_ref).to_string(),
             metaclass_fullname: Some(metaclass_fullname.to_string()),
+            mro: vec![type_ref.to_string()],
             ..Default::default()
         };
         r.insert(type_ref.to_string(), snap);
@@ -786,10 +775,37 @@ mod tests {
                 .next()
                 .unwrap_or(metaclass_fullname)
                 .to_string(),
+            mro: vec![metaclass_fullname.to_string()],
             ..Default::default()
         };
         r.insert(metaclass_fullname.to_string(), meta_snap);
         r
+    }
+
+    fn make_callable(fallback_ref: &str) -> Type {
+        Type::CallableType {
+            fallback: Box::new(make_instance(fallback_ref, vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: true,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
     }
 
     // -- custom_special_method --
@@ -828,14 +844,222 @@ mod tests {
     fn test_custom_special_method_missing_member() {
         let r = make_resolver_with_definer("mymod.Foo", "__ne__", 0, "mymod.Foo");
         let t = make_instance("mymod.Foo", vec![]);
-        // __eq__ not in member_definers -> None (defer).
+        // __eq__ not in member_definers, MRO exhausted -> Some(false),
+        // matching Python's `return False` tail (typeops.py:1956).
+        assert_eq!(
+            custom_special_method_inner(&t, "__eq__", false, &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_inherited_from_object() {
+        // Class without a custom __eq__: the MRO walk finds it on
+        // builtins.object and reports it as not-custom.
+        let mut r = TypeResolver::new();
+        let snap = TypeInfoSnapshot {
+            fullname: "mymod.Foo".to_string(),
+            name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        r.insert("mymod.Foo".to_string(), snap);
+        let mut obj_snap = TypeInfoSnapshot {
+            fullname: "builtins.object".to_string(),
+            name: "object".to_string(),
+            mro: vec!["builtins.object".to_string()],
+            ..Default::default()
+        };
+        obj_snap
+            .member_definers
+            .insert("__eq__".to_string(), (0, "builtins.object".to_string()));
+        r.insert("builtins.object".to_string(), obj_snap);
+        let t = make_instance("mymod.Foo", vec![]);
+        assert_eq!(
+            custom_special_method_inner(&t, "__eq__", false, &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_inherited_custom() {
+        // Class inherits a custom __eq__ from an ancestor: the MRO walk
+        // finds the ancestor's defining class and reports it as custom.
+        let mut r = TypeResolver::new();
+        let snap = TypeInfoSnapshot {
+            fullname: "mymod.Child".to_string(),
+            name: "Child".to_string(),
+            mro: vec![
+                "mymod.Child".to_string(),
+                "mymod.Base".to_string(),
+                "builtins.object".to_string(),
+            ],
+            ..Default::default()
+        };
+        r.insert("mymod.Child".to_string(), snap);
+        let base_snap = TypeInfoSnapshot {
+            fullname: "mymod.Base".to_string(),
+            name: "Base".to_string(),
+            mro: vec!["mymod.Base".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        r.insert("mymod.Base".to_string(), base_snap);
+        let mut obj_snap = TypeInfoSnapshot {
+            fullname: "builtins.object".to_string(),
+            name: "object".to_string(),
+            mro: vec!["builtins.object".to_string()],
+            ..Default::default()
+        };
+        obj_snap
+            .member_definers
+            .insert("__eq__".to_string(), (0, "builtins.object".to_string()));
+        r.insert("builtins.object".to_string(), obj_snap);
+        let mut base = TypeInfoSnapshot {
+            fullname: "mymod.Base".to_string(),
+            name: "Base".to_string(),
+            mro: vec!["mymod.Base".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        base.member_definers
+            .insert("__eq__".to_string(), (0, "mymod.Base".to_string()));
+        r.insert("mymod.Base".to_string(), base);
+        let t = make_instance("mymod.Child", vec![]);
+        assert_eq!(
+            custom_special_method_inner(&t, "__eq__", false, &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_missing_ancestor_snapshot_defers() {
+        // MRO names an ancestor with no snapshot -> None (defer to
+        // Python), never a guessed bool.
+        let mut r = TypeResolver::new();
+        let snap = TypeInfoSnapshot {
+            fullname: "mymod.Foo".to_string(),
+            name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string(), "mymod.Missing".to_string()],
+            ..Default::default()
+        };
+        r.insert("mymod.Foo".to_string(), snap);
+        let t = make_instance("mymod.Foo", vec![]);
         assert_eq!(custom_special_method_inner(&t, "__eq__", false, &r), None);
+    }
+
+    #[test]
+    fn test_custom_special_method_non_type_obj_overloaded_false() {
+        // Overloaded whose first item is not a type obj (plain function
+        // fallback, not a metaclass): FunctionLike.is_type_obj() False,
+        // so Python falls through to the `return False` tail.
+        let r = TypeResolver::new();
+        let callable = make_callable("builtins.function");
+        let overloaded = Type::Overloaded {
+            items: vec![callable],
+        };
+        assert_eq!(
+            custom_special_method_inner(&overloaded, "__eq__", false, &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_type_obj_overloaded_via_metaclass() {
+        // Overloaded whose first item IS a type obj (fallback is
+        // builtins.type): recurse on the fallback Instance MRO.
+        let r = make_resolver_with_definer("builtins.type", "__eq__", 0, "builtins.type");
+        let callable = make_callable("builtins.type");
+        let overloaded = Type::Overloaded {
+            items: vec![callable],
+        };
+        assert_eq!(
+            custom_special_method_inner(&overloaded, "__eq__", false, &r),
+            Some(false)
+        );
+        // Same, with a custom __eq__ on builtins.type.
+        let r2 = make_resolver_with_definer("builtins.type", "__eq__", 0, "mymod.CustomDef");
+        assert_eq!(
+            custom_special_method_inner(&overloaded, "__eq__", false, &r2),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_callable_type_obj_negative() {
+        // A bare CallableType (not Overloaded) whose fallback is a
+        // metaclass recurses the same way.
+        let r = make_resolver_with_definer("builtins.type", "__eq__", 0, "builtins.type");
+        let callable = make_callable("builtins.type");
+        assert_eq!(
+            custom_special_method_inner(&callable, "__eq__", false, &r),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_typetype_metaclass() {
+        // TypeType(Instance(C)): look __eq__ up via C's metaclass MRO.
+        let mut r = TypeResolver::new();
+        let c_snap = TypeInfoSnapshot {
+            fullname: "mymod.C".to_string(),
+            name: "C".to_string(),
+            metaclass_fullname: Some("mymod.Meta".to_string()),
+            mro: vec!["mymod.C".to_string()],
+            ..Default::default()
+        };
+        r.insert("mymod.C".to_string(), c_snap);
+        let mut meta_snap = TypeInfoSnapshot {
+            fullname: "mymod.Meta".to_string(),
+            name: "Meta".to_string(),
+            mro: vec!["mymod.Meta".to_string()],
+            ..Default::default()
+        };
+        meta_snap
+            .member_definers
+            .insert("__eq__".to_string(), (0, "mymod.Meta".to_string()));
+        r.insert("mymod.Meta".to_string(), meta_snap);
+        let t = Type::TypeType {
+            item: Box::new(make_instance("mymod.C", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(
+            custom_special_method_inner(&t, "__eq__", false, &r),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_custom_special_method_typetype_item_not_instance() {
+        // TypeType(Any): Python only enters the metaclass branch when
+        // item is an Instance, so it falls through to False.
+        let r = TypeResolver::new();
+        let t = Type::TypeType {
+            item: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            is_type_form: false,
+        };
+        assert_eq!(
+            custom_special_method_inner(&t, "__eq__", false, &r),
+            Some(false)
+        );
     }
 
     #[test]
     fn test_custom_special_method_missing_snapshot() {
         let r = TypeResolver::new();
         let t = make_instance("mymod.NotFound", vec![]);
+        assert_eq!(custom_special_method_inner(&t, "__eq__", false, &r), None);
+    }
+
+    #[test]
+    fn test_custom_special_method_type_alias_defers() {
+        let r = TypeResolver::new();
+        let t = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "mymod.Alias".to_string(),
+        };
         assert_eq!(custom_special_method_inner(&t, "__eq__", false, &r), None);
     }
 
@@ -912,6 +1136,7 @@ mod tests {
         let mut snap = TypeInfoSnapshot {
             fullname: "mymod.Foo".to_string(),
             name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string()],
             ..Default::default()
         };
         snap.member_definers
@@ -929,6 +1154,7 @@ mod tests {
         let mut snap = TypeInfoSnapshot {
             fullname: "builtins.int".to_string(),
             name: "int".to_string(),
+            mro: vec!["builtins.int".to_string()],
             ..Default::default()
         };
         snap.member_definers
@@ -944,6 +1170,69 @@ mod tests {
     fn test_has_custom_eq_checks_defers_on_missing() {
         let r = TypeResolver::new();
         let t = make_instance("mymod.NotFound", vec![]);
+        assert_eq!(has_custom_eq_checks_inner(&t, &r), None);
+    }
+
+    #[test]
+    fn test_has_custom_eq_checks_mro_defers_but_ne_custom() {
+        // __eq__ defers (missing snapshot) but Python's `or` still
+        // evaluates __ne__, which is custom -> Some(true), not None.
+        let mut r = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "mymod.Foo".to_string(),
+            name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string(), "mymod.Unknown".to_string()],
+            ..Default::default()
+        };
+        snap.member_definers
+            .insert("__ne__".to_string(), (0, "mymod.Foo".to_string()));
+        r.insert("mymod.Foo".to_string(), snap);
+        let t = make_instance("mymod.Foo", vec![]);
+        assert_eq!(has_custom_eq_checks_inner(&t, &r), Some(true));
+    }
+
+    #[test]
+    fn test_has_custom_eq_checks_ne_builtins_when_eq_defers() {
+        // __eq__ defers, __ne__ resolves to builtins -> Some(false).
+        let mut r = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "mymod.Foo".to_string(),
+            name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.member_definers
+            .insert("__ne__".to_string(), (0, "builtins.object".to_string()));
+        r.insert("mymod.Foo".to_string(), snap);
+        let mut obj_snap = TypeInfoSnapshot {
+            fullname: "builtins.object".to_string(),
+            name: "object".to_string(),
+            mro: vec!["builtins.object".to_string()],
+            ..Default::default()
+        };
+        obj_snap
+            .member_definers
+            .insert("__eq__".to_string(), (0, "builtins.object".to_string()));
+        obj_snap
+            .member_definers
+            .insert("__ne__".to_string(), (0, "builtins.object".to_string()));
+        r.insert("builtins.object".to_string(), obj_snap);
+        let t = make_instance("mymod.Foo", vec![]);
+        assert_eq!(has_custom_eq_checks_inner(&t, &r), Some(false));
+    }
+
+    #[test]
+    fn test_has_custom_eq_checks_mro_defers_both() {
+        // __eq__ defers and __ne__ defers -> None, falling back to Python.
+        let mut r = TypeResolver::new();
+        let snap = TypeInfoSnapshot {
+            fullname: "mymod.Foo".to_string(),
+            name: "Foo".to_string(),
+            mro: vec!["mymod.Foo".to_string(), "mymod.Unknown".to_string()],
+            ..Default::default()
+        };
+        r.insert("mymod.Foo".to_string(), snap);
+        let t = make_instance("mymod.Foo", vec![]);
         assert_eq!(has_custom_eq_checks_inner(&t, &r), None);
     }
 
