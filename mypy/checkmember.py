@@ -72,6 +72,7 @@ from mypy.types import (
     ProperType,
     TupleType,
     Type,
+    TypeAliasType,
     TypedDictType,
     TypeOfAny,
     TypeType,
@@ -498,12 +499,17 @@ def _analyze_member_access(
     # ParamSpec/TypeVarTuple fallback recursion).  Returns None (Python
     # None) for branches needing plugin state, union construction, error
 
-    # reporting, or resolver lookups — Python falls through.
+    # reporting, or resolver lookups: Python falls through.  The
+    # isinstance gate below also skips types Rust always defers on.
     if (
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
         and _rust_analyze_member_access is not None
+        and not isinstance(
+            typ,
+            (Instance, UnionType, TypeType, TypedDictType, NoneType, DeletedType, TypeAliasType),
+        )
     ):
         try:
             result = _rust_analyze_member_access(
