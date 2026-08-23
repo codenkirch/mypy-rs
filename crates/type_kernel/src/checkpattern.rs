@@ -651,10 +651,11 @@ fn construct_sequence_child_inner(
     if !can_seq {
         return encode_type(sequence);
     }
-    // Single by-instance expansion; equals Python's two-step split
-    // (expand_type_by_instance(empty, sequence) then (partial, proper)),
-    // which leaves a TypeVar the second call would reject for this subset.
-    let final_t = crate::expandtype::expand_type_by_instance_core(empty_type, outer, res, true)?;
+    // Mirror Python's two-step split (checkpattern.py:976-977): bind the
+    // class tvars from the narrowed sequence args, then re-expand; a single
+    // expand against `outer` would substitute object, not the narrowed int.
+    let step1 = crate::expandtype::expand_type_by_instance_core(empty_type, sequence, res, true)?;
+    let final_t = crate::expandtype::expand_type_by_instance_core(&step1, outer, res, true)?;
     encode_type(&final_t)
 }
 

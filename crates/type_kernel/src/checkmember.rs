@@ -625,24 +625,37 @@ pub(crate) fn rust_defined_in_superclass(
 /// `mypy.checkmember.analyze_instance_member_access` (checkmember.py:388-453),
 /// the method branch (checkmember.py:415-453), Rust subset.
 ///
-/// Ports the map-then-expand tail of the method path for a **static**,
-/// non-overloaded method: `map_instance_to_supertype` +
+/// Ports the map-then-expand tail of the method path for a **static** or
+/// **trivial-self** non-overloaded method: `map_instance_to_supertype` +
 /// `expand_type_by_instance` + `freeze_all_type_vars`. The Python caller
 /// freshens the signature before dispatching, so method-level type vars are
 /// freshened (raw_ids that are not class vars); Rust's
 /// `expand_type_with_env` defers any result that still contains a TypeVar,
 /// so methods generic over their own type vars fall through to Python.
 ///
-/// The caller gates on `method.is_static`, which guarantees the signature is
-/// not bound (non-static methods go through `bind_self`/`check_self_arg` on
-/// the Python side); a bound callable is not representable here because
-/// expand defers `is_bound`. Returns `None` (Python falls through) for:
+/// The caller gates on `method.is_static` or `method.is_trivial_self`. The
+/// trivial-self path only answers an *exact-class* receiver (the receiver's
+/// `type_ref` equals `method_fullname`); subclass receivers defer to Python
+/// because the class-var substitution on the mapped supertype is not yet
+/// parity-proven. A static signature is never bound; a trivial-self
+/// signature is bound via `bind_self_fast` (checkmember.py:704-705), which
+/// only drops the first argument and sets `is_bound` — no
+/// `__self__`/`__cls__` identity is involved, so Rust can mirror it after
+/// expansion instead of before. Expanding first on the unbound callable
+/// avoids the `is_bound` deferral in `expand_type_inner`; binding then only
+/// trims `arg_types[1:]`, which expansion does not touch semantically (a
+/// trivial self carries no type variables by construction). Returns `None`
+/// (Python falls through) for:
 ///   * a non-Instance `typ`
 ///   * an Overloaded signature (the static overloaded path maps in Python)
 ///   * a missing resolver snapshot / unresolvable derivation path
 ///   * a mapped instance with empty args or a TVT class (expand defers)
-///   * a bound callable or a ParamSpec/Unpack signature (expand defers)
+///   * a ParamSpec/Unpack signature (expand defers)
 ///   * an expanded result that still carries a TypeVar
+///   * a non-Callable trivial-self signature (bind_self_fast_inner's None:
+///     Overloaded with zero items); a zero-arg or *args/**kwargs callable is
+///     returned unchanged by bind_self_fast, and Rust mirrors that as the
+///     unchanged callable, not a deferral
 /// Python's `freeze_all_type_vars` is unported: the signature is already
 /// frozen by this seam (expand produces only bound class vars), so nothing
 /// remains to freeze when the Rust path fully succeeds.
@@ -654,6 +667,7 @@ pub(crate) fn rust_analyze_instance_member_access(
     signature_bytes: &[u8],
     method_fullname: &str,
     strict_optional: bool,
+    is_trivial_self: bool,
 ) -> Option<Vec<u8>> {
     let instance = decode_type(instance_bytes)?;
     let signature = decode_type(signature_bytes)?;
@@ -661,6 +675,12 @@ pub(crate) fn rust_analyze_instance_member_access(
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,
     };
+    // Trivial-self only answers an exact-class receiver: a subclass receiver
+    // needs a class-var substitution not yet parity-proven (generic NamedTuple
+    // subclass historically gave `Any`), so it defers.
+    if is_trivial_self && left_ref != method_fullname {
+        return None;
+    }
     if !matches!(signature, Type::CallableType { .. }) {
         return None; // Overloaded defers to Python
     }
@@ -677,14 +697,25 @@ pub(crate) fn rust_analyze_instance_member_access(
         last_known_value: None,
         extra_attrs: None,
     };
-    // checkmember.py:451 `expand_type_by_instance(signature, typ)`.
+    // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
+    // the unbound callable first (binding would defer the expand).
     let expanded = crate::expandtype::expand_type_by_instance_core(
         &signature,
         &mapped_instance,
         resolver.resolver(),
         strict_optional,
-    )?;
-    encode_type(&expanded)
+    );
+    let expanded = expanded?;
+    if is_trivial_self {
+        if crate::expandtype::result_has_typevar(&expanded) {
+            return None;
+        }
+        let bound = bind_self_fast_inner(&expanded);
+        let bound = bound?;
+        encode_type(&bound)
+    } else {
+        encode_type(&expanded)
+    }
 }
 
 // ---------------------------------------------------------------------------
