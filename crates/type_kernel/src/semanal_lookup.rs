@@ -5,10 +5,11 @@
 //! (`self.lookup(parts[0])`); Rust walks the remaining parts through
 //! `TypeInfo.get(part)` (MRO traversal) using the resolver snapshot.
 //!
-//! Conservative seam: only the `TypeInfo` chain is handled. MypyFile,
-//! TypeAlias, Var, ParamSpecExpr, and PlaceholderNode cases defer
-//! (return `None`) so Python runs the full logic unchanged. This is
-//! the strangler-fig per-call gate.
+//! Conservative seam: the `TypeInfo` chain and the non-Any `Var`
+//! not-found path are handled. MypyFile, TypeAlias, Any-typed Var,
+//! ParamSpecExpr, and PlaceholderNode cases defer (return `None`) so
+//! Python runs the full logic unchanged. This is the strangler-fig
+//! per-call gate.
 
 use pyo3::prelude::*;
 
@@ -34,16 +35,18 @@ const RESULT_NOT_FOUND: i64 = -1;
 /// sym's kind and fullname are passed in; Rust walks `parts[1:]` through
 /// the MRO of each TypeInfo, returning the resolved fullname of the
 /// final member. When any step hits a case Rust doesn't handle
-/// (MypyFile, TypeAlias, Var, PlaceholderNode, missing TypeInfo
-/// snapshot), it returns `None` so Python falls back.
+/// (MypyFile, TypeAlias, Any-typed Var, ParamSpecExpr, PlaceholderNode,
+/// missing TypeInfo snapshot), it returns `None` so Python falls back.
 ///
 /// Returns `Some((RESULT_KIND, fullname))`:
 /// - `(0, fullname)`: resolved to a TypeInfo member; Python calls
 ///   `TypeInfo.get(last_part)` to get the `SymbolTableNode`.
 /// - `(2, "")`: placeholder encountered mid-chain; Python returns
 ///   the current `sym` unchanged.
-/// - `(-1, "")`: member not found in any MRO entry; Python emits the
-///   "name not defined" error (unless `suppress_errors`).
+/// - `(-1, "")`: member not found in any MRO entry (or a non-Any Var
+///   first sym, whose Python else-branch always reports "name not
+///   defined"); Python emits the "name not defined" error (unless
+///   `suppress_errors`).
 #[pyfunction]
 #[pyo3(signature = (resolver, name, first_sym_kind, first_sym_fullname, first_sym_is_any))]
 pub(crate) fn rust_lookup_qualified(
@@ -70,9 +73,10 @@ pub(crate) fn rust_lookup_qualified(
             // Python returns implicit_symbol; we can't build that.
             return Ok(None);
         }
-        // Non-Any Var: nextsym = None path; but might be ParamSpecExpr.
-        // Defer to Python for the ParamSpecExpr args/kwargs check.
-        return Ok(None);
+        // Non-Any Var: Python's else branch sets nextsym = None, reports
+        // "name not defined", returns None. Emit RESULT_NOT_FOUND so the
+        // shim runs the identical name_not_defined path.
+        return Ok(Some((RESULT_NOT_FOUND, String::new())));
     }
 
     if first_sym_kind == KIND_PARAMSPECEXPR {

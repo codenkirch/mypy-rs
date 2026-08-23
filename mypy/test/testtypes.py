@@ -16483,6 +16483,76 @@ class NativeLookupSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLookupQualifiedVarSuite(Suite):
+    """Parity tests for the non-Any Var branch of `rust_lookup_qualified`.
+
+    Python's `lookup_qualified` (semanal.py:7747-7762) walks a non-Any Var
+    first sym into the else branch: `nextsym = None`, then reports
+    "name not defined" (unless suppress_errors) and returns None. The Rust
+    seam answers this case with `RESULT_NOT_FOUND = -1` so the Python shim
+    runs the identical `name_not_defined` + return-None path it already
+    uses for missing TypeInfo members. Any-typed Vars stay deferred (the
+    Python else branch constructs `implicit_symbol`), and MypyFile /
+    TypeAlias / ParamSpecExpr / PlaceholderNode first syms keep deferring
+    (they need `get_module_symbol` / alias-target resolution / special
+    arg handling / unchanged-sym return). Direct seam exercise, independent
+    of the build-manager gate.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.nodes import SymbolTableNode, TypeInfo, Var
+
+        self.fx = TypeFixture()
+        self._tk = _tk
+        self._SymbolTableNode = SymbolTableNode
+        self._TypeInfo = TypeInfo
+        self._Var = Var
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+
+    def _call(
+        self, name: str, kind: int, fullname: str, is_any: bool
+    ) -> Any:
+        return self._tk.rust_lookup_qualified(
+            self.resolver, name, kind, fullname, is_any
+        )
+
+    def test_var_non_any_reports_not_found(self) -> None:
+        # Non-Any Var first sym: Rust answers RESULT_NOT_FOUND so the
+        # Python shim emits "name not defined" + return None.
+        r = self._call("mod.x.y", 4, "mod.x", False)
+        assert r == (-1, "")
+
+    def test_var_any_still_defers(self) -> None:
+        # Any-typed Var needs `implicit_symbol` construction in Python.
+        r = self._call("mod.x.y", 4, "mod.x", True)
+        assert r is None
+
+    def test_mypyfile_still_defers(self) -> None:
+        # MypyFile needs get_module_symbol; keep deferring.
+        r = self._call("mod.sub.x", 1, "mod.sub", False)
+        assert r is None
+
+    def test_typealias_still_defers(self) -> None:
+        # TypeAlias needs alias-target resolution; keep deferring.
+        r = self._call("alias.x", 3, "mod.alias", False)
+        assert r is None
+
+    def test_paramspec_still_defers(self) -> None:
+        # ParamSpecExpr needs the args/kwargs special check; keep deferring.
+        r = self._call("P.args", 5, "mod.P", False)
+        assert r is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCallableArgConstraintsSuite(Suite):
     """Parity tests for `rust_infer_callable_arguments_constraints`.
 
