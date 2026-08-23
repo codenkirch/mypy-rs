@@ -14320,6 +14320,140 @@ class NativeCheckMemberSuite(Suite):
         )
         assert result is None
 
+    def _rust_member_method(
+        self,
+        instance: Type,
+        signature: Type,
+        method_fullname: str,
+        self_type: Type,
+        name: str = "foo",
+    ) -> bytes | None:
+        result = self._tk.rust_analyze_member_method(
+            self.resolver,
+            self._bytes_of(instance),
+            self._bytes_of(signature),
+            method_fullname,
+            self._bytes_of(self_type),
+            name,
+            False,
+            False,
+        )
+        return bytes(result) if result is not None else None
+
+    def test_member_method_parity_binds_and_expands(self) -> None:
+        # Plain non-trivial method on the defining class: Rust binds self
+        # and expands class type vars. G[T].foo(self: G[T]) -> G[T].
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        ns_t = TypeVarType(
+            "T",
+            "__main__.T",
+            TypeVarId(1, namespace="G"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        ret = Instance(self.fx.gi, [ns_t])
+        sig = CallableType(
+            arg_types=[Instance(self.fx.gi, [ns_t]), self.fx.a],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=["self", "x"],
+            ret_type=ret,
+            fallback=self.fx.function,
+        )
+        rust_bytes = self._rust_member_method(
+            self.fx.ga, sig, "G", self.fx.ga
+        )
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(rust_bytes)
+        assert isinstance(decoded, ProperType)
+        assert isinstance(decoded, CallableType)
+        # self stripped, is_bound set, G[A] substituted into ret type.
+        assert decoded.arg_types == [self.fx.a]
+        assert decoded.is_bound
+        assert decoded.ret_type == self.fx.ga
+
+    def test_member_method_parity_plain(self) -> None:
+        # Non-generic method on the defining class G: receiver G[A] with a
+        # concrete self annotation passes the self-arg filter; the shim
+        # restores the non-wire fields.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        sig = CallableType(
+            arg_types=[self.fx.ga, self.fx.b],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=["self", "x"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        rust_bytes = self._rust_member_method(
+            self.fx.ga, sig, "G", self.fx.ga
+        )
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(rust_bytes)
+        assert isinstance(decoded, ProperType)
+        assert isinstance(decoded, CallableType)
+        assert decoded.arg_types == [self.fx.b]
+        assert decoded.is_bound
+        assert decoded.ret_type == self.fx.a
+
+    def test_member_method_rust_none_for_classmethod(self) -> None:
+        # classmethod true -> defer to Python (needs TypeType wrapping).
+        sig = CallableType(
+            arg_types=[self.fx.a],
+            arg_kinds=[ARG_POS],
+            arg_names=["self"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        result = self._tk.rust_analyze_member_method(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "G",
+            self._bytes_of(self.fx.ga),
+            "foo",
+            False,
+            True,
+        )
+        assert result is None
+
+    def test_member_method_rust_none_for_foreign_self(self) -> None:
+        # self_type not the defining class -> check_self_arg could filter:
+        # defer.
+        sig = CallableType(
+            arg_types=[self.fx.a],
+            arg_kinds=[ARG_POS],
+            arg_names=["self"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        result = self._tk.rust_analyze_member_method(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "G",
+            self._bytes_of(self.fx.o),
+            "foo",
+            False,
+            False,
+        )
+        assert result is None
+
+    def test_member_method_rust_none_for_bindable_noncallable(self) -> None:
+        # A non-callable signature cannot be bound: defer.
+        result = self._tk.rust_analyze_member_method(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(self.fx.a),
+            "G",
+            self._bytes_of(self.fx.ga),
+            "foo",
+            False,
+            False,
+        )
+        assert result is None
+
     def test_instance_member_access_trivial_self_binds(self) -> None:
         # Trivial-self method: Rust binds the first arg and marks is_bound.
         from mypy.checkmember import _deserialize_type_for_checkmember

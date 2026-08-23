@@ -117,6 +117,7 @@ try:
         rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
         rust_analyze_member_access as _rust_analyze_member_access,
+        rust_analyze_member_method as _rust_analyze_member_method,
         rust_analyze_none_member_access as _rust_analyze_none_member_access,
         rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
@@ -137,6 +138,7 @@ except ImportError:
     _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
     _rust_analyze_member_access = None  # type: ignore[assignment]
+    _rust_analyze_member_method = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
     _rust_analyze_union_member_access = None  # type: ignore[assignment]
     _rust_analyze_none_member_access = None  # type: ignore[assignment]
@@ -718,6 +720,49 @@ def analyze_instance_member_access(
                 # Both defer to Python.
                 pass
         if not method.is_static:
+            # M20 follow-up: non-trivial plain FuncDef methods dispatched on
+            # the exact defining class bind+expand in Rust; the remaining
+            # cases defer to the pure-Python tail below.
+            if (
+                isinstance(method, FuncDef)
+                and not method.is_trivial_self
+                and not mx.is_super
+                and not mx.is_lvalue
+                and _HAS_TYPE_KERNEL
+                and _native_checkmember_active
+                and _native_checkmember_resolver is not None
+                and _rust_analyze_member_method is not None
+            ):
+                try:
+                    result = _rust_analyze_member_method(
+                        _native_checkmember_resolver,
+                        _serialize_type_for_checkmember(typ),
+                        _serialize_type_for_checkmember(signature),
+                        method.info.fullname,
+                        _serialize_type_for_checkmember(mx.self_type),
+                        name,
+                        state.state.strict_optional,
+                        method.is_class,
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_for_checkmember(bytes(result))
+                        if decoded is not None and isinstance(decoded, ProperType):
+                            decoded.line = typ.line
+                            decoded.column = typ.column
+                            if isinstance(decoded, CallableType):
+                                decoded.fallback.line = decoded.line
+                                if isinstance(signature, CallableType):
+                                    decoded.name = signature.name
+                                    decoded.definition = signature.definition
+                        instance_cache.int_type = None
+                        instance_cache.str_type = None
+                        instance_cache.bool_type = None
+                        instance_cache.object_type = None
+                        instance_cache.function_type = None
+                        if decoded is not None:
+                            return decoded
+                except (AssertionError, NotImplementedError):
+                    pass
             if isinstance(method, (FuncDef, OverloadedFuncDef)) and method.is_trivial_self:
                 signature = bind_self_fast(signature, mx.self_type)
             else:
