@@ -1290,27 +1290,27 @@ def true_only(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        try:
-            result = _type_kernel.rust_true_only(_serialize_type(t))
-            if result is not None:
-                interpreted = _interpret_truthiness_result(result, t)
-                if interpreted is not None:
-                    return interpreted
-        except (AssertionError, NotImplementedError):
-            pass
+    # Steps 1-2 + union recursion read the LIVE can_be_true/can_be_false
+    # flags, which the wire does not carry and copy_type may have mutated
+    # on union items; Rust only decides the step-4 dunder leaf.
     if not t.can_be_true:
-        # All values of t are False-ish, so there are no true values in it
         return UninhabitedType(line=t.line, column=t.column)
     elif not t.can_be_false:
-        # All values of t are already True-ish, so true_only is idempotent in this case
         return t
     elif isinstance(t, UnionType):
-        # The true version of a union type is the union of the true versions of its components
         new_items = [true_only(item) for item in t.items]
         can_be_true_items = [item for item in new_items if item.can_be_true]
         return make_simplified_union(can_be_true_items, line=t.line, column=t.column)
     else:
+        if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+            try:
+                result = _type_kernel.rust_true_only(_serialize_type(t), _native_typeops_resolver)
+                if result is not None:
+                    interpreted = _interpret_truthiness_result(result, t)
+                    if interpreted is not None:
+                        return interpreted
+            except (AssertionError, NotImplementedError):
+                pass
         ret_type = _get_type_method_ret_type(t, name="__bool__") or _get_type_method_ret_type(
             t, name="__len__"
         )
@@ -1329,28 +1329,16 @@ def false_only(t: Type) -> ProperType:
     """
     t = get_proper_type(t)
 
-    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        try:
-            result = _type_kernel.rust_false_only(_serialize_type(t), state.strict_optional)
-            if result is not None:
-                interpreted = _interpret_truthiness_result(result, t)
-                if interpreted is not None:
-                    return interpreted
-        except (AssertionError, NotImplementedError):
-            pass
+    # Steps 1-2 and union recursion (step 3) read LIVE flags (see
+    # true_only); they stay in Python. Rust only decides the step 4-6 leaf.
     if not t.can_be_false:
         if state.strict_optional:
-            # All values of t are True-ish, so there are no false values in it
             return UninhabitedType(line=t.line)
         else:
-            # When strict optional checking is disabled, everything can be
-            # False-ish since anything can be None
             return NoneType(line=t.line)
     elif not t.can_be_true:
-        # All values of t are already False-ish, so false_only is idempotent in this case
         return t
     elif isinstance(t, UnionType):
-        # The false version of a union type is the union of the false versions of its components
         new_items = [false_only(item) for item in t.items]
         can_be_false_items = [item for item in new_items if item.can_be_false]
         return make_simplified_union(can_be_false_items, line=t.line, column=t.column)
@@ -1359,6 +1347,17 @@ def false_only(t: Type) -> ProperType:
     elif isinstance(t, Instance) and t.type.fullname == "builtins.int":
         return LiteralType(0, fallback=t)
     else:
+        if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+            try:
+                result = _type_kernel.rust_false_only(
+                    _serialize_type(t), state.strict_optional, _native_typeops_resolver
+                )
+                if result is not None:
+                    interpreted = _interpret_truthiness_result(result, t)
+                    if interpreted is not None:
+                        return interpreted
+            except (AssertionError, NotImplementedError):
+                pass
         ret_type = _get_type_method_ret_type(t, name="__bool__") or _get_type_method_ret_type(
             t, name="__len__"
         )
@@ -1385,7 +1384,7 @@ def true_or_false(t: Type) -> ProperType:
 
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
         try:
-            result = _type_kernel.rust_true_or_false(_serialize_type(t))
+            result = _type_kernel.rust_true_or_false(_serialize_type(t), _native_typeops_resolver)
             if result is not None:
                 interpreted = _interpret_truthiness_result(result, t)
                 if interpreted is not None:

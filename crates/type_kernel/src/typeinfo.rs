@@ -234,7 +234,7 @@ fn read_opt_instance_fullname(obj: &PyAny, attr: &str) -> Option<String> {
 }
 
 /// Read a `list[TypeInfo]` attribute as a Vec of fullname strings.
-fn read_mro_fullnames(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
+pub(crate) fn read_mro_fullnames(obj: &PyAny, attr: &str) -> Option<Vec<String>> {
     let value = obj.getattr(attr).ok()?;
     let list = value.downcast::<PyList>().ok()?;
     let mut out = Vec::with_capacity(list.len());
