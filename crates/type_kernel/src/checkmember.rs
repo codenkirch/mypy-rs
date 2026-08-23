@@ -841,7 +841,11 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
             partial_fallback, ..
         } => {
             // Python: _analyze_member_access(name, tuple_fallback(typ), mx).
-            // Fall back to the partial fallback.
+            // Fall back to the partial fallback; an Instance target would
+            // defer inside the recursion, so short-circuit it.
+            if matches!(&**partial_fallback, Type::Instance { .. }) {
+                return None;
+            }
             analyze_member_access_inner(partial_fallback, resolver)
         }
         // --- TypedDictType ---
@@ -868,6 +872,10 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
                 // Python: make_simplified_union(typ.values), mx.
                 // We cannot build a union without knowing how to join; defer.
                 None
+            } else if matches!(&**upper_bound, Type::Instance { .. }) {
+                // Python: _analyze_member_access(name, typ.upper_bound, mx);
+                // an Instance target would defer inside the recursion.
+                None
             } else {
                 // Python: _analyze_member_access(name, typ.upper_bound, mx).
                 analyze_member_access_inner(upper_bound, resolver)
@@ -876,11 +884,17 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
         // --- ParamSpecType ---
         Type::ParamSpecType { upper_bound, .. } => {
             // Python: TypeVarLikeType -> _analyze_member_access(name, typ.upper_bound, mx).
+            if matches!(&**upper_bound, Type::Instance { .. }) {
+                return None; // Instance target would defer inside the recursion
+            }
             analyze_member_access_inner(upper_bound, resolver)
         }
         // --- TypeVarTupleType ---
         Type::TypeVarTupleType { tuple_fallback, .. } => {
             // No upper_bound for TypeVarTuple; fall back to tuple_fallback.
+            if matches!(&**tuple_fallback, Type::Instance { .. }) {
+                return None; // Instance target would defer inside the recursion
+            }
             analyze_member_access_inner(tuple_fallback, resolver)
         }
         // --- DeletedType ---
@@ -900,6 +914,9 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
         // --- LiteralType ---
         Type::LiteralType { fallback, .. } => {
             // Python: _analyze_member_access(name, typ.fallback, mx).
+            if matches!(&**fallback, Type::Instance { .. }) {
+                return None; // Instance target would defer inside the recursion
+            }
             analyze_member_access_inner(fallback, resolver)
         }
         // --- CallableType ---
@@ -910,6 +927,10 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
             // else recurse on fallback. Type objects need class-level
             // lookup (mx, override_info), so defer when is_type_obj.
             if is_type_obj(fallback, ret_type, resolver) {
+                None
+            } else if matches!(&**fallback, Type::Instance { .. }) {
+                // Python: _analyze_member_access(name, typ.fallback, mx);
+                // an Instance target would defer inside the recursion.
                 None
             } else {
                 analyze_member_access_inner(fallback, resolver)
@@ -928,6 +949,11 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
                     } = item
                     {
                         if is_type_obj(fallback, ret_type, resolver) {
+                            continue;
+                        }
+                        if matches!(&**fallback, Type::Instance { .. }) {
+                            // Instance target would defer inside the
+                            // recursion for this item; keep looking.
                             continue;
                         }
                         if let Some(r) = analyze_member_access_inner(fallback, resolver) {
