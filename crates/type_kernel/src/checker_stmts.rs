@@ -186,6 +186,7 @@ fn summarize(node: &AstNode) -> String {
             crate::astwire::ChildField::None => "_",
             crate::astwire::ChildField::Node(_) => "N",
             crate::astwire::ChildField::List(_) => "L",
+            crate::astwire::ChildField::NestedList(_) => "L",
         })
         .collect::<Vec<_>>()
         .join(",");

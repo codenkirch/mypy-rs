@@ -117,6 +117,7 @@ try:
         rust_has_yield_from_expression as _rust_has_yield_from_expression,
     )
     from type_kernel import rust_has_await_expression as _rust_has_await_expression
+    from type_kernel import rust_has_await_in_generator as _rust_has_await_in_generator
     from type_kernel import (
         rust_count_return_statements as _rust_count_return_statements,
     )
@@ -152,6 +153,7 @@ except ImportError:
     _rust_has_yield_expression = None  # type: ignore[assignment]
     _rust_has_yield_from_expression = None  # type: ignore[assignment]
     _rust_has_await_expression = None  # type: ignore[assignment]
+    _rust_has_await_in_generator = None  # type: ignore[assignment]
     _rust_count_return_statements = None  # type: ignore[assignment]
     _rust_count_yield_expressions = None  # type: ignore[assignment]
     _rust_count_yield_from_expressions = None  # type: ignore[assignment]
@@ -168,11 +170,32 @@ except ImportError:
     _TRAVERSER_HAS_KERNEL = False
 
 
+_serialize_ast_cache: dict[int, tuple[Node, bytes]] = {}
+
+
 def _serialize_ast_node(node: Node) -> bytes:
-    """Serialize a node for the Rust traverser (returns bytes)."""
+    """Serialize a node for the Rust traverser (returns bytes).
+
+    Memoized per node identity: the live AST is immutable during a build
+    and each call serializes the same root with a fresh visited-set, so
+    the bytes are deterministic per node. The cache holds a strong ref
+    to the node so a recycled ``id()`` can never serve stale bytes (the
+    identity check below defeats id-reuse). Callers must clear the cache
+    (``_clear_serialize_ast_cache``) when the AST may have changed.
+    """
+    key = id(node)
+    entry = _serialize_ast_cache.get(key)
+    if entry is not None and entry[0] is node:
+        return entry[1]
     buf = _AstWriteBuffer()
     _ast_serialize_node(node, buf)
-    return buf.getvalue()
+    bytes_out = buf.getvalue()
+    _serialize_ast_cache[key] = (node, bytes_out)
+    return bytes_out
+
+
+def _clear_serialize_ast_cache() -> None:
+    _serialize_ast_cache.clear()
 
 
 @trait
@@ -1163,6 +1186,30 @@ def has_await_expression(expr: MypyFile | FuncDef | Expression) -> bool:
     seeker = AwaitSeeker()
     expr.accept(seeker)
     return seeker.found
+
+
+def has_await_in_generator(gen: GeneratorExpr) -> bool:
+    """Combined has-await for the checkexpr GeneratorExpr check.
+
+    Serializes the GeneratorExpr once and lets Rust walk left_expr,
+    sequences[1:] and condlists in a single pass, instead of the 4
+    separate serialization round-trips the pure-Python check makes.
+    Falls back to the Python AwaitSeeker when the kernel is inactive.
+    """
+    if _TRAVERSER_HAS_KERNEL and _rust_has_await_in_generator is not None:
+        try:
+            return _rust_has_await_in_generator(_serialize_ast_node(gen))
+        except (AssertionError, NotImplementedError, RecursionError):
+            pass
+    if has_await_expression(gen.left_expr):
+        return True
+    if any(has_await_expression(sequence) for sequence in gen.sequences[1:]):
+        return True
+    return any(
+        has_await_expression(cond)
+        for condlist in gen.condlists
+        for cond in condlist
+    )
 
 
 class ReturnCollector(FuncCollectorBase):

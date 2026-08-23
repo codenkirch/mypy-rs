@@ -912,6 +912,12 @@ class BuildManager:
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        # Clear the traverser AST-serialization memo so stale bytes from a
+        # previous build never survive into the new AST (structure can
+        # change across builds even though the wire ignores scalars).
+        from mypy.traverser import _clear_serialize_ast_cache as _clear_ast_wire_cache
+
+        _clear_ast_wire_cache()
         # Propagate the type-kernel gate to the erasetype module flag, which
         # the hot-path `erase_type()` reads without an options lookup per call.
         from mypy.erasetype import _set_native_erase_active

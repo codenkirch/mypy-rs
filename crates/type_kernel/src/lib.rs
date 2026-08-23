@@ -995,6 +995,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        traverser::rust_has_await_in_generator,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         traverser::rust_count_return_statements,
         module
     )?)?;

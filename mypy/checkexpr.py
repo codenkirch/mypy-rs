@@ -130,7 +130,7 @@ from mypy.subtypes import (
 )
 from mypy.traverser import (
     all_name_and_member_expressions,
-    has_await_expression,
+    has_await_in_generator,
     has_str_expression,
 )
 from mypy.tvar_scope import TypeVarLikeScope
@@ -7412,15 +7412,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         )
 
     def visit_generator_expr(self, e: GeneratorExpr) -> Type:
-        # If any of the comprehensions use async for, the expression will return an
-        # async generator
-        # object, or await is used anywhere but in the leftmost sequence.
-        if (
-            any(e.is_async)
-            or has_await_expression(e.left_expr)
-            or any(has_await_expression(sequence) for sequence in e.sequences[1:])
-            or any(has_await_expression(cond) for condlist in e.condlists for cond in condlist)
-        ):
+        # async-for or a non-leftmost await makes an async generator;
+        # the combined check serializes the whole expr once (511b).
+        if any(e.is_async) or has_await_in_generator(e):
             typ = "typing.AsyncGenerator"
             # received type is always None in async generator expressions
             additional_args: list[Type] = [NoneType()]

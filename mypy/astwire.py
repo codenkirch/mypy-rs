@@ -198,6 +198,10 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
 
     Uses an explicit task stack instead of recursion so that deeply nested
     ASTs don't hit Python's recursion limit.
+
+    Lists-of-lists (e.g. GeneratorExpr.condlists) serialize as a
+    LIST_GEN whose items are themselves LIST_GEN blocks, so Rust sees
+    the full nested structure.
     """
     if node is None:
         write_tag(buf, LITERAL_NONE)
@@ -217,6 +221,13 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             write_tag(buf, LITERAL_NONE)
         elif kind == "list":
             items = task[1]
+            # Nested list: emit LIST_GEN with each item a LIST_GEN block.
+            if items and isinstance(items[0], (list, tuple)):
+                write_tag(buf, LIST_GEN)
+                write_int_bare(buf, len(items))
+                for item in reversed(items):
+                    stack.append(("list", item))
+                continue
             write_tag(buf, LIST_GEN)
             write_int_bare(buf, len(items))
             for item in reversed(items):
@@ -239,7 +250,7 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             write_tag(buf, tag)
             slots = _get_all_slots(cls)
 
-            # Collect child fields (Node or list-of-Node).
+            # Collect child fields (Node or list-of-Node, or nested list).
             child_fields: list[Any] = []
             for slot in slots:
                 value = getattr(n, slot, None)
@@ -249,9 +260,18 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
                     child_fields.append(value)
                 elif isinstance(value, (list, tuple)):
                     items = list(value)
-                    if all(
-                        isinstance(item, (nodes.Node, type(None))) for item in items
-                    ) and len(items) > 0:
+                    # Keep a field if it's a list of Nodes/None, or a
+                    # nested list-of-lists of Nodes/None (e.g.
+                    # GeneratorExpr.condlists).
+                    def _node_or_none(x: Any) -> bool:
+                        return isinstance(x, (nodes.Node, type(None)))
+
+                    if items and all(
+                        (all(_node_or_none(i) for i in row) if isinstance(row, (list, tuple)) else False)
+                        for row in items
+                    ):
+                        child_fields.append(items)
+                    elif items and all(_node_or_none(i) for i in items):
                         child_fields.append(items)
                     else:
                         child_fields.append(None)
