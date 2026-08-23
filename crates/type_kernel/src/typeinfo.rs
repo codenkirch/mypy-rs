@@ -1276,16 +1276,13 @@ fn snapshot_module(py: Python<'_>, item: &PyAny) -> Option<ModuleSnapshot> {
                 .map(|cls| cls == "MypyFile")
                 .unwrap_or(false);
             if !is_module {
-                return Some((false, String::new()));
+                return None;
             }
             let fullname = n
                 .getattr("fullname")
                 .and_then(|f| f.extract::<String>())
-                .ok();
-            match fullname {
-                Some(f) => Some((true, f)),
-                None => Some((false, String::new())),
-            }
+                .ok()?;
+            Some((true, fullname))
         });
         symbols.insert(name, (hidden, node));
     }
