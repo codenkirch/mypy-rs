@@ -1408,6 +1408,13 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         if tag == _UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR:
             self.fail(message_registry.INVALID_UNPACK_POSITION, t, code=codes.VALID_TYPE)
             return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_UNPACK_DEFER:
+            # Exact gold body (typeanal.py:1181-1186): the mutation around
+            # anal_type is applied here, live on self, same as the original.
+            self.allow_type_var_tuple = self.nesting_level + 1
+            result = UnpackType(self.anal_type(t.args[0]), line=t.line, column=t.column)
+            self.allow_type_var_tuple = -1
+            return result
         raise AssertionError(f"unknown special unbound tag {tag}")
 
     def get_omitted_any(self, typ: Type, fullname: str | None = None) -> AnyType:
@@ -3421,6 +3428,7 @@ _UNBOUND_SPECIAL_TAG_NAME_TYPEGUARD = 35
 _UNBOUND_SPECIAL_TAG_NAME_TYPEIS = 36
 _UNBOUND_SPECIAL_TAG_UNPACK_ARG_ERR = 37
 _UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR = 38
+_UNBOUND_SPECIAL_TAG_UNPACK_DEFER = 39
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the

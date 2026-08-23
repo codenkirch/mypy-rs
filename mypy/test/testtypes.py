@@ -5978,8 +5978,11 @@ class NativeCustomSpecialMethodSuite(Suite):
         self._assert_defers(t)
 
     def test_has_custom_eq_checks_par(self) -> None:
-        from mypy.checker import has_custom_eq_checks
-        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+            has_custom_eq_checks,
+        )
 
         cases = [
             self._info("mod.Eq"),  # no dunders at all
@@ -6119,7 +6122,7 @@ class NativeTruthinessSuite(Suite):
         Mirrors `TypeFixture._add_bool_dunder`: a FuncDef with a
         CallableType (no args -> returns ret) registered as MDEF.
         """
-        from mypy.nodes import Block, FuncDef, MDEF, SymbolTableNode
+        from mypy.nodes import MDEF, Block, FuncDef, SymbolTableNode
 
         signature = CallableType([], [], [], ret, self.fx.function)
         func_def = FuncDef(name, [], Block([]))
@@ -6265,8 +6268,8 @@ class NativeTruthinessSuite(Suite):
         # With the resolver removed, the Rust seam defers (None) and the
         # result equals the pure-Python path (which itself runs since the
         # gate is still active but the resolver is None -> skip).
-        from mypy.typeops import _set_native_typeops_resolver
         from mypy.state import state
+        from mypy.typeops import _set_native_typeops_resolver
 
         _set_native_typeops_resolver(None)
         try:
@@ -7188,7 +7191,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
     Required, NotRequired, ReadOnly) is decided in Rust from scalar facts
     (fullname + arity + a few flags); the Python shim applies the branch
     bodies (errors, object construction, anal recursion). Branches the Rust
-    classifier cannot decide purely (Literal, TypeGuard, Unpack, Self, the
+    classifier cannot decide purely (Self, the
     non-special tail, and every gold path that recurses) defer to the
     pure-Python body.
 
@@ -7777,14 +7780,17 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
         )
 
     def test_unpack_gold(self) -> None:
-        # Unpack[int] in a variadic position: the gold path mutates
-        # allow_type_var_tuple around anal_type, so the classifier defers
-        # (None) and both gates run the full Python body -> parity only.
+        # Unpack[int] in a variadic position: the gold path tag routes the
+        # shim to the exact original body (mutates allow_type_var_tuple
+        # around anal_type) -> still identical across gates.
         self._assert_par(
             "typing.Unpack",
             [UnboundType("int")],
             allow_unpack=True,
             expected="*builtins.int",
+        )
+        self._assert_engages(
+            fullname="typing.Unpack", arg_count=1, not_in_unpack=False, allow_unpack=True
         )
 
     def test_self_defer_parity(self) -> None:
@@ -21279,7 +21285,7 @@ class NativeJoinInstancesSuite(Suite):
     def test_seam_engages(self) -> None:
         # Direct seam call: rust_join_instances returns a disc tuple for
         # A vs A (args-less same-type). None would mean Rust defers.
-        from mypy.join import InstanceJoiner, _serialize_type
+        from mypy.join import _serialize_type
 
         result = _type_kernel.rust_join_instances(
             _serialize_type(self.fx.a),
