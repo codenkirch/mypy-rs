@@ -90,6 +90,13 @@ except ImportError:
 # avoids an attribute lookup on the options object per call.
 _native_erase_active: bool = False
 _native_erase_typevars_active: bool = False
+# wire-bytes -> decoded+fixed Type cache for the erase_typevars /
+# replace_meta_vars seams (12K calls, ~96% repeat). Read-only callers.
+_erase_decode_cache: dict[bytes, Type] = {}
+
+
+def _clear_erase_decode_cache() -> None:
+    _erase_decode_cache.clear()
 
 
 def _set_native_erase_active(active: bool) -> None:
@@ -164,9 +171,15 @@ def _deserialize_type(data: bytes) -> Type | None:
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
     """
+    cached = _erase_decode_cache.get(data)
+    if cached is not None:
+        return cached
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_read_type(_ReadBuffer(data)))
+    fixed = fixup_wire_type(_read_type(_ReadBuffer(data)))
+    if fixed is not None:
+        _erase_decode_cache[data] = fixed
+    return fixed
 
 
 def erase_type(typ: Type) -> ProperType:
