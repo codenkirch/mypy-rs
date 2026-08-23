@@ -150,8 +150,10 @@ pub(crate) fn rust_expand_type_by_instance(
 ///   variables = {binder.id: arg for binder, arg in zip(tvars, instance.args)}
 ///   return expand_type(typ, variables)
 ///
-/// The env keys use `(raw_id, 0, "")`: class typevars bind
-/// `TypeVarId(raw_id)` (types.py:554 defaults meta_level=0, namespace="").
+/// The env keys use `(raw_id, 0, type_ref)`: class typevars declare
+/// `TypeVarId(raw_id, namespace=<class fullname>)` (types.py:554), and
+/// the resolved `type_ref` of the instance is that fullname, so the keys
+/// match the namespaces wire-decoded TypeVars carry.
 pub(crate) fn expand_type_by_instance_core(
     typ: &Type,
     instance: &Type,
@@ -173,6 +175,9 @@ pub(crate) fn expand_type_by_instance_core(
     if args.is_empty() && !snap.has_type_var_tuple_type {
         return Some(typ.clone());
     }
+    // Instance typevars bind TypeVarId(raw_id, namespace=type_ref) so the
+    // env keys match the namespaces wire-decoded TypeVars carry.
+    let env_ns = type_ref.clone();
     let mut env = HashMap::with_capacity(args.len());
     if snap.has_type_var_tuple_type {
         // TypeVarTuple branch (expandtype.py:389-406): middle args bind
@@ -210,7 +215,7 @@ pub(crate) fn expand_type_by_instance_core(
         // Bind tvar.id: TupleType(args_middle, tvar.tuple_fallback)
         // (expandtype.py:390-391).
         env.insert(
-            (tvt_raw_id, 0, String::new()),
+            (tvt_raw_id, 0, env_ns.clone()),
             Type::TupleType {
                 partial_fallback: Box::new(tvt_fallback),
                 items: args_middle,
@@ -226,14 +231,14 @@ pub(crate) fn expand_type_by_instance_core(
         for i in 0..prefix {
             let raw_id = raw_ids[i];
             if raw_id >= 0 {
-                env.insert((raw_id, 0, String::new()), args[i].clone());
+                env.insert((raw_id, 0, env_ns.clone()), args[i].clone());
             }
         }
         for j in 0..suffix {
             let raw_id = raw_ids[tvars.len() - suffix + j];
             let arg = &args[args.len() - suffix + j];
             if raw_id >= 0 {
-                env.insert((raw_id, 0, String::new()), arg.clone());
+                env.insert((raw_id, 0, env_ns.clone()), arg.clone());
             }
         }
         return expand_type_with_env(typ, &env, strict_optional);
@@ -241,7 +246,7 @@ pub(crate) fn expand_type_by_instance_core(
     // Non-variadic: fast path + binding (expandtype.py:407-409).
     let raw_ids = &snap.type_var_raw_ids;
     for (raw_id, arg) in raw_ids.iter().zip(args) {
-        env.insert((*raw_id, 0, String::new()), arg.clone());
+        env.insert((*raw_id, 0, env_ns.clone()), arg.clone());
     }
     expand_type_with_env(typ, &env, strict_optional)
 }
@@ -1094,7 +1099,10 @@ mod tests {
             name: "Ts".to_string(),
             fullname: "__main__.Ts".to_string(),
             raw_id,
-            namespace: String::new(),
+            // Wire-decoded TypeVars carry the declaring class fullname as
+            // namespace (types.py:554); expand_type_by_instance_core keys
+            // its env with the instance's type_ref, which must line up.
+            namespace: "foo.Pair".to_string(),
             upper_bound: Box::new(any()),
             default: Box::new(any()),
             min_len: 0,
@@ -1226,7 +1234,7 @@ mod tests {
         // replaces the TypeVarTupleType node with
         // tuple_fallback[args=[Any]].
         let typ = type_var_tuple(7);
-        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), any())]);
+        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, "foo.Pair".to_string()), any())]);
         let out = expand_type_inner(&typ, &env, false).unwrap();
         match out {
             Type::Instance { type_ref, args, .. } => {
@@ -1243,7 +1251,7 @@ mod tests {
         // tuple_fallback[args=[UninhabitedType]].
         let typ = type_var_tuple(7);
         let env: HashMap<EnvKey, Type> = HashMap::from([(
-            (7, 0, String::new()),
+            (7, 0, "foo.Pair".to_string()),
             Type::UninhabitedType { ambiguous: false },
         )]);
         let out = expand_type_inner(&typ, &env, false).unwrap();
@@ -1279,7 +1287,8 @@ mod tests {
             items: vec![any()],
             implicit: false,
         };
-        let env: HashMap<EnvKey, Type> = HashMap::from([((7, 0, String::new()), tuple_repl)]);
+        let env: HashMap<EnvKey, Type> =
+            HashMap::from([((7, 0, "foo.Pair".to_string()), tuple_repl)]);
         assert!(expand_type_inner(&typ, &env, false).is_none());
     }
 }

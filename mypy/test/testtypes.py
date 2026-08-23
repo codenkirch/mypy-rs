@@ -13804,6 +13804,12 @@ class NativeCheckMemberSuite(Suite):
         self._set_active = _set_native_checkmember_active
         self._set_resolver = _set_native_checkmember_resolver
         self.fx = TypeFixture()
+        # Production class typevars bind TypeVarId(raw_id, namespace=<class
+        # fullname>) (types.py:554). Mirror that here so fixture tvars
+        # match the Rust expand env keyed on the instance type_ref.
+        for info in (self.fx.gi, self.fx.g2i, self.fx.hi):
+            for tv in info.defn.type_vars:
+                tv.id = TypeVarId(tv.id.raw_id, namespace=info.fullname)
         type_infos = [
             self.fx.oi,
             self.fx.ai,
@@ -14169,6 +14175,7 @@ class NativeCheckMemberSuite(Suite):
             self._bytes_of(signature),
             method_fullname,
             False,
+            False,
         )
         return bytes(result) if result is not None else None
 
@@ -14212,14 +14219,25 @@ class NativeCheckMemberSuite(Suite):
         assert decoded.ret_type == self.fx.a
 
     def test_instance_member_access_parity_expands(self) -> None:
-        # Generic: G[A].foo() -> G[A] substitutes T`1 -> A in the ret type.
+        # Generic: G[A].foo() -> G[A] substitutes T`1 into the ret type.
+        # Use a namespaced tvar (production keys env on the declaring class
+        # fullname, types.py:554) so both sides agree.
         from mypy.checkmember import _deserialize_type_for_checkmember
 
+        ns_t = TypeVarType(
+            "T",
+            "__main__.T",
+            TypeVarId(1, namespace="G"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        ret = Instance(self.fx.gi, [ns_t])
         sig = CallableType(
             arg_types=[],
             arg_kinds=[],
             arg_names=[],
-            ret_type=self.fx.gt,
+            ret_type=ret,
             fallback=self.fx.function,
         )
         expected = self._member_access_expected(self.fx.ga, self.fx.gi, sig)
@@ -14278,6 +14296,7 @@ class NativeCheckMemberSuite(Suite):
             self._bytes_of(sig),
             "G",
             False,
+            False,
         )
         assert result is None
 
@@ -14296,8 +14315,82 @@ class NativeCheckMemberSuite(Suite):
             self._bytes_of(sig),
             "NoSuchClass",
             False,
+            False,
         )
         assert result is None
+
+    def test_instance_member_access_trivial_self_binds(self) -> None:
+        # Trivial-self method: Rust binds the first arg and marks is_bound.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        sig = CallableType(
+            arg_types=[self.fx.a, self.fx.o],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=["self", "x"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        rust_bytes = self._tk.rust_analyze_instance_member_access(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "G",
+            False,
+            True,
+        )
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
+        # Bound: first arg dropped, is_bound set.
+        expected = CallableType(
+            arg_types=[self.fx.o],
+            arg_kinds=[ARG_POS],
+            arg_names=["x"],
+            ret_type=self.fx.a,
+            fallback=self.fx.function,
+        )
+        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        assert decoded.arg_types == expected.arg_types
+        assert decoded.arg_kinds == expected.arg_kinds
+        assert decoded.arg_names == expected.arg_names
+        assert decoded.is_bound
+        assert decoded.ret_type == expected.ret_type
+
+    def test_instance_member_access_trivial_self_expands(self) -> None:
+        # Trivial-self generic method: Rust expands then binds. Fixture
+        # tvars carry namespace "" while production/Rust key on the
+        # instance type_ref, so use a namespaced G signature.
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        ns_t = TypeVarType(
+            "T",
+            "__main__.T",
+            TypeVarId(1, namespace="G"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        sig = CallableType(
+            arg_types=[self.fx.a, ns_t],
+            arg_kinds=[ARG_POS, ARG_POS],
+            arg_names=["self", "x"],
+            ret_type=Instance(self.fx.gi, [ns_t]),
+            fallback=self.fx.function,
+        )
+        rust_bytes = self._tk.rust_analyze_instance_member_access(
+            self.resolver,
+            self._bytes_of(self.fx.ga),
+            self._bytes_of(sig),
+            "G",
+            False,
+            True,
+        )
+        assert rust_bytes is not None
+        decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
+        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        # t binds to A (instance arg of G[A]): arg x: T -> A, ret G[T] -> G[A].
+        assert decoded.arg_types == [self.fx.a]
+        assert decoded.is_bound
+        assert decoded.ret_type == self.fx.ga
 
 
 # ---------------------------------------------------------------------------

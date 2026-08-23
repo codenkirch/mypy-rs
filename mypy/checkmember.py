@@ -251,7 +251,7 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Type
     non-frozen objects the freeze would mutate in place.
     """
     from mypy.types import instance_cache
-    from mypy.wirefixup import fixup_wire_type, canonicalize_fresh_vars
+    from mypy.wirefixup import canonicalize_fresh_vars, check_no_fake_info, fixup_wire_type
 
     _hits = _deser_cache_hits[freeze]
     _dc = _deser_caches[freeze].get(data)
@@ -273,10 +273,14 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Type
     instance_cache.object_type = None
     instance_cache.function_type = None
     fixed = fixup_wire_type(decoded)
-    if fixed is not None:
-        # Wire round-trip loses fresh meta-var identity; re-unify
-        # occurrences before returning (mirrors expandtype.py:463-467).
-        fixed = canonicalize_fresh_vars(fixed)
+    if fixed is None or not check_no_fake_info(fixed):
+        # A decoded tree carrying a residual fake TypeInfo (stale wire
+        # typeinfo entry across fine-grained refreshes) must not enter
+        # the type graph; defer to Python.
+        return None
+    # Wire round-trip loses fresh meta-var identity; re-unify
+    # occurrences before returning (mirrors expandtype.py:463-467).
+    fixed = canonicalize_fresh_vars(fixed)
     if fixed is not None:
         _deser_caches[freeze][data] = fixed
     return fixed
@@ -659,8 +663,8 @@ def analyze_instance_member_access(
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
             and _native_checkmember_resolver is not None
-            and method.is_static
             and isinstance(method, FuncDef)
+            and (method.is_static or method.is_trivial_self)
             and not mx.is_super
             and not mx.is_lvalue
             and _rust_analyze_instance_member_access is not None
@@ -672,6 +676,7 @@ def analyze_instance_member_access(
                     _serialize_type_for_checkmember(signature),
                     method.info.fullname,
                     state.state.strict_optional,
+                    method.is_trivial_self,
                 )
                 if result is not None:
                     decoded = _deserialize_type_for_checkmember(bytes(result))
@@ -685,6 +690,12 @@ def analyze_instance_member_access(
                         decoded.column = typ.column
                         if isinstance(decoded, CallableType):
                             decoded.fallback.line = decoded.line
+        # The wire round-trip drops `.name` and `.definition`; both drive
+        # error-message formatting, so restore them from the pre-seam
+        # signature for identical bound-method notes.
+                        if isinstance(decoded, CallableType) and isinstance(signature, CallableType):
+                            decoded.name = signature.name
+                            decoded.definition = signature.definition
                     # Clear the process-global primitive decode singletons
                     # after a read so NOT_READY Instances cannot leak into
                     # later builds.
