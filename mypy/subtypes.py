@@ -200,6 +200,15 @@ def _serialize_type(t: Type) -> bytes:
     return result
 
 
+# wire-bytes -> decoded+fixed Type cache for the subtype-seam decodes
+# (171K calls, ~85% identical bytes); callers only read the result.
+_subtype_decode_cache: dict[bytes, Type] = {}
+
+
+def _clear_subtype_decode_cache() -> None:
+    _subtype_decode_cache.clear()
+
+
 def _deserialize_type(data: bytes) -> Type | None:
     """Deserialize wire bytes to a Type, fixing type_ref strings.
 
@@ -209,13 +218,19 @@ def _deserialize_type(data: bytes) -> Type | None:
     from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
 
+    cached = _subtype_decode_cache.get(data)
+    if cached is not None:
+        return cached
     decoded = _read_type(_ReadBuffer(data))
     instance_cache.int_type = None
     instance_cache.str_type = None
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded)
+    if fixed is not None:
+        _subtype_decode_cache[data] = fixed
+    return fixed
 
 
 # Flags for detected protocol members
