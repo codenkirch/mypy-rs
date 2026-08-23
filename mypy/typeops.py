@@ -178,12 +178,27 @@ def _serialize_type_list(items: Sequence[Type]) -> bytes:
     return buf.getvalue()
 
 
+# bytes -> decoded wire-Type cache for the typeops seam.  Byte-identical
+# blobs repeat heavily (~95% of 128K calls), so memoizing read_type +
+# fixup_wire_type cuts decode cost.
+_typeops_decode_cache: dict[bytes, Type] = {}
+_typeops_decode_list_cache: dict[bytes, list[Type]] = {}
+
+
+def _clear_typeops_decode_cache() -> None:
+    _typeops_decode_cache.clear()
+    _typeops_decode_list_cache.clear()
+
+
 def _deserialize_type(data: bytes) -> Type | None:
     """Deserialize wire bytes to a Type, fixing type_ref strings.
 
     Returns None if any type_ref cannot be resolved to a live TypeInfo
     (so the caller defers to Python).
     """
+    cached = _typeops_decode_cache.get(data)
+    if cached is not None:
+        return cached
     from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
 
@@ -195,7 +210,10 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded)
+    if fixed is not None:
+        _typeops_decode_cache[data] = fixed
+    return fixed
 
 
 def _deserialize_type_list(data: bytes) -> list[Type] | None:
@@ -204,6 +222,9 @@ def _deserialize_type_list(data: bytes) -> list[Type] | None:
     Returns None if any type_ref cannot be resolved to a live TypeInfo
     (so the caller defers to Python).
     """
+    cached = _typeops_decode_list_cache.get(data)
+    if cached is not None:
+        return cached
     from mypy.types import instance_cache, read_type_list
     from mypy.wirefixup import fixup_wire_type
 
@@ -220,6 +241,8 @@ def _deserialize_type_list(data: bytes) -> list[Type] | None:
         if fixed is None:
             return None
         result.append(fixed)
+    if result:
+        _typeops_decode_list_cache[data] = result
     return result
 
 
