@@ -5742,6 +5742,285 @@ class NativeFunctionTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCustomSpecialMethodSuite(Suite):
+    """Parity for the Rust `custom_special_method` port (mypy.typeops).
+
+    The Rust seam mirrors `mypy.typeops.custom_special_method`
+    (typeops.py:1936-1974): the Instance branch walks the MRO via the
+    snapshot `mro` (like `TypeInfo.get`), and the Overloaded / TypeType
+    branches decide from the wire shapes with no deferral for the
+    non-type-obj / non-Instance / no-metaclass tails. Toggling the
+    typeops gate off (pure Python on live types) and on (Rust seam on
+    serialized types) must produce identical results, for the
+    `custom_special_method` entry and for `has_custom_eq_checks`.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        # Per-test type infos, filled in by _info() / _dunder() so each
+        # test controls the member_definers and MRO.
+        self._typeinfos: list[TypeInfo] = []
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _info(self, fullname: str, bases: list[TypeInfo] | None = None) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        if bases:
+            info.bases = [Instance(b, []) for b in bases]
+            info.mro = [info] + [b for b in bases] + [self.fx.oi]
+        else:
+            info.mro = [info, self.fx.oi]
+        # Inject the modified info into the resolver so the Rust seam
+        # sees the same member_definers / mro the Python path sees.
+        self._typeinfos.append(info)
+        self._rebuild_resolver()
+        return info
+
+    def _meta_info(self, fullname: str, cls: TypeInfo | None = None) -> TypeInfo:
+        """A metaclass TypeInfo; when `cls` is given, set cls.metaclass_type."""
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info] + _base_infos(self.fx)
+        if cls is not None:
+            cls.metaclass_type = Instance(info, [])
+        self._typeinfos.append(info)
+        self._rebuild_resolver()
+        return info
+
+    def _rebuild_resolver(self) -> None:
+        self._resolver = _type_kernel.build_native_resolver(
+            self._typeinfos + _base_infos(self.fx), []
+        )
+
+    def _object_infos(self) -> list[TypeInfo]:
+        return [self.fx.oi]
+
+    def _dunder(self, info: TypeInfo, name: str, definer: TypeInfo) -> None:
+        node = FuncDef(name, [], None, None)
+        node.info = definer
+        info.names[name] = SymbolTableNode(MDEF, node)
+        # The resolver snapshots `names` at build time, so adding a
+        # member requires a rebuild for the Rust seam to see it.
+        self._rebuild_resolver()
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(self, typ: Type, name: str = "__eq__", check_all: bool = False) -> None:
+        from mypy.typeops import custom_special_method
+
+        off = self._with_gate(False, lambda: custom_special_method(typ, name, check_all))
+        on = self._with_gate(True, lambda: custom_special_method(typ, name, check_all))
+        assert on == off, f"custom_special_method parity {typ!r}/{name}: off={off} on={on}"
+
+    def _assert_engages(self, typ: Type, name: str = "__eq__") -> None:
+        from mypy.typeops import _serialize_type
+
+        result = _type_kernel.rust_custom_special_method(
+            _serialize_type(typ), name, False, self._resolver
+        )
+        assert result is not None, f"Rust custom_special_method did not engage for {typ!r}/{name}"
+
+    def _assert_defers(self, typ: Type, name: str = "__eq__") -> None:
+        from mypy.typeops import _serialize_type
+
+        result = _type_kernel.rust_custom_special_method(
+            _serialize_type(typ), name, False, self._resolver
+        )
+        assert result is None, f"Rust custom_special_method expected defer for {typ!r}/{name}"
+
+    def test_custom_dunder_direct(self) -> None:
+        # Genuinely custom dunder on the class itself.
+        info = self._info("mod.Custom")
+        self._dunder(info, "__eq__", info)
+        t = Instance(info, [])
+        self._assert_par(t)
+        self._assert_par(t, "__ne__")
+        self._assert_engages(t)
+
+    def test_inherited_from_object_false(self) -> None:
+        # No custom dunder: MRO finds it on builtins.object -> False.
+        # This was the deferral bulk before the MRO walk.
+        info = self._info("mod.Plain")
+        t = Instance(info, [])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_custom_inherited_from_base(self) -> None:
+        # Custom dunder inherited from a base class: MRO walk must find
+        # it on the base (definer = base), not defer.
+        base = self._info("mod.Base")
+        self._dunder(base, "__eq__", base)
+        child = self._info("mod.Child", [base])
+        t = Instance(child, [])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_different_special_methods(self) -> None:
+        # __bool__ on the class, but querying __format__ (missing on the
+        # live class and object): Python's `typ.type.get` misses the
+        # MRO walk as well and falls to the `return False` tail.
+        info = self._info("mod.Booler")
+        self._dunder(info, "__bool__", info)
+        t = Instance(info, [])
+        self._assert_par(t, "__bool__")
+        self._assert_par(t, "__format__")
+        self._assert_engages(t, "__format__")
+
+    def test_missing_member_not_custom_no_defer(self) -> None:
+        # Class with NO dunder at all (not even inherited): Python tail
+        # returns False; Rust must too (was `None` before).
+        info = self._info("mod.None")
+        t = Instance(info, [])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_any_type_true(self) -> None:
+        # AnyType: Python returns True unconditionally (uncertain).
+        t = AnyType(TypeOfAny.special_form)
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_union_any_short_circuit(self) -> None:
+        # Union with an Any member: `any(...)` short-circuits on the
+        # Any -> True before examining the Instance.
+        info = self._info("mod.U")
+        t = UnionType([Instance(info, []), AnyType(TypeOfAny.special_form)])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_non_type_obj_overloaded_false(self) -> None:
+        # Overloaded whose first item is a plain function (not a type
+        # obj): FunctionLike.is_type_obj() False -> tail False.
+        item = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            ["x"],
+            self.fx.a,
+            self.fx.function,
+            name="f",
+        )
+        t = Overloaded([item])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_type_obj_overloaded_via_metaclass(self) -> None:
+        # Overloaded whose first item IS a type obj: recurse on the
+        # fallback (metaclass) Instance. The fallback class must be a
+        # metaclass (MRO includes builtins.type) for is_type_obj.
+        mc = self._meta_info("builtins.type")
+        item = CallableType(
+            [],
+            [],
+            [],
+            self.fx.a,
+            Instance(mc, []),
+            name="__call__",
+        )
+        t = Overloaded([item])
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_typetype_metaclass_lookup(self) -> None:
+        info = self._info("mod.Klass")
+        mc = self._meta_info("builtins.type", cls=info)
+        self._dunder(mc, "__eq__", mc)
+        self._rebuild_resolver()
+        t = TypeType.make_normalized(Instance(info, []))
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_typetype_no_metaclass_false(self) -> None:
+        # TypeType of a class with no metaclass: Python skips the
+        # metaclass branch and falls to False.
+        info = self._info("mod.NoMeta")
+        t = TypeType.make_normalized(Instance(info, []))
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_typetype_non_instance_item_false(self) -> None:
+        # TypeType(Any): item not an Instance -> False.
+        t = TypeType(AnyType(TypeOfAny.special_form))
+        self._assert_par(t)
+        self._assert_engages(t)
+
+    def test_type_alias_structural_defer(self) -> None:
+        # TypeAliasType: no alias target on the wire -> structural defer
+        # to Python (which expands via get_proper_type).
+        from mypy.nodes import TypeAlias
+
+        t = TypeAliasType(TypeAlias(None, "mod.Alias", "mod", -1, -1), [])
+        self._assert_defers(t)
+
+    def test_has_custom_eq_checks_par(self) -> None:
+        from mypy.checker import has_custom_eq_checks
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        cases = [
+            self._info("mod.Eq"),  # no dunders at all
+            self._info("mod.Both"),  # custom __eq__ + __ne__
+            self._info("mod.NeOnly"),  # custom __ne__ only
+            self._info("mod.PlainAgain"),
+        ]
+        for info in cases:
+            if info.fullname == "mod.Eq":
+                pass
+            elif info.fullname == "mod.Both":
+                self._dunder(info, "__eq__", info)
+                self._dunder(info, "__ne__", info)
+            elif info.fullname == "mod.NeOnly":
+                self._dunder(info, "__ne__", info)
+        self._resolver = _type_kernel.build_native_resolver(
+            self._typeinfos + _base_infos(self.fx), []
+        )
+        _set_native_checker_active(True)
+        _set_native_checker_resolver(self._resolver)
+        try:
+            for info in cases:
+                t = Instance(info, [])
+                off = self._with_gate(
+                    False, lambda: has_custom_eq_checks(t)
+                )
+                on = self._with_gate(
+                    True, lambda: has_custom_eq_checks(t)
+                )
+                assert on == off, f"has_custom_eq_checks parity {info.fullname}: {off} vs {on}"
+        finally:
+            _set_native_checker_active(False)
+            _set_native_checker_resolver(None)
+
+
+def _base_infos(fx: TypeFixture) -> list[TypeInfo]:
+    """All fixture TypeInfos for the resolver + object."""
+    return [getattr(fx, n) for n in dir(fx) if n.endswith("i") and _is_type_info(getattr(fx, n))]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
     """Parity for the Rust `instantiate_type_alias` port (mypy.typeanal).
 
