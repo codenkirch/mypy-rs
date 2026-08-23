@@ -8016,7 +8016,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.checkexpr import _set_native_checkexpr_active
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
@@ -8039,11 +8039,15 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         instance_cache.function_type = None
         self._set_active = _set_native_checkexpr_active
         self._set_active(True)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checkexpr_resolver(self._resolver)
 
     def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
+        _set_native_checkexpr_resolver(None)
         set_wire_typeinfo_map(None)
 
     def _stub_checker(self) -> tuple[object, list[str]]:
@@ -8194,6 +8198,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
 
         assert _rust_check_argument_types_plan is not None
         result = _rust_check_argument_types_plan(
+            self._resolver,
             [_serialize_type_for_checkexpr(t) for t in arg_types],
             [int(k.value) for k in arg_kinds],
             f2a,
@@ -8270,6 +8275,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr
 
         result = _rust_check_argument_types_plan(
+            self._resolver,
             [_serialize_type_for_checkexpr(t) for t in [fx.a, fx.b]],
             [int(k.value) for k in [ARG_POS, ARG_POS]],
             [[0], [1]],

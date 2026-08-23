@@ -3776,23 +3776,18 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         # Keep track of consumed tuple *arg items.
         mapper = ArgTypeExpander(self.argument_infer_context())
 
-        # Native seam: Rust derives the per-formal argument-expansion
-        # plan (callee_arg_types/kinds and actual_types/kinds, or a
-        # too-many/too-few decision) from the wire data; the shim
-
-        # reports the count errors and drives the ArgTypeExpander +
-        # check_arg loop exactly as the pure-Python body below. Rust
-        # returns None (or the decoder fails) on a case it cannot
-
-        # reproduce (TypeAliasType, non-tuple unpack target, wire
-        # decode failure), falling back to the pure-Python body.
+        # Native seam: Rust derives the per-formal plan; the shim reports
+        # count errors and drives the ArgTypeExpander loop. No-args
+        # aliases expand in Rust; the rest defers (needs the resolver).
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
             and _rust_check_argument_types_plan is not None
         ):
             try:
                 plans = _rust_check_argument_types_plan(
+                    _native_checkexpr_resolver,
                     [_serialize_type_for_checkexpr(t) for t in arg_types],
                     [int(k.value) for k in arg_kinds],
                     formal_to_actual,
