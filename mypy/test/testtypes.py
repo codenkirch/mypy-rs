@@ -16103,15 +16103,15 @@ class NativeTypeExpressionClassifySuite(Suite):
     ) -> tuple[str, int, int]:
         sa = self._analyser()
         expr = node_factory()
-        sa.try_parse_as_type_expression(expr)
+        sa.try_parse_as_type_expression(expr)  # type: ignore[attr-defined]
         # NameExpr/MemberExpr never receive `as_type` (the method returns
         # before assigning it); represent that as a fixed sentinel so both
         # gates compare equal.
         as_type = str(expr.as_type) if hasattr(expr, "as_type") else "NO_AS_TYPE_ATTR"
         return (
             as_type,
-            sa.type_expression_full_parse_success_count,
-            sa.type_expression_full_parse_failure_count,
+            sa.type_expression_full_parse_success_count,  # type: ignore[attr-defined]
+            sa.type_expression_full_parse_failure_count,  # type: ignore[attr-defined]
         )
 
     def _assert_par(self, node_factory: Callable[[], Expression]) -> None:
@@ -16346,7 +16346,9 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
     ) -> None:
         def run() -> bool:
             sa = self._analyser(typealias_fullname)
-            return sa.can_possibly_be_type_form(node_factory())
+            result = sa.can_possibly_be_type_form(node_factory())  # type: ignore[attr-defined]
+            assert isinstance(result, bool)
+            return result
 
         off = self._with_gate(False, run)
         on = self._with_gate(True, run)
