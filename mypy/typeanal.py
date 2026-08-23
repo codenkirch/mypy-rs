@@ -3447,9 +3447,11 @@ def native_analyze_type(
     """Try the native (Rust) type analyser for an already-bound type.
 
     Returns the analysed Type as a live Python object, or ``None`` when the
-    Rust path does not handle the type (e.g. UnboundType, TypeAliasType,
-    PlaceholderType), matching Python's deferral semantics.  When ``None``
-    is returned the caller should fall through to the pure-Python visitor.
+    Rust path does not handle the type (e.g. UnboundType, PlaceholderType),
+    matching Python's deferral semantics.  When ``None`` is returned the
+    caller should fall through to the pure-Python visitor.  TypeAliasType
+    is handled: the Rust path passes the node through unchanged (args
+    untouched), mirroring ``visit_type_alias_type``.
     """
     if not _TYPEANAL_HAS_KERNEL or not _native_typeanal_active:
         return None
@@ -3481,7 +3483,7 @@ def _typeanal_decode(result: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    fixed = fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded, resolve_aliases=True)
     if fixed is None:
         return None
     # Any residual fake TypeInfo crashes later serialization, so defer.

@@ -17,8 +17,10 @@
 //!
 //! Parity contract: `str(python_type) == rust_read(bytes).to_string()` over
 //! the `TypeFixture` corpus (see `NativeTypeWireSuite` in `testtypes.py`).
-//! Reader-only — no `WriteBuffer`, no production wiring, no
-//! `Options.native_type_kernel` flip.
+//! `write_type` mirrors `Type.write` for the round-trip seams (`rust_type_analyze`,
+//! solve_one, etc.); `TypeAliasType` serializes its tagged args + `type_ref`
+//! string because the Python `write` insists on a live alias node but the
+//! kernel only ever sees the wire form (alias=None, type_ref set).
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1285,13 +1287,19 @@ impl fmt::Display for Type {
             }
             Type::UnpackType { typ } => write!(f, "*{typ}"),
             Type::LiteralType { value, .. } => write!(f, "Literal[{value}]"),
-            Type::TypeAliasType { .. } => {
+            Type::TypeAliasType { args, .. } => {
                 // The wire format carries `type_ref: String` but no resolved
                 // `TypeAlias` node, so `t.alias is None` and `TypeStrVisitor`
-                // renders `"<alias (unfixed)>"`. Stage 3b will resolve refs
-
-                // and expand non-recursive aliases here.
-                write!(f, "<alias (unfixed)>")
+                // renders `"<alias (unfixed)>"`. `rust_type_analyze` passes
+                // the alias through unchanged (a pure passthrough mirroring
+                // `visit_type_alias_type`), so the args render below.
+                write!(f, "<alias (unfixed)>")?;
+                if !args.is_empty() {
+                    write!(f, "[")?;
+                    list_str(f, args, false)?;
+                    write!(f, "]")?;
+                }
+                Ok(())
             }
             Type::Instance {
                 type_ref,
@@ -2278,9 +2286,13 @@ pub(crate) fn write_type(buf: &mut WriteBuffer, t: &Type) -> Result<(), WireErro
             Ok(())
         }
 
-        Type::TypeAliasType { .. } => Err(WireError::invalid(
-            "write_type: cannot serialize TypeAliasType (alias node would be lost)",
-        )),
+        Type::TypeAliasType { args, type_ref } => {
+            write_tag(buf, TYPE_ALIAS_TYPE);
+            write_type_list(buf, args)?;
+            write_str(buf, type_ref)?;
+            write_tag(buf, END_TAG);
+            Ok(())
+        }
 
         Type::Parameters(p) => write_parameters(buf, p),
 

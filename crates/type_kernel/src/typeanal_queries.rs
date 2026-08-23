@@ -12,12 +12,18 @@
 //! Hot path (`rust_type_analyze`): mirrors `TypeAnalyser.anal_type`, analyzing
 //! already-bound types (Instance, Callable, TypeVar, etc.) by recursing into
 //! children and rebuilding. Returns `None` for types needing semantic context
-//! (UnboundType, TypeAliasType, PlaceholderType) — exactly the deferral pattern
-//! Python uses (lookup_qualified, plugin hooks, type alias expansion).
+//! (UnboundType, PlaceholderType) — exactly the deferral pattern Python uses
+//! (lookup_qualified, plugin hooks). `TypeAliasType` is passed through
+//! unchanged: `visit_type_alias_type` in `mypy/typeanal.py` is a pure
+//! passthrough that returns `t` as-is (args untouched), so the kernel
+//! mirrors that instead of expanding or re-analyzing args (re-analysis
+//! would rebuild already-bound args, e.g. a `Self`, as fresh wire copies
+//! and break object identity; expansion needs the live alias target).
 //!
-//! All four queries defer on `TypeAliasType`; `rust_type_analyze` also defers on
-//! TypeAliasType and UnboundType because their analysis requires the live alias
-//! target or symbol lookup respectively.
+//! The four query helpers defer on `TypeAliasType` (they need alias
+//! expansion); `rust_type_analyze` passes it through unchanged instead
+//! and defers only on UnboundType and PlaceholderType (symbol lookup,
+//! plugin hooks).
 //!
 //! Live-object queries (Stage 18):
 //! - `find_self_type` — BoolTypeQuery with lookup callback, checks SELF_TYPE_NAMES.
@@ -1968,13 +1974,14 @@ fn analyze_type_inner(
             })
         }
 
-        Type::TypeAliasType {
-            args: _,
-            type_ref: _,
-        } => {
-            // Type alias expansion needs the live alias target (symbol lookup,
-            // type parameter substitution). Defer to Python.
-            None
+        Type::TypeAliasType { args, type_ref } => {
+            // Mirror `visit_type_alias_type` (typeanal.py): a pure
+            // passthrough returning the alias unchanged, not an
+            // expansion (needs the live target) nor arg re-analysis.
+            Some(Type::TypeAliasType {
+                args: args.clone(),
+                type_ref: type_ref.clone(),
+            })
         }
 
         Type::TypeVarType {

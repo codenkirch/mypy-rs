@@ -1328,6 +1328,17 @@ class BuildManager:
                     aliases.append(node)
         return aliases
 
+    def _collect_alias_map(self) -> dict[str, TypeAlias]:
+        """Build the fullname -> TypeAlias map for wire-decoded TypeAliasTypes.
+
+        The alias snapshot in the native resolver lives only in Rust; the
+        wire fixer (`mypy.wirefixup._TypeRefFixer`) needs the same live
+        aliases to resolve a decoded alias's `type_ref` back to a TypeAlias
+        node. Collected identically to `_collect_aliases`, so both stay in
+        sync across a build.
+        """
+        return {alias.fullname: alias for alias in self._collect_aliases()}
+
     def _build_native_resolvers(self) -> None:
         """Build or incrementally extend the `NativeTypeResolver` snapshot
         and install it on the subtype/join shims.
@@ -1429,6 +1440,12 @@ class BuildManager:
         # return a wrong answer. Wired to production.
         _set_native_mro_resolver(resolver, typeinfo_map)
         _set_native_join_typeinfo_map(typeinfo_map)
+        # Wire-decoded TypeAliasTypes resolve their `type_ref` through the
+        # same alias snapshot the resolver uses; cleared only by
+        # `_clear_native_resolvers` (per-SCC resets must not drop it).
+        from mypy.wirefixup import set_wire_alias_map
+
+        set_wire_alias_map(self._collect_alias_map())
         # Stage 3d: expand_type is wired to production. It defers
         # (returns None) for bound methods, ParamSpec/Unpack args,
         # empty envs, and any result still carrying a TypeVar-like node,
@@ -1514,10 +1531,14 @@ class BuildManager:
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_alias_map
 
         _set_native_subtype_resolver(None)
         _set_native_join_resolver(None)
         _set_native_join_typeinfo_map(None)
+        # The alias map is derived from the same build's resolver snapshot;
+        # a stale alias must never resolve into the new build.
+        set_wire_alias_map(None)
         _set_native_mro_resolver(None, None)
         from mypy.solve import _set_native_solve_resolver
 

@@ -14833,8 +14833,11 @@ class NativeTypeAnalSuite(Suite):
     NativeJoinMeetSuite uses.
 
     The Rust path returns ``None`` for types needing semantic context
-    (UnboundType, TypeAliasType, PlaceholderType), so those defer to Python
-    and parity is guaranteed by construction.
+    (UnboundType, PlaceholderType), so those defer to Python and parity is
+    guaranteed by construction. TypeAliasType is handled natively as a
+    passthrough (args analyzed, alias node unchanged, mirroring
+    ``visit_type_alias_type``), resolved to a live alias by the installed
+    alias map; without the map the same node defers.
 
     The test corpus covers: Instance, Callable, TypeVar, ParamSpec,
     TypeVarTuple, Tuple, TypedDict, Union, TypeType, Literal, Any, None,
@@ -14843,18 +14846,39 @@ class NativeTypeAnalSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.wirefixup import set_wire_typeinfo_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
 
         self.fx = TypeFixture()
         self._set_active = _set_native_typeanal_active
         type_infos = self._collect_type_infos()
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        set_wire_alias_map(self._collect_aliases())
 
     def tearDown(self) -> None:
-        from mypy.wirefixup import set_wire_typeinfo_map
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
 
         set_wire_typeinfo_map(None)
+        set_wire_alias_map(None)
         self._set_active(False)
+
+    def _collect_aliases(self) -> dict[str, Any]:
+        """Collect the fixture's TypeAlias nodes by fullname.
+
+        `def_alias_1(base)` builds a recursive alias (A = Tuple[Union[base,
+        A], ...]) whose TypeAlias node is returned only through its
+        TypeAliasType; `non_rec_alias` builds a fresh alias per call. Both
+        live under `__main__.A`, so the per-test map must re-install the
+        node the test actually references.
+        """
+        from mypy.nodes import TypeAlias
+
+        def _from(alias_type: TypeAliasType | None) -> dict[str, Any]:
+            if alias_type is None or not isinstance(alias_type.alias, TypeAlias):
+                return {}
+            return {alias_type.alias.fullname: alias_type.alias}
+
+        a1, _ = self.fx.def_alias_1(self.fx.a)
+        return _from(a1)
 
     def _collect_type_infos(self) -> list[TypeInfo]:
         from mypy.nodes import TypeInfo as _TI
@@ -15072,13 +15096,55 @@ class NativeTypeAnalSuite(Suite):
         self.assertIsNone(result)
         # Python fallback would look up "Foo" and process it.
 
-    def test_defer_type_alias_type(self) -> None:
-        """TypeAliasType requires alias target expansion — Rust always defers."""
+    def test_defer_type_alias_type_no_map(self) -> None:
+        """TypeAliasType defers when no alias map is installed.
+
+        Without `set_wire_alias_map`, the decoded alias's type_ref cannot
+        resolve to a live TypeAlias, so the fixer defers and the Python
+        visitor is authoritative (parity by construction).
+        """
         self._set_active(True)
+        from mypy.wirefixup import set_wire_alias_map
+
+        set_wire_alias_map(None)
         A, _ = self.fx.def_alias_1(self.fx.a)
         result = native_analyze_type(A, allow_unpack=True)
         self.assertIsNone(result)
-        # Python fallback would expand the alias target via symbol lookup.
+
+    # --- TypeAliasType passthrough (args analyzed, node unchanged) ---
+
+    def test_type_alias_type_passthrough(self) -> None:
+        """TypeAliasType analyzes args and passes the node through unchanged.
+
+        `visit_type_alias_type` (typeanal.py) is a pure passthrough: the
+        alias is returned as-is with its args analyzed. The Rust path mirrors
+        that, so the round trip preserves the alias and its arguments.
+        """
+        self._set_active(True)
+        from mypy.wirefixup import set_wire_alias_map
+
+        A, _ = self.fx.def_alias_1(self.fx.a)
+        set_wire_alias_map({A.alias.fullname: A.alias})
+        result = native_analyze_type(A, allow_unpack=True)
+        assert result is not None
+        assert isinstance(result, TypeAliasType)
+        self.assertEqual(str(result), str(A))
+        # The recursive alias's args contain a Union (base, A); analysis
+        # must have visited them (left the instance intact).
+        self.assertEqual(len(result.args), len(A.args))
+
+    def test_type_alias_type_non_recursive_args_analyzed(self) -> None:
+        """Non-recursive alias: args with a generic Instance analyze in place."""
+        self._set_active(True)
+        from mypy.wirefixup import set_wire_alias_map
+
+        NA = self.fx.non_rec_alias(Instance(self.fx.gi, [self.fx.t]), [self.fx.t], [self.fx.a])
+        set_wire_alias_map({NA.alias.fullname: NA.alias})
+        result = native_analyze_type(NA, allow_unpack=True)
+        assert result is not None
+        assert isinstance(result, TypeAliasType)
+        self.assertEqual(str(result), str(NA))
+        self.assertEqual(len(result.args), len(NA.args))
 
     # --- Nesting / child analysis ---
 
