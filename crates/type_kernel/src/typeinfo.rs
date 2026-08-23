@@ -154,9 +154,54 @@ impl TypeInfoSnapshot {
 /// Built once per type-checking pass by reading the live Python TypeInfo
 /// graph via PyO3. Lookups are `O(1)` HashMap. The future Stage 3c
 /// `is_subtype` calls `resolver.get(type_ref)` per Instance.
+/// Frozen snapshot of a `mypy.nodes.MypyFile`'s symbol table, keyed by
+/// module fullname. Backs the MypyFile branch of `rust_lookup_qualified`
+/// (semanal_lookup.rs): direct name hits in `module.names`.
+///
+/// For each name in `node.names` we capture `module_hidden` plus the
+/// node kind + fullname when the node is a `MypyFile`. The fullname is
+/// what Python's `get_module_symbol` reaches through a submodule chain:
+/// Rust must descend into the exact module the symbol names, not a guess
+/// from name joining (a name can alias a different module, or be a
+/// non-module while a same-named module exists).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct ModuleSnapshot {
+    /// `name -> (module_hidden, Optional<(is_module, module_fullname)>)`.
+    /// `module_fullname` is present only when the symbol's node is a
+    /// `MypyFile`; it is the node's `fullname` (what Python descends
+    /// into), which may differ from `module + "." + name`.
+    pub symbols: HashMap<String, (bool, Option<(bool, String)>)>,
+}
+
+impl ModuleSnapshot {
+    /// Whether `name` is a direct hit and not hidden.
+    pub fn visible(&self, name: &str) -> Option<bool> {
+        self.symbols.get(name).map(|(hidden, _)| !*hidden)
+    }
+
+    /// The module fullname this symbol descends into, when its node is a
+    /// `MypyFile`. `None` when the symbol is absent, hidden, or not a
+    /// module.
+    pub fn module_fullname(&self, name: &str) -> Option<&str> {
+        let (hidden, node) = self.symbols.get(name)?;
+        if *hidden {
+            return None;
+        }
+        let (is_module, fullname) = node.as_ref()?;
+        if !*is_module {
+            return None;
+        }
+        Some(fullname)
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct TypeResolver {
     snapshots: HashMap<String, TypeInfoSnapshot>,
+    /// `fullname -> ModuleSnapshot` for loaded modules. Populated from
+    /// `BuildManager.modules`; mirrors the `module.names` SymbolTable.
+    modules: HashMap<String, ModuleSnapshot>,
 }
 
 #[allow(dead_code)]
@@ -164,6 +209,7 @@ impl TypeResolver {
     pub fn new() -> Self {
         Self {
             snapshots: HashMap::new(),
+            modules: HashMap::new(),
         }
     }
 
@@ -173,6 +219,14 @@ impl TypeResolver {
 
     pub fn get(&self, fullname: &str) -> Option<&TypeInfoSnapshot> {
         self.snapshots.get(fullname)
+    }
+
+    pub fn insert_module(&mut self, fullname: String, snap: ModuleSnapshot) {
+        self.modules.insert(fullname, snap);
+    }
+
+    pub fn get_module(&self, fullname: &str) -> Option<&ModuleSnapshot> {
+        self.modules.get(fullname)
     }
 
     pub fn len(&self) -> usize {
@@ -907,6 +961,11 @@ pub(crate) struct NativeTypeResolver {
     /// Populated from `BuildManager._native_typeinfo_map` (live TypeInfos)
     /// at each `_build_native_resolvers` call. `None` until set.
     live_info_map: Option<PyObject>,
+    /// Module fullnames snapshotted so far. `update` re-reads `self.modules`
+    /// each call but only snapshots modules not seen (first seal wins, like
+    /// the TypeInfo side; a module's symbol table is final once its own SCC
+    /// sealed it).
+    seen_modules: HashSet<String>,
 }
 
 #[pymethods]
@@ -965,12 +1024,13 @@ impl NativeTypeResolver {
     /// graph (~8490 items) on every call. Returns `(added_infos,
     /// added_aliases)` so the Python side can grow its accumulated
     /// `typeinfo_map` in lockstep.
-    #[pyo3(signature = (type_infos, aliases))]
+    #[pyo3(signature = (type_infos, aliases, modules=None))]
     fn update(
         &mut self,
         py: Python<'_>,
         type_infos: &PyAny,
         aliases: &PyAny,
+        modules: Option<&PyAny>,
     ) -> PyResult<(usize, usize)> {
         let mut added_infos = 0usize;
         for item in type_infos.iter()? {
@@ -1019,6 +1079,12 @@ impl NativeTypeResolver {
             self.alias_resolver.insert(fullname, snap);
             added_aliases += 1;
         }
+        // Module snapshots: first seal wins (a module's symbol table is
+        // final once its own SCC sealed it; later SCCs must not overwrite
+        // it). Fresh-cache / dependency modules are already final here.
+        if let Some(modules) = modules {
+            self.snapshot_modules(py, modules);
+        }
         // The dict view is keyed by the full TypeInfo set; any growth
         // invalidates it (rebuilt lazily on next render).
         self.cached_dict = None;
@@ -1036,6 +1102,29 @@ impl NativeTypeResolver {
         self.live_info_map = map;
         let _ = py;
         Ok(())
+    }
+
+    /// Snapshot `BuildManager.modules` (a `fullname -> MypyFile` dict) into
+    /// the module table. First seal wins: modules already snapshotted are
+    /// skipped, matching the TypeInfo side. Individual read failures skip
+    /// that module (it defers to Python at lookup time).
+    fn snapshot_modules(&mut self, py: Python<'_>, modules: &PyAny) {
+        let Ok(modules) = modules.downcast::<PyDict>() else {
+            return;
+        };
+        for (key, value) in modules.iter() {
+            let fullname: String = match key.extract() {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if !self.seen_modules.insert(fullname.clone()) {
+                continue;
+            }
+            let Some(snap) = snapshot_module(py, value) else {
+                continue;
+            };
+            self.resolver.insert_module(fullname, snap);
+        }
     }
 }
 
@@ -1158,6 +1247,49 @@ fn snapshot_type_alias(
     })
 }
 
+/// Snapshot one live `mypy.nodes.MypyFile` into a `ModuleSnapshot`:
+/// read the `names` SymbolTable, capturing `module_hidden` and (for
+/// `MypyFile` nodes) the node's fullname per entry. Returns `None`
+/// (caller skips the item) when `names` is unreadable or not a dict.
+/// Individual reads are defensive: an unreadable `module_hidden` is
+/// captured as `false` (a visible hit then answers natively), and an
+/// unreadable node kind is captured as a non-module (Rust then declines
+/// to descend, deferring to Python). The name set itself is exact, so a
+/// miss only makes Rust defer to Python, never invent a symbol.
+fn snapshot_module(py: Python<'_>, item: &PyAny) -> Option<ModuleSnapshot> {
+    let names = item.getattr("names").ok()?;
+    let names = names.downcast::<PyDict>().ok()?;
+    let mut symbols = HashMap::with_capacity(names.len());
+    for (key, value) in names.iter() {
+        let name: String = key.extract().ok()?;
+        let hidden = value
+            .getattr("module_hidden")
+            .ok()
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false);
+        let node = value.getattr("node").ok();
+        let node = node.as_ref().and_then(|n| {
+            let is_module = n
+                .getattr("__class__")
+                .and_then(|c| c.getattr("__name__").and_then(|n| n.extract::<String>()))
+                .ok()
+                .map(|cls| cls == "MypyFile")
+                .unwrap_or(false);
+            if !is_module {
+                return None;
+            }
+            let fullname = n
+                .getattr("fullname")
+                .and_then(|f| f.extract::<String>())
+                .ok()?;
+            Some((true, fullname))
+        });
+        symbols.insert(name, (hidden, node));
+    }
+    let _ = py;
+    Some(ModuleSnapshot { symbols })
+}
+
 impl NativeTypeResolver {
     pub(crate) fn new(
         resolver: TypeResolver,
@@ -1168,6 +1300,7 @@ impl NativeTypeResolver {
             alias_resolver,
             cached_dict: None,
             live_info_map: None,
+            seen_modules: HashSet::new(),
         }
     }
 
@@ -1211,19 +1344,22 @@ impl NativeTypeResolver {
 }
 
 /// Build a `NativeTypeResolver` pyclass from an iterable of live
-/// `mypy.nodes.TypeInfo` objects and an iterable of `mypy.nodes.TypeAlias`
-/// objects. Holds both resolvers in Rust; the dict view is built lazily
-/// on first `render_dict()` call.
+/// `mypy.nodes.TypeInfo` objects, an iterable of `mypy.nodes.TypeAlias`
+/// objects, and a `fullname -> MypyFile` modules dict. Holds both
+/// resolvers in Rust; the dict view is built lazily on first
+/// `render_dict()` call.
 ///
 /// Mirrors `build_resolver` (dict-returning, Stage 3b) but returns the
 /// Rust-owned pyclass for zero-FFI-per-lookup access by Stage 3c
 /// `is_subtype`. The dict-returning `build_resolver` remains for one
 /// release as a deprecated alias so Stage 3b parity tests don't break.
 #[pyfunction]
+#[pyo3(signature = (type_infos, aliases, modules=None))]
 pub(crate) fn build_native_resolver(
     py: Python<'_>,
     type_infos: &PyAny,
     aliases: &PyAny,
+    modules: Option<&PyAny>,
 ) -> PyResult<Py<NativeTypeResolver>> {
     let mut resolver = TypeResolver::new();
     for item in type_infos.iter()? {
@@ -1249,6 +1385,25 @@ pub(crate) fn build_native_resolver(
             continue;
         };
         alias_resolver.insert(fullname, snap);
+    }
+
+    let mut seen_modules = HashSet::new();
+    if let Some(modules) = modules {
+        if let Ok(modules) = modules.downcast::<PyDict>() {
+            for (key, value) in modules.iter() {
+                let fullname: String = match key.extract() {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+                if !seen_modules.insert(fullname.clone()) {
+                    continue;
+                }
+                let Some(snap) = snapshot_module(py, value) else {
+                    continue;
+                };
+                resolver.insert_module(fullname, snap);
+            }
+        }
     }
 
     let native = NativeTypeResolver::new(resolver, alias_resolver);
@@ -1689,5 +1844,52 @@ mod tests {
         let mut keys: Vec<&String> = r.iter().map(|(k, _)| k).collect();
         keys.sort();
         assert_eq!(keys, vec![&"a".to_string(), &"b".to_string()]);
+    }
+
+    // --- ModuleSnapshot tests (MypyFile name tables) ---
+
+    fn make_module_snap(entries: &[(&str, bool, Option<&str>)]) -> ModuleSnapshot {
+        // (name, module_hidden, module_fullname-when-MypyFile)
+        let mut symbols = HashMap::new();
+        for &(name, hidden, mod_full) in entries {
+            let node = mod_full.map(|f| (true, f.to_string()));
+            symbols.insert(name.to_string(), (hidden, node));
+        }
+        ModuleSnapshot { symbols }
+    }
+
+    #[test]
+    fn module_snapshot_visible_distinguishes_hidden_and_missing() {
+        let m = make_module_snap(&[
+            ("x", false, None),
+            ("_hidden", true, None),
+            ("sub", false, Some("pkg.sub")),
+        ]);
+        assert_eq!(m.visible("x"), Some(true));
+        assert_eq!(m.visible("_hidden"), Some(false));
+        assert_eq!(m.visible("absent"), None);
+    }
+
+    #[test]
+    fn module_snapshot_module_fullname_only_for_visible_modules() {
+        let m = make_module_snap(&[
+            ("x", false, None),
+            ("_hidden_mod", true, Some("pkg.hidden")),
+            ("sub", false, Some("pkg.sub")),
+        ]);
+        assert_eq!(m.module_fullname("x"), None);
+        assert_eq!(m.module_fullname("_hidden_mod"), None);
+        assert_eq!(m.module_fullname("sub"), Some("pkg.sub"));
+        assert_eq!(m.module_fullname("absent"), None);
+    }
+
+    #[test]
+    fn resolver_module_accessors_roundtrip() {
+        let mut r = TypeResolver::new();
+        assert!(r.get_module("pkg").is_none());
+        let m = make_module_snap(&[("x", false, None)]);
+        r.insert_module("pkg".to_string(), m);
+        assert!(r.get_module("pkg").is_some());
+        assert!(r.get_module("other").is_none());
     }
 }

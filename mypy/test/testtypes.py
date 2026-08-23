@@ -16482,6 +16482,96 @@ class NativeLookupSuite(Suite):
         assert r == ("not_found", None)
 
 
+class NativeMypyFileLookupSuite(Suite):
+    """Parity tests for the MypyFile branch of `rust_lookup_qualified`.
+
+    Drives `type_kernel.rust_lookup_qualified` on a resolver built from
+    constructed `MypyFile` modules and asserts the returned
+    `(kind, fullname)` decision matches what `SemanticAnalyzer.
+    lookup_qualified` + `get_module_symbol` (semanal.py) would produce.
+    The Rust side answers only direct non-hidden name hits in snapshotted
+    modules; absent names, unresolved submodule chains, and non-module
+    mid-chain members defer (None) to the Python loop.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.nodes import MypyFile, SymbolTable, SymbolTableNode, Var
+
+        self._tk = _tk
+        self._MypyFile = MypyFile
+        self._SymbolTable = SymbolTable
+        self._SymbolTableNode = SymbolTableNode
+        self._Var = Var
+
+    def _module(self, fullname: str, names: dict[str, Any]) -> MypyFile:
+        m = self._MypyFile([], [])
+        m._fullname = fullname
+        m.names = self._SymbolTable(names)
+        return m
+
+    def _var(self, fullname: str, hidden: bool = False) -> SymbolTableNode:
+        v = self._Var(fullname.rsplit(".", 1)[-1])
+        v._fullname = fullname
+        return self._SymbolTableNode(0, v, module_hidden=hidden)
+
+    def _module_sym(
+        self, fullname: str, node: MypyFile, hidden: bool = False
+    ) -> SymbolTableNode:
+        return self._SymbolTableNode(0, node, module_hidden=hidden)
+
+    def _call(self, modules: dict[str, MypyFile], name: str) -> Any:
+        resolver = self._tk.build_native_resolver([], [], modules)
+        return self._tk.rust_lookup_qualified(resolver, name, 1, name.split(".")[0], False)
+
+    def test_direct_name_hit(self) -> None:
+        a = self._module("a", {"x": self._var("a.x")})
+        r = self._call({"a": a}, "a.x")
+        assert r == (0, "a")
+
+    def test_missing_module_defers(self) -> None:
+        # Module absent: the module currently being analyzed may not be
+        # sealed yet, so the native side defers to Python.
+        a = self._module("a", {"x": self._var("a.x")})
+        r = self._call({"a": a}, "b.x")
+        assert r is None
+
+    def test_absent_name_defers(self) -> None:
+        # Absent from `names`: could be a submodule via import_map, an
+        # incomplete namespace, `__getattr__`, or a missing module.
+        a = self._module("a", {})
+        r = self._call({"a": a}, "a.x")
+        assert r is None
+
+    def test_hidden_name_not_found(self) -> None:
+        # `module_hidden` names are positively not found.
+        a = self._module("a", {"x": self._var("a.x", hidden=True)})
+        r = self._call({"a": a}, "a.x")
+        assert r == (-1, "")
+
+    def test_mid_chain_module_descent(self) -> None:
+        # `a.ns` aliases module `other.ns`; descent uses the node's exact
+        # fullname, so `a.ns.x` resolves to the `other.ns` namespace.
+        other = self._module("other.ns", {"x": self._var("other.ns.x")})
+        a = self._module("a", {"ns": self._module_sym("a.ns", other)})
+        r = self._call({"a": a, "other.ns": other}, "a.ns.x")
+        assert r == (0, "other.ns")
+
+    def test_mid_chain_non_module_defers(self) -> None:
+        a = self._module("a", {"x": self._var("a.x")})
+        r = self._call({"a": a}, "a.x.y")
+        assert r is None
+
+    def test_mid_chain_hidden_not_found(self) -> None:
+        # Hidden mid-chain: the hidden check runs before descent, on every
+        # part. `ns` hidden -> positively not found.
+        other = self._module("other.ns", {"x": self._var("other.ns.x")})
+        a = self._module("a", {"ns": self._module_sym("a.ns", other, hidden=True)})
+        r = self._call({"a": a, "other.ns": other}, "a.ns.x")
+        assert r == (-1, "")
+
+
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeLookupQualifiedVarSuite(Suite):
     """Parity tests for the non-Any Var branch of `rust_lookup_qualified`.

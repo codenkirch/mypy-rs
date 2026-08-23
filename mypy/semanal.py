@@ -7699,14 +7699,17 @@ class SemanticAnalyzer(
                 if result is not None:
                     r_kind, r_fullname = result
                     if r_kind == 0:
-                        # Resolved to TypeInfo member. Walk the chain
-                        # in Python to get the SymbolTableNode (matches
-                        # module_hidden check, record_imported_symbol).
+                        # Resolved to a TypeInfo member or a MypyFile
+                        # name hit. Walk the chain in Python to get the
+                        # SymbolTableNode (module_hidden, record_imported_symbol).
                         node = sym.node
                         for i in range(1, len(parts)):
                             part = parts[i]
                             if isinstance(node, TypeInfo):
                                 nextsym = node.get(part)
+                            elif isinstance(node, MypyFile):
+                                nextsym = self.get_module_symbol(node, part)
+                                namespace = node.fullname
                             else:
                                 nextsym = None
                                 break
