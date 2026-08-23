@@ -22,8 +22,7 @@ from mypy.typevartuples import erased_vars
 # returns None for unsupported cases; we fall back to Python.
 try:
     import type_kernel as _type_kernel
-    from librt.internal import ReadBuffer as _ReadBuffer
-    from librt.internal import WriteBuffer as _WriteBuffer
+    from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
 
     _HAS_TYPE_KERNEL = True
 except ImportError:
@@ -40,6 +39,16 @@ def _set_native_typevars_active(active: bool) -> None:
     _native_typevars_active = active
 
 
+# bytes -> decoded wire-Type cache for the typevars seam.  Byte-identical
+# blobs repeat heavily (~97% of 90K calls), so memoizing read_type +
+# fixup_wire_type cuts decode cost.  Mirrors other deser caches.
+_typevars_decode_cache: dict[bytes, Type] = {}
+
+
+def _clear_typevars_decode_cache() -> None:
+    _typevars_decode_cache.clear()
+
+
 def _native_decode_well_formed(data: bytes) -> Type | None:
     """Decode wire bytes for the fill_typevars seam.
 
@@ -48,6 +57,9 @@ def _native_decode_well_formed(data: bytes) -> Type | None:
     across fine-grained refreshes, so a decoded tree with any residual
     fake TypeInfo defers to Python.
     """
+    cached = _typevars_decode_cache.get(data)
+    if cached is not None:
+        return cached
     from mypy.types import instance_cache
     from mypy.wirefixup import check_no_fake_info, fixup_wire_type
 
@@ -62,6 +74,7 @@ def _native_decode_well_formed(data: bytes) -> Type | None:
     fixed = fixup_wire_type(decoded)
     if fixed is None or not check_no_fake_info(fixed):
         return None
+    _typevars_decode_cache[data] = fixed
     return fixed
 
 
