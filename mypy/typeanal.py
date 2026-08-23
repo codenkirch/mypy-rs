@@ -985,6 +985,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 fullname not in ("typing_extensions.ReadOnly", "typing.ReadOnly"),
                 fullname not in LITERAL_TYPE_NAMES,
                 fullname not in UNPACK_TYPE_NAMES,
+                fullname not in SELF_TYPE_NAMES,
                 getattr(self, "allow_unpack", False),
             )
         except (AssertionError, NotImplementedError):
@@ -996,6 +997,11 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         Return the bound type if successful, and return None if the type is a normal type.
         """
         spec_tag = self._native_special_tag(t, fullname)
+        if spec_tag == _UNBOUND_SPECIAL_TAG_NOT_SPECIAL:
+            # Rust proved the name is no special form; the elif-chain below
+            # would fall through to `return None` anyway (the TypeGuard/TypeIs
+            # checks return None for other names). Skip it entirely.
+            return None
         if spec_tag is not None:
             return self._apply_special_unbound_tag(spec_tag, t, fullname)
         if fullname == "builtins.None":
@@ -3429,6 +3435,7 @@ _UNBOUND_SPECIAL_TAG_NAME_TYPEIS = 36
 _UNBOUND_SPECIAL_TAG_UNPACK_ARG_ERR = 37
 _UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR = 38
 _UNBOUND_SPECIAL_TAG_UNPACK_DEFER = 39
+_UNBOUND_SPECIAL_TAG_NOT_SPECIAL = 40
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
