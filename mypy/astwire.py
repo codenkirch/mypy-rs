@@ -164,9 +164,16 @@ def _register_node_tags() -> None:
 _register_node_tags()
 
 
+# Slots are fixed per class; cache the per-class slot lists once. AST
+# node classes are created before this module is imported, so the cache
+# cannot go stale during a run.
+_SLOT_CACHE: dict[type, list[str]] = {}
+
+
 def _get_all_slots(cls: type) -> list[str]:
-    """Collect all ``__slots__`` from ``cls`` and its MRO (excluding
-    ``Context`` and ``object``)."""
+    cached = _SLOT_CACHE.get(cls)
+    if cached is not None:
+        return cached
     result: list[str] = []
     skip = {object, nodes.Context, nodes.Node, nodes.Statement,
             nodes.Expression}
@@ -190,7 +197,8 @@ def _get_all_slots(cls: type) -> list[str]:
         if s not in seen:
             seen.add(s)
             out.append(s)
-    return out
+    _SLOT_CACHE[cls] = out
+    return tuple(out)
 
 
 def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
