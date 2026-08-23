@@ -164,9 +164,16 @@ def _register_node_tags() -> None:
 _register_node_tags()
 
 
+# Slots are fixed per class; cache the per-class slot lists once. AST
+# node classes are created before this module is imported, so the cache
+# cannot go stale during a run.
+_SLOT_CACHE: dict[type, list[str]] = {}
+
+
 def _get_all_slots(cls: type) -> list[str]:
-    """Collect all ``__slots__`` from ``cls`` and its MRO (excluding
-    ``Context`` and ``object``)."""
+    cached = _SLOT_CACHE.get(cls)
+    if cached is not None:
+        return cached
     result: list[str] = []
     skip = {object, nodes.Context, nodes.Node, nodes.Statement,
             nodes.Expression}
@@ -190,7 +197,8 @@ def _get_all_slots(cls: type) -> list[str]:
         if s not in seen:
             seen.add(s)
             out.append(s)
-    return out
+    _SLOT_CACHE[cls] = out
+    return tuple(out)
 
 
 def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
@@ -251,30 +259,42 @@ def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:
             slots = _get_all_slots(cls)
 
             # Collect child fields (Node or list-of-Node, or nested list).
+            # Lists are appended by reference: the serializer only reads
+            # them (reversed() iteration in the "list" task), never mutates.
             child_fields: list[Any] = []
             for slot in slots:
                 value = getattr(n, slot, None)
-                if value is None:
-                    child_fields.append(None)
-                elif isinstance(value, nodes.Node):
+                if isinstance(value, nodes.Node):
                     child_fields.append(value)
                 elif isinstance(value, (list, tuple)):
-                    items = list(value)
-                    # Keep a field if it's a list of Nodes/None, or a
-                    # nested list-of-lists of Nodes/None (e.g.
-                    # GeneratorExpr.condlists).
-                    def _node_or_none(x: Any) -> bool:
-                        return isinstance(x, (nodes.Node, type(None)))
-
-                    if items and all(
-                        (all(_node_or_none(i) for i in row) if isinstance(row, (list, tuple)) else False)
-                        for row in items
-                    ):
-                        child_fields.append(items)
-                    elif items and all(_node_or_none(i) for i in items):
-                        child_fields.append(items)
-                    else:
+                    # Keep list fields (Nodes/None, or nested lists of
+                    # them). Dispatch on value[0] so flat lists
+                    # skip the nested-row check.
+                    if not value:
                         child_fields.append(None)
+                    else:
+                        first = value[0]
+                        if isinstance(first, nodes.Node) or first is None:
+                            if all((isinstance(i, nodes.Node) or i is None)
+                                   for i in value):
+                                child_fields.append(value)
+                            else:
+                                child_fields.append(None)
+                        elif isinstance(first, (list, tuple)):
+                            ok = True
+                            for row in value:
+                                if not isinstance(row, (list, tuple)):
+                                    ok = False
+                                    break
+                                for i in row:
+                                    if not (isinstance(i, nodes.Node) or i is None):
+                                        ok = False
+                                        break
+                                if not ok:
+                                    break
+                            child_fields.append(value if ok else None)
+                        else:
+                            child_fields.append(None)
                 else:
                     child_fields.append(None)
 
