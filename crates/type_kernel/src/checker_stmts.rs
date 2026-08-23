@@ -84,26 +84,46 @@ fn type_requires_usage_inner(
     resolver: &TypeResolver,
     aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<u8> {
-    let Type::Instance { type_ref, .. } = typ else {
-        // A TypeAliasType expands via the alias resolver chain,
-        // mirroring Python's `get_proper_type`. Other non-Instance
-        // proper types (and unexpandable aliases) defer.
-        if let Type::TypeAliasType { .. } = typ {
+    match typ {
+        Type::TypeAliasType { .. } => {
+            // Expands via the alias resolver chain, mirroring Python's
+            // `get_proper_type`. Unexpandable aliases still defer.
             let (target, _, _) = expanded_alias_target(typ, aliases)?;
-            return type_requires_usage_inner(&target, resolver, aliases);
+            type_requires_usage_inner(&target, resolver, aliases)
         }
-        return None;
-    };
-    if type_ref == "typing.Coroutine" {
-        return Some(0);
-    }
-    // `type.get("__await__") is not None` mirrors TypeInfo.get
-    // (nodes.py:4063): first mro class whose own `names` contains the
-    // name. Missing snapshot = defer (absent vs unknown).
-    match member_present_by_ref(resolver, type_ref, "__await__") {
-        Some(true) => Some(1),
-        Some(false) => Some(2),
-        None => None,
+        Type::Instance { type_ref, .. } => {
+            if type_ref == "typing.Coroutine" {
+                return Some(0);
+            }
+            // `type.get("__await__") is not None` mirrors TypeInfo.get
+            // (nodes.py:4063): first mro class whose own `names` contains
+            // the name. Missing snapshot = defer (absent vs unknown).
+            match member_present_by_ref(resolver, type_ref, "__await__") {
+                Some(true) => Some(1),
+                Some(false) => Some(2),
+                None => None,
+            }
+        }
+        // Every other proper type fails Python's `isinstance(proper_type,
+        // Instance)` check and yields no note: 2 skips the Python body.
+        Type::NoneType
+        | Type::AnyType { .. }
+        | Type::UninhabitedType { .. }
+        | Type::UnionType { .. }
+        | Type::TupleType { .. }
+        | Type::CallableType { .. }
+        | Type::Overloaded { .. }
+        | Type::TypeVarType { .. }
+        | Type::ParamSpecType { .. }
+        | Type::TypeVarTupleType { .. }
+        | Type::LiteralType { .. }
+        | Type::TypedDictType { .. }
+        | Type::ErasedType
+        | Type::DeletedType { .. }
+        | Type::TypeType { .. }
+        | Type::UnpackType { .. }
+        | Type::UnboundType { .. }
+        | Type::Parameters(_) => Some(2),
     }
 }
 

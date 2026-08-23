@@ -21860,3 +21860,38 @@ class NativeTypeRequiresUsageSuite(Suite):
         )
         type_infos.extend(extra)
         return type_infos
+
+
+class NativeTypeRequiresUsageTailSuite(NativeTypeRequiresUsageSuite):
+    """Parity for the ported non-Instance tail of `rust_type_requires_usage`.
+
+    Python's `type_requires_usage` yields no note for every proper type
+    that is not an Instance. The Rust port now decides those cases
+    directly (Some(2), skipping the Python body); gate-on and gate-off
+    must agree, and the seam must engage rather than defer.
+    """
+
+    def test_bare_none_no_note(self) -> None:
+        typ = NoneType()
+        self._assert_par(typ, "NoneType")
+        self._assert_engages(typ, 2)
+
+    def test_any_no_note(self) -> None:
+        typ = self.fx.anyt
+        self._assert_par(typ, "AnyType")
+        self._assert_engages(typ, 2)
+
+    def test_union_no_note(self) -> None:
+        typ = UnionType([self.fx.anyt, self.fx.nonet])
+        self._assert_par(typ, "UnionType")
+        self._assert_engages(typ, 2)
+
+    def test_tuple_no_note(self) -> None:
+        typ = TupleType([self.fx.anyt, self.fx.nonet], self.fx.std_tuple)
+        self._assert_par(typ, "TupleType")
+        self._assert_engages(typ, 2)
+
+    def test_callable_no_note(self) -> None:
+        typ = self.fx.callable(self.fx.anyt, self.fx.nonet)
+        self._assert_par(typ, "CallableType")
+        self._assert_engages(typ, 2)
