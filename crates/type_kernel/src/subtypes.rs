@@ -1198,6 +1198,7 @@ fn visit_instance_noninstance_right(
     // TypeVarTupleType right (subtypes.py:617-620): tuple[Any, ...] is
     // like Any for tuples. Map left to the typevar's tuple_fallback and
     // require the mapped first arg to be Any (stays False if proper).
+
     // Only engages when left is an Instance with a "builtins.tuple" base;
     // other lefts (e.g. TypeVarTupleType itself, subtypes.py:2600-2603)
     // keep deferring through the helper's None path.
@@ -2414,6 +2415,62 @@ pub(crate) fn rust_is_subtype(
         strict_concatenate,
     );
     is_subtype(&left, &right, &ctx, resolver.resolver())
+}
+
+/// `#[pyfunction]` entry: batch variant of `rust_is_subtype`.
+///
+/// Arrives as a flat vec of interleaved `(left, right)` byte blobs plus
+/// the single shared `SubtypeContext` flag set (the Python accumulator
+/// only batches pairs whose resolved flags are identical). Each entry is
+/// decoded and answered with the same `is_subtype` engine as the
+/// single-pair entry; the output is one i8 per pair, position-aligned:
+/// 1 = true, 0 = false, -1 = defer (decode error or the engine returned
+/// `None`). A deferring entry only marks its own slot: the remaining
+/// pairs still get their answers, matching the single-pair fallthrough
+/// semantics so the Python shim re-runs exactly the deferred pairs.
+#[pyfunction]
+#[allow(clippy::too_many_arguments, dead_code)]
+pub(crate) fn rust_is_subtype_batch(
+    pairs_bytes: Vec<&[u8]>,
+    ignore_type_params: bool,
+    ignore_declared_variance: bool,
+    always_covariant: bool,
+    ignore_promotions: bool,
+    proper_subtype: bool,
+    strict_optional: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Vec<i8> {
+    let ctx = SubtypeContext::with_callable_flags(
+        ignore_type_params,
+        ignore_declared_variance,
+        always_covariant,
+        ignore_promotions,
+        proper_subtype,
+        strict_optional,
+        ignore_pos_arg_names,
+        strict_concatenate,
+    );
+    let resolver = resolver.resolver();
+    let mut out = Vec::with_capacity(pairs_bytes.len() / 2);
+    let (chunks, remainder) = pairs_bytes.as_chunks::<2>();
+    for [a, b] in chunks {
+        let answer = match (decode_type(a), decode_type(b)) {
+            (Some(left), Some(right)) => is_subtype(&left, &right, &ctx, resolver),
+            _ => None,
+        };
+        out.push(match answer {
+            Some(true) => 1,
+            Some(false) => 0,
+            None => -1,
+        });
+    }
+    // An odd trailing blob should never arrive (the Python edge always
+    // emits full pairs); mark it defer so the shim re-runs and surfaces
+    // the mismatch instead of silently dropping.
+    out.extend(remainder.iter().map(|_| -1));
+    out
 }
 
 /// `#[pyfunction]` entry for the TypeVarTupleType-right branch of
@@ -3683,5 +3740,101 @@ mod tests {
             erase_return_self_types_wire(&Type::NoneType, &self_t).unwrap(),
             Type::NoneType
         );
+    }
+
+    fn encode(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, t).expect("encode type for batch test");
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn batch_identical_pairs_match_single_pair() {
+        // Same (left, right) offered multiple times in one batch: every
+        // entry must produce the identical answer to the single-pair
+        // entry.
+
+        // Equal wire bytes make equal answers; dedup at the Python edge
+        // does not change the Rust contract.
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("a.B", "B"),
+            snap("builtins.object", "object"),
+        ]);
+        let left = instance("a.A", vec![]);
+        let right = instance("a.B", vec![]);
+        let pairs: Vec<Vec<u8>> = vec![
+            encode(&left),
+            encode(&right),
+            encode(&left),
+            encode(&right),
+            encode(&left),
+            encode(&right),
+            encode(&left),
+            encode(&right),
+        ];
+        let flat: Vec<&[u8]> = pairs.iter().map(|b| b.as_slice()).collect();
+        let single = is_subtype(&left, &right, &ctx_nominal(), &r);
+        let expect = match single {
+            Some(true) => 1 as i8,
+            Some(false) => 0,
+            None => -1,
+        };
+        let got = rust_is_subtype_batch(
+            flat,
+            false, // ignore_type_params
+            false, // ignore_declared_variance
+            false, // always_covariant
+            false, // ignore_promotions
+            false, // proper_subtype
+            true,  // strict_optional
+            false, // ignore_pos_arg_names
+            false, // strict_concatenate
+            &mut NativeTypeResolver::from_resolver(r),
+        );
+        assert_eq!(got, vec![expect; 4]);
+    }
+
+    #[test]
+    fn batch_deferring_pair_marks_only_its_slot() {
+        // a.Sub[Gen] without bases blobs defers to None (Rust cannot map
+        // to the supertype); the other pairs in the same batch still get
+        // their answers instead of the whole batch failing.
+        let mut gen = snap("a.Gen", "Gen");
+        gen.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        let mut derived = snap("a.Sub", "Sub");
+        derived.has_base.insert("a.Gen".to_string());
+        derived.mro.push("a.Gen".to_string());
+        let r = make_resolver(vec![gen, derived, snap("builtins.object", "object")]);
+        // Deferring pair: a.Sub[Any] <: a.Gen[Any] (no bases blobs).
+        let defer_left = instance("a.Sub", vec![any_type()]);
+        let defer_right = instance("a.Gen", vec![any_type()]);
+        // Decided pair: anything <: object is true.
+        let ok_left = instance("a.Sub", vec![any_type()]);
+        let ok_right = instance("builtins.object", vec![]);
+        let ok_left_b = encode(&ok_left);
+        let ok_right_b = encode(&ok_right);
+        let defer_left_b = encode(&defer_left);
+        let defer_right_b = encode(&defer_right);
+        let flat: Vec<&[u8]> = [
+            ok_left_b.as_slice(),
+            ok_right_b.as_slice(),
+            defer_left_b.as_slice(),
+            defer_right_b.as_slice(),
+        ]
+        .to_vec();
+        let got = rust_is_subtype_batch(
+            flat,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            &mut NativeTypeResolver::from_resolver(r),
+        );
+        assert_eq!(got, vec![1, -1]);
     }
 }
