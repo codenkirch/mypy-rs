@@ -19862,6 +19862,153 @@ class NativeSubtypesCallableSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsSubtypeBatchSuite(Suite):
+    """Parity for the batch `rust_is_subtype_batch` seam.
+
+    One Rust call answers many Instance-vs-Instance pairs with a single
+    shared flag set. Each slot must equal the answer the single-pair
+    `rust_is_subtype` call would give; a pair Rust cannot decide (a
+    protocol-Instance right) must be marked -1 for its slot only, without
+    poisoning the decided pairs in the same batch. The Python accumulator
+    (`_flush_subtype_batch`) drops -1 slots and answers the rest from the
+    returned dict, keyed by (left, right, flag-set).
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        # A protocol-Instance right is a guaranteed deferral (subtypes.rs
+        # returns None for protocol rights).
+        self.proto_info = self.fx.make_type_info("mod.Proto", mro=[self.fx.oi])
+        self.proto_info.is_protocol = True
+        type_infos.append(self.proto_info)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _clear_subtype_batch,
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _clear_subtype_batch()
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _batch(self, pairs: list[tuple[bytes, bytes]]) -> list[int]:
+        """Run `rust_is_subtype_batch` with the default flag set."""
+        flat: list[bytes] = []
+        for left_b, right_b in pairs:
+            flat.append(left_b)
+            flat.append(right_b)
+        return _type_kernel.rust_is_subtype_batch(
+            flat,
+            False,  # ignore_type_params
+            False,  # ignore_declared_variance
+            False,  # always_covariant
+            False,  # ignore_promotions
+            False,  # proper_subtype
+            state.strict_optional,
+            False,  # ignore_pos_arg_names
+            False,  # strict_concatenate
+            self.resolver,
+        )
+
+    def test_identical_repeats_match_single_pair(self) -> None:
+        # The same (A, object) pair repeated: every slot must carry the
+        # answer the single-pair call gives, so the Python-edge dedup is
+        # sound. (A <: B is false in the fixture; use A <: object.)
+        from mypy.subtypes import _serialize_type
+
+        left_b = _serialize_type(self.fx.a)
+        right_b = _serialize_type(self.fx.o)
+        got = self._batch([(left_b, right_b)] * 4)
+        assert got == [1, 1, 1, 1]
+
+    def test_decided_pair_batch_result(self) -> None:
+        # Decided pairs keep their per-slot answers when mixed together.
+        from mypy.subtypes import _serialize_type
+
+        # A <: object -> True (1); B <: A -> True (1); A <: B -> False (0).
+        pairs = [
+            (_serialize_type(self.fx.a), _serialize_type(self.fx.o)),
+            (_serialize_type(self.fx.b), _serialize_type(self.fx.a)),
+            (_serialize_type(self.fx.a), _serialize_type(self.fx.b)),
+        ]
+        got = self._batch(pairs)
+        assert got == [1, 1, 0]
+
+    def test_identical_pairs_share_one_slot_result(self) -> None:
+        # The same (left, right) appearing twice in one batch answers the
+        # same way in both slots.
+        from mypy.subtypes import _serialize_type
+
+        got = self._batch(
+            [
+                (_serialize_type(self.fx.a), _serialize_type(self.fx.o)),
+                (_serialize_type(self.fx.a), _serialize_type(self.fx.o)),
+            ]
+        )
+        assert got == [1, 1]
+
+    def test_protocol_right_defers_only_its_slot(self) -> None:
+        # A protocol-Instance right is a guaranteed deferral; its slot is
+        # -1 while the decided slot around it stays decided.
+        from mypy.subtypes import _serialize_type
+
+        proto_inst = Instance(self.proto_info, [])
+        got = self._batch(
+            [
+                (_serialize_type(self.fx.a), _serialize_type(self.fx.o)),
+                (_serialize_type(self.fx.a), _serialize_type(proto_inst)),
+            ]
+        )
+        assert got == [1, -1]
+
+    def test_accumulator_flush_maps_answers(self) -> None:
+        # `_flush_subtype_batch` folds decided pairs into the build-global
+        # answer cache and drops deferred (-1) slots.
+
+        # A repeated identical pair is answered from the cache without a
+        # fresh Rust call.
+
+        # Drives the batch primitive directly; 512 is a `Final` threshold,
+        # so the accumulator is exercised at the flush edge.
+        import mypy.subtypes as S
+
+        S._clear_subtype_batch()
+        left_b = S._serialize_type(self.fx.a)
+        right_b = S._serialize_type(self.fx.o)
+        ctx_key = (False, False, False, False, False, False, False, False)
+        S._subtype_batch.append((left_b, right_b, ctx_key))
+        proto_inst = Instance(self.proto_info, [])
+        S._subtype_batch.append((S._serialize_type(self.fx.a), S._serialize_type(proto_inst), ctx_key))
+        answers = S._flush_subtype_batch()
+        # Decided pair present; deferred pair absent from both dicts.
+        assert answers[(left_b, right_b, ctx_key)] is True
+        assert S._subtype_answers[(left_b, right_b, ctx_key)] is True
+        assert len(answers) == 1
+        assert S._subtype_batch == []
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 def _build_native_variance_resolver(infos: list[TypeInfo]) -> Any:
     """Build a `NativeTypeResolver` snapshot over the given live TypeInfos
     (the class plus the fixture graph it subclasses) so the Rust subtype

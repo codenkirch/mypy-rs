@@ -916,7 +916,7 @@ class BuildManager:
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
         from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.subtypes import _clear_subtype_decode_cache
+        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
@@ -926,6 +926,7 @@ class BuildManager:
         _clear_typevars_decode_cache()
         _clear_map_supertype_decode_cache()
         _clear_subtype_decode_cache()
+        _clear_subtype_batch()
         _clear_narrow_decode_cache()
         _clear_expand_decode_cache()
         # Clear the traverser AST-serialization memo so stale bytes from a
@@ -1554,7 +1555,7 @@ class BuildManager:
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
         from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.subtypes import _clear_subtype_decode_cache
+        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
@@ -1564,6 +1565,7 @@ class BuildManager:
         _clear_typevars_decode_cache()
         _clear_map_supertype_decode_cache()
         _clear_subtype_decode_cache()
+        _clear_subtype_batch()
         _clear_narrow_decode_cache()
         _clear_expand_decode_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map

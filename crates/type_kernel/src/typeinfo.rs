@@ -1310,6 +1310,12 @@ impl NativeTypeResolver {
         &self.resolver
     }
 
+    /// Wrap an already-built `TypeResolver` (tests only).
+    #[cfg(test)]
+    pub(crate) fn from_resolver(resolver: TypeResolver) -> Self {
+        Self::new(resolver, crate::aliases::TypeAliasResolver::new())
+    }
+
     /// Look up a live `TypeInfo` (as `&PyAny`) by fullname from the
     /// `live_info_map` installed by `set_live_typeinfo_map`. `None` when no
     /// map is installed or the fullname is absent. Used by enum-member reads

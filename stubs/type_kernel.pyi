@@ -63,6 +63,7 @@ __all__ = [
     "build_native_resolver",
     "read_type_to_str_with_native_resolver",
     "rust_is_subtype",
+    "rust_is_subtype_batch",
     "rust_subtype_tvar_tuple_right",
     "rust_variadic_tuple_subtype",
     "rust_trivial_join",
@@ -434,6 +435,19 @@ def rust_is_subtype(
     strict_concatenate: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
+
+def rust_is_subtype_batch(
+    pairs_bytes: list[bytes],
+    ignore_type_params: bool,
+    ignore_declared_variance: bool,
+    always_covariant: bool,
+    ignore_promotions: bool,
+    proper_subtype: bool,
+    strict_optional: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    resolver: NativeTypeResolver,
+) -> list[int]: ...
 
 def rust_subtype_tvar_tuple_right(
     left: bytes,
