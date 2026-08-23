@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from mypy.expandtype import expand_type_by_instance
@@ -26,6 +27,16 @@ from mypy.types import (
 # None for any type it does not handle, in which case we fall back to the
 
 # pure-Python path. This is the strangler-fig per-call gate.
+
+# wire-bytes -> decoded+fixed Instance cache for the supertype seam
+# (10K calls, ~82% repeat). Copy-on-hit: callers re-apply per-call
+# line/column. Cleared per build + on real typeinfo map replacement.
+_map_supertype_decode_cache: dict[bytes, Instance] = {}
+
+
+def _clear_map_supertype_decode_cache() -> None:
+    _map_supertype_decode_cache.clear()
+
 
 try:
     import type_kernel as _type_kernel
@@ -129,7 +140,16 @@ def _native_map_instance_to_supertype(
         )
         if result is None:
             return None
-        decoded = read_type(_ReadBuffer(bytes(result)))
+        raw = bytes(result)
+        cached = _map_supertype_decode_cache.get(raw)
+        if cached is not None:
+            # Shallow copy: callers re-apply per-call line/column
+            # (mirrors expand_type/checkmember memoization).
+            fixed = copy.copy(cached)
+            fixed.line = instance.line
+            fixed.column = instance.column
+            return fixed
+        decoded = read_type(_ReadBuffer(raw))
         from mypy.wirefixup import fixup_wire_type
 
         fixed = fixup_wire_type(decoded)
@@ -139,6 +159,7 @@ def _native_map_instance_to_supertype(
             # contexts report errors at the call site.
             fixed.line = instance.line
             fixed.column = instance.column
+            _map_supertype_decode_cache[raw] = fixed
             return fixed
         return None
     except (AssertionError, NotImplementedError, ValueError):
