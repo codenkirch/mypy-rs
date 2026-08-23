@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Iterable, Mapping
 from typing import Any, Final, TypeVar, cast, overload
 
@@ -59,6 +60,18 @@ import mypy.type_visitor  # ruff: isort: skip
 # type it does not handle, in which case we fall back to the pure-Python
 
 # visitor. This is the strangler-fig per-call gate.
+
+
+# wire-bytes -> decoded+fixed Type cache for the expand_type seam
+# (74K calls, ~98% repeat). Copy-on-hit: callers apply per-call
+# line/column. Cleared per build + on real typeinfo map replacement.
+_expand_type_decode_cache: dict[bytes, Type] = {}
+_expand_remove_trivial_cache: dict[bytes, list[Type]] = {}
+
+
+def _clear_expand_decode_cache() -> None:
+    _expand_type_decode_cache.clear()
+    _expand_remove_trivial_cache.clear()
 
 
 def _needs_python(typ: Type) -> bool:
@@ -290,7 +303,19 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 state.strict_optional,
             )
             if result is not None:
-                decoded = read_type(_ReadBuffer(bytes(result)))
+                raw = bytes(result)
+                cached = _expand_type_decode_cache.get(raw)
+                if cached is not None and isinstance(cached, ProperType):
+                    # Shallow copy: callers mutate top-level line/column;
+                    # identical blobs must not cross-contaminate sites
+                    # applying different locations.
+                    fixed = copy.copy(cached)
+                    fixed.line = typ.line
+                    fixed.column = typ.column
+                    if isinstance(fixed, CallableType):
+                        fixed.fallback.line = fixed.line
+                    return fixed
+                decoded = read_type(_ReadBuffer(raw))
                 from mypy.wirefixup import fixup_wire_type
 
                 fixed = fixup_wire_type(decoded)
@@ -318,6 +343,7 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
                 instance_cache.object_type = None
                 instance_cache.function_type = None
                 if fixed is not None:
+                    _expand_type_decode_cache[raw] = fixed
                     return fixed
         except (NotImplementedError, AssertionError):
             # AssertionError: TypeInfo not yet fixed during semanal.
@@ -1071,9 +1097,13 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                 buf.getvalue(), state.strict_optional
             )
             if result is not None:
+                raw = bytes(result)
+                cached = _expand_remove_trivial_cache.get(raw)
+                if cached is not None:
+                    return cached
                 from mypy.wirefixup import fixup_wire_type
 
-                decoded = read_type_list(_ReadBuffer(bytes(result)))
+                decoded = read_type_list(_ReadBuffer(raw))
                 # Clear the process-global primitive decode singletons
                 # after a read so NOT_READY Instances cannot leak into
                 # later builds (see expand_type).
@@ -1091,6 +1121,7 @@ def remove_trivial(types: Iterable[Type]) -> list[Type]:
                         break
                     fixed_types.append(fixed)
                 else:
+                    _expand_remove_trivial_cache[raw] = fixed_types
                     return fixed_types
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             # Defer to Python: semanal TypeInfo-not-fixed asserts,
