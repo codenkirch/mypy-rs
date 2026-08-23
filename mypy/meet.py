@@ -61,6 +61,16 @@ from mypy.types import (
 # path's resolver + WriteBuffer (only needs is_subtype). The active
 # flag + resolver are owned by `mypy.join`, read at call time.
 
+# wire-bytes -> decoded+fixed Type cache for narrow_declared_type
+# (28K calls, ~94% repeat; memoize read_type+fixup; cleared per
+# build and on a real wire-typeinfo map replacement).
+_narrow_decode_cache: dict[bytes, Type] = {}
+
+
+def _clear_narrow_decode_cache() -> None:
+    _narrow_decode_cache.clear()
+
+
 # TODO Describe this module.
 
 
@@ -247,7 +257,11 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
         except (AssertionError, NotImplementedError):
             encoded = None
         if encoded is not None:
-            decoded = read_type(join._ReadBuffer(bytes(encoded)))  # type: ignore[attr-defined]
+            raw = bytes(encoded)
+            cached = _narrow_decode_cache.get(raw)
+            if cached is not None:
+                return cached
+            decoded = read_type(join._ReadBuffer(raw))  # type: ignore[attr-defined]
             from mypy.types import instance_cache
             from mypy.wirefixup import fixup_wire_type
 
@@ -260,6 +274,7 @@ def narrow_declared_type(declared: Type, narrowed: Type) -> Type:
             instance_cache.function_type = None
             fixed = fixup_wire_type(decoded)
             if fixed is not None:
+                _narrow_decode_cache[raw] = fixed
                 return fixed
             # Fall through to Python.
 

@@ -75,6 +75,7 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
         from mypy.checker import _clear_checker_deser_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.meet import _clear_narrow_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
 
@@ -83,6 +84,7 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()
+        _clear_narrow_decode_cache()
     _last_real_map = typeinfo_map
     _wire_typeinfo_map = typeinfo_map
 
