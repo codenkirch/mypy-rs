@@ -907,11 +907,13 @@ class BuildManager:
 
         _clear_type_wire_cache()
         _set_type_wire_cache_enabled(False)
-        from mypy.checkmember import _clear_deser_cache
         from mypy.checker import _clear_checker_deser_cache
+        from mypy.checkexpr import _clear_argtypes_plan_cache
+        from mypy.checkmember import _clear_deser_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        _clear_argtypes_plan_cache()
         # Clear the traverser AST-serialization memo so stale bytes from a
         # previous build never survive into the new AST (structure can
         # change across builds even though the wire ignores scalars).
@@ -1529,11 +1531,13 @@ class BuildManager:
         # The accumulated typeinfo map is re-created for the new build;
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
-        from mypy.checkmember import _clear_deser_cache
         from mypy.checker import _clear_checker_deser_cache
+        from mypy.checkexpr import _clear_argtypes_plan_cache
+        from mypy.checkmember import _clear_deser_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        _clear_argtypes_plan_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
@@ -1613,11 +1617,11 @@ class BuildManager:
 
     def dump_stats(self) -> None:
         if self.stats_enabled:
+            from mypy.checker import _checker_decode_count
             from mypy.checkmember import (
                 _deser_cache_hits,
                 _deser_cache_misses,
             )
-            from mypy.checker import _checker_decode_count
 
             for freeze, hits in _deser_cache_hits.items():
                 self.stats[f"deser_cache_hits_{freeze}"] = hits[0]
