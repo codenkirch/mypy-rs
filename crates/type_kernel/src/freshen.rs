@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use pyo3::prelude::*;
 
-use crate::expandtype::{expand_type_inner, make_type_normalized, result_has_typevar, EnvKey};
+use crate::expandtype::{expand_type_inner, make_type_normalized, EnvKey};
 use crate::setops::{union_item_can_be_false, union_item_can_be_true};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
@@ -297,11 +297,6 @@ fn freshen_function_type_vars(callee: &Type, next_raw_id: &mut i64) -> Option<Ty
             }
             // expand_type(callee, tvmap) then copy_modified(variables=tvs).
             let expanded = expand_type_inner(callee, &tvmap, true)?;
-            if result_has_typevar(&expanded) {
-                // A surviving TypeVar would lose identity on the wire
-                // round-trip; defer to Python which preserves it.
-                return None;
-            }
             Some(set_callable_variables(expanded, tvs))
         }
         Type::Overloaded { items } => {
