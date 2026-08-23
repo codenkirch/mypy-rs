@@ -99,9 +99,7 @@ pub(crate) fn rust_lookup_qualified(
         match walk_mypyfile_chain(resolver.resolver(), &parts, first_sym_fullname) {
             WalkOutcome::NotFound => return Ok(Some((RESULT_NOT_FOUND, String::new()))),
             WalkOutcome::Defer => return Ok(None),
-            WalkOutcome::Resolved(fullname) => {
-                return Ok(Some((RESULT_TYPEINFO_MEMBER, fullname)))
-            }
+            WalkOutcome::Resolved(fullname) => return Ok(Some((RESULT_TYPEINFO_MEMBER, fullname))),
         }
     }
 
@@ -359,7 +357,10 @@ mod tests {
     #[test]
     fn walk_hidden_mid_chain_is_not_found() {
         let mut r = TypeResolver::new();
-        let (m, s) = module("pkg", &[("_sub", true, Some("pkg._sub")), ("x", false, None)]);
+        let (m, s) = module(
+            "pkg",
+            &[("_sub", true, Some("pkg._sub")), ("x", false, None)],
+        );
         r.insert_module(m, s);
         let p = parts("pkg._sub.x");
         assert!(matches!(
