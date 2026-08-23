@@ -657,9 +657,9 @@ Returns the note/code for the typing.Coroutine (UNUSED_COROUTINE) and
         return ("Are you missing an await?", UNUSED_COROUTINE)
     if code == 1:
         return ("Are you missing an await?", UNUSED_AWAITABLE)
-    # code == 2: Rust decided no __await__ in the mro, so no note. Return
-    # None (no note) without re-running the pure-Python body; the
-    # pure-Python fallback would reach the identical conclusion.
+    # code == 2: Rust decided no note applies (no __await__ in the mro,
+    # or the proper type is not an Instance). None = no note, skipping
+    # the pure-Python body, which reaches the identical conclusion.
     return None
 
 
