@@ -29,10 +29,17 @@
 //! the shim: `Literal` always defers to `analyze_literal_type`, the two
 //! is-check families fold into the bool-alias branch (tag-name variants
 //! `TAG_NAME_TYPEGUARD` / `TAG_NAME_TYPEIS`), and `Unpack` classifies
-//! only its two pure error branches (`TAG_UNPACK_ARG_ERR` /
-//! `TAG_UNPACK_POS_ERR`). The `Unpack` gold path (mutates
-//! `allow_type_var_tuple`) and the whole `Self` family (needs the live
-//! `api.type`, args-error falls through to the gold body) defer.
+//! the two pure error branches (`TAG_UNPACK_ARG_ERR` /
+//! `TAG_UNPACK_POS_ERR`) plus the gold path (`TAG_UNPACK_DEFER`, whose
+//! only non-pure step is the `allow_type_var_tuple` mutation the shim
+//! applies around the same `anal_type` recursion). The whole `Self`
+//! family (needs the live `api.type`, and there is no pure sub-branch:
+//! the args-error falls through to the gold body) defers.
+//!
+//! Since #775, the bool-alias `TypeGuard`/`TypeIs` filtering and the
+//! `Unpack` branch tags are gated on pure arity facts; the shim passes
+//! the membership booleans and `allow_unpack` so the classifier can
+//! return the tags without touching live `t.args` contents.
 //!
 //! The fullname membership sets are passed from Python as booleans (the
 //! shim computes the tuple membership with the live `mypy.types.*_NAMES`
@@ -81,6 +88,7 @@ const TAG_NAME_TYPEGUARD: i64 = 35; // 1168-1173 TypeGuard/TypeIs is-check
 const TAG_NAME_TYPEIS: i64 = 36; // 1168-1173 TypeGuard/TypeIs is-check
 const TAG_UNPACK_ARG_ERR: i64 = 37; // 1174-1177 arity != 1 -> fail + Any(from_error)
 const TAG_UNPACK_POS_ERR: i64 = 38; // 1178-1180 !allow_unpack -> fail + Any(from_error)
+const TAG_UNPACK_DEFER: i64 = 39; // 1181-1186 gold path (mutates allow_type_var_tuple)
 
 /// `try_analyze_special_unbound_type` classifier. Mirrors the branch order
 /// of typeanal.py:936-1141 and returns the terminal branch tag; `None`
@@ -241,8 +249,9 @@ pub(crate) fn rust_classify_special_unbound(
         )
     } else {
         // TypeGuard / TypeIs / Unpack / Self (typeanal.py:1168-1202) and
-        // the non-special tail. Unpack's two error branches are pure
-        // (arity + allow_unpack); its gold path stays in Python.
+        // the non-special tail. Unpack is fully classified: the pure
+        // error branches plus the gold path tag, whose only non-pure step
+        // is the allow_type_var_tuple mutation the shim applies.
         if !not_in_unpack {
             if arg_count != 1 {
                 return Ok(Some(TAG_UNPACK_ARG_ERR));
@@ -250,7 +259,7 @@ pub(crate) fn rust_classify_special_unbound(
             if !allow_unpack {
                 return Ok(Some(TAG_UNPACK_POS_ERR));
             }
-            return Ok(None);
+            return Ok(Some(TAG_UNPACK_DEFER));
         }
         return Ok(classify_tail(&fullname));
     };
@@ -784,14 +793,17 @@ mod tests {
     }
 
     #[test]
-    fn unpack_gold_path_defers() {
+    fn unpack_gold_path_tags_defer() {
+        // Unpack[int] in a variadic position: the gold path tag routes the
+        // shim to the exact original body (mutates allow_type_var_tuple
+        // around anal_type).
         let f = Facts {
             fullname: "typing.Unpack".to_string(),
             arg_count: 1,
             allow_unpack: true,
             ..Default::default()
         };
-        assert_eq!(classify(&f), None);
+        assert_eq!(classify(&f), Some(TAG_UNPACK_DEFER));
     }
 
     #[test]
