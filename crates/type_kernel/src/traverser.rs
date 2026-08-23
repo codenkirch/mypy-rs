@@ -173,6 +173,51 @@ fn has_await_inner(node: &AstNode) -> bool {
     node.child_nodes().iter().any(|c| has_await_inner(c))
 }
 
+/// `mypy.checkexpr.visit_generator_expr` — combined has-await for a
+/// GeneratorExpr: walks left_expr, sequences[1:], and all condlists.
+/// Mirrors the pure-Python check at checkexpr.py:7417-7422 exactly:
+/// the first sequence and the indices are NOT checked.
+#[pyfunction]
+pub(crate) fn rust_has_await_in_generator(node_bytes: &[u8]) -> PyResult<bool> {
+    let node = match decode_node(node_bytes) {
+        Some(n) => n,
+        None => return Ok(false),
+    };
+    // GeneratorExpr slots order: left_expr, sequences, condlists,
+    // is_async, indices. is_async is list[bool] and drops to a None
+    // child field, so positions survive for the rest.
+    let children = &node.children;
+    if children.len() < 3 {
+        return Ok(false);
+    }
+    let any_has_await = |n: &AstNode| has_await_inner(n);
+    // left_expr (field 0).
+    if let ChildField::Node(left) = &children[0] {
+        if any_has_await(left) {
+            return Ok(true);
+        }
+    }
+    // sequences[1:] (field 1, flat list).
+    if let ChildField::List(seqs) = &children[1] {
+        for seq in seqs.iter().skip(1) {
+            if any_has_await(seq) {
+                return Ok(true);
+            }
+        }
+    }
+    // condlists (field 2, nested list).
+    if let ChildField::NestedList(rows) = &children[2] {
+        for row in rows {
+            for cond in row {
+                if any_has_await(cond) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // all_return_statements (FuncCollectorBase)
 // ---------------------------------------------------------------------------
@@ -368,6 +413,19 @@ fn collect_returns_and_flags(
                             total,
                             in_finally_count,
                         );
+                    }
+                }
+                ChildField::NestedList(rows) => {
+                    for row in rows {
+                        for item in row {
+                            collect_returns_and_flags(
+                                item,
+                                inside_func || is_func_def(node.tag),
+                                child_in_finally,
+                                total,
+                                in_finally_count,
+                            );
+                        }
                     }
                 }
                 ChildField::None => {}

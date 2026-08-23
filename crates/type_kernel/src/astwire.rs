@@ -14,7 +14,7 @@
 //! Python serializer skips them. Only structure + node kind survives the
 //! round-trip, which is what the seekers need.
 
-use crate::wire::{read_int_bare, read_tag, ReadBuffer, WireError, WriteBuffer};
+use crate::wire::{peek_tag, read_int_bare, read_tag, ReadBuffer, WireError, WriteBuffer};
 
 // Shared wire tags (mirror mypy.cache).
 const LITERAL_NONE: u8 = 2;
@@ -112,12 +112,14 @@ pub(crate) const TSTRING_EXPR: u8 = 229;
 // Node tree representation
 // ---------------------------------------------------------------------------
 
-/// A child field: either None, a single node, or a list of nodes.
+/// A child field: either None, a single node, a list of nodes, or a
+/// nested list (list-of-list, e.g. GeneratorExpr.condlists).
 #[derive(Debug, Clone)]
 pub(crate) enum ChildField {
     None,
     Node(AstNode),
     List(Vec<AstNode>),
+    NestedList(Vec<Vec<AstNode>>),
 }
 
 /// An AST node: variant tag + child fields. Structure only (no scalar data).
@@ -135,6 +137,11 @@ impl AstNode {
             match field {
                 ChildField::Node(n) => out.push(n),
                 ChildField::List(items) => out.extend(items.iter()),
+                ChildField::NestedList(rows) => {
+                    for row in rows {
+                        out.extend(row.iter());
+                    }
+                }
                 ChildField::None => {}
             }
         }
@@ -176,6 +183,23 @@ fn read_child_field(buf: &mut ReadBuffer<'_>) -> Result<ChildField, WireError> {
     }
     if tag == LIST_GEN {
         let size = read_int_bare(buf)? as usize;
+        // Detect nesting by peeking the first item: if it is LIST_GEN,
+        // the whole field is a list-of-lists (e.g. condlists).
+        if peek_tag(buf) == Some(LIST_GEN) {
+            let mut rows: Vec<Vec<AstNode>> = Vec::with_capacity(size);
+            for _ in 0..size {
+                read_tag(buf)?; // consume row LIST_GEN
+                let row_size = read_int_bare(buf)? as usize;
+                let mut row = Vec::with_capacity(row_size);
+                for _ in 0..row_size {
+                    if let Some(node) = read_node(buf)? {
+                        row.push(node);
+                    }
+                }
+                rows.push(row);
+            }
+            return Ok(ChildField::NestedList(rows));
+        }
         let mut items = Vec::with_capacity(size);
         for _ in 0..size {
             if let Some(node) = read_node(buf)? {
@@ -221,6 +245,17 @@ fn write_child_field(buf: &mut WriteBuffer, field: &ChildField) {
             crate::wire::write_int_bare(buf, items.len() as i64).expect("write list size");
             for item in items {
                 write_node(buf, item);
+            }
+        }
+        ChildField::NestedList(rows) => {
+            buf.push(LIST_GEN);
+            crate::wire::write_int_bare(buf, rows.len() as i64).expect("write nested list size");
+            for row in rows {
+                buf.push(LIST_GEN);
+                crate::wire::write_int_bare(buf, row.len() as i64).expect("write row size");
+                for item in row {
+                    write_node(buf, item);
+                }
             }
         }
     }

@@ -179,6 +179,11 @@ pub(crate) fn read_tag(buf: &mut ReadBuffer<'_>) -> Result<u8, WireError> {
     buf.read_u8()
 }
 
+/// Peek the next tag without advancing (None on truncated input).
+pub(crate) fn peek_tag(buf: &ReadBuffer<'_>) -> Option<u8> {
+    buf.data.get(buf.pos).copied()
+}
+
 /// Read a bool (1 byte: 0=False, 1=True, else Invalid). Mirrors `read_bool`.
 pub(crate) fn read_bool(buf: &mut ReadBuffer<'_>) -> Result<bool, WireError> {
     match buf.read_u8()? {
