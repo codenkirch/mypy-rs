@@ -515,12 +515,17 @@ def _try_native_narrow_type_by_identity_equality(
     if pair is None:
         return None
     if_type, else_type = pair
-    if_type_dec = (
-        _deserialize_type_from_checker(bytes(if_type)) if if_type is not None else None
-    )
-    else_type_dec = (
-        _deserialize_type_from_checker(bytes(else_type)) if else_type is not None else None
-    )
+    try:
+        if_type_dec = (
+            _deserialize_type_from_checker(bytes(if_type)) if if_type is not None else None
+        )
+        else_type_dec = (
+            _deserialize_type_from_checker(bytes(else_type)) if else_type is not None else None
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        # A wire ref that cannot resolve to a live TypeInfo must not surface
+        # as "no new info"; defer the whole call to the pure-Python path.
+        return None
     # fixup_wire_type returns None when a type_ref cannot resolve to a live
     # TypeInfo. An unresolvable branch must not surface as "no new info";
     # defer the whole call to the pure-Python path instead.
@@ -557,9 +562,12 @@ def _try_native_generator_return_type_helpers(
         return None
     if blob is None:
         return None
-    dec = _deserialize_type_from_checker(cast(bytes, blob))
-    # fixup_wire_type returns None when a type_ref cannot resolve to a live
-    # TypeInfo; defer rather than fabricate a type.
+    try:
+        dec = _deserialize_type_from_checker(cast(bytes, blob))
+    except (AssertionError, NotImplementedError, ValueError):
+        # fixup_wire_type cannot resolve a type_ref to a live TypeInfo
+        # (class still being analyzed / placeholder); defer.
+        return None
     return dec
 
 
@@ -612,7 +620,12 @@ def _try_native_get_coroutine_return_type(return_type: Type) -> Type | None:
         return None
     if blob is None:
         return None
-    return _deserialize_type_from_checker(bytes(blob))
+    try:
+        return _deserialize_type_from_checker(bytes(blob))
+    except (AssertionError, NotImplementedError, ValueError):
+        # fixup_wire_type cannot resolve a type_ref to a live TypeInfo
+        # (class still being analyzed / placeholder); defer.
+        return None
 
 
 def _try_native_type_requires_usage(typ: Type) -> tuple[str, ErrorCode] | None:
@@ -743,10 +756,12 @@ def _try_native_except_handler_tests(
         if blob is None:
             pairs.append((tag, None))
         else:
-            # fixup_wire_type can fail on an unresolvable type_ref and return
-            # None even though _deserialize_type_from_checker's signature says
-            # Type; annotation keeps the guard statically reachable.
-            t: Type | None = _deserialize_type_from_checker(bytes(blob))
+            try:
+                t = _deserialize_type_from_checker(bytes(blob))
+            except (AssertionError, NotImplementedError, ValueError):
+                # fixup_wire_type cannot resolve a type_ref to a live
+                # TypeInfo (class still being analyzed); defer.
+                return None
             if t is None:
                 return None
             pairs.append((tag, t))
@@ -6321,19 +6336,23 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         typ = get_proper_type(typ)
         res = _try_native_try_handler_union(typ)
         if res is not None:
-            # Native path returns deserialized types with TypeInfo refs
-            # stored as strings (NOT_READY). Resolve them against the module
-            # table before the caller dereferences, then drop cached types.
-            types = [_deserialize_type_from_checker(b) for b in res]
-            for t in types:
-                t.accept(TypeFixer(self.modules, allow_missing=True))
-            from mypy.types import instance_cache
+            # Decode can fail when a type_ref targets a class not yet in the
+            # live snapshot; fall through to the pure-Python path then.
+            try:
+                types = [_deserialize_type_from_checker(b) for b in res]
+            except (AssertionError, NotImplementedError, ValueError):
+                types = None  # type: ignore[assignment]
+            if types is not None:
+                for t in types:
+                    t.accept(TypeFixer(self.modules, allow_missing=True))
+                from mypy.types import instance_cache
 
-            for attr in ("int_type", "str_type", "bool_type", "object_type", "function_type"):
-                s = getattr(instance_cache, attr)
-                if s is not None and s.type_ref is not None:
-                    setattr(instance_cache, attr, None)
-            return types
+                for attr in ("int_type", "str_type", "bool_type", "object_type", "function_type"):
+                    s = getattr(instance_cache, attr)
+                    if s is not None and s.type_ref is not None:
+                        setattr(instance_cache, attr, None)
+                return types
+            # fall through to the pure-Python path below
         if isinstance(typ, TupleType):
             merged_type = make_simplified_union(typ.items)
             if isinstance(merged_type, UnionType):
@@ -8350,7 +8369,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     yes_bytes, no_bytes = result
                     yes_type = _deserialize_type_from_checker(bytes(yes_bytes))
                     no_type = _deserialize_type_from_checker(bytes(no_bytes))
-                    return yes_type, no_type
+                    if yes_type is not None and no_type is not None:
+                        return yes_type, no_type
             except (AssertionError, NotImplementedError):
                 pass
         typ = get_proper_type(typ)
@@ -9549,8 +9569,18 @@ def conditional_types(
             )
             if raw is not None:
                 yes, no = raw
-                yes_typ = _deserialize_type_from_checker(bytes(yes)) if yes is not None else None
-                no_typ = _deserialize_type_from_checker(bytes(no)) if no is not None else None
+                if yes is None:
+                    yes_typ: Type | None = None
+                else:
+                    yes_typ = _deserialize_type_from_checker(bytes(yes))
+                    if yes_typ is None:
+                        raise AssertionError("wire decode produced unresolvable type_ref")
+                if no is None:
+                    no_typ: Type | None = None
+                else:
+                    no_typ = _deserialize_type_from_checker(bytes(no))
+                    if no_typ is None:
+                        raise AssertionError("wire decode produced unresolvable type_ref")
                 return yes_typ, no_typ
         except (AssertionError, NotImplementedError, ValueError):
             pass
@@ -9762,7 +9792,9 @@ def builtin_item_type(tp: Type) -> Type | None:
                 _serialize_type_for_checker(tp), state.strict_optional, _native_checker_resolver
             )
             if result is not None:
-                return _deserialize_type_from_checker(bytes(result))
+                dec = _deserialize_type_from_checker(bytes(result))
+                if dec is not None:
+                    return dec
         except (AssertionError, NotImplementedError, ValueError):
             pass
     tp = get_proper_type(tp)
@@ -10118,20 +10150,22 @@ def expand_callable_variants(c: CallableType) -> list[CallableType]:
                 _serialize_type_for_checker(c), state.strict_optional
             )
             if raw is not None:
-                variants: list[CallableType] = []
-                for v in _deserialize_type_list_from_checker(bytes(raw)):
-                    assert isinstance(v, CallableType)
-                    variants.append(
-                        c.copy_modified(
-                            arg_types=v.arg_types,
-                            ret_type=v.ret_type,
-                            type_guard=v.type_guard,
-                            type_is=v.type_is,
-                            instance_type=v.instance_type,
-                            variables=[],
+                decoded_variants = _deserialize_type_list_from_checker(bytes(raw))
+                if decoded_variants is not None:
+                    variants: list[CallableType] = []
+                    for v in decoded_variants:
+                        assert isinstance(v, CallableType)
+                        variants.append(
+                            c.copy_modified(
+                                arg_types=v.arg_types,
+                                ret_type=v.ret_type,
+                                type_guard=v.type_guard,
+                                type_is=v.type_is,
+                                instance_type=v.instance_type,
+                                variables=[],
+                            )
                         )
-                    )
-                return variants
+                    return variants
         except (AssertionError, NotImplementedError):
             pass
     for tv in c.variables:
@@ -11091,6 +11125,8 @@ def partition_equality_ambiguous_types(
                     if ambiguous_blob is not None
                     else []
                 )
+                if narrowable is None or ambiguous is None:
+                    raise AssertionError("partition equality decode failed")
                 # Same make_union calls as the pure-Python body: len > 1 folds
                 # into a fresh UnionType, len == 1 collapses to the bare item.
                 return (
