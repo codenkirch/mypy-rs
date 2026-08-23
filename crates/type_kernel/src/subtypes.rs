@@ -2454,15 +2454,8 @@ pub(crate) fn rust_is_subtype_batch(
     );
     let resolver = resolver.resolver();
     let mut out = Vec::with_capacity(pairs_bytes.len() / 2);
-    let mut chunks = pairs_bytes.chunks_exact(2);
-    for pair in &mut chunks {
-        let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
-            // Defensive: odd trailing blob should never arrive (the Python
-            // edge always emits full pairs). Mark defer so the shim can
-            // re-run and surface the mismatch instead of silently dropping.
-            out.push(-1);
-            continue;
-        };
+    let (chunks, remainder) = pairs_bytes.as_chunks::<2>();
+    for [a, b] in chunks {
         let answer = match (decode_type(a), decode_type(b)) {
             (Some(left), Some(right)) => is_subtype(&left, &right, &ctx, resolver),
             _ => None,
@@ -2473,9 +2466,10 @@ pub(crate) fn rust_is_subtype_batch(
             None => -1,
         });
     }
-    // chunks_exact never leaves a remainder in the iterator, but keep the
-    // length contract honest if the input was malformed.
-    out.extend(chunks.remainder().iter().map(|_| -1));
+    // An odd trailing blob should never arrive (the Python edge always
+    // emits full pairs); mark it defer so the shim re-runs and surfaces
+    // the mismatch instead of silently dropping.
+    out.extend(remainder.iter().map(|_| -1));
     out
 }
 
