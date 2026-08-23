@@ -721,6 +721,7 @@ pub(crate) fn rust_analyze_instance_member_access(
 /// Non-trivial-instance-method tail of `analyze_instance_member_access`
 /// (checkmember.py:717-731): receiver-validated bind + map + expand in one
 /// wire call. Defers (None) when any step needs Python's object semantics.
+#[allow(clippy::too_many_arguments)]
 fn member_method_inner(
     instance: &Type,
     signature: &Type,
