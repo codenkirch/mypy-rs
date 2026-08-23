@@ -34,6 +34,8 @@ from typing import Any, Callable
 # the ported share. Re-measure before extending: only settled negatives count.
 CLASSIFIER_NEGATIVE_SEAMS: tuple[str, ...] = (
     "rust_get_typevarlike_declaration",
+    "rust_find_dataclass_transform_spec",
+    "rust_find_duplicate",
 )
 
 
