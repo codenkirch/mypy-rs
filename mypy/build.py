@@ -908,6 +908,7 @@ class BuildManager:
         _clear_type_wire_cache()
         _set_type_wire_cache_enabled(False)
         from mypy.checker import _clear_checker_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
@@ -918,6 +919,7 @@ class BuildManager:
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        _clear_erase_decode_cache()
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()
@@ -1542,6 +1544,7 @@ class BuildManager:
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
         from mypy.checker import _clear_checker_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
@@ -1552,6 +1555,7 @@ class BuildManager:
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        _clear_erase_decode_cache()
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()

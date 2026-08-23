@@ -73,6 +73,7 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
         # rechecks): cached decodes from the previous map must not
         # survive, they would resolve into stale TypeInfo objects.
         from mypy.checker import _clear_checker_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
@@ -83,6 +84,7 @@ def set_wire_typeinfo_map(typeinfo_map: dict[str, Any] | None) -> None:
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
+        _clear_erase_decode_cache()
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()
