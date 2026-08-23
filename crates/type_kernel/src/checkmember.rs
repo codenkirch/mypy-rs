@@ -718,6 +718,120 @@ pub(crate) fn rust_analyze_instance_member_access(
     }
 }
 
+/// Non-trivial-instance-method tail of `analyze_instance_member_access`
+/// (checkmember.py:717-731): receiver-validated bind + map + expand in one
+/// wire call. Defers (None) when any step needs Python's object semantics.
+#[allow(clippy::too_many_arguments)]
+fn member_method_inner(
+    instance: &Type,
+    signature: &Type,
+    method_fullname: &str,
+    self_type: &Type,
+    name: &str,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+    is_class: bool,
+) -> Option<Type> {
+    if is_class {
+        return None; // classmethod branch needs TypeType wrapping.
+    }
+    let (left_ref, left_args) = match instance {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return None,
+    };
+    // The seam fires only when the receiver is the exact class the method
+    // is defined on (the same-class guard). A subclass / union receiver
+    // defers so Python's `check_self_arg` + generic `bind_self` handle it.
+    let self_ref = match self_type {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
+        _ => return None,
+    };
+    if self_ref != method_fullname {
+        return None;
+    }
+    // checkmember.py:727 `check_self_arg(signature, mx.self_type, ...)`:
+    // Rust mirrors the overload-item self filter; a zero-match defers so
+    // Python emits `incompatible_self_argument` on the unfiltered signature.
+    let filtered = check_self_arg_inner(
+        signature,
+        self_type,
+        false, // is_classmethod (is_class already deferred above)
+        name,
+        strict_optional,
+        resolver,
+    )?;
+    // checkmember.py:728 `typ = map_instance_to_supertype(typ, method.info)`.
+    let mapped_args =
+        crate::subtypes::map_instance_to_supertype(left_ref, left_args, method_fullname, resolver)?;
+    let mapped_instance = Type::Instance {
+        type_ref: method_fullname.to_string(),
+        args: mapped_args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    // checkmember.py:729 `expand_type_by_instance` runs on the unbound
+    // callable (the wire expand Callable arm defers on `is_bound`); the
+    // binding after only strips `arg_types[1:]`, so the orders agree.
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        &filtered,
+        &mapped_instance,
+        resolver,
+        strict_optional,
+    );
+    let expanded = expanded?;
+    if crate::expandtype::result_has_typevar(&expanded) {
+        return None; // free type vars need object-preserving Python path.
+    }
+    // bind_self (non-generic path): the same-class guard + self-arg filter
+    // kept only items whose self is compatible with the concrete receiver,
+    // so `bind_self_fast_inner` mirrors it exactly: strip, set `is_bound`.
+    let bound = match expanded {
+        Type::Overloaded { items } => {
+            if items.is_empty() {
+                return None;
+            }
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                let item = bind_self_fast_inner(&item)?;
+                new_items.push(item);
+            }
+            Type::Overloaded { items: new_items }
+        }
+        Type::CallableType { .. } => bind_self_fast_inner(&expanded)?,
+        _ => return None,
+    };
+    Some(bound)
+}
+
+/// `#[pyfunction]` entry: `rust_analyze_member_method`.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_analyze_member_method(
+    resolver: &NativeTypeResolver,
+    instance_bytes: &[u8],
+    signature_bytes: &[u8],
+    method_fullname: &str,
+    self_type_bytes: &[u8],
+    name: &str,
+    strict_optional: bool,
+    is_class: bool,
+) -> Option<Vec<u8>> {
+    let instance = decode_type(instance_bytes)?;
+    let signature = decode_type(signature_bytes)?;
+    let self_type = decode_type(self_type_bytes)?;
+    let result = member_method_inner(
+        &instance,
+        &signature,
+        method_fullname,
+        &self_type,
+        name,
+        resolver.resolver(),
+        strict_optional,
+        is_class,
+    )?;
+    encode_type(&result)
+}
+
 // ---------------------------------------------------------------------------
 // classify_member_access
 // ---------------------------------------------------------------------------
@@ -2919,5 +3033,202 @@ mod tests {
         let resolver = TypeResolver::new();
         // has_readable_member_by_ref defers when the snapshot is missing.
         assert!(has_readable_member_by_ref(&resolver, "descriptor.D", "__get__").is_none());
+    }
+
+    // --- rust_analyze_member_method / member_method_inner ---
+
+    fn make_g_resolver() -> TypeResolver {
+        // G[T] with one type var T (raw_id 1); the snapshot must carry
+        // type_vars_with_variance + type_var_raw_ids, and A + builtins.object
+        // so check_self_arg subtype checks against `A` resolve.
+        let mut r = TypeResolver::new();
+        for fullname in ["A", "builtins.object"] {
+            r.insert(
+                fullname.to_string(),
+                TypeInfoSnapshot {
+                    fullname: fullname.to_string(),
+                    name: fullname.to_string(),
+                    mro: vec![fullname.to_string(), "builtins.object".to_string()],
+                    has_base: [fullname.to_string(), "builtins.object".to_string()]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                },
+            );
+        }
+        let mut snap = TypeInfoSnapshot {
+            fullname: "G".to_string(),
+            name: "G".to_string(),
+            mro: vec!["G".to_string(), "builtins.object".to_string()],
+            has_base: ["G".to_string(), "builtins.object".to_string()]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        snap.type_vars_with_variance = vec![("T".to_string(), 0, 0)];
+        snap.type_var_raw_ids = vec![1];
+        r.insert("G".to_string(), snap);
+        r
+    }
+
+    fn make_ga_instance() -> Type {
+        Type::Instance {
+            type_ref: "G".to_string(),
+            args: vec![make_instance("A")],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn make_g_method() -> Type {
+        // def foo(self: G[T], x: A) -> G[T]
+        Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![make_ga_instance(), make_instance("A")],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("self".to_string()), Some("x".to_string())],
+            ret_type: Box::new(make_ga_instance()),
+            name: Some("foo".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn test_member_method_bind_and_expand() {
+        let resolver = make_g_resolver();
+        let method = make_g_method();
+        // Step 1: map_instance_to_supertype fast path (G == G).
+        let mapped =
+            crate::subtypes::map_instance_to_supertype("G", &[make_instance("A")], "G", &resolver);
+        assert_eq!(mapped, Some(vec![make_instance("A")]));
+        let mapped_instance = Type::Instance {
+            type_ref: "G".to_string(),
+            args: vec![make_instance("A")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        // Step 1b: check_self_arg filter passes for the generic `self: G[T]`
+        // receiver `G[A]` (the TypeVar overlaps with the concrete arg).
+        let filtered =
+            check_self_arg_inner(&method, &make_ga_instance(), false, "foo", true, &resolver);
+        assert!(filtered.is_some(), "TypeVar self must survive the filter");
+        // Step 2: expand runs on the unbound callable; the Callable arm of
+        // expand_type_inner defers on is_bound, so bind must come after.
+        let expanded = crate::expandtype::expand_type_by_instance_core(
+            &method,
+            &mapped_instance,
+            &resolver,
+            true,
+        )
+        .expect("expand should succeed");
+        assert!(!crate::expandtype::result_has_typevar(&expanded));
+        // Step 3: bind_self_fast_inner strips self (G[T]).
+        let bound = bind_self_fast_inner(&expanded).expect("bind should succeed");
+        match &bound {
+            Type::CallableType {
+                arg_types,
+                is_bound,
+                ..
+            } => {
+                assert!(is_bound);
+                assert_eq!(arg_types.len(), 1);
+            }
+            other => panic!("expected CallableType, got {other:?}"),
+        }
+        // Step 4: member_method_inner composes check_self_arg (receiver `G[A]`
+        // with `self: G[A]` passes the subtype filter), then expands and
+        // binds; an incompatible self defers so Python reports the error.
+        let concrete_self_method = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![make_ga_instance(), make_instance("A")],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("self".to_string()), Some("x".to_string())],
+            ret_type: Box::new(make_instance("A")),
+            name: Some("foo".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let result = member_method_inner(
+            &make_ga_instance(),
+            &concrete_self_method,
+            "G",
+            &make_ga_instance(),
+            "foo",
+            &resolver,
+            true,
+            false, // is_class
+        );
+        match result {
+            Some(Type::CallableType { is_bound, .. }) => assert!(is_bound),
+            other => panic!("expected bound CallableType, got {other:?}"),
+        }
+        // An incompatible self arg defers so Python reports "Invalid self
+        // argument" (mirrors check_self_arg zero-match).
+        let bad_self_method = Type::CallableType {
+            fallback: Box::new(make_instance("builtins.function")),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![make_instance("C"), make_instance("A")],
+            arg_kinds: vec![ARG_POS, ARG_POS],
+            arg_names: vec![Some("self".to_string()), Some("x".to_string())],
+            ret_type: Box::new(make_instance("A")),
+            name: Some("foo".to_string()),
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        };
+        let result = member_method_inner(
+            &make_ga_instance(),
+            &bad_self_method,
+            "G",
+            &make_ga_instance(),
+            "foo",
+            &resolver,
+            true,
+            false, // is_class
+        );
+        assert!(result.is_none(), "incompatible self must defer");
+    }
+
+    #[test]
+    fn test_member_method_classmethod_defers() {
+        let resolver = make_g_resolver();
+        let method = make_g_method();
+        let result = member_method_inner(
+            &make_ga_instance(),
+            &method,
+            "G",
+            &make_ga_instance(),
+            "foo",
+            &resolver,
+            true,
+            true, // is_class
+        );
+        assert!(result.is_none(), "classmethod must defer");
     }
 }

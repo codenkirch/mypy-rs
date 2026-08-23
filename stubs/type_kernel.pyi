@@ -862,6 +862,17 @@ def rust_analyze_instance_member_access(
     signature: bytes,
     method_fullname: str,
     strict_optional: bool,
+    is_trivial_self: bool,
+) -> bytes | None: ...
+def rust_analyze_member_method(
+    resolver: NativeTypeResolver,
+    instance: bytes,
+    signature: bytes,
+    method_fullname: str,
+    self_type: bytes,
+    name: str,
+    strict_optional: bool,
+    is_class: bool,
 ) -> bytes | None: ...
 def rust_solve_one(
     lowers: list[bytes],

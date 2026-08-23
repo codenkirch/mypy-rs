@@ -1568,6 +1568,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkmember::rust_analyze_member_method,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkmember::rust_analyze_member_access,
         module
     )?)?;
