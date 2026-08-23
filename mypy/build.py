@@ -910,6 +910,7 @@ class BuildManager:
         from mypy.checker import _clear_checker_deser_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.meet import _clear_narrow_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
 
@@ -918,6 +919,7 @@ class BuildManager:
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()
+        _clear_narrow_decode_cache()
         # Clear the traverser AST-serialization memo so stale bytes from a
         # previous build never survive into the new AST (structure can
         # change across builds even though the wire ignores scalars).
@@ -1538,6 +1540,7 @@ class BuildManager:
         from mypy.checker import _clear_checker_deser_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.meet import _clear_narrow_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
 
@@ -1546,6 +1549,7 @@ class BuildManager:
         _clear_argtypes_plan_cache()
         _clear_typeops_decode_cache()
         _clear_typevars_decode_cache()
+        _clear_narrow_decode_cache()
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
