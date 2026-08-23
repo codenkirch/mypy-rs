@@ -15593,6 +15593,27 @@ class NativeTypeAnalSuite(Suite):
         result = self._assert_par(u)
         self.assertIsInstance(result, UnionType)
 
+    def test_union_with_unpack_child_defers(self) -> None:
+        """Union items analyze with allow_unpack=False in Python, so an
+        UnpackType child must defer to the Python error path instead of
+        analyzing with the outer flag."""
+        self._set_active(True)
+        u = UnionType(
+            [self.fx.a, UnpackType(self.fx.b, line=-1, column=-1)],
+            line=-1,
+            column=-1,
+        )
+        result = native_analyze_type(u, allow_unpack=True)
+        self.assertIsNone(result)
+
+    def test_tuple_implicit_defers_without_tuple_literal(self) -> None:
+        """visit_tuple_type errors on implicit tuples when tuple literals
+        are disallowed; Rust must defer so Python emits the error."""
+        self._set_active(True)
+        tup = TupleType([self.fx.a], self.fx.std_tuple, line=-1, implicit=True)
+        result = native_analyze_type(tup, allow_tuple_literal=False)
+        self.assertIsNone(result)
+
     # --- TypeType ---
 
     def test_type_type_simple(self) -> None:
