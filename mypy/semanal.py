@@ -4047,7 +4047,7 @@ class SemanticAnalyzer(
         """
         if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
             try:
-                result = _rust_can_possibly_be_type_form(s)
+                result = _rust_can_possibly_be_type_form(s, self.is_pep_613(s))
                 if result is not None:
                     return result
             except (AssertionError, NotImplementedError):

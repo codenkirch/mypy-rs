@@ -39,6 +39,7 @@ from mypy.nodes import (
     MDEF,
     ArgKind,
     Argument,
+    AssignmentStmt,
     BytesExpr,
     CallExpr,
     Context,
@@ -16286,6 +16287,124 @@ class NativeTypeExpressionClassifySuite(Suite):
              0, False, False, False, False),
             None,
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCanPossiblyBeTypeFormSuite(Suite):
+    """Parity for the Rust `rust_can_possibly_be_type_form` port.
+
+    Mirrors the structural branch of
+    `SemanticAnalyzer.can_possibly_be_type_form` (semanal.py:4040-4067).
+    The Python shim precomputes the resolver-backed `is_pep_613` fact
+    (it needs `self.lookup_qualified`) and passes it as a scalar; Rust
+    decides the whole branch natively, including the annotated-var
+    rejection that previously deferred. Toggling the semanal-visitor gate
+    off (pure Python) and on (Rust seam) must produce identical results;
+    direct seam calls prove the Rust classifier engages.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, typealias_fullname: str | None) -> object:
+        from mypy.semanal import SemanticAnalyzer
+
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        if typealias_fullname is not None:
+            from types import SimpleNamespace
+
+            sym = SymbolTableNode(
+                MDEF, SimpleNamespace(fullname=typealias_fullname)
+            )
+        else:
+            sym = None
+        sa.lookup = (  # type: ignore[method-assign]
+            lambda name, ctx, suppress_errors=True: sym
+        )
+        return sa
+
+    def _assert_par(
+        self,
+        node_factory: Callable[[], AssignmentStmt],
+        typealias_fullname: str | None = None,
+    ) -> None:
+        def run() -> bool:
+            sa = self._analyser(typealias_fullname)
+            return sa.can_possibly_be_type_form(node_factory())
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert_equal(on, off, "can_possibly_be_type_form parity")
+
+    def _assert_engages(
+        self, s: AssignmentStmt, is_pep_613: bool, expected: bool | None
+    ) -> None:
+        result = self._tk.rust_can_possibly_be_type_form(s, is_pep_613)
+        assert_equal(result, expected, "rust_can_possibly_be_type_form")
+
+    # --- Annotated variable: `x: int = 1` -> False (previously deferred) ---
+
+    def test_annotated_var_false(self) -> None:
+        def make() -> AssignmentStmt:
+            return AssignmentStmt(
+                [NameExpr("x")], IntExpr(1), type=UnboundType("int")
+            )
+
+        self._assert_par(make)
+        self._assert_engages(make(), False, False)
+
+    # --- Unannotated subscript: `X = Foo[Bar]` -> True ---
+
+    def test_unannotated_index_true(self) -> None:
+        def make() -> AssignmentStmt:
+            return AssignmentStmt(
+                [NameExpr("X")],
+                IndexExpr(NameExpr("Foo"), NameExpr("Bar")),
+            )
+
+        self._assert_par(make)
+        self._assert_engages(make(), False, True)
+
+    # --- PEP 613: `X: TypeAlias = List[int]` -> True (previously deferred) ---
+
+    def test_pep_613_true(self) -> None:
+        def make() -> AssignmentStmt:
+            return AssignmentStmt(
+                [NameExpr("X")],
+                IndexExpr(NameExpr("List"), NameExpr("int")),
+                type=UnboundType("TypeAlias"),
+            )
+
+        typealias = "typing.TypeAlias"
+        self._assert_par(make, typealias_fullname=typealias)
+        self._assert_engages(make(), True, True)
+
+    # --- Plain call rvalue: `x = foo()` -> False ---
+
+    def test_call_rvalue_false(self) -> None:
+        def make() -> AssignmentStmt:
+            callee = NameExpr("foo")
+            callee.fullname = "mod.foo"
+            return AssignmentStmt([NameExpr("x")], CallExpr(callee, [], [], []))
+
+        self._assert_par(make)
+        self._assert_engages(make(), False, False)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

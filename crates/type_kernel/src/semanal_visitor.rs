@@ -1632,11 +1632,15 @@ fn is_type_var_like_name(fullname: &str) -> bool {
 
 /// `mypy.semanal.SemanticAnalyzer.can_possibly_be_type_form`
 ///
-/// Mirrors semanal.py:3708-3728. Returns `Some(bool)` for cases Rust can
-/// decide, or `None` to defer to Python when `is_pep_613` (which requires
-/// `self`) would be needed.
+/// Mirrors semanal.py:4040-4067. Returns `Some(bool)` for cases Rust can
+/// decide, or `None` to defer to Python. The `is_pep_613_annot` fact is
+/// precomputed by the Python shim (it needs `self.lookup_qualified`).
 #[pyfunction]
-pub(crate) fn rust_can_possibly_be_type_form(py: Python<'_>, s: &PyAny) -> PyResult<Option<bool>> {
+pub(crate) fn rust_can_possibly_be_type_form(
+    py: Python<'_>,
+    s: &PyAny,
+    is_pep_613_annot: bool,
+) -> PyResult<Option<bool>> {
     let nodes_mod = py.import("mypy.nodes")?;
     let assignment_stmt_cls: &PyType = nodes_mod.getattr("AssignmentStmt")?.downcast()?;
     if !s.is_instance(assignment_stmt_cls)? {
@@ -1677,10 +1681,11 @@ pub(crate) fn rust_can_possibly_be_type_form(py: Python<'_>, s: &PyAny) -> PyRes
         return Ok(Some(false));
     }
     // s.unanalyzed_type is not None and not self.is_pep_613(s) -> False.
-    // Rust cannot call is_pep_613 (needs self), so defer.
+    // is_pep_613 is precomputed by the Python shim (needs lookup_qualified);
+    // when True we fall through to the rvalue structural checks below.
     let unanalyzed_type = s.getattr("unanalyzed_type")?;
-    if !unanalyzed_type.is_none() {
-        return Ok(None);
+    if !unanalyzed_type.is_none() && !is_pep_613_annot {
+        return Ok(Some(false));
     }
     let index_expr_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
     let op_expr_cls: &PyType = nodes_mod.getattr("OpExpr")?.downcast()?;
