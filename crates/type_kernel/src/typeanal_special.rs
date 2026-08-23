@@ -20,10 +20,19 @@
 //! (`make_union` over `anal_array` results), `Optional`'s gold path,
 //! `analyze_callable_type`, the `Type[...]`/`TypeForm[...]` one-arg and
 //! multi-arg tails, the `ClassVar` one-arg tail, `Annotated`'s gold path,
-//! the `Required`/`NotRequired`/`ReadOnly` gold paths, and everything past
-//! ClassVar's arity check (`Literal`, TypeGuard, `Unpack`, `Self`). The
-//! deferred branches keep their full pure-Python body, honoring the
-//! strangler-fig per-call gate.
+//! the `Required`/`NotRequired`/`ReadOnly` gold paths, and plain
+//! (non-special) names. The deferred branches keep their full pure-Python
+//! body, honoring the strangler-fig per-call gate.
+//!
+//! The `Literal`, `TypeGuard`, `TypeIs` and `Unpack` families are
+//! classified by family membership, with the gold paths still routed by
+//! the shim: `Literal` always defers to `analyze_literal_type`, the two
+//! is-check families fold into the bool-alias branch (tag-name variants
+//! `TAG_NAME_TYPEGUARD` / `TAG_NAME_TYPEIS`), and `Unpack` classifies
+//! only its two pure error branches (`TAG_UNPACK_ARG_ERR` /
+//! `TAG_UNPACK_POS_ERR`). The `Unpack` gold path (mutates
+//! `allow_type_var_tuple`) and the whole `Self` family (needs the live
+//! `api.type`, args-error falls through to the gold body) defer.
 //!
 //! The fullname membership sets are passed from Python as booleans (the
 //! shim computes the tuple membership with the live `mypy.types.*_NAMES`
@@ -33,12 +42,7 @@ use pyo3::prelude::*;
 
 // Branch tags handed to the Python shim. Each maps to exactly one terminal
 // branch of `try_analyze_special_unbound_type`; the comment cites the
-// typeanal.py line and the Python-side effect the shim must apply.
-
-// Branch tags handed to the Python shim. Each maps to exactly one terminal
-// branch of `try_analyze_special_unbound_type`; the comment cites the
 // typeanal.py line and the Python-side effect the shim must apply. Plain
-
 // names (not special forms) return `None` from the classifier and keep the
 // full pure-Python body.
 const TAG_NONE_TYPE: i64 = 2; // 936-937 NoneType()
@@ -72,6 +76,11 @@ const TAG_NOTREQUIRED_DEFER: i64 = 30; // 1089-1091 gold path
 const TAG_READONLY_BAD_CTX: i64 = 31; // 1093-1099 flag off -> fail + Any(from_error)
 const TAG_READONLY_ARG_ERR: i64 = 32; // 1100-1104 arity != 1 -> fail + Any(from_error)
 const TAG_READONLY_DEFER: i64 = 33; // 1105 gold path
+const TAG_LITERAL_DEFER: i64 = 34; // 1108-1109 analyze_literal_type
+const TAG_NAME_TYPEGUARD: i64 = 35; // 1168-1173 TypeGuard/TypeIs is-check
+const TAG_NAME_TYPEIS: i64 = 36; // 1168-1173 TypeGuard/TypeIs is-check
+const TAG_UNPACK_ARG_ERR: i64 = 37; // 1174-1177 arity != 1 -> fail + Any(from_error)
+const TAG_UNPACK_POS_ERR: i64 = 38; // 1178-1180 !allow_unpack -> fail + Any(from_error)
 
 /// `try_analyze_special_unbound_type` classifier. Mirrors the branch order
 /// of typeanal.py:936-1141 and returns the terminal branch tag; `None`
@@ -88,7 +97,8 @@ const TAG_READONLY_DEFER: i64 = 33; // 1105 gold path
 /// - `tuple_ellipsis_form`: `len(t.args) == 2 and isinstance(t.args[1],
 ///   EllipsisType)` computed on the live `t` (the Tuple[T, ...] form).
 /// - `not_in_*`: the fullname is not in the corresponding
-///   `mypy.types.*_NAMES` tuple (computed Python-side).
+///   `mypy.types.*_NAMES` tuple / `SELF_TYPE_NAMES` set (computed
+///   Python-side).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 pub(crate) fn rust_classify_special_unbound(
@@ -108,6 +118,9 @@ pub(crate) fn rust_classify_special_unbound(
     not_in_required: bool,
     not_in_notrequired: bool,
     not_in_readonly: bool,
+    not_in_literal: bool,
+    not_in_unpack: bool,
+    allow_unpack: bool,
 ) -> PyResult<Option<i64>> {
     // builtins.None (typeanal.py:936-937).
     if fullname == "builtins.None" {
@@ -193,10 +206,11 @@ pub(crate) fn rust_classify_special_unbound(
     if !not_in_never {
         return Ok(Some(TAG_NEVER));
     }
-    // typing.Literal (typeanal.py:1046-1047): analyze_literal_type, pure
-    // classification impossible, defer.
-    if fullname == "typing.Literal" {
-        return Ok(None);
+    // typing.Literal (typeanal.py:1046-1047): the gold path is
+    // analyze_literal_type (recursive, side-effect-bound) which stays in
+    // Python; the family membership is decidable from the fullname.
+    if !not_in_literal {
+        return Ok(Some(TAG_LITERAL_DEFER));
     }
     // Annotated (typeanal.py:1048-1059).
     if !not_in_annotated {
@@ -226,9 +240,19 @@ pub(crate) fn rust_classify_special_unbound(
             TAG_READONLY_DEFER,
         )
     } else {
-        // Everything past this point (TypeGuard, Unpack, Self) defers; the
-        // decision is not classifiable from facts alone.
-        return Ok(None);
+        // TypeGuard / TypeIs / Unpack / Self (typeanal.py:1168-1202) and
+        // the non-special tail. Unpack's two error branches are pure
+        // (arity + allow_unpack); its gold path stays in Python.
+        if !not_in_unpack {
+            if arg_count != 1 {
+                return Ok(Some(TAG_UNPACK_ARG_ERR));
+            }
+            if !allow_unpack {
+                return Ok(Some(TAG_UNPACK_POS_ERR));
+            }
+            return Ok(None);
+        }
+        return Ok(classify_tail(&fullname));
     };
     let tag = if !allow_typed_dict_special_forms {
         bad_ctx_tag
@@ -238,6 +262,17 @@ pub(crate) fn rust_classify_special_unbound(
         defer_tag
     };
     Ok(Some(tag))
+}
+
+/// Classify the tail of `try_analyze_special_unbound_type`
+/// (typeanal.py:1168-1202): the TypeGuard/TypeIs is-check families, the
+/// Unpack and Self special forms, and the non-special tail.
+fn classify_tail(fullname: &str) -> Option<i64> {
+    match fullname {
+        "typing.TypeGuard" | "typing_extensions.TypeGuard" => Some(TAG_NAME_TYPEGUARD),
+        "typing.TypeIs" | "typing_extensions.TypeIs" => Some(TAG_NAME_TYPEIS),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +287,7 @@ mod tests {
         allow_typed_dict_special_forms: bool,
         tuple_missing_or_placeholder: bool,
         tuple_ellipsis_form: bool,
+        allow_unpack: bool,
     }
 
     impl Default for Facts {
@@ -263,6 +299,7 @@ mod tests {
                 allow_typed_dict_special_forms: false,
                 tuple_missing_or_placeholder: false,
                 tuple_ellipsis_form: false,
+                allow_unpack: false,
             }
         }
     }
@@ -292,6 +329,9 @@ mod tests {
             f.fullname != "typing.Required" && f.fullname != "typing_extensions.Required",
             f.fullname != "typing.NotRequired" && f.fullname != "typing_extensions.NotRequired",
             f.fullname != "typing.ReadOnly" && f.fullname != "typing_extensions.ReadOnly",
+            !(f.fullname == "typing.Literal" || f.fullname == "typing_extensions.Literal"),
+            !(f.fullname == "typing.Unpack" || f.fullname == "typing_extensions.Unpack"),
+            f.allow_unpack,
         )
         .unwrap()
     }
@@ -682,9 +722,84 @@ mod tests {
     }
 
     #[test]
-    fn literal_defers() {
+    fn literal_defers_tag() {
+        // Literal always defers to analyze_literal_type; the tag tells the
+        // shim which branch to run.
         let f = Facts {
             fullname: "typing.Literal".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_LITERAL_DEFER));
+    }
+
+    #[test]
+    fn typeguard_tags() {
+        let f = Facts {
+            fullname: "typing.TypeGuard".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NAME_TYPEGUARD));
+    }
+
+    #[test]
+    fn typeguard_ext_tags() {
+        let f = Facts {
+            fullname: "typing_extensions.TypeGuard".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NAME_TYPEGUARD));
+    }
+
+    #[test]
+    fn typeis_tags() {
+        let f = Facts {
+            fullname: "typing_extensions.TypeIs".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_NAME_TYPEIS));
+    }
+
+    #[test]
+    fn unpack_arg_count_error() {
+        // Unpack[int, str] -> arity != 1 -> from_error Any; only the two
+        // error branches of the Unpack family are classified.
+        let f = Facts {
+            fullname: "typing.Unpack".to_string(),
+            arg_count: 2,
+            allow_unpack: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_UNPACK_ARG_ERR));
+    }
+
+    #[test]
+    fn unpack_not_in_variadic_position_error() {
+        let f = Facts {
+            fullname: "typing_extensions.Unpack".to_string(),
+            arg_count: 1,
+            allow_unpack: false,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), Some(TAG_UNPACK_POS_ERR));
+    }
+
+    #[test]
+    fn unpack_gold_path_defers() {
+        let f = Facts {
+            fullname: "typing.Unpack".to_string(),
+            arg_count: 1,
+            allow_unpack: true,
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), None);
+    }
+
+    #[test]
+    fn self_type_defers() {
+        // Every Self branch needs the live api.type / self_type, and the
+        // args-error falls through to the gold body; nothing is decidable.
+        let f = Facts {
+            fullname: "typing_extensions.Self".to_string(),
             ..Default::default()
         };
         assert_eq!(classify(&f), None);

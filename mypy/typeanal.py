@@ -983,6 +983,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 fullname not in ("typing_extensions.Required", "typing.Required"),
                 fullname not in ("typing_extensions.NotRequired", "typing.NotRequired"),
                 fullname not in ("typing_extensions.ReadOnly", "typing.ReadOnly"),
+                fullname not in LITERAL_TYPE_NAMES,
+                fullname not in UNPACK_TYPE_NAMES,
+                getattr(self, "allow_unpack", False),
             )
         except (AssertionError, NotImplementedError):
             return None
@@ -1391,6 +1394,20 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             return AnyType(TypeOfAny.from_error)
         if tag == _UNBOUND_SPECIAL_TAG_READONLY_DEFER:
             return ReadOnlyType(self.anal_type(t.args[0], allow_typed_dict_special_forms=True))
+        if tag == _UNBOUND_SPECIAL_TAG_LITERAL_DEFER:
+            return self.analyze_literal_type(t)
+        if tag in (_UNBOUND_SPECIAL_TAG_NAME_TYPEGUARD, _UNBOUND_SPECIAL_TAG_NAME_TYPEIS):
+            if tag == _UNBOUND_SPECIAL_TAG_NAME_TYPEGUARD:
+                self.anal_type_guard_arg(t, fullname)
+            else:
+                self.anal_type_is_arg(t, fullname)
+            return self.named_type("builtins.bool")
+        if tag == _UNBOUND_SPECIAL_TAG_UNPACK_ARG_ERR:
+            self.fail("Unpack[...] requires exactly one type argument", t)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR:
+            self.fail(message_registry.INVALID_UNPACK_POSITION, t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
         raise AssertionError(f"unknown special unbound tag {tag}")
 
     def get_omitted_any(self, typ: Type, fullname: str | None = None) -> AnyType:
@@ -3399,6 +3416,11 @@ _UNBOUND_SPECIAL_TAG_NOTREQUIRED_DEFER = 30
 _UNBOUND_SPECIAL_TAG_READONLY_BAD_CTX = 31
 _UNBOUND_SPECIAL_TAG_READONLY_ARG_ERR = 32
 _UNBOUND_SPECIAL_TAG_READONLY_DEFER = 33
+_UNBOUND_SPECIAL_TAG_LITERAL_DEFER = 34
+_UNBOUND_SPECIAL_TAG_NAME_TYPEGUARD = 35
+_UNBOUND_SPECIAL_TAG_NAME_TYPEIS = 36
+_UNBOUND_SPECIAL_TAG_UNPACK_ARG_ERR = 37
+_UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR = 38
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
