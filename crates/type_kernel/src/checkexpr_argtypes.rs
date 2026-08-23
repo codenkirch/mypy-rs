@@ -13,11 +13,13 @@
 //! needs the live `ExpressionChecker` state.
 //!
 //! Strangler-fig contract: returns `None` (defer to the pure-Python
-//! body) when Rust cannot reproduce the decision, i.e. any `TypeAliasType` in
-//! the inputs whose expansion the wire cannot carry, a callee-tuple
-//! `UnpackType` whose target is neither a tuple nor a plain
-//! `builtins.tuple` Instance, or a wire decode failure. The per-formal
-//! plans are returned as a `list[bytes]` (one blob per callee formal).
+//! body) when Rust cannot reproduce the decision, i.e. a wire decode
+//! failure, a callee-tuple `UnpackType` whose target is neither a tuple
+//! nor a plain `builtins.tuple` Instance, an alias that needs argument
+//! substitution on the wire (the substituted target cannot be carried),
+//! a recursion/cycle in the aliases, or a TypeVarTuple/heterogeneous
+//! unpack that a formal needs at call time. The per-formal plans are
+//! returned as a `list[bytes]` (one blob per callee formal).
 //!
 //! Plan blob wire format (bare primitives, mirror-encoded for the Python
 //! shim):
@@ -26,10 +28,21 @@
 //! - if tag == 0: `write_type_list` (`callee_arg_types`),
 //!   `write_int_list` (`callee_arg_kinds`), `write_type_list`
 //!   (`actual_types`), `write_int_list` (`actual_kinds`).
+//!
+//! Alias handling mirrors the wire seams' `expand_alias_target_raw`:
+//! a `TypeAliasType` in a formal position is expanded to its snapped
+//! target *without* type-argument substitution (`no_args` aliases or
+//! empty-arg aliases only; a substitution-requiring alias defers). The
+//! Python shim must not substitute again: the returned plan carries the
+//! raw target, and `orig_callee_arg_type` semantics are preserved
+//! because the target is the effective `callee_arg_type` Python would
+//! derive (`get_proper_type`).
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyList};
 
+use crate::checkexpr_functions::expand_alias_target_raw;
+use crate::typeinfo::NativeTypeResolver;
 use crate::visitor::find_unpack_in_list_inner;
 use crate::wire::{
     read_type, write_int_bare, write_int_list, write_type_list, ReadBuffer, Type, WriteBuffer,
@@ -51,12 +64,14 @@ const TAG_TOO_FEW: i64 = 2;
 #[pyfunction]
 pub(crate) fn rust_check_argument_types_plan<'py>(
     py: Python<'py>,
+    resolver: &NativeTypeResolver,
     arg_type_blobs: Vec<Vec<u8>>,
     arg_kinds: Vec<i64>,
     formal_to_actual: Vec<Vec<i64>>,
     callee_bytes: &[u8],
 ) -> PyResult<Option<&'py PyList>> {
     let plans = check_argument_types_plan_inner(
+        resolver.alias_resolver(),
         &arg_type_blobs,
         &arg_kinds,
         &formal_to_actual,
@@ -73,6 +88,7 @@ pub(crate) fn rust_check_argument_types_plan<'py>(
 }
 
 fn check_argument_types_plan_inner(
+    aliases: &crate::aliases::TypeAliasResolver,
     arg_type_blobs: &[Vec<u8>],
     arg_kinds: &[i64],
     formal_to_actual: &[Vec<i64>],
@@ -93,7 +109,6 @@ fn check_argument_types_plan_inner(
     // ZIP: mypy `for i, actuals in enumerate(formal_to_actual)` and
     // indexes callee.arg_types[i] / callee.arg_kinds[i]. If the wire
     // callable does not have an entry for a formal the Python body
-
     // would raise; defer on that mismatch (incl. arg_kinds shorter
     // than arg_types).
     if callee_arg_types.len() != callee_arg_kinds.len() {
@@ -102,6 +117,7 @@ fn check_argument_types_plan_inner(
     for i in 0..formal_to_actual.len() {
         let plan = plan_for_formal(
             i,
+            aliases,
             &arg_types,
             arg_kinds,
             formal_to_actual,
@@ -116,6 +132,7 @@ fn check_argument_types_plan_inner(
 /// Compute the per-formal plan, mirroring checkexpr.py:3688-3761.
 fn plan_for_formal(
     i: usize,
+    aliases: &crate::aliases::TypeAliasResolver,
     arg_types: &[Type],
     arg_kinds: &[i64],
     formal_to_actual: &[Vec<i64>],
@@ -132,7 +149,7 @@ fn plan_for_formal(
         .map(|&a| arg_kinds.get(a).copied())
         .collect::<Option<_>>()?;
 
-    let orig_callee_arg_type = get_proper_type_or_none(callee_arg_types.get(i)?)?.clone();
+    let orig_callee_arg_type = get_proper_type_owned(callee_arg_types.get(i)?, aliases)?;
 
     // Checking the case that we have more than one item but the first
     // argument is an unpack, so this is something like:
@@ -143,9 +160,8 @@ fn plan_for_formal(
     let mut actual_types: Vec<Type> = Vec::new();
 
     if actuals.len() > 1 {
-        let p_actual_type = proper_type_or_none(arg_types.get(actuals[0])?)?;
-        if let Type::TupleType { items, .. } = p_actual_type {
-            let items = &items.clone();
+        let p_actual_type = get_proper_type_owned(arg_types.get(actuals[0])?, aliases)?;
+        if let Type::TupleType { items, .. } = &p_actual_type {
             if items.len() == 1
                 && matches!(items[0], Type::UnpackType { .. })
                 && actual_kinds == star_then_pos(actuals.len() - 1)
@@ -155,8 +171,8 @@ fn plan_for_formal(
                     actual_types.push(arg_types.get(*a)?.clone());
                 }
                 if let Type::UnpackType { typ } = &orig_callee_arg_type {
-                    let p_callee_type = proper_type_or_none(typ)?;
-                    if let Type::TupleType { items, .. } = p_callee_type {
+                    let p_callee_type = get_proper_type_owned(typ, aliases)?;
+                    if let Type::TupleType { items, .. } = &p_callee_type {
                         if items.is_empty() {
                             // assert p_callee_type.items would fail in
                             // Python; defer.
@@ -169,6 +185,17 @@ fn plan_for_formal(
                 }
             }
         }
+    } else if let Type::UnpackType { typ } = &orig_callee_arg_type {
+        // len(actuals) == 1: Python's expanded_tuple arm does not
+        // trigger (needs >1), so the unpack expands as if it were the
+        // sole formal. Expand any alias in the unpack target.
+        let unpacked_type = get_proper_type_owned(typ, aliases)?;
+        if !matches!(
+            unpacked_type,
+            Type::TupleType { .. } | Type::TypeVarTupleType { .. } | Type::Instance { .. }
+        ) {
+            return None;
+        }
     }
 
     if !expanded_tuple {
@@ -177,10 +204,10 @@ fn plan_for_formal(
             actual_types.push(arg_types.get(a)?.clone());
         }
         if let Type::UnpackType { typ } = &orig_callee_arg_type {
-            let unpacked_type = proper_type_or_none(typ)?;
+            let unpacked_type = get_proper_type_owned(typ, aliases)?;
             match unpacked_type {
                 Type::TupleType { items, .. } => {
-                    let inner_unpack_index = find_unpack_in_list_inner(items);
+                    let inner_unpack_index = find_unpack_in_list_inner(&items);
                     if inner_unpack_index < 0 {
                         callee_types = items.clone();
                         callee_kinds = vec![ARG_POS; actuals.len()];
@@ -190,7 +217,7 @@ fn plan_for_formal(
                             // Python asserts UnpackType; defer.
                             return None;
                         };
-                        let inner_unpacked_type = proper_type_or_none(inner_typ)?;
+                        let inner_unpacked_type = get_proper_type_owned(inner_typ, aliases)?;
                         match inner_unpacked_type {
                             Type::TypeVarTupleType { .. } => {
                                 callee_types = items.clone();
@@ -204,7 +231,6 @@ fn plan_for_formal(
                                 // Heterogeneous tuples are desugared
                                 // earlier: get_proper_type gives an
                                 // Instance, Python asserts its item
-
                                 // type exists on the wire.
                                 let item_type = args.first()?;
                                 // Python: `[item] * (len(actuals) -
@@ -235,10 +261,9 @@ fn plan_for_formal(
                     callee_types = vec![item_type.clone(); actuals.len()];
                     callee_kinds = vec![ARG_POS; actuals.len()];
                 }
-                _ => {
-                    // Python asserts Instance tuple; defer.
-                    return None;
-                }
+                // Python asserts Instance tuple when the entry is
+                // positioned past the one-item-unpack rule's handling.
+                _ => return None,
             }
         } else {
             callee_types = vec![orig_callee_arg_type.clone(); actuals.len()];
@@ -270,19 +295,17 @@ fn star_then_pos(n: usize) -> Vec<i64> {
     v
 }
 
-/// `mypy.types.get_proper_type` on the wire: expand `TypeAliasType`.
-///
-/// The wire cannot expand a live alias target (no alias snapshot here),
-/// so an alias in the position Python would expand is a deferral.
-fn get_proper_type_or_none(typ: &Type) -> Option<&Type> {
-    match typ {
-        Type::TypeAliasType { .. } => None,
-        t => Some(t),
+/// `mypy.types.get_proper_type` on the wire: expand a `TypeAliasType`
+/// to its chain-resolved snapshot target when the alias carries no type
+/// arguments and no substitution is required (mirrors
+/// `expand_alias_target_raw`). Substitution-requiring aliases, missing
+/// snapshots, cycles, and undecodable targets defer (`None`). Returns an
+/// owned `Type` so callers clone freely.
+fn get_proper_type_owned(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<Type> {
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return expand_alias_target_raw(typ, aliases);
     }
-}
-
-fn proper_type_or_none(typ: &Type) -> Option<&Type> {
-    get_proper_type_or_none(typ)
+    Some(typ.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -408,8 +431,15 @@ mod tests {
         formal_to_actual: Vec<Vec<i64>>,
         callee: &Type,
     ) -> Option<Vec<Vec<u8>>> {
+        let aliases = crate::aliases::TypeAliasResolver::new();
         let blobs: Vec<Vec<u8>> = arg_types.iter().map(encode).collect();
-        check_argument_types_plan_inner(&blobs, arg_kinds, &formal_to_actual, &encode(callee))
+        check_argument_types_plan_inner(
+            &aliases,
+            &blobs,
+            arg_kinds,
+            &formal_to_actual,
+            &encode(callee),
+        )
     }
 
     #[test]
@@ -521,17 +551,85 @@ mod tests {
     }
 
     #[test]
-    fn typealias_defers() {
-        // A TypeAliasType carries no resolved target on the wire, so the
-        // proper-type expansion (which needs the resolver) defers; the
-        // wire round-trip itself now succeeds (alias passed through).
+    fn typealias_missing_snapshot_defers() {
+        // No snapshot for "m.A" in the resolver: the alias expansion
+        // (which needs the snapshot) defers; the seam must refuse
+        // instead of emitting a plan with the raw alias.
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "m.A".to_string(),
         };
-        let mut buf = WriteBuffer::new();
-        write_type(&mut buf, &alias).unwrap();
-        assert!(get_proper_type_or_none(&alias).is_none());
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        assert!(get_proper_type_owned(&alias, &aliases).is_none());
+    }
+
+    #[test]
+    fn typealias_noargs_target_resolves_shape() {
+        // A no-args alias (`A = list[int]`) snaps to its raw target:
+        // the shape-only expansion returns the tuple Instance.
+        use crate::aliases::{AliasTvar, TypeAliasSnapshot};
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let mut w = WriteBuffer::new();
+        write_type(&mut w, &instance("builtins.tuple", vec![any_type()])).unwrap();
+        aliases.insert(
+            "m.A".to_string(),
+            TypeAliasSnapshot {
+                fullname: "m.A".to_string(),
+                target: w.into_bytes(),
+                alias_tvars: vec![],
+                tvar_tuple_index: None,
+                no_args: true,
+                python_3_12_type_alias: false,
+            },
+        );
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "m.A".to_string(),
+        };
+        let expanded = get_proper_type_owned(&alias, &aliases).expect("no-args alias must expand");
+        assert!(matches!(
+            expanded,
+            Type::Instance { type_ref, .. } if type_ref == "builtins.tuple"
+        ));
+        let _ = AliasTvar::default();
+    }
+
+    #[test]
+    fn typealias_substitution_defers() {
+        // `A[T] = list[T]`: the raw expansion refuses (substitution
+        // required) and the plan defers to Python.
+        use crate::aliases::TypeAliasSnapshot;
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let mut w = WriteBuffer::new();
+        write_type(&mut w, &instance("builtins.tuple", vec![any_type()])).unwrap();
+        aliases.insert(
+            "m.A".to_string(),
+            TypeAliasSnapshot {
+                fullname: "m.A".to_string(),
+                target: w.into_bytes(),
+                alias_tvars: vec![crate::aliases::AliasTvar {
+                    name: "T".to_string(),
+                    raw_id: 1,
+                    meta_level: 0,
+                    namespace: "m".to_string(),
+                    is_type_var_tuple: false,
+                }],
+                tvar_tuple_index: None,
+                no_args: false,
+                python_3_12_type_alias: false,
+            },
+        );
+        let alias = Type::TypeAliasType {
+            args: vec![any_type()],
+            type_ref: "m.A".to_string(),
+        };
+        let aliases_ref = &aliases;
+        // Whole-call defer: the shim falls back to Python which expands
+        // with the live target.
+        let callee = callable(vec![alias], vec![ARG_POS]);
+        let plans = run(&[any_type()], &[ARG_POS], vec![vec![0]], &callee);
+        assert!(plans.is_none());
+        let _ = aliases_ref;
     }
 
     #[test]
