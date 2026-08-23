@@ -1398,7 +1398,7 @@ class BuildManager:
         type_infos = self._collect_type_infos()
         aliases = self._collect_aliases()
         if self._native_resolver is None:
-            resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+            resolver = _type_kernel.build_native_resolver(type_infos, aliases, self.modules)
             # Grow the accumulated fullname -> TypeInfo map with this
             # call's infos. First call: everything is new.
             for info in type_infos:
@@ -1417,7 +1417,7 @@ class BuildManager:
                     self._native_typeinfo_map[info.fullname] = info
                 elif info.fullname.startswith("builtins."):
                     pending.append(info)
-            resolver.update(pending, aliases)
+            resolver.update(pending, aliases, self.modules)
         self._native_resolver = resolver
         typeinfo_map = self._native_typeinfo_map
         # Stage 3c resolvers wired: the subtype/join kernels now defer
