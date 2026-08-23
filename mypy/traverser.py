@@ -117,7 +117,6 @@ try:
         rust_has_yield_from_expression as _rust_has_yield_from_expression,
     )
     from type_kernel import rust_has_await_expression as _rust_has_await_expression
-    from type_kernel import rust_has_await_in_generator as _rust_has_await_in_generator
     from type_kernel import (
         rust_count_return_statements as _rust_count_return_statements,
     )
@@ -153,7 +152,6 @@ except ImportError:
     _rust_has_yield_expression = None  # type: ignore[assignment]
     _rust_has_yield_from_expression = None  # type: ignore[assignment]
     _rust_has_await_expression = None  # type: ignore[assignment]
-    _rust_has_await_in_generator = None  # type: ignore[assignment]
     _rust_count_return_statements = None  # type: ignore[assignment]
     _rust_count_yield_expressions = None  # type: ignore[assignment]
     _rust_count_yield_from_expressions = None  # type: ignore[assignment]
@@ -1191,25 +1189,29 @@ def has_await_expression(expr: MypyFile | FuncDef | Expression) -> bool:
 def has_await_in_generator(gen: GeneratorExpr) -> bool:
     """Combined has-await for the checkexpr GeneratorExpr check.
 
-    Serializes the GeneratorExpr once and lets Rust walk left_expr,
-    sequences[1:] and condlists in a single pass, instead of the 4
-    separate serialization round-trips the pure-Python check makes.
-    Falls back to the Python AwaitSeeker when the kernel is inactive.
+    Walks left_expr, sequences[1:] and condlists with a Python
+    AwaitSeeker. This is the original fallback semantics; the Rust
+    kernel mirror (rust_has_await_in_generator) was retired from the
+    hot path: serializing the whole GeneratorExpr subtree cost more
+    than the Rust walk saved at a 0/1137 true rate in the self-check
+    (one serialize per cache miss). The kernel function stays exported
+    for parity tests. The first sequence and the indices are NOT
+    checked, matching checkexpr.py:7417-7422.
     """
-    if _TRAVERSER_HAS_KERNEL and _rust_has_await_in_generator is not None:
-        try:
-            return _rust_has_await_in_generator(_serialize_ast_node(gen))
-        except (AssertionError, NotImplementedError, RecursionError):
-            pass
-    if has_await_expression(gen.left_expr):
+    seeker = AwaitSeeker()
+    gen.left_expr.accept(seeker)
+    if seeker.found:
         return True
-    if any(has_await_expression(sequence) for sequence in gen.sequences[1:]):
-        return True
-    return any(
-        has_await_expression(cond)
-        for condlist in gen.condlists
-        for cond in condlist
-    )
+    for sequence in gen.sequences[1:]:
+        sequence.accept(seeker)
+        if seeker.found:
+            return True
+    for condlist in gen.condlists:
+        for cond in condlist:
+            cond.accept(seeker)
+            if seeker.found:
+                return True
+    return False
 
 
 class ReturnCollector(FuncCollectorBase):
