@@ -473,10 +473,14 @@ _checker_decode_count: list[int] = [0]
 # Callers get a shallow copy so the in-place TypeFixer at
 # try_handler_union_decoded never corrupts the shared template.
 _checker_deser_template: dict[bytes, Type] = {}
+# bytes -> decoded list-of-Types cache for the partition/ambiguous
+# variants seam (13K calls, ~94% repeat). Read-only consumers.
+_checker_deser_list_cache: dict[bytes, list[Type]] = {}
 
 
 def _clear_checker_deser_cache() -> None:
     _checker_deser_template.clear()
+    _checker_deser_list_cache.clear()
 
 
 def _set_native_checker_resolver(resolver: Any) -> None:
@@ -873,6 +877,9 @@ def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
     item's type_ref to live TypeInfo via wirefixup. An unresolvable item
     asserts so the caller defers to the pure-Python path.
     """
+    cached = _checker_deser_list_cache.get(b)
+    if cached is not None:
+        return cached
     from mypy.types import read_type_list
     from mypy.wirefixup import fixup_wire_type
 
@@ -881,6 +888,7 @@ def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
         fixed = fixup_wire_type(item)
         assert fixed is not None, "native partition produced unresolvable type_ref"
         result.append(fixed)
+    _checker_deser_list_cache[b] = result
     return result
 
 
