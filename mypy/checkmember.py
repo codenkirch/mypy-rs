@@ -2193,6 +2193,23 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
     with trivial self/cls annotations.
     """
     if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_bind_self_fast is not None:
+        # Rust path is a pure handled decision; its strip rebuild is
+        # deterministic from Python attrs, so skip the round-trip and reuse
+        # the Python body directly. Overloaded recursion stays native.
+        if isinstance(method, CallableType):
+            if not method.arg_types:
+                return method
+            if method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
+                return method
+            return cast(
+                F,
+                method.copy_modified(
+                    arg_types=method.arg_types[1:],
+                    arg_kinds=method.arg_kinds[1:],
+                    arg_names=method.arg_names[1:],
+                    is_bound=True,
+                ),
+            )
         result = _rust_bind_self_fast(_serialize_type_for_checkmember(method))
         if result is not None:
             decoded = _deserialize_type_for_checkmember(bytes(result))

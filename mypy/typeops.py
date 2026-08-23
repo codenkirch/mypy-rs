@@ -1422,6 +1422,12 @@ def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
     # #747 seam: Rust mirrors the whole body (typed passthrough, callable_type
     # self-binding, broken-overload dummy). Passthrough returns `func.type`
     # live; built arms restore line/column/definition via copy_modified.
+    if _HAS_TYPE_KERNEL and _native_typeops_active and func.type is not None:
+        # Pre-check (the #789 pattern): the passthrough arm is `func.type`
+        # truthy -> return it, decided by Rust on the same condition. Skip
+        # the serialize + PyO3 call for the dominant passthrough case.
+        assert isinstance(func.type, FunctionLike)
+        return func.type
     if _HAS_TYPE_KERNEL and _native_typeops_active:
         try:
             result = _type_kernel.rust_function_type(func, _serialize_type(fallback))
