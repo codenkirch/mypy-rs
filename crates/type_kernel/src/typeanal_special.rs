@@ -89,6 +89,7 @@ const TAG_NAME_TYPEIS: i64 = 36; // 1168-1173 TypeGuard/TypeIs is-check
 const TAG_UNPACK_ARG_ERR: i64 = 37; // 1174-1177 arity != 1 -> fail + Any(from_error)
 const TAG_UNPACK_POS_ERR: i64 = 38; // 1178-1180 !allow_unpack -> fail + Any(from_error)
 const TAG_UNPACK_DEFER: i64 = 39; // 1181-1186 gold path (mutates allow_type_var_tuple)
+const TAG_NOT_SPECIAL: i64 = 40; // tail: a plain name; Python skips the elif-chain
 
 /// `try_analyze_special_unbound_type` classifier. Mirrors the branch order
 /// of typeanal.py:936-1141 and returns the terminal branch tag; `None`
@@ -128,6 +129,7 @@ pub(crate) fn rust_classify_special_unbound(
     not_in_readonly: bool,
     not_in_literal: bool,
     not_in_unpack: bool,
+    not_in_self: bool,
     allow_unpack: bool,
 ) -> PyResult<Option<i64>> {
     // builtins.None (typeanal.py:936-937).
@@ -261,6 +263,11 @@ pub(crate) fn rust_classify_special_unbound(
             }
             return Ok(Some(TAG_UNPACK_DEFER));
         }
+        // Self (typeanal.py:1188-1205): state-dependent (api.type,
+        // has_base, prohibit_self_type), always defer to Python.
+        if !not_in_self {
+            return Ok(None);
+        }
         return Ok(classify_tail(&fullname));
     };
     let tag = if !allow_typed_dict_special_forms {
@@ -280,7 +287,9 @@ fn classify_tail(fullname: &str) -> Option<i64> {
     match fullname {
         "typing.TypeGuard" | "typing_extensions.TypeGuard" => Some(TAG_NAME_TYPEGUARD),
         "typing.TypeIs" | "typing_extensions.TypeIs" => Some(TAG_NAME_TYPEIS),
-        _ => None,
+        // Any other name is not a special form; the shim then skips the
+        // elif-chain (which would fall through to None anyway).
+        _ => Some(TAG_NOT_SPECIAL),
     }
 }
 
@@ -340,15 +349,28 @@ mod tests {
             f.fullname != "typing.ReadOnly" && f.fullname != "typing_extensions.ReadOnly",
             !(f.fullname == "typing.Literal" || f.fullname == "typing_extensions.Literal"),
             !(f.fullname == "typing.Unpack" || f.fullname == "typing_extensions.Unpack"),
+            f.fullname != "typing.Self" && f.fullname != "typing_extensions.Self",
             f.allow_unpack,
         )
         .unwrap()
     }
 
     #[test]
-    fn plain_name_defers() {
-        // A plain (non-special) name returns None -> pure-Python body.
-        assert_eq!(classify(&Facts::default()), None);
+    fn plain_name_is_not_special() {
+        // A plain (non-special) name is now classified: the Python shim
+        // skips the whole elif-chain (which would return None anyway).
+        assert_eq!(classify(&Facts::default()), Some(TAG_NOT_SPECIAL));
+    }
+
+    #[test]
+    fn self_defers() {
+        // Self is state-dependent (api.type, has_base, prohibit_self_type);
+        // Rust must defer so the pure-Python body runs unchanged.
+        let f = Facts {
+            fullname: "typing.Self".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(classify(&f), None);
     }
 
     #[test]

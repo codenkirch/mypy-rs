@@ -7380,6 +7380,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
             "not_in_readonly": True,
             "not_in_literal": True,
             "not_in_unpack": True,
+            "not_in_self": True,
             "allow_unpack": False,
         }
         defaults.update(facts)
@@ -7402,6 +7403,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
             defaults["not_in_readonly"],
             defaults["not_in_literal"],
             defaults["not_in_unpack"],
+            defaults["not_in_self"],
             defaults["allow_unpack"],
         )
         assert result is not None, "Rust try_analyze_special_unbound did not engage"
