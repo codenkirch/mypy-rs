@@ -178,10 +178,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        subtypes::rust_is_subtype_batch,
-        module
-    )?)?;
+    module.add_function(wrap_pyfunction!(subtypes::rust_is_subtype_batch, module)?)?;
     module.add_function(wrap_pyfunction!(
         subtypes::rust_subtype_tvar_tuple_right,
         module
