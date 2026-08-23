@@ -6,7 +6,10 @@
 //! * `rust_is_simple_literal` — checks if a type is a simple literal.
 //! * `rust_true_only` / `rust_false_only` / `rust_true_or_false` — truthiness
 //!   narrowing via discriminators (Python shim performs the `copy_type` +
-//!   flag mutation on live objects).
+//!   flag mutation on live objects). Step 6 (`__bool__`/`__len__` lookups,
+//!   `is_final`/`is_enum` checks) walks the resolver's live TypeInfo map;
+//!   runs without a resolver get the pre-resolver subset (steps 1-5), and
+//!   unresolved snapshot lookups still defer to Python.
 //! * `rust_fill_typevars` — `mypy.typevars.fill_typevars` on a live
 //!   `TypeInfo`: rebuilds the class type parameters at line=-1 and returns
 //!   the encoded `Instance` (or `TupleType` for named tuples).
@@ -22,7 +25,8 @@ use pyo3::types::PyList;
 use pyo3::IntoPy;
 
 use crate::typeinfo::{
-    read_bool_attr, read_str_list_attr, serialize_type_to_bytes, NativeTypeResolver, TypeResolver,
+    read_bool_attr, read_mro_fullnames, read_str_list_attr, serialize_type_to_bytes,
+    NativeTypeResolver, TypeResolver,
 };
 use crate::wire::{self, LiteralValue, ReadBuffer, Type, WriteBuffer};
 
@@ -135,6 +139,9 @@ pub(crate) fn can_be_true_default(t: &Type) -> Option<bool> {
     match t {
         Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(false),
+        // FunctionLike: Python sets `_can_be_false = False` only
+        // (types.py:2023); can_be_true stays True.
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(true),
         Type::LiteralType { value, fallback } => {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
                 return Some(true);
@@ -175,6 +182,8 @@ pub(crate) fn can_be_false_default(t: &Type) -> Option<bool> {
     match t {
         Type::UninhabitedType { .. } => Some(false),
         Type::NoneType => Some(true),
+        // FunctionLike: functions are never False-ish (types.py:2023).
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(false),
         Type::LiteralType { value, fallback } => {
             if !matches!(fallback.as_ref(), Type::Instance { .. }) {
                 return Some(true);
@@ -240,42 +249,158 @@ enum TruthinessResult {
 }
 
 // ---------------------------------------------------------------------------
+// Step-6 helpers: __bool__/__len__ lookup and falsy-instance classification
+// ---------------------------------------------------------------------------
+
+/// Result of a wire-decoded `__bool__`/`__len__` lookup on a live `TypeInfo`
+/// MRO, distinguishing "no dunder found" from "defer to Python".
+enum DunderLookup {
+    /// A dunder was found and its ret_type decoded from the wire.
+    Found(Type),
+    /// The MRO walk completed with no `CallableType`-typed symbol for the
+    /// name (mirrors `_get_type_method_ret_type` returning `None`).
+    NotFound,
+    /// The live map / MRO / sym.type could not be read or serialized.
+    /// The Python caller falls back to the pure-Python path.
+    Defer,
+}
+
+/// Does the `Instance` type have a custom `__bool__`/`__len__` whose return
+/// type is not truthy (so `true_only` yields `UninhabitedType`)? Mirrors the
+/// `_get_type_method_ret_type` + `not ret_type.can_be_true` decision that
+/// step 4 performs (typeops.py:1314-1319).
+///
+/// Returns:
+/// * `Some(true)` — the resolved return type is `not can_be_true` (the
+///   caller narrows to `Uninhabited`).
+/// * `Some(false)` — no truthiness dunder on the MRO (the caller copies with
+///   the flag mutation).
+/// * `None` — defer to Python (live map missing, wire decode failed, or the
+///   ret_type truthiness cannot be decided on the wire).
+fn step4_dunder_ret_type_all_false(
+    py: Python<'_>,
+    t: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    match live_dunder_ret_type(py, t, resolver)? {
+        DunderLookup::Found(ret_type) => match can_be_true_default(&ret_type) {
+            Some(false) => Some(true),
+            Some(true) => Some(false),
+            None => None,
+        },
+        DunderLookup::NotFound => Some(false),
+        DunderLookup::Defer => None,
+    }
+}
+
+/// Resolve the `__bool__` (or `__len__`, as a fallback) return type of an
+/// `Instance` via the live TypeInfo map, mirroring `TypeInfo.get`'s MRO walk
+/// (nodes.py:4063) + `_get_type_method_ret_type` (typeops.py:1216-1229).
+///
+/// `_get_type_method_ret_type` means `t.type.get(name)` (NOT
+/// `custom_special_method`, so there is no builtins/typing exclusion):
+/// first MRO class with the name in its `names` table wins, its symbol's
+/// proper type must be a `CallableType`, and the callable's ret_type is
+/// returned. `TypeInfo.get` returns `None` when no MRO class has the name.
+///
+/// The `sym.type` (a live `mypy.types.Type`, possibly a TypeAliasType) is
+/// serialized over the wire and the not-yet-proper alias resolved by the
+/// wire decoder; a non-CallableType dict/FuncBase/DataclassTransform symbol
+/// makes Python's `isinstance(sym_type, CallableType)` false -> the MRO walk
+/// keeps going with the NEXT name (or `NotFound`), exactly like Python.
+fn live_dunder_ret_type(
+    py: Python<'_>,
+    t: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<DunderLookup> {
+    let Type::Instance { type_ref, .. } = t else {
+        return Some(DunderLookup::NotFound);
+    };
+    let info = resolver.live_typeinfo(py, type_ref)?;
+    let mro = read_mro_fullnames(info, "mro")?;
+    for name in ["__bool__", "__len__"] {
+        for cls_fullname in &mro {
+            let Some(cls) = resolver.live_typeinfo(py, cls_fullname) else {
+                return Some(DunderLookup::Defer);
+            };
+            let names = cls.getattr("names").ok()?;
+            let sym = names
+                .downcast::<pyo3::types::PyDict>()
+                .ok()?
+                .get_item(name)
+                .ok()?;
+            let Some(sym) = sym else {
+                continue;
+            };
+            let sym_type = sym.getattr("type").ok()?;
+            let sym_type = serialize_type_to_bytes(py, sym_type)?;
+            let Some(sym_type) = decode_type(&sym_type) else {
+                return Some(DunderLookup::Defer);
+            };
+            // Python runs get_proper_type(sym.type) before the CallableType
+            // check; the wire decoder does not resolve TypeAliasType, so
+            // defer rather than wrongly advancing the walk.
+            if matches!(sym_type, Type::TypeAliasType { .. }) {
+                return Some(DunderLookup::Defer);
+            }
+            let Type::CallableType { ret_type, .. } = sym_type else {
+                // Non-callable symbol: Python's `isinstance` check fails,
+                // so the name's walk continues with the next MRO class.
+                continue;
+            };
+            return Some(DunderLookup::Found(*ret_type));
+        }
+    }
+    Some(DunderLookup::NotFound)
+}
+
+/// Is the `Instance` type a `final` class or an enum (so under
+/// `strict_optional` `false_only` yields Never, typeops.py:1369-1371)?
+/// Reads `is_final` / `is_enum` live from the TypeInfo map (the snapshot
+/// does not carry `is_final`; `is_enum` can go stale). `None` when the live
+/// map cannot decide (structurally deferred).
+fn step6_is_final_or_enum(py: Python<'_>, t: &Type, resolver: &NativeTypeResolver) -> Option<bool> {
+    let Type::Instance { type_ref, .. } = t else {
+        return Some(false);
+    };
+    let info = resolver.live_typeinfo(py, type_ref)?;
+    let is_enum = read_bool_attr(info, "is_enum").unwrap_or(false);
+    if is_enum {
+        return Some(true);
+    }
+    let is_final = read_bool_attr(info, "is_final").unwrap_or(false);
+    Some(is_final)
+}
+
+// ---------------------------------------------------------------------------
 // true_only
 // ---------------------------------------------------------------------------
 
 /// `true_only` (typeops.py:790-817): restrict `t` to only True-ish values.
 ///
-/// Logic:
-/// 1. If `not can_be_true` -> `UninhabitedType`
-/// 2. If `not can_be_false` -> `t` (already all-true)
-/// 3. If `UnionType` -> union of `true_only` on each item, filtered to
-///    `can_be_true` items, via `make_simplified_union`
-/// 4. Else -> `copy_type(t)` with `can_be_false=False` (unless `__bool__`/
-///    `__len__` ret_type says all-false, then UninhabitedType)
+/// Rust owns ONLY the step-4 leaf (the `else` branch, typeops.py:803-807).
+/// The Python shim handles the live-flag steps 1-2 and union recursion
+/// (steps 3) because they read `t.can_be_true` / `t.can_be_false` — live
+/// flags the wire does not carry on instances — and union items carry
+/// mutated flags from earlier `copy_type` calls.
 ///
-/// Step 4's `__bool__`/`__len__` lookup needs live TypeInfo -> defer (None).
-/// Union recursion (step 3) recurses via discriminators.
-fn true_only(t: &Type) -> Option<TruthinessResult> {
-    let cbt = can_be_true_default(t)?;
-    if !cbt {
-        return Some(TruthinessResult::Uninhabited);
+/// Step 4 leaf: when a custom `__bool__`/`__len__` ret_type is not
+/// `can_be_true` (on the wire), every value is False-ish -> Uninhabited;
+/// otherwise CopyTrueOnly. Defers (`None`) when the live TypeInfo map is
+/// missing, the dunder ret_type truthiness cannot be decided, or the leaf
+/// is a LiteralType (only enum literals reach the leaf; the enum unwrap in
+/// `_get_type_method_ret_type` needs live TypeInfo).
+fn true_only(py: Python<'_>, t: &Type, resolver: &NativeTypeResolver) -> Option<TruthinessResult> {
+    // Only enum literals reach the leaf (plain literals exit at the Python
+    // live-flag steps); the enum unwrap needs live TypeInfo -> defer.
+    if matches!(t, Type::LiteralType { .. }) {
+        return None;
     }
-    let cbf = can_be_false_default(t)?;
-    if !cbf {
-        return Some(TruthinessResult::SameType);
+    match step4_dunder_ret_type_all_false(py, t, resolver) {
+        Some(true) => Some(TruthinessResult::Uninhabited),
+        Some(false) => Some(TruthinessResult::CopyTrueOnly),
+        None => None,
     }
-    if let Type::UnionType { items, .. } = t {
-        // Keep position-ordered discs for every item: the Python side maps
-        // disc[i] back to t.items[i] then filters via make_simplified_union.
-        // Filtering here would shift positions and mis-decode other items.
-        let mut item_results = Vec::with_capacity(items.len());
-        for item in items {
-            item_results.push(true_only(item)?);
-        }
-        return Some(TruthinessResult::UnionNarrow(item_results));
-    }
-    // Step 4: __bool__/__len__ lookup needs live TypeInfo -> defer.
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -284,45 +409,33 @@ fn true_only(t: &Type) -> Option<TruthinessResult> {
 
 /// `false_only` (typeops.py:820-862): restrict `t` to only False-ish values.
 ///
-/// Logic:
-/// 1. If `not can_be_false`:
-///    - strict_optional -> `UninhabitedType`
-///    - non-strict -> `NoneType`
-/// 2. If `not can_be_true` -> `t` (already all-false)
-/// 3. If `UnionType` -> union of `false_only` on each item, filtered to
-///    `can_be_false` items, via `make_simplified_union`
-/// 4. If `Instance(builtins.str)` or `Instance(builtins.bytes)` ->
-///    `LiteralType("", fallback=t)`
-/// 5. If `Instance(builtins.int)` -> `LiteralType(0, fallback=t)`
-/// 6. Else -> `__bool__`/`__len__` lookup, or `copy_type(t)` with
-///    `can_be_true=False`
+/// Rust owns ONLY the step 4-6 leaf (the non-union `elif` chain,
+/// typeops.py:845-862). The Python shim handles the live-flag steps 1-2
+/// and union recursion (step 3) for the same reason as `true_only`.
 ///
-/// Step 6's method lookup and `is_final`/`is_enum` checks need live TypeInfo
-/// -> defer (None). Steps 4-5 return the literal directly.
-fn false_only(t: &Type, strict_optional: bool) -> Option<TruthinessResult> {
-    let cbf = can_be_false_default(t)?;
-    if !cbf {
-        if strict_optional {
-            return Some(TruthinessResult::Uninhabited);
-        } else {
-            return Some(TruthinessResult::NoneType);
-        }
+/// Leaf logic (mirrors Python's elif order):
+/// 1. `Instance(builtins.str)` / `builtins.bytes` -> `LiteralType("",
+///    fallback=t)`
+/// 2. `Instance(builtins.int)` -> `LiteralType(0, fallback=t)`
+/// 3. `__bool__`/`__len__` lookup via the live MRO: a ret_type that is not
+///    `can_be_false` -> Uninhabited; a found-but-can-be-false ret_type skips
+///    the `is_final` check entirely (Python's elif-chain).
+/// 4. A `@final` class or enum, or an enum literal, under `strict_optional`
+///    -> Uninhabited (typeops.py:1369-1373). Defer when the live map cannot
+///    decide.
+fn false_only(
+    py: Python<'_>,
+    t: &Type,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<TruthinessResult> {
+    // Only enum literals reach the leaf; the `is_enum_literal` tail and the
+    // enum unwrap in `_get_type_method_ret_type` need live TypeInfo -> defer.
+    if matches!(t, Type::LiteralType { .. }) {
+        return None;
     }
-    let cbt = can_be_true_default(t)?;
-    if !cbt {
-        return Some(TruthinessResult::SameType);
-    }
-    if let Type::UnionType { items, .. } = t {
-        // Position-ordered discs for every item (see true_only).
-        let mut item_results = Vec::with_capacity(items.len());
-        for item in items {
-            item_results.push(false_only(item, strict_optional)?);
-        }
-        return Some(TruthinessResult::UnionNarrow(item_results));
-    }
-    // Steps 4-5: str/bytes/int Instance -> LiteralType("", fallback) or
-    // LiteralType(0, fallback). Only fire for plain Instances (no args, no
-    // last_known_value) matching the Python `isinstance(t, Instance)` check.
+    // Steps 1-2: str/bytes/int Instance -> LiteralType(""/0, fallback).
+    // Only fire for plain Instances matching the Python `isinstance` check.
     if let Type::Instance { type_ref, .. } = t {
         if type_ref == "builtins.str" || type_ref == "builtins.bytes" {
             let fb_bytes = encode_type(t)?;
@@ -333,9 +446,25 @@ fn false_only(t: &Type, strict_optional: bool) -> Option<TruthinessResult> {
             return Some(TruthinessResult::LiteralZero(fb_bytes));
         }
     }
-    // Step 6: __bool__/__len__ lookup + is_final/is_enum checks need live
-    // TypeInfo -> defer.
-    None
+    // Step 3: __bool__/__len__ ret_type not can_be_false -> Uninhabited;
+    // Python's elif chain (typeops.py:1361-1373) checks is_final/is_enum
+    // only when the ret_type lookup found nothing, else falls to copy.
+    match live_dunder_ret_type(py, t, resolver)? {
+        DunderLookup::Found(ret_type) => match can_be_false_default(&ret_type) {
+            Some(false) => return Some(TruthinessResult::Uninhabited),
+            Some(true) => return Some(TruthinessResult::CopyFalseOnly),
+            None => return None,
+        },
+        DunderLookup::NotFound => {}
+        DunderLookup::Defer => return None,
+    }
+    // Step 4: a @final class or enum under strict_optional -> Uninhabited.
+    match step6_is_final_or_enum(py, t, resolver) {
+        Some(true) if strict_optional => return Some(TruthinessResult::Uninhabited),
+        Some(_) => {}
+        None => return None,
+    }
+    Some(TruthinessResult::CopyFalseOnly)
 }
 
 // ---------------------------------------------------------------------------
@@ -996,28 +1125,47 @@ impl Scalar {
 }
 
 /// `#[pyfunction]` entry for `true_only`. Returns a truthiness discriminator
-/// tuple or `None` (defer to Python).
+/// tuple or `None` (defer to Python). `__bool__`/`__len__` step-6 lookups go
+/// through the resolver's live TypeInfo map.
 #[pyfunction]
-pub(crate) fn rust_true_only(t_bytes: &[u8]) -> Option<TruthinessOut> {
-    let t = decode_type(t_bytes)?;
-    let result = true_only(&t)?;
-    Python::with_gil(|py| Some(truthiness_to_py(py, result)))
+#[pyo3(signature = (type_bytes, resolver))]
+pub(crate) fn rust_true_only(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<TruthinessOut> {
+    let t = decode_type(type_bytes)?;
+    let result = true_only(py, &t, resolver)?;
+    Some(truthiness_to_py(py, result))
 }
 
 /// `#[pyfunction]` entry for `false_only`.
 #[pyfunction]
-pub(crate) fn rust_false_only(t_bytes: &[u8], strict_optional: bool) -> Option<TruthinessOut> {
-    let t = decode_type(t_bytes)?;
-    let result = false_only(&t, strict_optional)?;
-    Python::with_gil(|py| Some(truthiness_to_py(py, result)))
+#[pyo3(signature = (type_bytes, strict_optional, resolver))]
+pub(crate) fn rust_false_only(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<TruthinessOut> {
+    let t = decode_type(type_bytes)?;
+    let result = false_only(py, &t, strict_optional, resolver)?;
+    Some(truthiness_to_py(py, result))
 }
 
-/// `#[pyfunction]` entry for `true_or_false`.
+/// `#[pyfunction]` entry for `true_or_false`. No resolver needed (no live
+/// lookups), kept for a uniform `(type_bytes, resolver)` call convention.
 #[pyfunction]
-pub(crate) fn rust_true_or_false(t_bytes: &[u8]) -> Option<TruthinessOut> {
-    let t = decode_type(t_bytes)?;
+#[pyo3(signature = (type_bytes, resolver))]
+pub(crate) fn rust_true_or_false(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<TruthinessOut> {
+    let _ = resolver;
+    let t = decode_type(type_bytes)?;
     let result = true_or_false(&t)?;
-    Python::with_gil(|py| Some(truthiness_to_py(py, result)))
+    Some(truthiness_to_py(py, result))
 }
 
 // ---------------------------------------------------------------------------
@@ -2381,8 +2529,15 @@ pub(crate) fn rust_callable_type(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typeinfo::NativeTypeResolver;
     use crate::typeinfo::TypeInfoSnapshot;
     use crate::wire::{LiteralValue, Parameters, Type};
+
+    /// Empty resolver for truthiness unit tests: every case these tests
+    /// exercise decides at steps 1-5, so step 6's live MRO walk never runs.
+    fn empty_resolver() -> NativeTypeResolver {
+        NativeTypeResolver::new(Default::default(), Default::default())
+    }
 
     #[test]
     fn simple_literal_type_extracts_fallback() {
@@ -2442,14 +2597,19 @@ mod tests {
     }
 
     #[test]
-    fn true_only_none_type_returns_uninhabited() {
+    fn true_only_none_type_returns_copy_true_only() {
+        // NoneType exits at the Python live-flag step 1. If the leaf is
+        // reached it decides purely on the dunder lookup: no MRO -> NotFound
+        // -> CopyTrueOnly.
         let t = Type::NoneType;
-        let result = true_only(&t).unwrap();
-        assert!(matches!(result, TruthinessResult::Uninhabited));
+        let result = Python::with_gil(|py| true_only(py, &t, &empty_resolver())).unwrap();
+        assert!(matches!(result, TruthinessResult::CopyTrueOnly));
     }
 
     #[test]
-    fn true_only_literal_true_returns_same() {
+    fn true_only_literal_defers() {
+        // Plain literals exit at the Python live-flag steps; the leaf defers
+        // on ANY LiteralType (enum literals need the live TypeInfo unwrap).
         let t = Type::LiteralType {
             fallback: Box::new(Type::Instance {
                 type_ref: "builtins.bool".to_string(),
@@ -2459,19 +2619,20 @@ mod tests {
             }),
             value: LiteralValue::Bool(true),
         };
-        let result = true_only(&t).unwrap();
-        assert!(matches!(result, TruthinessResult::SameType));
+        let result: Option<TruthinessResult> =
+            Python::with_gil(|py| true_only(py, &t, &empty_resolver()));
+        assert!(result.is_none());
     }
 
     #[test]
-    fn false_only_none_type_returns_same() {
+    fn false_only_none_type_returns_copy_false_only() {
         let t = Type::NoneType;
-        let result = false_only(&t, true).unwrap();
-        assert!(matches!(result, TruthinessResult::SameType));
+        let result = Python::with_gil(|py| false_only(py, &t, true, &empty_resolver())).unwrap();
+        assert!(matches!(result, TruthinessResult::CopyFalseOnly));
     }
 
     #[test]
-    fn false_only_literal_false_returns_same() {
+    fn false_only_literal_defers() {
         let t = Type::LiteralType {
             fallback: Box::new(Type::Instance {
                 type_ref: "builtins.bool".to_string(),
@@ -2481,8 +2642,9 @@ mod tests {
             }),
             value: LiteralValue::Bool(false),
         };
-        let result = false_only(&t, true).unwrap();
-        assert!(matches!(result, TruthinessResult::SameType));
+        let result: Option<TruthinessResult> =
+            Python::with_gil(|py| false_only(py, &t, true, &empty_resolver()));
+        assert!(result.is_none());
     }
 
     #[test]
@@ -2498,9 +2660,10 @@ mod tests {
     }
 
     #[test]
-    fn true_only_union_narrows_items() {
-        // NoneType can_be_true=False -> discarded (Uninhabited, position kept).
-        // LiteralType(True): can_be_false=False -> SameType.
+    fn true_only_union_leaf_defers_to_python_union() {
+        // Union recursion moved to the Python shim (live flags); the Rust
+        // leaf must still decide a bare union conservatively via the dunder
+        // lookup, which for a non-Instance is NotFound -> CopyTrueOnly.
         let t = Type::UnionType {
             items: vec![
                 Type::NoneType,
@@ -2518,18 +2681,8 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let result = true_only(&t).unwrap();
-        match result {
-            TruthinessResult::UnionNarrow(items) => {
-                // Positions preserved: NoneType -> Uninhabited, LiteralType(True)
-                // -> SameType. Python remaps result[i] to t.items[i]
-                // positionally (typeops.py:878).
-                assert_eq!(items.len(), 2);
-                assert_eq!(items[0], TruthinessResult::Uninhabited);
-                assert_eq!(items[1], TruthinessResult::SameType);
-            }
-            _ => panic!("expected UnionNarrow"),
-        }
+        let result = Python::with_gil(|py| true_only(py, &t, &empty_resolver())).unwrap();
+        assert!(matches!(result, TruthinessResult::CopyTrueOnly));
     }
 
     #[test]
@@ -2540,7 +2693,7 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         };
-        let result = false_only(&t, true).unwrap();
+        let result = Python::with_gil(|py| false_only(py, &t, true, &empty_resolver())).unwrap();
         match result {
             TruthinessResult::LiteralEmptyStr(_) => {}
             _ => panic!("expected LiteralEmptyStr"),
@@ -2555,7 +2708,7 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         };
-        let result = false_only(&t, true).unwrap();
+        let result = Python::with_gil(|py| false_only(py, &t, true, &empty_resolver())).unwrap();
         match result {
             TruthinessResult::LiteralZero(_) => {}
             _ => panic!("expected LiteralZero"),

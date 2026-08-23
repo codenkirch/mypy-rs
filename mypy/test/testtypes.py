@@ -6021,6 +6021,286 @@ def _base_infos(fx: TypeFixture) -> list[TypeInfo]:
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTruthinessSuite(Suite):
+    """Parity for the Rust `true_only`/`false_only`/`true_or_false` port.
+
+    The Python bodies (typeops.py:1287-1402) gate behind the typeops gate
+    and the installed resolver. The Rust port decides each step (including
+    the step-6 `__bool__`/`__len__` live-MRO lookup and the `is_final`/
+    `is_enum` checks) and returns a discriminator; the Python shim applies
+    the `copy_type` + flag mutation on live objects.
+
+    Every test runs gate-off (pure Python) vs gate-on (Rust seam) and
+    asserts identical `str()`. Direct seam calls prove the Rust function
+    engages rather than silently deferring. The fixture must install BOTH
+    the resolver and the live TypeInfo map (`set_live_typeinfo_map`), since
+    the step-6 MRO walk reads `mro`/`names` live.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.typeinfo_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(self.typeinfo_map)
+        # The resolver holds its own live_info_map; install it so the
+        # step-6 MRO walk sees it. build_native_resolver owns the object.
+        self.resolver.set_live_typeinfo_map(self.typeinfo_map)
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], ProperType]) -> ProperType:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(
+        self,
+        op: str,
+        t: ProperType,
+        *,
+        strict_optional: bool = True,
+        expect_uninhabited: bool = False,
+    ) -> None:
+        from mypy.state import state
+        from mypy.typeops import false_only, true_only, true_or_false
+
+        fn: Callable[[Type], ProperType]
+        if op == "true_only":
+            fn = true_only
+        elif op == "false_only":
+            fn = false_only
+        elif op == "true_or_false":
+            fn = true_or_false
+        else:
+            raise AssertionError(f"bad op {op}")
+        with state.strict_optional_set(strict_optional):
+            off = self._with_gate(False, lambda: fn(t))
+            on = self._with_gate(True, lambda: fn(t))
+        assert_equal(
+            str(on),
+            str(off),
+            f"{op}(t) str parity strict_optional={strict_optional}",
+        )
+        if expect_uninhabited:
+            assert isinstance(get_proper_type(on), UninhabitedType), (
+                f"{op}(t) should be UninhabitedType, got {on!r}"
+            )
+
+    def _add_dunder(
+        self,
+        info: TypeInfo,
+        name: str,
+        ret: Type,
+    ) -> None:
+        """Add a `def __bool__/__len__(self) -> ret` method to a live TypeInfo.
+
+        Mirrors `TypeFixture._add_bool_dunder`: a FuncDef with a
+        CallableType (no args -> returns ret) registered as MDEF.
+        """
+        from mypy.nodes import Block, FuncDef, MDEF, SymbolTableNode
+
+        signature = CallableType([], [], [], ret, self.fx.function)
+        func_def = FuncDef(name, [], Block([]))
+        func_def.type = signature
+        info.names[name] = SymbolTableNode(MDEF, func_def)
+
+    def _add_bool_ret(self, info: TypeInfo, ret: Type) -> None:
+        self._add_dunder(info, "__bool__", ret)
+
+    def _add_len_ret(self, info: TypeInfo, ret: Type) -> None:
+        self._add_dunder(info, "__len__", ret)
+
+    def test_plain_instance_no_dunder(self) -> None:
+        # D (mro=[object]) has no __bool__/__len__ in any live MRO entry
+        # (the fixture object TypeInfo's names table is empty) -> both ops
+        # copy with a flag mutation, not a defer and not Uninhabited.
+        self._assert_par("true_only", self.fx.d)
+        self._assert_par("false_only", self.fx.d)
+
+    def test_instance_bool_returns_never_true_only(self) -> None:
+        # def __bool__(self) -> Never: true_only(D) -> Uninhabited.
+        self._add_bool_ret(self.fx.di, UninhabitedType())
+        self._assert_par("true_only", self.fx.d, expect_uninhabited=True)
+
+    def test_instance_bool_returns_never_false_only(self) -> None:
+        # def __bool__(self) -> Never: false_only(D) -> Uninhabited
+        # (ret_type found and not can_be_false).
+        self._add_bool_ret(self.fx.di, UninhabitedType())
+        self._assert_par("false_only", self.fx.d, expect_uninhabited=True)
+
+    def test_instance_bool_returns_bool(self) -> None:
+        # __bool__ -> bool: can_be_true and can_be_false, so
+        # true_only/false_only both copy; false_only must NOT narrow a
+        # @final class with __bool__ -> bool to Uninhabited.
+        self._add_bool_ret(self.fx.di, self.fx.bool_type)
+        self._assert_par("true_only", self.fx.d)
+        self._assert_par("false_only", self.fx.d)
+
+    def test_final_class_no_dunder_strict(self) -> None:
+        # @final class D (no custom dunder) under strict_optional:
+        # false_only(D) -> Uninhabited.
+        self.fx.di.is_final = True
+        self._assert_par("false_only", self.fx.d, expect_uninhabited=True)
+
+    def test_final_class_no_dunder_non_strict(self) -> None:
+        # Non-strict: is_final check only runs under strict_optional ->
+        # false_only(D) copies (not Uninhabited).
+        self.fx.di.is_final = True
+        self._assert_par("false_only", self.fx.d, strict_optional=False)
+
+    def test_final_class_with_bool_dunder(self) -> None:
+        # @final class with __bool__ -> bool: ret_type found and
+        # can_be_false -> copy. This is the exact case the draft's
+        # conflation broke.
+        self.fx.di.is_final = True
+        self._add_bool_ret(self.fx.di, self.fx.bool_type)
+        self._assert_par("true_only", self.fx.d)
+        self._assert_par("false_only", self.fx.d)
+
+    def test_enum_class_no_dunder_strict(self) -> None:
+        # is_enum=True: false_only(D) -> Uninhabited under strict_optional.
+        self.fx.di.is_enum = True
+        self._assert_par("false_only", self.fx.d, expect_uninhabited=True)
+
+    def test_enum_class_no_dunder_non_strict(self) -> None:
+        self.fx.di.is_enum = True
+        self._assert_par("false_only", self.fx.d, strict_optional=False)
+
+    def test_str_instance(self) -> None:
+        # str -> LiteralType("", fallback=str) in false_only; true_only
+        # copies (str can_be_true).
+        self._assert_par("true_only", self.fx.str_type)
+        self._assert_par("false_only", self.fx.str_type)
+
+    def test_bytes_instance(self) -> None:
+        # bytes/str share the LiteralType("") rule. Build a bytes TypeInfo
+        # via make_type_info and set the builtins.bytes fullname.
+        bytes_info = self.fx.make_type_info("bytes")
+        bytes_info._fullname = "builtins.bytes"
+        bytes_inst = Instance(bytes_info, [])
+        self._assert_par("true_only", bytes_inst)
+        self._assert_par("false_only", bytes_inst)
+
+    def test_int_instance(self) -> None:
+        # int -> LiteralType(0) in false_only. Build a builtins.int TypeInfo.
+        int_info = self.fx.make_type_info("int")
+        int_info._fullname = "builtins.int"
+        int_inst = Instance(int_info, [])
+        self._assert_par("true_only", int_inst)
+        self._assert_par("false_only", int_inst)
+
+    def test_none_uninhabited_bool_literals(self) -> None:
+        self._assert_par("true_only", self.fx.nonet)
+        self._assert_par("false_only", self.fx.nonet)
+        self._assert_par("true_only", self.fx.uninhabited)
+        self._assert_par("false_only", self.fx.uninhabited, expect_uninhabited=True)
+        self._assert_par("true_only", self.fx.lit_false, expect_uninhabited=True)
+        self._assert_par("true_only", self.fx.lit_true)
+        self._assert_par("false_only", self.fx.lit_true, expect_uninhabited=True)
+        self._assert_par("false_only", self.fx.lit_false)
+
+    def test_union_narrow(self) -> None:
+        # A | None under strict_optional: false_only keeps None, true_only
+        # keeps A meaning both copy; the union recursion must preserve
+        # per-item discriminators.
+        from mypy.typeops import make_simplified_union
+
+        u = make_simplified_union([self.fx.a, self.fx.nonet])
+        self._assert_par("true_only", u)
+        self._assert_par("false_only", u)
+        # A | int: int false_only is LiteralType(0) — the union disc for
+        # int must decode to the fallback correctly.
+        u2 = make_simplified_union([self.fx.a, self.fx.str_type])
+        self._assert_par("false_only", u2)
+
+    def test_dunder_in_mro_base(self) -> None:
+        # class B(A); A has __bool__ -> Never. Instance(B)'s MRO walk must
+        # find A's __bool__.
+        self._add_bool_ret(self.fx.ai, UninhabitedType())
+        self._assert_par("true_only", self.fx.b, expect_uninhabited=True)
+
+    def test_dunder_in_fixture_a(self) -> None:
+        # The fixture gives A a __bool__ -> bool. Both ops must handle the
+        # live-map dunder normally (copy on both).
+        self._assert_par("true_only", self.fx.a)
+        self._assert_par("false_only", self.fx.a)
+
+    def test_len_fallback_when_no_bool(self) -> None:
+        # D has no __bool__ but a __len__ -> Never: false_only(D) ->
+        # Uninhabited via the __len__ fallback.
+        self._add_len_ret(self.fx.di, UninhabitedType())
+        self._assert_par("false_only", self.fx.d, expect_uninhabited=True)
+
+    def test_bool_wins_over_len(self) -> None:
+        # D has __bool__ -> bool AND __len__ -> Never: the __bool__ lookup
+        # wins (first name in the or-chain), so false_only copies instead
+        # of narrowing via __len__.
+        self._add_bool_ret(self.fx.di, self.fx.bool_type)
+        self._add_len_ret(self.fx.di, UninhabitedType())
+        self._assert_par("false_only", self.fx.d)
+
+    def test_resolver_absent_defers_to_python(self) -> None:
+        # With the resolver removed, the Rust seam defers (None) and the
+        # result equals the pure-Python path (which itself runs since the
+        # gate is still active but the resolver is None -> skip).
+        from mypy.typeops import _set_native_typeops_resolver
+        from mypy.state import state
+
+        _set_native_typeops_resolver(None)
+        try:
+            with state.strict_optional_set(True):
+                off = self._with_gate(False, lambda: true_only(self.fx.a))
+                on = self._with_gate(True, lambda: true_only(self.fx.a))
+            assert_equal(str(on), str(off), "resolver-absent true_only parity")
+        finally:
+            _set_native_typeops_resolver(self.resolver)
+
+    def test_true_or_false_resets_flags(self) -> None:
+        self._assert_par("true_or_false", self.fx.a)
+        self._assert_par("true_or_false", self.fx.lit_false)
+        u = make_simplified_union([self.fx.a, self.fx.nonet])
+        self._assert_par("true_or_false", u)
+
+    def test_engages_via_direct_seam(self) -> None:
+        # Direct seam calls prove the Rust functions engage for the
+        # handled cases (not silently deferring to Python).
+        from mypy.typeops import _serialize_type
+
+        d_bytes = _serialize_type(self.fx.d)
+        assert _type_kernel.rust_true_only(d_bytes, self.resolver) is not None
+        assert _type_kernel.rust_false_only(d_bytes, True, self.resolver) is not None
+        assert _type_kernel.rust_true_or_false(d_bytes, self.resolver) is not None
+        self._add_bool_ret(self.fx.di, UninhabitedType())
+        assert _type_kernel.rust_true_only(d_bytes, self.resolver) is not None
+
+
+def _base_infos(fx: TypeFixture) -> list[TypeInfo]:
+    """All fixture TypeInfos for the resolver + object."""
+    return [getattr(fx, n) for n in dir(fx) if n.endswith("i") and _is_type_info(getattr(fx, n))]
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
     """Parity for the Rust `instantiate_type_alias` port (mypy.typeanal).
 

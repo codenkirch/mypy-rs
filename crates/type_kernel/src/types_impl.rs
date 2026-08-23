@@ -90,6 +90,8 @@ fn can_be_true_default_inner(typ: &Type) -> Option<bool> {
         Type::UninhabitedType { .. } => Some(false),
         // NoneType: can_be_true = False.
         Type::NoneType => Some(false),
+        // FunctionLike (CallableType / Overloaded): can_be_true stays True.
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(true),
         // UnionType: any(item.can_be_true). The wire UnionType stores
         // precomputed can_be_true/can_be_false fields (layout >= 11).
         Type::UnionType { can_be_true, .. } => Some(*can_be_true),
@@ -151,6 +153,10 @@ fn can_be_false_default_inner(typ: &Type) -> Option<bool> {
         Type::UninhabitedType { .. } => Some(false),
         // NoneType: base default True (no override).
         Type::NoneType => Some(true),
+        // FunctionLike (CallableType / Overloaded): Python sets
+        // `_can_be_false = False` in FunctionLike.__init__ (types.py:2023),
+        // so a function is never False-ish.
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(false),
         // UnionType: any(item.can_be_false). Wire stores precomputed field.
         Type::UnionType { can_be_false, .. } => Some(*can_be_false),
         // TypeAliasType: delegates to alias.target — defer.
