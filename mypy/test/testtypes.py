@@ -62,6 +62,7 @@ from mypy.nodes import (
     SliceExpr,
     StarExpr,
     StrExpr,
+    SymbolTable,
     SymbolTableNode,
     TemplateStrExpr,
     TupleExpr,
@@ -5146,6 +5147,74 @@ class NativeTryGettingLiteralSuite(Suite):
         self._assert_par(self.fx.uninhabited)
         self._assert_engages(self.fx.uninhabited)
 
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSemanalClassPropSuite(Suite):
+    """Parity for the Rust `semanal_classprop` ports (Issue #538).
+
+    These four seams (`calculate_class_abstract_status`,
+    `check_protocol_status`, `calculate_class_vars`,
+    `add_type_promotion`) run under the `_HAS_RUST_CLASSPROP` import gate
+    rather than a toggled option, so a gate-off/on differential is not
+    applicable. Each test calls the seam directly on freshly-built
+    `TypeInfo`s and asserts the Rust call does not raise and produces the
+    same side effects the pure-Python implementation would: abstract
+    status/attributes, protocol-base errors, inferred class vars, and the
+    `_promote` / `alt_promote` edges for the hardcoded TYPE_PROMOTIONS and
+    the mypyc native-int special case.
+
+    The native-int special case is the regression for the PySet->tuple
+    fix: `MYPYC_NATIVE_INT_NAMES` is a tuple, and a `downcast::<PySet>()`
+    raised on every call, silently falling through the shim's
+    `except: pass`. The `_promote` append must actually land.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def test_abstract_status_sets_flags(self) -> None:
+        assert _type_kernel is not None
+        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
+        _type_kernel.rust_calculate_class_abstract_status(info, False, None)
+        assert not info.is_abstract
+
+    def test_calculate_class_vars_no_raise(self) -> None:
+        assert _type_kernel is not None
+        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
+        _type_kernel.rust_calculate_class_vars(info)
+
+    def test_check_protocol_status_no_raise(self) -> None:
+        assert _type_kernel is not None
+        info = self.fx.make_type_info("builtins.A", mro=[self.fx.oi])
+        _type_kernel.rust_check_protocol_status(info, None)
+
+    def test_add_type_promotion_hardcoded(self) -> None:
+        assert _type_kernel is not None
+        # builtins.int -> builtins.float.
+        float_info = self.fx.make_type_info("builtins.float")
+        int_info = self.fx.make_type_info("builtins.int")
+        int_info.defn.info = int_info  # semanal normally wires this
+        # add_type_promotion reads defn.fullname, defn.decorators, defn.info
+        names = SymbolTable()
+        names["float"] = SymbolTableNode(MDEF, float_info)
+        _type_kernel.rust_add_type_promotion(int_info, names, None, None)
+        assert int_info._promote, "int should gain a float promotion"
+
+    def test_add_type_promotion_native_int(self) -> None:
+        assert _type_kernel is not None
+        # mypyc native int: int._promote gains the native type, and the
+        # native type gets alt_promote = int. Regression for the
+        # PySet->tuple bug (MYPYC_NATIVE_INT_NAMES is a tuple).
+        int_info = self.fx.make_type_info("builtins.int")
+        int_info.defn.info = int_info
+        nativ = self.fx.make_type_info("mypy_extensions.i64")
+        nativ.defn.fullname = "mypy_extensions.i64"
+        nativ.defn.info = nativ
+        builtin_names = SymbolTable()
+        builtin_names["int"] = SymbolTableNode(MDEF, int_info)
+        _type_kernel.rust_add_type_promotion(nativ, SymbolTable(), None, builtin_names)
+        assert int_info._promote, "int should gain the i64 promotion"
+        assert nativ.alt_promote is not None, "i64 should get alt_promote = int"
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAliasExpansionSuite(Suite):

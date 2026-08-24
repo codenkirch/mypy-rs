@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple, PyType};
+use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
 
 // Hard-coded type promotions (shared between all Python versions).
 const TYPE_PROMOTIONS: &[(&str, &str)] = &[
@@ -400,8 +400,23 @@ pub(crate) fn rust_add_type_promotion(
 
     // Special case: promotions between 'int' and native integer types.
     let mypyc_native_int_names = types_mod.getattr("MYPYC_NATIVE_INT_NAMES")?;
-    let mypyc_names_set = mypyc_native_int_names.downcast::<PySet>()?;
-    let in_native_ints = mypyc_names_set.contains(defn_fullname_str)?;
+    // MYPYC_NATIVE_INT_NAMES is a tuple in mypy.types; keep the PyList
+    // branch for robustness if it ever changes to a list.
+    let in_native_ints = if let Ok(list) = mypyc_native_int_names.downcast::<PyList>() {
+        list.iter().any(|n| {
+            n.extract::<String>()
+                .map(|s| s == defn_fullname_str)
+                .unwrap_or(false)
+        })
+    } else if let Ok(tuple) = mypyc_native_int_names.downcast::<PyTuple>() {
+        tuple.iter().any(|n| {
+            n.extract::<String>()
+                .map(|s| s == defn_fullname_str)
+                .unwrap_or(false)
+        })
+    } else {
+        false
+    };
 
     if in_native_ints {
         let int_sym = builtin_names.call_method1("get", ("int",))?;
