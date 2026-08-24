@@ -476,6 +476,14 @@ including:
   removal, `rust_expand_and_bind_callable` went 54% → 98% native,
   `rust_expand_type_by_instance` 6% → 67%, `rust_expand_type` 85% → 91%.
   ParamSpec/Unpack walls stay deferred.
+- `expand_type_by_instance` recursive arms (subtypes.rs, behind the
+  `rust_is_subtype` seam) — mirrors `expandtype.py`'s ExpandTypeVisitor:
+  five new arms (CallableType, Overloaded, TupleType, TypeType,
+  UnpackType) walk the pure tree where decidable. CallableType defers on
+  a declared ParamSpec (Parameters args-splice path) and on a var-arg
+  `UnpackType` (interpolation splice); TupleType defers on single-item
+  normalization and non-builtins fallback; TypeType defers on a Union
+  item. 8 Rust unit tests in `subtypes.rs` (`test_expand_by_instance_*`).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
