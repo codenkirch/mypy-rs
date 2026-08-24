@@ -1137,8 +1137,6 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
         # (Instance/TupleType) through; a __get__-bearing one defers.
         if (
             _HAS_TYPE_KERNEL
-        if (
-            _HAS_TYPE_KERNEL
             and _native_checkmember_active
             and _native_checkmember_resolver is not None
             and _rust_analyze_descriptor_access is not None
