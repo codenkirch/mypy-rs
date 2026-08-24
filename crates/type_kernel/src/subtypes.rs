@@ -1951,13 +1951,18 @@ fn visit_instance_nominal(
     // (subtypes.py:598-621). VARIANCE_NOT_READY returns None (Python
     // handles infer_class_variances; mutating live defn, deferred).
     let right_tvars = &right_snap.type_vars_with_variance;
-    if mapped_args.len() != right_args.len() || mapped_args.len() != right_tvars.len() {
-        // Arity mismatch. Python would assert; we fall through rather
-        // than panic, since the snapshot may be stale mid-build.
-        return None;
-    }
+    // Python uses zip(t.args, right.args, right.type.defn.type_vars)
+    // (subtypes.py:1101), which silently truncates to the shortest
+    // iterable. Mirror that instead of deferring on arity mismatch (#820).
+    let n = mapped_args
+        .len()
+        .min(right_args.len())
+        .min(right_tvars.len());
     let mut nominal = true;
     for (i, (_tvar_name, variance, kind)) in right_tvars.iter().enumerate() {
+        if i >= n {
+            break;
+        }
         // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else branch
         // (subtypes.py:691-696) treats them as COVARIANT, but the arg shapes
         // hit unsupported variants in the recursive is_subtype. Defer.
