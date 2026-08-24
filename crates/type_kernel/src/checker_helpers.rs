@@ -40,6 +40,7 @@ use pyo3::types::PyList;
 
 use crate::subtypes::{is_subtype, SubtypeContext};
 use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
+use crate::visitor::has_type_vars_inner;
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -730,8 +731,12 @@ fn join_type_list_inner(
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
-    // Single-item passthrough defers: the wire round-trip breaks
-    // TypeVar/ParamSpec identity that join inference depends on.
+    // Single-item passthrough: Python's fold starts `joined = types[0]`,
+    // so one item has no join decision. Pass through only identity-safe
+    // items (resolver-resolvable, no TypeVar/ParamSpec anywhere).
+    if items.len() == 1 && is_join_safe(&items[0], resolver) && !has_type_vars_inner(&items[0]) {
+        return Some(items[0].clone());
+    }
     if items.len() == 1 {
         return None;
     }
@@ -1975,13 +1980,47 @@ mod tests {
 
     #[test]
     fn test_join_type_list_single_returns_item() {
-        // Single-item passthrough defers (None): the wire round-trip
-        // breaks TypeVar/ParamSpec identity inference depends on.
-        let r = TypeResolver::new();
+        // Single-item passthrough: no join decision (Python's fold starts
+        // `joined = types[0]`). Resolver-resolvable Instance passes
+        // through; identity-sensitive classes (TypeVar) still defer.
+        let mut r = TypeResolver::new();
+        let snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        r.insert("builtins.int".to_string(), snap);
         let inst = make_instance("builtins.int", vec![]);
-        assert_eq!(join_type_list_inner(&[inst.clone()], true, &r), None);
+        assert_eq!(join_type_list_inner(&[inst.clone()], true, &r), Some(inst));
         let none_t = Type::NoneType;
-        assert_eq!(join_type_list_inner(&[none_t.clone()], true, &r), None);
+        assert_eq!(join_type_list_inner(&[none_t.clone()], true, &r), Some(none_t));
+    }
+
+    #[test]
+    fn test_join_type_list_single_typevar_defers() {
+        // TypeVar single item: wire round-trip breaks identity that join
+        // inference depends on; Python must run.
+        let r = TypeResolver::new();
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: "ns".to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        assert_eq!(join_type_list_inner(&[tvar], true, &r), None);
     }
 
     #[test]
