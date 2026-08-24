@@ -2270,7 +2270,8 @@ fn analyze_type_inner(
             // explode the ParamSpec); other stars analyze with allow_unpack.
             let mut arg_types_out: Vec<Type> = Vec::with_capacity(arg_types.len());
             for (kind, at) in arg_kinds.iter().zip(arg_types.iter()) {
-                if (*kind == ARG_STAR || *kind == ARG_STAR2) && matches!(at, Type::ParamSpecType { .. })
+                if (*kind == ARG_STAR || *kind == ARG_STAR2)
+                    && matches!(at, Type::ParamSpecType { .. })
                 {
                     // Bound P.args/P.kwargs: pass through as-is.
                     arg_types_out.push(at.clone());
