@@ -493,6 +493,20 @@ including:
   matching `anal_star_arg_type`'s fallback `anal_type(t, nested,
   allow_unpack=True)` instead of deferring. Covered by
   `NativeTypeAnalSuite` in `mypy/test/testtypes.py`.
+- `rust_is_protocol_implementation` (subtypes.py:1766-1895) — ported
+  behind the `_is_subtype` fallback: when `rust_is_subtype` defers on a
+  protocol-right Instance pair, the seam drives the full member-compat
+  loop natively (member lookup via `get_protocol_member_inner`,
+  per-member `is_subtype` with a fresh default context, trivial flag
+  gate). Decorator nodes on the protocol (right) side unwrap to `.var`
+  and route through `member_method_inner` (bind_self + expand),
+  matching `find_node_type`'s callable path for decorated protocol
+  members. Defers on: protocol-left (recursion-prone `assuming` guard),
+  generic Callable-Callable member pairs (needs type inference),
+  non-trivial flag combinations (settable/classvar), MRO misses.
+  Measured (self-check): 18623 calls, 13049 decided (70% native).
+  Covered by `NativeProtocolImplementationSuite` in
+  `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

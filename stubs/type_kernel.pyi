@@ -64,6 +64,7 @@ __all__ = [
     "read_type_to_str_with_native_resolver",
     "rust_is_subtype",
     "rust_is_subtype_batch",
+    "rust_is_protocol_implementation",
     "rust_subtype_tvar_tuple_right",
     "rust_variadic_tuple_subtype",
     "rust_trivial_join",
@@ -425,6 +426,21 @@ def rust_get_type_triggers(typ: Any, use_logical_deps: bool) -> list[str] | None
 def rust_is_subtype(
     left: bytes,
     right: bytes,
+    ignore_type_params: bool,
+    ignore_declared_variance: bool,
+    always_covariant: bool,
+    ignore_promotions: bool,
+    proper_subtype: bool,
+    strict_optional: bool,
+    ignore_pos_arg_names: bool,
+    strict_concatenate: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
+
+def rust_is_protocol_implementation(
+    left: bytes,
+    right: bytes,
+    skip: list[str],
     ignore_type_params: bool,
     ignore_declared_variance: bool,
     always_covariant: bool,
