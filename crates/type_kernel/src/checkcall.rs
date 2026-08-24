@@ -1911,12 +1911,20 @@ mod tests {
     }
 
     #[test]
-    fn solve_generic_any_actuals_defers() {
-        // AnyType actuals are skipped at constraint generation
-        // (checkcall.rs:779), leaving no constraints -> defer.
+    fn solve_generic_any_actuals_solves() {
+        // AnyType actuals are NOT skipped: the template yields T :> Any,
+        // so the solve succeeds and T resolves to Any. The old Any-skip
+        // left the lower bound empty and broke joins (testNativeIntJoins).
         let callee = generic_identity();
         let arg = any_type();
         let out = solve_generic_bytes(&callee, &[arg], vec![vec![0]]);
-        assert!(out.is_none(), "expected deferral on Any-only actuals");
+        assert!(out.is_some(), "expected solve with T :> Any, got deferral");
+        let bytes = out.unwrap();
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable with T=Any"
+        );
     }
 }
