@@ -2,10 +2,9 @@
 //!
 //! Ports the "Step 3" loop of `ExpressionChecker.check_overload_call`
 //! (checkexpr.py:~3570) to a Rust-native first-match indexer.
-//! Rust accelerates the no-union-arg, no-star-actual, non-generic-target
-//! path; Any args are handled by the subtype engine (Any-left
-//! short-circuit). Returns `Option<usize>` — the index of the first
-//! matching callable target, or `None` to defer to Python.
+//! Rust only accelerates the no-Any, no-union-arg, no-star-actual,
+//! non-generic-target path. Returns `Option<usize>` — the index of the
+//! first matching callable target, or `None` to defer to Python.
 //!
 //! Rust NEVER decides "no match" or "ambiguous". Any uncertainty
 //! (subtype could-not-decide, decode failure, unexpected actual kind)
@@ -65,8 +64,8 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 /// or `None` to defer to Python's `infer_overload_return_type` loop.
 ///
 /// The Python caller must have already:
-///   * Checked `not any(self.real_union(arg) for arg in arg_types)`
-///     (union args route to Python's union-math path).
+///   * Checked `not any(map(has_any_type, arg_types))`.
+///   * Checked `not any(self.real_union(arg) for arg in arg_types)`.
 ///
 /// Algorithm contract:
 ///   1. Any actual with ARG_STAR / ARG_STAR2 -> defer.
@@ -75,11 +74,10 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
 ///   3. rust_map_actuals_to_formals -> None = unknown -> defer.
 ///   4. Count / duplicate checks mirror Python map + check_argument_count.
 ///   5. rust_is_duplicate_mapping -> Some(true) = not match; None = defer.
-///   6. Subtype check per mapped (actual, formal): Some(false) = not
-///      match, None = defer immediately. Any/Union-typed actuals are
-///      decided by the subtype engine itself (Any-left short-circuit,
-///      Union-left itemwise).
-///   7. First target where all formals pass -> Some(index).
+///   6. AnyType / UnionType actual -> defer (belt-and-suspenders).
+///   7. Subtype check per mapped (actual, formal): Some(false) = not match,
+///      None = defer immediately.
+///   8. First target where all formals pass -> Some(index).
 ///
 /// Returns `None` on decode failures, buffer OOB, or any "could not
 /// decide" signal. Rust NEVER decides "no match" or "ambiguous".
@@ -247,9 +245,13 @@ pub fn rust_check_overload_call(
             for &ai in mapped_indices {
                 let actual = arg_types.get(ai as usize)?;
 
-                // The engine handles Any/Union actuals itself (Any-left
-                // short-circuit, Union-left itemwise), so no belt-and-
-                // suspenders defer here; only an undecided pair defers.
+                // Belt-and-suspenders: AnyType or UnionType actual.
+                if matches!(actual, Type::AnyType { .. })
+                    || matches!(actual, Type::UnionType { .. })
+                {
+                    return None;
+                }
+
                 match subtypes::is_subtype(actual, &formal_type, &ctx, resolver_ref) {
                     Some(true) => {}
                     Some(false) => {
