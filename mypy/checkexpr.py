@@ -4049,19 +4049,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             arg_types, arg_kinds, arg_names, callee
         )
 
-        # Native overload dispatch: Rust returns the first-match target index
-        # for the no-Any, no-union-arg, no-star-actual, non-generic-target path.
-        # We re-run check_call on the chosen target inside filter_errors and
-
-        # trust it only when it produces no new errors; otherwise Python flow
-        # proceeds unchanged.
+        # Native overload dispatch: Rust returns the first-match target
+        # index. Any args handled by the engine; Union args stay in
+        # Python's Step-2 union math. Undecided pairs defer to Python.
         native_idx: int | None = None
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkcall_active
             and _native_checkexpr_resolver is not None
             and plausible_targets
-            and not any(map(has_any_type, arg_types))
             and not any(self.real_union(arg) for arg in arg_types)
         ):
             try:

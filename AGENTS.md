@@ -467,6 +467,16 @@ including:
   empty-args or TVT-class mapped instances, ParamSpec/Unpack signatures, and
   un-frozen TypeVar-carrying results still defer to Python. Exercised by the
   native checkmember suites and Rust unit tests in `checkmember.rs`.
+- `rust_check_overload_call` Any-arg unlocking (checkexpr.py:4052) — the
+  native first-match overload-dispatch indexer (overload.rs) previously
+  required `not any(has_any_type)` plus `not any(real_union)` in the
+  Python gate, leaving it at 0% native. The `has_any_type` precondition
+  is removed: the subtype engine decides `AnyType`-typed actuals itself
+  (Any-left short-circuit), so Any-arg overload calls now go native.
+  Union args still gate to Python's Step-2 union math (first-match is
+  unsound there) and star actuals stay deferred. Covered by the native
+  checkexpr differential suites (`NativeFindMatchingOverloadSuite` and
+  friends) in `mypy/test/testtypes.py`.
 - `expand_type_inner` Callable arm `is_bound` (issue #833) — removed the
   `is_bound` defer in the wire Callable expansion: Python's
   `visit_callable_type` never branches on the flag (it survives
