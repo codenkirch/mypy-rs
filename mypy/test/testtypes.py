@@ -11834,6 +11834,35 @@ class NativeWireFixupSuite(Suite):
         assert_equal(actual, expected)
         assert isinstance(actual, Instance)  # type: ignore[misc]
 
+    def test_replace_meta_vars_erased_type_target(self) -> None:
+        # replace_meta_vars round-trips an ErasedType replacement (checkexpr
+        # passes ErasedType() as the target during inference). A meta-var
+        # TypeVar must be replaced by the target; a class typevar untouched.
+        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
+        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
+
+        from mypy.types import TypeVarId
+
+        meta = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(-1, meta_level=1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        target = ErasedType()
+        typ = Instance(self.fx.gi, [meta])
+
+        _set_native_erase_typevars_active(False)
+        expected = replace_meta_vars(typ, target)
+        _set_native_erase_typevars_active(True)
+        actual = replace_meta_vars(typ, target)
+        self._assert_no_fake_info(actual)
+        assert_equal(actual, expected)
+        assert isinstance(actual, Instance)  # type: ignore[misc]
+        assert isinstance(actual.args[0], ErasedType)
+
     def test_copy_type_fixes_up_instance(self) -> None:
         from mypy.copytype import _set_native_copy_active, copy_type
 

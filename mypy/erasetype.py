@@ -182,6 +182,27 @@ def _deserialize_type(data: bytes) -> Type | None:
     return fixed
 
 
+def _deserialize_type_with_erased(data: bytes) -> Type | None:
+    """Decode wire bytes that may carry an ErasedType (replace_meta_vars).
+
+    The replace_meta_vars shim legitimately round-trips an ErasedType
+    replacement (checkexpr passes ErasedType() as the target). Python's
+    read_type refuses tag 122 unless the opt-in flag is set, so enable it
+    around the decode and restore afterwards; the cache is per-result, so
+    no ErasedType poisoning can leak beyond this decode.
+    """
+    from mypy.types import _ALLOW_WIRE_ERASED_TYPE
+
+    old = _ALLOW_WIRE_ERASED_TYPE
+    _ALLOW_WIRE_ERASED_TYPE = True
+    try:
+        return _deserialize_type(data)
+    except (AssertionError, NotImplementedError):
+        return None
+    finally:
+        _ALLOW_WIRE_ERASED_TYPE = old
+
+
 def erase_type(typ: Type) -> ProperType:
     """Erase any type variables from a type.
 
@@ -327,7 +348,7 @@ def replace_meta_vars(t: Type, target_type: Type) -> Type:
             target_bytes = _serialize_type(target_type)
             result = _rust_replace_meta_vars(type_bytes, target_bytes)
             if result is not None:
-                decoded = _deserialize_type(bytes(result))
+                decoded = _deserialize_type_with_erased(bytes(result))
                 if decoded is not None:
                     return decoded
         except (AssertionError, NotImplementedError):
