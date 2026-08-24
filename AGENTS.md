@@ -456,6 +456,15 @@ including:
   non-`Instance` descriptor types, passing `mx.is_lvalue`. Exercised by
   the native checkmember suites in `mypy/test/testtypes.py` plus Rust
   unit tests (`test_descriptor_access_*` in `checkmember.rs`).
+- `expand_type_inner` Callable arm `is_bound` (issue #833) — removed the
+  `is_bound` defer in the wire Callable expansion: Python's
+  `visit_callable_type` never branches on the flag (it survives
+  `copy_modified` unchanged and expansion only touches arg_types/ret_type/
+  type_guard/type_is/instance_type), so the Rust defer was over-conservative.
+  Wall trace showed `callable-bound` dominated the expand defers; after the
+  removal, `rust_expand_and_bind_callable` went 54% → 98% native,
+  `rust_expand_type_by_instance` 6% → 67%, `rust_expand_type` 85% → 91%.
+  ParamSpec/Unpack walls stay deferred.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
