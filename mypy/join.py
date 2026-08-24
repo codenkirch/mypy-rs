@@ -1180,6 +1180,24 @@ def is_better(t: Type, s: Type) -> bool:
     t = get_proper_type(t)
     s = get_proper_type(s)
 
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_join_active
+        and _native_join_resolver is not None
+        and not isinstance(t, ErasedType)
+        and not isinstance(s, ErasedType)
+    ):
+        try:
+            result = _type_kernel.rust_is_better(
+                _serialize_type(t),
+                _serialize_type(s),
+                _native_join_resolver,
+            )
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            result = None
+        if result is not None:
+            return result
+
     if isinstance(t, Instance):
         if not isinstance(s, Instance):
             return True
