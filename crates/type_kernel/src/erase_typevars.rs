@@ -122,6 +122,29 @@ fn should_erase(raw_id: i64, namespace: &str, ids: Option<&HashSet<IdKey>>) -> b
     }
 }
 
+/// Build the erased form of a `TypeVarTupleType`: its `tuple_fallback`
+/// Instance with a single arg (`the replacement`). Mirrors
+/// `tuple_fallback.copy_modified(args=[replacement])`
+/// (erasetype.py:393). Returns `None` when the fallback is not a wire
+/// Instance, deferring to Python.
+fn type_var_tuple_fallback_with_args(fallback: &Type, replacement: &Type) -> Option<Type> {
+    if let Type::Instance {
+        type_ref,
+        last_known_value,
+        extra_attrs,
+        ..
+    } = fallback
+    {
+        return Some(Type::Instance {
+            type_ref: type_ref.clone(),
+            args: vec![replacement.clone()],
+            last_known_value: last_known_value.clone(),
+            extra_attrs: extra_attrs.clone(),
+        });
+    }
+    None
+}
+
 /// Check if a TypeVarId is a meta var. Mirrors `TypeVarId.is_meta_var()`
 /// (types.py:658-659): meta vars have meta_level > 0 (NOT negative
 /// raw_id — negative raw ids are function type variables).
@@ -212,16 +235,9 @@ pub(crate) fn erase_typevars_inner(
             min_len,
         } => {
             if should_erase(*raw_id, namespace, ids) {
-                // Produce a TupleType(replacement) with tuple_fallback.
-                // tuple_fallback is Instance; copy_modified(args=[replacement])
-                // means the new tuple has a single arg = replacement.
-
-                // However, the wire format TypeVarTupleType.tuple_fallback is
-                // an Instance Type. copy_modified(args=[repl]) would create
-                // an Instance with args=[repl]. We can't do copy_modified on
-
-                // a wire-format Type without knowing the TypeInfo. Defer.
-                None
+                // visit_type_var_tuple (erasetype.py:391-394): the wire
+                // fallback is an Instance, rebuild it with args=[replacement].
+                type_var_tuple_fallback_with_args(tuple_fallback, replacement)
             } else {
                 Some(Type::TypeVarTupleType {
                     tuple_fallback: tuple_fallback.clone(),
@@ -321,6 +337,27 @@ pub(crate) fn erase_typevars_inner(
             let new_variables = erase_typevars_list(variables, ids, replacement)?;
             let new_type_guard = erase_typevars_opt(type_guard.as_deref(), ids, replacement)?;
             let new_type_is = erase_typevars_opt(type_is.as_deref(), ids, replacement)?;
+            let mut new_arg_types = new_arg_types;
+            // visit_callable_type (erasetype.py:383-389) calls
+            // result.normalize_trivial_unpack() after the super() walk:
+            // *args: *tuple[X, ...] -> *args: X in place.
+            if let Some(idx) = arg_kinds.iter().position(|k| *k == 2) {
+                // ARG_STAR == 2. Only when the star arg is an unpack of a
+                // builtins.tuple Instance.
+                if let Type::UnpackType { typ: inner } = &new_arg_types[idx] {
+                    if let Type::Instance {
+                        type_ref,
+                        args,
+                        last_known_value: _,
+                        extra_attrs: _,
+                    } = inner.as_ref()
+                    {
+                        if type_ref == "builtins.tuple" && args.len() == 1 {
+                            new_arg_types[idx] = args[0].clone();
+                        }
+                    }
+                }
+            }
             Some(Type::CallableType {
                 fallback: Box::new(new_fallback),
                 instance_type: new_instance_type.map(Box::new),
@@ -619,6 +656,23 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
                 Some(t) => Some(Box::new(replace_meta_vars_inner(t, target)?)),
                 None => None,
             };
+            let mut new_arg_types = new_arg_types;
+            // Same normalize_trivial_unpack as erase_typevars_inner.
+            if let Some(idx) = arg_kinds.iter().position(|k| *k == 2) {
+                if let Type::UnpackType { typ: inner } = &new_arg_types[idx] {
+                    if let Type::Instance {
+                        type_ref,
+                        args,
+                        last_known_value: _,
+                        extra_attrs: _,
+                    } = inner.as_ref()
+                    {
+                        if type_ref == "builtins.tuple" && args.len() == 1 {
+                            new_arg_types[idx] = args[0].clone();
+                        }
+                    }
+                }
+            }
             Some(Type::CallableType {
                 fallback: Box::new(new_fallback),
                 instance_type: new_instance_type,
@@ -862,6 +916,57 @@ mod tests {
         let target = make_instance("builtins.int", vec![]);
         let result = replace_meta_vars_inner(&t, &target);
         assert!(matches!(result, Some(Type::TypeVarType { .. })));
+    }
+
+    fn make_type_var_tuple(raw_id: i64) -> Type {
+        Type::TypeVarTupleType {
+            tuple_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            name: "Ts".to_string(),
+            fullname: "Ts".to_string(),
+            raw_id,
+            namespace: "ns".to_string(),
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 12,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 12,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            min_len: 0,
+        }
+    }
+
+    #[test]
+    fn test_erase_type_var_tuple_erased() {
+        let t = make_type_var_tuple(1);
+        let result = erase_typevars_inner(&t, None, &make_any()).unwrap();
+        match result {
+            Type::Instance {
+                type_ref,
+                args,
+                last_known_value,
+                extra_attrs,
+            } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert_eq!(args.len(), 1);
+                assert!(matches!(args[0], Type::AnyType { .. }));
+                assert!(last_known_value.is_none());
+                assert!(extra_attrs.is_none());
+            }
+            _ => panic!("expected Instance"),
+        }
+    }
+
+    #[test]
+    fn test_erase_type_var_tuple_not_erased() {
+        let t = make_type_var_tuple(1);
+        let mut ids = HashSet::new();
+        ids.insert((2, "ns".to_string()));
+        let result = erase_typevars_inner(&t, Some(&ids), &make_any());
+        assert!(matches!(result, Some(Type::TypeVarTupleType { .. })));
     }
 
     #[test]
