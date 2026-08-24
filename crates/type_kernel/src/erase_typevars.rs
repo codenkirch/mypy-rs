@@ -551,7 +551,8 @@ fn replace_meta_vars_inner(typ: &Type, target: &Type) -> Option<Type> {
             // Python visit_type_var_tuple (erasetype.py:412-415) replaces
             // with `t.tuple_fallback.copy_modified(args=[replacement])`
             // when meta, else leaves it; wire lacks meta_level, defer.
-            None        }
+            None
+        }
         // For composite types, recurse. Reuse erase_typevars_inner but with
         // a meta-var-only predicate. We can't pass a closure, so inline the
         // recursion for each variant.
