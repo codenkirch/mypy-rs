@@ -497,9 +497,7 @@ fn replace_meta_vars_parameters(
 fn replace_meta_vars_inner(typ: &Type, target: &Type) -> Option<Type> {
     match typ {
         Type::ErasedType => Some(typ.clone()), // Python: visit_erased_type passthrough
-        Type::TypeVarType {
-            meta_level, ..
-        } => {
+        Type::TypeVarType { meta_level, .. } => {
             if is_meta_var(*meta_level) {
                 Some(target.clone())
             } else {
