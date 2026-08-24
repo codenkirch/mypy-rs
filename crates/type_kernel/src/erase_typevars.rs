@@ -59,16 +59,9 @@ pub(crate) fn rust_erase_typevars(type_bytes: &[u8], ids_bytes: &[u8]) -> Option
 pub(crate) fn rust_replace_meta_vars(type_bytes: &[u8], target_bytes: &[u8]) -> Option<Vec<u8>> {
     let typ = decode_type(type_bytes)?;
     let target = decode_type(target_bytes)?;
-    // Before ErasedType gained a wire tag, serializing an ErasedType target
-    // raised NotImplementedError, so replace_meta_vars always deferred to
-    // the pure-Python TypeVarEraser. Nothing in the type kernel's
-
-    // TypeVarEraser port exercised an ErasedType replacement, so keep that
-    // behavior: defer when the target is ErasedType so inference semantics
-    // do not change (parity-safe strangler).
-    if matches!(target, Type::ErasedType) {
-        return None;
-    }
+    // ErasedType wire carries no fields, and the Python shim decodes it to a
+    // transient ErasedType only for this seam (read_type is opt-in via
+    // _ALLOW_WIRE_ERASED_TYPE), so no deferral is needed here.
     let result = replace_meta_vars_inner(&typ, &target)?;
     encode_type(&result)
 }
@@ -130,9 +123,10 @@ fn should_erase(raw_id: i64, namespace: &str, ids: Option<&HashSet<IdKey>>) -> b
 }
 
 /// Check if a TypeVarId is a meta var. Mirrors `TypeVarId.is_meta_var()`
-/// (types.py:495-504): meta vars have negative raw_id.
-fn is_meta_var(raw_id: i64) -> bool {
-    raw_id < 0
+/// (types.py:658-659): meta vars have meta_level > 0 (NOT negative
+/// raw_id — negative raw ids are function type variables).
+fn is_meta_var(meta_level: i64) -> bool {
+    meta_level > 0
 }
 
 /// The core TypeVarEraser visitor. Mirrors `TypeVarEraser` (erasetype.py:204-285).
@@ -497,47 +491,31 @@ fn replace_meta_vars_parameters(
     })
 }
 
-/// Replace only meta-var type variables (raw_id < 0) with the target type.
+/// Replace only meta-var type variables (meta_level > 0) with the target type.
 /// Mirrors `replace_meta_vars` (erasetype.py:199-201) which calls
 /// `TypeVarEraser(erase_meta_id, target_type)`.
 fn replace_meta_vars_inner(typ: &Type, target: &Type) -> Option<Type> {
     match typ {
-        Type::TypeVarType { raw_id, .. } => {
-            if is_meta_var(*raw_id) {
+        Type::ErasedType => Some(typ.clone()), // Python: visit_erased_type passthrough
+        Type::TypeVarType {
+            meta_level, ..
+        } => {
+            if is_meta_var(*meta_level) {
                 Some(target.clone())
             } else {
                 Some(typ.clone())
             }
         }
-        Type::ParamSpecType {
-            prefix,
-            name,
-            fullname,
-            raw_id,
-            namespace,
-            flavor,
-            upper_bound,
-            default,
-        } => {
-            if is_meta_var(*raw_id) {
-                Some(target.clone())
-            } else {
-                let new_prefix = replace_meta_vars_parameters(prefix, target)?;
-                Some(Type::ParamSpecType {
-                    prefix: Box::new(new_prefix),
-                    name: name.clone(),
-                    fullname: fullname.clone(),
-                    raw_id: *raw_id,
-                    namespace: namespace.clone(),
-                    flavor: *flavor,
-                    upper_bound: upper_bound.clone(),
-                    default: default.clone(),
-                })
-            }
+        Type::ParamSpecType { .. } => {
+            // Python visit_param_spec (erasetype.py:417-421) replaces the
+            // WHOLE ParamSpec when its id is a meta var; the wire format
+            // lacks ParamSpec meta_level, so Rust cannot decide. Defer.
+            None
         }
         Type::TypeVarTupleType { .. } => {
-            // TypeVarEraser.visit_type_var_tuple with meta_var check.
-            // We can't do copy_modified on wire format, so defer.
+            // Python visit_type_var_tuple (erasetype.py:412-415) replaces
+            // with `t.tuple_fallback.copy_modified(args=[replacement])`
+            // when meta, else leaves it; wire lacks meta_level, defer.
             None
         }
         // For composite types, recurse. Reuse erase_typevars_inner but with
@@ -738,7 +716,7 @@ fn erase_typevars_with_meta_check(typ: &Type, target: &Type) -> Option<Type> {
         | Type::ErasedType
         | Type::UninhabitedType { .. }
         | Type::DeletedType { .. } => Some(typ.clone()),
-        // Deferred.
+        // Deferred (mirror main's wire deferral contract).
         Type::TypeAliasType { .. } => None,
         Type::UnboundType { .. } => None,
         // TypeVar-like variants are handled in replace_meta_vars_inner
@@ -792,6 +770,14 @@ mod tests {
             variance: 0,
             meta_level: 0,
         }
+    }
+
+    fn make_typevar_meta(raw_id: i64, ns: &str) -> Type {
+        let mut t = make_typevar(raw_id, ns);
+        if let Type::TypeVarType { meta_level, .. } = &mut t {
+            *meta_level = 1;
+        }
+        t
     }
 
     fn make_instance(type_ref: &str, args: Vec<Type>) -> Type {
@@ -863,7 +849,8 @@ mod tests {
 
     #[test]
     fn test_replace_meta_vars() {
-        let t = make_typevar(-1, "ns");
+        // A meta TypeVar (meta_level > 0) is replaced by the target.
+        let t = make_typevar_meta(1, "ns");
         let target = make_instance("builtins.int", vec![]);
         let result = replace_meta_vars_inner(&t, &target);
         assert!(
@@ -881,10 +868,12 @@ mod tests {
 
     #[test]
     fn test_is_meta_var() {
-        assert!(is_meta_var(-1));
-        assert!(is_meta_var(-100));
+        // is_meta_var is meta_level > 0 (types.py:658-659). Negative ids
+        // are function type vars, not meta vars.
+        assert!(is_meta_var(1));
+        assert!(is_meta_var(2));
         assert!(!is_meta_var(0));
-        assert!(!is_meta_var(1));
+        assert!(!is_meta_var(-1));
     }
 
     #[test]

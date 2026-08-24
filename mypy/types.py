@@ -5207,6 +5207,11 @@ RAW_EXPRESSION_TYPE: Final[Tag] = 120  # Only valid in serialized ASTs
 CALL_TYPE: Final[Tag] = 121  # Only valid in serialized ASTs
 ERASED_TYPE: Final[Tag] = 122  # First free tag after the AST-only range.
 
+# Opt-in wire ErasedType decode: `read_type` lacks an ERASED_TYPE branch by
+# default (ErasedType is transient, never cached), so seams enable the flag
+# around decode of their own result bytes (e.g. replace_meta_vars) only.
+_ALLOW_WIRE_ERASED_TYPE: bool = False
+
 
 def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
     if tag is None:
@@ -5246,12 +5251,12 @@ def read_type(data: ReadBuffer, tag: Tag | None = None) -> Type:
         return Parameters.read(data)
     if tag == UNINHABITED_TYPE:
         return UninhabitedType.read(data)
-    # NOTE: ERASED_TYPE (tag 122) is intentionally NOT decodable here. ErasedType
-    # exists only transiently during semantic analysis and is never stored in
-    # caches or exchanged across wire seams; letting tag-122 bytes fail to decode
-
-    # makes any Rust wire seam that emits an ErasedType defer to the pure-Python
-    # fallback, preserving main's behavior.
+    # ERASED_TYPE (tag 122) is not decodable here by default: ErasedType is
+    # transient, never cached. The erasetype shim enables the opt-in flag.
+    if tag == ERASED_TYPE:
+        if not _ALLOW_WIRE_ERASED_TYPE:
+            assert False, f"Unknown type tag {tag}"
+        return ErasedType.read(data)
     if tag == UNBOUND_TYPE:
         return UnboundType.read(data)
     if tag == DELETED_TYPE:
