@@ -16,18 +16,29 @@
 //!   * `join_type_list` (join.py:1142) — fold-join over a list of types.
 //!     Reuses the existing `setops::join_types` wire kernel. Returns
 //!     encoded bytes so the Python shim can decode to a live `Type`.
-//!   * `get_protocol_member` (subtypes.py:1513) — the pure
-//!     `__call__`-special-case prefix of `get_protocol_member` that
-//!     does not need `find_member`. Defers (returns `None`) for the
-//!     general `find_member` path.
+//!   * `get_protocol_member` (subtypes.py:1832) — `get_protocol_member`
+//!     minus `find_member`'s attribute-hook / descriptor / error paths and
+//!     the `__call__`-on-class-object `type_object_type` computation. Rust
+//!     decides the `__call__` special cases and the common protocol-member
+//!     cases of `find_member` (subtypes.py:1874-1948) by live PyO3 reads:
+//!     a plain `FuncDef` / `OverloadedFuncDef` method defined directly on
+//!     the receiver class binds + expands via the checkmember.rs
+//!     `member_method_inner` machinery, and a plain annotated `Var`
+//!     (not a property / classmethod / staticmethod / classvar / inferred
+//!     var, no descriptor, no plugin attribute hook, no Self type) expands
+//!     via `expand_type_by_instance` preserving type-var ids. Defers
+//!     (returns `None`) on anything needing plugins, descriptors, class
+//!     attributes, error emission, `type_object_type`, or a non-direct
+//!     receiver.
 //!
 //! All functions take wire-format `Type` bytes and a `NativeTypeResolver`,
 //! mirroring the established `subtypes::rust_is_subtype` pattern. `None`
 //! means "Rust defers, Python runs the pure-Python path".
 
 use pyo3::prelude::*;
+use pyo3::types::PyList;
 
-use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -43,6 +54,104 @@ fn encode_type(typ: &Type) -> Option<Vec<u8>> {
     let mut wbuf = WriteBuffer::new();
     wire::write_type(&mut wbuf, typ).ok()?;
     Some(wbuf.into_bytes())
+}
+
+// Live-attribute helpers (mirror member_flags.rs:42-52). `None` on any
+// read failure means "defer to Python", never a guessed value.
+fn get_bool_flag(py: Python<'_>, node: &PyAny, name: &str) -> Option<bool> {
+    let v = node.getattr(name).ok()?;
+    if v.is_none() {
+        return Some(false);
+    }
+    if let Ok(b) = v.extract::<bool>() {
+        return Some(b);
+    }
+    if let Ok(b) = v.downcast::<pyo3::types::PyBool>() {
+        return Some(b.is_true());
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Some(i != 0);
+    }
+    // A non-bool, non-int object: Python truthiness is not decidable here.
+    let _ = py;
+    None
+}
+
+fn get_opt_str_attr(node: &PyAny, name: &str) -> Option<String> {
+    let v = node.getattr(name).ok()?;
+    if v.is_none() {
+        None
+    } else {
+        v.extract::<String>().ok()
+    }
+}
+
+/// `is_descriptor(typ)` (subtypes.py:2091-2097) for the wire format:
+/// true iff `typ` is an Instance whose class has a readable `__get__`, or
+/// a Union all of whose relevant items do. Defer (None) when any component
+/// cannot be decided from the resolver snapshots.
+fn is_descriptor_wire(typ: &Type, resolver: &TypeResolver) -> Option<bool> {
+    let proper = get_proper_or_none(typ)?;
+    match proper {
+        Type::Instance { type_ref, .. } => {
+            crate::checkmember::has_readable_member_by_ref(resolver, type_ref, "__get__")
+        }
+        Type::UnionType { items, .. } => {
+            let mut any_none = false;
+            for t in items {
+                match is_descriptor_wire(t, resolver) {
+                    Some(true) => {
+                        // all(...) — first true item: whole union is a
+                        // descriptor.
+                        return Some(true);
+                    }
+                    Some(false) => {}
+                    None => any_none = true,
+                }
+            }
+            // relevant_items filters NoneType under strict_optional; treat
+            // a None item as non-descriptor (mirrors is_descriptor).
+            if any_none {
+                None
+            } else {
+                Some(false)
+            }
+        }
+        _ => Some(false),
+    }
+}
+
+/// `TypeInfo.get(name)` (nodes.py:4063-4068) walking the live MRO: return
+/// the first `(TypeInfo, SymbolTableNode)` whose own `names` dict contains
+/// `name`. `None` when absent or when any MRO class lacks `.names`.
+fn mro_get(py: Python<'_>, info: &PyAny, name: &str) -> Option<(PyObject, PyObject)> {
+    let mro = info.getattr("mro").ok()?;
+    let mro_list = mro.downcast::<PyList>().ok()?;
+    for base in mro_list.iter() {
+        let names = base.getattr("names").ok()?;
+        let value = names.get_item(name).ok()?;
+        if !value.is_none() {
+            return Some((base.to_object(py), value.to_object(py)));
+        }
+    }
+    None
+}
+
+/// Safe read of the plugin-hook absence flag from `mypy.checkexpr`.
+fn plugin_get_attribute_hook_absent(py: Python<'_>) -> bool {
+    py.import("mypy.checkexpr")
+        .and_then(|m| m.getattr("plugin_hook_known_absent"))
+        .and_then(|f| f.call1(("get_attribute_hook", "protocol-member-dummy")))
+        .and_then(|r| r.extract::<bool>())
+        .unwrap_or(false)
+}
+
+/// Read `fullname -> TypeInfo` map presence for the plugin-hook registry.
+fn live_plugin_registry_absent(py: Python<'_>) -> bool {
+    py.import("mypy.checkexpr")
+        .and_then(|m| m.getattr("_native_plugin_hook_has_user_plugins"))
+        .and_then(|v| v.extract::<bool>())
+        .unwrap_or(false)
 }
 
 /// `get_proper_type` for the wire format. Expands `TypeAliasType` by
@@ -630,50 +739,372 @@ pub(crate) fn rust_join_type_list(
 }
 
 // ---------------------------------------------------------------------------
-// get_protocol_member (subtypes.py:1513)
+// get_protocol_member (subtypes.py:1832)
 // ---------------------------------------------------------------------------
 
-/// `mypy.subtypes.get_protocol_member` (subtypes.py:1513-1533): look up
+/// `mypy.subtypes.get_protocol_member` (subtypes.py:1832-1871): look up
 /// a member on a protocol instance.
 ///
-/// Handles the two pure special cases that do not need `find_member`:
-///   1. `member == "__call__" and class_obj` -> return `type_object_type(left.type)`.
-/// 2. `member == "__call__" and left.type.is_metaclass(precise=True)` -> return `None`.
+/// Handles, in Python order:
+///   1. `member == "__call__" and class_obj` -> defer (needs
+///      `type_object_type(left.type)`, the full TypeInfo -> constructor
+///      computation, which is complex).
+///   2. `member == "__call__" and left.type.is_metaclass(precise=True)`
+///      -> return `None` (avoid falling back to metaclass `__call__`).
+///   3. Otherwise, `find_member` (subtypes.py:1874-1948) restricted to a
+///      member defined directly on the receiver class (`left.type`) whose
+///      node is a plain `FuncDef` / `OverloadedFuncDef` / `Var` and whose
+///      resolution needs no checker state, plugins, or error emission:
+///      * a plain method -> `analyze_instance_member_access` via the
+///        `checkmember.rs` machinery (`member_method_inner`): `function_type`
+///        passthrough gives the live signature, then check-self-arg +
+///        map + expand + bind; the defining class is the receiver class so
+///        `map_instance_to_supertype` is checked for identity first.
+///      * a plain `Var` (not a property, classmethod, staticmethod,
+///        classvar, inferred var, no PartialType) -> expand `var.type` by
+///        the receiver preserving type-var ids, matching
+///        `find_node_type`'s non-callable tail.
 ///
-/// For all other cases, defers to Python (returns `None`), since the
-/// general path needs `find_member` + `checker_state`.
+/// Defers (returns `None`) whenever anything needs plugins, descriptors,
+/// class-attribute access, error emission, live checker state, or a
+/// decision the live/wire data cannot carry exactly. A wrong answer is
+/// worse than a deferral.
 ///
-/// Returns `Some(Vec<u8>)` (encoded type) or `None` (defer). For case 2,
-/// returns `Some(empty_vec)` to distinguish "Rust decided None" from
-/// "Rust defers". The Python shim interprets `Some(empty)` as
-/// "return None" and `None` as "defer".
+/// Returns `Some(Vec<u8>)` (encoded type) for a found member,
+/// `Some(empty_vec)` for "Rust decided None", or `None` (defer). The Python
+/// shim interprets `Some(empty)` as "return None" and `None` as "defer".
+#[allow(clippy::too_many_arguments)]
 fn get_protocol_member_inner(
+    py: Python<'_>,
     left: &Type,
     member: &str,
     class_obj: bool,
-    resolver: &TypeResolver,
-) -> GetProtocolMemberResult {
-    let Type::Instance { type_ref, .. } = left else {
-        return GetProtocolMemberResult::Defer;
+    is_lvalue: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<GetProtocolMemberResult> {
+    let Type::Instance {
+        type_ref,
+        args: left_args,
+        extra_attrs,
+        ..
+    } = left
+    else {
+        return None;
     };
-    let snap = match resolver.get(type_ref) {
-        Some(s) => s,
-        None => return GetProtocolMemberResult::Defer,
-    };
+    if extra_attrs.is_some() {
+        // `find_member` consults `itype.extra_attrs` for module attrs; a
+        // present extra_attrs cannot be decided here.
+        return Some(GetProtocolMemberResult::Defer);
+    }
+    let snap = resolver.resolver().get(type_ref)?;
 
     if member == "__call__" && class_obj {
         // type_object_type(left.type): the constructor type. This needs
         // the full TypeInfo -> type_object_type computation which is
         // complex; defer to Python.
-        return GetProtocolMemberResult::Defer;
+        return Some(GetProtocolMemberResult::Defer);
     }
 
-    if member == "__call__" && is_metaclass_precise(snap, resolver) {
+    if member == "__call__" && is_metaclass_precise(snap, resolver.resolver()) {
         // Avoid falling back to metaclass __call__; return None.
-        return GetProtocolMemberResult::None;
+        return Some(GetProtocolMemberResult::NoneVal);
     }
 
-    GetProtocolMemberResult::Defer
+    if member == "__init__" {
+        // analyze_instance_member_access (checkmember.py:616-621) filters
+        // `__init__` access to final methods / super; anything else issues
+        // CANNOT_ACCESS_INIT. Rust must not emit errors -> defer.
+        return Some(GetProtocolMemberResult::Defer);
+    }
+    if class_obj {
+        // analyze_vars / class-attribute path needs class-var substitution,
+        // TypeType wrapping, and metaclass fallbacks. Defer.
+        return Some(GetProtocolMemberResult::Defer);
+    }
+    if is_lvalue {
+        // setter / assignment code paths need error emission.
+        return Some(GetProtocolMemberResult::Defer);
+    }
+
+    // find_member (subtypes.py:1894-1915): `info.get(name)` walks the MRO.
+    let info = match resolver.live_typeinfo(py, type_ref) {
+        Some(i) => i,
+        None => return Some(GetProtocolMemberResult::Defer),
+    };
+    // `live_typeinfo` returns a dict value which may be `None` when the
+    // fullname key maps to nothing; treat that as a deferral.
+    if info.is_none() {
+        return Some(GetProtocolMemberResult::Defer);
+    }
+    let (sym_info, sym_node) = match mro_get(py, info, member) {
+        Some(pair) => pair,
+        None => return Some(GetProtocolMemberResult::Defer),
+    };
+    let sym_info: &PyAny = sym_info.as_ref(py);
+    let node = match sym_node.as_ref(py).getattr("node") {
+        Ok(n) => n.to_object(py),
+        Err(_) => return Some(GetProtocolMemberResult::Defer),
+    };
+    let node_ref: &PyAny = node.as_ref(py);
+    if node_ref.is_none() {
+        // find_member falls to the missing-attribute path (getattr /
+        // fallback_to_any / extra_attrs / None). All need checker state
+        // or error emission -> defer.
+        return Some(GetProtocolMemberResult::Defer);
+    }
+    let class_name = node_ref.get_type().name().unwrap_or("").to_string();
+    match class_name.as_str() {
+        "FuncDef" | "OverloadedFuncDef" => {
+            // A property is an OverloadedFuncDef with is_property=True; its
+            // member access is analyze_var's property path. Defer so Python
+            // returns the getter value, not the bound getter callable.
+            if get_bool_flag(py, node_ref, "is_property") == Some(true) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            // Plain method: analyze_instance_member_access
+            // (checkmember.py:634-776). `function_type` returns `node.type`
+            // (live signature, serialized; preserve_type_var_ids=True so no
+            // freshen runs). Same-class guard: member_method_inner's
+            // check_self_arg + bind tail mirrors checkmember.py:769-772.
+            let node_type_obj = match node_ref.getattr("type") {
+                Ok(t) => t,
+                Err(_) => return Some(GetProtocolMemberResult::Defer),
+            };
+            if node_type_obj.is_none() {
+                // `function_type` falls back to building the signature
+                // from the FuncItem (Defn); defer so Python handles it.
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let signature = match serialize_type_to_bytes(py, node_type_obj) {
+                Some(bytes) => match decode_type(&bytes) {
+                    Some(t) => t,
+                    None => return Some(GetProtocolMemberResult::Defer),
+                },
+                None => return Some(GetProtocolMemberResult::Defer),
+            };
+            // method_fullname must be the receiver's type_ref.
+            let method_fullname = match get_opt_str_attr(sym_info, "fullname") {
+                Some(f) => f,
+                None => return Some(GetProtocolMemberResult::Defer),
+            };
+            if method_fullname != *type_ref {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let strict_optional = live_strict_optional(py);
+            let result = crate::checkmember::member_method_inner(
+                left,
+                &signature,
+                &method_fullname,
+                left,
+                member,
+                resolver.resolver(),
+                strict_optional,
+                false, // is_class
+            );
+            match result {
+                Some(t) => Some(GetProtocolMemberResult::Found(t)),
+                None => Some(GetProtocolMemberResult::Defer),
+            }
+        }
+        "Var" => {
+            // find_node_type (subtypes.py:2117-2160) Var path ->
+            // analyze_var's non-callable tail (checkmember.py:1377-1422).
+            if !live_var_plain(py, node_ref, sym_info, type_ref, resolver) {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let var_type_obj = match node_ref.getattr("type") {
+                Ok(t) => t,
+                Err(_) => return Some(GetProtocolMemberResult::Defer),
+            };
+            if var_type_obj.is_none() {
+                return Some(GetProtocolMemberResult::Defer);
+            }
+            let typ = match serialize_type_to_bytes(py, var_type_obj) {
+                Some(bytes) => match decode_type(&bytes) {
+                    Some(t) => t,
+                    None => return Some(GetProtocolMemberResult::Defer),
+                },
+                None => return Some(GetProtocolMemberResult::Defer),
+            };
+            // expand_without_binding with preserve_type_var_ids=True
+            // (checkmember.py:1498-1503): no freshen, no Self (var has no
+            // self_type), expand_type_by_instance. Wire fast-path + no
+            // self_type + identity map == plain expand_type_by_instance.
+            let mapped = Type::Instance {
+                type_ref: type_ref.to_string(),
+                args: left_args.to_vec(),
+                last_known_value: None,
+                extra_attrs: None,
+            };
+            let expanded = crate::expandtype::expand_type_by_instance_core(
+                &typ,
+                &mapped,
+                resolver.resolver(),
+                live_strict_optional(py),
+            );
+            match expanded {
+                Some(t) => {
+                    if crate::expandtype::result_has_typevar(&t) {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
+                    Some(GetProtocolMemberResult::Found(t))
+                }
+                None => Some(GetProtocolMemberResult::Defer),
+            }
+        }
+        _ => {
+            // Decorator, MypyFile, TypeInfo, TypeAlias, TypeVarLikeExpr,
+            // PlaceholderNode: defer.
+            Some(GetProtocolMemberResult::Defer)
+        }
+    }
+}
+
+/// The `live_strict_optional` read from `mypy.state` (checkmember.py uses
+/// `state.state.strict_optional`); defaults to `true` (the production
+/// default) on any read failure. Conservative: a wrong strict_optional
+/// could change an expand decision.
+fn live_strict_optional(py: Python<'_>) -> bool {
+    py.import("mypy.state")
+        .and_then(|m| m.getattr("state"))
+        .and_then(|s| s.getattr("strict_optional"))
+        .and_then(|v| v.extract::<bool>())
+        .unwrap_or(true)
+}
+
+/// The Var gate of the protocol-member var path: `true` iff the live Var
+/// can be answered by plain expand_type_by_instance.
+///
+/// Mirrors find_node_type's Var tail (subtypes.py:2117-2124) +
+/// analyze_var's non-callable decision (checkmember.py:1377-1422) + the
+/// descriptor / plugin hooks that Rust cannot run (defer on those instead
+/// of guessing). All must hold else the whole member lookup defers.
+#[allow(clippy::too_many_arguments)]
+fn live_var_plain(
+    py: Python<'_>,
+    var: &PyAny,
+    sym_info: &PyAny,
+    type_ref: &str,
+    resolver: &NativeTypeResolver,
+) -> bool {
+    // var type ready + not a property / classmethod / staticmethod /
+    // classvar / setter (analyze_var / bind rules). `get_bool_flag`
+    // returns None when the attribute is missing; only proceed when every
+    // decision is readable (a missing flag defers).
+    let is_ready = match get_bool_flag(py, var, "is_ready") {
+        Some(b) => b,
+        None => return false,
+    };
+    if !is_ready {
+        return false;
+    }
+    let is_property = get_bool_flag(py, var, "is_property");
+    let is_classmethod = get_bool_flag(py, var, "is_classmethod");
+    let is_staticmethod = get_bool_flag(py, var, "is_staticmethod");
+    let is_classvar = get_bool_flag(py, var, "is_classvar");
+    let is_settable_property = get_bool_flag(py, var, "is_settable_property");
+    let is_property = match is_property {
+        Some(b) => b,
+        None => return false,
+    };
+    let is_classmethod = match is_classmethod {
+        Some(b) => b,
+        None => return false,
+    };
+    let is_staticmethod = match is_staticmethod {
+        Some(b) => b,
+        None => return false,
+    };
+    let is_classvar = match is_classvar {
+        Some(b) => b,
+        None => return false,
+    };
+    let is_settable_property = match is_settable_property {
+        Some(b) => b,
+        None => return false,
+    };
+    if is_property || is_classmethod || is_staticmethod || is_classvar || is_settable_property {
+        return false;
+    }
+    // is_instance_var (checkmember.py:1346-1355): name in var.info.names,
+    // that node is the var, not classvar, not inferred.
+    let is_inferred = match get_bool_flag(py, var, "is_inferred") {
+        Some(b) => b,
+        None => return false,
+    };
+    if !is_inferred {
+        return false;
+    }
+    // var.info.self_type must be None (expand_self_type would need the Var).
+    let info = match var.getattr("info").ok() {
+        Some(i) => i,
+        None => return false,
+    };
+    let self_type = match info.getattr("self_type") {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if !self_type.is_none() {
+        return false;
+    }
+    // Attribute hook absence: a hook would need the AttributeContext +
+    // live checker in Python.
+    if !plugin_get_attribute_hook_absent(py) {
+        return false;
+    }
+    if live_plugin_registry_absent(py) {
+        // user plugins present -> the Python chain is the source of truth.
+        return false;
+    }
+    // Descriptor gate (checkmember.py:1451-1452): descriptor access runs
+    // when result is non-None and not (implicit or protocol-instance-var).
+    // Read the `implicit` flag of the defining symbol.
+    let name = match var.getattr("name").and_then(|n| n.extract::<String>()) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let implicit = match sym_info
+        .getattr("names")
+        .and_then(|names| names.get_item(&name))
+        .and_then(|sym| sym.getattr("implicit"))
+        .and_then(|v| v.extract::<bool>())
+    {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    // `var.info.is_protocol and is_instance_var(var)` skips the descriptor
+    // gate. The defining class is `sym_info`; its is_protocol flag decides.
+    let proto_skip = match get_bool_flag(py, sym_info, "is_protocol") {
+        Some(b) => {
+            if b {
+                // is_instance_var(var) already guaranteed `not is_inferred`.
+                !is_inferred
+            } else {
+                false
+            }
+        }
+        None => return false,
+    };
+    if !implicit && !proto_skip {
+        // The var type is expanded below; detect descriptor-ness on the
+        // *pre-expansion* var.type via has_readable_member_by_ref, deferring
+        // whenever the snapshot cannot decide.
+        let t = match var.getattr("type") {
+            Ok(vt) => match serialize_type_to_bytes(py, vt) {
+                Some(b) => match decode_type(&b) {
+                    Some(t) => t,
+                    None => return false,
+                },
+                None => return false,
+            },
+            Err(_) => return false,
+        };
+        if is_descriptor_wire(&t, resolver.resolver()) == Some(true) {
+            return false;
+        }
+    }
+    let _ = type_ref;
+    true
 }
 
 /// `TypeInfo.is_metaclass(precise=True)` (nodes.py:4128-4133): true iff
@@ -686,10 +1117,13 @@ fn is_metaclass_precise(
     snap.fullname == "builtins.type" || snap.fullname == "abc.ABCMeta"
 }
 
-/// Distinguish "Rust decided None" from "Rust defers".
+/// Distinguish "Rust decided None" from "Rust defers" from "Rust found".
+#[derive(Debug, PartialEq)]
 enum GetProtocolMemberResult {
     /// The member is None (e.g. __call__ on a precise metaclass).
-    None,
+    NoneVal,
+    /// A member type was found and fully computed in Rust.
+    Found(Type),
     /// Rust defers to Python.
     Defer,
 }
@@ -703,6 +1137,7 @@ enum GetProtocolMemberResult {
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn rust_get_protocol_member(
+    py: Python<'_>,
     left_bytes: &[u8],
     original_left_bytes: &[u8],
     member: &str,
@@ -712,9 +1147,9 @@ pub(crate) fn rust_get_protocol_member(
 ) -> Option<Vec<u8>> {
     let _original = decode_type(original_left_bytes)?;
     let left = decode_type(left_bytes)?;
-    let _ = is_lvalue;
-    match get_protocol_member_inner(&left, member, class_obj, resolver.resolver()) {
-        GetProtocolMemberResult::None => Some(Vec::new()),
+    match get_protocol_member_inner(py, &left, member, class_obj, is_lvalue, resolver)? {
+        GetProtocolMemberResult::NoneVal => Some(Vec::new()),
+        GetProtocolMemberResult::Found(t) => encode_type(&t),
         GetProtocolMemberResult::Defer => None,
     }
 }
@@ -735,6 +1170,13 @@ mod tests {
             last_known_value: None,
             extra_attrs: None,
         }
+    }
+
+    /// Wrap a bare `TypeResolver` in the native wrapper for seam calls
+    /// (tests only; no live map is installed, so only the snapshot-decided
+    /// paths engage).
+    fn make_native(r: TypeResolver) -> NativeTypeResolver {
+        NativeTypeResolver::from_resolver(r)
     }
 
     fn make_resolver_with_definer(
@@ -1238,48 +1680,117 @@ mod tests {
 
     // -- get_protocol_member --
 
+    // The inner decides `__call__` on a precise metaclass (None) and
+    // `__call__` on a class object (defer) before touching live state, so
+    // those two paths are testable without a live map.
+
     #[test]
     fn test_get_protocol_member_call_on_metaclass_precise() {
-        let r = make_resolver_with_metaclass("builtins.type", "builtins.type");
-        let left = make_instance("builtins.type", vec![]);
-        let res = get_protocol_member_inner(&left, "__call__", false, &r);
-        assert!(matches!(res, GetProtocolMemberResult::None));
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass(
+                "builtins.type",
+                "builtins.type",
+            ));
+            let left = make_instance("builtins.type", vec![]);
+            let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
+            assert!(matches!(res, Some(GetProtocolMemberResult::NoneVal)));
+        });
     }
 
     #[test]
     fn test_get_protocol_member_call_on_non_metaclass_defers() {
-        let r = make_resolver_with_metaclass("mymod.Foo", "builtins.type");
-        let left = make_instance("mymod.Foo", vec![]);
-        let res = get_protocol_member_inner(&left, "__call__", false, &r);
-        assert!(matches!(res, GetProtocolMemberResult::Defer));
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
+            let left = make_instance("mymod.Foo", vec![]);
+            let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
+            assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
     }
 
     #[test]
-    fn test_get_protocol_member_non_call_defers() {
-        let r = make_resolver_with_metaclass("mymod.Foo", "builtins.type");
-        let left = make_instance("mymod.Foo", vec![]);
-        let res = get_protocol_member_inner(&left, "foo", false, &r);
-        assert!(matches!(res, GetProtocolMemberResult::Defer));
+    fn test_get_protocol_member_class_obj_call_defers() {
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
+            let left = make_instance("mymod.Foo", vec![]);
+            let res = get_protocol_member_inner(py, &left, "__call__", true, false, &r);
+            assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
     }
 
     #[test]
     fn test_get_protocol_member_missing_snapshot_defers() {
-        let r = TypeResolver::new();
-        let left = make_instance("mymod.NotFound", vec![]);
-        let res = get_protocol_member_inner(&left, "__call__", false, &r);
-        assert!(matches!(res, GetProtocolMemberResult::Defer));
+        Python::with_gil(|py| {
+            let r = make_native(TypeResolver::new());
+            let left = make_instance("mymod.NotFound", vec![]);
+            let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
+            assert!(matches!(res, None));
+        });
     }
 
     #[test]
     fn test_get_protocol_member_non_instance_defers() {
+        Python::with_gil(|py| {
+            let r = make_native(TypeResolver::new());
+            let left = Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            };
+            let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
+            assert!(matches!(res, None));
+        });
+    }
+
+    #[test]
+    fn test_get_protocol_member_init_defers() {
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
+            let left = make_instance("mymod.Foo", vec![]);
+            // __init__ access filters to final/super; Rust defers so Python
+            // decides CANNOT_ACCESS_INIT.
+            let res = get_protocol_member_inner(py, &left, "__init__", false, false, &r);
+            assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
+    }
+
+    #[test]
+    fn test_get_protocol_member_is_lvalue_defers() {
+        Python::with_gil(|py| {
+            let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
+            let left = make_instance("mymod.Foo", vec![]);
+            // lvalue needs setter / assignment paths -> defer.
+            let res = get_protocol_member_inner(py, &left, "foo", false, true, &r);
+            assert!(matches!(res, Some(GetProtocolMemberResult::Defer)));
+        });
+    }
+
+    #[test]
+    fn test_is_descriptor_wire_missing_snapshot_defers() {
         let r = TypeResolver::new();
-        let left = Type::AnyType {
+        let inst = make_instance("mymod.NoSnapshot", vec![]);
+        // has_readable_member_by_ref defers on a missing snapshot.
+        assert!(is_descriptor_wire(&inst, &r).is_none());
+    }
+
+    #[test]
+    fn test_is_descriptor_wire_union_any() {
+        let r = TypeResolver::new();
+        let any = Type::AnyType {
             type_of_any: 0,
             source_any: None,
             missing_import_name: None,
         };
-        let res = get_protocol_member_inner(&left, "__call__", false, &r);
-        assert!(matches!(res, GetProtocolMemberResult::Defer));
+        let union = Type::UnionType {
+            items: vec![any.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        // Non-Instance, non-Union item -> Some(false).
+        assert_eq!(is_descriptor_wire(&any, &r), Some(false));
+        // Union whose items are all non-descriptors -> Some(false).
+        assert_eq!(is_descriptor_wire(&union, &r), Some(false));
     }
 
     // -- join_type_list --

@@ -240,6 +240,33 @@ def _deserialize_type(data: bytes) -> Type | None:
     return fixed
 
 
+def _restore_protocol_member_definition(
+    left: Instance, member: str, decoded: Type
+) -> Type:
+    """Restore ``definition`` links lost in the wire round-trip.
+
+    The Rust seam returns a bound (self-stripped, ``is_bound``) FunctionLike
+    matching ``bind_self`` in ``find_node_type``, but the wire format drops
+    ``CallableType.definition``. Error rendering (``pretty_callable`` /
+    ``get_first_arg``) needs the live ``FuncDef`` to re-add the ``self``
+    parameter name, so copy definitions from the live symbol's ``node.type``
+    (``_restore_definition`` mirrors the same idea).
+    """
+    from mypy.checkmember import _restore_definition
+    from mypy.types import CallableType, FunctionLike, Overloaded
+
+    if not isinstance(decoded, FunctionLike):  # type: ignore[misc]
+        return decoded
+    sym = left.type.get(member)
+    node = sym.node if sym else None
+    if node is None:
+        return decoded
+    node_type = getattr(node, "type", None)
+    if not isinstance(node_type, (CallableType, Overloaded)):
+        return decoded
+    return _restore_definition(node_type, decoded)  # type: ignore[return-value]
+
+
 # Batch accumulator for the native `_is_subtype` path (measurement: ~171K
 # calls, ~85K identical-pair repeats). Pairs are buffered as
 # (left_bytes, right_bytes, ctx_key) and flushed in one
@@ -1847,7 +1874,7 @@ def get_protocol_member(
                     return None
                 decoded = _deserialize_type(bytes(result))
                 if decoded is not None:
-                    return decoded
+                    return _restore_protocol_member_definition(left, member, decoded)
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
     if member == "__call__" and class_obj:

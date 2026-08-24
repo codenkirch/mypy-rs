@@ -574,7 +574,11 @@ fn meta_has_operator_inner(item: &Type, op_method: &str, resolver: &TypeResolver
 /// first class whose own `names` dict contains the name (existence-only;
 /// implicit or explicit). Defer (None) when any class in the mro is missing
 /// from the resolver — we cannot distinguish "absent" from "unknown".
-fn has_readable_member_by_ref(resolver: &TypeResolver, type_ref: &str, name: &str) -> Option<bool> {
+pub(crate) fn has_readable_member_by_ref(
+    resolver: &TypeResolver,
+    type_ref: &str,
+    name: &str,
+) -> Option<bool> {
     let snap = resolver.get(type_ref)?;
     for base in &snap.mro {
         let b = resolver.get(base)?;
@@ -722,7 +726,7 @@ pub(crate) fn rust_analyze_instance_member_access(
 /// (checkmember.py:717-731): receiver-validated bind + map + expand in one
 /// wire call. Defers (None) when any step needs Python's object semantics.
 #[allow(clippy::too_many_arguments)]
-fn member_method_inner(
+pub(crate) fn member_method_inner(
     instance: &Type,
     signature: &Type,
     method_fullname: &str,
