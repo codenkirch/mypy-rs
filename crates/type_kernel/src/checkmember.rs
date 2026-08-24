@@ -638,11 +638,12 @@ pub(crate) fn rust_defined_in_superclass(
 /// so methods generic over their own type vars fall through to Python.
 ///
 /// The caller gates on `method.is_static` or `method.is_trivial_self`. The
-/// trivial-self path only answers an *exact-class* receiver (the receiver's
-/// `type_ref` equals `method_fullname`); subclass receivers defer to Python
-/// because the class-var substitution on the mapped supertype is not yet
-/// parity-proven. A static signature is never bound; a trivial-self
-/// signature is bound via `bind_self_fast` (checkmember.py:704-705), which
+/// trivial-self path maps subclass receivers too: `map_instance_to_supertype`
+/// already returns None for a non-base receiver (the identical deferral the
+/// old exact-class guard produced), and the class-var substitution on the
+/// mapped supertype is handled natively. A static signature is never bound;
+/// a trivial-self signature is bound via `bind_self_fast`
+/// (checkmember.py:704-705), which
 /// only drops the first argument and sets `is_bound` — no
 /// `__self__`/`__cls__` identity is involved, so Rust can mirror it after
 /// expansion instead of before. Expanding first on the unbound callable
@@ -679,12 +680,9 @@ pub(crate) fn rust_analyze_instance_member_access(
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return None,
     };
-    // Trivial-self only answers an exact-class receiver: a subclass receiver
-    // needs a class-var substitution not yet parity-proven (generic NamedTuple
-    // subclass historically gave `Any`), so it defers.
-    if is_trivial_self && left_ref != method_fullname {
-        return None;
-    }
+    // `map_instance_to_supertype` walks map_derivation_path and returns
+    // None for a non-base receiver, deferring to Python exactly as the
+    // old exact-class guard did; subclass receivers now map natively.
     if !matches!(signature, Type::CallableType { .. }) {
         return None; // Overloaded defers to Python
     }
