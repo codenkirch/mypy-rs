@@ -732,8 +732,22 @@ fn member_method_inner(
     strict_optional: bool,
     is_class: bool,
 ) -> Option<Type> {
+    // Class methods: bind_self's non-generic strip path is
+    // is_classmethod-agnostic, so the same strip is valid here; the
+    // generic path needs the TypeType-wrap, so defer.
     if is_class {
-        return None; // classmethod branch needs TypeType wrapping.
+        let has_vars = matches!(
+            signature,
+            Type::CallableType { variables, .. } if !variables.is_empty()
+        ) || matches!(
+            signature,
+            Type::Overloaded { items } if items.iter().any(
+                |it| matches!(it, Type::CallableType { variables, .. } if !variables.is_empty())
+            )
+        );
+        if has_vars {
+            return None;
+        }
     }
     let (left_ref, left_args) = match instance {
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
@@ -749,13 +763,13 @@ fn member_method_inner(
     if self_ref != method_fullname {
         return None;
     }
-    // checkmember.py:727 `check_self_arg(signature, mx.self_type, ...)`:
+    // checkmember.py:769 `check_self_arg(signature, mx.self_type, ...)`:
     // Rust mirrors the overload-item self filter; a zero-match defers so
     // Python emits `incompatible_self_argument` on the unfiltered signature.
     let filtered = check_self_arg_inner(
         signature,
         self_type,
-        false, // is_classmethod (is_class already deferred above)
+        is_class,
         name,
         strict_optional,
         resolver,

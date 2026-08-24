@@ -1760,6 +1760,14 @@ fn visit_instance_nominal(
 
     let right_snap = right_snap?;
 
+    // Same-ref fast path: identical args are always True regardless of
+    // variance or tvar kinds; proper-mode and protocol-right need the
+    // full walk (protocol/cache semantics), so only non-proper fires.
+    if !ctx.proper_subtype && !right_is_protocol && left_ref == right_ref && left_args == right_args
+    {
+        return Some(true);
+    }
+
     // Variadic right (subtypes.py:644-670): Python takes a special path
     // using split_with_prefix_and_suffix to splice the TypeVarTuple
     // middle into left/right args. Not ported; defer to Python.
@@ -3167,11 +3175,12 @@ mod tests {
     fn variance_not_ready_returns_none() {
         // When a tvar has VARIANCE_NOT_READY, Python calls
         // infer_class_variances (mutates live defn); we return None.
+        // Different args keep the same-ref fast path out of the way.
         let mut gen = snap("a.Gen", "Gen");
         gen.type_vars_with_variance = vec![("T".to_string(), VARIANCE_NOT_READY, 0)];
         let r = make_resolver(vec![gen]);
         let left = instance("a.Gen", vec![any_type()]);
-        let right = instance("a.Gen", vec![any_type()]);
+        let right = instance("a.Gen", vec![instance("a.A", vec![])]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 

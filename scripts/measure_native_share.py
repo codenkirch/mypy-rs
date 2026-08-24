@@ -13,6 +13,11 @@ runs the cold self-check. Both import styles (`import type_kernel as
 _tk` and `from type_kernel import rust_x`) bind attributes at import
 time, so the proxy is seen by both.
 
+`rust_is_subtype_batch` returns a per-pair decision list (1/0 answered,
+-1 deferred); its slots are unwrapped so each decision counts as native
+or fallback, matching how the direct seams are counted per call. This
+keeps the metric per-unit-of-work rather than per-seam-call.
+
 Usage:
     uv run python scripts/measure_native_share.py [--only-native]
 
@@ -38,6 +43,10 @@ CLASSIFIER_NEGATIVE_SEAMS: tuple[str, ...] = (
     "rust_find_duplicate",
 )
 
+# Batch seam returning a per-pair list: 1/0 = native, -1 = deferral.
+# Count per-decision, not per-call, so deferred slots stay visible.
+_BATCH_SLOT_SEAMS: frozenset[str] = frozenset({"rust_is_subtype_batch"})
+
 
 class CountingProxy:
     """Wrap one rust_* function, counting calls and None (deferral) results."""
@@ -54,7 +63,19 @@ class CountingProxy:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         self.calls += 1
         result = self.wrapped(*args, **kwargs)
-        if result is None and self.name not in CLASSIFIER_NEGATIVE_SEAMS:
+        if self.name in _BATCH_SLOT_SEAMS:
+            # Per-decision: each answered slot is native work, each -1 is
+            # a deferral. The seam itself always returns a list (never
+            # None), so without unwrapping every batch would count native.
+            if isinstance(result, list):
+                for slot in result:
+                    if slot == -1:
+                        self.fallback += 1
+                    else:
+                        self.native += 1
+            else:
+                self.native += 1
+        elif result is None and self.name not in CLASSIFIER_NEGATIVE_SEAMS:
             self.fallback += 1
         else:
             self.native += 1
