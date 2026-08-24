@@ -444,6 +444,18 @@ including:
   deferral. Exercised by the gate-on/off parity differential of the
   checkexpr suites in `mypy/test/testtypes.py` plus 40 pure unit tests
   in `checkcall.rs`.
+- `rust_analyze_descriptor_access` — extends the checkmember
+  `analyze_descriptor_access` transform head (checkmember.py:1120-1162).
+  Rust short-circuits three pure-type branches on the wire Type: a
+  `UnionType` mapped item-wise and joined via make_simplified_union, and
+  a non-lvalue `TupleType`/`Instance` whose class/partial-fallback has
+  no readable `__get__` (the descriptor passes through unchanged). A
+  `__get__`-bearing Instance defers (`None`) so the heavy
+  `__get__`-analysis path (checker state, transform_callee_type,
+  check_call) stays in Python. The shim gate now covers `UnionType` and
+  non-`Instance` descriptor types, passing `mx.is_lvalue`. Exercised by
+  the native checkmember suites in `mypy/test/testtypes.py` plus Rust
+  unit tests (`test_descriptor_access_*` in `checkmember.rs`).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
