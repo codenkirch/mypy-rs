@@ -423,6 +423,27 @@ including:
   `NativeFunctionTypeSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential on `str()`/line/column/definition plus direct seam
   calls proving engagement, including a lambda-with-`ret_type` case).
+- `rust_join_type_list` (issue #824) — Rust drives
+  `mypy/join.join_type_list` (join.py:1491-1511): the empty/single-item
+  base cases, the `is_subtype`-dominated fold (keeps the dominant item),
+  and the LKV-erasure decision. Defers (`None`) to the pure-Python fold
+  on union/typevar items (join reassociation would change the result),
+  missing snapshot entries, and class-mismatched pairs. Gated by
+  `_native_join_active` and exercised by the gate-on/off parity
+  differential of the full join suites in `mypy/test/testtypes.py`
+  (`NativeJoinTypesSuite` and friends), plus Rust unit tests
+  (`test_join_type_list_*` in `checker_helpers.rs`).
+- `rust_solve_generic_call` (issue #826) — ported the generic-call solve
+  entry (`solve_constraints` + `infer_constraints_full_inner` +
+  `apply_generic_arguments`) behind the `_native_checkexpr_active` gate
+  in `mypy/checkexpr.py`. Rust solves from wire `Type` bytes and returns
+  the fully-resolved `CallableType`; defers (`None`) on ArgTypeExpander
+  star-expansion, Multi-Lower constraint joins, and ParamSpec forms. The
+  Python shim feeds `strict_optional` + `infer_unions` from
+  `state`/`type_state` and falls back to the pure-Python body on any
+  deferral. Exercised by the gate-on/off parity differential of the
+  checkexpr suites in `mypy/test/testtypes.py` plus 40 pure unit tests
+  in `checkcall.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
