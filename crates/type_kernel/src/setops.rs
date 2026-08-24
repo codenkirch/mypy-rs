@@ -3342,7 +3342,6 @@ fn is_typeddict_fallback_anonymous(type_ref: &str) -> bool {
 /// Pure comparison: no mutation, no plugin visibility, no messages.
 /// Ported as a standalone helper for testability and potential reuse
 /// by callers that need to compare join candidates.
-#[allow(dead_code)]
 fn is_better_join(t: &Type, s: &Type, resolver: &TypeResolver) -> bool {
     if let Type::Instance {
         type_ref: t_ref, ..
@@ -3372,6 +3371,21 @@ fn is_better_join(t: &Type, s: &Type, resolver: &TypeResolver) -> bool {
         }
     }
     false
+}
+
+/// `#[pyfunction]` entry for `is_better` (join.py:1177-1193).
+/// Serializes both types, runs the comparison, returns `Some(bool)` or
+/// `None` when a type can't be decoded (Python falls back to the pure
+/// implementation).
+#[pyfunction]
+pub(crate) fn rust_is_better(
+    t_bytes: &[u8],
+    s_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let t = decode_type(t_bytes)?;
+    let s = decode_type(s_bytes)?;
+    Some(is_better_join(&t, &s, resolver.resolver()))
 }
 
 /// `TypeInfo.is_enum` (nodes.py:3753) read for a LiteralType's fallback
