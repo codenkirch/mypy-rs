@@ -456,6 +456,17 @@ including:
   non-`Instance` descriptor types, passing `mx.is_lvalue`. Exercised by
   the native checkmember suites in `mypy/test/testtypes.py` plus Rust
   unit tests (`test_descriptor_access_*` in `checkmember.rs`).
+- `rust_analyze_instance_member_access` method path (checkmember.py:415-453)
+  — ported for static and trivial-self methods (issue #631). The trivial-self
+  path now maps *subclass* receivers natively too: `map_instance_to_supertype`
+  already returns None for a non-base receiver (the identical deferral the
+  old exact-class guard produced), so the exact-class guard that deferred
+  subclass receivers was removed; `bind_self_fast` is receiver-independent.
+  Measured: IAMA 85% → 95% native, global share 97.3% → 97.4%. Overloaded
+  signatures, missing resolver snapshots / unresolvable derivation paths,
+  empty-args or TVT-class mapped instances, ParamSpec/Unpack signatures, and
+  un-frozen TypeVar-carrying results still defer to Python. Exercised by the
+  native checkmember suites and Rust unit tests in `checkmember.rs`.
 - `expand_type_inner` Callable arm `is_bound` (issue #833) — removed the
   `is_bound` defer in the wire Callable expansion: Python's
   `visit_callable_type` never branches on the flag (it survives
