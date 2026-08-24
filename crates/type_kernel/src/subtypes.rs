@@ -28,6 +28,11 @@ pub(crate) const COVARIANT: i64 = 1;
 pub(crate) const CONTRAVARIANT: i64 = 2;
 pub(crate) const VARIANCE_NOT_READY: i64 = 3;
 
+/// `ArgKind.ARG_STAR` (nodes.py:2563) — the `*args` formal kind. Used
+/// by the expand_type_by_instance CallableType arm to detect a var-arg
+/// typed `UnpackType` (deferred interpolation).
+const ARG_STAR: i64 = 2;
+
 /// `TypeOfAny.special_form` (types.py) — used when synthesizing an
 /// `AnyType` for a tuple-like right without an explicit iter type.
 const ANY_SPECIAL_FORM: i64 = 6;
@@ -1499,8 +1504,7 @@ fn td_item(
 /// Class type vars have `raw_id = i+1` and `namespace = class.fullname`,
 /// so we match `(namespace == left_ref, raw_id == i+1)` and substitute
 /// `left_args[i]`. Returns `None` for Type variants the subset walker
-/// does not handle (CallableType, ParamSpec, UnpackType, etc. inside
-/// the tree); the caller falls through to Python for those.
+/// does not handle; the caller falls through to Python for those.
 fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Option<Type> {
     match typ {
         Type::Instance {
@@ -1567,6 +1571,145 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
         Type::NoneType | Type::UninhabitedType { .. } => Some(typ.clone()),
         Type::AnyType { .. } | Type::DeletedType { .. } | Type::LiteralType { .. } => {
             Some(typ.clone())
+        }
+        Type::CallableType {
+            fallback,
+            instance_type,
+            is_ellipsis_args,
+            implicit,
+            is_bound,
+            from_concatenate,
+            imprecise_arg_kinds,
+            unpack_kwargs,
+            from_type_type,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type,
+            name,
+            variables,
+            type_guard,
+            type_is,
+        } => {
+            // visit_callable_type (expandtype.py:870-918). Defer when a
+            // declared ParamSpec means Python's param_spec() takes the
+            // *args: P.args + **kwargs: P.kwargs branch (Parameters join).
+            for v in variables {
+                if matches!(v, Type::ParamSpecType { .. }) {
+                    return None;
+                }
+            }
+            // Defer a var-arg typed UnpackType: interpolation
+            // (expandtype.py:482-491) needs tuple splicing we do not port.
+            for (flag, at) in arg_kinds.iter().zip(arg_types.iter()) {
+                if *flag == ARG_STAR && matches!(at, Type::UnpackType { .. }) {
+                    return None;
+                }
+            }
+            let mut new_arg_types = Vec::with_capacity(arg_types.len());
+            for at in arg_types {
+                new_arg_types.push(expand_type_by_instance(at, left_ref, left_args)?);
+            }
+            let new_ret = expand_type_by_instance(ret_type, left_ref, left_args)?;
+            let new_guard = match type_guard {
+                Some(tg) => Some(Box::new(expand_type_by_instance(tg, left_ref, left_args)?)),
+                None => None,
+            };
+            let new_type_is = match type_is {
+                Some(ti) => Some(Box::new(expand_type_by_instance(ti, left_ref, left_args)?)),
+                None => None,
+            };
+            let new_instance_type = match instance_type {
+                Some(it) => Some(Box::new(expand_type_by_instance(it, left_ref, left_args)?)),
+                None => None,
+            };
+            // Python expands arg_types, ret_type, type_guard, type_is and
+            // instance_type only (expandtype.py:911-917); the fallback
+            // and declared variables are definitions, not uses.
+            Some(Type::CallableType {
+                fallback: fallback.clone(),
+                instance_type: new_instance_type,
+                is_ellipsis_args: *is_ellipsis_args,
+                implicit: *implicit,
+                is_bound: *is_bound,
+                from_concatenate: *from_concatenate,
+                imprecise_arg_kinds: *imprecise_arg_kinds,
+                unpack_kwargs: *unpack_kwargs,
+                from_type_type: *from_type_type,
+                arg_types: new_arg_types,
+                arg_kinds: arg_kinds.clone(),
+                arg_names: arg_names.clone(),
+                ret_type: Box::new(new_ret),
+                name: name.clone(),
+                variables: variables.clone(),
+                type_guard: new_guard,
+                type_is: new_type_is,
+            })
+        }
+        Type::Overloaded { items } => {
+            // visit_overloaded (expandtype.py:811-818): each item is a
+            // CallableType, expanded item-wise.
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                new_items.push(expand_type_by_instance(item, left_ref, left_args)?);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            implicit,
+        } => {
+            // visit_tuple_type (expandtype.py:720-740). Defer the single-item
+            // Tuple[*tuple[X, ...]] normalization and the named-tuple
+            // fallback branches; the common case only expands item+fallback.
+            if items.len() == 1 {
+                if let Type::UnpackType { .. } = &items[0] {
+                    return None;
+                }
+            }
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                new_items.push(expand_type_by_instance(item, left_ref, left_args)?);
+            }
+            let new_fallback = expand_type_by_instance(partial_fallback, left_ref, left_args)?;
+            if let Type::Instance { ref type_ref, .. } = new_fallback {
+                if type_ref == "builtins.tuple" && new_items.len() == 1 {
+                    if let Type::UnpackType { .. } = &new_items[0] {
+                        // Single Tuple[*tuple[X, ...]] with a builtins.tuple
+                        // fallback normalizes to the inner Instance; defer.
+                        return None;
+                    }
+                }
+                Some(Type::TupleType {
+                    partial_fallback: Box::new(new_fallback),
+                    items: new_items,
+                    implicit: *implicit,
+                })
+            } else {
+                None
+            }
+        }
+        Type::TypeType { item, is_type_form } => {
+            // visit_type_type (expandtype.py:736-740): expand the item then
+            // TypeType.make_normalized. Type[Union[...]] distribution needs
+            // the make_normalized port; defer a union item.
+            let new_item = expand_type_by_instance(item, left_ref, left_args)?;
+            if matches!(new_item, Type::UnionType { .. }) {
+                return None;
+            }
+            Some(Type::TypeType {
+                item: Box::new(new_item),
+                is_type_form: *is_type_form,
+            })
+        }
+        Type::UnpackType { typ } => {
+            // visit_unpack_type (expandtype.py:370-380): expand the inner
+            // type and rewrap (the variadic splice happens in the caller).
+            let new_typ = expand_type_by_instance(typ, left_ref, left_args)?;
+            Some(Type::UnpackType {
+                typ: Box::new(new_typ),
+            })
         }
         // Unsupported variants in the tree: fall through to Python.
         _ => None,
@@ -2754,6 +2897,7 @@ pub(crate) fn rust_subtype_tvar_tuple_right(
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
+    use crate::wire::Parameters;
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
         let mut r = TypeResolver::new();
@@ -3064,15 +3208,309 @@ mod tests {
     }
 
     #[test]
-    fn expand_type_by_instance_returns_none_for_unsupported() {
-        // TupleType inside the tree is not handled by the subset walker.
+    fn expand_type_by_instance_expands_tuple_items_and_fallback() {
+        // TupleType is handled by the subset walker: items and the
+        // builtins.tuple fallback are expanded recursively.
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+            meta_level: 0,
+        };
         let t = Type::TupleType {
-            partial_fallback: Box::new(instance("builtins.tuple", vec![])),
-            items: vec![any_type()],
+            partial_fallback: Box::new(instance("builtins.tuple", vec![tvar.clone()])),
+            items: vec![tvar],
             implicit: false,
         };
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[any_type()]);
-        assert_eq!(expanded, None);
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expected = Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple", vec![left_arg.clone()])),
+            items: vec![left_arg],
+            implicit: false,
+        };
+        assert_eq!(expanded, Some(expected));
+    }
+
+    #[test]
+    fn expand_type_by_instance_defers_single_unpack_tuple() {
+        // Tuple[*tuple[X, ...]] with a builtins.tuple fallback normalizes
+        // to the inner Instance in Python (expandtype.py:973-989); the
+        // normalization is not ported, so defer.
+        let unpack = Type::UnpackType {
+            typ: Box::new(instance("builtins.tuple", vec![any_type()])),
+        };
+        let t = tuple_type(vec![unpack]);
+        assert_eq!(expand_type_by_instance(&t, "a.Sub", &[any_type()]), None);
+    }
+
+    #[test]
+    fn expand_type_by_instance_expands_callable_args_and_ret() {
+        // Callable[[Instance[T]], Instance[T]] with left = a.Sub[A]:
+        // arg_types and ret_type get the TypeVar substituted.
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+            meta_level: 0,
+        };
+        let t = callable_type(
+            vec![instance("a.Gen", vec![tvar.clone()])],
+            instance("a.Gen", vec![tvar]),
+            None,
+        );
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expected = callable_type(
+            vec![instance("a.Gen", vec![left_arg.clone()])],
+            instance("a.Gen", vec![left_arg]),
+            None,
+        );
+        assert_eq!(expanded, Some(expected));
+    }
+
+    #[test]
+    fn expand_type_by_instance_defers_paramspec_arg() {
+        // A Callable declaring a ParamSpec takes the *args: P.args +
+        // **kwargs: P.kwargs branch in Python (expandtype.py:871-899);
+        // Parameters join/prefix merging is not ported, so defer.
+        let paramspec = Type::ParamSpecType {
+            prefix: Box::new(Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "a.Sub.P".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+        };
+        let t = callable_type(vec![], any_type(), None);
+        let with_paramspec = match t {
+            Type::CallableType {
+                variables: _,
+                fallback,
+                instance_type,
+                is_ellipsis_args,
+                implicit,
+                is_bound,
+                from_concatenate,
+                imprecise_arg_kinds,
+                unpack_kwargs,
+                from_type_type,
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                name,
+                type_guard,
+                type_is,
+            } => Type::CallableType {
+                variables: vec![paramspec],
+                fallback,
+                instance_type,
+                is_ellipsis_args,
+                implicit,
+                is_bound,
+                from_concatenate,
+                imprecise_arg_kinds,
+                unpack_kwargs,
+                from_type_type,
+                arg_types,
+                arg_kinds,
+                arg_names,
+                ret_type,
+                name,
+                type_guard,
+                type_is,
+            },
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            expand_type_by_instance(&with_paramspec, "a.Sub", &[any_type()]),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_type_by_instance_defers_star_unpack_arg() {
+        // A var-arg typed UnpackType needs interpolate_args_for_unpack
+        // (expandtype.py:840-868), which is not ported; defer.
+        let unpack = Type::UnpackType {
+            typ: Box::new(instance("builtins.tuple", vec![any_type()])),
+        };
+        let t = callable_type(vec![], any_type(), None);
+        let with_star = match t {
+            Type::CallableType {
+                variables: _,
+                fallback,
+                instance_type,
+                is_ellipsis_args,
+                implicit,
+                is_bound,
+                from_concatenate,
+                imprecise_arg_kinds,
+                unpack_kwargs,
+                from_type_type,
+                mut arg_types,
+                mut arg_kinds,
+                mut arg_names,
+                ret_type,
+                name,
+                type_guard,
+                type_is,
+            } => {
+                arg_types.push(unpack);
+                arg_kinds.push(ARG_STAR);
+                arg_names.push(None);
+                Type::CallableType {
+                    variables: vec![],
+                    fallback,
+                    instance_type,
+                    is_ellipsis_args,
+                    implicit,
+                    is_bound,
+                    from_concatenate,
+                    imprecise_arg_kinds,
+                    unpack_kwargs,
+                    from_type_type,
+                    arg_types,
+                    arg_kinds,
+                    arg_names,
+                    ret_type,
+                    name,
+                    type_guard,
+                    type_is,
+                }
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            expand_type_by_instance(&with_star, "a.Sub", &[any_type()]),
+            None
+        );
+    }
+
+    #[test]
+    fn expand_type_by_instance_expands_overloaded_items() {
+        // Overloaded items are CallableTypes expanded item-wise
+        // (expandtype.py:941-948).
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+            meta_level: 0,
+        };
+        let t = Type::Overloaded {
+            items: vec![
+                callable_type(vec![tvar.clone()], any_type(), None),
+                callable_type(vec![], tvar.clone(), None),
+            ],
+        };
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expected = Type::Overloaded {
+            items: vec![
+                callable_type(vec![left_arg.clone()], any_type(), None),
+                callable_type(vec![], left_arg, None),
+            ],
+        };
+        assert_eq!(expanded, Some(expected));
+    }
+
+    #[test]
+    fn expand_type_by_instance_expands_type_type_item() {
+        // TypeType[Instance[T]] with left = a.Sub[A] expands the item
+        // (expandtype.py:1036-1041).
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+            meta_level: 0,
+        };
+        let t = Type::TypeType {
+            item: Box::new(instance("a.Gen", vec![tvar])),
+            is_type_form: false,
+        };
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        assert_eq!(
+            expanded,
+            Some(Type::TypeType {
+                item: Box::new(instance("a.Gen", vec![left_arg])),
+                is_type_form: false,
+            })
+        );
+    }
+
+    #[test]
+    fn expand_type_by_instance_defers_type_type_union_item() {
+        // Type[Union[...]] distributes via TypeType.make_normalized in
+        // Python (expandtype.py:1036-1041); the union distribution is not
+        // ported, so defer.
+        let t = Type::TypeType {
+            item: Box::new(Type::UnionType {
+                items: vec![any_type(), any_type()],
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            }),
+            is_type_form: false,
+        };
+        assert_eq!(expand_type_by_instance(&t, "a.Sub", &[any_type()]), None);
+    }
+
+    #[test]
+    fn expand_type_by_instance_expands_unpack_inner() {
+        // UnpackType[Instance[T]] with left = a.Sub[A]: the inner type
+        // expands and the unpack re-wraps (expandtype.py:804-815).
+        let tvar = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "a.Sub.T".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            values: vec![],
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            default: Box::new(any_type()),
+            variance: COVARIANT,
+            meta_level: 0,
+        };
+        let t = Type::UnpackType {
+            typ: Box::new(instance("a.Gen", vec![tvar])),
+        };
+        let left_arg = instance("a.A", vec![]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        assert_eq!(
+            expanded,
+            Some(Type::UnpackType {
+                typ: Box::new(instance("a.Gen", vec![left_arg])),
+            })
+        );
     }
 
     #[test]
