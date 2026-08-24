@@ -501,12 +501,9 @@ pub(crate) fn expand_type_inner(
                     return None;
                 }
             }
-            // Bound methods (is_bound) defer: `__self`/`__cls` identity
-            // does not survive a wire round-trip, and mypy's
-            // bind_self/extract_callable_type relies on it.
-            if *is_bound {
-                return None;
-            }
+            // `is_bound` needs no special handling here: it survives
+            // copy_modified unchanged and expansion never branches on it.
+
             // The Unpack interpolation branch
             // (expandtype.py:482-488, interpolate_args_for_unpack) is
             // deferred: if a var_arg is an UnpackType, defer to Python.
