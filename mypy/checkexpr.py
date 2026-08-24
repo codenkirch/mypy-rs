@@ -2706,51 +2706,52 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 continue
                             if fi < len(callee.arg_types):
                                 arg_context[ai] = callee.arg_types[fi]
-                    # A lambda arg whose context depends on a callee type
-                    # variable needs Python's two-pass lambda inference:
-                    # args are accepted before the solve, so its body would
+                    # Any star actual (*x, *y) needs Python's ArgTypeExpander to expand
+                    # the iterable/tuple element-wise against the formal.
+                    if any(k.is_star() for k in arg_kinds):
+                        pass  # fall through to Python below
+                    else:
+                        # A lambda arg whose context depends on a callee type
+                        # variable needs Python's two-pass inference.
+                        lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
+                        callee_var_ids = {v.id for v in callee.variables}
 
-                    # otherwise be checked against the bare variable. Defer.
-                    lam_idx = [i for i, a in enumerate(args) if isinstance(a, LambdaExpr)]
-                    callee_var_ids = {v.id for v in callee.variables}
+                        def _lam_ctx_has_callee_var(i: int) -> bool:
+                            ctx = arg_context[i]
+                            if ctx is None:
+                                return False
+                            return any(tv.id in callee_var_ids for tv in get_type_vars(ctx))
 
-                    def _lam_ctx_has_callee_var(i: int) -> bool:
-                        ctx = arg_context[i]
-                        if ctx is None:
-                            return False
-                        return any(tv.id in callee_var_ids for tv in get_type_vars(ctx))
-
-                    lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
-                    if not lam_typevar_ctx:
-                        arg_types_bytes = [
-                            _serialize_type_for_checkexpr(
-                                get_proper_type(
-                                    self.accept(a, ctx) if ctx is not None else self.accept(a)
+                        lam_typevar_ctx = any(_lam_ctx_has_callee_var(i) for i in lam_idx)
+                        if not lam_typevar_ctx:
+                            arg_types_bytes = [
+                                _serialize_type_for_checkexpr(
+                                    get_proper_type(
+                                        self.accept(a, ctx) if ctx is not None else self.accept(a)
+                                    )
                                 )
+                                for a, ctx in zip(args, arg_context)
+                            ]
+                            resolved_bytes = _rust_solve_generic_call(
+                                _native_checkexpr_resolver,
+                                _serialize_type_for_checkexpr(callee),
+                                arg_types_bytes,
+                                formal_to_actual,
+                                self.chk.in_checked_function(),
+                                type_state.infer_unions,
+                                state.strict_optional,
                             )
-                            for a, ctx in zip(args, arg_context)
-                        ]
-                        resolved_bytes = _rust_solve_generic_call(
-                            _native_checkexpr_resolver,
-                            _serialize_type_for_checkexpr(callee),
-                            arg_types_bytes,
-                            formal_to_actual,
-                            self.chk.in_checked_function(),
-                            type_state.infer_unions,
-                        )
-                        if resolved_bytes is not None:
-                            resolved_callee = _deserialize_type_from_checkexpr(
-                                bytes(resolved_bytes)
-                            )
-                            # Deserialize may return None when a type_ref cannot
-                            # be resolved to a live TypeInfo; in that case defer
-                            # to Python's generic-call inference below. The
-
-                            # isinstance also narrows None out of the union.
-                            if isinstance(resolved_callee, CallableType):  # type: ignore[misc]
-                                callee = resolved_callee
-                                # Native solve succeeded; skip Python's infer pass.
-                                native_solved = True
+                            if resolved_bytes is not None:
+                                resolved_callee = _deserialize_type_from_checkexpr(
+                                    bytes(resolved_bytes)
+                                )
+                                # Deserialize may return None when a type_ref
+                                # cannot resolve to a live TypeInfo; defer.
+                                # The isinstance narrows None out of the union.
+                                if isinstance(resolved_callee, CallableType):  # type: ignore[misc]
+                                    callee = resolved_callee
+                                    # Native solve succeeded; skip Python's infer pass.
+                                    native_solved = True
                 except (AssertionError, NotImplementedError, ValueError, TypeError):
                     pass  # Defer to Python
 

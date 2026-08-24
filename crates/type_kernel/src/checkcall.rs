@@ -675,6 +675,20 @@ fn check_callable_call_tail(callee: &Type, arg_types: &[Type]) -> Option<Type> {
 /// length — if 0 the callable is fully resolved; if >0 it still carries
 /// residual (non-inferred) type vars, and the caller may do additional
 /// passes or fall through to Python.
+///
+/// The solve step uses `solve::rust_solve_constraints`, whose first tuple
+/// element is a status sentinel (0 = success), not a "number solved"
+/// count. The solver always fills every callable variable with a concrete
+/// solution (strict Never / lax Any for unconstrained vars, mirroring
+/// `solve_constraints` solve.py:322-331), so a success status does not
+/// mean "nothing was solved" — the solutions blob is authoritative.
+///
+/// `strict_optional` mirrors `state.strict_optional` at the Python call
+/// site (checkexpr.py), and `skip_unsatisfied` mirrors the
+/// `solve_constraints` / `apply_generic_arguments` defaults used by
+/// Python's inference path: both are `False`, so `pre_validate_solutions`
+/// runs and unsatisfied type-variable values still get the
+/// "cannot be ..." error instead of being silently skipped.
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn rust_solve_generic_call(
@@ -685,6 +699,7 @@ pub fn rust_solve_generic_call(
     formal_to_actual: Vec<Vec<i64>>,
     strict: bool,
     infer_unions: bool,
+    strict_optional: bool,
 ) -> Option<Vec<u8>> {
     // Decode the callee.
     let mut buf = crate::wire::ReadBuffer::new(callee_bytes);
@@ -776,14 +791,22 @@ pub fn rust_solve_generic_call(
             let actual_type = arg_types_vec.get(ai as usize)?;
             // Skip None actuals (argument was in a deferred pass).
             let actual_proper = get_proper_or_none(actual_type)?;
-            if matches!(actual_proper, Type::AnyType { .. }) {
-                continue;
+            // Python expands star actuals (TupleType against `*args`) element-wise
+            // via ArgTypeExpander; the wire has no arg-kind mapping here, so defer.
+            if matches!(actual_proper, Type::TupleType { .. }) {
+                return None;
+            }
+            // Python's visit_uninhabited_type on a template actual returns
+            // no constraints, so Never/NoReturn yields "Cannot infer"
+            // instead of a concrete solve. Mirror that by deferring.
+            if matches!(actual_proper, Type::UninhabitedType { .. }) {
+                return None;
             }
             let formal_proper = get_proper_or_none(formal_type)?;
             let constraints = crate::constraints::infer_constraints_full_inner(
                 formal_proper,
                 actual_proper,
-                crate::constraints::SUBTYPE_OF,
+                crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
                 resolver.resolver(),
             )?;
             all_constraints.extend(constraints);
@@ -792,6 +815,35 @@ pub fn rust_solve_generic_call(
 
     if all_constraints.is_empty() {
         return None; // Nothing to solve.
+    }
+
+    // Multiple lowers for one typevar make Python report "Cannot infer"
+    // when the joined solution cannot satisfy an invariant parameter.
+    // The Rust solve picks the first lower; defer for the diagnostic.
+    let tv_key = |t: &Type| -> Option<(i64, String)> {
+        match t {
+            Type::TypeVarType {
+                raw_id, namespace, ..
+            } => Some((*raw_id, namespace.clone())),
+            Type::ParamSpecType {
+                raw_id, namespace, ..
+            } => Some((*raw_id, namespace.clone())),
+            Type::TypeVarTupleType {
+                raw_id, namespace, ..
+            } => Some((*raw_id, namespace.clone())),
+            _ => None,
+        }
+    };
+    let mut lowers_by_var: std::collections::HashMap<(i64, String), usize> =
+        std::collections::HashMap::new();
+    for c in &all_constraints {
+        if c.op == crate::constraints::SUPERTYPE_OF {
+            let key = tv_key(&c.origin_type_var)?;
+            *lowers_by_var.entry(key).or_insert(0) += 1;
+        }
+    }
+    if lowers_by_var.values().any(|&n| n >= 2) {
+        return None;
     }
 
     // Step 3: Solve constraints for the callable's type vars.
@@ -820,17 +872,14 @@ pub fn rust_solve_generic_call(
         constraint_blobs,
         strict,
         infer_unions,
-        true, // strict_optional: assume strict
-        true, // skip_unsatisfied: safe for callable checking
+        strict_optional,
+        false, // skip_unsatisfied: mirror infer_function_type_arguments
         resolver,
     );
 
-    let Some((num_solved, sol_blob, _free_blob)) = solve_result else {
+    let Some((_status, sol_blob, _free_blob)) = solve_result else {
         return None; // Solver deferred.
     };
-    if num_solved == 0 {
-        return None;
-    }
 
     // Step 4: Decode solutions and apply to callable.
     let sol_bytes = sol_blob?;
@@ -851,12 +900,13 @@ pub fn rust_solve_generic_call(
 
     let mut wbuf = crate::wire::WriteBuffer::new();
     crate::wire::write_type(&mut wbuf, &normalized).ok()?;
+    let normalized_bytes = wbuf.into_bytes();
     let applied = crate::applytype::rust_apply_generic_arguments(
         resolver,
-        wbuf.into_bytes().as_slice(),
+        normalized_bytes.as_slice(),
         &orig_types_blob,
-        true, // skip_unsatisfied
-        true, // strict_optional
+        false, // skip_unsatisfied: mirror the Python inference path
+        strict_optional,
     )?;
     // The wire cannot carry `from_type_type`: serializing back would drop
     // the abstract-error suppression. Defer when the result carries a
@@ -1047,10 +1097,14 @@ fn solve_typevar_key(t: &Type) -> Option<(i64, i64, String)> {
 
 /// Serialize an optional type list in the wire format expected by
 /// `apply_generic_arguments`: count (bare int) + for each entry: a 0/1 byte
-/// (0 = None, 1 = present) followed by a Type blob if present.
+/// (0 = None, 1 = present) followed by a Type blob if present. The count
+/// uses a bare int (`write_int_bare`): `decode_optional_type_list`
+/// (applytype.rs:540) reads it with `read_int_bare`, and a tagged
+/// `write_int` would insert a LITERAL_INT tag byte the reader treats as
+/// the int's first byte.
 fn serialize_optional_types(types: &[Option<Type>]) -> Option<Vec<u8>> {
     let mut buf = crate::wire::WriteBuffer::new();
-    crate::wire::write_int(&mut buf, types.len() as i64).ok()?;
+    crate::wire::write_int_bare(&mut buf, types.len() as i64).ok()?;
     for t in types {
         match t {
             None => buf.push(0),
@@ -1727,5 +1781,150 @@ mod tests {
             *instance_type = Some(Box::new(instance()));
         }
         assert_eq!(check_callable_call_tail(&callee, &[str_instance()]), None);
+    }
+
+    // ------------------------------------------------------------------
+    // rust_solve_generic_call
+    // ------------------------------------------------------------------
+
+    fn test_resolver() -> crate::typeinfo::NativeTypeResolver {
+        let mut r = crate::typeinfo::TypeResolver::new();
+        for snap in [
+            solve_snap("builtins.int"),
+            solve_snap("builtins.str"),
+            solve_snap("builtins.object"),
+        ] {
+            r.insert(snap.fullname.clone(), snap);
+        }
+        crate::typeinfo::NativeTypeResolver::from_resolver(r)
+    }
+
+    fn solve_snap(fullname: &str) -> crate::typeinfo::TypeInfoSnapshot {
+        let mut s = crate::typeinfo::TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        s.has_base.insert(fullname.to_string());
+        if fullname != "builtins.object" && !s.has_base.contains("builtins.object") {
+            s.mro.push("builtins.object".to_string());
+            s.has_base.insert("builtins.object".to_string());
+        }
+        s
+    }
+
+    fn generic_identity() -> Type {
+        // def [T] (x: T) -> T
+        Type::CallableType {
+            fallback: Box::new(instance()),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![type_var()],
+            arg_kinds: vec![ARG_POS],
+            arg_names: vec![None],
+            ret_type: Box::new(type_var()),
+            name: None,
+            variables: vec![type_var()],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn solve_generic_bytes(
+        callee: &Type,
+        arg_types: &[Type],
+        formal_to_actual: Vec<Vec<i64>>,
+    ) -> Option<Vec<u8>> {
+        let mut cb = WriteBuffer::new();
+        write_type(&mut cb, callee).ok()?;
+        let arg_blobs: Vec<Vec<u8>> = arg_types
+            .iter()
+            .map(|t| {
+                let mut b = WriteBuffer::new();
+                write_type(&mut b, t).ok()?;
+                Some(b.into_bytes())
+            })
+            .collect::<Option<_>>()?;
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            rust_solve_generic_call(
+                py,
+                &test_resolver(),
+                &cb.into_bytes(),
+                arg_blobs,
+                formal_to_actual,
+                true,
+                false,
+                true,
+            )
+        })
+    }
+
+    fn solved_typevar(t: &Type) -> bool {
+        // The returned callable's variables are empty when the single
+        // TypeVar was solved and applied (full resolution).
+        let Type::CallableType { variables, .. } = t else {
+            return false;
+        };
+        variables.is_empty()
+    }
+
+    #[test]
+    fn solve_generic_identity_int() {
+        // identity(int) should resolve T=int and fully apply it.
+        let callee = generic_identity();
+        let arg = int_instance();
+        let out = solve_generic_bytes(&callee, &[arg], vec![vec![0]]);
+        assert!(out.is_some(), "expected successful solve, got deferral");
+        let bytes = out.unwrap();
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable"
+        );
+    }
+
+    #[test]
+    fn solve_generic_identity_str() {
+        let callee = generic_identity();
+        let arg = str_instance();
+        let out = solve_generic_bytes(&callee, &[arg], vec![vec![0]]);
+        assert!(out.is_some(), "expected successful solve, got deferral");
+    }
+
+    #[test]
+    fn solve_generic_empty_constraints_defers() {
+        // No actuals -> no constraints -> nothing to solve. Python has no
+        // basis for inference either, so the seam defers (caller runs
+        // Python's infer pass); the old num_solved==0 path.
+        let callee = generic_identity();
+        let out = solve_generic_bytes(&callee, &[], vec![]);
+        assert!(out.is_none(), "expected deferral on empty constraints");
+    }
+
+    #[test]
+    fn solve_generic_any_actuals_solves() {
+        // AnyType actuals are NOT skipped: the template yields T :> Any,
+        // so the solve succeeds and T resolves to Any. The old Any-skip
+        // left the lower bound empty and broke joins (testNativeIntJoins).
+        let callee = generic_identity();
+        let arg = any_type();
+        let out = solve_generic_bytes(&callee, &[arg], vec![vec![0]]);
+        assert!(out.is_some(), "expected solve with T :> Any, got deferral");
+        let bytes = out.unwrap();
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable with T=Any"
+        );
     }
 }
