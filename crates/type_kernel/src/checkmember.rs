@@ -686,6 +686,12 @@ pub(crate) fn rust_analyze_instance_member_access(
     if !matches!(signature, Type::CallableType { .. }) {
         return None; // Overloaded defers to Python
     }
+    // Defer `builtins.tuple` methods: a NamedTuple subclass mapped there
+    // needs the `tuple_fallback` special case (maptype.py:316-339) Rust
+    // does not implement; mirrors maptype.py:130's `!= "builtins.tuple"`.
+    if method_fullname == "builtins.tuple" {
+        return None;
+    }
     // checkmember.py:450 `typ = map_instance_to_supertype(typ, method.info)`.
     let mapped_args = crate::subtypes::map_instance_to_supertype(
         left_ref,
