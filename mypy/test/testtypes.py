@@ -4390,8 +4390,9 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
     def test_per_member_deferral_sentinel(self) -> None:
         # Per-member deferral sentinel: Rust returns a parallel flags
-        # Vec (true = mapped, false = re-run in Python). A GV[Ts] member
-        # (variadic frame) defers, so flags[0] false; G[A] maps, true.
+        # Vec (true = mapped, false = re-run in Python). The variadic
+        # G[Ts] member defers (has_type_var_tuple_type guard); G[A] maps
+        # natively. Flags are [False, True].
         import type_kernel as _tk
 
         from mypy.maptype import _WriteBuffer
@@ -5215,6 +5216,220 @@ class NativeSemanalClassPropSuite(Suite):
         _type_kernel.rust_add_type_promotion(nativ, SymbolTable(), None, builtin_names)
         assert int_info._promote, "int should gain the i64 promotion"
         assert nativ.alt_promote is not None, "i64 should get alt_promote = int"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeProtocolImplementationSuite(Suite):
+    """Engagement for the `rust_is_protocol_implementation` seam.
+
+    The `_is_subtype` protocol-right fallback (subtypes.py) drives the
+    member-compat loop natively when `right.type.is_protocol` and the
+    left is a non-protocol Instance: it matches the targets that owned
+    the `rust_is_subtype` deferral population (SupportsIndex / Sized /
+    SupportsBool / SupportsInt / Awaitable). The deferred path needs a
+    live `checker_state.type_checker`, so it cannot be exercised through
+    `is_subtype` in unit tests; instead each test calls the seam
+    directly, proving engagement and agreement with the pure-Python
+    member loop on small synthetic protocols.
+
+    The member-lookup half of the loop runs `get_protocol_member_inner`
+    (plain methods bind via `member_method_inner`; plain vars expand via
+    `expand_type_by_instance`), and the member pair recurses into the
+    native callable engine for method members. Protocols are built with
+    `make_type_info`, a `protocol_members`-visible MRO
+    (`[info, object]`), `is_protocol=True`, and `names` populated with
+    FuncDef/Var members; the live TypeInfo map is passed
+    (`set_live_typeinfo_map`) so the member lookups resolve.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+
+    def _protocol(
+        self,
+        fullname: str,
+        members: list[str],
+        func_types: dict[str, CallableType] | None = None,
+    ) -> TypeInfo:
+        """Build a protocol TypeInfo with plain-method members.
+
+        Members are `FuncDef`s typed with `func_types` (default a plain
+        method with self → the class and return A), which the
+        `get_protocol_member_inner` plain-method path binds via
+        `member_method_inner`. The MRO must be set for
+        `protocol_members` to be readable (nodes.py:4081 asserts MRO).
+        """
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        info.is_protocol = True
+        inst = Instance(info, [])
+        for name in members:
+            node = FuncDef(name, [], None, None)
+            node.info = info
+            node.type = (
+                func_types[name]
+                if func_types is not None
+                else self._method_callable(self.fx.a, inst)
+            )
+            node.line = 1
+            node.column = 1
+            info.names[name] = SymbolTableNode(MDEF, node)
+        self._live_info[fullname] = info
+        return info
+
+    def _impl(self, fullname: str, members: list[str], func_types: dict[str, CallableType] | None = None) -> TypeInfo:
+        """Build an implementing (non-protocol) Info with typed methods."""
+        from mypy.types import Instance
+
+        info = self.fx.make_type_info(fullname)
+        info.mro = [info, self.fx.oi]
+        inst = Instance(info, [])
+        for name in members:
+            node = FuncDef(name, [], None, None)
+            node.info = info
+            node.type = (
+                func_types[name]
+                if func_types is not None
+                else self._method_callable(self.fx.a, inst)
+            )
+            node.line = 1
+            node.column = 1
+            info.names[name] = SymbolTableNode(MDEF, node)
+        self._live_info[fullname] = info
+        return info
+
+    def _method_callable(self, ret: Type | None = None, self_type: Type | None = None) -> CallableType:
+        from mypy.types import CallableType
+
+        # A plain method has an explicit `self` positional param typed as
+        # the defining class (check_self_arg_inner requires a non-empty
+        # arg[0]; bind_self strips it after self-compat).
+        self_arg = self_type if self_type is not None else self.fx.a
+        return CallableType(
+            [self_arg],
+            [ARG_POS],
+            [None],
+            ret if ret is not None else self.fx.a,
+            self.fx.function,
+        )
+
+    def _build_resolver(self) -> None:
+        """Build a native resolver over fixture + synthetic infos."""
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend(list(self._live_info.values()))
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_info))
+        set_wire_typeinfo_map(dict(self._live_info))
+
+    def _serialize(self, typ: Type) -> bytes:
+        from mypy.subtypes import _serialize_type
+
+        return _serialize_type(typ)
+
+    def _seam_call(
+        self, left: Type, right: Type, *, proper: bool = False
+    ) -> bool | None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(True)
+        try:
+            result = _type_kernel.rust_is_protocol_implementation(
+                self._serialize(left),
+                self._serialize(right),
+                [],
+                False,  # ignore_type_params
+                False,
+                False,
+                False,
+                proper,
+                True,  # strict_optional
+                False,  # ignore_pos_arg_names
+                False,  # strict_concatenate
+                self.resolver,
+            )
+            return result
+        finally:
+            _set_native_subtype_active(False)
+
+    def _method_with_return(self, info: TypeInfo, ret: Type) -> CallableType:
+        from mypy.types import Instance
+
+        return self._method_callable(ret, Instance(info, []))
+
+
+    def test_single_method_protocol_engages(self) -> None:
+        """A simple `__len__`-style protocol must be decided natively."""
+        self._live_info = {}
+        # protocol P: def f(self) -> A
+        p = self._protocol("mod.P", ["f"])
+        # impl I: def f(self) -> A
+        i = self._impl("mod.I", ["f"])
+        self._build_resolver()
+        from mypy.types import Instance
+
+        result = self._seam_call(Instance(i, []), Instance(p, []))
+        assert result is True, f"implementing protocol must be True, got {result!r}"
+
+    def test_non_matching_arg_type_returns_false(self) -> None:
+        """A method returning object (A's supertype) is not an
+        implementation of `f() -> A`."""
+        from mypy.types import CallableType, Instance
+
+        self._live_info = {}
+        p = self._protocol("mod.P", ["f"])
+        i = self._impl("mod.I", ["f"])
+        # f on I returns object; protocol requires A. object is a
+        # supertype of A, so the return is not compatible.
+        i.names["f"].node.type = self._method_with_return(i, self.fx.o)
+        self._build_resolver()
+        result = self._seam_call(Instance(i, []), Instance(p, []))
+        assert result is False, (
+            f"object-returning member must not implement, got {result!r}"
+        )
+
+    def test_missing_method_returns_false(self) -> None:
+        """Missing method: Rust returns False (not an implementation)."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p = self._protocol("mod.P", ["f"])
+        i = self._impl("mod.I", [])
+        self._build_resolver()
+        result = self._seam_call(Instance(i, []), Instance(p, []))
+        assert result is False, f"missing member must be False, got {result!r}"
+
+    def test_protocol_left_defers(self) -> None:
+        """Protocol-left (recursion-prone) must defer (None)."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        p1 = self._protocol("mod.P1", ["f"])
+        p2 = self._protocol("mod.P2", ["f"])
+        self._build_resolver()
+        result = self._seam_call(Instance(p1, []), Instance(p2, []))
+        assert result is None, f"protocol-left must defer, got {result!r}"
+
+    def test_non_protocol_right_defers(self) -> None:
+        """Non-protocol right must defer (None), matching the assert in
+        `is_protocol_implementation` (callers pass protocol rights only)."""
+        from mypy.types import Instance
+
+        self._live_info = {}
+        i = self._impl("mod.I", ["f"])
+        self._build_resolver()
+        result = self._seam_call(Instance(i, []), Instance(i, []))
+        assert result is None, f"non-protocol right must defer, got {result!r}"
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAliasExpansionSuite(Suite):

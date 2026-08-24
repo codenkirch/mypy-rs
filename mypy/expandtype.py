@@ -15,9 +15,6 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
     LiteralType,
     NoneType,
     Overloaded,
@@ -41,6 +38,9 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     flatten_nested_unions,
     get_proper_type,
     read_type,
@@ -353,6 +353,41 @@ def expand_type(typ: Type, env: Mapping[TypeVarId, Type]) -> Type:
     return typ.accept(ExpandTypeVisitor(env))
 
 
+def _restore_expand_definition(original: Type, decoded: Type) -> Type:
+    """Copy the ``definition`` link from ``original`` onto ``decoded``.
+
+    The wire round-trip drops ``CallableType.definition`` (and the per-item
+    definitions on an ``Overloaded``); only used for error-message
+    self/cls prepending. Restore it from the pre-seam type so
+    ``pretty_callable`` shows the self argument. Mirrors
+    ``checkmember._restore_definition`` but inlined here to avoid a
+    circular import (checkmember imports expandtype).
+    """
+    if isinstance(original, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
+        if original.definition is not None and decoded.definition is None:
+            return decoded.copy_modified(definition=original.definition)
+    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
+        if len(original.items) == len(decoded.items):
+            new_items = []
+            changed = False
+            for orig, dec in zip(original.items, decoded.items):
+                if orig.definition is not None and dec.definition is None:
+                    new_items.append(dec.copy_modified(definition=orig.definition))
+                    changed = True
+                else:
+                    new_items.append(dec)
+            if changed:
+                return Overloaded(new_items)
+    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):  # type: ignore[misc]
+        for orig in original.items:
+            if (
+                orig.definition is not None
+                and len(orig.arg_types) == len(decoded.arg_types)
+            ):
+                return decoded.copy_modified(definition=orig.definition)
+    return decoded
+
+
 @overload
 def expand_type_by_instance(typ: CallableType, instance: Instance) -> CallableType: ...
 
@@ -403,9 +438,7 @@ def expand_type_by_instance(typ: Type, instance: Instance) -> Type:
                         fixed.column = typ.column
                         if isinstance(fixed, CallableType):
                             fixed.fallback.line = fixed.line
-                    # Clear the process-global primitive decode singletons
-                    # after a read so NOT_READY Instances cannot leak into
-                    # later builds.
+                        fixed = _restore_expand_definition(typ, fixed)
                     from mypy.types import instance_cache
 
                     instance_cache.int_type = None

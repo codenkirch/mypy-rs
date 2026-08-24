@@ -1753,14 +1753,14 @@ fn map_derivation_path(
     resolver: &TypeResolver,
 ) -> Option<Vec<Type>> {
     let left_snap = resolver.get(left_ref)?;
-    // Variadic left: expand_type_by_instance would need the
-    // split_with_prefix_and_suffix logic to substitute the TypeVarTuple
-    // middle. Not ported; defer to Python. Also guards mid-path bases
-
-    // that are variadic even when the original left isn't.
+    // Variadic left: expand_type_by_instance_core handles the env
+    // binding but the subset walker doesn't fully handle all
+    // prefix/suffix splicing cases, producing wrong results. Defer
+    // to Python until the full split_with_prefix_and_suffix is ported.
     if left_snap.has_type_var_tuple_type {
         return None;
     }
+    let expand = |typ: &Type| -> Option<Type> { expand_type_by_instance(typ, left_ref, left_args) };
     for base_blob in &left_snap.bases {
         let base = decode_type(base_blob)?;
         if let Type::Instance {
@@ -1771,7 +1771,7 @@ fn map_derivation_path(
         {
             if base_ref == right_ref {
                 // Direct base: expand base's args by left's frame.
-                let expanded = expand_type_by_instance(&base, left_ref, left_args)?;
+                let expanded = expand(&base)?;
                 if let Type::Instance { args, .. } = expanded {
                     return Some(args);
                 }
@@ -1779,7 +1779,7 @@ fn map_derivation_path(
             }
             // Multi-level: recurse through this base. First map left to
             // this base's frame, then continue from there.
-            let mapped = expand_type_by_instance(&base, left_ref, left_args)?;
+            let mapped = expand(&base)?;
             if let Type::Instance {
                 type_ref: mid_ref,
                 args: mid_args,
@@ -1917,6 +1917,7 @@ fn visit_instance_nominal(
     if right_snap.has_type_var_tuple_type {
         return None;
     }
+
     // Variadic left when left != right: map_instance_to_supertype would
     // need the same split logic to substitute the variadic tvar. Defer.
     if left_ref != right_ref && left_snap.is_some_and(|s| s.has_type_var_tuple_type) {
@@ -2263,6 +2264,17 @@ fn expand_aliases_depth(
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     wire::read_type(&mut buf, None).ok()
+}
+
+#[cfg(test)]
+/// Encode a `Type` to its wire format via `wire::write_type`. Returns
+/// `None` when the type has no wire representation (e.g. a missing
+/// `TypeInfo`), mirroring the `encode_type` helpers in other kernel
+/// modules. Used by tests to build `TypeInfoSnapshot.bases` blobs.
+fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+    let mut wbuf = WriteBuffer::new();
+    wire::write_type(&mut wbuf, typ).ok()?;
+    Some(wbuf.into_bytes())
 }
 
 // =====================================================================
@@ -3126,6 +3138,69 @@ mod tests {
         let left = instance("a.Sub", vec![]);
         let right = instance("a.Gen", vec![any_type()]);
         // No bases blobs -> map_instance_to_supertype returns None.
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn variadic_left_defers_at_derivation_path() {
+        // Variadic-left frames defer: the subset walker doesn't fully
+        // handle prefix/suffix splicing for TypeVarTuple substitution.
+        // The guard in map_derivation_path returns None (defer to Python).
+        let tvt = Type::TypeVarTupleType {
+            name: "Ts".to_string(),
+            fullname: "a.Sub.Ts".to_string(),
+            raw_id: 1,
+            namespace: "a.Sub".to_string(),
+            upper_bound: Box::new(instance("builtins.object", vec![])),
+            tuple_fallback: Box::new(instance("builtins.tuple", vec![])),
+            default: Box::new(Type::UninhabitedType { ambiguous: false }),
+            min_len: 0,
+        };
+        let mut base = snap("a.Gen", "Gen");
+        base.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        let mut derived = snap("a.Sub", "Sub");
+        derived.bases.push(
+            encode_type(&instance(
+                "a.Gen",
+                vec![Type::TupleType {
+                    partial_fallback: Box::new(instance("builtins.tuple", vec![])),
+                    items: vec![Type::UnpackType {
+                        typ: Box::new(tvt.clone()),
+                    }],
+                    implicit: false,
+                }],
+            ))
+            .unwrap(),
+        );
+        derived.has_base.insert("a.Gen".to_string());
+        derived.mro.push("a.Gen".to_string());
+        derived.has_type_var_tuple_type = true;
+        derived.type_vars_with_variance = vec![("Ts".to_string(), COVARIANT, 2)];
+        derived.type_var_raw_ids = vec![1];
+        derived.type_var_tuple_prefix = Some(0);
+        derived.type_var_tuple_suffix = Some(0);
+        derived.type_var_tuple_fallback = Some(encode_type(&tvt).unwrap());
+        let r = make_resolver(vec![base, derived]);
+        let left = instance("a.Sub", vec![instance("builtins.int", vec![])]);
+        let right = instance("a.Gen", vec![any_type()]);
+        let result = is_subtype(&left, &right, &ctx_nominal(), &r);
+        // Variadic left defers: the guard catches has_type_var_tuple_type
+        // and returns None before attempting the env-based expansion.
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn variadic_left_without_bases_still_defers() {
+        // Left is variadic but has no bases blobs (stale snapshot):
+        // map_instance_to_supertype still returns None -> defer.
+        let mut derived = snap("a.Sub", "Sub");
+        derived.has_type_var_tuple_type = true;
+        derived.has_base.insert("a.Gen".to_string());
+        let mut base = snap("a.Gen", "Gen");
+        base.type_vars_with_variance = vec![("T".to_string(), COVARIANT, 0)];
+        let r = make_resolver(vec![base, derived]);
+        let left = instance("a.Sub", vec![instance("builtins.int", vec![])]);
+        let right = instance("a.Gen", vec![any_type()]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 

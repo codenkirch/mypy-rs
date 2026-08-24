@@ -824,8 +824,49 @@ def _is_subtype(
             result = None
         if result is not None:
             return result
-        # Rust returned None (unsupported case) — fall through to Python.
-
+        # Protocol-right native seam (protocols.rs) disabled: the
+        # member-compat loop drops `definition` links, causing
+        # `pretty_callable` to omit `self` from error messages.
+        if (
+            False
+            and _HAS_TYPE_KERNEL
+            and _native_subtype_active
+            and _native_subtype_resolver is not None
+            and checker_state.type_checker is not None
+            and isinstance(left, Instance)
+            and isinstance(right, Instance)
+            and right.type.is_protocol
+            and not left.type.is_protocol
+        ):
+            try:
+                protocol_result = _type_kernel.rust_is_protocol_implementation(
+                    _serialize_type(left),
+                    _serialize_type(right),
+                    [],  # skip: callers pass explicit skip only via is_protocol_implementation
+                    subtype_context.ignore_type_params,
+                    subtype_context.ignore_declared_variance,
+                    subtype_context.always_covariant,
+                    subtype_context.ignore_promotions,
+                    proper_subtype,
+                    state.strict_optional,
+                    subtype_context.ignore_pos_arg_names,
+                    (subtype_context.options.strict_concatenate if subtype_context.options else False),
+                    _native_subtype_resolver,
+                )
+            except (AssertionError, NotImplementedError, ValueError, AttributeError):
+                protocol_result = None
+            if protocol_result is not None:
+                # Mirror is_protocol_implementation's bookkeeping so
+                # fine-grained rechecks and the positive subtype cache
+                # observe the native decision.
+                type_state.record_protocol_subtype_check(left.type, right.type)
+                if protocol_result:
+                    type_state.record_subtype_cache_entry(
+                        SubtypeVisitor.build_subtype_kind(subtype_context, proper_subtype),
+                        left,
+                        right,
+                    )
+                return protocol_result
     return left.accept(SubtypeVisitor(orig_right, subtype_context, proper_subtype))
 
 

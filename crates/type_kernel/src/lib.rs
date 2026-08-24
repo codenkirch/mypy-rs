@@ -107,6 +107,7 @@ mod overlap_unsafe;
 mod overload;
 mod overload_never;
 mod overload_override;
+mod protocols;
 
 mod partially_defined;
 mod plugin_helpers;
@@ -200,6 +201,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         member_flags::rust_get_member_flags,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        protocols::rust_is_protocol_implementation,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

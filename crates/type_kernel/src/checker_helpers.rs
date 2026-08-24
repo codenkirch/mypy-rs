@@ -942,7 +942,7 @@ pub(crate) fn rust_join_type_list(
 /// `Some(empty_vec)` for "Rust decided None", or `None` (defer). The Python
 /// shim interprets `Some(empty)` as "return None" and `None` as "defer".
 #[allow(clippy::too_many_arguments)]
-fn get_protocol_member_inner(
+pub(crate) fn get_protocol_member_inner(
     py: Python<'_>,
     left: &Type,
     member: &str,
@@ -997,7 +997,9 @@ fn get_protocol_member_inner(
     // find_member (subtypes.py:1894-1915): `info.get(name)` walks the MRO.
     let info = match resolver.live_typeinfo(py, type_ref) {
         Some(i) => i,
-        None => return Some(GetProtocolMemberResult::Defer),
+        None => {
+            return Some(GetProtocolMemberResult::Defer);
+        }
     };
     // `live_typeinfo` returns a dict value which may be `None` when the
     // fullname key maps to nothing; treat that as a deferral.
@@ -1006,12 +1008,16 @@ fn get_protocol_member_inner(
     }
     let (sym_info, sym_node) = match mro_get(py, info, member) {
         Some(pair) => pair,
-        None => return Some(GetProtocolMemberResult::Defer),
+        None => {
+            return Some(GetProtocolMemberResult::Defer);
+        }
     };
     let sym_info: &PyAny = sym_info.as_ref(py);
     let node = match sym_node.as_ref(py).getattr("node") {
         Ok(n) => n.to_object(py),
-        Err(_) => return Some(GetProtocolMemberResult::Defer),
+        Err(_) => {
+            return Some(GetProtocolMemberResult::Defer);
+        }
     };
     let node_ref: &PyAny = node.as_ref(py);
     if node_ref.is_none() {
@@ -1036,7 +1042,9 @@ fn get_protocol_member_inner(
             // check_self_arg + bind tail mirrors checkmember.py:769-772.
             let node_type_obj = match node_ref.getattr("type") {
                 Ok(t) => t,
-                Err(_) => return Some(GetProtocolMemberResult::Defer),
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
             if node_type_obj.is_none() {
                 // `function_type` falls back to building the signature
@@ -1046,14 +1054,20 @@ fn get_protocol_member_inner(
             let signature = match serialize_type_to_bytes(py, node_type_obj) {
                 Some(bytes) => match decode_type(&bytes) {
                     Some(t) => t,
-                    None => return Some(GetProtocolMemberResult::Defer),
+                    None => {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
                 },
-                None => return Some(GetProtocolMemberResult::Defer),
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
             // method_fullname must be the receiver's type_ref.
             let method_fullname = match get_opt_str_attr(sym_info, "fullname") {
                 Some(f) => f,
-                None => return Some(GetProtocolMemberResult::Defer),
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
             if method_fullname != *type_ref {
                 return Some(GetProtocolMemberResult::Defer);
@@ -1074,6 +1088,11 @@ fn get_protocol_member_inner(
                 None => Some(GetProtocolMemberResult::Defer),
             }
         }
+        "Decorator" => {
+            // Decorator member access needs the full find_node_type path
+            // (property unwrapping, decorator chain). Defer to Python.
+            Some(GetProtocolMemberResult::Defer)
+        }
         "Var" => {
             // find_node_type (subtypes.py:2117-2160) Var path ->
             // analyze_var's non-callable tail (checkmember.py:1377-1422).
@@ -1082,7 +1101,9 @@ fn get_protocol_member_inner(
             }
             let var_type_obj = match node_ref.getattr("type") {
                 Ok(t) => t,
-                Err(_) => return Some(GetProtocolMemberResult::Defer),
+                Err(_) => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
             if var_type_obj.is_none() {
                 return Some(GetProtocolMemberResult::Defer);
@@ -1090,9 +1111,13 @@ fn get_protocol_member_inner(
             let typ = match serialize_type_to_bytes(py, var_type_obj) {
                 Some(bytes) => match decode_type(&bytes) {
                     Some(t) => t,
-                    None => return Some(GetProtocolMemberResult::Defer),
+                    None => {
+                        return Some(GetProtocolMemberResult::Defer);
+                    }
                 },
-                None => return Some(GetProtocolMemberResult::Defer),
+                None => {
+                    return Some(GetProtocolMemberResult::Defer);
+                }
             };
             // expand_without_binding with preserve_type_var_ids=True
             // (checkmember.py:1498-1503): no freshen, no Self (var has no
@@ -1287,7 +1312,7 @@ fn is_metaclass_precise(
 
 /// Distinguish "Rust decided None" from "Rust defers" from "Rust found".
 #[derive(Debug, PartialEq)]
-enum GetProtocolMemberResult {
+pub(crate) enum GetProtocolMemberResult {
     /// The member is None (e.g. __call__ on a precise metaclass).
     NoneVal,
     /// A member type was found and fully computed in Rust.

@@ -175,6 +175,49 @@ fn get_member_flags_inner(
     strict_optional: bool,
     resolver: &NativeTypeResolver,
 ) -> Option<Vec<i64>> {
+    get_member_flags_inner_impl(
+        py,
+        info,
+        name,
+        class_obj,
+        extra_attrs,
+        strict_optional,
+        resolver,
+    )
+}
+
+/// Re-exported for `protocols::is_protocol_implementation_inner` (the
+/// Rust member-flag loop). Delegates to the same impl as
+/// `get_member_flags_inner`.
+pub(crate) fn get_member_flags_inner_pub(
+    py: Python<'_>,
+    info: &PyAny,
+    name: &str,
+    class_obj: bool,
+    extra_attrs: Option<&PyAny>,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<Vec<i64>> {
+    get_member_flags_inner_impl(
+        py,
+        info,
+        name,
+        class_obj,
+        extra_attrs,
+        strict_optional,
+        resolver,
+    )
+}
+
+fn get_member_flags_inner_impl(
+    py: Python<'_>,
+    info: &PyAny,
+    name: &str,
+    class_obj: bool,
+    extra_attrs: Option<&PyAny>,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<Vec<i64>> {
     let method = get_method_node(info, name);
     let setattr_meth = has_setattr(info)?.then_some(());
     if let Some(method) = method {
