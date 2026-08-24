@@ -484,6 +484,15 @@ including:
   `UnpackType` (interpolation splice); TupleType defers on single-item
   normalization and non-builtins fallback; TypeType defers on a Union
   item. 8 Rust unit tests in `subtypes.rs` (`test_expand_by_instance_*`).
+- `analyze_type_inner` Callable star-args (issue-kind: Callable in the
+  `rust_type_analyze` wire seam) — mirrors `visit_callable_type`
+  (typeanal.py:1873-2027) + `anal_star_arg_type` (:1935). A bound
+  `ARG_STAR`/`ARG_STAR2` arg typed `ParamSpecType` (`P.args`/`P.kwargs`)
+  passes through unchanged (Python returns the pre-built ParamSpec
+  directly), while other star args analyze with `allow_unpack=True`
+  matching `anal_star_arg_type`'s fallback `anal_type(t, nested,
+  allow_unpack=True)` instead of deferring. Covered by
+  `NativeTypeAnalSuite` in `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

@@ -35,6 +35,7 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
 
+use crate::argmap::{ARG_STAR, ARG_STAR2};
 use crate::refs::{is_instance, TypeRefs};
 use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Type, WriteBuffer};
 
@@ -2255,23 +2256,35 @@ fn analyze_type_inner(
             type_guard,
             type_is,
         } => {
-            // Callable analysis: analyze arg_types, ret_type, variables, and
-            // optional fields. This is the most complex branch — mirroring
-            // visit_callable_type which binds type vars, handles type guards,
-
-            // and analyzes star args.
+            // Callable analysis: mirror visit_callable_type (typeanal.py:1873).
+            // Re-analyze arg_types, ret_type, variables, type guards.
+            // Bind-vars + guard/is analysis needs live context: defer.
             let ret = analyze_type_inner(
                 ret_type,
                 allow_tuple_literal,
                 allow_param_spec_literals,
                 allow_unpack,
             )?;
-            let arg_types = analyze_type_list(
-                arg_types,
-                allow_tuple_literal,
-                allow_param_spec_literals,
-                allow_unpack,
-            )?;
+            // Star-arg handling (typeanal.py:1886-1903): bound
+            // P.args/P.kwargs pass through unchanged (substitution would
+            // explode the ParamSpec); other stars analyze with allow_unpack.
+            let mut arg_types_out: Vec<Type> = Vec::with_capacity(arg_types.len());
+            for (kind, at) in arg_kinds.iter().zip(arg_types.iter()) {
+                if (*kind == ARG_STAR || *kind == ARG_STAR2)
+                    && matches!(at, Type::ParamSpecType { .. })
+                {
+                    // Bound P.args/P.kwargs: pass through as-is.
+                    arg_types_out.push(at.clone());
+                } else {
+                    let analyzed = analyze_type_inner(
+                        at,
+                        allow_tuple_literal,
+                        allow_param_spec_literals,
+                        *kind == ARG_STAR || *kind == ARG_STAR2 || allow_unpack,
+                    )?;
+                    arg_types_out.push(analyzed);
+                }
+            }
             let variables = analyze_type_var_likes(
                 variables,
                 allow_tuple_literal,
@@ -2321,7 +2334,7 @@ fn analyze_type_inner(
                 imprecise_arg_kinds: *imprecise_arg_kinds,
                 unpack_kwargs: *unpack_kwargs,
                 from_type_type: *from_type_type,
-                arg_types,
+                arg_types: arg_types_out,
                 arg_kinds: arg_kinds.clone(),
                 arg_names: arg_names.clone(),
                 ret_type: Box::new(ret),
