@@ -762,18 +762,14 @@ mod tests {
     }
 
     #[test]
-    fn yield_type_zero_arg_generator_defers_safely() {
-        // A zero-arg `Generator` is not constructible via typing (3
-        // mandatory params, none with defaults). The arity guard in
-        // visit_instance_nominal (3 mapped args != 0 right args) defers to
-
-        // Python rather than panic on a stale/malformed snapshot. Rust's
-        // job here is to defer safely, not decide.
+    fn yield_type_zero_arg_generator_is_subtype() {
+        // Python's zip truncates to 0 iterations on empty right args, so
+        // is_subtype returns True and the yield type is Any(special_form).
         let r = make_resolver(vec![generator_snap()]);
         let noargs = i("typing.Generator", vec![]);
         assert_eq!(
             get_generator_yield_type_inner(&noargs, false, true, &r),
-            None
+            Some(any_type(ANY_SPECIAL_FORM, None))
         );
     }
 
