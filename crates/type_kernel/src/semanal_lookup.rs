@@ -16,6 +16,7 @@
 use pyo3::prelude::*;
 
 use crate::typeinfo::{NativeTypeResolver, TypeInfoSnapshot};
+use crate::wire::{self, ReadBuffer, Type};
 
 /// Kind codes passed from Python for the first symbol's node.
 const KIND_TYPEINFO: i64 = 0;
@@ -87,9 +88,53 @@ pub(crate) fn rust_lookup_qualified(
     }
 
     if first_sym_kind == KIND_TYPEALIAS {
-        // TypeAlias with no_args + Instance target: would need the alias
-        // resolver to decode the target and resolve type_ref. Defer.
-        return Ok(None);
+        // TypeAlias with no_args + Instance target: decode the alias
+        // target, extract the Instance type_ref, and continue the
+        // TypeInfo chain walk from there (Python: semanal.py:7743-7746).
+        let alias = resolver.alias_resolver().get(first_sym_fullname);
+        let alias_snap = match alias {
+            Some(a) => a,
+            None => return Ok(None),
+        };
+        if !alias_snap.no_args {
+            // Python's elif requires no_args=True; no_args=False falls
+            // through to the else branch (nextsym = None, error). Defer
+            // so Python runs the exact same path.
+            return Ok(None);
+        }
+        let target = match decode_type(&alias_snap.target) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let target_ref = match &target {
+            Type::Instance { type_ref, .. } => type_ref.clone(),
+            _ => {
+                // Non-Instance target: Python sets nextsym = None (error).
+                // Defer so Python handles it.
+                return Ok(None);
+            }
+        };
+        // Continue the TypeInfo chain walk from the alias target.
+        let type_resolver = resolver.resolver();
+        let mut current_fullname = target_ref;
+        for &part in parts.iter().skip(1) {
+            let snap = match type_resolver.get(&current_fullname) {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            match find_member_in_mro(type_resolver, snap, part) {
+                Some(_found_fullname) => {
+                    let next_fullname = format!("{}.{}", current_fullname, part);
+                    if type_resolver.get(&next_fullname).is_some() {
+                        current_fullname = next_fullname;
+                    } else {
+                        return Ok(Some((RESULT_TYPEINFO_MEMBER, next_fullname)));
+                    }
+                }
+                None => return Ok(Some((RESULT_NOT_FOUND, String::new()))),
+            }
+        }
+        return Ok(Some((RESULT_TYPEINFO_MEMBER, current_fullname)));
     }
 
     if first_sym_kind == KIND_MYPYFILE {
@@ -368,4 +413,9 @@ mod tests {
             WalkOutcome::NotFound
         ));
     }
+}
+
+fn decode_type(bytes: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(bytes);
+    wire::read_type(&mut buf, None).ok()
 }
