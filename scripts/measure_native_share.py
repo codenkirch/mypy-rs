@@ -47,6 +47,18 @@ CLASSIFIER_NEGATIVE_SEAMS: tuple[str, ...] = (
 # Count per-decision, not per-call, so deferred slots stay visible.
 _BATCH_SLOT_SEAMS: frozenset[str] = frozenset({"rust_is_subtype_batch"})
 
+# Unit-handled seams: Rust returns None (PyOk unit) as the HANDLED result,
+# not a deferral (semanal_classprop full ports; shim returns on success).
+# Without this, every successful call would count as a fallback.
+UNIT_HANDLED_SEAMS: frozenset[str] = frozenset(
+    {
+        "rust_calculate_class_abstract_status",
+        "rust_check_protocol_status",
+        "rust_calculate_class_vars",
+        "rust_add_type_promotion",
+    }
+)
+
 
 class CountingProxy:
     """Wrap one rust_* function, counting calls and None (deferral) results."""
@@ -76,7 +88,11 @@ class CountingProxy:
             else:
                 self.native += 1
         elif result is None and self.name not in CLASSIFIER_NEGATIVE_SEAMS:
-            self.fallback += 1
+            if self.name in UNIT_HANDLED_SEAMS:
+                # Unit seam: None is the handled result, not a deferral.
+                self.native += 1
+            else:
+                self.fallback += 1
         else:
             self.native += 1
         return result
