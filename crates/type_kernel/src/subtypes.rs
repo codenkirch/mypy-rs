@@ -1763,8 +1763,7 @@ fn visit_instance_nominal(
     // Same-ref fast path: identical args are always True regardless of
     // variance or tvar kinds; proper-mode and protocol-right need the
     // full walk (protocol/cache semantics), so only non-proper fires.
-    if !ctx.proper_subtype && !right_is_protocol
-        && left_ref == right_ref && left_args == right_args
+    if !ctx.proper_subtype && !right_is_protocol && left_ref == right_ref && left_args == right_args
     {
         return Some(true);
     }
