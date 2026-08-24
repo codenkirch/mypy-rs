@@ -1863,6 +1863,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_call_on_non_metaclass_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
@@ -1873,6 +1874,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_class_obj_call_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
@@ -1883,6 +1885,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_missing_snapshot_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(TypeResolver::new());
             let left = make_instance("mymod.NotFound", vec![]);
@@ -1893,6 +1896,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_non_instance_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(TypeResolver::new());
             let left = Type::AnyType {
@@ -1907,6 +1911,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_init_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
@@ -1919,6 +1924,7 @@ mod tests {
 
     #[test]
     fn test_get_protocol_member_is_lvalue_defers() {
+        pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             let r = make_native(make_resolver_with_metaclass("mymod.Foo", "builtins.type"));
             let left = make_instance("mymod.Foo", vec![]);
