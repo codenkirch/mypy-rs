@@ -1424,23 +1424,28 @@ fn analyze_enum_class_attribute_access_inner(
 // analyze_descriptor_access (Union-map + non-Instance guard only)
 // ---------------------------------------------------------------------------
 
-/// `mypy.checkmember.analyze_descriptor_access` (checkmember.py:822-928),
+/// `mypy.checkmember.analyze_descriptor_access` (checkmember.py:1120-1162),
 /// the pure-type-transform head only.
 ///
-/// Ports two early-return guards:
+/// Ports three early-return guards:
 ///   * `UnionType` → map each item through `analyze_descriptor_access`
 ///     and `make_simplified_union`.
-///   * Not an `Instance` → return the original descriptor type unchanged.
+///   * Not an `Instance` → return the original descriptor type unchanged
+///     (deferred here; the identity round-trip of a non-Instance alias is
+///     not parity-proven, so Python keeps the guard).
+///   * `Instance` + lvalue=false + no readable `__get__` → return the
+///     descriptor unchanged (checkmember.py:1189-1190).
 ///
 /// Everything else needs `mx.chk` (checker state), `map_instance_to_supertype`,
-/// `expand_type_by_instance`, `check_call`, `warn_deprecated`, or
-/// `has_readable_member` on live TypeInfo — all deferred. The `is_lvalue`
-/// flag gates the `__set__`/`__get__` checks which need checker state, so
-/// even with `is_lvalue` we defer past the two guards above.
+/// `expand_type_by_instance`, `check_call`, or `warn_deprecated` — all
+/// deferred. The `is_lvalue` flag gates the `__set__`/`__get__` split which
+/// needs checker state, so even with `is_lvalue` we defer past the guards
+/// above.
 #[pyfunction]
 pub(crate) fn rust_analyze_descriptor_access(
     resolver: &NativeTypeResolver,
     descriptor_bytes: &[u8],
+    is_lvalue: bool,
     strict_optional: bool,
 ) -> PyResult<Option<Vec<u8>>> {
     let typ = match decode_type(descriptor_bytes) {
@@ -1448,13 +1453,14 @@ pub(crate) fn rust_analyze_descriptor_access(
         None => return Ok(None),
     };
     Ok(
-        analyze_descriptor_access_inner(&typ, strict_optional, resolver.resolver())
+        analyze_descriptor_access_inner(&typ, is_lvalue, strict_optional, resolver.resolver())
             .and_then(|t| encode_type(&t)),
     )
 }
 
 fn analyze_descriptor_access_inner(
     typ: &Type,
+    is_lvalue: bool,
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
@@ -1464,17 +1470,41 @@ fn analyze_descriptor_access_inner(
             // Map the access over union types, then make_simplified_union.
             let mut results = Vec::with_capacity(items.len());
             for item in items {
-                let r = analyze_descriptor_access_inner(item, strict_optional, resolver)?;
+                let r =
+                    analyze_descriptor_access_inner(item, is_lvalue, strict_optional, resolver)?;
                 results.push(r);
             }
             let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
             make_simplified_union(&results, &ctx, resolver, true)
         }
-        // Everything else deferred: the `not isinstance(...)` early return
-        // hands back the *original* descriptor object (identity-preserving,
-        // and it fires on every method-access call), and the Instance branch
-
-        // needs checker state (has_readable_member, get_method, check_call).
+        Type::TupleType {
+            partial_fallback, ..
+        } if !is_lvalue => {
+            // Tuple descriptor (e.g. property on a namedtuple): check the
+            // partial fallback's __get__ presence (matches the Python
+            // head recursing on the tuple fallback).
+            if !matches!(&**partial_fallback, Type::Instance { .. }) {
+                return None;
+            }
+            let Type::Instance { type_ref, .. } = &**partial_fallback else {
+                unreachable!()
+            };
+            let has_get = has_readable_member_by_ref(resolver, type_ref, "__get__")?;
+            if has_get {
+                return None;
+            }
+            Some(typ.clone())
+        }
+        Type::Instance { type_ref, .. } if !is_lvalue => {
+            // Non-lvalue __get__ short-circuit (checkmember.py:1189):
+            // no-readable-__get__ passes the descriptor through; a
+            // __get__-bearing descriptor defers (heavy-path analysis).
+            let has_get = has_readable_member_by_ref(resolver, type_ref, "__get__")?;
+            if has_get {
+                return None;
+            }
+            Some(typ.clone())
+        }
         _ => None,
     }
 }
@@ -2669,11 +2699,11 @@ mod tests {
     // --- analyze_descriptor_access_inner ---
 
     #[test]
-    fn test_descriptor_access_non_union_defers() {
+    fn test_descriptor_access_lvalue_instance_defers() {
         let resolver = TypeResolver::new();
         let inst = make_instance("builtins.int");
-        // Instance branch needs checker state -> defer.
-        assert!(analyze_descriptor_access_inner(&inst, true, &resolver).is_none());
+        // lvalue Instance needs checker state -> defer.
+        assert!(analyze_descriptor_access_inner(&inst, true, true, &resolver).is_none());
     }
 
     #[test]
@@ -2683,15 +2713,115 @@ mod tests {
             args: vec![],
             type_ref: "some.Alias".to_string(),
         };
-        assert!(analyze_descriptor_access_inner(&alias, true, &resolver).is_none());
+        assert!(analyze_descriptor_access_inner(&alias, true, true, &resolver).is_none());
     }
 
     #[test]
-    fn test_descriptor_access_union_with_instance_defers() {
+    fn test_descriptor_access_union_with_lvalue_instance_defers() {
         let resolver = TypeResolver::new();
         let union = make_union(vec![make_instance("builtins.int")]);
-        // Instance item defers -> union defers.
-        assert!(analyze_descriptor_access_inner(&union, true, &resolver).is_none());
+        // lvalue Instance item defers -> union defers.
+        assert!(analyze_descriptor_access_inner(&union, true, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_non_lvalue_no_get_returns_item() {
+        // Class with no readable __get__: non-lvalue access returns the
+        // descriptor unchanged (checkmember.py:1189-1190).
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        // Default member_info is empty (no __get__); is_base for itself.
+        snap.has_base.insert("desc.D".to_string());
+        resolver.insert("desc.D".to_string(), snap);
+        // mro walk requires every entry resolvable; provide object.
+        resolver.insert(
+            "builtins.object".to_string(),
+            TypeInfoSnapshot {
+                fullname: "builtins.object".to_string(),
+                name: "object".to_string(),
+                mro: vec!["builtins.object".to_string()],
+                ..Default::default()
+            },
+        );
+        let inst = make_instance("desc.D");
+        let r = analyze_descriptor_access_inner(&inst, false, true, &resolver);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn test_descriptor_access_non_lvalue_with_get_defers() {
+        // Class with a readable __get__: non-lvalue access needs the heavy
+        // __get__-analysis path -> defer.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("desc.D".to_string());
+        snap.member_info.insert("__get__".to_string(), (true, true));
+        resolver.insert("desc.D".to_string(), snap);
+        let inst = make_instance("desc.D");
+        assert!(analyze_descriptor_access_inner(&inst, false, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_tuple_no_get_returns_item() {
+        // TupleType descriptor (e.g. property on a namedtuple): non-lvalue
+        // access checks the partial fallback's __get__ presence.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.tuple".to_string(),
+            name: "tuple".to_string(),
+            mro: vec!["builtins.tuple".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("builtins.tuple".to_string());
+        resolver.insert("builtins.tuple".to_string(), snap);
+        resolver.insert(
+            "builtins.object".to_string(),
+            TypeInfoSnapshot {
+                fullname: "builtins.object".to_string(),
+                name: "object".to_string(),
+                mro: vec!["builtins.object".to_string()],
+                ..Default::default()
+            },
+        );
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple")),
+            items: vec![make_instance("builtins.str")],
+            implicit: false,
+        };
+        let r = analyze_descriptor_access_inner(&tup, false, true, &resolver);
+        assert!(r.is_some());
+    }
+
+    #[test]
+    fn test_descriptor_access_tuple_with_get_defers() {
+        // TupleType descriptor whose fallback has a readable __get__ needs
+        // the heavy path -> defer.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.tuple".to_string(),
+            name: "tuple".to_string(),
+            mro: vec!["builtins.tuple".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("builtins.tuple".to_string());
+        snap.member_info.insert("__get__".to_string(), (true, true));
+        resolver.insert("builtins.tuple".to_string(), snap);
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple")),
+            items: vec![make_instance("builtins.str")],
+            implicit: false,
+        };
+        assert!(analyze_descriptor_access_inner(&tup, false, true, &resolver).is_none());
     }
 
     // --- check_self_arg_inner ---

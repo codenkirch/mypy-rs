@@ -1131,10 +1131,12 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     orig_descriptor_type = descriptor_type
     descriptor_type = get_proper_type(descriptor_type)
 
-    if isinstance(descriptor_type, UnionType):
-        # M20: gate the union-map through Rust. Rust maps each item through
-        # analyze_descriptor_access and joins via make_simplified_union.
-        # Defer (None) when any item defers — Python falls through.
+    if isinstance(descriptor_type, UnionType) or not isinstance(descriptor_type, Instance):
+        # M20: gated descriptor head. Rust maps a UnionType item-wise
+        # and joins, and passes a non-lvalue, no-__get__ descriptor
+        # (Instance/TupleType) through; a __get__-bearing one defers.
+        if (
+            _HAS_TYPE_KERNEL
         if (
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
@@ -1145,6 +1147,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
                 result = _rust_analyze_descriptor_access(
                     _native_checkmember_resolver,
                     _serialize_type_for_checkmember(descriptor_type),
+                    mx.is_lvalue,
                     state.state.strict_optional,
                 )
                 if result is not None:
@@ -1156,6 +1159,7 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
                         return decoded
             except (AssertionError, NotImplementedError):
                 pass
+    if isinstance(descriptor_type, UnionType):
         # Map the access over union types
         return make_simplified_union(
             [analyze_descriptor_access(typ, mx) for typ in descriptor_type.items]
