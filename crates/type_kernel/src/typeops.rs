@@ -2221,6 +2221,10 @@ pub(crate) fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>
         }
         Type::TypeAliasType { .. } => None,
         Type::Instance { args, .. } => collect_list(args, include_all, out),
+        // TupleType: skip the partial fallback Instance like Python's copy
+        // (typeops.py:1471), so a TypeVarTuple in the items is not
+        // double-collected via its synthetic tuple fallback.
+        Type::TupleType { items, .. } => collect_list(items, include_all, out),
         Type::CallableType {
             arg_types,
             ret_type,
@@ -2234,15 +2238,6 @@ pub(crate) fn collect_type_vars(t: &Type, include_all: bool, out: &mut Vec<Type>
                     collect(it, include_all, out)?;
                 }
             }
-            Some(())
-        }
-        Type::TupleType {
-            partial_fallback,
-            items,
-            ..
-        } => {
-            collect(partial_fallback, include_all, out)?;
-            collect_list(items, include_all, out)?;
             Some(())
         }
         Type::TypedDictType { items, .. } => {
@@ -3456,6 +3451,8 @@ mod tests {
 
     #[test]
     fn get_type_vars_finds_nested_typevar() {
+        // Instance args are traversed (typeops.py:1462 `TypeQuery`
+        // visit_instance walks args).
         let t = Type::Instance {
             type_ref: "builtins.list".to_string(),
             args: vec![tv_type(1, "T")],
@@ -3464,6 +3461,30 @@ mod tests {
         };
         let blobs = rust_get_type_vars(&encode(&t), false).unwrap();
         assert_eq!(blobs.len(), 1);
+        assert_eq!(super::decode_type(&blobs[0]).unwrap(), tv_type(1, "T"));
+    }
+
+    #[test]
+    fn get_type_vars_tuple_skips_partial_fallback_but_collects_items() {
+        // Mirror typeops.py:1471-1474: the TupleType arm collects only
+        // the items (fallback skipped), so a TypeVarTuple T in the items
+        // is collected once, not via the synthetic tuple fallback.
+        let t = Type::TupleType {
+            partial_fallback: Box::new(Type::Instance {
+                type_ref: "builtins.tuple".to_string(),
+                args: vec![tv_type(1, "T")],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            items: vec![tv_type(1, "T")],
+            implicit: false,
+        };
+        let blobs = rust_get_type_vars(&encode(&t), true).unwrap();
+        assert_eq!(
+            blobs.len(),
+            1,
+            "fallback-skip parity: exactly one T from the tuple items"
+        );
         assert_eq!(super::decode_type(&blobs[0]).unwrap(), tv_type(1, "T"));
     }
 
