@@ -1612,27 +1612,15 @@ fn expand_type_by_instance(typ: &Type, left_ref: &str, left_args: &[Type]) -> Op
             }
             let new_ret = expand_type_by_instance(ret_type, left_ref, left_args)?;
             let new_guard = match type_guard {
-                Some(tg) => Some(Box::new(expand_type_by_instance(
-                    tg,
-                    left_ref,
-                    left_args,
-                )?)),
+                Some(tg) => Some(Box::new(expand_type_by_instance(tg, left_ref, left_args)?)),
                 None => None,
             };
             let new_type_is = match type_is {
-                Some(ti) => Some(Box::new(expand_type_by_instance(
-                    ti,
-                    left_ref,
-                    left_args,
-                )?)),
+                Some(ti) => Some(Box::new(expand_type_by_instance(ti, left_ref, left_args)?)),
                 None => None,
             };
             let new_instance_type = match instance_type {
-                Some(it) => Some(Box::new(expand_type_by_instance(
-                    it,
-                    left_ref,
-                    left_args,
-                )?)),
+                Some(it) => Some(Box::new(expand_type_by_instance(it, left_ref, left_args)?)),
                 None => None,
             };
             // Python expands arg_types, ret_type, type_guard, type_is and
