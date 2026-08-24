@@ -1760,6 +1760,15 @@ fn visit_instance_nominal(
 
     let right_snap = right_snap?;
 
+    // Same-ref fast path: identical args are always True regardless of
+    // variance or tvar kinds; proper-mode and protocol-right need the
+    // full walk (protocol/cache semantics), so only non-proper fires.
+    if !ctx.proper_subtype && !right_is_protocol
+        && left_ref == right_ref && left_args == right_args
+    {
+        return Some(true);
+    }
+
     // Variadic right (subtypes.py:644-670): Python takes a special path
     // using split_with_prefix_and_suffix to splice the TypeVarTuple
     // middle into left/right args. Not ported; defer to Python.
