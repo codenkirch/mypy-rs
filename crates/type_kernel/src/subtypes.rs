@@ -3175,11 +3175,12 @@ mod tests {
     fn variance_not_ready_returns_none() {
         // When a tvar has VARIANCE_NOT_READY, Python calls
         // infer_class_variances (mutates live defn); we return None.
+        // Different args keep the same-ref fast path out of the way.
         let mut gen = snap("a.Gen", "Gen");
         gen.type_vars_with_variance = vec![("T".to_string(), VARIANCE_NOT_READY, 0)];
         let r = make_resolver(vec![gen]);
         let left = instance("a.Gen", vec![any_type()]);
-        let right = instance("a.Gen", vec![any_type()]);
+        let right = instance("a.Gen", vec![instance("a.A", vec![])]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
     }
 
