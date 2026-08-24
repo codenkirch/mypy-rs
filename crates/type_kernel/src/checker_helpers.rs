@@ -1993,7 +1993,10 @@ mod tests {
         let inst = make_instance("builtins.int", vec![]);
         assert_eq!(join_type_list_inner(&[inst.clone()], true, &r), Some(inst));
         let none_t = Type::NoneType;
-        assert_eq!(join_type_list_inner(&[none_t.clone()], true, &r), Some(none_t));
+        assert_eq!(
+            join_type_list_inner(&[none_t.clone()], true, &r),
+            Some(none_t)
+        );
     }
 
     #[test]
