@@ -126,9 +126,19 @@ fn is_literal_in_union(x: &Type, y: &Type) -> Option<bool> {
     Some(false)
 }
 
-/// `mypy.typeops.get_possible_variants` (meet.py:353-400).
-fn get_possible_variants(t: &Type, res: &TypeResolver) -> Option<Vec<Type>> {
-    match t {
+/// `mypy.typeops.get_possible_variants` (meet.py:353-400). Resolves
+/// `TypeAliasType` operands via the alias resolver (mirroring meet.py's
+/// `typ = get_proper_type(typ)` at the top).
+fn get_possible_variants(
+    t: &Type,
+    res: &TypeResolver,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
+) -> Option<Vec<Type>> {
+    let t = match aliases {
+        Some(a) => crate::checkexpr_functions::get_proper_or_expand(t, a)?,
+        None => t.clone(),
+    };
+    match &t {
         Type::TypeVarType {
             values,
             upper_bound,
@@ -166,7 +176,6 @@ fn get_possible_variants(t: &Type, res: &TypeResolver) -> Option<Vec<Type>> {
         Type::TypeVarTupleType { upper_bound, .. } => Some(vec![upper_bound.as_ref().clone()]),
         Type::UnionType { items, .. } => Some(items.clone()),
         Type::Overloaded { items } => Some(items.clone()),
-        Type::TypeAliasType { .. } => None,
         other => Some(vec![other.clone()]),
     }
 }
@@ -192,6 +201,9 @@ fn make_union(items: Vec<Type>) -> Type {
 }
 
 /// The `_is_overlapping_types` recursive worker (meet.py:547-774).
+/// External callers use this alias-less public entry. The meet.rs seam
+/// entry points call `overlap_impl` with `Some(alias_resolver)` so
+/// `TypeAliasType` operands resolve natively (see `overlap_impl`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn overlap(
     left: &Type,
@@ -202,9 +214,51 @@ pub(crate) fn overlap(
     res: &TypeResolver,
     depth: i64,
 ) -> Option<bool> {
+    overlap_impl(
+        left,
+        right,
+        strict_optional,
+        ignore_promotions,
+        overlap_for_overloads,
+        res,
+        None,
+        depth,
+    )
+}
+
+/// Same as [`overlap`] but resolves `TypeAliasType` operands through the
+/// alias resolver, mirroring the `get_proper_types` call at the top of each
+/// `is_overlapping_types` recursion level (meet.py:556). `aliases = None`
+/// leaves alias operands to defer (unchanged external behavior); the
+/// meet.rs seam entries pass `Some`, closing the alias defer sites.
+#[allow(clippy::too_many_arguments)]
+fn overlap_impl(
+    left: &Type,
+    right: &Type,
+    strict_optional: bool,
+    ignore_promotions: bool,
+    overlap_for_overloads: bool,
+    res: &TypeResolver,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
+    depth: i64,
+) -> Option<bool> {
     if depth > MAX_DEPTH {
         return None;
     }
+
+    // 0. resolve TypeAliasType operands (meet.py:556). A missing resolver
+    // snapshot / cycle defers (None), falling back to Python exactly as
+    // `get_proper_types` would when expansion is impossible.
+    let (left, right) = match aliases {
+        Some(a) => {
+            let lo = crate::checkexpr_functions::get_proper_or_expand(left, a)?;
+            let ro = crate::checkexpr_functions::get_proper_or_expand(right, a)?;
+            (lo, ro)
+        }
+        None => (left.clone(), right.clone()),
+    };
+    let left = &left;
+    let right = &right;
 
     // 1. illegal types: Unbound/Deleted in Python are an overlap (True).
     // ErasedType is not on the wire; PartialType corrupts the wire so the
@@ -270,18 +324,19 @@ pub(crate) fn overlap(
     }
 
     // 7. get_possible_variants (meet.py:526-570).
-    let lv = get_possible_variants(&left, res)?;
-    let rv = get_possible_variants(&right, res)?;
+    let lv = get_possible_variants(&left, res, aliases)?;
+    let rv = get_possible_variants(&right, res, aliases)?;
     if lv.len() > 1 || rv.len() > 1 || is_type_var_like(&left) || is_type_var_like(&right) {
         for l in &lv {
             for r in &rv {
-                if overlap(
+                if overlap_impl(
                     l,
                     r,
                     strict_optional,
                     ignore_promotions,
                     overlap_for_overloads,
                     res,
+                    aliases,
                     depth + 1,
                 )? {
                     return Some(true);
@@ -299,13 +354,14 @@ pub(crate) fn overlap(
     // 9. TypedDicts (meet.py:586-597).
     if let (Type::TypedDictType { .. }, Type::TypedDictType { .. }) = (&left, &right) {
         return are_typed_dicts_overlapping(&left, &right, &|a, b| {
-            overlap(
+            overlap_impl(
                 a,
                 b,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             )
         });
@@ -313,13 +369,14 @@ pub(crate) fn overlap(
     if typed_dict_mapping_pair(&left, &right, res)? || typed_dict_mapping_pair(&right, &left, res)?
     {
         let overlapping_inner = &|a: &Type, b: &Type| -> Option<bool> {
-            overlap(
+            overlap_impl(
                 a,
                 b,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             )
         };
@@ -337,13 +394,14 @@ pub(crate) fn overlap(
     // 10. Tuples (meet.py:600-610).
     if is_tuple(&left) && is_tuple(&right) {
         return are_tuples_overlapping(&left, &right, &|a, b| {
-            overlap(
+            overlap_impl(
                 a,
                 b,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             )
         });
@@ -362,13 +420,14 @@ pub(crate) fn overlap(
     // 11. TypeType pairs (meet.py:612-637).
     match (&left, &right) {
         (Type::TypeType { item: li, .. }, Type::TypeType { item: ri, .. }) => {
-            return overlap(
+            return overlap_impl(
                 li,
                 ri,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             );
         }
@@ -382,6 +441,7 @@ pub(crate) fn overlap(
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth,
             ) {
                 Some(true) => return Some(true),
@@ -395,6 +455,7 @@ pub(crate) fn overlap(
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth,
             ) {
                 Some(true) => return Some(true),
@@ -419,13 +480,14 @@ pub(crate) fn overlap(
             return None;
         }
         let is_compat: &dyn Fn(&Type, &Type) -> Option<bool> = &|l, r| {
-            overlap(
+            overlap_impl(
                 l,
                 r,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             )
         };
@@ -502,6 +564,7 @@ pub(crate) fn overlap(
             ignore_promotions,
             overlap_for_overloads,
             res,
+            aliases,
             depth + 1,
         );
     }
@@ -889,19 +952,21 @@ fn _type_object_overlap(
     ignore_promotions: bool,
     overlap_for_overloads: bool,
     res: &TypeResolver,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
     depth: i64,
 ) -> Option<bool> {
     let Type::TypeType { item, .. } = get_proper(left)? else {
         return Some(false);
     };
     match get_proper(right)? {
-        Type::CallableType { ret_type, .. } => overlap(
+        Type::CallableType { ret_type, .. } => overlap_impl(
             item,
             ret_type,
             strict_optional,
             ignore_promotions,
             overlap_for_overloads,
             res,
+            aliases,
             depth + 1,
         ),
         Type::Instance {
@@ -918,13 +983,14 @@ fn _type_object_overlap(
                         last_known_value: None,
                         extra_attrs: None,
                     };
-                    return overlap(
+                    return overlap_impl(
                         &meta_inst,
                         right,
                         strict_optional,
                         ignore_promotions,
                         overlap_for_overloads,
                         res,
+                        aliases,
                         depth + 1,
                     );
                 }
@@ -951,6 +1017,7 @@ fn instances_overlap(
     ignore_promotions: bool,
     overlap_for_overloads: bool,
     res: &TypeResolver,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
     depth: i64,
 ) -> Option<bool> {
     let left = left.clone();
@@ -1051,13 +1118,14 @@ fn instances_overlap(
     let len_r = r2_args.len();
     if len_l == len_r {
         for (la, ra) in l2_args.iter().zip(r2_args.iter()) {
-            if !overlap(
+            if !overlap_impl(
                 la,
                 ra,
                 strict_optional,
                 ignore_promotions,
                 overlap_for_overloads,
                 res,
+                aliases,
                 depth + 1,
             )? {
                 return Some(false);
@@ -1083,8 +1151,9 @@ const MYPYC_NATIVE_INT_NAMES: [&str; 4] = [
 
 /// PyO3 entry mirroring `mypy.meet.is_overlapping_types`. The Python shim
 /// guards TypeGuardedType, recursive pairs, TypeAliasType expansion, and
-/// the `seen_types` recursion before calling; Rust only decides non-alias
-/// cases. Returns `None` (defer to Python) for any deferred case.
+/// the `seen_types` recursion before calling; Rust decides non-alias cases
+/// and resolves `TypeAliasType` operands through the alias resolver. Returns
+/// `None` (defer to Python) for any deferred case.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_is_overlapping_types(
@@ -1097,18 +1166,14 @@ pub(crate) fn rust_is_overlapping_types(
 ) -> Option<bool> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
-    // TypeAliasType cannot be expanded without the alias resolver: let
-    // Python (get_proper_types) handle it.
-    if matches!(left, Type::TypeAliasType { .. }) || matches!(right, Type::TypeAliasType { .. }) {
-        return None;
-    }
-    overlap(
+    overlap_impl(
         &left,
         &right,
         strict_optional,
         ignore_promotions,
         overlap_for_overloads,
         resolver.resolver(),
+        Some(resolver.alias_resolver()),
         0,
     )
 }
@@ -1131,12 +1196,13 @@ fn relevant_items_with_none(items: &[Type], strict_optional: bool) -> Option<Vec
 ///
 /// The Python shim resolves the `declared == narrowed` top-level equality
 /// (object identity for most types, not structural) before calling us, on
-/// the proper forms. It also guarantees neither side is `TypeAliasType`
-/// (unexpanded, `get_proper` returns None -> deferred). This worker mirrors
-/// the meet.py body after that equality check. Returns `None` (defer to
-/// Python) for any case that needs a live `TypeInfo` outside our snapshot
-/// (aliases, TypeForm-normalization special cases) or that we simply did
-/// not port; the Python shim re-runs the pure-Python visitor unchanged.
+/// the proper forms. This worker resolves `TypeAliasType` operands through
+/// the alias resolver (mirroring `get_proper_type` at the top of the Python
+/// body) and mirrors the meet.py body after that equality check. Returns
+/// `None` (defer to Python) for any case that needs a live `TypeInfo`
+/// outside our snapshot (TypeForm-normalization special cases) or that we
+/// simply did not port; the Python shim re-runs the pure-Python visitor
+/// unchanged.
 ///
 /// Cross-branch recursion mirrors Python's mutual recursion through
 /// `narrow_declared_type` -> `is_overlapping_types`/`is_subtype`/`meet_types`
@@ -1146,10 +1212,18 @@ pub(crate) fn narrow_rec(
     declared: &Type,
     narrowed: &Type,
     strict_optional: bool,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
     res: &TypeResolver,
 ) -> Option<Type> {
-    let declared_p = get_proper(declared)?;
-    let narrowed_p = get_proper(narrowed)?;
+    let (declared_c, narrowed_c) = match aliases {
+        Some(a) => (
+            crate::checkexpr_functions::get_proper_or_expand(declared, a)?,
+            crate::checkexpr_functions::get_proper_or_expand(narrowed, a)?,
+        ),
+        None => (declared.clone(), narrowed.clone()),
+    };
+    let declared_p = get_proper(&declared_c)?;
+    let narrowed_p = get_proper(&narrowed_c)?;
 
     // meet.py:224: declared == narrowed (identity-equality branch handled
     // in the Python shim; any in-branch equality here resolves via the
@@ -1166,7 +1240,7 @@ pub(crate) fn narrow_rec(
         let mut results = Vec::new();
         for d in &declared_items {
             for n in &narrowed_items {
-                if overlap(d, n, strict_optional, true, false, res, 0)?
+                if overlap_impl(d, n, strict_optional, true, false, res, aliases, 0)?
                     || is_subtype(
                         n,
                         d,
@@ -1174,7 +1248,7 @@ pub(crate) fn narrow_rec(
                         res,
                     )?
                 {
-                    results.push(narrow_rec(d, n, strict_optional, res)?);
+                    results.push(narrow_rec(d, n, strict_optional, aliases, res)?);
                 }
             }
         }
@@ -1194,7 +1268,7 @@ pub(crate) fn narrow_rec(
         let relevant = relevant_items_with_none(items, strict_optional)?;
         let mut results = Vec::new();
         for x in &relevant {
-            results.push(narrow_rec(declared, x, strict_optional, res)?);
+            results.push(narrow_rec(declared, x, strict_optional, aliases, res)?);
         }
         return make_simplified_union(
             &results,
@@ -1215,7 +1289,7 @@ pub(crate) fn narrow_rec(
                 res,
             )?
         {
-            let new_ub = narrow_rec(upper_bound, narrowed, strict_optional, res)?;
+            let new_ub = narrow_rec(upper_bound, narrowed, strict_optional, aliases, res)?;
             let mut t = declared_p.clone();
             if let Type::TypeVarType { upper_bound, .. } = &mut t {
                 **upper_bound = new_ub;
@@ -1234,7 +1308,7 @@ pub(crate) fn narrow_rec(
                 res,
             )?
         {
-            let new_ub = narrow_rec(declared, upper_bound, strict_optional, res)?;
+            let new_ub = narrow_rec(declared, upper_bound, strict_optional, aliases, res)?;
             let mut t = narrowed_p.clone();
             if let Type::TypeVarType { upper_bound, .. } = &mut t {
                 **upper_bound = new_ub;
@@ -1244,13 +1318,14 @@ pub(crate) fn narrow_rec(
     }
 
     // meet.py:271-276: disjoint -> UninhabitedType (strict) / NoneType.
-    if !overlap(
+    if !overlap_impl(
         declared_p,
         narrowed_p,
         strict_optional,
         false,
         false,
         res,
+        aliases,
         0,
     )? {
         return if strict_optional {
@@ -1265,7 +1340,7 @@ pub(crate) fn narrow_rec(
         let relevant = relevant_items_with_none(items, strict_optional)?;
         let mut results = Vec::new();
         for x in &relevant {
-            results.push(narrow_rec(declared, x, strict_optional, res)?);
+            results.push(narrow_rec(declared, x, strict_optional, aliases, res)?);
         }
         return make_simplified_union(
             &results,
@@ -1387,8 +1462,9 @@ fn materialize_meet_result(
 ///
 /// The Python shim guarantees: no `TypeGuardedType`, no recursive pair,
 /// and it resolves the top-level `declared == narrowed` identity branch
-/// before us. We re-check alias-deferral internally. Returns serialized
-/// result bytes, or `None` (defer to Python).
+/// before us. `TypeAliasType` operands resolve through the alias resolver
+/// inside `narrow_rec`. Returns serialized result bytes, or `None` (defer
+/// to Python).
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_narrow_declared_type(
@@ -1399,12 +1475,13 @@ pub(crate) fn rust_narrow_declared_type(
 ) -> Option<Vec<u8>> {
     let declared = decode_type(declared_bytes)?;
     let narrowed = decode_type(narrowed_bytes)?;
-    if matches!(declared, Type::TypeAliasType { .. })
-        || matches!(narrowed, Type::TypeAliasType { .. })
-    {
-        return None;
-    }
-    let result = narrow_rec(&declared, &narrowed, strict_optional, resolver.resolver())?;
+    let result = narrow_rec(
+        &declared,
+        &narrowed,
+        strict_optional,
+        Some(resolver.alias_resolver()),
+        resolver.resolver(),
+    )?;
     let mut wbuf = WriteBuffer::new();
     crate::wire::write_type(&mut wbuf, &result).ok()?;
     Some(wbuf.into_bytes())
@@ -1424,7 +1501,8 @@ pub(crate) fn rust_get_possible_variants(
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let typ = decode_type(typ_bytes)?;
-    let variants = get_possible_variants(&typ, resolver.resolver())?;
+    let variants =
+        get_possible_variants(&typ, resolver.resolver(), Some(resolver.alias_resolver()))?;
     let mut wbuf = WriteBuffer::new();
     crate::wire::write_type_list(&mut wbuf, &variants).ok()?;
     Some(wbuf.into_bytes())
@@ -1682,6 +1760,23 @@ mod tests {
         }
     }
 
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn alias_ref(name: &str) -> Type {
+        Type::TypeAliasType {
+            type_ref: name.to_string(),
+            args: Vec::new(),
+        }
+    }
+
     #[test]
     fn equal_unknown_identity_defers_to_python_shim() {
         // meet.py:222: declared == narrowed -> original_declared is handled
@@ -1693,7 +1788,7 @@ mod tests {
         // branch is Python's, not Rust's.
         let r = make_resolver();
         let a = instance("a.A");
-        let out = narrow_rec(&a, &a, true, &r);
+        let out = narrow_rec(&a, &a, true, None, &r);
         assert!(out.is_none());
     }
 
@@ -1705,6 +1800,7 @@ mod tests {
             &instance("builtins.int"),
             &instance("builtins.str"),
             true,
+            None,
             &r,
         );
         assert_eq!(out, Some(uninhabited()));
@@ -1718,6 +1814,7 @@ mod tests {
             &instance("builtins.int"),
             &instance("builtins.str"),
             false,
+            None,
             &r,
         );
         assert_eq!(out, Some(Type::NoneType));
@@ -1735,7 +1832,7 @@ mod tests {
             can_be_true: true,
             can_be_false: true,
         };
-        let out = narrow_rec(&n, &instance("builtins.int"), true, &r).unwrap();
+        let out = narrow_rec(&n, &instance("builtins.int"), true, None, &r).unwrap();
         assert!(matches!(out, Type::Instance { ref type_ref, .. } if type_ref == "builtins.int"));
     }
 
@@ -1744,7 +1841,7 @@ mod tests {
         // meet.py:281-282: narrowed AnyType -> original_narrowed.
         let r = make_resolver();
         let d = instance("builtins.int");
-        let out = narrow_rec(&d, &any_type(), true, &r).unwrap();
+        let out = narrow_rec(&d, &any_type(), true, None, &r).unwrap();
         assert!(matches!(out, Type::AnyType { .. }));
     }
 
@@ -1753,7 +1850,7 @@ mod tests {
         // meet.py:315-316: Instance + Instance -> meet_types; SameS -> declared.
         let r = make_resolver();
         let d = instance("builtins.int");
-        let out = narrow_rec(&d, &d, true, &r);
+        let out = narrow_rec(&d, &d, true, None, &r);
         assert_eq!(out, Some(d));
     }
 
@@ -1768,7 +1865,7 @@ mod tests {
             items: vec![instance("builtins.int")],
             implicit: false,
         };
-        let out = narrow_rec(&t, &instance("builtins.int"), true, &r);
+        let out = narrow_rec(&t, &instance("builtins.int"), true, None, &r);
         assert!(out.is_none());
     }
 
@@ -1788,7 +1885,7 @@ mod tests {
             variance: crate::subtypes::INVARIANT,
             meta_level: 0,
         };
-        let out = narrow_rec(&tv, &instance("builtins.int"), true, &r).unwrap();
+        let out = narrow_rec(&tv, &instance("builtins.int"), true, None, &r).unwrap();
         match out {
             Type::TypeVarType { upper_bound, .. } => match *upper_bound {
                 Type::Instance { ref type_ref, .. } => {
@@ -1807,7 +1904,7 @@ mod tests {
         let r = make_resolver();
         let d = instance("builtins.int");
         let g = guarded(&instance("builtins.bool"), &instance("builtins.str"));
-        let out = narrow_rec(&d, &g, true, &r);
+        let out = narrow_rec(&d, &g, true, None, &r);
         assert!(out.is_none());
     }
 
@@ -1821,7 +1918,7 @@ mod tests {
         let r = make_resolver();
         let d = instance("builtins.int");
         let n = instance("builtins.str");
-        let out = narrow_rec(&d, &n, true, &r).expect("disjoint pair should resolve");
+        let out = narrow_rec(&d, &n, true, None, &r).expect("disjoint pair should resolve");
         assert_eq!(out, Type::UninhabitedType { ambiguous: false });
         // The bytes the wrapper hands back must round-trip through the wire
         // encoder/decoder used by the real seam.
@@ -1840,7 +1937,7 @@ mod tests {
         let r = make_resolver();
         let d = type_alias();
         let n = instance("builtins.int");
-        let out = narrow_rec(&d, &n, true, &r);
+        let out = narrow_rec(&d, &n, true, None, &r);
         assert!(out.is_none());
     }
 
@@ -1851,5 +1948,97 @@ mod tests {
         // decoder the wrapper calls first. Assert that path directly.
         assert!(decode_type(b"\xff\xff").is_none());
         assert!(decode_type(&[]).is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // alias expansion (get_proper_or_expand) on the meet seams
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn get_possible_variants_alias_expands_to_union_items() {
+        // get_possible_variants ran `Type::TypeAliasType => None` before
+        // #874; Python calls get_proper_type at the top (meet.py:384), so a
+        // resolvable alias must yield its target's variants natively.
+        let r = make_resolver();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        let target = Type::UnionType {
+            items: vec![instance("builtins.int"), instance("builtins.str")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        aliases.insert("mod.U".to_string(), alias_snap("mod.U", &target));
+        let alias = alias_ref("mod.U");
+        assert_eq!(
+            get_possible_variants(&alias, &r, Some(&aliases)),
+            Some(vec![instance("builtins.int"), instance("builtins.str")])
+        );
+        // No snapshot -> the pre-#874 TypeAliasType defer is preserved.
+        let empty = crate::aliases::TypeAliasResolver::new();
+        assert!(get_possible_variants(&alias, &r, Some(&empty)).is_none());
+    }
+
+    #[test]
+    fn overlap_alias_resolves_via_resolver() {
+        // A `Type::TypeAliasType` operand that used to defer now resolves
+        // through the alias per recursion level (meet.py:556).
+        let r = make_resolver();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.A".to_string(),
+            alias_snap("mod.A", &instance("builtins.int")),
+        );
+        let alias = alias_ref("mod.A");
+        // alias -> builtins.int overlapping int: complete via subtype.
+        assert_eq!(
+            overlap_impl(
+                &alias,
+                &instance("builtins.int"),
+                true,
+                false,
+                false,
+                &r,
+                Some(&aliases),
+                0,
+            ),
+            Some(true)
+        );
+        // Missing snapshot defers (matches get_proper_type's inability to
+        // expand an unresolvable alias).
+        let empty = crate::aliases::TypeAliasResolver::new();
+        assert!(overlap_impl(
+            &alias,
+            &instance("builtins.str"),
+            true,
+            false,
+            false,
+            &r,
+            Some(&empty),
+            0,
+        )
+        .is_none());
+        // The public alias-less `overlap` entry still defers (no resolver).
+        assert!(overlap(&alias, &instance("builtins.int"), true, false, false, &r, 0).is_none());
+    }
+
+    #[test]
+    fn narrow_alias_expands_to_target() {
+        // narrow_declared_type runs get_proper_type at the top; an alias
+        // operand now expands. narrowed Any returns original_narrowed
+        // (meet.py:281-282), a meet_types-free branch -> deterministic.
+        let r = make_resolver();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.A".to_string(),
+            alias_snap("mod.A", &instance("builtins.int")),
+        );
+        let alias = alias_ref("mod.A");
+        // Without the alias resolver: get_proper(alias) is None -> defer.
+        assert!(narrow_rec(&alias, &any_type(), true, None, &r).is_none());
+        // With it: declared expands to int, narrowed Any -> Any.
+        assert_eq!(
+            narrow_rec(&alias, &any_type(), true, Some(&aliases), &r),
+            Some(any_type())
+        );
     }
 }
