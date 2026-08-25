@@ -116,6 +116,7 @@ try:
         rust_analyze_descriptor_access as _rust_analyze_descriptor_access,
         rust_analyze_enum_class_attribute_access as _rust_analyze_enum_class_attribute_access,
         rust_analyze_instance_member_access as _rust_analyze_instance_member_access,
+        rust_analyze_instance_member_dispatch as _rust_analyze_instance_member_dispatch,
         rust_analyze_member_access as _rust_analyze_member_access,
         rust_analyze_member_method as _rust_analyze_member_method,
         rust_analyze_none_member_access as _rust_analyze_none_member_access,
@@ -140,6 +141,7 @@ except ImportError:
     _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_method = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
+    _rust_analyze_instance_member_dispatch = None  # type: ignore[assignment]
     _rust_analyze_union_member_access = None  # type: ignore[assignment]
     _rust_analyze_none_member_access = None  # type: ignore[assignment]
     _rust_analyze_typeddict_access = None  # type: ignore[assignment]
@@ -630,6 +632,55 @@ def analyze_instance_member_access(
     ):
         mx.msg.note("Occurrence of '{}.{}'".format(*state.find_occurrences), mx.context)
 
+    # M20 kernel dispatch (#805): the whole method branch is one Rust
+    # call for a plain FuncBase (freshen, static/trivial-self tail,
+    # generic tail). Deferred: Decorator, property, lvalue/super, plugin.
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _native_checkmember_resolver is not None
+        and _rust_analyze_instance_member_dispatch is not None
+        and method is not None
+        and not isinstance(method, Decorator)
+        and not method.is_property
+        and not mx.is_super
+        and not mx.is_lvalue
+    ):
+        try:
+            result = _rust_analyze_instance_member_dispatch(
+                _native_checkmember_resolver,
+                _serialize_type_for_checkmember(typ),
+                name,
+                override_info.fullname if override_info else None,
+                _serialize_type_for_checkmember(mx.self_type),
+                mx.no_deferral,
+                mx.preserve_type_var_ids,
+                TypeVarId.next_raw_id,
+                state.state.strict_optional,
+            )
+            if result is not None:
+                next_raw_id, changed, wire_bytes = result
+                if changed:
+                    TypeVarId.next_raw_id = next_raw_id
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+                if decoded is not None and isinstance(decoded, ProperType):
+                    decoded.line = typ.line
+                    decoded.column = typ.column
+                    if isinstance(decoded, CallableType):
+                        decoded.fallback.line = decoded.line
+                method_sig = getattr(method, "type", None)
+                if method_sig is not None:
+                    decoded = _restore_definition(method_sig, decoded)
+                instance_cache.int_type = None
+                instance_cache.str_type = None
+                instance_cache.bool_type = None
+                instance_cache.object_type = None
+                instance_cache.function_type = None
+                if decoded is not None:
+                    return decoded
+        except (AssertionError, NotImplementedError):
+            pass
+
     # Look up the member. First look up the method dictionary.
     if method and not isinstance(method, Decorator):
         if mx.is_super and not mx.suppress_errors:
@@ -892,10 +943,8 @@ def analyze_type_type_member_access(
 def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) -> Type:
     with mx.msg.disable_type_names():
         # M20: gate the union-map through Rust when the kernel is active.
-        # Rust maps relevant_items through the pure-type-transform subset of
-        # _analyze_member_access and joins via make_simplified_union. Defer
-
-        # (None) when any item needs checker state — Python falls through.
+        # Rust maps relevant_items and returns per-item results; this shim
+        # joins via make_simplified_union. Defer: property / Var / lvalue.
         if (
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
@@ -906,16 +955,43 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
                 result = _rust_analyze_union_member_access(
                     _native_checkmember_resolver,
                     _serialize_type_for_checkmember(typ),
+                    name,
+                    mx.is_lvalue,
+                    mx.is_super,
+                    mx.no_deferral,
+                    mx.preserve_type_var_ids,
+                    TypeVarId.next_raw_id,
                     state.state.strict_optional,
                 )
                 if result is not None:
-                    decoded = _deserialize_type_for_checkmember(bytes(result))
-                    if decoded is not None:
-                        if isinstance(decoded, ProperType):
-                            decoded.line = typ.line
-                            decoded.column = typ.column
-                        return decoded
-            except (AssertionError, NotImplementedError):
+                    next_raw_id, changed, per_item = result
+                    if changed:
+                        TypeVarId.next_raw_id = next_raw_id
+                    relevant = typ.relevant_items()
+                    if len(per_item) == len(relevant):
+                        decoded_items = []
+                        for subtype, item_bytes in zip(relevant, per_item):
+                            decoded = _deserialize_type_for_checkmember(bytes(item_bytes))
+                            if decoded is None:
+                                break
+                            if isinstance(subtype, Instance):
+                                method = subtype.type.get_method(name)
+                                if (
+                                    method is not None
+                                    and not isinstance(method, Decorator)
+                                    and getattr(method, "type", None) is not None
+                                ):
+                                    decoded = _restore_definition(method.type, decoded)
+                            decoded_items.append(decoded)
+                        else:
+                            for decoded in decoded_items:
+                                if isinstance(decoded, ProperType):
+                                    decoded.line = typ.line
+                                    decoded.column = typ.column
+                                    if isinstance(decoded, CallableType):
+                                        decoded.fallback.line = decoded.line
+                            return make_simplified_union(decoded_items)
+            except (AssertionError, NotImplementedError, ValueError):
                 pass
         results = []
         for subtype in typ.relevant_items():
