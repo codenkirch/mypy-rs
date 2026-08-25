@@ -1830,87 +1830,152 @@ fn join_type_list_inner(items: &[Type], resolver: &NativeTypeResolver) -> Option
     let ctx = crate::subtypes::SubtypeContext::new(false, false, false, false, false, true);
     let mut result = items[0].clone();
     for item in &items[1..] {
-        let joined = crate::setops::join_types(&result, item, &ctx, resolver.resolver());
-        match joined {
-            Some(crate::setops::SetOpResult::SameS) => {}
-            Some(crate::setops::SetOpResult::SameT) => result = item.clone(),
-            Some(crate::setops::SetOpResult::Object) => {
-                result = Type::Instance {
-                    type_ref: "builtins.object".to_string(),
-                    args: vec![],
-                    last_known_value: None,
-                    extra_attrs: None,
-                };
-            }
-            Some(crate::setops::SetOpResult::Bottom) => {
-                result = Type::UnionType {
-                    items: vec![result.clone(), item.clone()],
-                    uses_pep604_syntax: false,
-                    can_be_true: true,
-                    can_be_false: true,
-                };
-            }
-            Some(crate::setops::SetOpResult::Any) => {
-                result = Type::AnyType {
-                    type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
-                    source_any: None,
-                    missing_import_name: None,
-                };
-            }
-            Some(crate::setops::SetOpResult::Ancestor(fullname)) => {
-                result = Type::Instance {
-                    type_ref: fullname,
-                    args: vec![],
-                    last_known_value: None,
-                    extra_attrs: None,
-                };
-            }
-            Some(crate::setops::SetOpResult::SameTypeWithArgs {
-                type_ref,
-                arg_discs,
-            }) => {
-                // Per-arg reconstruction: disc 0 -> result.args[i],
-                // disc 1 -> item.args[i] (mirrors join.py:425-441).
-
-                // The operands must be Instances to index args;
-                // defer otherwise.
-                let (Type::Instance { args: r_args, .. }, Type::Instance { args: i_args, .. }) =
-                    (&result, &item)
-                else {
-                    return None;
-                };
-                if arg_discs.len() != r_args.len() || arg_discs.len() != i_args.len() {
-                    return None;
-                }
-                let final_args: Vec<Type> = arg_discs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &d)| match d {
-                        0 => r_args[i].clone(),
-                        1 => i_args[i].clone(),
-                        _ => Type::AnyType {
-                            type_of_any: 0,
-                            source_any: None,
-                            missing_import_name: None,
-                        },
-                    })
-                    .collect();
-                result = Type::Instance {
-                    type_ref,
-                    args: final_args,
-                    last_known_value: None,
-                    extra_attrs: None,
-                };
-            }
-            Some(crate::setops::SetOpResult::Encoded(bytes)) => {
-                // Encoded carries a serialized Type; decode it into the join.
-                let decoded = decode_type(&bytes)?;
-                result = decoded;
-            }
-            None => return None,
-        }
+        result = join_one_pair(&result, item, &ctx, resolver)?;
     }
     Some(result)
+}
+
+/// Join one pair of types, mirroring `join.join_type_list` for a
+/// two-item list. The fast path is the same Instance-fold that
+/// `join_type_list_inner` was already doing; the added prejoin handles
+/// the args-less Instance-Instance nominal case exactly like
+/// `visit_instance_join` (setops.rs), so a list like
+/// `[int, object]` joins to `object` instead of deferring on the
+/// non-subtype pair.
+fn join_one_pair(
+    left: &Type,
+    right: &Type,
+    ctx: &crate::subtypes::SubtypeContext,
+    resolver: &NativeTypeResolver,
+) -> Option<Type> {
+    // Instance-Instance args-less nominal prejoin (mirrors join_types via
+    // visit_instance_join: same-type, subtype -> supertype, else common
+    // ancestor). Needs the resolver for the MRO/bases walk.
+    if let (
+        Type::Instance {
+            type_ref: l_ref,
+            args: l_args,
+            last_known_value: l_lkv,
+            ..
+        },
+        Type::Instance {
+            type_ref: r_ref,
+            args: r_args,
+            last_known_value: r_lkv,
+            ..
+        },
+    ) = (left, right)
+    {
+        if l_args.is_empty()
+            && r_args.is_empty()
+            && l_lkv.is_none()
+            && r_lkv.is_none()
+            && resolver.resolver().get(l_ref).is_some()
+            && resolver.resolver().get(r_ref).is_some()
+        {
+            if l_ref == r_ref {
+                return Some(left.clone());
+            }
+            // Decide via the shared nominal join, mapped back to the
+            // concrete Instance node (Python's join_types never returns
+            // a bare SetOpResult).
+            let result = crate::setops::visit_instance_join(left, right, ctx, resolver.resolver())?;
+            return instance_join_result_to_type(&result, left, right);
+        }
+    }
+    let joined = crate::setops::join_types(left, right, ctx, resolver.resolver());
+    match joined {
+        Some(crate::setops::SetOpResult::SameS) => Some(left.clone()),
+        Some(crate::setops::SetOpResult::SameT) => Some(right.clone()),
+        Some(crate::setops::SetOpResult::Object) => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        Some(crate::setops::SetOpResult::Bottom) => Some(Type::UnionType {
+            items: vec![left.clone(), right.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }),
+        Some(crate::setops::SetOpResult::Any) => Some(Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        }),
+        Some(crate::setops::SetOpResult::Ancestor(fullname)) => Some(Type::Instance {
+            type_ref: fullname,
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        Some(crate::setops::SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        }) => {
+            let (Type::Instance { args: l_args, .. }, Type::Instance { args: r_args, .. }) =
+                (left, right)
+            else {
+                return None;
+            };
+            if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
+                return None;
+            }
+            let final_args: Vec<Type> = arg_discs
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| match d {
+                    0 => l_args[i].clone(),
+                    1 => r_args[i].clone(),
+                    _ => Type::AnyType {
+                        type_of_any: 0,
+                        source_any: None,
+                        missing_import_name: None,
+                    },
+                })
+                .collect();
+            Some(Type::Instance {
+                type_ref,
+                args: final_args,
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::Encoded(bytes)) => decode_type(&bytes),
+        None => None,
+    }
+}
+
+/// Map a `visit_instance_join` result to the concrete joined `Type`.
+/// The join of two args-less `Instance`s never builds a fresh type in
+/// the Python source: `SameS`/`SameT` are the operands, `Ancestor`/
+/// `Object` are built as `Instance(fullname)` / `object`, exactly what
+/// `visit_instance_join` produces for the args-less case.
+fn instance_join_result_to_type(
+    result: &crate::setops::SetOpResult,
+    left: &Type,
+    right: &Type,
+) -> Option<Type> {
+    match result {
+        crate::setops::SetOpResult::SameS => Some(left.clone()),
+        crate::setops::SetOpResult::SameT => Some(right.clone()),
+        crate::setops::SetOpResult::Ancestor(fullname) => Some(Type::Instance {
+            type_ref: fullname.clone(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        crate::setops::SetOpResult::Object => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        // Other results (SameTypeWithArgs, Encoded, Bottom, Any) cannot
+        // be produced for the args-less no-LKV case; defer if seen.
+        _ => None,
+    }
 }
 
 /// `_first_or_join_fast_item` inner: mirroring the Python version.
@@ -2037,14 +2102,61 @@ pub(crate) fn rust_build_tuple_type<'py>(
     };
 
     if seen_unpack == 1 {
-        // Python: `result = expand_type(result, {})` (checkexpr.py:6033-6035)
-        // splices UnpackType into the tuple (e.g. `(*a,)` with float...). The
-        // Rust item loop does not model that, so defer single-unpack tuples.
-        return Ok(None);
+        // Python: `result = expand_type(result, {})` (checkexpr.py:6033-6035).
+        // Identity except a single-item `Tuple[*tuple[X, ...]]` unwraps to the
+        // `tuple[X, ...]` Instance itself; lone alias/non-tuple unpack defers.
+        let updated = match unpack_expand_updated(&result) {
+            Some(u) => u,
+            None => return Ok(None), // lone non-tuple/recursive-alias unpack: defer
+        };
+        let bytes = encode_type(&updated).unwrap_or_default();
+        return Ok(Some(PyBytes::new(py, &bytes)));
     }
 
     let bytes = encode_type(&result).unwrap_or_default();
     Ok(Some(PyBytes::new(py, &bytes)))
+}
+
+/// `expand_type(result, {})` for a tuple built by `build_tuple_type`.
+/// Mirrors `TypeExpander.visit_tuple_type` (expandtype.py:1004-1033)
+/// with an empty substitution map, which makes the walk effectively the
+/// identity. The only non-identity step is the single-item
+/// normalization at expandtype.py:1009-1033: a lone `UnpackType` whose
+/// un-packed type is a `builtins.tuple` Instance unwraps to that
+/// Instance (a `TypeVarTuple` star or `Any`/`Uninhabited` star does NOT,
+/// since `get_proper_type` on them is not an Instance). Returns `None`
+/// (defer) when the lone unpack needs live TypeInfo to decide.
+fn unpack_expand_updated(result: &Type) -> Option<Type> {
+    let Type::TupleType {
+        partial_fallback,
+        items,
+        implicit,
+    } = result
+    else {
+        return None;
+    };
+    if items.len() == 1 {
+        let item = &items[0];
+        if let Type::UnpackType { typ: inner } = item {
+            match inner.as_ref() {
+                Type::Instance {
+                    type_ref, args, ..
+                } if type_ref == "builtins.tuple" => {
+                    // Normalize Tuple[*tuple[X, ...]] -> tuple[X, ...].
+                    return Some((**inner).clone());
+                }
+                Type::Instance { .. } => return None, // non-tuple unpack: defer
+                Type::TypeAliasType { .. } => return None, // recursive check needs info
+                _ => {}
+            }
+        }
+    }
+    // Everything else is the identity: same items, same fallback.
+    Some(Type::TupleType {
+        partial_fallback: partial_fallback.clone(),
+        items: items.clone(),
+        implicit: *implicit,
+    })
 }
 
 /// Compute the combined type context for the right operand of a boolean
@@ -4761,8 +4873,8 @@ mod tests {
 
     #[test]
     fn test_join_type_list_subtype_chain_defers() {
-        // [int, object] with an empty resolver: is_subtype(int, object) is
-        // None (no TypeInfo snapshot), so join_types returns None and
+        // [int, object] with an EMPTY resolver: both the nominal prejoin
+        // and is_subtype(int, object) are None (no TypeInfo snapshot), so
         // join_type_list_inner defers. Documents conservative behavior.
         let i = make_instance("builtins.int", vec![]);
         let o = make_instance("builtins.object", vec![]);
@@ -4779,6 +4891,218 @@ mod tests {
             join_type_list_inner(&[any.clone(), i], &make_native_resolver()),
             Some(any)
         );
+    }
+
+    #[test]
+    fn test_join_one_pair_same_instance_type() {
+        // The nominal prejoin: equal args-less Instances with populated
+        // resolver produce the type itself (Python join_types
+        // `t.type == s.type -> Instance(t.type, [])`).
+        let i = make_instance("builtins.int", vec![]);
+        assert_eq!(
+            join_one_pair(&i, &i, &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true), &make_native_resolver()),
+            Some(i)
+        );
+    }
+
+    #[test]
+    fn test_join_one_pair_subtype_to_object() {
+        // [int, object] with populated resolver: int <: object via
+        // visit_instance_join, so the join is object (Python join_types
+        // too). The old join_type_list_inner DEFERRED on this pair.
+        let mut r = TypeResolver::new();
+        let mut int_snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        int_snap.mro.push("builtins.int".to_string());
+        int_snap.mro.push("builtins.object".to_string());
+        int_snap.has_base.insert("builtins.object".to_string());
+        int_snap.has_base.insert("builtins.int".to_string());
+        r.insert("builtins.int".to_string(), int_snap);
+        let mut obj_snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "builtins.object".to_string(),
+            name: "object".to_string(),
+            ..Default::default()
+        };
+        obj_snap.mro.push("builtins.object".to_string());
+        obj_snap.has_base.insert("builtins.object".to_string());
+        r.insert("builtins.object".to_string(), obj_snap);
+        let nres = NativeTypeResolver::new(r, crate::aliases::TypeAliasResolver::new());
+
+        let i = make_instance("builtins.int", vec![]);
+        let o = make_instance("builtins.object", vec![]);
+        let out = join_one_pair(
+            &i,
+            &o,
+            &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true),
+            &nres,
+        );
+        match out {
+            Some(Type::Instance { type_ref, .. }) => assert_eq!(type_ref, "builtins.object"),
+            other => panic!("expected object join, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_join_one_pair_instance_args_defers() {
+        // An args-carrying Instance (e.g. List[int]) does not take the
+        // nominal prejoin; it falls through to join_types, which defers
+        // on the args case -> None (Python handles it).
+        let vi = make_instance("builtins.list", vec![make_instance("builtins.int", vec![])]);
+        let vs = make_instance("builtins.list", vec![make_instance("builtins.str", vec![])]);
+        assert_eq!(
+            join_one_pair(
+                &vi,
+                &vs,
+                &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true),
+                &make_native_resolver()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_join_one_pair_lkv_pairs_join_to_instance() {
+        // Two LKV-carrying Instances of the same type: the prejoin guard (no
+        // LKV) does NOT apply, so join_types -> visit_instance_join same-type
+        // builds a FRESH Instance with LKV stripped (Python: plain `int`).
+        let li = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(Type::LiteralType {
+                fallback: Box::new(make_instance("builtins.int", vec![])),
+                value: crate::wire::LiteralValue::Int(1),
+            })),
+            extra_attrs: None,
+        };
+        let ls = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: Some(Box::new(Type::LiteralType {
+                fallback: Box::new(make_instance("builtins.int", vec![])),
+                value: crate::wire::LiteralValue::Int(2),
+            })),
+            extra_attrs: None,
+        };
+        let out = join_one_pair(
+            &li,
+            &ls,
+            &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true),
+            &make_native_resolver(),
+        );
+        match out {
+            Some(Type::Instance {
+                type_ref,
+                last_known_value: None,
+                ..
+            }) => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected plain int join, got {other:?}"),
+        }
+    }
+
+    // -- update_unpack_expand (build_tuple_type seen_unpack reduce) --
+
+    #[test]
+    fn test_unpack_expand_single_tuple_instance_normalizes() {
+        // Tuple[*tuple[int, ...]] -> tuple[int, ...] (the lone-UnpackType
+        // normalization, expandtype.py:1009-1033).
+        let inner_items = make_instance("builtins.int", vec![]);
+        let star = Type::UnpackType {
+            typ: Box::new(make_instance(
+                "builtins.tuple",
+                vec![inner_items.clone()],
+            )),
+        };
+        let result = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![star],
+            implicit: false,
+        };
+        let updated = unpack_expand_updated(&result).unwrap();
+        match updated {
+            Type::Instance { type_ref, args, .. } => {
+                assert_eq!(type_ref, "builtins.tuple");
+                assert_eq!(args.len(), 1);
+            }
+            other => panic!("expected tuple[...] instance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_expand_single_non_tuple_instance_defers() {
+        // A lone *list[int] unpack (non-tuple Instance star): cannot be decided
+        // from the wire alone (Python splices via expand_unpack, needs the
+        // live TypeVarTuple fallback). Defer.
+        let star = Type::UnpackType {
+            typ: Box::new(make_instance("builtins.list", vec![make_instance(
+                "builtins.int",
+                vec![],
+            )])),
+        };
+        let result = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![star],
+            implicit: false,
+        };
+        assert_eq!(unpack_expand_updated(&result), None);
+    }
+
+    #[test]
+    fn test_unpack_expand_typevar_tuple_single_passthrough() {
+        // Tuple[*Ts] (Ts a TypeVarTuple) carries over unchanged with an
+        // empty substitution: get_proper_type(Ts) is Ts, not an Instance,
+        // so no splice. Returns the same TupleType.
+        let ts = Type::TypeVarTupleType {
+            tuple_fallback: Box::new(make_instance(
+                "builtins.tuple",
+                vec![make_instance("builtins.object", vec![])],
+            )),
+            name: "Ts".to_string(),
+            fullname: "mod.Ts".to_string(),
+            raw_id: 5,
+            namespace: Default::default(),
+            upper_bound: Box::new(make_instance(
+                "builtins.tuple",
+                vec![make_instance("builtins.object", vec![])],
+            )),
+            default: Box::new(make_any(TYPE_OF_ANY_FROM_OMITTED_GENERICS)),
+            min_len: 0,
+        };
+        let star = Type::UnpackType { typ: Box::new(ts) };
+        let tuple = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![star],
+            implicit: false,
+        };
+        let updated = unpack_expand_updated(&tuple).unwrap();
+        match updated {
+            Type::TupleType { items, .. } => {
+                assert_eq!(items.len(), 1);
+                assert!(matches!(items[0], Type::UnpackType { .. }));
+            }
+            other => panic!("expected unchanged TupleType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_expand_multi_item_identical() {
+        // Tuple[int, str] with no unpack: expand_type is identity, items
+        // carry over unchanged.
+        let tuple = Type::TupleType {
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            items: vec![
+                make_instance("builtins.int", vec![]),
+                make_instance("builtins.str", vec![]),
+            ],
+            implicit: false,
+        };
+        let updated = unpack_expand_updated(&tuple).unwrap();
+        match updated {
+            Type::TupleType { items, .. } => assert_eq!(items.len(), 2),
+            other => panic!("expected TupleType, got {other:?}"),
+        }
     }
 
     // -- first_or_join_fast_item_inner --

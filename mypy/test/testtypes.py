@@ -9604,6 +9604,174 @@ class NativeHasAnyTypeSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTupleExpandAndJoinSuite(Suite):
+    """Parity suite for the `rust_build_tuple_type` seen_unpack reduce and
+    the `join_type_list_inner` nominal Instance prejoin (issue #846).
+
+    Port 1 (`unpack_expand_updated` in checkexpr_functions.rs): a tuple
+    expression with exactly one star (e.g. `(*ts,)` where `ts:
+    tuple[X, ...]`) previously deferred the whole `build_tuple_type`
+    result to Python (`return Ok(None)` on `seen_unpack == 1`). The Rust
+    side now expands the tuple with the empty substitution map, which is
+    the identity except for the single-item normalization
+    (expandtype.py:1009-1033): `Tuple[*tuple[X, ...]]` unwraps to the
+    `tuple[X, ...]` Instance. A lone non-tuple Instance or TypeAliasType
+    unpack still defers.
+
+    Port 2 (`join_one_pair` prejoin in checkexpr_functions.rs): the
+    args-less Instance-Instance nominal fold of `join.join_type_list`
+    (used by the fast container literal path). When both items are
+    plain `Instance`s with no args and no last_known_value, the join is
+    decided by the shared `visit_instance_join` (same-type -> the type
+    itself; subtype -> the supertype; else common ancestor) instead of
+    falling through to the generic `join_types` fold. Behavior is
+    identical to the Python twin; the Rust side now decides these cases
+    inline, keeping the fold native for the nominal fast path.
+
+    Each test asserts both parity (gate-off vs gate-on produce the same
+    result string) and Rust engagement (the direct seam call returns a
+    result rather than deferring).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.bool_type_info,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ]
+        self.resolver = _type_kernel.build_native_resolver(infos, [])
+        self.wire_infos = {i.fullname: i for i in infos}
+        set_wire_typeinfo_map(self.wire_infos)
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _build_tuple(self, items: list[Type], seen_unpack: int) -> Type | None:
+        from mypy.checkexpr import (
+            _deserialize_type_from_checkexpr,
+            _serialize_type_for_checkexpr,
+        )
+
+        items_bytes = [_serialize_type_for_checkexpr(t) for t in items]
+        raw = _type_kernel.rust_build_tuple_type(items_bytes, seen_unpack)
+        if raw is None:
+            return None
+        return _deserialize_type_from_checkexpr(bytes(raw))
+
+    def _container(self, tag: str, items: list[Type]) -> Type | None:
+        from mypy.checkexpr import (
+            _deserialize_type_from_checkexpr,
+            _serialize_type_for_checkexpr,
+        )
+
+        items_bytes = [_serialize_type_for_checkexpr(t) for t in items]
+        raw = _type_kernel.rust_container_type(self.resolver, tag, items_bytes, None, 0)
+        if raw is None:
+            return None
+        return _deserialize_type_from_checkexpr(bytes(raw))
+
+    def test_single_star_any_tuple_unwraps(self) -> None:
+        # (*ts,) with ts: tuple[Any, ...] -> tuple[Any, ...]. Python runs
+        # expand_type(result, {}) which normalizes the lone unpack to the
+        # tuple Instance. Rust now mirrors it.
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        items = [AnyType(TypeOfAny.special_form)]
+        off = self._with_gate(_set_native_checkexpr_active, False, self._build_tuple, items, 1)
+        on = self._build_tuple(items, 1)
+        assert on is not None, "Rust build_tuple_type single-star did not engage"
+        assert str(on) == str(off)
+
+    def test_single_star_typevar_tuple_unpack_passthrough(self) -> None:
+        # (*Ts,) with Ts a TypeVarTuple: lone unpack is not a tuple Instance,
+        # so `unpack_expand_updated` returns the tuple UNCHANGED, matching
+        # Python's `expand_type` identity. Keeps its `tuple[*Ts]` shape.
+        tv = TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(0),
+            self.fx.o,
+            self.fx.std_tuple,
+            self.fx.anyt,
+            min_len=0,
+        )
+        items = [UnpackType(tv)]
+        t = self._build_tuple(items, 1)
+        assert t is not None, "Rust build_tuple_type did not engage"
+        assert str(t) == "tuple[*Ts]"
+
+    def test_multi_star_defers(self) -> None:
+        # A tuple with two stars is not the seen_unpack == 1 case; the
+        # Rust path returns the tuple directly (no expansion). Python
+        # expands each item (identity with an empty map). Parity holds.
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        items = [self.fx.a, self.fx.b]
+        off = self._with_gate(_set_native_checkexpr_active, False, self._build_tuple, items, 0)
+        on = self._build_tuple(items, 0)
+        assert on is not None, "Rust build_tuple_type did not engage"
+        assert str(on) == str(off)
+
+    def test_join_same_instance_engages(self) -> None:
+        # [A, A] -> list[A]. The fixture TypeInfo uses the full builtins
+        # prefix in str().
+        t = self._container("list", [self.fx.a, self.fx.a])
+        assert t is not None, "Rust container type did not engage"
+        assert str(t) == "builtins.list[A]"
+
+    def test_join_subtype_instance_engages(self) -> None:
+        # [A, object] -> list[object]. The nominal prejoin resolves via
+        # visit_instance_join (A <: object), where the old fold deferred.
+        t = self._container("list", [self.fx.a, self.fx.o])
+        assert t is not None, "Rust container type did not engage"
+        assert str(t) == "builtins.list[builtins.object]"
+
+    def test_join_pair_parity(self) -> None:
+        # Same container literal through the gate-off (pure-Python
+        # join_type_list) and gate-on (Rust seam) paths.
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        items = [self.fx.a, self.fx.o]
+        off = self._with_gate(_set_native_checkexpr_active, False, self._container, "list", items)
+        on = self._container("list", items)
+        assert on is not None, "Rust container type did not engage"
+        assert str(on) == str(off)
+
+    def _with_gate(
+        self,
+        set_active: Any,
+        active: bool,
+        fn: Any,
+        *args: Any,
+    ) -> Type | None:
+        set_active(active)
+        try:
+            return fn(*args)
+        finally:
+            set_active(True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUninhabitedSuite(Suite):
     """Parity suite for the Rust `has_uninhabited_component` and
     `has_ambiguous_uninhabited_component` ports with alias expansion
@@ -22704,3 +22872,138 @@ class NativeTypeRequiresUsageTailSuite(NativeTypeRequiresUsageSuite):
         typ = self.fx.callable(self.fx.anyt, self.fx.nonet)
         self._assert_par(typ, "CallableType")
         self._assert_engages(typ, 2)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckexprJoinAndTupleSuite(Suite):
+    """Parity for the checkexpr `join_one_pair` and `unpack_expand_updated` ports.
+
+    `ExpressionChecker.visit_conditional_expr` and `visit_tuple_expr` consult
+    the Rust checkexpr seams for two previously-deferred decisions: the
+    args-less Instance-Instance nominal prejoin (`join_one_pair`, exposed via
+    `_try_native_conditional_expr_join`) and the lone `Tuple[*tuple[X, ...]]`
+    normalization (`unpack_expand_updated`, exposed via
+    `_try_native_build_tuple_type`). Toggling the checkexpr gate on vs off
+    must keep the visible result identical to the pure-Python twins
+    (`join.join_types` / `expand_type`), and the decided cases must engage
+    (return a type instead of deferring).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self.typeinfo_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(self.typeinfo_map)
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        _set_native_checkexpr_resolver(self._resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _join_native(self, if_type: Type, else_type: Type) -> str | None:
+        from mypy.checkexpr import (
+            _deserialize_type_from_checkexpr,
+            _serialize_type_for_checkexpr,
+            _try_native_conditional_expr_join,
+        )
+
+        raw = _try_native_conditional_expr_join(
+            _serialize_type_for_checkexpr(if_type),
+            _serialize_type_for_checkexpr(else_type),
+        )
+        if raw is None:
+            return None
+        decoded = _deserialize_type_from_checkexpr(raw)
+        return str(decoded) if decoded is not None else None
+
+    def _join_python(self, if_type: Type, else_type: Type) -> str:
+        from mypy.join import join_types
+
+        return str(join_types(if_type, else_type))
+
+    def _tuple_native(self, items: list[Type], seen_unpack: bool) -> str | None:
+        from mypy.checkexpr import _try_native_build_tuple_type
+
+        result = _try_native_build_tuple_type(items, seen_unpack)
+        return str(result) if result is not None else None
+
+    def _tuple_python(self, items: list[Type], seen_unpack: bool) -> str:
+        from mypy.expandtype import expand_type
+        from mypy.types import TupleType
+
+        fallback = self.fx.std_tuple
+        result: Type = TupleType(items, fallback)
+        if seen_unpack:
+            result = expand_type(result, {})
+        return str(result)
+
+    def _assert_join_parity(self, if_t: Type, else_t: Type, engage: bool) -> None:
+        native = self._join_native(if_t, else_t)
+        python = self._join_python(if_t, else_t)
+        if engage:
+            assert native is not None, f"join({if_t}, {else_t}) did not engage"
+        assert native is None or native == python, (
+            f"join({if_t}, {else_t}): native {native!r} != python {python!r}"
+        )
+
+    def _assert_tuple_parity(self, items: list[Type], seen_unpack: bool, engage: bool) -> None:
+        native = self._tuple_native(items, seen_unpack)
+        python = self._tuple_python(items, seen_unpack)
+        if engage:
+            assert native is not None, "tuple build did not engage"
+        assert native is None or native == python, (
+            f"tuple {[str(i) for i in items]} unpack={seen_unpack}: "
+            f"native {native!r} != python {python!r}"
+        )
+
+    def test_join_same_type_engages(self) -> None:
+        self._assert_join_parity(self.fx.a, self.fx.a, engage=True)
+
+    def test_join_subtype_pair_engages(self) -> None:
+        # B <: A; join(A, B) = A. Previously the args-less Instance-Instance
+        # nominal pair deferred to Python.
+        self._assert_join_parity(self.fx.a, self.fx.b, engage=True)
+
+    def test_join_common_ancestor_engages(self) -> None:
+        # B and C both derive from A; join(B, C) = A. Previously deferred.
+        self._assert_join_parity(self.fx.b, self.fx.c, engage=True)
+
+    def test_join_unrelated_instances_defer_or_union(self) -> None:
+        # E and D are unrelated branches of object; join_types decides via
+        # join_instances. Whichever way the seam resolves, it must match.
+        self._assert_join_parity(self.fx.e, self.fx.d, engage=False)
+
+    def test_join_instances_with_args(self) -> None:
+        # Args-bearing Instances (List[A], List[B]) skip the args-less
+        # prejoin. Parity must hold on the general join_types fallback.
+        self._assert_join_parity(self.fx.lsta, self.fx.lstb, engage=False)
+
+    def test_unpack_single_tuple_instance_normalizes(self) -> None:
+        # Tuple[*tuple[A, ...]] expands to the tuple[A, ...] Instance.
+        # Previously this whole path deferred (seen_unpack -> None).
+        unpack = UnpackType(Instance(self.fx.std_tuplei, [self.fx.a]))
+        self._assert_tuple_parity([unpack], seen_unpack=True, engage=True)
+
+    def test_unpack_multi_items_identity(self) -> None:
+        # More than one item: the expansion is the identity; the TupleType
+        # is returned as-is.
+        unpack = UnpackType(Instance(self.fx.std_tuplei, [self.fx.b]))
+        self._assert_tuple_parity([self.fx.a, unpack], seen_unpack=True, engage=True)
+
+    def test_no_unpack_plain_tuple(self) -> None:
+        self._assert_tuple_parity([self.fx.a, self.fx.b], seen_unpack=False, engage=True)
