@@ -23140,3 +23140,315 @@ class NativeCheckcallSetopsDeferSuite(Suite):
 
         result = _type_kernel.rust_real_union(_serialize_type_for_checkexpr(tvar), True)
         assert result is not None and result is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeGeneratorReturnTypeSuite(Suite):
+    """Parity for the checker generator/coroutine return-type cluster (generators.rs, #434).
+
+    The six `TypeChecker` methods (`is_generator_return_type`,
+    `is_async_generator_return_type`, `get_generator_yield_type`,
+    `get_generator_receive_type`, `get_generator_return_type`,
+    `get_coroutine_return_type`) are Rust-ported behind the
+    `_native_checker_types_active` + `_native_checker_resolver` gate. This
+    suite locks in the parity: calling the real methods on a bare checker
+    (built via `TypeChecker.__new__`) with the gate off (pure Python) and on
+    (Rust seam) must give identical results, the direct Rust seams must
+    engage (return a decision) rather than silently defer on the decided
+    cases, and TypeAliasType inputs must defer to Python (the wire carries no
+    alias target; Python expands via `get_proper_type`).
+
+    #855 deferral audit: every remaining defer in `generators.rs` is
+    non-wire-portable. `get_proper_or_defer` / `encode_type` defer on
+    TypeAliasType (no alias target on the wire; a poisoned alias across the
+    seam crashes, see checker_stmts.rs); `decode_type` defers on wire decode
+    failure; `get_coroutine_return_type_inner`'s non-Instance tail defers
+    because Python asserts Instance; the union arms defer through
+    `make_simplified_union` (setops-owned: alias flatten, recursive
+    `is_subtype` None, literal contraction); the `is_*` classification
+    propagates those `is_subtype` defers (TypeAliasType operands, missing
+    snapshots, protocol/variadic/named-tuple rights, ParamSpec/TVT-kinded
+    nominal args, `map_instance_to_supertype` failures, FunctionLike rights,
+    TypeType metaclass paths). No portable sites remain; the generator
+    cluster is fully native.
+    """
+
+    # typing parametrization: Generator/Coroutine take 3 covariant params,
+    # AsyncGenerator 2, Awaitable 1; AwaitableGenerator is matched by the
+    # exact `type_ref` string, so it needs no resolver snapshot.
+    _GEN_PARAMS = 3
+    _AGEN_PARAMS = 2
+    _AWAIT_PARAMS = 1
+    _CORO_PARAMS = 3
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_resolver,
+            _set_native_checker_types_active,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.geni = self.fx.make_type_info(
+            "typing.Generator",
+            mro=[self.fx.oi],
+            typevars=["T", "T2", "T3"],
+            variances=[COVARIANT] * self._GEN_PARAMS,
+        )
+        self.ageni = self.fx.make_type_info(
+            "typing.AsyncGenerator",
+            mro=[self.fx.oi],
+            typevars=["T", "T2"],
+            variances=[COVARIANT] * self._AGEN_PARAMS,
+        )
+        self.awaiti = self.fx.make_type_info(
+            "typing.Awaitable",
+            mro=[self.fx.oi],
+            typevars=["T"],
+            variances=[COVARIANT] * self._AWAIT_PARAMS,
+        )
+        self.coroi = self.fx.make_type_info(
+            "typing.Coroutine",
+            mro=[self.fx.oi],
+            typevars=["T", "T2", "T3"],
+            variances=[COVARIANT] * self._CORO_PARAMS,
+        )
+        # AwaitableGenerator: no type vars; matched by fullname string alone.
+        self.awgi = self.fx.make_type_info("typing.AwaitableGenerator", mro=[self.fx.oi])
+
+        types_to_resolve: list[TypeInfo] = [
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.oi,
+            self.fx.str_type_info,
+            self.geni,
+            self.ageni,
+            self.awaiti,
+            self.coroi,
+            self.awgi,
+        ]
+        self.typeinfo_map = {info.fullname: info for info in types_to_resolve}
+        set_wire_typeinfo_map(self.typeinfo_map)
+        self.resolver = _type_kernel.build_native_resolver(types_to_resolve, [])
+        self._set_active = _set_native_checker_types_active
+        self._set_resolver = _set_native_checker_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _chk(self) -> TypeChecker:
+        from mypy.checker import TypeChecker
+
+        chk = TypeChecker.__new__(TypeChecker)
+        infos = {
+            "typing.Awaitable": self.awaiti,
+            "typing.Generator": self.geni,
+            "typing.AsyncGenerator": self.ageni,
+        }
+
+        def lookup_typeinfo(fullname: str) -> TypeInfo:
+            if fullname not in infos:
+                raise KeyError(fullname)
+            return infos[fullname]
+
+        # Feedback loop: the gate-off run uses the same fixtures, so the
+        # Python classifier, the shims, and the wire resolver all agree.
+        chk.lookup_typeinfo = lookup_typeinfo  # type: ignore[method-assign]
+        return chk
+
+    def _gen(self, args: list[Type]) -> Instance:
+        return Instance(self.geni, args)
+
+    def _assert_par(self, typ: Type, is_coroutine: bool, label: str) -> None:
+        chk = self._chk()
+        # is_generator_return_type
+        off = self._with_gate(False, lambda: chk.is_generator_return_type(typ, is_coroutine))
+        on = self._with_gate(True, lambda: chk.is_generator_return_type(typ, is_coroutine))
+        assert_equal(on, off, f"is_generator_return_type parity {label}")
+        # async generator classification
+        off = self._with_gate(False, lambda: chk.is_async_generator_return_type(typ))
+        on = self._with_gate(True, lambda: chk.is_async_generator_return_type(typ))
+        assert_equal(on, off, f"is_async_generator_return_type parity {label}")
+        # the three type extractors
+        for meth in (
+            "get_generator_yield_type",
+            "get_generator_receive_type",
+            "get_generator_return_type",
+        ):
+            off = self._with_gate(False, lambda: getattr(chk, meth)(typ, is_coroutine))
+            on = self._with_gate(True, lambda: getattr(chk, meth)(typ, is_coroutine))
+            assert_equal(str(on), str(off), f"{meth} parity {label}")
+
+    def _assert_par_coroutine(self, typ: Type, label: str) -> None:
+        chk = self._chk()
+        off = self._with_gate(False, lambda: chk.get_coroutine_return_type(typ))
+        on = self._with_gate(True, lambda: chk.get_coroutine_return_type(typ))
+        assert_equal(str(on), str(off), f"get_coroutine_return_type parity {label}")
+
+    def _assert_engages_bool(self, seam: str, typ: Type, is_coroutine: bool, expected: bool) -> None:
+        from mypy.checker import _serialize_type_for_checker
+
+        # rust_is_async_generator_return_type takes just (typ_bytes,
+        # strict_optional, resolver); the other classifiers take the
+        # is_coroutine flag too.
+        if seam == "rust_is_async_generator_return_type":
+            args: tuple[object, ...] = (_serialize_type_for_checker(typ),)
+        else:
+            args = (_serialize_type_for_checker(typ), is_coroutine)
+        result = getattr(_type_kernel, seam)(
+            *args, state.strict_optional, self.resolver
+        )
+        assert result == expected, (
+            f"{seam}({typ}, coroutine={is_coroutine}) = {result!r}, expected {expected!r}"
+        )
+
+    def _assert_engages_type(
+        self,
+        seam: str,
+        typ: Type,
+        is_coroutine: bool,
+        expected: str,
+    ) -> None:
+        from mypy.checker import _deserialize_type_from_checker, _serialize_type_for_checker
+
+        if seam == "rust_get_coroutine_return_type":
+            # Pure Type-in/Type-out: no classification, no resolver.
+            blob = _type_kernel.rust_get_coroutine_return_type(
+                _serialize_type_for_checker(typ)
+            )
+        else:
+            blob = getattr(_type_kernel, seam)(
+                _serialize_type_for_checker(typ),
+                is_coroutine,
+                state.strict_optional,
+                self.resolver,
+            )
+        assert blob is not None, f"{seam}({typ}) deferred"
+        result = str(_deserialize_type_from_checker(bytes(blob)))
+        assert_equal(result, expected, f"{seam}({typ})")
+
+    def test_generator_result_type_par(self) -> None:
+        # Generator[int, str, bool]: ty=int, tc=str, tr=bool. All three
+        # extractors engage (same type_ref nominal decision).
+        typ = self._gen([self.fx.a, self.fx.b, self.fx.str_type])
+        self._assert_par(typ, False, "generator-result")
+        self._assert_engages_type("rust_get_generator_yield_type", typ, False, str(self.fx.a))
+        self._assert_engages_type("rust_get_generator_receive_type", typ, False, str(self.fx.b))
+        self._assert_engages_type("rust_get_generator_return_type", typ, False, str(self.fx.str_type))
+
+    def test_generator_any_args_par(self) -> None:
+        # Generator[Any, Any, Any]: subclass matching is decidable and the
+        # extractors return the Any args via the args-not-empty branches.
+        typ = self._gen([self.fx.anyt, self.fx.anyt, self.fx.anyt])
+        self._assert_par(typ, False, "generator-any")
+        self._assert_engages_type("rust_get_generator_yield_type", typ, False, "Any")
+        self._assert_engages_type("rust_get_generator_receive_type", typ, False, "Any")
+        self._assert_engages_type("rust_get_generator_return_type", typ, False, "Any")
+
+    def test_awaitable_coroutine_par(self) -> None:
+        # Awaitable[int] (coroutine): ty=Any, tc=Any, tr=int.
+        typ = Instance(self.awaiti, [self.fx.a])
+        self._assert_par(typ, True, "awaitable-coroutine")
+        self._assert_engages_type("rust_get_generator_yield_type", typ, True, "Any")
+        self._assert_engages_type("rust_get_generator_receive_type", typ, True, "Any")
+        self._assert_engages_type("rust_get_generator_return_type", typ, True, str(self.fx.a))
+
+    def test_awaitable_generator_matches_par(self) -> None:
+        # AwaitableGenerator is the exact-fullname branch; both coroutine and
+        # non-coroutine classify it as a generator return.
+        typ = Instance(self.awgi, [self.fx.a])
+        self._assert_par(typ, False, "awaitable-generator")
+        self._assert_par(typ, True, "awaitable-generator-coroutine")
+
+    def test_async_generator_par(self) -> None:
+        # yield=int, receive=str; the one-sided `tr` tail (no async
+        # alternative, checker.py:1541) yields Any(from_error) for a bare
+        # AsyncGenerator while receive reads args[1].
+        typ = Instance(self.ageni, [self.fx.a, self.fx.str_type])
+        self._assert_par(typ, False, "async-generator")
+        self._assert_engages_type("rust_get_generator_yield_type", typ, False, str(self.fx.a))
+        self._assert_engages_type("rust_get_generator_receive_type", typ, False, str(self.fx.str_type))
+        self._assert_engages_type("rust_get_generator_return_type", typ, False, "Any")
+
+    def test_non_generator_any_from_error(self) -> None:
+        # A plain class is not a generator return; the extractors fall to
+        # Any(from_error). The classification probes need the right-side
+        # snapshots (builtins.A, typing.Generator, ...) to decide.
+        typ = Instance(self.fx.ai, [])
+        self._assert_par(typ, False, "plain-A")
+        self._assert_engages_type("rust_get_generator_yield_type", typ, False, "Any")
+        self._assert_engages_type("rust_get_generator_receive_type", typ, False, "Any")
+        self._assert_engages_type("rust_get_generator_return_type", typ, False, "Any")
+
+    def test_union_yield_recurses(self) -> None:
+        # Union[Generator[int, Any, Any], str]: the Generator branch yields
+        # int, the non-generator branch Any(from_error), simplified back to
+        # Union[int, Any] (portable recursive make_simplified_union).
+        typ = UnionType(
+            [self._gen([self.fx.a, self.fx.anyt, self.fx.anyt]), self.fx.str_type]
+        )
+        self._assert_par(typ, False, "union-yield")
+        from mypy.checker import _deserialize_type_from_checker, _serialize_type_for_checker
+
+        blob = _type_kernel.rust_get_generator_yield_type(
+            _serialize_type_for_checker(typ),
+            False,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert blob is not None, "rust_get_generator_yield_type(union) deferred"
+        result = str(_deserialize_type_from_checker(bytes(blob)))
+        assert_equal(result, "A | Any", "union yield")
+
+    def test_alias_defers_to_python(self) -> None:
+        # TypeAliasType: the wire has no alias target, so every generators.rs
+        # seam defers and Python expands via `get_proper_type`. Gate-off and
+        # gate-on must still agree.
+        alias_typ = self.fx.non_rec_alias(self._gen([self.fx.a, self.fx.b, self.fx.str_type]))
+        self._assert_par(alias_typ, False, "alias")
+        from mypy.checker import _serialize_type_for_checker
+
+        for seam in (
+            "rust_is_generator_return_type",
+            "rust_is_async_generator_return_type",
+            "rust_get_generator_yield_type",
+            "rust_get_generator_receive_type",
+            "rust_get_generator_return_type",
+        ):
+            # rust_is_async_generator_return_type has no is_coroutine param.
+            if seam == "rust_is_async_generator_return_type":
+                args: tuple[object, ...] = (_serialize_type_for_checker(alias_typ),)
+            else:
+                args = (_serialize_type_for_checker(alias_typ), False)
+            result = getattr(_type_kernel, seam)(
+                *args, state.strict_optional, self.resolver
+            )
+            assert result is None, f"{seam}(alias) should defer, got {result!r}"
+        # get_coroutine_return_type: pure Type-in/Type-out, deferred on the
+        # alias target just like the five classifier/extractor seams.
+        assert _type_kernel.rust_get_coroutine_return_type(
+            _serialize_type_for_checker(alias_typ)
+        ) is None, "rust_get_coroutine_return_type(alias) should defer"
+
+    def test_coroutine_return_type_par(self) -> None:
+        # Coroutine[Any, Any, int]: tr = args[2]. get_coroutine_return_type
+        # is pure Type-in/Type-out (no classification, no resolver).
+        typ = Instance(self.coroi, [self.fx.anyt, self.fx.anyt, self.fx.a])
+        self._assert_par_coroutine(typ, "coroutine-return")
+        self._assert_engages_type(
+            "rust_get_coroutine_return_type", typ, True, str(self.fx.a)
+        )
