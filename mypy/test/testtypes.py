@@ -3105,6 +3105,181 @@ class NativeJoinTypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinTypeListSuite(Suite):
+    """Parity suite for the Rust `rust_join_type_list` fold
+    (join.py:1508-1529, the join_type_list native hook).
+
+    With the native join gate on, `join_type_list` serializes the whole
+    list and lets Rust fold it through the setops join kernel
+    (`join_one_pair`, checker_helpers.rs). Rust returns `None`
+    (whole-call defer) on any LKV / fallback_to_any item, a
+    non-identity-safe single item, or any undecidable pair; Python then
+    re-runs the pure-Python fold, so every result matches Python.
+
+    Every test runs a gate-off vs gate-on differential on
+    `str(join_type_list(...))`; the portable cases also require the
+    direct seam to engage (non-None).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _join(self, active: bool, *types: Type) -> Type:
+        import mypy.join
+        from mypy.join import join_type_list
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            with state.strict_optional_set(True):
+                return join_type_list(list(types))
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def _seam(self, *types: Type) -> bytes | None:
+        from mypy.join import _serialize_type
+
+        return _type_kernel.rust_join_type_list(
+            [_serialize_type(t) for t in types], True, self.resolver
+        )
+
+    def _assert_parity(self, engage: bool, *types: Type) -> None:
+        from mypy.join import _deserialize_type
+
+        py = self._join(False, *types)
+        native = self._join(True, *types)
+        assert str(native) == str(py), f"{types}: native {native!r} != py {py!r}"
+        seam = self._seam(*types)
+        if engage:
+            assert seam is not None, f"{types}: seam did not engage"
+            decoded = _deserialize_type(bytes(seam))
+            assert decoded is not None
+            assert str(decoded) == str(py), f"{types}: seam {decoded!r} != py {py!r}"
+        else:
+            assert seam is None, f"{types}: seam should defer"
+
+    def test_join_type_list_empty_returns_uninhabited(self) -> None:
+        from mypy.types import UninhabitedType
+
+        py = self._join(False)
+        assert isinstance(py, UninhabitedType)
+        self._assert_parity(True)
+
+    def test_join_type_list_single_item(self) -> None:
+        self._assert_parity(True, self.fx.a)
+
+    def test_join_type_list_same_pair(self) -> None:
+        self._assert_parity(True, self.fx.a, self.fx.a)
+
+    def test_join_type_list_subtype_pair(self) -> None:
+        # A <: object -> the join is object.
+        self._assert_parity(True, self.fx.a, self.fx.o)
+
+    def test_join_type_list_incomparable_common_ancestor(self) -> None:
+        # Unrelated A and B join to their common ancestor (object).
+        self._assert_parity(True, self.fx.a, self.fx.b)
+
+    def test_join_type_list_union_item(self) -> None:
+        # join(A, A | None) -> A | None (A <: the union, join.py:432).
+        self._assert_parity(
+            True, self.fx.a, UnionType([self.fx.a, self.fx.nonet])
+        )
+
+    def test_join_type_list_leading_none(self) -> None:
+        # join(None, A) strict -> A | None; the fold must NOT skip the
+        # leading None (the old conservative fold did).
+        self._assert_parity(True, self.fx.nonet, self.fx.a)
+
+    def test_join_type_list_any_absorption(self) -> None:
+        self._assert_parity(True, self.fx.anyt, self.fx.a)
+
+    def test_join_type_list_typevar_item(self) -> None:
+        # join(A, T) -> default(A) = object (join.py:546).
+        self._assert_parity(True, self.fx.a, self.fx.t)
+
+    def test_join_type_list_identical_callables(self) -> None:
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function
+        )
+        self._assert_parity(True, c1, c1)
+
+    def test_join_type_list_named_similar_callables(self) -> None:
+        # Similar but not equivalent callables (different kwarg names):
+        # the fold copies the last element's shape; the `definition`
+        # restore is covered by the check-inference test suite.
+        ca = CallableType(
+            [self.fx.a], [ARG_NAMED], ["k"], self.fx.a, self.fx.function
+        )
+        cb = CallableType(
+            [self.fx.a], [ARG_NAMED], ["m"], self.fx.a, self.fx.function
+        )
+        self._assert_parity(True, ca, cb)
+
+    def test_join_type_list_lkv_defers(self) -> None:
+        # A Literal-typed item carries a last_known_value; Rust defers
+        # the whole call (has_lkv guard) and Python joins via the
+        # literal's fallback instance.
+        self._assert_parity(False, self.fx.lit1, self.fx.a)
+
+    def test_rust_seam_engages_on_basic_cases(self) -> None:
+        # Engagement measurement for the join_type_list seam: how many
+        # representative pairs the Rust fold decides (non-None).
+        cases = [
+            [self.fx.a, self.fx.a],
+            [self.fx.a, self.fx.o],
+            [self.fx.a, self.fx.b],
+            [self.fx.a, self.fx.nonet],
+            [self.fx.anyt, self.fx.a],
+            [self.fx.a, self.fx.t],
+        ]
+        c1 = CallableType(
+            [self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function
+        )
+        cases.append([c1, c1])
+        engaged = sum(1 for ts in cases if self._seam(*ts) is not None)
+        assert engaged >= 6, f"seam engaged on only {engaged}/{len(cases)} cases"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMatchGenericCallablesSuite(Suite):
     """Parity suite for the Rust `match_generic_callables` id-renumbering
     port (join.py:1152-1180, freshen.rs).
@@ -4389,9 +4564,9 @@ class NativeMapInstanceToSupertypesSuite(Suite):
         )
 
     def test_per_member_deferral_sentinel(self) -> None:
-        # Per-member deferral sentinel: Rust returns a parallel flags
-        # Vec (true = mapped, false = re-run in Python). G[Ts] defers
-        # (type-var-tuple guard); G[A] maps natively. Flags: [False, True].
+        # Per-member deferral sentinel: Rust returns a parallel flags Vec
+        # (true = mapped, false = re-run in Python); Variadic G[Ts] defers,
+        # G[A] maps. Flags are [False, True].
         import type_kernel as _tk
 
         from mypy.maptype import _WriteBuffer

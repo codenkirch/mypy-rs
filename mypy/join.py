@@ -1516,6 +1516,13 @@ def join_type_list(types: Sequence[Type]) -> Type:
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
                 if decoded is not None:
+                    # Wire format omits `definition`; message formatting
+                    # needs it for callee names. The last element of the
+                    # fold supplies it, so restore it from the live one.
+                    if isinstance(decoded, CallableType) and len(types) >= 2:
+                        last = get_proper_type(types[-1])
+                        if isinstance(last, CallableType):
+                            decoded = decoded.copy_modified(definition=last.definition)
                     return decoded
         except (AssertionError, NotImplementedError, ValueError, AttributeError):
             pass
