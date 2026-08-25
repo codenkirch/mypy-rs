@@ -4406,11 +4406,17 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         if not plausible_targets or not arg_types:
             return False
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+        ):
             try:
                 arg_type_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
                 target_bytes = [_serialize_type_for_checkexpr(c) for c in plausible_targets]
-                result = _rust_possible_none_type_var_overlap(arg_type_bytes, target_bytes)
+                result = _rust_possible_none_type_var_overlap(
+                    _native_checkexpr_resolver, arg_type_bytes, target_bytes
+                )
                 if result is not None:
                     return result
             except (AssertionError, NotImplementedError, ValueError):
@@ -4539,10 +4545,16 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return result
 
     def real_union(self, typ: Type) -> bool:
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+        ):
             try:
                 type_bytes = _serialize_type_for_checkexpr(typ)
-                result = _rust_real_union(type_bytes, state.strict_optional)
+                result = _rust_real_union(
+                    _native_checkexpr_resolver, type_bytes, state.strict_optional
+                )
                 if result is not None:
                     return result
             except (AssertionError, NotImplementedError, ValueError):

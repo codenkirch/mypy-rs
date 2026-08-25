@@ -360,19 +360,31 @@ impl CallableBase {
 /// a "real" union has more than one relevant item. When `strict_optional`
 /// is False, NoneType items are stripped from the union before counting
 /// (mirrors `UnionType.relevant_items`). Returns None on wire/decode
-/// failure or TypeAliasType (unresolved alias target).
+/// failure or on an unresolvable TypeAliasType (missing alias snapshot /
+/// substitution the kernel cannot perform); a resolvable alias expands
+/// through the alias resolver, mirroring Python's `get_proper_type`.
 #[pyfunction]
-pub(crate) fn rust_real_union(type_bytes: &[u8], strict_optional: bool) -> Option<bool> {
+pub(crate) fn rust_real_union(
+    resolver: &crate::typeinfo::NativeTypeResolver,
+    type_bytes: &[u8],
+    strict_optional: bool,
+) -> Option<bool> {
     let mut buf = ReadBuffer::new(type_bytes);
     let typ = read_type(&mut buf, None).ok()?;
-    real_union(&typ, strict_optional)
+    real_union(&typ, strict_optional, resolver.alias_resolver())
 }
 
 /// Mirror of `checkexpr.real_union` (checkexpr.py:4541-4550).
-/// TypeAliasType resolves first in Python, so the wire alias defers (None);
-/// a non-Union proper type incl. a union-bound TypeVar is Some(false).
-fn real_union(typ: &Type, strict_optional: bool) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
+/// A top-level TypeAliasType expands through the alias resolver exactly
+/// like Python's `typ = get_proper_type(typ)`, so an alias resolving to a
+/// union is counted; an unresolvable alias or a non-Union proper type
+/// incl. a union-bound TypeVar is Some(false).
+fn real_union(
+    typ: &Type,
+    strict_optional: bool,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let proper = crate::checkexpr_functions::get_proper_or_expand(typ, aliases)?;
     match proper {
         Type::UnionType { items, .. } => {
             let count = if strict_optional {
@@ -394,12 +406,17 @@ fn real_union(typ: &Type, strict_optional: bool) -> Option<bool> {
 /// forced. Returns True when an argument is a union containing NoneType
 /// AND some plausible overload target has a NoneType formal while another
 /// has a TypeVarType formal at the same position. Returns None on any
-/// wire/decode failure or TypeAliasType in the inputs.
+/// wire/decode failure or an unresolvable TypeAliasType (the Python
+/// mirror resolves aliases with `get_proper_types` / `get_proper_type`
+/// before the checks; missing snapshot defers).
 ///
 /// Inputs are serialized arg_types and plausible_targets (CallableType
-/// list). The Python caller passes already-proper types.
+/// list). The Python caller passes already-proper types, but a
+/// TypeAliasType may still appear (e.g. a formal typed with an alias);
+/// the resolver expands it.
 #[pyfunction]
 pub(crate) fn rust_possible_none_type_var_overlap(
+    resolver: &crate::typeinfo::NativeTypeResolver,
     arg_type_bytes: Vec<Vec<u8>>,
     target_bytes: Vec<Vec<u8>>,
 ) -> Option<bool> {
@@ -413,20 +430,25 @@ pub(crate) fn rust_possible_none_type_var_overlap(
         let mut buf = ReadBuffer::new(bytes);
         targets.push(read_type(&mut buf, None).ok()?);
     }
-    possible_none_type_var_overlap(&arg_types, &targets)
+    possible_none_type_var_overlap(&arg_types, &targets, resolver.alias_resolver())
 }
 
-fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Option<bool> {
+fn possible_none_type_var_overlap(
+    arg_types: &[Type],
+    targets: &[Type],
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
     if targets.is_empty() || arg_types.is_empty() {
         return Some(false);
     }
     // Step 1: check if any arg_type is a union containing NoneType.
+    // Python resolves each arg and each union item with `get_proper_types`.
     let mut has_optional_arg = false;
     for arg_type in arg_types {
-        let proper = get_proper_or_none(arg_type)?;
-        if let Type::UnionType { items, .. } = proper {
+        let proper = crate::checkexpr_functions::get_proper_or_expand(arg_type, aliases)?;
+        if let Type::UnionType { items, .. } = &proper {
             for item in items {
-                let item_proper = get_proper_or_none(item)?;
+                let item_proper = crate::checkexpr_functions::get_proper_or_expand(item, aliases)?;
                 if matches!(item_proper, Type::NoneType) {
                     has_optional_arg = true;
                     break;
@@ -440,14 +462,16 @@ fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Optio
     if !has_optional_arg {
         return Some(false);
     }
-    // Step 2: find min prefix length across all target arg_types.
+    // Step 2: find min prefix length across all target arg_types. Python
+    // does not resolve the target itself (it is a CallableType), so only
+    // the formal types inside are resolved.
     let mut min_prefix = usize::MAX;
     for target in targets {
-        let proper = get_proper_or_none(target)?;
+        let proper = crate::checkexpr_functions::get_proper_or_expand(target, aliases)?;
         let Type::CallableType {
             arg_types: t_arg_types,
             ..
-        } = proper
+        } = &proper
         else {
             return None;
         };
@@ -459,21 +483,23 @@ fn possible_none_type_var_overlap(arg_types: &[Type], targets: &[Type]) -> Optio
         return Some(false);
     }
     // Step 3: for each position, check if some target has NoneType and
-    // another has TypeVarType at that position.
+    // another has TypeVarType at that position (mirrors Python's
+    // `get_proper_type(c.arg_types[i])`).
     for i in 0..min_prefix {
         let mut has_none = false;
         let mut has_typevar = false;
         for target in targets {
-            let proper = get_proper_or_none(target)?;
+            let proper = crate::checkexpr_functions::get_proper_or_expand(target, aliases)?;
             let Type::CallableType {
                 arg_types: t_arg_types,
                 ..
-            } = proper
+            } = &proper
             else {
                 return None;
             };
-            let formal = get_proper_or_none(&t_arg_types[i])?;
-            match formal {
+            let formal =
+                crate::checkexpr_functions::get_proper_or_expand(&t_arg_types[i], aliases)?;
+            match &formal {
                 Type::NoneType => has_none = true,
                 Type::TypeVarType { .. } => has_typevar = true,
                 _ => {}
@@ -1424,114 +1450,219 @@ mod tests {
         buf.into_bytes()
     }
 
+    fn empty_resolver() -> crate::typeinfo::NativeTypeResolver {
+        crate::typeinfo::NativeTypeResolver::new(
+            crate::typeinfo::TypeResolver::new(),
+            crate::aliases::TypeAliasResolver::new(),
+        )
+    }
+
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn resolver_with_alias(alias: &str, target: &Type) -> crate::typeinfo::NativeTypeResolver {
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(alias.to_string(), alias_snap(alias, target));
+        crate::typeinfo::NativeTypeResolver::new(crate::typeinfo::TypeResolver::new(), aliases)
+    }
+
+    fn alias_type(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn real_union_bytes(typ: &Type, strict_optional: bool) -> Option<bool> {
+        rust_real_union(&empty_resolver(), &encode(typ), strict_optional)
+    }
+
+    fn overlap_bytes(args: &[Type], targets: &[Type]) -> Option<bool> {
+        rust_possible_none_type_var_overlap(
+            &empty_resolver(),
+            args.iter().map(encode).collect(),
+            targets.iter().map(encode).collect(),
+        )
+    }
+
     #[test]
     fn real_union_non_union_returns_false() {
         let t = any_type();
-        assert_eq!(rust_real_union(&encode(&t), true), Some(false));
+        assert_eq!(real_union_bytes(&t, true), Some(false));
     }
 
     #[test]
     fn real_union_single_item_returns_false() {
         let t = union_of(vec![any_type()]);
-        assert_eq!(rust_real_union(&encode(&t), true), Some(false));
+        assert_eq!(real_union_bytes(&t, true), Some(false));
     }
 
     #[test]
     fn real_union_multi_item_returns_true() {
         let t = union_of(vec![any_type(), instance()]);
-        assert_eq!(rust_real_union(&encode(&t), true), Some(true));
+        assert_eq!(real_union_bytes(&t, true), Some(true));
     }
 
     #[test]
     fn real_union_strips_none_when_not_strict() {
         // Union[int, None] with strict_optional=False: relevant = [int], count=1 -> false
         let t = union_of(vec![instance(), none_type()]);
-        assert_eq!(rust_real_union(&encode(&t), false), Some(false));
+        assert_eq!(real_union_bytes(&t, false), Some(false));
     }
 
     #[test]
     fn real_union_keeps_none_when_strict() {
         // Union[int, None] with strict_optional=True: relevant = [int, None], count=2 -> true
         let t = union_of(vec![instance(), none_type()]);
-        assert_eq!(rust_real_union(&encode(&t), true), Some(true));
+        assert_eq!(real_union_bytes(&t, true), Some(true));
     }
 
     #[test]
-    fn none_overlap_empty_args_returns_false() {
+    fn real_union_alias_to_union_resolves() {
+        // T = Union[A, B]; real_union(T) counts the two items -> true.
+        let t = union_of(vec![any_type(), instance()]);
+        let res = resolver_with_alias("mod.T", &t);
         assert_eq!(
-            rust_possible_none_type_var_overlap(vec![], vec![encode(&callable(0))]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn none_overlap_no_targets_returns_false() {
-        assert_eq!(
-            rust_possible_none_type_var_overlap(vec![encode(&any_type())], vec![]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn none_overlap_no_union_arg_returns_false() {
-        let arg = encode(&any_type());
-        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
-        assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn none_overlap_union_without_none_returns_false() {
-        let arg = encode(&union_of(vec![any_type(), instance()]));
-        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
-        assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn none_overlap_union_with_none_no_typevar_returns_false() {
-        let arg = encode(&union_of(vec![instance(), none_type()]));
-        let target = encode(&callable_with_args(vec![none_type(), any_type()]));
-        assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn none_overlap_union_with_none_and_typevar_returns_true() {
-        let arg = encode(&union_of(vec![instance(), none_type()]));
-        let target1 = encode(&callable_with_args(vec![none_type()]));
-        let target2 = encode(&callable_with_args(vec![type_var()]));
-        assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target1, target2]),
+            rust_real_union(&res, &encode(&alias_type("mod.T")), true),
             Some(true)
         );
     }
 
     #[test]
-    fn none_overlap_single_target_none_and_typevar_different_pos_returns_false() {
-        // NoneType at pos 0, TypeVar at pos 1: neither position has both.
-        let arg = encode(&union_of(vec![instance(), none_type()]));
-        let target = encode(&callable_with_args(vec![none_type(), type_var()]));
+    fn real_union_alias_to_single_union_false() {
+        // T = Union[A]; real_union(T) -> one relevant item -> false.
+        let t = union_of(vec![any_type()]);
+        let res = resolver_with_alias("mod.T", &t);
         assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target]),
+            rust_real_union(&res, &encode(&alias_type("mod.T")), true),
             Some(false)
         );
     }
 
     #[test]
-    fn none_overlap_typevar_in_different_position_returns_false() {
-        let arg = encode(&union_of(vec![instance(), none_type()]));
-        let target1 = encode(&callable_with_args(vec![none_type(), any_type()]));
-        let target2 = encode(&callable_with_args(vec![any_type(), type_var()]));
+    fn real_union_alias_missing_snapshot_defers() {
+        // No snapshot for mod.T: the expansion cannot resolve -> defer.
         assert_eq!(
-            rust_possible_none_type_var_overlap(vec![arg], vec![target1, target2]),
+            rust_real_union(&empty_resolver(), &encode(&alias_type("mod.T")), true),
+            None
+        );
+    }
+
+    #[test]
+    fn real_union_alias_to_non_union_false() {
+        // T = A (non-union); after expansion the result is Some(false).
+        let res = resolver_with_alias("mod.T", &instance());
+        assert_eq!(
+            rust_real_union(&res, &encode(&alias_type("mod.T")), true),
             Some(false)
+        );
+    }
+
+    #[test]
+    fn none_overlap_empty_args_returns_false() {
+        assert_eq!(overlap_bytes(&[], &[callable(0)]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_no_targets_returns_false() {
+        assert_eq!(overlap_bytes(&[any_type()], &[]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_no_union_arg_returns_false() {
+        let arg = any_type();
+        let target = callable_with_args(vec![none_type(), type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_union_without_none_returns_false() {
+        let arg = union_of(vec![any_type(), instance()]);
+        let target = callable_with_args(vec![none_type(), type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_union_with_none_no_typevar_returns_false() {
+        let arg = union_of(vec![instance(), none_type()]);
+        let target = callable_with_args(vec![none_type(), any_type()]);
+        assert_eq!(overlap_bytes(&[arg], &[target]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_union_with_none_and_typevar_returns_true() {
+        let arg = union_of(vec![instance(), none_type()]);
+        let target1 = callable_with_args(vec![none_type()]);
+        let target2 = callable_with_args(vec![type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target1, target2]), Some(true));
+    }
+
+    #[test]
+    fn none_overlap_single_target_none_and_typevar_different_pos_returns_false() {
+        // NoneType at pos 0, TypeVar at pos 1: neither position has both.
+        let arg = union_of(vec![instance(), none_type()]);
+        let target = callable_with_args(vec![none_type(), type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_typevar_in_different_position_returns_false() {
+        let arg = union_of(vec![instance(), none_type()]);
+        let target1 = callable_with_args(vec![none_type(), any_type()]);
+        let target2 = callable_with_args(vec![any_type(), type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target1, target2]), Some(false));
+    }
+
+    #[test]
+    fn none_overlap_alias_arg_to_union_resolves() {
+        // T = Union[A, None]; overlap(T, [None], [T'var]) -> NoneType present
+        // after expansion, a target has NoneType / another a TypeVar -> true.
+        let arg_union = union_of(vec![instance(), none_type()]);
+        let arg_alias = alias_type("mod.T");
+        let res = resolver_with_alias("mod.T", &arg_union);
+        let target1 = callable_with_args(vec![none_type()]);
+        let target2 = callable_with_args(vec![type_var()]);
+        assert_eq!(
+            rust_possible_none_type_var_overlap(
+                &res,
+                vec![encode(&arg_alias)],
+                vec![encode(&target1), encode(&target2)],
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn none_overlap_alias_missing_snapshot_defers() {
+        // Alias with no snapshot: the expansion defers.
+        let arg = alias_type("mod.T");
+        let target1 = callable_with_args(vec![none_type()]);
+        let target2 = callable_with_args(vec![type_var()]);
+        assert_eq!(overlap_bytes(&[arg], &[target1, target2]), None);
+    }
+
+    #[test]
+    fn none_overlap_alias_formal_resolves() {
+        // A formal typed as an alias expands to NoneType; another formal is
+        // a TypeVarType -> the None+TypeVar overlap is found at that pos.
+        let res = resolver_with_alias("mod.N", &none_type());
+        let arg = union_of(vec![instance(), none_type()]);
+        let target1 = callable_with_args(vec![alias_type("mod.N")]);
+        let target2 = callable_with_args(vec![type_var()]);
+        assert_eq!(
+            rust_possible_none_type_var_overlap(
+                &res,
+                vec![encode(&arg)],
+                vec![encode(&target1), encode(&target2)],
+            ),
+            Some(true)
         );
     }
 

@@ -157,6 +157,7 @@ from mypy.types import (
     UnionType,
     UnpackType,
     get_proper_type,
+    get_proper_types,
     has_recursive_types,
 )
 
@@ -15346,6 +15347,11 @@ class NativeCheckCallSuite(Suite):
     Tests `rust_real_union` and `rust_possible_none_type_var_overlap`
     against the pure-Python implementations in `mypy.checkexpr`. Each
     test toggles the native gate off/on and compares.
+
+    Since issue #873 the two seams expand top-level TypeAliasType operands
+    through the alias resolver (mirroring `get_proper_type` /
+    `get_proper_types`); a resolver is built per test so alias parity is
+    exercised too.
     """
 
     def setUp(self) -> None:
@@ -15356,9 +15362,31 @@ class NativeCheckCallSuite(Suite):
         self._set_active = _set_native_checkexpr_active
         self._set_active(True)
         self._state = _state
+        self.resolver = _type_kernel.build_native_resolver(self._collect_type_infos(), [])
 
     def tearDown(self) -> None:
         self._set_active(False)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _rebuild_resolver(self, aliases: list[Any]) -> None:
+        self.resolver = _type_kernel.build_native_resolver(self._collect_type_infos(), aliases)
+
+    def _make_alias(self, fullname: str, target: Type) -> Any:  # TypeAlias
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(target, fullname, "mod", -1, -1, alias_tvars=[])
+
+    def _alias_type(self, alias: Any) -> Any:  # TypeAliasType
+        return TypeAliasType(alias, [])
 
     def _serialize(self, t: Type) -> bytes:
         from mypy.checkexpr import _serialize_type_for_checkexpr
@@ -15368,7 +15396,7 @@ class NativeCheckCallSuite(Suite):
     def _rust_real_union(self, t: Type, strict_optional: bool) -> bool | None:
         import type_kernel as tk
 
-        return tk.rust_real_union(self._serialize(t), strict_optional)
+        return tk.rust_real_union(self.resolver, self._serialize(t), strict_optional)
 
     def _rust_overlap(
         self, arg_types: list[Type], targets: list[CallableType] | list[Type]
@@ -15376,6 +15404,7 @@ class NativeCheckCallSuite(Suite):
         import type_kernel as tk
 
         return tk.rust_possible_none_type_var_overlap(
+            self.resolver,
             [self._serialize(t) for t in arg_types],
             [self._serialize(t) for t in targets],
         )
@@ -15388,6 +15417,34 @@ class NativeCheckCallSuite(Suite):
             return isinstance(p, UnionType) and len(p.relevant_items()) > 1
         finally:
             self._state.strict_optional = old
+
+    def _py_overlap(self, arg_types: list[Type], targets: list[CallableType]) -> bool:
+        """Pure-Python mirror of `possible_none_type_var_overlap`."""
+        if not targets or not arg_types:
+            return False
+        has_optional_arg = False
+        for arg_type in get_proper_types(arg_types):
+            if not isinstance(arg_type, UnionType):
+                continue
+            for item in get_proper_types(arg_type.items):
+                if isinstance(item, NoneType):
+                    has_optional_arg = True
+                    break
+            if has_optional_arg:
+                break
+        if not has_optional_arg:
+            return False
+        min_prefix = min(len(c.arg_types) for c in targets)
+        for i in range(min_prefix):
+            has_none = any(
+                isinstance(get_proper_type(c.arg_types[i]), NoneType) for c in targets
+            )
+            has_typevar = any(
+                isinstance(get_proper_type(c.arg_types[i]), TypeVarType) for c in targets
+            )
+            if has_none and has_typevar:
+                return True
+        return False
 
     # --- real_union ---
 
@@ -15497,6 +15554,50 @@ class NativeCheckCallSuite(Suite):
         target1 = self._callable([NoneType()])
         target2 = self._callable([self.fx.a, self.fx.a, self.fx.t])
         assert self._rust_overlap([arg], [target1, target2]) is False
+
+    # --- real_union / overlap with TypeAliasType operands (#873) ---
+
+    def test_real_union_alias_to_union_parity(self) -> None:
+        # T = Union[A, B]: the alias expands and both Rust and Python count
+        # the two union items -> True (strict_optional).
+        alias = self._make_alias("mod.T", UnionType.make_union([self.fx.a, self.fx.b]))
+        self._rebuild_resolver([alias])
+        alias_t = self._alias_type(alias)
+        assert self._rust_real_union(alias_t, True) == self._py_real_union(alias_t, True)
+        assert self._rust_real_union(alias_t, True) is True
+
+    def test_real_union_alias_to_non_union_parity(self) -> None:
+        # T = A (non-union): after expansion both report False.
+        alias = self._make_alias("mod.T", self.fx.a)
+        self._rebuild_resolver([alias])
+        alias_t = self._alias_type(alias)
+        assert self._rust_real_union(alias_t, True) == self._py_real_union(alias_t, True)
+        assert self._rust_real_union(alias_t, True) is False
+
+    def test_overlap_alias_arg_parity(self) -> None:
+        # T = Union[A, None]; overlap(T, [None], [Tvar]) finds Both.
+        alias = self._make_alias("mod.T", UnionType.make_union([self.fx.a, NoneType()]))
+        self._rebuild_resolver([alias])
+        arg = self._alias_type(alias)
+        target1 = self._callable([NoneType()])
+        target2 = self._callable([self.fx.t])
+        rust = self._rust_overlap([arg], [target1, target2])
+        py = self._py_overlap([arg], [target1, target2])
+        assert rust == py
+        assert rust is True
+
+    def test_overlap_alias_formal_parity(self) -> None:
+        # A formal typed as an alias to NoneType + another as a TypeVar:
+        # both Rust and Python resolve the formal and find the overlap.
+        alias_none = self._make_alias("mod.N", NoneType())
+        self._rebuild_resolver([alias_none])
+        arg = UnionType.make_union([self.fx.a, NoneType()])
+        target1 = self._callable([self._alias_type(alias_none)])
+        target2 = self._callable([self.fx.t])
+        rust = self._rust_overlap([arg], [target1, target2])
+        py = self._py_overlap([arg], [target1, target2])
+        assert rust == py
+        assert rust is True
 
 
 @skipUnless(
@@ -25244,7 +25345,11 @@ class NativeCheckcallSetopsDeferSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.checkexpr import _set_native_checkcall_active, _set_native_checkexpr_active
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
@@ -25260,14 +25365,17 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         set_wire_typeinfo_map({info.fullname: info for info in type_infos})
         self._set_active = _set_native_checkexpr_active
         self._set_checkcall_active = _set_native_checkcall_active
+        self._set_resolver = _set_native_checkexpr_resolver
         self._set_active(True)
         self._set_checkcall_active(True)
+        self._set_resolver(self.resolver)
 
     def tearDown(self) -> None:
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
         self._set_checkcall_active(False)
+        self._set_resolver(None)
         set_wire_typeinfo_map(None)
 
     def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
@@ -25323,7 +25431,9 @@ class NativeCheckcallSetopsDeferSuite(Suite):
     def _assert_real_union_engages(self, typ: Type) -> None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
-        result = _type_kernel.rust_real_union(_serialize_type_for_checkexpr(typ), True)
+        result = _type_kernel.rust_real_union(
+            self.resolver, _serialize_type_for_checkexpr(typ), True
+        )
         assert result is not None, f"Rust real_union did not engage for {typ}"
 
     def test_real_union_strips_none_non_strict(self) -> None:
@@ -25362,7 +25472,9 @@ class NativeCheckcallSetopsDeferSuite(Suite):
             assert off is False
         from mypy.checkexpr import _serialize_type_for_checkexpr
 
-        result = _type_kernel.rust_real_union(_serialize_type_for_checkexpr(tvar), True)
+        result = _type_kernel.rust_real_union(
+            self.resolver, _serialize_type_for_checkexpr(tvar), True
+        )
         assert result is not None and result is False
 
 
