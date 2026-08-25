@@ -4390,8 +4390,8 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
     def test_per_member_deferral_sentinel(self) -> None:
         # Per-member deferral sentinel: Rust returns a parallel flags
-        # Vec (true = mapped, false = re-run in Python). G[Ts] member
-        # defers; G[A] maps natively. Flags are [False, True].
+        # Vec (true = mapped, false = re-run in Python). G[Ts] defers
+        # (type-var-tuple guard); G[A] maps natively. Flags: [False, True].
         import type_kernel as _tk
 
         from mypy.maptype import _WriteBuffer
@@ -6260,6 +6260,30 @@ class NativeCustomSpecialMethodSuite(Suite):
 
         t = TypeAliasType(TypeAlias(None, "mod.Alias", "mod", -1, -1), [])
         self._assert_defers(t)
+
+    def _rebuild_resolver_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.typeops import _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        infos = self._typeinfos + _base_infos(self.fx)
+        set_wire_typeinfo_map({info.fullname: info for info in infos})
+        self._resolver = _type_kernel.build_native_resolver(infos, aliases)
+        _set_native_typeops_resolver(self._resolver)
+
+    def test_type_alias_expands_to_custom(self) -> None:
+        # A top-level TypeAliasType expands through the alias resolver,
+        # mirroring `typ = get_proper_type(typ)` (typeops.py:1981): the
+        # alias target carries a custom __eq__, so the seam says True.
+        from mypy.nodes import TypeAlias
+
+        info = self._info("mod.Custom")
+        self._dunder(info, "__eq__", info)
+        alias = TypeAlias(Instance(info, []), "mod.Alias", "mod", -1, -1)
+        self._rebuild_resolver_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        self._assert_par(t)
+        self._assert_par(t, "__ne__")
+        self._assert_engages(t)
 
     def test_has_custom_eq_checks_par(self) -> None:
         from mypy.checker import (
@@ -16653,8 +16677,171 @@ class NativeCoversAtRuntimeSuite(Suite):
         assert self.assert_engages(self.fx.b, self.fx.a) is True
         assert self.assert_engages(self.fx.b, self.fx.d) is False
 
+    def _rebuild_resolver_with_aliases(self, aliases: list[Any]) -> None:
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
 
-# NativeTypeAnalSuite: differential parity for the Rust type analysis hot path.
+    def test_type_alias_item_covers(self) -> None:
+        # A top-level TypeAliasType operand expands through the alias
+        # resolver, mirroring `_is_subtype`'s get_proper_type on both
+        # sides (subtypes.py:531): alias-to-B covers A like plain B.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.b, "mod.BAlias", "mod", -1, -1)
+        self._rebuild_resolver_with_aliases([alias])
+        item = TypeAliasType(alias, [])
+        self.assert_par(item, self.fx.a)
+        assert self.assert_engages(item, self.fx.a) is True
+
+    def test_type_alias_supertype_covers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.AAlias", "mod", -1, -1)
+        self._rebuild_resolver_with_aliases([alias])
+        supertype = TypeAliasType(alias, [])
+        self.assert_par(self.fx.b, supertype)
+        assert self.assert_engages(self.fx.b, supertype) is True
+
+    def test_type_alias_missing_snapshot_defers(self) -> None:
+        # The alias is NOT registered in the resolver (never rebuilt with
+        # aliases), so the seam has no snapshot and defers; the Python
+        # body resolves the live alias instead and both paths agree.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.b, "mod.NoSnap", "mod", -1, -1)
+        item = TypeAliasType(alias, [])
+        self.assert_par(item, self.fx.a)
+        assert _type_kernel.rust_covers_at_runtime(
+            self._bytes_of(item),
+            self._bytes_of(self.fx.a),
+            state.strict_optional,
+            self.resolver,
+        ) is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRestrictSubtypeAwaySuite(Suite):
+    """Parity for `rust_restrict_subtype_away` (mypy.subtypes.restrict_subtype_away).
+
+    The seam expands top-level TypeAliasType operands through the alias
+    resolver (mirroring Python's `get_proper_type` on both sides), then
+    `restrict_subtype_away_inner` decides the covers / proper-subtype
+    branch. Gate-off (pure Python) vs gate-on (Rust seam) must agree on
+    the same t/s pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        self._wire_map = set_wire_typeinfo_map
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._wire_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _rebuild_resolver_with_aliases(self, aliases: list[Any]) -> None:
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
+
+    def assert_par(self, t: Type, s: Type, consider: bool = True) -> None:
+        from mypy.subtypes import restrict_subtype_away
+
+        self._set_active(False)
+        try:
+            expected = restrict_subtype_away(t, s, consider_runtime_isinstance=consider)
+        finally:
+            self._set_active(True)
+        actual = restrict_subtype_away(t, s, consider_runtime_isinstance=consider)
+        assert str(actual) == str(expected), (
+            f"restrict parity {t!r} minus {s!r}: py={expected!r} rust={actual!r}"
+        )
+
+    def assert_engages(self, t: Type, s: Type) -> bytes:
+        """Call the seam directly; returns the encoded result (or raises)."""
+        buf_t = _WriteBuffer()
+        t.write(buf_t)
+        buf_s = _WriteBuffer()
+        s.write(buf_s)
+        result = _type_kernel.rust_restrict_subtype_away(
+            buf_t.getvalue(),
+            buf_s.getvalue(),
+            True,
+            state.strict_optional,
+            self.resolver,
+        )
+        assert result is not None, f"seam did not engage for {t!r} minus {s!r}"
+        return bytes(result)
+
+    def test_alias_t_covered_by_s(self) -> None:
+        # t = Alias -> B, s = A: the seam expands the alias and decides
+        # covers_at_runtime(B, A) -> UninhabitedType, like Python.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.b, "mod.BAlias", "mod", -1, -1)
+        self._rebuild_resolver_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        self.assert_par(t, self.fx.a)
+        self.assert_par(self.fx.b, self.fx.a)
+        assert self.assert_engages(t, self.fx.a)
+
+    def test_alias_s_expands_too(self) -> None:
+        # s = Alias -> A: the seam expands the supertype operand so the
+        # covers check decides instead of deferring.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.AAlias", "mod", -1, -1)
+        self._rebuild_resolver_with_aliases([alias])
+        s = TypeAliasType(alias, [])
+        self.assert_par(self.fx.b, s)
+        assert self.assert_engages(self.fx.b, s)
+
+    def test_alias_without_snapshot_defers(self) -> None:
+        # The alias is NOT registered in the resolver (never rebuilt
+        # with aliases): the seam defers and the Python body resolves
+        # the live alias, preserving the pre-change behavior.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.b, "mod.NoSnap", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        self.assert_par(t, self.fx.a)
+        buf = _WriteBuffer()
+        t.write(buf)
+        s_buf = _WriteBuffer()
+        self.fx.a.write(s_buf)
+        assert (
+            _type_kernel.rust_restrict_subtype_away(
+                buf.getvalue(),
+                s_buf.getvalue(),
+                True,
+                state.strict_optional,
+                self.resolver,
+            )
+            is None
+        )
 # Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
 # Python and Rust paths on the same Type, assert results match.
 @skipUnless(
