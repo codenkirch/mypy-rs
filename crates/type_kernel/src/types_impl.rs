@@ -25,10 +25,10 @@
 
 use pyo3::prelude::*;
 
-use crate::typeinfo::{read_bool_attr, read_mro_fullnames, NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 #[allow(unused_imports)]
 use crate::checkexpr_functions::expanded_alias_target;
+use crate::typeinfo::{read_bool_attr, read_mro_fullnames, NativeTypeResolver, TypeResolver};
+use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // ArgKind values (mirror mypy.nodes.ArgKind)
@@ -867,8 +867,14 @@ pub(crate) mod extension_seams {
     use pyo3::prelude::*;
 
     pub(crate) fn add_seams(module: &pyo3::types::PyModule) -> pyo3::PyResult<()> {
-        module.add_function(wrap_pyfunction!(super::rust_can_be_true_default_live, module)?)?;
-        module.add_function(wrap_pyfunction!(super::rust_can_be_false_default_live, module)?)?;
+        module.add_function(wrap_pyfunction!(
+            super::rust_can_be_true_default_live,
+            module
+        )?)?;
+        module.add_function(wrap_pyfunction!(
+            super::rust_can_be_false_default_live,
+            module
+        )?)?;
         Ok(())
     }
 }
