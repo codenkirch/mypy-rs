@@ -9,6 +9,7 @@
 
 use pyo3::prelude::*;
 
+use crate::checkexpr_functions::get_proper_or_expand;
 use crate::subtypes::{map_instance_to_supertype, CONTRAVARIANT, COVARIANT};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::visitor::{
@@ -146,8 +147,13 @@ pub(crate) fn rust_infer_constraints_full(
     let template = read_type(&mut tb, None).ok()?;
     let mut ab = ReadBuffer::new(actual_bytes);
     let actual = read_type(&mut ab, None).ok()?;
-    let constraints =
-        infer_constraints_full_inner(&template, &actual, direction, resolver.resolver())?;
+    let constraints = infer_constraints_full_inner(
+        &template,
+        &actual,
+        direction,
+        resolver.resolver(),
+        resolver.alias_resolver(),
+    )?;
     let mut out = Vec::with_capacity(constraints.len());
     for c in constraints {
         let mut b = WriteBuffer::new();
@@ -175,24 +181,22 @@ pub(crate) fn infer_constraints_full_inner(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
-    // Python re-normalizes unions at the top of every `_infer_constraints`
-    // entry (constraints.py:547-550) and resolves type aliases via
-    // get_proper_type. Rust cannot re-run make_simplified_union, so defer any
-
-    // union or alias on either side before the TypeVar/visitor dispatch:
-    // Rust would otherwise emit a constraint against an unsimplified target
-    // (`T <: bool | int | float` instead of `T <: int | float`) and change
-
-    // solver results. The old union defer below this point ran too late,
-    // because the TypeVar branch above returns first.
-    if matches!(
-        template,
-        Type::UnionType { .. } | Type::TypeAliasType { .. }
-    ) || matches!(actual, Type::UnionType { .. } | Type::TypeAliasType { .. })
-    {
+    // `_infer_constraints` calls get_proper_type on both operands at the top
+    // (constraints.py:548-549), so a TypeAliasType operand (reaching this core
+    // via `push_inner`) expands through the alias resolver here.
+    let template = get_proper_or_expand(template, aliases)?;
+    let actual = get_proper_or_expand(actual, aliases)?;
+    // Python re-normalizes unions via make_simplified_union at the top of every
+    // `_infer_constraints` entry (constraints.py:552-558); Rust cannot re-run
+    // that. Defer if either side is a union (incl. an alias expanding into one).
+    if matches!(template, Type::UnionType { .. }) || matches!(actual, Type::UnionType { .. }) {
         return None;
     }
+    // Otherwise Rust would emit constraints against an unsimplified target
+    // (`T <: bool | int | float` instead of `T <: int | float`) and change
+    // solver results.
     // Ignore suggestion-engine Any types before any constraint is emitted:
     // constraints.py:546 runs before the TypeVar branch, so a recursive
     // `(T, Any_suggestion)` pair yields `[]`, never `T <: Any` (the #337 fix).
@@ -200,14 +204,14 @@ pub(crate) fn infer_constraints_full_inner(
         type_of_any,
         source_any: None,
         missing_import_name: None,
-    } = actual
+    } = &actual
     {
         if *type_of_any == ANY_SUGGESTION {
             return Some(vec![]);
         }
     }
     // Template is a TypeVar -> single constraint (direction + target).
-    if let Type::TypeVarType { .. } = template {
+    if let Type::TypeVarType { .. } = &template {
         // `from_type_type` rides the wire now, so CallableType/Overloaded
         // targets no longer round-trip flagless (see infer_constraints_inner).
         return Some(vec![Constraint {
@@ -222,19 +226,37 @@ pub(crate) fn infer_constraints_full_inner(
         meta_level,
         upper_bound,
         ..
-    } = actual
+    } = &actual
     {
         if values.is_empty() && *meta_level == 0 && direction == SUPERTYPE_OF {
-            return infer_constraints_full_inner(template, upper_bound, direction, resolver);
+            return infer_constraints_full_inner(
+                &template,
+                upper_bound,
+                direction,
+                resolver,
+                aliases,
+            );
         }
     }
-    match template {
-        Type::Instance { .. } => visit_instance_native(template, actual, direction, resolver),
-        Type::TupleType { .. } => visit_tuple_native(template, actual, direction, resolver),
-        Type::TypedDictType { .. } => visit_typeddict_native(template, actual, direction, resolver),
-        Type::TypeType { .. } => visit_type_type_native(template, actual, direction, resolver),
-        Type::CallableType { .. } => visit_callable_native(template, actual, direction, resolver),
-        Type::Overloaded { .. } => visit_overloaded_native(template, actual, direction, resolver),
+    match &template {
+        Type::Instance { .. } => {
+            visit_instance_native(&template, &actual, direction, resolver, aliases)
+        }
+        Type::TupleType { .. } => {
+            visit_tuple_native(&template, &actual, direction, resolver, aliases)
+        }
+        Type::TypedDictType { .. } => {
+            visit_typeddict_native(&template, &actual, direction, resolver, aliases)
+        }
+        Type::TypeType { .. } => {
+            visit_type_type_native(&template, &actual, direction, resolver, aliases)
+        }
+        Type::CallableType { .. } => {
+            visit_callable_native(&template, &actual, direction, resolver, aliases)
+        }
+        Type::Overloaded { .. } => {
+            visit_overloaded_native(&template, &actual, direction, resolver, aliases)
+        }
         Type::AnyType { .. }
         | Type::NoneType
         | Type::UnboundType { .. }
@@ -245,7 +267,9 @@ pub(crate) fn infer_constraints_full_inner(
         Type::TypeVarType { .. } => {
             unreachable!("TypeVarType template handled above")
         }
-        Type::TypeAliasType { .. } => None, // needs get_proper_type alias expansion
+        // The top-level get_proper_or_expand guarantees a non-alias template
+        // here; an unresolvable alias already deferred at the top.
+        Type::TypeAliasType { .. } => None,
         // UnionType is deferred at the top-level check (constraints.py:547-550),
         // these arms are unreachable. Return [] as a safety fallback.
         Type::UnionType { .. } => Some(vec![]),
@@ -265,6 +289,7 @@ fn visit_instance_native(
     original_actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let template_args = match template {
         Type::Instance { args, .. } => args,
@@ -317,6 +342,7 @@ fn visit_instance_native(
                                 inst_arg.clone(),
                                 direction,
                                 resolver,
+                                aliases,
                             )?);
                         }
                         if tvar.1 != COVARIANT {
@@ -325,6 +351,7 @@ fn visit_instance_native(
                                 inst_arg.clone(),
                                 neg_op(direction),
                                 resolver,
+                                aliases,
                             )?);
                         }
                     }
@@ -337,6 +364,7 @@ fn visit_instance_native(
                             inst_arg.clone(),
                             direction,
                             resolver,
+                            aliases,
                         )?);
                     }
                     _ => {}
@@ -363,6 +391,7 @@ fn visit_instance_native(
                                 mapped_arg.clone(),
                                 direction,
                                 resolver,
+                                aliases,
                             )?);
                         }
                         if tvar.1 != COVARIANT {
@@ -371,6 +400,7 @@ fn visit_instance_native(
                                 mapped_arg.clone(),
                                 neg_op(direction),
                                 resolver,
+                                aliases,
                             )?);
                         }
                     }
@@ -381,12 +411,14 @@ fn visit_instance_native(
                             mapped_arg.clone(),
                             SUBTYPE_OF,
                             resolver,
+                            aliases,
                         )?);
                         res.extend(push_inner(
                             template_arg.clone(),
                             mapped_arg.clone(),
                             SUPERTYPE_OF,
                             resolver,
+                            aliases,
                         )?);
                     }
                     _ => {}
@@ -401,7 +433,7 @@ fn visit_instance_native(
         }
         // Fall through to the tail (actual is a non-protocol instance).
     }
-    visit_instance_tail_native(template, actual, direction, resolver)
+    visit_instance_tail_native(template, actual, direction, resolver, aliases)
 }
 
 /// Port of the tail of `visit_instance` (constraints.py:1156-1205),
@@ -413,13 +445,14 @@ fn visit_instance_tail_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let template_args = match template {
         Type::Instance { args, .. } => args,
         _ => return None,
     };
     if let Type::AnyType { .. } = actual {
-        return infer_against_any_native(template_args, actual, direction, resolver);
+        return infer_against_any_native(template_args, actual, direction, resolver, aliases);
     }
     if let Type::TupleType { items, .. } = actual {
         let template_ref = get_type_ref(template)?;
@@ -430,10 +463,24 @@ fn visit_instance_tail_native(
             let mut res = Vec::new();
             for item in items {
                 let constrained = match item {
+                    // Python: `unpacked = get_proper_type(item.type)`; an
+                    // alias expands through the resolver (constraints.py:1459).
                     Type::UnpackType { typ } => match typ.as_ref() {
                         Type::TypeVarTupleType { .. } => None,
                         Type::Instance { args, .. } if get_type_ref(typ)? == "builtins.tuple" => {
                             args.first().cloned()
+                        }
+                        Type::TypeAliasType { .. } => {
+                            let expanded = get_proper_or_expand(typ, aliases)?;
+                            match expanded {
+                                Type::TypeVarTupleType { .. } => None,
+                                Type::Instance { args, .. }
+                                    if get_type_ref(&expanded)? == "builtins.tuple" =>
+                                {
+                                    args.first().cloned()
+                                }
+                                _ => return None,
+                            }
                         }
                         _ => return None,
                     },
@@ -445,6 +492,7 @@ fn visit_instance_tail_native(
                         ci,
                         direction,
                         resolver,
+                        aliases,
                     )?);
                 }
             }
@@ -462,13 +510,13 @@ fn visit_instance_tail_native(
     } = actual
     {
         return if values.is_empty() && *meta_level == 0 {
-            infer_constraints_full_inner(template, upper_bound, direction, resolver)
+            infer_constraints_full_inner(template, upper_bound, direction, resolver, aliases)
         } else {
             Some(vec![])
         };
     }
     if let Type::ParamSpecType { upper_bound, .. } = actual {
-        return infer_constraints_full_inner(template, upper_bound, direction, resolver);
+        return infer_constraints_full_inner(template, upper_bound, direction, resolver, aliases);
     }
     // TypeVarTupleType actual raises NotImplementedError in Python.
     if matches!(actual, Type::TypeVarTupleType { .. }) {
@@ -490,6 +538,7 @@ fn visit_tuple_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let template_items = match template {
         Type::TupleType { items, .. } => items,
@@ -502,7 +551,7 @@ fn visit_tuple_native(
     };
     if !(matches!(actual, Type::TupleType { .. }) || is_varlength) {
         if let Type::AnyType { .. } = actual {
-            return infer_against_any_native(template_items, actual, direction, resolver);
+            return infer_against_any_native(template_items, actual, direction, resolver, aliases);
         }
         return Some(vec![]);
     }
@@ -514,14 +563,15 @@ fn visit_tuple_native(
             // (constraints.py:1742-1768). Map the actual up to builtins.tuple
             // and constrain the unpacked type against the mapped instance.
             let unpack_type = &template_items[unpack_index as usize];
+            // get_proper_type(rhs): expand a top-level alias through the
+            // resolver; an unresolvable alias (missing snapshot) defers.
             let unmapped_inner = match unpack_type {
-                Type::UnpackType { typ } => typ.as_ref(),
+                Type::UnpackType { typ } => match typ.as_ref() {
+                    Type::TypeAliasType { .. } => get_proper_or_expand(typ, aliases)?,
+                    other => other.clone(),
+                },
                 _ => return None,
             };
-            // get_proper_type(rhs) — TypeAliasType needs alias expansion.
-            if matches!(unmapped_inner, Type::TypeAliasType { .. }) {
-                return None;
-            }
             let actual_args = match actual {
                 Type::Instance { args, .. } => args,
                 _ => return None,
@@ -541,7 +591,7 @@ fn visit_tuple_native(
                 last_known_value: None,
                 extra_attrs: None,
             };
-            match unmapped_inner {
+            match &unmapped_inner {
                 Type::TypeVarTupleType { .. } => {
                     res.push(Constraint {
                         origin_type_var: unmapped_inner.clone(),
@@ -555,6 +605,7 @@ fn visit_tuple_native(
                         mapped_instance.clone(),
                         direction,
                         resolver,
+                        aliases,
                     )?);
                 }
                 _ => return None,
@@ -571,6 +622,7 @@ fn visit_tuple_native(
                     mapped_arg.clone(),
                     direction,
                     resolver,
+                    aliases,
                 )?);
             }
             return Some(res);
@@ -583,6 +635,7 @@ fn visit_tuple_native(
                 a_items,
                 direction,
                 resolver,
+                aliases,
             )?);
         } else {
             return None;
@@ -606,6 +659,7 @@ fn visit_tuple_native(
                 a_fb.as_ref().clone(),
                 direction,
                 resolver,
+                aliases,
             )?);
         }
         return Some(res);
@@ -626,6 +680,7 @@ fn visit_tuple_native(
             a_items.to_vec(),
             direction,
             resolver,
+            aliases,
         );
     }
     let a_unpack = &a_items[a_unpack_index as usize];
@@ -643,14 +698,19 @@ fn visit_tuple_native(
             Vec::new(),
             direction,
             resolver,
+            aliases,
         );
     }
     // The actual-unpack middle only constrains when the unpacked is a
     // homogenous `*tuple[X, ...]` instance; get_proper_type(a_unpack.type)
-    // may expand a TypeAliasType (defer).
-    let a_unpacked = match a_unpacked {
-        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
-        Type::TypeAliasType { .. } => return None,
+    // may expand a TypeAliasType through the resolver. An alias resolving to
+    // a non-tuple target still runs the tail, matching Python.
+    let a_unpacked: Option<Vec<Type>> = match a_unpacked {
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args.clone()),
+        Type::TypeAliasType { .. } => match get_proper_or_expand(a_unpacked, aliases)? {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+            _ => None,
+        },
         Type::TupleType { .. } => return None,
         _ => None,
     };
@@ -669,7 +729,13 @@ fn visit_tuple_native(
         // U <: Z.
         let mid_arg = a_mid_args.first()?;
         for tm in t_middle {
-            res.extend(push_inner(tm, mid_arg.clone(), direction, resolver)?);
+            res.extend(push_inner(
+                tm,
+                mid_arg.clone(),
+                direction,
+                resolver,
+                aliases,
+            )?);
         }
     }
     // Fall through to the equal-length per-item + fallback tail; the
@@ -681,6 +747,7 @@ fn visit_tuple_native(
         actual_items,
         direction,
         resolver,
+        aliases,
     )?);
     Some(res)
 }
@@ -697,6 +764,7 @@ fn visit_tuple_tail_native(
     actual_items: Vec<Type>,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let mut res = Vec::new();
     // Named-tuple early return (constraints.py:1814-1821): if both are named
@@ -728,6 +796,7 @@ fn visit_tuple_tail_native(
                     a_fb.as_ref().clone(),
                     direction,
                     resolver,
+                    aliases,
                 );
             }
         }
@@ -735,7 +804,13 @@ fn visit_tuple_tail_native(
     // Per-item constraints for equal-length tuples.
     if actual_items.len() == template_items.len() {
         for (t_i, a_i) in template_items.iter().zip(actual_items.iter()) {
-            res.extend(push_inner(t_i.clone(), a_i.clone(), direction, resolver)?);
+            res.extend(push_inner(
+                t_i.clone(),
+                a_i.clone(),
+                direction,
+                resolver,
+                aliases,
+            )?);
         }
     }
     // Always append the fallback-vs-fallback constraint.
@@ -755,6 +830,7 @@ fn visit_tuple_tail_native(
             a_fb.as_ref().clone(),
             direction,
             resolver,
+            aliases,
         )?);
     }
     Some(res)
@@ -778,6 +854,7 @@ fn simple_unpack_native(
     actual_args: &[Type],
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let template_unpack = find_unpack_in_list_inner(template_args);
     if template_unpack < 0 {
@@ -819,14 +896,26 @@ fn simple_unpack_native(
         let (start, middle, end) =
             split_with_prefix_and_suffix_inner(actual_args, template_prefix, template_suffix);
         for (t, a) in template_args[..template_prefix].iter().zip(start.iter()) {
-            res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+            res.extend(push_inner(
+                t.clone(),
+                a.clone(),
+                direction,
+                resolver,
+                aliases,
+            )?);
         }
         if template_suffix > 0 {
             for (t, a) in template_args[template_args.len() - template_suffix..]
                 .iter()
                 .zip(end.iter())
             {
-                res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+                res.extend(push_inner(
+                    t.clone(),
+                    a.clone(),
+                    direction,
+                    resolver,
+                    aliases,
+                )?);
             }
         }
         // Constraint(s) for the variadic item when possible. `t_unpack` is
@@ -841,7 +930,7 @@ fn simple_unpack_native(
                 let inner_arg = args.first()?;
                 // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
                 res.extend(constrain_homogeneous_middle(
-                    &middle, inner_arg, direction, resolver,
+                    &middle, inner_arg, direction, resolver, aliases,
                 )?);
             }
             Type::TypeVarTupleType { .. } => {
@@ -874,14 +963,26 @@ fn simple_unpack_native(
     let (start, middle, end) =
         split_with_prefix_and_suffix_inner(actual_args, common_prefix, common_suffix);
     for (t, a) in template_args[..common_prefix].iter().zip(start.iter()) {
-        res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+        res.extend(push_inner(
+            t.clone(),
+            a.clone(),
+            direction,
+            resolver,
+            aliases,
+        )?);
     }
     if common_suffix > 0 {
         for (t, a) in template_args[template_args.len() - common_suffix..]
             .iter()
             .zip(end.iter())
         {
-            res.extend(push_inner(t.clone(), a.clone(), direction, resolver)?);
+            res.extend(push_inner(
+                t.clone(),
+                a.clone(),
+                direction,
+                resolver,
+                aliases,
+            )?);
         }
     }
     if let Some(tu) = t_unpack {
@@ -894,7 +995,7 @@ fn simple_unpack_native(
                 let inner_arg = args.first()?;
                 // Homogeneous case *tuple[T, ...] <: [X, Y, Z, ...].
                 res.extend(constrain_homogeneous_middle(
-                    &middle, inner_arg, direction, resolver,
+                    &middle, inner_arg, direction, resolver, aliases,
                 )?);
             }
             Type::TypeVarTupleType { .. } => {
@@ -922,9 +1023,16 @@ fn simple_unpack_native(
         };
         // Only an *tuple[A, ...] actual unpack produces constraints. A
         // TypeVarTuple actual unpack yields nothing (constraints.py:2137).
-        let a_inner_args = match a_unpacked {
-            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
-            Type::TypeAliasType { .. } => return None, // needs alias expansion
+        // get_proper_type(a_unpack_type.type) expands an alias through the
+        // resolver; a non-tuple target yields nothing.
+        let a_inner_args: Option<Vec<Type>> = match a_unpacked {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                Some(args.clone())
+            }
+            Type::TypeAliasType { .. } => match get_proper_or_expand(a_unpacked, aliases)? {
+                Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+                _ => None,
+            },
             _ => None,
         };
         let t_unpack_item = &template_args[template_unpack as usize];
@@ -932,9 +1040,14 @@ fn simple_unpack_native(
             Type::UnpackType { typ } => typ.as_ref(),
             _ => return None,
         };
-        let t_inner_args = match t_inner {
-            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
-            Type::TypeAliasType { .. } => return None,
+        let t_inner_args: Option<Vec<Type>> = match t_inner {
+            Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                Some(args.clone())
+            }
+            Type::TypeAliasType { .. } => match get_proper_or_expand(t_inner, aliases)? {
+                Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args),
+                _ => None,
+            },
             _ => None,
         };
         if let (Some(t_args), Some(a_args)) = (t_inner_args, a_inner_args) {
@@ -944,6 +1057,7 @@ fn simple_unpack_native(
                     a_arg.clone(),
                     direction,
                     resolver,
+                    aliases,
                 )?);
             } else {
                 // Empty tuple args: Python would IndexError on args[0]; defer.
@@ -963,6 +1077,7 @@ fn constrain_homogeneous_middle(
     inner_arg: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let mut res = Vec::new();
     for a in middle {
@@ -973,7 +1088,14 @@ fn constrain_homogeneous_middle(
                     Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
                         args.first().cloned()
                     }
-                    Type::TypeAliasType { .. } => return None,
+                    // get_proper_type(item.type): expand a top-level alias; a
+                    // non-tuple target is silently skipped (constraints.py:2121).
+                    Type::TypeAliasType { .. } => match get_proper_or_expand(typ, aliases)? {
+                        Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
+                            args.first().cloned()
+                        }
+                        _ => None,
+                    },
                     _ => None,
                 };
                 if let Some(a_arg) = a_inner {
@@ -982,6 +1104,7 @@ fn constrain_homogeneous_middle(
                         a_arg.clone(),
                         direction,
                         resolver,
+                        aliases,
                     )?);
                 }
             }
@@ -991,6 +1114,7 @@ fn constrain_homogeneous_middle(
                     non_unpack.clone(),
                     direction,
                     resolver,
+                    aliases,
                 )?);
             }
         }
@@ -1013,6 +1137,7 @@ fn visit_typeddict_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let t_items = match template {
         Type::TypedDictType { items, .. } => items,
@@ -1025,14 +1150,20 @@ fn visit_typeddict_native(
             let mut res = Vec::new();
             for (name, t_v) in t_items {
                 if let Some(a_v) = a_items.iter().find(|(n, _)| n == name).map(|(_, v)| v) {
-                    res.extend(push_inner(t_v.clone(), a_v.clone(), direction, resolver)?);
+                    res.extend(push_inner(
+                        t_v.clone(),
+                        a_v.clone(),
+                        direction,
+                        resolver,
+                        aliases,
+                    )?);
                 }
             }
             Some(res)
         }
         Type::AnyType { .. } => {
             let values: Vec<Type> = t_items.iter().map(|(_, v)| v.clone()).collect();
-            infer_against_any_native(&values, actual, direction, resolver)
+            infer_against_any_native(&values, actual, direction, resolver, aliases)
         }
         _ => Some(vec![]),
     }
@@ -1047,6 +1178,7 @@ fn visit_type_type_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let template_item = match template {
         Type::TypeType { item, .. } => item.as_ref(),
@@ -1059,10 +1191,15 @@ fn visit_type_type_native(
             item.as_ref().clone(),
             direction,
             resolver,
+            aliases,
         ),
-        Type::AnyType { .. } => {
-            push_inner(template_item.clone(), actual.clone(), direction, resolver)
-        }
+        Type::AnyType { .. } => push_inner(
+            template_item.clone(),
+            actual.clone(),
+            direction,
+            resolver,
+            aliases,
+        ),
         _ => Some(vec![]),
     }
 }
@@ -1085,6 +1222,7 @@ fn visit_callable_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let callee = match template {
         Type::CallableType {
@@ -1140,6 +1278,7 @@ fn visit_callable_native(
             &any_type,
             direction,
             resolver,
+            aliases,
         )?);
     } else {
         let ps = param_spec?;
@@ -1163,6 +1302,7 @@ fn visit_callable_native(
         any_type.clone(),
         direction,
         resolver,
+        aliases,
     )?);
     Some(res)
 }
@@ -1224,6 +1364,7 @@ fn visit_overloaded_native(
     actual: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let items = match template {
         Type::Overloaded { items } => items,
@@ -1239,7 +1380,13 @@ fn visit_overloaded_native(
         if !matches!(t, Type::CallableType { .. }) {
             return None;
         }
-        res.extend(push_inner(t.clone(), actual.clone(), direction, resolver)?);
+        res.extend(push_inner(
+            t.clone(),
+            actual.clone(),
+            direction,
+            resolver,
+            aliases,
+        )?);
     }
     Some(res)
 }
@@ -1250,6 +1397,7 @@ fn infer_against_any_native(
     any_type: &Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     let flat = flatten_nested_tuples_inner(items, true)?;
     let mut res = Vec::new();
@@ -1266,7 +1414,13 @@ fn infer_against_any_native(
                 _ => return None,
             },
             other => {
-                res.extend(push_inner(other, any_type.clone(), direction, resolver)?);
+                res.extend(push_inner(
+                    other,
+                    any_type.clone(),
+                    direction,
+                    resolver,
+                    aliases,
+                )?);
             }
         }
     }
@@ -1280,8 +1434,9 @@ fn push_inner(
     other: Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
-    infer_constraints_full_inner(&t, &other, direction, resolver)
+    infer_constraints_full_inner(&t, &other, direction, resolver, aliases)
 }
 
 /// std-only 3-way zip (avoids an itertools dependency).
@@ -1388,6 +1543,7 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             rs.typ.clone(),
             direction,
             resolver.resolver(),
+            resolver.alias_resolver(),
         )?);
     }
     if let (Some(ls2), Some(rs2)) = (&left_star2, &right_star2) {
@@ -1396,6 +1552,7 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             rs2.typ.clone(),
             direction,
             resolver.resolver(),
+            resolver.alias_resolver(),
         )?);
     }
 
@@ -1416,6 +1573,7 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
             right_arg.typ.clone(),
             direction,
             resolver.resolver(),
+            resolver.alias_resolver(),
         )?);
     }
 
@@ -1433,6 +1591,7 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
                 right_by_position.typ.clone(),
                 direction,
                 resolver.resolver(),
+                resolver.alias_resolver(),
             )?);
             j += 1;
         }
@@ -1459,6 +1618,7 @@ pub(crate) fn rust_infer_callable_arguments_constraints(
                     right_by_name.typ.clone(),
                     direction,
                     resolver.resolver(),
+                    resolver.alias_resolver(),
                 )?);
             }
         }
@@ -1484,6 +1644,7 @@ pub(crate) fn infer_directed_arg_constraints_native(
     right: Type,
     direction: i64,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<Vec<Constraint>> {
     if matches!(left, Type::ParamSpecType { .. } | Type::UnpackType { .. })
         || matches!(right, Type::ParamSpecType { .. } | Type::UnpackType { .. })
@@ -1495,7 +1656,7 @@ pub(crate) fn infer_directed_arg_constraints_native(
     } else {
         (right, left, neg_op(direction))
     };
-    infer_constraints_full_inner(&template, &actual, inferred_dir, resolver)
+    infer_constraints_full_inner(&template, &actual, inferred_dir, resolver, aliases)
 }
 
 #[cfg(test)]
@@ -1700,7 +1861,13 @@ mod tests {
         // Callable[[T], T] against Any -> [T <: Any, T :> Any via ret]
         let resolver = crate::typeinfo::TypeResolver::new();
         let template = minimal_callable(type_var(1, "T"));
-        let res = visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver);
+        let res = visit_callable_native(
+            &template,
+            &any_type(),
+            SUPERTYPE_OF,
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new(),
+        );
         assert!(res.is_some());
         let constraints = res.unwrap();
         // arg_types=[T] -> infer_against_any yields T :> Any.
@@ -1723,7 +1890,8 @@ mod tests {
             &template,
             &instance_builtins_object(),
             SUBTYPE_OF,
-            &resolver
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new()
         )
         .is_none());
     }
@@ -1753,7 +1921,14 @@ mod tests {
             type_guard: None,
             type_is: None,
         };
-        assert!(visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver).is_none());
+        assert!(visit_callable_native(
+            &template,
+            &any_type(),
+            SUPERTYPE_OF,
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1794,7 +1969,14 @@ mod tests {
             type_guard: None,
             type_is: None,
         };
-        assert!(visit_callable_native(&template, &any_type(), SUPERTYPE_OF, &resolver).is_none());
+        assert!(visit_callable_native(
+            &template,
+            &any_type(),
+            SUPERTYPE_OF,
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1805,7 +1987,14 @@ mod tests {
         };
         // CallableType actual -> defer (find_matching_overload_items needed).
         let actual = minimal_callable(any_type());
-        assert!(visit_overloaded_native(&template, &actual, SUBTYPE_OF, &resolver).is_none());
+        assert!(visit_overloaded_native(
+            &template,
+            &actual,
+            SUBTYPE_OF,
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new()
+        )
+        .is_none());
     }
 
     #[test]
@@ -1816,11 +2005,177 @@ mod tests {
         };
         // AnyType actual -> each item (CallableType) recurses via
         // visit_callable_native, which handles Any.
-        let res = visit_overloaded_native(&template, &any_type(), SUPERTYPE_OF, &resolver);
+        let res = visit_overloaded_native(
+            &template,
+            &any_type(),
+            SUPERTYPE_OF,
+            &resolver,
+            &crate::aliases::TypeAliasResolver::new(),
+        );
         assert!(res.is_some());
         let constraints = res.unwrap();
         assert!(constraints
             .iter()
             .all(|c| matches!(c.target, Type::AnyType { .. })));
+    }
+
+    // -- alias expansion through the resolver (issue #869) --
+
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        crate::wire::write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn alias_type(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn instance_int() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_top_level_alias_template_expands_to_typevar() {
+        // A TypeAliasType template whose target is a TypeVarType expands
+        // through the resolver, so the TypeVar branch emits the constraint
+        // (the pre-#869 code deferred the whole call on any alias operand).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &type_var(1, "T")),
+        );
+        let template = alias_type("mod.Alias");
+        let res =
+            infer_constraints_full_inner(&template, &any_type(), SUPERTYPE_OF, &resolver, &aliases);
+        let constraints = res.expect("alias template must resolve natively");
+        assert_eq!(constraints.len(), 1);
+        if let Type::TypeVarType { name, .. } = &constraints[0].origin_type_var {
+            assert_eq!(name, "T");
+        } else {
+            panic!("origin not a TypeVarType");
+        }
+        assert_eq!(constraints[0].op, SUPERTYPE_OF);
+    }
+
+    #[test]
+    fn test_top_level_alias_actual_expands_in_typevar_target() {
+        // A TypeAliasType actual expands before the TypeVar template branch,
+        // so the emitted constraint target is the expanded Instance rather
+        // than the (unresolvable) alias placeholder.
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &instance_int()),
+        );
+        let template = type_var(1, "T");
+        let actual = alias_type("mod.Alias");
+        let res =
+            infer_constraints_full_inner(&template, &actual, SUPERTYPE_OF, &resolver, &aliases);
+        let constraints = res.expect("alias actual must resolve natively");
+        assert_eq!(constraints.len(), 1);
+        assert_eq!(constraints[0].target, instance_int());
+    }
+
+    #[test]
+    fn test_top_level_alias_missing_snapshot_defers() {
+        // An alias with no resolver snapshot still defers the whole call,
+        // preserving the pre-#869 fallback to Python.
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let aliases = crate::aliases::TypeAliasResolver::new();
+        let template = type_var(1, "T");
+        let actual = alias_type("mod.Missing");
+        assert!(infer_constraints_full_inner(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_top_level_alias_expanding_to_union_defers() {
+        // An alias whose target is a union would need make_simplified_union,
+        // so it defers (the union check runs after alias expansion).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.UAlias".to_string(),
+            alias_snap(
+                "mod.UAlias",
+                &Type::UnionType {
+                    items: vec![instance_int(), Type::NoneType],
+                    uses_pep604_syntax: false,
+                    can_be_true: true,
+                    can_be_false: true,
+                },
+            ),
+        );
+        let template = type_var(1, "T");
+        let actual = alias_type("mod.UAlias");
+        assert!(infer_constraints_full_inner(
+            &template,
+            &actual,
+            SUPERTYPE_OF,
+            &resolver,
+            &aliases,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_visit_instance_tail_alias_unpack_target_expands() {
+        // visit_instance_tail_native: a tuple-item Unpack whose inner is a
+        // TypeAliasType resolves to a typevar-tuple / tuple instance instead
+        // of deferring on the alias placeholder.
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        // tuple[A, ...] template against *Alias inside a TupleType actual.
+        aliases.insert(
+            "mod.TAlias".to_string(),
+            alias_snap(
+                "mod.TAlias",
+                &Type::Instance {
+                    type_ref: "builtins.tuple".to_string(),
+                    args: vec![type_var(2, "A")],
+                    last_known_value: None,
+                    extra_attrs: None,
+                },
+            ),
+        );
+        let template = Type::Instance {
+            type_ref: "typing.Iterable".to_string(),
+            args: vec![type_var(1, "T")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        // Actual is a TupleType with an unpack element `*Alias` that resolves
+        // to `tuple[A, ...]`; Python's visit_instance constrains T against
+        // the alias's first arg (A) rather than skipping/deferring.
+        let actual = Type::TupleType {
+            partial_fallback: Box::new(instance_builtins_object()),
+            items: vec![Type::UnpackType {
+                typ: Box::new(alias_type("mod.TAlias")),
+            }],
+            implicit: false,
+        };
+        let res = visit_instance_tail_native(&template, &actual, SUPERTYPE_OF, &resolver, &aliases);
+        assert!(res.is_some());
     }
 }

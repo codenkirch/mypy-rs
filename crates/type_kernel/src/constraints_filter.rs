@@ -343,6 +343,7 @@ pub(crate) fn rust_infer_directed_arg_constraints(
         &actual,
         inferred_dir,
         resolver.resolver(),
+        resolver.alias_resolver(),
     )?;
 
     let mut output = WriteBuffer::new();

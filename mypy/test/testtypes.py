@@ -19393,6 +19393,195 @@ class NativeTupleConstraintsSuite(Suite):
         template = self._tup(self.fx.t)
         actual = Instance(self.fx.std_listi, [self.fx.a])
         self._assert_par(template, actual)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeConstraintsDeferralSuite(Suite):
+    """Parity suite for the constraints.rs defer-reduction (issue #869).
+
+    `_try_native_constraint_builder` routes the full ConstraintBuilderVisitor
+    through Rust (`rust_infer_constraints_full`). Before #869 a
+    `TypeAliasType` operand anywhere in the recursion deferred the whole call
+    to Python. Now `infer_constraints_full_inner` expands both operands
+    through the alias resolver at the top (mirroring `get_proper_type` at
+    constraints.py:548-549), so a nested alias resolves natively. Union
+    operands (including an alias that expands into one) and unresolvable
+    (missing-snapshot) aliases still defer.
+
+    Differential harness: runs `infer_constraints` with the gate on
+    (resolver + wire map installed) and off (pure Python), asserting equal
+    constraint lists; a direct `rust_infer_constraints_full` call proves
+    native engagement (returns blobs) for the alias cases and None (defer)
+    for the union / missing-snapshot cases.
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Safe default so a mismatched gate never crosses suites.
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        self.resolver = _type_kernel.build_native_resolver(type_infos, aliases)
+        _set_native_constraints_resolver(self.resolver)
+
+    def _list(self, *args: Type) -> Instance:
+        return Instance(self.fx.std_listi, list(args))
+
+    def _alias(self, target: Type, name: str) -> Any:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(target, name, "mod", -1, -1)
+
+    def _constraints(
+        self, template: Type, actual: Type, direction: int, native: bool
+    ) -> list[Any]:
+        from mypy.constraints import (
+            _set_native_constraints_resolver,
+            infer_constraints,
+        )
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return infer_constraints(template, actual, direction)
+
+    def _assert_par(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        native = self._constraints(template, actual, direction, native=True)
+        python = self._constraints(template, actual, direction, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _rust(
+        self, template: Type, actual: Type, direction: int = SUBTYPE_OF
+    ) -> Any:
+        return _type_kernel.rust_infer_constraints_full(
+            self.resolver,
+            self._bytes_of(template),
+            self._bytes_of(actual),
+            direction,
+            False,
+            False,
+        )
+
+    def _assert_engages(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        raw = self._rust(template, actual, direction)
+        assert raw is not None, (
+            f"Rust seam must engage for template={template!r} actual={actual!r}"
+        )
+
+    def _assert_defers(self, template: Type, actual: Type, direction: int = SUBTYPE_OF) -> None:
+        raw = self._rust(template, actual, direction)
+        assert raw is None, f"Rust seam must defer for template={template!r} actual={actual!r}"
+
+    # --- alias operands expand natively through the resolver ---
+
+    def test_actual_alias_operand_expands(self) -> None:
+        # List[T] vs List[Alias->A]: the Alias actual arg reaches
+        # infer_constraints_full_inner via push_inner and expands to A, so
+        # the native seam emits T <: A / T :> A instead of deferring.
+        alias = self._alias(self.fx.a, "mod.AliasA")
+        self._rebuild_with_aliases([alias])
+        template = self._list(self.fx.t)
+        actual = self._list(TypeAliasType(alias, []))
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_template_alias_operand_expands(self) -> None:
+        # H[T, Alias->A] vs H[A, B]: the Alias template arg expands to A on
+        # the template side while the T position still constrains, so the
+        # native seam yields the same constraints as Python.
+        alias = self._alias(self.fx.a, "mod.AliasT")
+        self._rebuild_with_aliases([alias])
+        template = Instance(self.fx.hi, [self.fx.t, TypeAliasType(alias, [])])
+        actual = Instance(self.fx.hi, [self.fx.a, self.fx.b])
+        self._assert_par(template, actual)
+        self._assert_engages(template, actual)
+
+    def test_alias_expanding_to_union_defers(self) -> None:
+        # List[T] vs List[Alias->(A | B)]: expansion yields a union, which
+        # needs make_simplified_union, so the native seam defers and Python
+        # constrains T against each union item.
+        from mypy.types import UnionType
+
+        alias = self._alias(
+            UnionType.make_union([self.fx.a, self.fx.b]), "mod.AliasU"
+        )
+        self._rebuild_with_aliases([alias])
+        template = self._list(self.fx.t)
+        actual = self._list(TypeAliasType(alias, []))
+        self._assert_par(template, actual)
+        self._assert_defers(template, actual)
+
+    # --- union operands still defer ---
+
+    def test_actual_union_operand_defers(self) -> None:
+        # List[T] vs List[A | B]: the union actual arg cannot re-run
+        # make_simplified_union, so the native seam defers to Python.
+        actual_union = UnionType.make_union([self.fx.a, self.fx.b])
+        template = self._list(self.fx.t)
+        actual = self._list(actual_union)
+        self._assert_par(template, actual)
+        self._assert_defers(template, actual)
+
+    def test_template_union_operand_defers(self) -> None:
+        # H[T, (A | B)] vs H[A, A]: the union template arg defers before the
+        # other position constrains, so the seam falls back to Python.
+        template_union = UnionType.make_union([self.fx.a, self.fx.b])
+        template = Instance(self.fx.hi, [self.fx.t, template_union])
+        actual = Instance(self.fx.hi, [self.fx.a, self.fx.a])
+        self._assert_par(template, actual)
+        self._assert_defers(template, actual)
+
+    # --- unresolvable alias defers to Python ---
+
+    def test_missing_snapshot_defers(self) -> None:
+        # List[T] vs List[Alias] with no resolver snapshot: expansion cannot
+        # proceed, so the native seam defers and Python resolves the alias
+        # from the live node.
+        alias = self._alias(self.fx.a, "mod.Missing")
+        self._rebuild_with_aliases([])
+        template = self._list(self.fx.t)
+        actual = self._list(TypeAliasType(alias, []))
+        self._assert_par(template, actual)
+        self._assert_defers(template, actual)
+
+
 class NativeAreParametersCompatibleSuite(Suite):
     """Parity for the Rust `are_parameters_compatible` seam.
 

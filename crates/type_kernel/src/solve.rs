@@ -591,11 +591,16 @@ fn add_secondary_constraints(
     if matches!(upper, Type::UnionType { .. }) && matches!(lower, Type::UnionType { .. }) {
         return Ok(());
     }
+    // No alias resolver is threaded through solve's secondary-constraint
+    // path; an empty resolver means a TypeAliasType operand defers exactly
+    // as it did before (the old top-level check returned None on an alias).
+    let no_aliases = crate::aliases::TypeAliasResolver::new();
     let sub = crate::constraints::infer_constraints_full_inner(
         lower,
         upper,
         crate::constraints::SUBTYPE_OF,
         resolver,
+        &no_aliases,
     )
     .ok_or(())?;
     for c in sub {
@@ -608,6 +613,7 @@ fn add_secondary_constraints(
         lower,
         crate::constraints::SUPERTYPE_OF,
         resolver,
+        &no_aliases,
     )
     .ok_or(())?;
     for c in sup {
@@ -1627,6 +1633,7 @@ pub(crate) fn rust_infer_function_type_arguments(
                 &expanded,
                 crate::constraints::SUPERTYPE_OF,
                 resolver.resolver(),
+                resolver.alias_resolver(),
             )?);
         }
     }
