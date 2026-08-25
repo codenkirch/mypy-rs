@@ -23246,6 +23246,182 @@ class NativeSolveOneSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSolveDependentNoopSuite(Suite):
+    """Parity for the dependent-solver single-bound no-op port (issue #853).
+
+    `solve_one_for_dependent` used to defer every single-bound variable,
+    which pushed the whole `solve_with_dependent` call back to Python
+    whenever any batch contained one (the dominant solve deferral). The
+    no-op cases now flow through `solve_one_inner`, which mirrors
+    solve.py's `UnionType.make_union(lowers)` / raw-top construction
+    exactly. This suite drives `solve_with_dependent` gate-off vs gate-on
+    and asserts identical results, plus direct `rust_solve_dependent`
+    seam calls proving each case engages natively.
+    """
+
+    def setUp(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.fx.str_type_info, self.fx.bool_type_info])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+        from mypy.state import state
+        from mypy.typestate import type_state
+
+        self._set_native_solve_active = _set_native_solve_active
+        self._set_native_solve_resolver = _set_native_solve_resolver
+        self._infer_unions = type_state.infer_unions
+        self._strict_optional = state.strict_optional
+        self._vars = [self.fx.t]
+        self._set_active(True)
+        # The dependent gate (solve.py:360-367) requires both flags;
+        # infer_unions lives on the TypeState, strict_optional on the
+        # StrictOptionalState.
+        type_state.infer_unions = True
+        state.strict_optional = True
+
+    def tearDown(self) -> None:
+        from mypy.solve import _set_native_solve_active, _set_native_solve_resolver
+        from mypy.state import state
+        from mypy.typestate import type_state
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        type_state.infer_unions = self._infer_unions
+        state.strict_optional = self._strict_optional
+        _set_native_solve_active(False)
+        _set_native_solve_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _set_active(self, active: bool) -> None:
+        self._set_native_solve_active(active)
+        self._set_native_solve_resolver(self.resolver if active else None)
+
+    def _assert_par(self, constraints: list[Constraint]) -> None:
+        from mypy.solve import solve_with_dependent
+
+        tvars = {tv.id: tv for tv in self._vars}
+        tvar_ids = list(tvars)
+        self._set_active(False)
+        ref = solve_with_dependent(tvar_ids, constraints, tvar_ids, tvars)
+        self._set_active(True)
+        res = solve_with_dependent(tvar_ids, constraints, tvar_ids, tvars)
+        assert_equal(res, ref)
+
+    def _seam_solutions(
+        self, constraints: list[Constraint]
+    ) -> dict[TypeVarId, Type | None]:
+        """Drive `rust_solve_dependent` directly; assert it engaged."""
+        from mypy.solve import (
+            _native_solve_dependent_result,
+            _serialize_constraint_list,
+            _serialize_type_list,
+        )
+
+        tvars = {tv.id: tv for tv in self._vars}
+        tvar_ids = list(tvars)
+        result = _type_kernel.rust_solve_dependent(
+            _serialize_type_list(list(tvars.values())),
+            _serialize_constraint_list(constraints),
+            True,  # infer_unions
+            True,  # strict_optional
+            self.resolver,
+        )
+        assert result is not None, "Rust dependent solver deferred"
+        out = _native_solve_dependent_result(result, tvars)
+        assert out is not None
+        solutions, _ = out
+        return solutions
+
+    def test_single_lower_noop(self) -> None:
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+
+        c = Constraint(self.fx.t, SUPERTYPE_OF, self.fx.a)
+        self._assert_par([c])
+        solutions = self._seam_solutions([c])
+        assert_equal(solutions[self.fx.t.id], self.fx.a)
+
+    def test_single_upper_noop(self) -> None:
+        from mypy.constraints import SUBTYPE_OF, Constraint
+
+        c = Constraint(self.fx.t, SUBTYPE_OF, self.fx.a)
+        self._assert_par([c])
+        solutions = self._seam_solutions([c])
+        assert_equal(solutions[self.fx.t.id], self.fx.a)
+
+    def test_single_union_lower_passthrough(self) -> None:
+        # A single lower bound that is itself a union passes through
+        # unchanged: UnionType.make_union (solve.py:591) is a raw
+        # constructor, not a simplification.
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.types import UnionType
+
+        u = UnionType.make_union([self.fx.a, self.fx.b])
+        c = Constraint(self.fx.t, SUPERTYPE_OF, u)
+        self._assert_par([c])
+        solutions = self._seam_solutions([c])
+        assert_equal(solutions[self.fx.t.id], u)
+
+    def test_single_any_lower_absorbs(self) -> None:
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.types import AnyType
+
+        anyt = AnyType(TypeOfAny.special_form)
+        c = Constraint(self.fx.t, SUPERTYPE_OF, anyt)
+        self._assert_par([c])
+        solutions = self._seam_solutions([c])
+        got = solutions[self.fx.t.id]
+        assert isinstance(got, AnyType)
+        assert_equal(got.type_of_any, TypeOfAny.from_another_any)
+        assert_equal(got.source_any, anyt)
+
+    def test_ambiguous_never_upper_still_never(self) -> None:
+        from mypy.constraints import SUBTYPE_OF, Constraint
+        from mypy.types import UninhabitedType
+
+        nb = UninhabitedType()
+        nb.ambiguous = True
+        c = Constraint(self.fx.t, SUBTYPE_OF, nb)
+        self._assert_par([c])
+        solutions = self._seam_solutions([c])
+        got = solutions[self.fx.t.id]
+        assert isinstance(got, UninhabitedType)
+        assert got.ambiguous
+
+    def test_mixed_batch_solves_natively(self) -> None:
+        # A batch with a single-bound var used to defer the whole call;
+        # now the no-op var solves alongside the join var.
+        from mypy.constraints import SUPERTYPE_OF, Constraint
+        from mypy.types import UnionType
+
+        self._vars = [self.fx.t, self.fx.s]
+        try:
+            cs = [
+                Constraint(self.fx.t, SUPERTYPE_OF, self.fx.a),
+                Constraint(self.fx.s, SUPERTYPE_OF, self.fx.a),
+                Constraint(self.fx.s, SUPERTYPE_OF, self.fx.b),
+            ]
+            self._assert_par(cs)
+            solutions = self._seam_solutions(cs)
+            assert_equal(solutions[self.fx.t.id], self.fx.a)
+            # infer_unions is on (the dependent gate requires it), so the
+            # two-lower solve is make_union(a, b) = a | b, not the join.
+            assert_equal(
+                solutions[self.fx.s.id], UnionType.make_union([self.fx.a, self.fx.b])
+            )
+        finally:
+            self._vars = [self.fx.t]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeJoinInstancesSuite(Suite):
     """Parity for the Rust `InstanceJoiner.join_instances` port
     (join.py:208-303, setops.rs `join_instances_core`).

@@ -80,10 +80,18 @@ pub(crate) fn solve_one_inner(
     let bottom: Option<Type> = if lowers.is_empty() {
         None
     } else if infer_unions {
-        // UnionType.make_union = make_simplified_union (flatten +
-        // dedupe + literal contraction + primitive union), which already
-        // returns Option (defers internally).
-        setops::make_simplified_union(lowers, &ctx, resolver, true)
+        // UnionType.make_union(lowers) (solve.py:591) is the RAW
+        // constructor; make_simplified_union would re-simplify e.g.
+        // `T :> A | B` (B <: A) to `A` while Python keeps A | B.
+        Some(match lowers {
+            [single] => single.clone(),
+            _ => Type::UnionType {
+                items: lowers.to_vec(),
+                uses_pep604_syntax: false,
+                can_be_true: true,
+                can_be_false: true,
+            },
+        })
     } else {
         // join_type_list preserves sorted_lowers[0] even for an AnyType
         // (mypy TypeAlias). Wire types are never alias shadows, so a
@@ -292,10 +300,13 @@ fn object_or_any_from_type(t: &Type, resolver: &crate::typeinfo::TypeResolver) -
     }
 }
 
-/// AnyType with `type_of_any=0` (special_form).
+/// AnyType materialized by meet/join folds: `TypeOfAny.special_form`
+/// (6), matching the Anys Python's meet/join emit (meet.py:200-204,
+/// join.py:131-135). A raw 0 would be an enum-invalid value that the
+/// wire-safety probe (`wire_unsafe_solution`) rejects, forcing a defer.
 fn any_type() -> Type {
     Type::AnyType {
-        type_of_any: 0,
+        type_of_any: 6,
         source_any: None,
         missing_import_name: None,
     }
@@ -994,13 +1005,9 @@ fn solve_one_for_dependent(
         return Ok(Some(Type::UninhabitedType { ambiguous: true }));
     }
 
-    // Single-bound no-op solves return the bound itself; defer so the
-    // original object identity survives (solve.py:387-390).
-    let noop = (lowers.len() == 1 && filtered_uppers.is_empty())
-        || (filtered_uppers.len() == 1 && lowers.is_empty());
-    if noop {
-        return Err(());
-    }
+    // Single-bound no-op solves return the bound itself: Python's raw
+    // UnionType.make_union(lowers) / single-upper top (solve.py:587-610)
+    // mirror solve_one_inner exactly, so no special-casing is needed.
 
     // Identity-bearing bounds: solving while a bound still holds a live
     // TypeVar would leak it into a candidate.
@@ -1012,14 +1019,16 @@ fn solve_one_for_dependent(
         return Err(());
     }
 
-    let out = solve_one_inner(
+    let out = match solve_one_inner(
         lowers,
         &filtered_uppers,
         infer_unions,
         strict_optional,
         resolver,
-    )
-    .ok_or(())?;
+    ) {
+        Some(o) => o,
+        None => return Err(()),
+    };
     match out {
         (0, Some(bytes)) | (1, Some(bytes)) | (3, Some(bytes)) => {
             let typ = decode_type(&bytes).ok_or(())?;
@@ -1131,9 +1140,7 @@ fn solve_with_dependent_native(
         .iter()
         .map(|t| tv_id(t).ok_or(()))
         .collect::<Result<_, _>>()?;
-
     let (mut graph, mut lowers, mut uppers) = transitive_closure(&tvars, constraints, resolver)?;
-
     let dmap = compute_dependencies(&tvars, &graph, &lowers, &uppers);
 
     let vertices: HashSet<TvId> = tvars.iter().cloned().collect();
@@ -1143,7 +1150,10 @@ fn solve_with_dependent_native(
         return Ok(Some((None, None)));
     }
     let data = prepare_sccs(sccs, &dmap);
-    let raw_batches = topsort(&data)?;
+    let raw_batches = match topsort(&data) {
+        Ok(b) => b,
+        Err(()) => return Err(()),
+    };
 
     // Free-variable pass over the first (leaf) batch only (solve.py:257-269).
     let mut free_vars: Vec<TvId> = Vec::new();
@@ -1191,7 +1201,7 @@ fn solve_with_dependent_native(
     let mut solutions: Vec<(TvId, Option<Type>)> = Vec::new();
     for level in &raw_batches {
         let flat: Vec<TvId> = level.iter().flat_map(|s| s.iter().cloned()).collect();
-        let res = solve_iteratively_native(
+        match solve_iteratively_native(
             &flat,
             &mut graph,
             &mut lowers,
@@ -1199,8 +1209,10 @@ fn solve_with_dependent_native(
             infer_unions,
             strict_optional,
             resolver,
-        )?;
-        solutions.extend(res);
+        ) {
+            Ok(res) => solutions.extend(res),
+            Err(()) => return Err(()),
+        }
     }
     let sol_blob = encode_solutions_blob(&solutions)?;
     let free_blob = encode_free_vars_blob(&free_vars)?;
@@ -1263,7 +1275,10 @@ pub(crate) fn rust_solve_dependent(
     let mut dep_constraints: Vec<Constraint> = Vec::with_capacity(constraints.len());
     for b in &constraints {
         let mut buf = ReadBuffer::new(b);
-        dep_constraints.push(crate::constraints::Constraint::read(&mut buf).ok()?);
+        match crate::constraints::Constraint::read(&mut buf) {
+            Ok(c) => dep_constraints.push(c),
+            Err(_) => return None,
+        }
     }
     let out = match solve_with_dependent_native(
         &var_types,
@@ -1615,9 +1630,9 @@ pub(crate) fn rust_infer_function_type_arguments(
             )?);
         }
     }
-    if constraints.is_empty() {
-        return None;
-    }
+    // Empty constraints fall through to `solve_constraints_native`:
+    // Python has no fast path either; its empty-cmap fill yields strict
+    // Never / lax Any defaults per variable, which native solve mirrors.
     let (sol_blob, _free_blob) = solve_constraints_native(
         &vars_types,
         &vars_types,
@@ -2262,5 +2277,158 @@ mod tests {
         let out = solve_one_inner(&[lo], &[up], false, true, &r).unwrap();
         assert_eq!(out.0, 0);
         assert!(out.1.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // solve_one_for_dependent no-op ports (issue #853)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn dependent_noop_single_lower_returns_bound() {
+        // T :> A only -> solve_one_for_dependent returns A itself,
+        // mirroring solve.py's `bottom = UnionType.make_union([A])`.
+        let r = make_resolver(vec![snap("a.A")]);
+        let lo = instance("a.A", vec![]);
+        let out = solve_one_for_dependent(std::slice::from_ref(&lo), &[], false, true, &r);
+        assert_eq!(out, Ok(Some(lo)));
+    }
+
+    #[test]
+    fn dependent_noop_single_lower_union_passthrough() {
+        // A | B as the only lower passes through unchanged: Python's
+        // UnionType.make_union (solve.py:591) is a raw constructor and a
+        // single bound is returned as-is (no flatten, no dedupe).
+        let r = make_resolver(vec![snap("a.A"), snap("a.B")]);
+        let u = Type::UnionType {
+            items: vec![instance("a.A", vec![]), instance("a.B", vec![])],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let out = solve_one_for_dependent(std::slice::from_ref(&u), &[], true, true, &r).unwrap();
+        assert_eq!(out, Some(u));
+    }
+
+    #[test]
+    fn dependent_noop_single_upper_returns_bound() {
+        // T <: A only -> candidate = the raw upper A.
+        let r = make_resolver(vec![snap("a.A")]);
+        let up = instance("a.A", vec![]);
+        let out = solve_one_for_dependent(&[], std::slice::from_ref(&up), false, true, &r);
+        assert_eq!(out, Ok(Some(up)));
+    }
+
+    #[test]
+    fn dependent_noop_any_lower_absorbs() {
+        // Single Any lower -> AnyType(from_another_any, the Any itself),
+        // with the source's missing_import_name carried over
+        // (solve.py:612-617, types.py:1386-1392).
+        let r = make_resolver(vec![]);
+        let any = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: Some("mod.thing".to_string()),
+        };
+        let out =
+            solve_one_for_dependent(std::slice::from_ref(&any), &[], false, true, &r).unwrap();
+        let Some(typ) = out else {
+            panic!("expected a solution, got None");
+        };
+        let Type::AnyType {
+            type_of_any,
+            source_any,
+            missing_import_name,
+        } = typ
+        else {
+            panic!("expected AnyType, got {typ:?}");
+        };
+        assert_eq!(type_of_any, 7); // TypeOfAny.from_another_any
+        assert_eq!(*source_any.unwrap(), any);
+        assert_eq!(missing_import_name.as_deref(), Some("mod.thing"));
+    }
+
+    #[test]
+    fn dependent_noop_typevar_bound_defers() {
+        // A bound carrying a live TypeVar must still defer (identity).
+        let r = make_resolver(vec![snap("a.A")]);
+        let lo = Type::UnionType {
+            items: vec![instance("a.A", vec![]), tv_type(7, "T")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let out = solve_one_for_dependent(&[lo], &[], false, true, &r);
+        assert_eq!(out, Err(()));
+    }
+
+    // ------------------------------------------------------------------
+    // empty-constraint defaults + any_type alignment (issue #853)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn empty_constraints_fill_strict_never() {
+        // solve_constraints with no constraints: every var gets a strict
+        // ambiguous Never (solve.py:326-331), so `rust_infer_function_
+        // type_arguments` no longer needs its empty-constraints defer.
+        let r = make_resolver(vec![]);
+        let tv = tv_type(7, "T");
+        let (sol_blob, _free) = solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[],
+            true,
+            false,
+            true,
+            false,
+            &r,
+        )
+        .unwrap();
+        let sols = decode_solve_solutions_here(&sol_blob).unwrap();
+        assert_eq!(sols.len(), 1);
+        assert_eq!(sols[0].0, (7, 1, "fn".to_string()));
+        assert_eq!(sols[0].1, Some(Type::UninhabitedType { ambiguous: true }));
+    }
+
+    #[test]
+    fn empty_constraints_fill_lax_any() {
+        // Non-strict: every var gets AnyType(TypeOfAny.special_form).
+        let r = make_resolver(vec![]);
+        let tv = tv_type(7, "T");
+        let (sol_blob, _free) = solve_constraints_native(
+            std::slice::from_ref(&tv),
+            std::slice::from_ref(&tv),
+            &[],
+            false,
+            false,
+            true,
+            false,
+            &r,
+        )
+        .unwrap();
+        let sols = decode_solve_solutions_here(&sol_blob).unwrap();
+        assert_eq!(sols.len(), 1);
+        assert_eq!(
+            sols[0].1,
+            Some(Type::AnyType {
+                type_of_any: 6,
+                source_any: None,
+                missing_import_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn any_type_is_special_form_and_wire_safe() {
+        // any_type() must encode TypeOfAny.special_form (6); the old
+        // enum-invalid 0 made the wire-safety probe defer every
+        // meet/join fold that materialized an Any.
+        let any = any_type();
+        let Type::AnyType { type_of_any, .. } = &any else {
+            panic!("expected AnyType");
+        };
+        assert_eq!(*type_of_any, 6);
+        assert!(!wire_unsafe_solution(&any));
+        let bytes = encode_type(&any).unwrap();
+        assert_eq!(decode_type(&bytes).unwrap(), any);
     }
 }
