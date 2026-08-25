@@ -2139,9 +2139,7 @@ fn unpack_expand_updated(result: &Type) -> Option<Type> {
         let item = &items[0];
         if let Type::UnpackType { typ: inner } = item {
             match inner.as_ref() {
-                Type::Instance {
-                    type_ref, args, ..
-                } if type_ref == "builtins.tuple" => {
+                Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
                     // Normalize Tuple[*tuple[X, ...]] -> tuple[X, ...].
                     return Some((**inner).clone());
                 }
@@ -4900,7 +4898,12 @@ mod tests {
         // `t.type == s.type -> Instance(t.type, [])`).
         let i = make_instance("builtins.int", vec![]);
         assert_eq!(
-            join_one_pair(&i, &i, &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true), &make_native_resolver()),
+            join_one_pair(
+                &i,
+                &i,
+                &crate::subtypes::SubtypeContext::new(false, false, false, false, false, true),
+                &make_native_resolver()
+            ),
             Some(i)
         );
     }
@@ -5010,10 +5013,7 @@ mod tests {
         // normalization, expandtype.py:1009-1033).
         let inner_items = make_instance("builtins.int", vec![]);
         let star = Type::UnpackType {
-            typ: Box::new(make_instance(
-                "builtins.tuple",
-                vec![inner_items.clone()],
-            )),
+            typ: Box::new(make_instance("builtins.tuple", vec![inner_items.clone()])),
         };
         let result = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
@@ -5036,10 +5036,10 @@ mod tests {
         // from the wire alone (Python splices via expand_unpack, needs the
         // live TypeVarTuple fallback). Defer.
         let star = Type::UnpackType {
-            typ: Box::new(make_instance("builtins.list", vec![make_instance(
-                "builtins.int",
-                vec![],
-            )])),
+            typ: Box::new(make_instance(
+                "builtins.list",
+                vec![make_instance("builtins.int", vec![])],
+            )),
         };
         let result = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
