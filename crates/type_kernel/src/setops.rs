@@ -3478,9 +3478,7 @@ fn remove_redundant_union_items(
                     break;
                 }
             }
-            if duplicate_index.is_some() {
-                // Truthiness adjustment skipped (not modeled).
-            } else {
+            if duplicate_index.is_none() {
                 new_items.push(ti);
             }
         }
