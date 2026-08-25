@@ -18807,8 +18807,117 @@ class NativeRestrictSubtypeAwaySuite(Suite):
             )
             is None
         )
-# Mirrors the NativeServerDepsSuite pattern: toggle the gate on/off, run both
-# Python and Rust paths on the same Type, assert results match.
+
+
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeCheckerHelpersDeferralSuite(Suite):
+    """Parity for the `restrict_subtype_away` erase_instances defer (#885).
+
+    The `consider_runtime_isinstance=False` path in `restrict_subtype_away`
+    runs a second `is_proper_subtype(..., erase_instances=True)` check after
+    the plain proper-subtype check. The Rust kernel cannot represent
+    `erase_instances`, so it previously deferred the whole call whenever the
+    first check was `Some(false)`. This is wire-portable for a non-generic,
+    non-protocol Instance supertype: erasure only erases Instance args inside
+    `visit_instance`'s nominal branch, and a supertype with no type parameters
+    has no argument recursion, so the erased check is provably identical to
+    the first. The seam now answers `t` natively for that case.
+
+    Gate-on vs gate-off differential: Rust and pure Python must agree on the
+    same t/s pairs, including pairs that still defer (generic / protocol
+    supertypes), where the Python body is the source of truth.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        self._wire_map = set_wire_typeinfo_map
+        self._wire_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._wire_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def assert_par(self, t: Type, s: Type) -> None:
+        from mypy.subtypes import restrict_subtype_away
+
+        self._set_active(False)
+        try:
+            expected = restrict_subtype_away(t, s, consider_runtime_isinstance=False)
+        finally:
+            self._set_active(True)
+        actual = restrict_subtype_away(t, s, consider_runtime_isinstance=False)
+        assert str(actual) == str(expected), (
+            f"restrict parity (consider_runtime_isinstance=False) {t!r} minus "
+            f"{s!r}: py={expected!r} rust={actual!r}"
+        )
+
+    def seam_result(self, t: Type, s: Type) -> bytes | None:
+        """Call the seam directly; None means the kernel defers."""
+        buf_t = _WriteBuffer()
+        t.write(buf_t)
+        buf_s = _WriteBuffer()
+        s.write(buf_s)
+        result = _type_kernel.rust_restrict_subtype_away(
+            buf_t.getvalue(),
+            buf_s.getvalue(),
+            False,  # consider_runtime_isinstance
+            state.strict_optional,
+            self.resolver,
+        )
+        return None if result is None else bytes(result)
+
+    def test_different_plain_classes_keeps_t(self) -> None:
+        # a minus b, consider=False: neither is a proper subtype of the other;
+        # the supertype b is non-generic/non-protocol so the erased check is
+        # identical and Python returns a. The seam now decides it.
+        from mypy.join import _deserialize_type
+
+        self.assert_par(self.fx.a, self.fx.b)
+        assert _deserialize_type(self.seam_result(self.fx.a, self.fx.b)) == self.fx.a
+        # And the reverse direction.
+        self.assert_par(self.fx.b, self.fx.a)
+
+    def test_union_restricts_concrete_supertype(self) -> None:
+        # Union[A, B] minus B under consider=False: A survives (not a proper
+        # subtype); B is restricted away by the "left is right" proper-subtype
+        # fast path, so the union folds to A. Previously the whole call deferred.
+        from mypy.join import _deserialize_type
+        from mypy.types import UnionType
+
+        union = UnionType.make_union([self.fx.a, self.fx.b])
+        self.assert_par(union, self.fx.b)
+        actual = _deserialize_type(self.seam_result(union, self.fx.b))
+        assert actual == self.fx.a
+
+    def test_generic_supertype_still_defers(self) -> None:
+        # s = G[T] is generic: erasure could differ inside the nominal arg
+        # recursion, so the kernel must still defer; the Python body answers.
+        self.assert_par(self.fx.a, self.fx.gt)
+        assert self.seam_result(self.fx.a, self.fx.gt) is None
+
+
 @skipUnless(
     _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
 )
