@@ -10,13 +10,25 @@
 //!   * `TypeAliasType` — `can_be_true/false_default` delegates to
 //!     `self.alias.target`, which needs the live alias target.
 //!   * `TupleType` with a non-`builtins.tuple` fallback — `can_be_any_bool`
-//!     needs the live `TypeInfo.names` dict to check for `__bool__`.
-//!   * `LiteralType` — `can_be_true/false_default` checks
-//!     `self.fallback.type.is_enum`, which needs live `TypeInfo`.
+//!     needs the live `TypeInfo.names` dict to check for `__bool__` (unless
+//!     the resolver carries the class snapshots, see `can_be_any_bool_ref`).
+//!   * `LiteralType` whose fallback class is missing from the resolver —
+//!     the enum checks need the live `TypeInfo` (see `can_be_true_live`).
+//!
+//! The `rust_can_be_true_default_live` / `rust_can_be_false_default_live`
+//! seams take the `NativeTypeResolver`: they port the `TupleType`
+//! `can_be_any_bool` check, the `TypeAliasType` alias-target delegation
+//! (via the frozen alias snapshots), and the enum `LiteralType` branch
+//! (via live `is_enum` + `can_be_true`/`can_be_false` reads on the
+//! fallback). The byte-only seams keep the pre-existing deferral behavior
+//! so non-resolver callers stay parity-safe.
 
 use pyo3::prelude::*;
 
-use crate::wire::{read_type, ReadBuffer, Type};
+use crate::typeinfo::{read_bool_attr, read_mro_fullnames, NativeTypeResolver, TypeResolver};
+use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+#[allow(unused_imports)]
+use crate::checkexpr_functions::expanded_alias_target;
 
 // ---------------------------------------------------------------------------
 // ArgKind values (mirror mypy.nodes.ArgKind)
@@ -56,6 +68,15 @@ fn kind_is_star(kind: i64) -> bool {
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     read_type(&mut buf, None).ok()
+}
+
+/// `encode_type`: serialize a wire `Type` back to bytes. Used to re-encode
+/// sub-blobs (e.g. a `partial_fallback`) for the byte-passing resolver
+/// helpers.
+fn encode_type(typ: &Type) -> Option<Vec<u8>> {
+    let mut wbuf = WriteBuffer::new();
+    write_type(&mut wbuf, typ).ok()?;
+    Some(wbuf.into_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +236,315 @@ fn can_be_any_bool_wire(fallback: &Type) -> bool {
         // in Python (e.g. UnboundType), so can_be_any_bool returns False.
         // We return False to proceed (no __bool__ check needed).
         false
+    }
+}
+
+/// Wire-portable `TupleType.can_be_any_bool` (types.py:3094-3099) decided
+/// from `TypeInfoSnapshot`s. Returns `Some(true)` when the fallback class
+/// differs from `builtins.tuple` and has a `__bool__` name in some MRO
+/// class's `member_info` (a `str` key suffices: the Python `names.get`
+/// matches vars-hidden and Var names equally), `Some(false)` otherwise.
+/// Defer (None) when the fallback is not an `Instance`, or any MRO class
+/// snapshot is missing from the resolver (absent vs unknown is
+/// indistinguishable, so the Python `names` lookup must decide).
+fn can_be_any_bool_ref(fallback: &Type, resolver: &TypeResolver) -> Option<bool> {
+    let Type::Instance { type_ref, .. } = fallback else {
+        return Some(false);
+    };
+    if type_ref == "builtins.tuple" {
+        return Some(false);
+    }
+    let snap = resolver.get(type_ref)?;
+    for base in &snap.mro {
+        let b = resolver.get(base)?;
+        if b.member_info.contains_key("__bool__") {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Validate and decode one wire sub-type blob: it must decode to an
+/// `Instance`. Returns `None` to defer.
+fn decode_instance(bytes: &[u8]) -> Option<Type> {
+    let t = decode_type(bytes)?;
+    match t {
+        Type::Instance { .. } => Some(t),
+        _ => None,
+    }
+}
+
+/// `TupleType.can_be_any_bool` against a live fallback `Instance`
+/// (types.py:3094-3099). The full `names.get("__bool__")` check needs the
+/// live `TypeInfo.names` dict: the snapshot only carries a membership key.
+/// Returns `None` (defer) on any read failure: missing live map entry,
+/// MRO read failure, or a missing/non-str `__bool__` name.
+fn can_be_any_bool_live(
+    py: Python<'_>,
+    instance: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    let Type::Instance { type_ref, .. } = instance else {
+        return Some(false);
+    };
+    if type_ref == "builtins.tuple" {
+        return Some(false);
+    }
+    let info = resolver.live_typeinfo(py, type_ref)?;
+    if info.is_none() {
+        return None;
+    }
+    let mro = read_mro_fullnames(info, "mro")?;
+    for cls_fullname in &mro {
+        let Some(cls) = resolver.live_typeinfo(py, cls_fullname) else {
+            return None;
+        };
+        if cls.is_none() {
+            return None;
+        }
+        let names = cls.getattr("names").ok()?;
+        let names = names.downcast::<pyo3::types::PyDict>().ok()?;
+        let sym = names.get_item("__bool__").ok()?;
+        let Some(sym) = sym else {
+            continue;
+        };
+        if !sym.is_none() {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Resolve a sub-type blob to the `Instance` it must be, then apply
+/// `can_be_any_bool` via the snapshot resolver, falling back to the live
+/// map. Returns `(bool, Instance)` when decided, `None` to defer.
+fn can_be_any_bool_for(
+    py: Python<'_>,
+    bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> Option<(bool, Type)> {
+    let instance = decode_instance(bytes)?;
+    if let Some(decided) = can_be_any_bool_ref(&instance, resolver.resolver()) {
+        return Some((decided, instance));
+    }
+    let decided = can_be_any_bool_live(py, &instance, resolver)?;
+    Some((decided, instance))
+}
+
+/// Resolve a fallback blob: a `TypeAliasType` is expanded through the
+/// frozen alias snapshots; everything else must decode to an `Instance`.
+/// Returns `None` to defer (missing alias snapshot, unreadable target,
+/// nested alias, or non-instance fallback).
+fn resolve_fallback(py: Python<'_>, bytes: &[u8], resolver: &NativeTypeResolver) -> Option<Type> {
+    let decoded = decode_type(bytes)?;
+    if matches!(decoded, Type::TypeAliasType { .. }) {
+        let aliases = resolver.alias_resolver();
+        let (target, _, _) = expanded_alias_target(&decoded, aliases)?;
+        if matches!(target, Type::TypeAliasType { .. }) {
+            // Only a top-level TypeAliasType fallback is supported; a
+            // still-alias target needs validity checks -> defer.
+            return None;
+        }
+        let _ = py;
+        return Some(target);
+    }
+    decode_instance(bytes)
+}
+
+/// Resolver-backed `mypy.types.Type.can_be_true_default` (types.py:360-364).
+/// Covers the deferral sites that carry live-type information on the wire
+/// seam but can now be decided from the resolver:
+///   * `TupleType` with a named-tuple/custom fallback: `can_be_any_bool()`
+///     found via the class snapshots (`__bool__` in an MRO member table).
+///   * `TypeAliasType`: `alias.target.can_be_true` from the frozen alias
+///     snapshots, chain-resolved.
+///   * `LiteralType` with an enum fallback: `self.fallback.can_be_true`
+///     read live (`is_enum` flag); for non-enum literals the byte-only
+///     default applies.
+/// Returns `Some(bool)` when decided, `None` to defer to Python.
+#[pyfunction]
+pub(crate) fn rust_can_be_true_default_live(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(can_be_true_live(py, &typ, resolver))
+}
+
+fn can_be_true_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -> Option<bool> {
+    match typ {
+        Type::UninhabitedType { .. } => Some(false),
+        Type::NoneType => Some(false),
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(true),
+        Type::UnionType { can_be_true, .. } => Some(*can_be_true),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            let fallback_bytes = match encode_type(partial_fallback) {
+                Some(b) => b,
+                None => return None,
+            };
+            let (any_bool, _) = can_be_any_bool_for(py, &fallback_bytes, resolver)?;
+            // types.py:3069-3074: with can_be_any_bool() the
+            // NamedTuple-with-__bool__ corner makes the tuple both true- and
+            // false-able; otherwise the tuple is true iff length() > 0.
+            Some(any_bool || !items.is_empty())
+        }
+        Type::LiteralType { fallback, value } => {
+            let fallback_bytes = match encode_type(fallback) {
+                Some(b) => b,
+                None => return None,
+            };
+            let fallback_inst = resolve_fallback(py, &fallback_bytes, resolver)?;
+            let Type::Instance { type_ref, .. } = &fallback_inst else {
+                return None;
+            };
+            let Some(info) = resolver.live_typeinfo(py, type_ref) else {
+                return None;
+            };
+            if info.is_none() {
+                return None;
+            }
+            if read_bool_attr(info, "is_enum").unwrap_or(false) {
+                // types.py:3610-3612: enum literal truthiness delegates to
+                // the enum class instance's flag.
+                let ct = read_bool_attr(info, "can_be_true").unwrap_or(false);
+                return Some(ct);
+            }
+            // Non-enum fallback: a TypeVarType fallback (possible from
+            // make_simplified_union) must keep the byte-seam deferral, base
+            // default True needs live `has_default()` to be safe.
+            if matches!(&fallback_inst, Type::TypeVarType { .. }) {
+                return None;
+            }
+            Some(bool_value_is_true(value))
+        }
+        // TypeAliasType delegation: alias.target.can_be_true (types.py:476-479).
+        Type::TypeAliasType { .. } => alias_can_be(py, typ, true, resolver),
+        _ => Some(true),
+    }
+}
+
+/// `TypeAliasType.can_be_true/false_default`: delegate to
+/// `self.alias.target` (types.py:476-484), chain-resolving the frozen
+/// alias target. `None` (defer) on a missing alias snapshot, an unreadable
+/// target, or a target that is itself an unresolved TypeAliasType.
+fn alias_can_be(
+    py: Python<'_>,
+    typ: &Type,
+    is_true: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    let aliases = resolver.alias_resolver();
+    let (target, _, _) = expanded_alias_target(typ, aliases)?;
+    if matches!(target, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    if is_true {
+        can_be_true_live(py, &target, resolver)
+    } else {
+        can_be_false_live(py, &target, resolver)
+    }
+}
+
+/// Resolver-backed `mypy.types.Type.can_be_false_default` (types.py:366-370).
+/// See `rust_can_be_true_default_live` for the covered sites; the tuple
+/// tail follows types.py:3076-3092 exactly.
+#[pyfunction]
+pub(crate) fn rust_can_be_false_default_live(
+    py: Python<'_>,
+    type_bytes: &[u8],
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(can_be_false_live(py, &typ, resolver))
+}
+
+fn can_be_false_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -> Option<bool> {
+    match typ {
+        Type::UninhabitedType { .. } => Some(false),
+        Type::NoneType => Some(true),
+        Type::CallableType { .. } | Type::Overloaded { .. } => Some(false),
+        Type::UnionType { can_be_false, .. } => Some(*can_be_false),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            let fallback_bytes = match encode_type(partial_fallback) {
+                Some(b) => b,
+                None => return None,
+            };
+            let (any_bool, _) = can_be_any_bool_for(py, &fallback_bytes, resolver)?;
+            if any_bool {
+                return Some(true);
+            }
+            let length = items.len();
+            if length == 0 {
+                return Some(true);
+            }
+            if length > 1 {
+                return Some(false);
+            }
+            let item = &items[0];
+            if let Type::UnpackType { typ: inner } = item {
+                if let Type::TypeVarTupleType { min_len, .. } = inner.as_ref() {
+                    return Some(*min_len == 0);
+                }
+                return Some(true);
+            }
+            Some(false)
+        }
+        Type::LiteralType { fallback, value } => {
+            let fallback_bytes = match encode_type(fallback) {
+                Some(b) => b,
+                None => return None,
+            };
+            let fallback_inst = resolve_fallback(py, &fallback_bytes, resolver)?;
+            let Type::Instance { type_ref, .. } = &fallback_inst else {
+                return None;
+            };
+            let Some(info) = resolver.live_typeinfo(py, type_ref) else {
+                return None;
+            };
+            if info.is_none() {
+                return None;
+            }
+            if read_bool_attr(info, "is_enum").unwrap_or(false) {
+                // types.py:3605-3607: enum literal falsiness delegates to
+                // the enum class instance's flag.
+                let cf = read_bool_attr(info, "can_be_false").unwrap_or(false);
+                return Some(cf);
+            }
+            if matches!(&fallback_inst, Type::TypeVarType { .. }) {
+                return None;
+            }
+            Some(!bool_value_is_true(value))
+        }
+        Type::TypeAliasType { .. } => alias_can_be(py, typ, false, resolver),
+        _ => Some(true),
+    }
+}
+
+/// Wire-portable `bool(value)` for a serialized `LiteralValue`
+/// (types.py:3608 / 3613: `not self.value` / `bool(self.value)`).
+fn bool_value_is_true(value: &crate::wire::LiteralValue) -> bool {
+    use crate::wire::LiteralValue;
+    match value {
+        LiteralValue::Int(i) => *i != 0,
+        LiteralValue::Str(s) => !s.is_empty(),
+        LiteralValue::Bytes(b) => !b.is_empty(),
+        LiteralValue::Bool(b) => *b,
+        LiteralValue::Float(_) => true,
     }
 }
 
@@ -524,6 +854,23 @@ fn union_length_inner(typ: &Type) -> Option<i64> {
         Some(items.len() as i64)
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolver-enabled truthiness defaults (issue #854)
+// ---------------------------------------------------------------------------
+
+/// Expose the resolver-enabled live truthiness seams to the extension
+/// module (Python parity tests call them directly). Also referenced by the
+/// plain lib build so the functions are not dead code there.
+pub(crate) mod extension_seams {
+    use pyo3::prelude::*;
+
+    pub(crate) fn add_seams(module: &pyo3::types::PyModule) -> pyo3::PyResult<()> {
+        module.add_function(wrap_pyfunction!(super::rust_can_be_true_default_live, module)?)?;
+        module.add_function(wrap_pyfunction!(super::rust_can_be_false_default_live, module)?)?;
+        Ok(())
     }
 }
 
