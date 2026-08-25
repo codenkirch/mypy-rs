@@ -296,9 +296,7 @@ fn can_be_any_bool_live(
     }
     let mro = read_mro_fullnames(info, "mro")?;
     for cls_fullname in &mro {
-        let Some(cls) = resolver.live_typeinfo(py, cls_fullname) else {
-            return None;
-        };
+        let cls = resolver.live_typeinfo(py, cls_fullname)?;
         if cls.is_none() {
             return None;
         }
@@ -386,10 +384,7 @@ fn can_be_true_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -
             items,
             ..
         } => {
-            let fallback_bytes = match encode_type(partial_fallback) {
-                Some(b) => b,
-                None => return None,
-            };
+            let fallback_bytes = encode_type(partial_fallback)?;
             let (any_bool, _) = can_be_any_bool_for(py, &fallback_bytes, resolver)?;
             // types.py:3069-3074: with can_be_any_bool() the
             // NamedTuple-with-__bool__ corner makes the tuple both true- and
@@ -397,17 +392,12 @@ fn can_be_true_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -
             Some(any_bool || !items.is_empty())
         }
         Type::LiteralType { fallback, value } => {
-            let fallback_bytes = match encode_type(fallback) {
-                Some(b) => b,
-                None => return None,
-            };
+            let fallback_bytes = encode_type(fallback)?;
             let fallback_inst = resolve_fallback(py, &fallback_bytes, resolver)?;
             let Type::Instance { type_ref, .. } = &fallback_inst else {
                 return None;
             };
-            let Some(info) = resolver.live_typeinfo(py, type_ref) else {
-                return None;
-            };
+            let info = resolver.live_typeinfo(py, type_ref)?;
             if info.is_none() {
                 return None;
             }
@@ -480,10 +470,7 @@ fn can_be_false_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) 
             items,
             ..
         } => {
-            let fallback_bytes = match encode_type(partial_fallback) {
-                Some(b) => b,
-                None => return None,
-            };
+            let fallback_bytes = encode_type(partial_fallback)?;
             let (any_bool, _) = can_be_any_bool_for(py, &fallback_bytes, resolver)?;
             if any_bool {
                 return Some(true);
@@ -505,17 +492,12 @@ fn can_be_false_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) 
             Some(false)
         }
         Type::LiteralType { fallback, value } => {
-            let fallback_bytes = match encode_type(fallback) {
-                Some(b) => b,
-                None => return None,
-            };
+            let fallback_bytes = encode_type(fallback)?;
             let fallback_inst = resolve_fallback(py, &fallback_bytes, resolver)?;
             let Type::Instance { type_ref, .. } = &fallback_inst else {
                 return None;
             };
-            let Some(info) = resolver.live_typeinfo(py, type_ref) else {
-                return None;
-            };
+            let info = resolver.live_typeinfo(py, type_ref)?;
             if info.is_none() {
                 return None;
             }
