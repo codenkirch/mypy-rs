@@ -518,19 +518,24 @@ class PatternChecker(PatternVisitor[PatternType]):
         to length 4 the result is [bool, int, int, str].
         """
         if _HAS_TYPE_KERNEL and _native_checkpattern_active:
-            try:
-                result = _type_kernel.rust_expand_starred_pattern_types(
-                    [_serialize_type(t) for t in types],
-                    star_pos,
-                    num_types,
-                    original_unpack,
-                )
-                if result is not None:
-                    decoded = _deserialize_type_list([bytes(b) for b in result])
-                    if decoded is not None:
-                        return decoded
-            except (AssertionError, NotImplementedError):
-                pass
+            from mypy.subtypes import _native_subtype_resolver
+
+            resolver = _native_subtype_resolver
+            if resolver is not None:
+                try:
+                    result = _type_kernel.rust_expand_starred_pattern_types(
+                        [_serialize_type(t) for t in types],
+                        star_pos,
+                        num_types,
+                        original_unpack,
+                        resolver,
+                    )
+                    if result is not None:
+                        decoded = _deserialize_type_list([bytes(b) for b in result])
+                        if decoded is not None:
+                            return decoded
+                except (AssertionError, NotImplementedError):
+                    pass
         if star_pos is None:
             return types
         if original_unpack:
@@ -979,12 +984,16 @@ class PatternChecker(PatternVisitor[PatternType]):
 
 def get_match_arg_names(typ: TupleType) -> list[str | None]:
     if _HAS_TYPE_KERNEL and _native_checkpattern_active:
-        try:
-            result = _type_kernel.rust_get_match_arg_names(_serialize_type(typ))
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+        from mypy.subtypes import _native_subtype_resolver
+
+        resolver = _native_subtype_resolver
+        if resolver is not None:
+            try:
+                result = _type_kernel.rust_get_match_arg_names(_serialize_type(typ), resolver)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
     args: list[str | None] = []
     for item in typ.items:
         values = try_getting_str_literals_from_type(item)
@@ -1034,10 +1043,14 @@ def get_type_range(typ: Type) -> TypeRange:
 
 def is_uninhabited(typ: Type) -> bool:
     if _HAS_TYPE_KERNEL and _native_checkpattern_active:
-        try:
-            result = _type_kernel.rust_is_uninhabited(_serialize_type(typ))
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+        from mypy.subtypes import _native_subtype_resolver
+
+        resolver = _native_subtype_resolver
+        if resolver is not None:
+            try:
+                result = _type_kernel.rust_is_uninhabited(_serialize_type(typ), resolver)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
     return isinstance(get_proper_type(typ), UninhabitedType)

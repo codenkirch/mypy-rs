@@ -15656,51 +15656,144 @@ class NativeCheckPatternSuite(Suite):
     def setUp(self) -> None:
         self.fx = TypeFixture()
         self._buf = _WriteBuffer()
+        self._resolver = self._build_resolver(self._type_infos(), [])
+
+    def _type_infos(self) -> list[TypeInfo]:
+        from mypy.nodes import TypeInfo
+
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _build_resolver(self, infos: list[TypeInfo], aliases: list[Any]) -> object:
+        return _type_kernel.build_native_resolver(infos, aliases)
 
     def _bytes_of(self, t: Type) -> bytes:
         self._buf = _WriteBuffer()
         t.write(self._buf)
         return self._buf.getvalue()
 
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checkpattern import _set_native_checkpattern_active
+
+        _set_native_checkpattern_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkpattern_active(True)
+
     def test_is_uninhabited_true(self) -> None:
         t = UninhabitedType()
-        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is True
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t), self._resolver) is True
 
     def test_is_uninhabited_false(self) -> None:
         t = self.fx.a
-        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t), self._resolver) is False
 
     def test_is_uninhabited_none_type(self) -> None:
         t = NoneType()
-        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t), self._resolver) is False
 
     def test_is_uninhabited_union_with_uninhabited(self) -> None:
         # Union containing UninhabitedType: get_proper_type keeps it in the
         # union, but is_uninhabited checks the whole type, not items.
         t = UnionType.make_union([self.fx.a, UninhabitedType()])
-        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t)) is False
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(t), self._resolver) is False
+
+    def test_is_uninhabited_alias_to_uninhabited(self) -> None:
+        # A TypeAliasType resolving to UninhabitedType must answer True
+        # (Python: isinstance(get_proper_type(typ), UninhabitedType)); the
+        # Rust seam expands the alias via the resolver snapshot.
+        from mypy.checkpattern import is_uninhabited
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(UninhabitedType(), "mod.Never", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        resolver = self._build_resolver([], [alias])
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(typ), resolver) is True
+        off = self._with_gate(False, lambda: is_uninhabited(typ))
+        on = self._with_gate(True, lambda: is_uninhabited(typ))
+        assert_equal(on, off, "alias-to-uninhabited is_uninhabited parity")
+
+    def test_is_uninhabited_alias_to_non_uninhabited(self) -> None:
+        from mypy.checkpattern import is_uninhabited
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        resolver = self._build_resolver([], [alias])
+        assert _type_kernel.rust_is_uninhabited(self._bytes_of(typ), resolver) is False
+        assert_equal(
+            self._with_gate(True, lambda: is_uninhabited(typ)),
+            self._with_gate(False, lambda: is_uninhabited(typ)),
+            "alias-to-instance is_uninhabited parity",
+        )
+
+    def test_is_uninhabited_alias_missing_snapshot(self) -> None:
+        # Missing resolver snapshot: Rust defers (None) and Python falls back.
+        from mypy.checkpattern import is_uninhabited
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(UninhabitedType(), "mod.Missing", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        off = self._with_gate(False, lambda: is_uninhabited(typ))
+        on = self._with_gate(True, lambda: is_uninhabited(typ))
+        assert_equal(on, off, "missing-snapshot is_uninhabited parity")
+        assert on is True
 
     def test_get_match_arg_names_all_str(self) -> None:
         # TupleType with str-literal items -> list of str values.
         t = TupleType([self.fx.lit_str1, self.fx.lit_str2], self.fx.std_tuple)
-        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t), self._resolver)
         assert result == ["x", "y"]
 
     def test_get_match_arg_names_mixed(self) -> None:
         # TupleType with a non-str-literal item -> None in that position.
         t = TupleType([self.fx.lit_str1, self.fx.a], self.fx.std_tuple)
-        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t), self._resolver)
         assert result == ["x", None]
 
     def test_get_match_arg_names_no_literals(self) -> None:
         t = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
-        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t), self._resolver)
         assert result == [None, None]
 
     def test_get_match_arg_names_empty(self) -> None:
         t = TupleType([], self.fx.std_tuple)
-        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t))
+        result = _type_kernel.rust_get_match_arg_names(self._bytes_of(t), self._resolver)
         assert result == []
+
+    def test_get_match_arg_names_alias_item(self) -> None:
+        # An item that is a str-alias expands through the resolver to its
+        # Literal[str], matching try_getting_str_literals_from_type.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.lit_str1, "mod.S", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        t = TupleType([typ, self.fx.lit_str2], self.fx.std_tuple)
+        resolver = self._build_resolver([], [alias])
+        assert _type_kernel.rust_get_match_arg_names(self._bytes_of(t), resolver) == [
+            "x",
+            "y",
+        ]
+
+    def test_get_match_arg_names_alias_missing_snapshot_defers(self) -> None:
+        # An unresolvable alias item: Rust defers (None) so Python resolves it.
+        from mypy.checkpattern import get_match_arg_names
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.lit_str1, "mod.Missing", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        t = TupleType([typ, self.fx.lit_str2], self.fx.std_tuple)
+        off = self._with_gate(False, lambda: get_match_arg_names(t))
+        on = self._with_gate(True, lambda: get_match_arg_names(t))
+        assert_equal(on, off, "missing-snapshot match-arg parity")
+        assert on == ["x", "y"]
 
     def test_get_type_range_bool_lkv(self) -> None:
         # Instance with a bool last_known_value should return True (unwrap).
