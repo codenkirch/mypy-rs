@@ -736,24 +736,33 @@ fn has_erased_component_inner_seen(
 /// `mypy.checkexpr.has_bytes_component` — is this one of builtin byte
 /// types, or a union that contains it?
 ///
-/// Mirrors `has_bytes_component` (checkexpr.py:6988-6997). Defers on
-/// TypeAliasType (needs get_proper_type).
+/// Mirrors `has_bytes_component` (checkexpr.py:8762-8774). The Python
+/// body `get_proper_type`-expands a top-level TypeAliasType and every
+/// union item before the class-name check, so we thread the alias
+/// resolver and expand via `get_proper_or_expand`. A missing resolver
+/// snapshot defers to the pure-Python fallback.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_has_bytes_component(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+pub(crate) fn rust_has_bytes_component(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(has_bytes_component_inner(&typ))
+    Ok(has_bytes_component_inner(&typ, resolver.alias_resolver()))
 }
 
-pub(crate) fn has_bytes_component_inner(typ: &Type) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
+pub(crate) fn has_bytes_component_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let proper = get_proper_or_expand(typ, aliases)?;
+    match &proper {
         Type::UnionType { items, .. } => {
             for t in items {
-                match has_bytes_component_inner(t) {
+                match has_bytes_component_inner(t, aliases) {
                     Some(true) => return Some(true),
                     None => return None,
                     Some(false) => {}
@@ -762,7 +771,7 @@ pub(crate) fn has_bytes_component_inner(typ: &Type) -> Option<bool> {
             Some(false)
         }
         Type::Instance { type_ref, .. } => {
-            Some(*type_ref == "builtins.bytes" || *type_ref == "builtins.bytearray")
+            Some(type_ref == "builtins.bytes" || type_ref == "builtins.bytearray")
         }
         _ => Some(false),
     }
@@ -1325,24 +1334,38 @@ pub(crate) fn is_typeddict_type_context_inner(typ: &Type) -> Option<bool> {
 /// fast-path container literal: an Instance, or a TupleType whose items
 /// all qualify.
 ///
-/// Mirrors `allow_fast_container_literal` (checkexpr.py:413-419). A
-/// recursive TypeAlias defers (needs get_proper_type with alias target).
+/// Mirrors `allow_fast_container_literal` (checkexpr.py:413-419). The
+/// Python body `get_proper_type`-expands a TypeAliasType before the
+/// isinstance chain, so we thread the alias resolver and expand via
+/// `expand_alias_shape` (the answer depends only on the target's type
+/// class, never on Instance args). A recursive alias defers (a shape
+/// chain cycle returns None; Python would answer False), as does a
+/// missing resolver snapshot.
 #[pyfunction]
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_allow_fast_container_literal(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+pub(crate) fn rust_allow_fast_container_literal(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
     let typ = match decode_type(type_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
-    Ok(allow_fast_container_literal_inner(&typ))
+    Ok(allow_fast_container_literal_inner(
+        &typ,
+        resolver.alias_resolver(),
+    ))
 }
 
-pub(crate) fn allow_fast_container_literal_inner(typ: &Type) -> Option<bool> {
-    let proper = get_proper_or_none(typ)?;
-    match proper {
+pub(crate) fn allow_fast_container_literal_inner(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<bool> {
+    let proper = expand_alias_shape(typ, aliases)?;
+    match &proper {
         Type::TupleType { items, .. } => {
             for it in items {
-                match allow_fast_container_literal_inner(it) {
+                match allow_fast_container_literal_inner(it, aliases) {
                     Some(true) => {}
                     Some(false) => return Some(false),
                     None => return None,
@@ -1998,7 +2021,7 @@ fn first_or_join_fast_item_inner(items: &[Type], resolver: &NativeTypeResolver) 
     {
         return None;
     }
-    match allow_fast_container_literal_inner(&joined) {
+    match allow_fast_container_literal_inner(&joined, resolver.alias_resolver()) {
         Some(true) => Some(joined),
         _ => None,
     }
@@ -3726,7 +3749,10 @@ mod tests {
     #[test]
     fn test_allow_fast_container_literal_instance() {
         assert_eq!(
-            allow_fast_container_literal_inner(&make_instance("list", vec![])),
+            allow_fast_container_literal_inner(
+                &make_instance("list", vec![]),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
             Some(true)
         );
     }
@@ -3738,7 +3764,10 @@ mod tests {
             items: vec![make_instance("int", vec![]), make_instance("str", vec![])],
             implicit: false,
         };
-        assert_eq!(allow_fast_container_literal_inner(&tup), Some(true));
+        assert_eq!(
+            allow_fast_container_literal_inner(&tup, &crate::aliases::TypeAliasResolver::new()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -3748,22 +3777,59 @@ mod tests {
             items: vec![make_instance("int", vec![]), make_union(vec![])],
             implicit: false,
         };
-        assert_eq!(allow_fast_container_literal_inner(&tup), Some(false));
+        assert_eq!(
+            allow_fast_container_literal_inner(&tup, &crate::aliases::TypeAliasResolver::new()),
+            Some(false)
+        );
     }
 
     #[test]
-    fn test_allow_fast_container_literal_alias_defers() {
+    fn test_allow_fast_container_literal_alias_missing_defers() {
         let alias = Type::TypeAliasType {
             args: vec![],
             type_ref: "mod.A".to_string(),
         };
-        assert_eq!(allow_fast_container_literal_inner(&alias), None);
+        assert_eq!(
+            allow_fast_container_literal_inner(&alias, &crate::aliases::TypeAliasResolver::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_alias_to_tuple_resolves() {
+        // A = Tuple[int, str]: Python get_proper_type expands the alias and
+        // all items qualify -> true.
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.A",
+            Type::TupleType {
+                partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+                items: vec![make_instance("int", vec![]), make_instance("str", vec![])],
+                implicit: false,
+            },
+        )]);
+        assert_eq!(
+            allow_fast_container_literal_inner(&make_type_alias("mod.A"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_allow_fast_container_literal_alias_to_list_resolves() {
+        // A = list[int]: expands to an Instance -> true.
+        let aliases = alias_resolver_with_targets(&[("mod.L", make_instance("list", vec![]))]);
+        assert_eq!(
+            allow_fast_container_literal_inner(&make_type_alias("mod.L"), &aliases),
+            Some(true)
+        );
     }
 
     #[test]
     fn test_has_bytes_component_true() {
         assert_eq!(
-            has_bytes_component_inner(&make_instance("builtins.bytes", vec![])),
+            has_bytes_component_inner(
+                &make_instance("builtins.bytes", vec![]),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
             Some(true)
         );
     }
@@ -3771,7 +3837,10 @@ mod tests {
     #[test]
     fn test_has_bytes_component_false() {
         assert_eq!(
-            has_bytes_component_inner(&make_instance("builtins.int", vec![])),
+            has_bytes_component_inner(
+                &make_instance("builtins.int", vec![]),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
             Some(false)
         );
     }
@@ -3782,7 +3851,49 @@ mod tests {
             make_instance("builtins.int", vec![]),
             make_instance("builtins.bytes", vec![]),
         ]);
-        assert_eq!(has_bytes_component_inner(&u), Some(true));
+        assert_eq!(
+            has_bytes_component_inner(&u, &crate::aliases::TypeAliasResolver::new()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_bytes_component_alias_to_bytes_resolves() {
+        // A = builtins.bytes: Python get_proper_type expands the alias.
+        let aliases =
+            alias_resolver_with_targets(&[("mod.B", make_instance("builtins.bytes", vec![]))]);
+        assert_eq!(
+            has_bytes_component_inner(&make_type_alias("mod.B"), &aliases),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_has_bytes_component_union_alias_item_resolves() {
+        // Union[int, A] where A = builtins.bytearray.
+        let aliases =
+            alias_resolver_with_targets(&[("mod.BA", make_instance("builtins.bytearray", vec![]))]);
+        let u = Type::UnionType {
+            items: vec![
+                make_instance("builtins.int", vec![]),
+                make_type_alias("mod.BA"),
+            ],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(has_bytes_component_inner(&u, &aliases), Some(true));
+    }
+
+    #[test]
+    fn test_has_bytes_component_alias_missing_defers() {
+        assert_eq!(
+            has_bytes_component_inner(
+                &make_type_alias("mod.Missing"),
+                &crate::aliases::TypeAliasResolver::new()
+            ),
+            None
+        );
     }
 
     #[test]

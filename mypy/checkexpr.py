@@ -1038,10 +1038,14 @@ class TooManyUnions(Exception):
 
 
 def allow_fast_container_literal(t: Type) -> bool:
-    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(t)
-            result = _rust_allow_fast_container_literal(type_bytes)
+            result = _rust_allow_fast_container_literal(_native_checkexpr_resolver, type_bytes)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):
@@ -8773,10 +8777,14 @@ def is_expr_literal_type(node: Expression) -> bool:
 
 def has_bytes_component(typ: Type) -> bool:
     """Is this one of builtin byte types, or a union that contains it?"""
-    if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+    if (
+        _CHECKEXPR_HAS_TYPE_KERNEL
+        and _native_checkexpr_active
+        and _native_checkexpr_resolver is not None
+    ):
         try:
             type_bytes = _serialize_type_for_checkexpr(typ)
-            result = _rust_has_bytes_component(type_bytes)
+            result = _rust_has_bytes_component(_native_checkexpr_resolver, type_bytes)
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

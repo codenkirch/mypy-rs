@@ -4745,6 +4745,177 @@ class NativeTypeTypeContextSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckexprFunctionsDeferralSuite(Suite):
+    """Differential parity for the #871 checkexpr_functions alias defers.
+
+    Ports top-level TypeAliasType operand expansion into the
+    `has_bytes_component` and `allow_fast_container_literal` seams,
+    mirroring the `get_proper_type` calls at the top of the Python bodies
+    (checkexpr.py). Each test runs the public function gate-off (pure
+    Python) and gate-on (Rust seam) and asserts equal answers; for the
+    resolved-alias cases it also calls the seam directly and asserts a
+    non-None result, proving the resolver-snapshot expansion fired
+    instead of deferring. A missing resolver snapshot still defers (the
+    Python fallback gives the answer, so both gates agree).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        self.fx = TypeFixture()
+        self.bytes_info = self.fx.make_type_info("builtins.bytes")
+        self.bytearray_info = self.fx.make_type_info("builtins.bytearray")
+        self.resolver = self._build_resolver([], [])
+        _set_native_checkexpr_resolver(self.resolver)
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+
+        _set_native_checkexpr_active(False)
+        _set_native_checkexpr_resolver(None)
+
+    def _build_resolver(self, extra_infos: list[Any], aliases: list[Any]) -> Any:
+        from mypy.checkexpr import _set_native_checkexpr_resolver
+
+        infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.type_typei,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ] + extra_infos
+        self.resolver = _type_kernel.build_native_resolver(infos, aliases)
+        _set_native_checkexpr_resolver(self.resolver)
+        return self.resolver
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkexpr_active(True)
+
+    def _differential(self, fn: Callable[[], object]) -> object:
+        # Gate-off (pure Python) vs gate-on (Rust seam) must agree.
+        off = self._with_gate(False, fn)
+        assert fn() == off
+        return off
+
+    def test_has_bytes_alias_to_bytes(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr, has_bytes_component
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.bytes_info, []), "mod.AB", "mod", -1, -1
+        )
+        self._build_resolver([self.bytes_info], [alias])
+        typ = TypeAliasType(alias, [])
+        # Rust must decide (non-None): the alias expands to builtins.bytes.
+        assert _type_kernel.rust_has_bytes_component(
+            self.resolver, _serialize_type_for_checkexpr(typ)
+        ) is True
+        assert self._differential(lambda: has_bytes_component(typ)) is True
+
+    def test_has_bytes_union_alias_item(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr, has_bytes_component
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.bytearray_info, []), "mod.ABA", "mod", -1, -1
+        )
+        self._build_resolver([self.bytearray_info], [alias])
+        union = UnionType.make_union([self.fx.a, TypeAliasType(alias, [])])
+        assert _type_kernel.rust_has_bytes_component(
+            self.resolver, _serialize_type_for_checkexpr(union)
+        ) is True
+        assert self._differential(lambda: has_bytes_component(union)) is True
+
+    def test_has_bytes_non_bytes_false(self) -> None:
+        from mypy.checkexpr import has_bytes_component
+
+        assert self._differential(lambda: has_bytes_component(self.fx.a)) is False
+
+    def test_has_bytes_alias_missing_snapshot(self) -> None:
+        # Missing resolver snapshot: both gates fall through to Python's
+        # get_proper_type and must agree.
+        from mypy.checkexpr import has_bytes_component
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.bytes_info, []), "mod.AMissing", "mod", -1, -1
+        )
+        typ = TypeAliasType(alias, [])
+        assert self._differential(lambda: has_bytes_component(typ)) is True
+
+    def test_allow_fast_alias_to_tuple(self) -> None:
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            allow_fast_container_literal,
+        )
+        from mypy.nodes import TypeAlias
+
+        fallback = Instance(self.fx.std_tuplei, [])
+        target = TupleType(
+            [Instance(self.fx.ai, []), Instance(self.fx.bi, [])], fallback
+        )
+        alias = TypeAlias(target, "mod.AT", "mod", -1, -1)
+        self._build_resolver([], [alias])
+        typ = TypeAliasType(alias, [])
+        assert _type_kernel.rust_allow_fast_container_literal(
+            self.resolver, _serialize_type_for_checkexpr(typ)
+        ) is True
+        assert self._differential(lambda: allow_fast_container_literal(typ)) is True
+
+    def test_allow_fast_alias_to_list(self) -> None:
+        from mypy.checkexpr import (
+            _serialize_type_for_checkexpr,
+            allow_fast_container_literal,
+        )
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.a]), "mod.AL", "mod", -1, -1
+        )
+        self._build_resolver([], [alias])
+        typ = TypeAliasType(alias, [])
+        assert _type_kernel.rust_allow_fast_container_literal(
+            self.resolver, _serialize_type_for_checkexpr(typ)
+        ) is True
+        assert self._differential(lambda: allow_fast_container_literal(typ)) is True
+
+    def test_allow_fast_plain_instance_true(self) -> None:
+        from mypy.checkexpr import allow_fast_container_literal
+
+        assert self._differential(lambda: allow_fast_container_literal(self.fx.a)) is True
+
+    def test_allow_fast_alias_missing_snapshot(self) -> None:
+        # Alias absent from the resolver: the seam defers (None), so the
+        # answer comes from Python's get_proper_type; both gates agree.
+        from mypy.checkexpr import _serialize_type_for_checkexpr, allow_fast_container_literal
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(
+            Instance(self.fx.std_listi, [self.fx.a]), "mod.AMissL", "mod", -1, -1
+        )
+        typ = TypeAliasType(alias, [])
+        assert _type_kernel.rust_allow_fast_container_literal(
+            self.resolver, _serialize_type_for_checkexpr(typ)
+        ) is None
+        assert self._differential(lambda: allow_fast_container_literal(typ)) is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeClassCallableSuite(Suite):
     """Parity for the Rust `class_callable` port (mypy.typeops, #492 follow-up).
 
