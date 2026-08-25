@@ -4629,6 +4629,104 @@ class NativeExpandTypeByInstanceSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExpandTypeEmptyEnvSuite(Suite):
+    """Parity for the Rust `expand_type` empty-env fast path.
+
+    `expand_type(typ, {})` performs no substitution. The seam used to bail
+    on ANY empty env (expandtype.rs returned None inside rust_expand_type),
+    forcing a pure-Python rebuild even for typevar-free types. Now an empty
+    env is wire-portable: `expand_type_with_env` rebuilds the tree and only
+    defers when a leftover TypeVar would break the caller's object-identity
+    expectations (the `result_has_typevar` guard). This suite locks the
+    differential: a typevar-free type must engage natively, a typevar-bearing
+    type must keep deferring (identity), and gate-on == gate-off for both.
+    """
+
+    def setUp(self) -> None:
+        from mypy.expandtype import (
+            _set_native_expand_type_active,
+            _set_native_expand_type_resolver,
+            _set_native_expand_type_typeinfo_map,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_expand_type_active
+        self._set_resolver = _set_native_expand_type_resolver
+        self._set_map = _set_native_expand_type_typeinfo_map
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self._resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self._resolver)
+        self._set_map({info.fullname: info for info in type_infos})
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._set_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _expand(self, typ: Type) -> Type:
+        from mypy.expandtype import expand_type
+
+        return expand_type(typ, {})
+
+    def _assert_par(self, typ: Type) -> None:
+        off = str(self._with_gate(False, lambda: self._expand(typ)))
+        on = str(self._with_gate(True, lambda: self._expand(typ)))
+        assert_equal(on, off, f"expand_type(empty env) parity {typ}")
+
+    def test_seam_engages_typevar_free(self) -> None:
+        # G[A] with an empty env has no TypeVar to substitute; the seam must
+        # engage (return bytes) and produce a rebuilt G[A].
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(self.fx.ga),
+            _serialize_env({}),
+            state.strict_optional,
+        )
+        assert result is not None, "empty-env typevar-free expand_type did not engage"
+
+    def test_typevar_free_parity(self) -> None:
+        # G[A] (no typevars): native rebuild must equal Python rebuild.
+        self._assert_par(self.fx.ga)
+
+    def test_typevar_still_defers_for_identity(self) -> None:
+        # G[T] with an empty env leaves T unmatched. Python keeps the
+        # original T object; a wire clone would break identity, so the seam
+        # must return None and defer, while gate-on still equals gate-off.
+        from mypy.expandtype import _serialize_env, _serialize_type
+
+        result = _type_kernel.rust_expand_type(
+            self._resolver,
+            _serialize_type(self.fx.gt),
+            _serialize_env({}),
+            state.strict_optional,
+        )
+        assert result is None, "empty-env typevar-bearing expand_type must defer for identity"
+        self._assert_par(self.fx.gt)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypeTypeContextSuite(Suite):
     """Parity suite for the Rust `is_type_type_context` port (Phase B3a, #591).
 
