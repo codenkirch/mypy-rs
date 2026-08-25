@@ -4390,9 +4390,8 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
     def test_per_member_deferral_sentinel(self) -> None:
         # Per-member deferral sentinel: Rust returns a parallel flags
-        # Vec (true = mapped, false = re-run in Python). The variadic
-        # G[Ts] member defers (has_type_var_tuple_type guard); G[A] maps
-        # natively. Flags are [False, True].
+        # Vec (true = mapped, false = re-run in Python). G[Ts] member
+        # defers; G[A] maps natively. Flags are [False, True].
         import type_kernel as _tk
 
         from mypy.maptype import _WriteBuffer
@@ -15246,6 +15245,325 @@ class NativeCheckMemberSuite(Suite):
         assert decoded.arg_types == [self.fx.a]
         assert decoded.is_bound
         assert decoded.ret_type == self.fx.ga
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMemberAccessDispatchSuite(Suite):
+    """Parity tests for the #805 method-branch dispatch seam.
+
+    `rust_analyze_instance_member_dispatch` replaces the whole method
+    branch of `analyze_instance_member_access` (checkmember.py:634-775):
+    freshen, the static/trivial-self tail, and the non-trivial tail.
+    Rust reads live node flags and the serialized `method.type`,
+    freshens against the shared raw-id counter, and returns
+    (next_raw_id, changed, wire bytes). Deferred (None) cases fall
+    through to the pure-Python branch. The union seam returns per-item
+    results that the Python shim joins via `make_simplified_union`.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+        from librt.internal import WriteBuffer as _WB
+
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._tk = _tk
+        self._WB = _WB
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self.fx = TypeFixture()
+        for info in (self.fx.gi, self.fx.g2i, self.fx.hi):
+            for tv in info.defn.type_vars:
+                tv.id = TypeVarId(tv.id.raw_id, namespace=info.fullname)
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.di,
+            self.fx.ei,
+            self.fx.e2i,
+            self.fx.e3i,
+            self.fx.fi,
+            self.fx.f2i,
+            self.fx.f3i,
+            self.fx.gi,
+            self.fx.g2i,
+            self.fx.hi,
+            self.fx.std_tuplei,
+            self.fx.type_typei,
+            self.fx.bool_type_info,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+        # Live-node read path (build.py:1518).
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.resolver.set_live_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = self._WB()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _add_method(
+        self,
+        info: TypeInfo,
+        name: str,
+        sig: CallableType | Overloaded,
+        *,
+        is_static: bool = False,
+        is_trivial_self: bool = False,
+        is_class: bool = False,
+        is_final: bool = False,
+    ) -> FuncDef:
+        from mypy.nodes import MDEF, FuncDef, SymbolTableNode
+
+        fn = FuncDef(name, [], None, None)
+        fn.type = sig
+        fn.info = info
+        fn.is_static = is_static
+        fn.is_trivial_self = is_trivial_self
+        fn.is_class = is_class
+        fn.is_final = is_final
+        info.names[name] = SymbolTableNode(MDEF, fn)
+        return fn
+
+    def _sig(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: list[str | None],
+        ret: Type,
+        variables: list[TypeVarLikeType] | None = None,
+    ) -> CallableType:
+        return CallableType(
+            arg_types=arg_types,
+            arg_kinds=arg_kinds,
+            arg_names=arg_names,
+            ret_type=ret,
+            fallback=self.fx.function,
+            variables=variables or [],
+            is_bound=False,
+        )
+
+    def _dispatch(
+        self,
+        instance: Instance,
+        name: str,
+        self_type: Type,
+        *,
+        preserve: bool = False,
+        start_raw_id: int | None = None,
+        override: str | None = None,
+    ) -> tuple[int, bool, Type | None]:
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        start = TypeVarId.next_raw_id if start_raw_id is None else start_raw_id
+        result = self._tk.rust_analyze_instance_member_dispatch(
+            self.resolver,
+            self._bytes_of(instance),
+            name,
+            override,
+            self._bytes_of(self_type),
+            False,
+            preserve,
+            start,
+            False,
+        )
+        if result is None:
+            return (start, False, None)
+        next_raw_id, changed, wire_bytes = result
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+        return (next_raw_id, changed, decoded)
+
+    def _raw_dispatch(self, instance: Instance, name: str) -> tuple[int, bool, list[int]] | None:
+        return self._tk.rust_analyze_instance_member_dispatch(
+            self.resolver,
+            self._bytes_of(instance),
+            name,
+            None,
+            self._bytes_of(instance),
+            False,
+            False,
+            100,
+            False,
+        )
+
+    def test_dispatch_static_non_generic_preserves(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai, "m", self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a), is_static=True
+        )
+        _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        assert changed is False
+        assert isinstance(decoded, CallableType)
+        assert decoded.ret_type == self.fx.a
+        assert decoded.is_bound is False
+
+    def test_dispatch_trivial_self_binds(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            self._sig([self.fx.o, self.fx.a], [ARG_POS, ARG_POS], ["self", "x"], self.fx.a),
+            is_trivial_self=True,
+        )
+        _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        assert changed is False
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is True
+        assert decoded.arg_types == [self.fx.a]
+        assert decoded.ret_type == self.fx.a
+
+    def test_dispatch_non_trivial_same_class_binds(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            self._sig([self.fx.o, self.fx.a], [ARG_POS, ARG_POS], ["self", "x"], self.fx.a),
+        )
+        _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        assert changed is False
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is True
+        assert decoded.arg_types == [self.fx.a]
+        assert decoded.ret_type == self.fx.a
+
+    def test_dispatch_static_overloaded_expands(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        item1 = self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a)
+        item2 = self._sig([self.fx.a], [ARG_POS], ["x"], self.fx.b)
+        self._add_method(self.fx.ai, "m", Overloaded([item1, item2]), is_static=True)
+        _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        assert changed is False
+        assert isinstance(decoded, Overloaded)
+        assert len(decoded.items) == 2
+        assert decoded.items[0].ret_type == self.fx.a
+        assert decoded.items[1].ret_type == self.fx.b
+        assert decoded.items[0].is_bound is False
+
+    def test_dispatch_freshens_generic_method(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        ns_t = TypeVarType(
+            "T",
+            "__main__.T",
+            TypeVarId(1, namespace="G"),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        self._add_method(
+            self.fx.ai,
+            "m",
+            self._sig([self.fx.o], [ARG_POS], ["x"], ns_t, variables=[ns_t]),
+            is_static=True,
+        )
+        old = TypeVarId.next_raw_id
+        try:
+            next_raw_id, changed, decoded = self._dispatch(
+                self.fx.a, "m", self.fx.a, start_raw_id=old
+            )
+            assert changed is True
+            assert next_raw_id == old + 1
+            assert isinstance(decoded, CallableType)
+            assert decoded.ret_type.id.raw_id == old
+            assert decoded.ret_type.id.meta_level == 1
+        finally:
+            TypeVarId.next_raw_id = old
+
+    def test_dispatch_defers_unknown_name(self) -> None:
+        assert self._raw_dispatch(self.fx.a, "zzz") is None
+
+    def test_dispatch_defers_decorator(self) -> None:
+        from mypy.nodes import Decorator, FuncDef, MDEF, SymbolTableNode, Var
+
+        fn = FuncDef("m", [], None, None)
+        fn.type = self._sig([], [], [], self.fx.a)
+        self.fx.ai.names["m"] = SymbolTableNode(MDEF, Decorator(fn, [], Var("m")))
+        assert self._raw_dispatch(self.fx.a, "m") is None
+
+    def test_dispatch_defers_var_node(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        self.fx.ai.names["m"] = SymbolTableNode(MDEF, Var("m"))
+        assert self._raw_dispatch(self.fx.a, "m") is None
+
+    def test_dispatch_defers_subclass_receiver(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai, "m", self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a)
+        )
+        assert self._raw_dispatch(self.fx.c, "m") is None
+
+    def test_dispatch_defers_non_final_init(self) -> None:
+        from mypy.nodes import ARG_POS
+
+        self._add_method(
+            self.fx.ai, "__init__", self._sig([self.fx.o], [ARG_POS], ["self"], NoneType())
+        )
+        assert self._raw_dispatch(self.fx.a, "__init__") is None
+
+    def test_union_seam_per_item(self) -> None:
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        self._add_method(self.fx.ai, "m", self._sig([], [], [], self.fx.a), is_static=True)
+        self._add_method(self.fx.bi, "m", self._sig([], [], [], self.fx.b), is_static=True)
+        union = UnionType([self.fx.a, self.fx.b])
+        result = self._tk.rust_analyze_union_member_access(
+            self.resolver,
+            self._bytes_of(union),
+            "m",
+            False,
+            False,
+            False,
+            True,
+            100,
+            False,
+        )
+        assert result is not None
+        _next_raw_id, changed, per_item = result
+        assert changed is False
+        assert len(per_item) == 2
+        decoded = [_deserialize_type_for_checkmember(bytes(b)) for b in per_item]
+        assert isinstance(decoded[0], CallableType) and isinstance(decoded[1], CallableType)
+        assert decoded[0].ret_type == self.fx.a
+        assert decoded[1].ret_type == self.fx.b
+
+    def test_union_seam_defers_for_lvalue(self) -> None:
+        union = UnionType([self.fx.a, self.fx.b])
+        result = self._tk.rust_analyze_union_member_access(
+            self.resolver,
+            self._bytes_of(union),
+            "m",
+            True,
+            False,
+            False,
+            True,
+            100,
+            False,
+        )
+        assert result is None
 
 
 # ---------------------------------------------------------------------------

@@ -23,6 +23,13 @@
 //!     checker state.
 //!   * `defined_in_superclass` — whether a variable has an explicit value at
 //!     class level in any superclass.
+//!   * `rust_analyze_instance_member_dispatch` (issue #805) — the method
+//!     branch head of `analyze_instance_member_access`: live `get_method`
+//!     lookup via the resolver's live TypeInfo map, flag reads, freshen,
+//!     and the static / trivial-self / non-trivial tail.
+//!   * `rust_analyze_union_member_access` (issue #805) — per-item mapping
+//!     of `analyze_union_member_access`; Instance items dispatch, the
+//!     Python shim joins via `make_simplified_union`.
 //!
 //! Deferred (return None):
 //!   * `TypeAliasType` — the wire format carries no resolved alias target,
@@ -36,10 +43,12 @@
 //!     return None rather than risk a wrong boolean.
 
 use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
 
+use crate::freshen::freshen_type;
 use crate::setops::make_simplified_union;
 use crate::subtypes::SubtypeContext;
-use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
@@ -626,44 +635,95 @@ pub(crate) fn rust_defined_in_superclass(
 // analyze_instance_member_access (method path)
 // ---------------------------------------------------------------------------
 
-/// `mypy.checkmember.analyze_instance_member_access` (checkmember.py:388-453),
-/// the method branch (checkmember.py:415-453), Rust subset.
+/// Shared map-then-expand tail of `analyze_instance_member_access`
+/// (checkmember.py:773-775) for static and trivial-self methods, and the
+/// member-access dispatch: `map_instance_to_supertype` +
+/// `expand_type_by_instance`, with an optional trivial-self bind.
 ///
-/// Ports the map-then-expand tail of the method path for a **static** or
-/// **trivial-self** non-overloaded method: `map_instance_to_supertype` +
-/// `expand_type_by_instance` + `freeze_all_type_vars`. The Python caller
-/// freshens the signature before dispatching, so method-level type vars are
-/// freshened (raw_ids that are not class vars); Rust's
-/// `expand_type_with_env` defers any result that still contains a TypeVar,
-/// so methods generic over their own type vars fall through to Python.
-///
-/// The caller gates on `method.is_static` or `method.is_trivial_self`. The
-/// trivial-self path maps subclass receivers too: `map_instance_to_supertype`
-/// already returns None for a non-base receiver (the identical deferral the
-/// old exact-class guard produced), and the class-var substitution on the
-/// mapped supertype is handled natively. A static signature is never bound;
-/// a trivial-self signature is bound via `bind_self_fast`
-/// (checkmember.py:704-705), which
-/// only drops the first argument and sets `is_bound` — no
-/// `__self__`/`__cls__` identity is involved, so Rust can mirror it after
-/// expansion instead of before. Expanding first on the unbound callable
-/// avoids the `is_bound` deferral in `expand_type_inner`; binding then only
-/// trims `arg_types[1:]`, which expansion does not touch semantically (a
-/// trivial self carries no type variables by construction). Returns `None`
-/// (Python falls through) for:
+/// A static signature is never bound; a trivial-self signature is bound via
+/// `bind_self_fast` (checkmember.py:704-705), which only drops the first
+/// argument and sets `is_bound` — no `__self__`/`__cls__` identity is
+/// involved, so Rust can mirror it after expansion instead of before.
+/// Expanding first on the unbound callable avoids the `is_bound` deferral
+/// in `expand_type_inner`; binding then only trims `arg_types[1:]`, which
+/// expansion does not touch semantically (a trivial self carries no type
+/// variables by construction). Returns `None` (Python falls through) for:
 ///   * a non-Instance `typ`
-///   * an Overloaded signature (the static overloaded path maps in Python)
+///   * an Overloaded signature when `allow_overloaded` is false (the
+///     legacy static seam maps overloads in Python)
 ///   * a missing resolver snapshot / unresolvable derivation path
 ///   * a mapped instance with empty args or a TVT class (expand defers)
 ///   * a ParamSpec/Unpack signature (expand defers)
-///   * an expanded result that still carries a TypeVar
+///   * an expanded result that still carries a TypeVar (trivial self only)
 ///   * a non-Callable trivial-self signature (bind_self_fast_inner's None:
 ///     Overloaded with zero items); a zero-arg or *args/**kwargs callable is
 ///     returned unchanged by bind_self_fast, and Rust mirrors that as the
 ///     unchanged callable, not a deferral
+///
 /// Python's `freeze_all_type_vars` is unported: the signature is already
 /// frozen by this seam (expand produces only bound class vars), so nothing
 /// remains to freeze when the Rust path fully succeeds.
+fn static_member_tail(
+    instance: &Type,
+    signature: &Type,
+    method_fullname: &str,
+    strict_optional: bool,
+    resolver: &TypeResolver,
+    is_trivial: bool,
+    allow_overloaded: bool,
+) -> Option<Type> {
+    let (left_ref, left_args) = match instance {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return None,
+    };
+    // `map_instance_to_supertype` walks map_derivation_path and returns
+    // None for a non-base receiver, deferring to Python exactly as the
+    // old exact-class guard did; subclass receivers now map natively.
+    let ok = match signature {
+        Type::CallableType { .. } => true,
+        Type::Overloaded { .. } => allow_overloaded,
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+    // Defer `builtins.tuple` methods: a NamedTuple subclass mapped there
+    // needs the `tuple_fallback` special case (maptype.py:316-339) Rust
+    // does not implement; mirrors maptype.py:130's `!= "builtins.tuple"`.
+    if method_fullname == "builtins.tuple" {
+        return None;
+    }
+    // checkmember.py:450 `typ = map_instance_to_supertype(typ, method.info)`.
+    let mapped_args =
+        crate::subtypes::map_instance_to_supertype(left_ref, left_args, method_fullname, resolver)?;
+    let mapped_instance = Type::Instance {
+        type_ref: method_fullname.to_string(),
+        args: mapped_args,
+        last_known_value: None,
+        extra_attrs: None,
+    };
+    // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
+    // the unbound callable first (binding would defer the expand).
+    let expanded = crate::expandtype::expand_type_by_instance_core(
+        signature,
+        &mapped_instance,
+        resolver,
+        strict_optional,
+    );
+    let expanded = expanded?;
+    if is_trivial {
+        if crate::expandtype::result_has_typevar(&expanded) {
+            return None;
+        }
+        bind_self_fast_inner(&expanded)
+    } else {
+        Some(expanded)
+    }
+}
+
+/// Legacy M20 seam for a static or trivial-self `FuncDef` method
+/// (checkmember.py:670-721). Overloaded signatures defer to Python,
+/// preserving the seam's pre-dispatch behavior.
 #[pyfunction]
 #[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) fn rust_analyze_instance_member_access(
@@ -676,54 +736,16 @@ pub(crate) fn rust_analyze_instance_member_access(
 ) -> Option<Vec<u8>> {
     let instance = decode_type(instance_bytes)?;
     let signature = decode_type(signature_bytes)?;
-    let (left_ref, left_args) = match &instance {
-        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
-        _ => return None,
-    };
-    // `map_instance_to_supertype` walks map_derivation_path and returns
-    // None for a non-base receiver, deferring to Python exactly as the
-    // old exact-class guard did; subclass receivers now map natively.
-    if !matches!(signature, Type::CallableType { .. }) {
-        return None; // Overloaded defers to Python
-    }
-    // Defer `builtins.tuple` methods: a NamedTuple subclass mapped there
-    // needs the `tuple_fallback` special case (maptype.py:316-339) Rust
-    // does not implement; mirrors maptype.py:130's `!= "builtins.tuple"`.
-    if method_fullname == "builtins.tuple" {
-        return None;
-    }
-    // checkmember.py:450 `typ = map_instance_to_supertype(typ, method.info)`.
-    let mapped_args = crate::subtypes::map_instance_to_supertype(
-        left_ref,
-        left_args,
-        method_fullname,
-        resolver.resolver(),
-    )?;
-    let mapped_instance = Type::Instance {
-        type_ref: method_fullname.to_string(),
-        args: mapped_args,
-        last_known_value: None,
-        extra_attrs: None,
-    };
-    // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
-    // the unbound callable first (binding would defer the expand).
-    let expanded = crate::expandtype::expand_type_by_instance_core(
+    let result = static_member_tail(
+        &instance,
         &signature,
-        &mapped_instance,
-        resolver.resolver(),
+        method_fullname,
         strict_optional,
-    );
-    let expanded = expanded?;
-    if is_trivial_self {
-        if crate::expandtype::result_has_typevar(&expanded) {
-            return None;
-        }
-        let bound = bind_self_fast_inner(&expanded);
-        let bound = bound?;
-        encode_type(&bound)
-    } else {
-        encode_type(&expanded)
-    }
+        resolver.resolver(),
+        is_trivial_self,
+        false,
+    )?;
+    encode_type(&result)
 }
 
 /// Non-trivial-instance-method tail of `analyze_instance_member_access`
@@ -852,6 +874,266 @@ pub(crate) fn rust_analyze_member_method(
         is_class,
     )?;
     encode_type(&result)
+}
+
+// ---------------------------------------------------------------------------
+// analyze_instance_member_access (method-branch dispatch, issue #805)
+// ---------------------------------------------------------------------------
+
+/// Live `get_method` result: a function node (FuncBase) or a `Decorator`.
+/// The dispatch only handles FuncBase; decorated methods defer to Python.
+enum LiveMethod {
+    FuncBase(Py<PyAny>),
+    Decorator,
+}
+
+/// Mirror `TypeInfo.get_method` (nodes.py:4167-4183) on a live `TypeInfo`:
+/// walk its MRO, prefer the exact name, then the last sorted
+/// `name}-redefinition` entry, and return the node only when it is a
+/// `FuncDef`/`OverloadedFuncDef` (SYMBOL_FUNCBASE_TYPES) or a `Decorator`.
+/// A found-but-non-function node stops the walk, matching Python. Returns
+/// `None` for both "not a method" and any read failure — the dispatch
+/// defers either way.
+fn get_method_live(py: Python<'_>, info: &PyAny, name: &str) -> Option<LiveMethod> {
+    let nodes_mod = py.import("mypy.nodes").ok()?;
+    let func_def_cls = nodes_mod.getattr("FuncDef").ok()?;
+    let overloaded_cls = nodes_mod.getattr("OverloadedFuncDef").ok()?;
+    let decorator_cls = nodes_mod.getattr("Decorator").ok()?;
+    let mro = info.getattr("mro").ok()?.downcast::<PyList>().ok()?;
+    let redefinition_prefix = format!("{name}-redefinition");
+    for cls in mro.iter() {
+        let names = cls.getattr("names").ok()?.downcast::<PyDict>().ok()?;
+        let node = if let Some(entry) = names.get_item(name).ok()? {
+            entry.getattr("node").ok()?
+        } else {
+            // sorted([n for n in cls.names.keys()
+            //         if n.startswith(f"{name}-redefinition")])[-1]
+            let mut redefs: Vec<String> = Vec::new();
+            for key in names.keys() {
+                if let Ok(key) = key.extract::<String>() {
+                    if key.starts_with(&redefinition_prefix) {
+                        redefs.push(key);
+                    }
+                }
+            }
+            if redefs.is_empty() {
+                continue;
+            }
+            redefs.sort();
+            names
+                .get_item(&redefs[redefs.len() - 1])
+                .ok()??
+                .getattr("node")
+                .ok()?
+        };
+        if node.is_none() {
+            return None;
+        }
+        // isinstance(node, SYMBOL_FUNCBASE_TYPES) — two explicit checks
+        // instead of a tuple arg (PyO3 has no tuple `isinstance`).
+        if node.is_instance(func_def_cls).ok()? || node.is_instance(overloaded_cls).ok()? {
+            return Some(LiveMethod::FuncBase(node.into()));
+        }
+        if node.is_instance(decorator_cls).ok()? {
+            return Some(LiveMethod::Decorator);
+        }
+        return None; // found-but-non-func node stops the walk
+    }
+    None
+}
+
+/// Live-attribute read that defers (None) on any failure, mirroring the
+/// checker_helpers helper. `None` values read as `false` (Python treats
+/// None/absent flags as False in the method branch).
+fn get_bool_flag(py: Python<'_>, node: &PyAny, name: &str) -> Option<bool> {
+    let v = node.getattr(name).ok()?;
+    if v.is_none() {
+        return Some(false);
+    }
+    if let Ok(b) = v.extract::<bool>() {
+        return Some(b);
+    }
+    if let Ok(b) = v.downcast::<pyo3::types::PyBool>() {
+        return Some(b.is_true());
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Some(i != 0);
+    }
+    // A non-bool, non-int object: Python truthiness is not decidable here.
+    let _ = py;
+    None
+}
+
+/// Freshen a method signature: `freshen_type` handles CallableType;
+/// Overloaded is freshened per item with the shared raw-id counter
+/// (mirrors FreshenCallableVisitor over an Overloaded). Any item that
+/// defers defers the whole signature.
+fn freshen_signature(
+    signature: &Type,
+    next_raw_id: &mut i64,
+    changed: &mut bool,
+    strict_optional: bool,
+) -> Option<Type> {
+    match signature {
+        Type::Overloaded { items } => {
+            let mut new_items = Vec::with_capacity(items.len());
+            for item in items {
+                new_items.push(freshen_type(item, next_raw_id, changed, strict_optional)?);
+            }
+            Some(Type::Overloaded { items: new_items })
+        }
+        _ => freshen_type(signature, next_raw_id, changed, strict_optional),
+    }
+}
+
+/// Wire-portable head of `analyze_instance_member_access`
+/// (checkmember.py:607-776): live `get_method` lookup, flag reads,
+/// `freshen_all_functions_type_vars`, and the static / trivial-self /
+/// non-trivial tail dispatch. Returns `None` when any step needs Python
+/// (decorated methods, properties, lvalues, `__init__` guard failures,
+/// unresolvable live reads, unanalyzable signatures).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_instance_member_inner(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    instance: &Type,
+    name: &str,
+    override_info: Option<&str>,
+    self_type: &Type,
+    preserve_type_var_ids: bool,
+    next_raw_id: &mut i64,
+    changed: &mut bool,
+    strict_optional: bool,
+) -> Option<Type> {
+    let type_ref = match instance {
+        Type::Instance { type_ref, .. } => type_ref.as_str(),
+        _ => return None,
+    };
+    // checkmember.py:610-612 `info = typ.type; if override_info: info = ...`
+    let lookup_fullname = override_info.unwrap_or(type_ref);
+    let info = resolver.live_typeinfo(py, lookup_fullname)?;
+    if info.is_none() {
+        return None; // present-but-None map entry
+    }
+    let method = match get_method_live(py, info, name)? {
+        LiveMethod::FuncBase(node) => node,
+        // The Python shim pre-gates Decorator / property / lvalue / super
+        // for the instance path; the union path bypasses it, so Rust
+        // re-checks here.
+        LiveMethod::Decorator => return None,
+    };
+    let method = method.as_ref(py);
+    if get_bool_flag(py, method, "is_property")? {
+        return None;
+    }
+    let is_static = get_bool_flag(py, method, "is_static")?;
+    let is_trivial_self = get_bool_flag(py, method, "is_trivial_self")?;
+    let is_class = get_bool_flag(py, method, "is_class")?;
+    // checkmember.py:616-621 `__init__` guard: non-final class and method
+    // (and not via super, already gated) defers so Python emits the error.
+    if name == "__init__"
+        && !get_bool_flag(py, info, "is_final")?
+        && !get_bool_flag(py, method, "is_final")?
+    {
+        return None;
+    }
+    // checkmember.py:648-658 `method.info.fullname` + `function_type`
+    // typed passthrough (`method.type`). A None type is a not-ready
+    // overload or an unanalyzed function — defer to Python.
+    let method_fullname: String = method
+        .getattr("info")
+        .ok()?
+        .getattr("fullname")
+        .ok()?
+        .extract()
+        .ok()?;
+    let type_attr = method.getattr("type").ok()?;
+    if type_attr.is_none() {
+        return None;
+    }
+    let sig_bytes = serialize_type_to_bytes(py, type_attr)?;
+    let mut signature = decode_type(&sig_bytes)?;
+    if !matches!(
+        signature,
+        Type::CallableType { .. } | Type::Overloaded { .. }
+    ) {
+        return None;
+    }
+    // checkmember.py:659-660 `freshen_all_functions_type_vars(signature)`
+    // unless `preserve_type_var_ids`.
+    if !preserve_type_var_ids {
+        signature = freshen_signature(&signature, next_raw_id, changed, strict_optional)?;
+    }
+    // checkmember.py:722-775 tail: static never binds, trivial-self binds
+    // via bind_self_fast, otherwise the validated member_method_inner.
+    if is_static {
+        static_member_tail(
+            instance,
+            &signature,
+            &method_fullname,
+            strict_optional,
+            resolver.resolver(),
+            false,
+            true,
+        )
+    } else if is_trivial_self {
+        static_member_tail(
+            instance,
+            &signature,
+            &method_fullname,
+            strict_optional,
+            resolver.resolver(),
+            true,
+            true,
+        )
+    } else {
+        member_method_inner(
+            instance,
+            &signature,
+            &method_fullname,
+            self_type,
+            name,
+            resolver.resolver(),
+            strict_optional,
+            is_class,
+        )
+    }
+}
+
+/// `#[pyfunction]` entry for the method-branch dispatch (issue #805).
+#[pyfunction]
+#[pyo3(signature = (resolver, instance_bytes, name, override_info, self_type_bytes,
+                    _no_deferral, preserve_type_var_ids, start_raw_id, strict_optional))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_analyze_instance_member_dispatch(
+    py: Python<'_>,
+    resolver: &NativeTypeResolver,
+    instance_bytes: &[u8],
+    name: &str,
+    override_info: Option<String>,
+    self_type_bytes: &[u8],
+    _no_deferral: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+) -> Option<(i64, bool, Vec<u8>)> {
+    let instance = decode_type(instance_bytes)?;
+    let self_type = decode_type(self_type_bytes)?;
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
+    let result = dispatch_instance_member_inner(
+        py,
+        resolver,
+        &instance,
+        name,
+        override_info.as_deref(),
+        &self_type,
+        preserve_type_var_ids,
+        &mut next_raw_id,
+        &mut changed,
+        strict_optional,
+    )?;
+    Some((next_raw_id, changed, encode_type(&result)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,37 +1430,37 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
 // analyze_union_member_access
 // ---------------------------------------------------------------------------
 
-/// `mypy.checkmember.analyze_union_member_access` (checkmember.py:656-663).
-///
-/// Maps `relevant_items()` of the union through `_analyze_member_access`
-/// (the pure-type-transform Rust subset), then joins the results via
-/// `make_simplified_union`. Defer (None) when any item defers — Python
-/// falls through. The Python `disable_type_names()` context only affects
-/// error messages during the recursion; the pure branches Rust handles
-/// emit no errors, and non-pure branches defer, so the context is
-/// irrelevant on the Rust path. The per-item `self_type` override is also
-/// unused by the pure branches.
+/// `mypy.checkmember.analyze_union_member_access` (checkmember.py:892-925),
+/// per-item Rust subset (issue #805). Returns per-item results, not the
+/// joined union: the Python shim joins via `make_simplified_union` after
+/// restoring each item's `definition` link, mirroring the pure-Python loop
+/// (checkmember.py:920-925). An Instance item is dispatched through
+/// `dispatch_instance_member_inner` (self_type = item, override_info =
+/// None); any other item goes through `analyze_member_access_inner`.
+/// Defers (None) when any item defers or when `is_lvalue` / `is_super`
+/// (the Python shim pre-gates those for the instance path; per-item
+/// lvalue/super semantics stay in Python).
 #[pyfunction]
+#[pyo3(signature = (resolver, union_bytes, name, is_lvalue, is_super,
+                    _no_deferral, preserve_type_var_ids, start_raw_id,
+                    strict_optional))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_analyze_union_member_access(
+    py: Python<'_>,
     resolver: &NativeTypeResolver,
     union_bytes: &[u8],
+    name: &str,
+    is_lvalue: bool,
+    is_super: bool,
+    _no_deferral: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
     strict_optional: bool,
-) -> PyResult<Option<Vec<u8>>> {
-    let typ = match decode_type(union_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    Ok(
-        analyze_union_member_access_inner(&typ, strict_optional, resolver.resolver())
-            .and_then(|t| encode_type(&t)),
-    )
-}
-
-fn analyze_union_member_access_inner(
-    typ: &Type,
-    strict_optional: bool,
-    resolver: &TypeResolver,
-) -> Option<Type> {
+) -> Option<(i64, bool, Vec<Vec<u8>>)> {
+    if is_lvalue || is_super {
+        return None;
+    }
+    let typ = decode_type(union_bytes)?;
     let items = match typ {
         Type::UnionType { items, .. } => items,
         _ => return None,
@@ -1192,13 +1474,33 @@ fn analyze_union_member_access_inner(
             .filter(|i| !matches!(i, Type::NoneType))
             .collect()
     };
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
     let mut results = Vec::with_capacity(relevant.len());
     for item in &relevant {
-        let r = analyze_member_access_inner(item, resolver)?;
-        results.push(r);
+        let r = match item {
+            Type::Instance { .. } => {
+                // Python binds self_type per union item
+                // (mx.copy_modified(self_type=subtype) at
+                // checkmember.py:923).
+                dispatch_instance_member_inner(
+                    py,
+                    resolver,
+                    item,
+                    name,
+                    None,
+                    item,
+                    preserve_type_var_ids,
+                    &mut next_raw_id,
+                    &mut changed,
+                    strict_optional,
+                )?
+            }
+            _ => analyze_member_access_inner(item, resolver.resolver())?,
+        };
+        results.push(encode_type(&r)?);
     }
-    let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-    make_simplified_union(&results, &ctx, resolver, true)
+    Some((next_raw_id, changed, results))
 }
 
 // ---------------------------------------------------------------------------
@@ -2523,7 +2825,7 @@ mod tests {
         );
     }
 
-    // --- analyze_union_member_access_inner ---
+    // --- freshen_signature / static_member_tail ---
 
     fn make_union(items: Vec<Type>) -> Type {
         Type::UnionType {
@@ -2535,72 +2837,74 @@ mod tests {
     }
 
     #[test]
-    fn test_union_access_any_items_returns_any_union() {
-        let resolver = TypeResolver::new();
-        let union = make_union(vec![make_instance("builtins.int")]);
-        // Instance item defers -> union defers.
-        assert!(analyze_union_member_access_inner(&union, true, &resolver).is_none());
+    fn test_freshen_signature_overloaded_per_item() {
+        // Overloaded freshens per item with the shared counter. Non-generic
+        // items translate in place and leave the counter untouched.
+        let sig = Type::Overloaded {
+            items: vec![
+                make_callable(vec![ARG_POS], false),
+                make_callable(vec![ARG_POS], true),
+            ],
+        };
+        let mut next_raw_id = 5;
+        let mut changed = false;
+        let result = freshen_signature(&sig, &mut next_raw_id, &mut changed, false);
+        let Type::Overloaded { items } = result.expect("non-generic overload freshens") else {
+            panic!("expected Overloaded");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(!changed);
+        assert_eq!(next_raw_id, 5);
     }
 
     #[test]
-    fn test_union_access_defers_on_instance_item() {
-        let resolver = TypeResolver::new();
-        let any_t = Type::AnyType {
-            type_of_any: 6,
-            source_any: None,
-            missing_import_name: None,
+    fn test_freshen_signature_overloaded_any_item_defers() {
+        // A non-wire item (Parameters) defers the whole Overloaded.
+        let sig = Type::Overloaded {
+            items: vec![Type::Parameters(crate::wire::Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            })],
         };
-        let union = make_union(vec![any_t, make_instance("builtins.int")]);
-        // Instance item defers -> whole union defers.
-        assert!(analyze_union_member_access_inner(&union, true, &resolver).is_none());
+        let mut next_raw_id = 5;
+        let mut changed = false;
+        assert!(freshen_signature(&sig, &mut next_raw_id, &mut changed, false).is_none());
+        assert_eq!(next_raw_id, 5);
     }
 
     #[test]
-    fn test_union_access_single_any_returns_any() {
-        let resolver = TypeResolver::new();
-        let any_t = Type::AnyType {
-            type_of_any: 6,
-            source_any: None,
-            missing_import_name: None,
-        };
-        let union = make_union(vec![any_t]);
-        let result =
-            analyze_union_member_access_inner(&union, true, &resolver).expect("single Any item");
-        match result {
-            Type::AnyType { .. } => {}
-            other => panic!("expected AnyType, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_union_access_two_any_simplifies_to_any() {
-        let resolver = TypeResolver::new();
-        let any1 = Type::AnyType {
-            type_of_any: 6,
-            source_any: None,
-            missing_import_name: None,
-        };
-        let any2 = Type::AnyType {
-            type_of_any: 6,
-            source_any: None,
-            missing_import_name: None,
-        };
-        let union = make_union(vec![any1, any2]);
-        let result =
-            analyze_union_member_access_inner(&union, true, &resolver).expect("two Any items");
-        // make_simplified_union removes redundant items: Any <: Any, so
-        // the second Any is dropped and the result is a single Any.
-        match result {
-            Type::AnyType { .. } => {}
-            other => panic!("expected AnyType after simplification, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_union_access_non_union_defers() {
+    fn test_static_member_tail_overloaded_signature_gate() {
+        // The legacy seam defers an Overloaded at the signature gate; the
+        // dispatch may allow it. Signature-gate check runs before any map,
+        // so an empty resolver still shows the allow=false distinction.
         let resolver = TypeResolver::new();
         let inst = make_instance("builtins.int");
-        assert!(analyze_union_member_access_inner(&inst, true, &resolver).is_none());
+        let sig = Type::Overloaded {
+            items: vec![make_callable(vec![ARG_POS], false)],
+        };
+        assert!(
+            static_member_tail(&inst, &sig, "builtins.int", false, &resolver, false, false)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_static_member_tail_non_instance_defers() {
+        let resolver = TypeResolver::new();
+        let sig = make_callable(vec![ARG_POS], false);
+        assert!(static_member_tail(
+            &Type::NoneType,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false
+        )
+        .is_none());
     }
 
     // --- analyze_none_member_access_inner ---
