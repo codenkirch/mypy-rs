@@ -23452,3 +23452,354 @@ class NativeGeneratorReturnTypeSuite(Suite):
         self._assert_engages_type(
             "rust_get_coroutine_return_type", typ, True, str(self.fx.a)
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSemanalVisitorAuditSuite(Suite):
+    """Parity for the semanal_visitor deferral-audit decisions (Issue #850).
+
+    The #850 audit walked every `None` site in `crates/type_kernel/src/
+    semanal_visitor.rs` and classified each as wire-portable or not. Result:
+    no portable sites remain. The 26 defer sites are either output-shape
+    defers (attribute-downcast / non-matching AST shape), where `None`
+    exactly equals the Python fallback and the seam is semantically complete
+    (e.g. `rust_parse_bool` on a non-`builtins.True`/`builtins.False`
+    NameExpr, `rust_is_type_ref` on a non-RefExpr), or deep-analyzer defers
+    that need live `SemanticAnalyzer` state (`self.lookup` / `self.fail` /
+    `is_none_alias` / module re-export visibility / `__getattr__` Var
+    synthesis). Those are not wire-portable and stay in Python.
+
+    This suite locks in the decided subset (the gate-only pure-classifier
+    seams, which the Python shims let decide without a pre-gate return) by a
+    gate-off vs gate-on differential on real `is_type_ref` /
+    `can_possibly_be_type_form` / `can_possibly_be_typevarlike_declaration`
+    calls, plus direct seam-engagement asserts on the AST-shape defer
+    boundaries (engagement asserts documented against the Rust contract for
+    each seam). `rust_can_be_type_alias` is exercised at gate-off for the
+    deep `is_none_alias` defer and pure-Python fallback on OpExpr unions and
+    `CallExpr` aliases (`type(None)`, `None | X`).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._tk = _tk
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+        self._make_sa()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _make_sa(self) -> None:
+        # A real SemanticAnalyzer built via `__new__` with only the state the
+        # seam methods read (NativeTypeExpressionSuite precedent,
+        # testtypes.py:16705); the differential compares Rust-vs-true decisions.
+        from contextlib import nullcontext
+
+        from mypy.errors import Errors
+        from mypy.options import Options
+        from mypy.semanal import SemanticAnalyzer
+
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        sa._is_stub_file = False
+        sa.globals = {}
+        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign]
+        sa.is_pep_613 = lambda s: False  # type: ignore[method-assign]
+        sa.is_none_alias = lambda node: False  # type: ignore[method-assign]
+        sa.errors = Errors(Options())
+        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign]
+        self.sa = sa
+
+    # --- node builders ---
+
+    def _name(self, fullname: str) -> NameExpr:
+        node = NameExpr(fullname.rsplit(".", 1)[-1])
+        node.fullname = fullname
+        return node
+
+    def _member(self, base: str, attr: str) -> MemberExpr:
+        node = MemberExpr(self._name(base), attr)
+        node.fullname = f"{base}.{attr}"
+        return node
+
+    def _instance(self, fullname: str, is_enum: bool = False) -> Any:
+        # A minimal TypeInfo stand-in carrying just the fields the Rust seam
+        # reads (fullname, is_enum).
+        return _FakeTypeInfo(fullname, is_enum)
+
+    def _assign(
+        self,
+        lvalues: list[Any],
+        rvalue: Expression,
+        unanalyzed: object = None,
+    ) -> AssignmentStmt:
+        s = AssignmentStmt(lvalues, rvalue)
+        s.unanalyzed_type = unanalyzed  # type: ignore[assignment]
+        return s
+
+    def _call(
+        self, callee: Any, args: list[Expression], kinds: list[ArgKind] | None = None
+    ) -> CallExpr:
+        if kinds is None:
+            kinds = [ARG_POS] * len(args)
+        return CallExpr(callee, args, kinds, [None] * len(args))
+
+    # --- differential helpers (gate-off vs gate-on) ---
+
+    def _par(self, fn: Callable[[], object], label: str) -> None:
+        self._set_active(False)
+        try:
+            off = fn()
+        finally:
+            self._set_active(True)
+        on = fn()
+        assert_equal(on, off, f"semanal_visitor differential {label}")
+
+    # --- is_type_ref (bare) ---
+
+    def test_is_type_ref_non_refexpr(self) -> None:
+        # Non-RefExprs are decided (false) by the Rust seam; Python's
+        # isinstance gate falls to False identically.
+        self._par(lambda: self.sa.is_type_ref(IntExpr(1), bare=True), "is_type_ref-int")
+        self._par(lambda: self.sa.is_type_ref(StrExpr("x"), bare=True), "is_type_ref-str")
+        self._par(lambda: self.sa.is_type_ref(UnaryExpr("-", IntExpr(1)), bare=True), "is_type_ref-unary")
+
+    def test_is_type_ref_typevarlike_node(self) -> None:
+        # A NameExpr whose node is a TypeVarLikeExpr: the seam decides Some(false).
+        # Python's true-path also calls `self.fail` (live analyzer state),
+        # so this is a seam-engagement assert only, not a differential.
+        from mypy.nodes import TypeVarLikeExpr
+        from mypy.types import AnyType, TypeOfAny
+
+        rv = self._name("m.T")
+        rv.node = TypeVarLikeExpr(
+            "T",
+            "m.T",
+            AnyType(TypeOfAny.special_form),
+            AnyType(TypeOfAny.special_form),
+        )
+        assert self._tk.rust_is_type_ref(rv, True) is False
+
+    def test_is_type_ref_valid_refs_bare(self) -> None:
+        # bare=True: typing.Any / Tuple / Callable are valid.
+        for fullname in ("typing.Any", "typing.Tuple", "typing.Callable"):
+            rv = self._name(fullname)
+            rv.node = self._instance(fullname)
+            self._par(
+                lambda rv=rv: self.sa.is_type_ref(rv, bare=True),
+                f"is_type_ref-{fullname}",
+            )
+
+    def test_is_type_ref_valid_refs_not_bare(self) -> None:
+        # bare=False: the type_constructors set (Union, Optional, Type, ...).
+        # Reuse the AutoExpectTypeFixture-like minimal TypeInfo for these.
+        for fullname in (
+            "typing.Union",
+            "typing.Optional",
+            "typing.Type",
+            "typing.Literal",
+            "typing_extensions.Literal",
+            "typing.Annotated",
+            "typing_extensions.Annotated",
+        ):
+            rv = self._name(fullname)
+            rv.node = self._instance(fullname)
+            self._par(
+                lambda rv=rv: self.sa.is_type_ref(rv, bare=False),
+                f"is_type_ref-{fullname}",
+            )
+
+    def test_is_type_ref_never_var(self) -> None:
+        # A Var node whose fullname is a NEVER_NAME: decided true.
+        from mypy.nodes import Var
+
+        rv = self._name("typing.NoReturn")
+        v = Var("NoReturn")
+        v._fullname = "typing.NoReturn"
+        rv.node = v
+        self._par(lambda: self.sa.is_type_ref(rv, bare=True), "is_type_ref-never")
+
+    def test_is_type_ref_plain_var_not_never(self) -> None:
+        # A plain Var (non-Never): decided false.
+        from mypy.nodes import Var
+
+        rv = self._name("m.x")
+        v = Var("x")
+        v._fullname = "m.x"
+        rv.node = v
+        self._par(lambda: self.sa.is_type_ref(rv, bare=True), "is_type_ref-plain-var")
+
+    def test_is_type_ref_node_none_defers(self) -> None:
+        # The final `None` is the NameExpr/MemberExpr lookup case, which needs
+        # self.lookup; audit classified it deep-analyzer (not wire-portable).
+        # Direct seam: refexpr with node=None -> returns None (defer).
+        rv = self._name("m.x")
+        assert self._tk.rust_is_type_ref(rv, True) is None
+        assert self._tk.rust_is_type_ref(rv, False) is None
+        # MemberExpr with node=None also defers.
+        me = self._member("m", "attr")
+        assert self._tk.rust_is_type_ref(me, True) is None
+
+    # --- can_possibly_be_type_form ---
+
+    def test_type_form_non_assignment_defers(self) -> None:
+        # Non-AssignmentStmt input: the seam returns None (defer).
+        assert self._tk.rust_can_possibly_be_type_form(IntExpr(1), False) is None
+
+    def test_type_form_positive_decided(self) -> None:
+        # Lvalue NameExpr, rvalue IndexExpr, no unanalyzed annotation:
+        # decided True by both paths.
+        s = self._assign(
+            [self._name("Alias")], IndexExpr(self._name("typing.Union"), StrExpr("x"))
+        )
+        self._par(lambda: self.sa.can_possibly_be_type_form(s), "form-index")
+
+    def test_type_form_unanalyzed_not_pep613(self) -> None:
+        # unanalyzed_type set and is_pep_613 False -> decided False.
+        s = self._assign(
+            [self._name("Alias")],
+            IndexExpr(self._name("typing.Union"), StrExpr("x")),
+            object(),
+        )
+        self._par(lambda: self.sa.can_possibly_be_type_form(s), "form-unanalyzed")
+
+    # --- can_possibly_be_typevarlike_declaration ---
+
+    def test_typevarlike_positive_decided(self) -> None:
+        # lvalue NameExpr + rvalue CallExpr with NameExpr callee + known
+        # TYPE_VAR_LIKE fullname: decided True by both paths. The Python
+        # true-path calls `ref.accept(self)` (no-op) then reads fullname.
+        s = self._assign(
+            [self._name("T")],
+            self._call(self._name("typing.TypeVar"), [StrExpr("T")]),
+        )
+        self._par(lambda: self.sa.can_possibly_be_typevarlike_declaration(s), "tvl-call")
+
+    def test_typevarlike_unknown_callee_decided_false(self) -> None:
+        # NameExpr callee whose fullname is NOT in TYPE_VAR_LIKE_NAMES:
+        # both paths decide False. MemberExpr-callee is excluded; it would
+        # need an analyzed callee fullname on the Python side.
+        s = self._assign(
+            [self._name("T")],
+            self._call(self._name("m.TypeVarNotSpecial"), [StrExpr("T")]),
+        )
+        self._par(lambda: self.sa.can_possibly_be_typevarlike_declaration(s), "tvl-unknown")
+
+    # --- can_be_type_alias (gate-off pure-Python fallback) ---
+
+    def test_can_be_type_alias_call_expr(self) -> None:
+        # `call = type(None)`: the seam returns Some(false), which the shim never
+        # trusts, so gate-on and gate-off results are identical (both run the
+        # true path; is_none_alias is False on the stub -> False).
+        from mypy.semanal import _rust_can_be_type_alias
+
+        call = self._call(self._name("builtins.type"), [self._name("builtins.None")])
+        assert _rust_can_be_type_alias(call, False, False) is False
+        self._par(lambda: self.sa.can_be_type_alias(call), "can_be_type_alias type(None)")
+
+    def test_can_be_type_alias_op_union_defer(self) -> None:
+        # `None | X`: the OpExpr arm needs is_none_alias (deep analyzer), so the
+        # seam defers on the union; Python evaluates is_none_alias (False on
+        # the stub) and both agree (False) through the recursion.
+        from mypy.semanal import _rust_can_be_type_alias
+
+        op = OpExpr("|", self._name("builtins.None"), self._name("m.X"))
+        r = _rust_can_be_type_alias(op, False, False)
+        assert r in (None, False), f"union seam result: {r!r}"
+        self._par(lambda: self.sa.can_be_type_alias(op), "can_be_type_alias None|X")
+
+    # --- check_typevarlike_name ---
+
+    def test_check_typevarlike_name_valid(self) -> None:
+        from mypy.semanal import _rust_check_typevarlike_name
+
+        call = self._call(self._name("typing.TypeVar"), [StrExpr("T")])
+        r = _rust_check_typevarlike_name(call, "T")
+        # ArgKind is a plain Enum, not IntEnum, so pyo3's `extract::<i64>` always
+        # fails and the seam defers; the shim only trusts `Some`, so behavior
+        # is preserved but the seam stays deferred (audit finding from #850).
+        assert r is None, f"check_typevarlike_name valid: {r!r}"
+
+    def test_check_typevarlike_name_mismatch_defers(self) -> None:
+        from mypy.semanal import _rust_check_typevarlike_name
+
+        call = self._call(self._name("typing.TypeVar"), [StrExpr("U")])
+        r = _rust_check_typevarlike_name(call, "T")
+        # Same plain-Enum arg_kinds defer: the mismatch decision is never
+        # produced; Python emits the error itself.
+        assert r is None, f"mismatch: {r!r}"
+
+    def test_check_typevarlike_name_not_call_defers(self) -> None:
+        from mypy.semanal import _rust_check_typevarlike_name
+
+        assert _rust_check_typevarlike_name(IntExpr(1), "T") is None
+
+    # --- parse_bool ---
+
+    def test_parse_bool_true(self) -> None:
+        assert self.sa.parse_bool(self._name("builtins.True")) is True
+
+    def test_parse_bool_false(self) -> None:
+        assert self.sa.parse_bool(self._name("builtins.False")) is False
+
+    def test_parse_bool_other_defers(self) -> None:
+        # A NameExpr with a non-bool fullname, or a non-NameExpr, defers to
+        # Python's parse_bool (which returns None for non-bool literals).
+        assert self.sa.parse_bool(self._name("m.x")) is None
+        assert self.sa.parse_bool(IntExpr(1)) is None
+
+    # --- var_is_typing_special_form (staticmethod, drives the seam) ---
+
+    def test_var_is_typing_special_form(self) -> None:
+        from mypy.nodes import Var
+        from mypy.semanal import SemanticAnalyzer
+
+        for fullname, expected in (
+            ("typing.Callable", True),
+            ("typing.Union", True),
+            ("typing_extensions.TypeGuard", True),
+            ("typing.Literal", True),
+            ("typing.something_else", False),
+        ):
+            v = Var(fullname.rsplit(".", 1)[-1])
+            v._fullname = fullname
+            assert SemanticAnalyzer.var_is_typing_special_form(v) is expected, fullname
+
+    def test_var_is_typing_special_form_nonvar_false(self) -> None:
+        # A non-Var object -> Rust returns false; the staticmethod's Python
+        # fallback would raise AttributeError, caught by the seam wrapper.
+        assert self._tk.rust_var_is_typing_special_form(IntExpr(1)) is False
+
+    # --- refers_to_fullname differential (module-level gated seam) ---
+
+    def test_refers_to_fullname(self) -> None:
+        from mypy.semanal import refers_to_fullname
+
+        n = self._name("builtins.int")
+        self._par(lambda: refers_to_fullname(n, "builtins.int"), "refers_to_fullname-hit")
+        self._par(lambda: refers_to_fullname(n, "builtins.str"), "refers_to_fullname-miss")
+        # MemberExpr form.
+        m = self._member("m", "attr")
+        self._par(lambda: refers_to_fullname(m, "m.attr"), "refers_to_fullname-member")
+
+    def test_refers_to_fullname_nonrefexpr(self) -> None:
+        from mypy.semanal import refers_to_fullname
+
+        # Non-RefExprs: both paths return False.
+        self._par(lambda: refers_to_fullname(IntExpr(1), "builtins.int"), "refers_to_fullname-int")
+
+
+class _FakeTypeInfo:
+    """Minimal TypeInfo stand-in carrying just the fields the Rust seam reads.
+
+    The semanal_visitor seams only read `fullname` (and `is_enum` for the
+    TypeInfo is_type_ref branch), so a tiny fake keeps the suite hermetic and
+    independent of the resolver / TypeFixture graph.
+    """
+
+    def __init__(self, fullname: str, is_enum: bool = False) -> None:
+        self.fullname = fullname
+        self.is_enum = is_enum
