@@ -23064,6 +23064,7 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         `None` providers is safe (matching the existing `method_fullname`
         suite which passes `None` for the checker).
         """
+        from mypy.checkexpr import ExpressionChecker
         from mypy.checker import TypeChecker
         from mypy.errors import Errors
         from mypy.messages import MessageBuilder
