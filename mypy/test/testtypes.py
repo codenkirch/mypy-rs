@@ -22878,15 +22878,15 @@ class NativeTypeRequiresUsageTailSuite(NativeTypeRequiresUsageSuite):
 class NativeCheckexprJoinAndTupleSuite(Suite):
     """Parity for the checkexpr `join_one_pair` and `unpack_expand_updated` ports.
 
-    `ExpressionChecker.visit_conditional_expr` and `visit_tuple_expr` consult
-    the Rust checkexpr seams for two previously-deferred decisions: the
-    args-less Instance-Instance nominal prejoin (`join_one_pair`, exposed via
-    `_try_native_conditional_expr_join`) and the lone `Tuple[*tuple[X, ...]]`
-    normalization (`unpack_expand_updated`, exposed via
-    `_try_native_build_tuple_type`). Toggling the checkexpr gate on vs off
-    must keep the visible result identical to the pure-Python twins
-    (`join.join_types` / `expand_type`), and the decided cases must engage
-    (return a type instead of deferring).
+    The fast container-literal path (`_first_or_join_fast_item` -> checkexpr's
+    `join_type_list_inner`, exposed via `_try_native_container_type`) and
+    the tuple-expression build (`_try_native_build_tuple_type`) consult the
+    Rust checkexpr seams for two previously-deferred decisions: the
+    args-less Instance-Instance nominal fold (`join_one_pair`) and the lone
+    `Tuple[*tuple[X, ...]]` normalization (`unpack_expand_updated`). The
+    visible result must be identical to the pure-Python twins
+    (`join.join_type_list` / `expand_type`), and the decided cases must
+    engage (return a type instead of deferring).
     """
 
     def setUp(self) -> None:
@@ -22916,25 +22916,20 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         set_wire_typeinfo_map(None)
 
     def _join_native(self, if_type: Type, else_type: Type) -> str | None:
-        from mypy.checkexpr import (
-            _deserialize_type_from_checkexpr,
-            _serialize_type_for_checkexpr,
-            _try_native_conditional_expr_join,
-        )
+        from mypy.checkexpr import _try_native_container_type
+        from mypy.types import Instance
 
-        raw = _try_native_conditional_expr_join(
-            _serialize_type_for_checkexpr(if_type),
-            _serialize_type_for_checkexpr(else_type),
-        )
-        if raw is None:
+        result = _try_native_container_type("list", [if_type, else_type])
+        if result is None:
             return None
-        decoded = _deserialize_type_from_checkexpr(raw)
-        return str(decoded) if decoded is not None else None
+        # The container seam returns `list[joined]`; extract the element.
+        assert isinstance(result, Instance) and result.args
+        return str(result.args[0])
 
     def _join_python(self, if_type: Type, else_type: Type) -> str:
-        from mypy.join import join_types
+        from mypy.join import join_type_list
 
-        return str(join_types(if_type, else_type))
+        return str(join_type_list([if_type, else_type]))
 
     def _tuple_native(self, items: list[Type], seen_unpack: bool) -> str | None:
         from mypy.checkexpr import _try_native_build_tuple_type
@@ -22972,26 +22967,28 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         )
 
     def test_join_same_type_engages(self) -> None:
+        # [A, A] -> list[A]; the prejoin returns the operand itself.
         self._assert_join_parity(self.fx.a, self.fx.a, engage=True)
 
     def test_join_subtype_pair_engages(self) -> None:
-        # B <: A; join(A, B) = A. Previously the args-less Instance-Instance
+        # B <: A; join([A, B]) = A. Previously the args-less Instance-Instance
         # nominal pair deferred to Python.
         self._assert_join_parity(self.fx.a, self.fx.b, engage=True)
 
     def test_join_common_ancestor_engages(self) -> None:
-        # B and C both derive from A; join(B, C) = A. Previously deferred.
+        # B and C both derive from A; join([B, C]) = A. Previously deferred.
         self._assert_join_parity(self.fx.b, self.fx.c, engage=True)
 
-    def test_join_unrelated_instances_defer_or_union(self) -> None:
-        # E and D are unrelated branches of object; join_types decides via
-        # join_instances. Whichever way the seam resolves, it must match.
-        self._assert_join_parity(self.fx.e, self.fx.d, engage=False)
+    def test_join_unrelated_instances_engages(self) -> None:
+        # E and D are unrelated branches of object; join(list[E], list[D])
+        # = list[object] via the nominal fold (not via a union fallback).
+        # The container seam engages and matches join_type_list.
+        self._assert_join_parity(self.fx.e, self.fx.d, engage=True)
 
-    def test_join_instances_with_args(self) -> None:
+    def test_join_instances_with_args_engages(self) -> None:
         # Args-bearing Instances (List[A], List[B]) skip the args-less
-        # prejoin. Parity must hold on the general join_types fallback.
-        self._assert_join_parity(self.fx.lsta, self.fx.lstb, engage=False)
+        # prejoin; the general join_type_list fold decides (list[A]).
+        self._assert_join_parity(self.fx.lsta, self.fx.lstb, engage=True)
 
     def test_unpack_single_tuple_instance_normalizes(self) -> None:
         # Tuple[*tuple[A, ...]] expands to the tuple[A, ...] Instance.
