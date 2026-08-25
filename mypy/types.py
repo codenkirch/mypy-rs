@@ -4502,7 +4502,9 @@ try:
     from type_kernel import (
         rust_callable_with_ellipsis as _rust_callable_with_ellipsis,
         rust_can_be_false_default as _rust_can_be_false_default,
+        rust_can_be_false_default_live as _rust_can_be_false_default_live,
         rust_can_be_true_default as _rust_can_be_true_default,
+        rust_can_be_true_default_live as _rust_can_be_true_default_live,
         rust_callable_is_generic as _rust_callable_is_generic,
         rust_callable_is_kw_arg as _rust_callable_is_kw_arg,
         rust_callable_is_var_arg as _rust_callable_is_var_arg,
@@ -4545,7 +4547,9 @@ except ImportError:
     _rust_flatten_nested_tuples = None  # type: ignore[assignment]
     _rust_copy_type = None  # type: ignore[assignment]
     _rust_can_be_true_default = None  # type: ignore[assignment]
+    _rust_can_be_true_default_live = None  # type: ignore[assignment]
     _rust_can_be_false_default = None  # type: ignore[assignment]
+    _rust_can_be_false_default_live = None  # type: ignore[assignment]
     _rust_callable_min_args = None  # type: ignore[assignment]
     _rust_callable_is_var_arg = None  # type: ignore[assignment]
     _rust_callable_is_kw_arg = None  # type: ignore[assignment]
@@ -4564,12 +4568,25 @@ except ImportError:
 _native_visitor_active: bool = False
 _native_visitor_types_active: bool = False
 _native_truthiness_in_flight: bool = False
+_native_truthiness_resolver: Any = None
 
 
 def _set_native_visitor_active(active: bool) -> None:
     """Enable/disable the Rust visitor path (parity-only)."""
     global _native_visitor_active
     _native_visitor_active = active
+
+
+def _set_native_truthiness_resolver(resolver: Any) -> None:
+    """Install the resolver used by the live truthiness seams (parity-only).
+
+    The resolver carries the snapshot tables (TypeInfo/alias) and a live
+    TypeInfo map installed via `set_live_typeinfo_map`; the live seams use
+    it to decide `can_be_any_bool`, enum-literal truthiness, and alias
+    targets without reading those fields through the byte seam.
+    """
+    global _native_truthiness_resolver
+    _native_truthiness_resolver = resolver
 
 
 def _set_native_visitor_types_active(active: bool) -> None:
@@ -4599,6 +4616,10 @@ def _native_can_be_true_default(t: Type) -> bool | None:
         return None
     _native_truthiness_in_flight = True
     try:
+        if _native_truthiness_resolver is not None:
+            return _rust_can_be_true_default_live(
+                _serialize_type_for_visitor(t), _native_truthiness_resolver
+            )
         return _rust_can_be_true_default(_serialize_type_for_visitor(t))
     except (AssertionError, NotImplementedError):
         return None
@@ -4621,6 +4642,10 @@ def _native_can_be_false_default(t: Type) -> bool | None:
         return None
     _native_truthiness_in_flight = True
     try:
+        if _native_truthiness_resolver is not None:
+            return _rust_can_be_false_default_live(
+                _serialize_type_for_visitor(t), _native_truthiness_resolver
+            )
         return _rust_can_be_false_default(_serialize_type_for_visitor(t))
     except (AssertionError, NotImplementedError):
         return None

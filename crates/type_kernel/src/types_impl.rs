@@ -412,10 +412,10 @@ fn can_be_true_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) -
                 return None;
             }
             if read_bool_attr(info, "is_enum").unwrap_or(false) {
-                // types.py:3610-3612: enum literal truthiness delegates to
-                // the enum class instance's flag.
-                let ct = read_bool_attr(info, "can_be_true").unwrap_or(false);
-                return Some(ct);
+                // types.py:3610-3612: Enum literal truthiness is the fallback
+                // Instance's, i.e. the base Type default (True/True); mypy
+                // does not respect __bool__/__len__ for Instance truthiness.
+                return Some(true);
             }
             // Non-enum fallback: a TypeVarType fallback (possible from
             // make_simplified_union) must keep the byte-seam deferral, base
@@ -521,9 +521,8 @@ fn can_be_false_live(py: Python<'_>, typ: &Type, resolver: &NativeTypeResolver) 
             }
             if read_bool_attr(info, "is_enum").unwrap_or(false) {
                 // types.py:3605-3607: enum literal falsiness delegates to
-                // the enum class instance's flag.
-                let cf = read_bool_attr(info, "can_be_false").unwrap_or(false);
-                return Some(cf);
+                // `self.fallback.can_be_false` (an Instance = True).
+                return Some(true);
             }
             if matches!(&fallback_inst, Type::TypeVarType { .. }) {
                 return None;
@@ -544,7 +543,7 @@ fn bool_value_is_true(value: &crate::wire::LiteralValue) -> bool {
         LiteralValue::Str(s) => !s.is_empty(),
         LiteralValue::Bytes(b) => !b.is_empty(),
         LiteralValue::Bool(b) => *b,
-        LiteralValue::Float(_) => true,
+        LiteralValue::Float(f) => *f != 0.0,
     }
 }
 
