@@ -100,8 +100,8 @@ fn remove_optional(typ: &Type) -> Option<Type> {
 
 /// `has_bytes_component` (checkexpr.py:8451-8465): is this a byte type or a
 /// union containing one? Reuses the native `checkexpr_functions` worker.
-fn has_bytes_component(typ: &Type) -> Option<bool> {
-    crate::checkexpr_functions::has_bytes_component_inner(typ)
+fn has_bytes_component(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<bool> {
+    crate::checkexpr_functions::has_bytes_component_inner(typ, aliases)
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +139,7 @@ fn dangerous_comparison_inner(
     abstract_set_ref: Option<&str>,
     abstract_map_ref: Option<&str>,
     resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
 ) -> Option<bool> {
     if python_seen {
         return Some(false);
@@ -184,7 +185,8 @@ fn dangerous_comparison_inner(
     // b'abc' in b'cde' (byte containers) always returns True; only flag
     // when the check can NEVER be True.
     if let Some(original_container) = original_container {
-        if has_bytes_component(original_container)? && has_bytes_component(&left)? {
+        if has_bytes_component(original_container, aliases)? && has_bytes_component(&left, aliases)?
+        {
             return Some(false);
         }
     }
@@ -236,6 +238,7 @@ fn dangerous_comparison_inner(
                 Some(abstract_set_ref),
                 abstract_map_ref,
                 resolver,
+                aliases,
             );
         } else if resolver.get(left_ref)?.has_base("typing.Mapping")
             && resolver.get(right_ref)?.has_base("typing.Mapping")
@@ -268,6 +271,7 @@ fn dangerous_comparison_inner(
                 abstract_set_ref,
                 Some(abstract_map_ref),
                 resolver,
+                aliases,
             )?;
             if key_dangerous {
                 return Some(true);
@@ -291,6 +295,7 @@ fn dangerous_comparison_inner(
                 abstract_set_ref,
                 Some(abstract_map_ref),
                 resolver,
+                aliases,
             );
         } else if (left_ref == "builtins.list" || left_ref == "builtins.tuple")
             && right_ref == left_ref
@@ -314,6 +319,7 @@ fn dangerous_comparison_inner(
                 abstract_set_ref,
                 abstract_map_ref,
                 resolver,
+                aliases,
             );
         } else if OVERLAPPING_BYTES_ALLOWLIST.contains(&left_ref.as_str())
             && OVERLAPPING_BYTES_ALLOWLIST.contains(&right_ref.as_str())
@@ -490,5 +496,6 @@ pub(crate) fn rust_dangerous_comparison(
         abstract_set_ref.as_deref(),
         abstract_map_ref.as_deref(),
         resolver.resolver(),
+        resolver.alias_resolver(),
     ))
 }
