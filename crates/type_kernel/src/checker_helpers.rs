@@ -521,15 +521,39 @@ pub(crate) fn restrict_subtype_away_inner(
                     None => return None,
                     Some(false) => {}
                 }
-                // erase_instances=True — Python checks is_proper_subtype
-                // again with erase_instances. Rust's SubtypeContext lacks
-                // an erase_instances field, so this second check is
-
-                // incomplete. Defer to Python.
+                // erase_instances=True: the erased check is provably identical
+                // to the plain check when `s` is non-generic/non-protocol, so
+                // answer `t` natively (see should_restrict_to_t_no_erase).
+                if should_restrict_to_t_no_erase(s, resolver)? {
+                    return Some(t.clone());
+                }
                 None
             }
         }
     }
+}
+
+/// Decides `erase_instances` parity for `restrict_subtype_away`'s
+/// ``consider_runtime_isinstance=False`` branch. Python's second check
+/// `is_proper_subtype(t, s, ignore_promotions=True, erase_instances=True)`
+/// erases the left Instance *only* inside `visit_instance`'s nominal
+/// branch (subtypes.py:1069), and then only against a right whose type
+/// parameters drive an argument recursion. When `s` is a non-generic
+/// (empty `type_vars_with_variance`), non-protocol Instance, the whole
+/// comparison has no parameter recursion, so erasing is a no-op for every
+/// reachable subtype check: `Some(false)` from check 1 implies check 2 is
+/// also false and Python returns `t` unchanged. Returns `Some(true)` to
+/// answer `t` natively, `Some(false)` to keep deferring, or `None` (a
+/// missing right snapshot) to propagate the existing deferral.
+fn should_restrict_to_t_no_erase(s: &Type, resolver: &TypeResolver) -> Option<bool> {
+    let Type::Instance { type_ref, .. } = s else {
+        return Some(false);
+    };
+    let snap = resolver.get(type_ref)?;
+    if snap.is_protocol || !snap.type_vars_with_variance.is_empty() {
+        return Some(false);
+    }
+    Some(true)
 }
 
 /// `try_restrict_literal_union` (subtypes.py:2264-2282). Reuses the
@@ -2223,7 +2247,207 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    // -- alias expansion at the pyfunction seams --
+    // -- restrict_subtype_away: consider_runtime_isinstance=False, non-generic right --
+
+    fn insert_plain_class(r: &mut TypeResolver, fullname: &str) {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: fullname.rsplit('.').next().unwrap_or(fullname).to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        s.has_base.insert(fullname.to_string());
+        r.insert(fullname.to_string(), s);
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_consider_false_non_generic_right_keeps_t() {
+        // int restricted by str (non-generic, non-protocol): check 1 fails and
+        // check 2 (erase_instances) is identical, so Python returns t; the
+        // previous code deferred the whole call on the erase gap.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        insert_plain_class(&mut r, "builtins.str");
+        let t = make_instance("builtins.int", vec![]);
+        let s = make_instance("builtins.str", vec![]);
+        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        assert_eq!(result, Some(t));
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_consider_false_subtype_still_uninhabited() {
+        // int proper-subtype of object: check 1 Some(true) -> UninhabitedType.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        insert_plain_class(&mut r, "builtins.object");
+        let r_snap = r.get("builtins.object").cloned().unwrap();
+        // builtins.object must be a base of int for the nominal check.
+        let mut int_snap = r.get("builtins.int").cloned().unwrap();
+        int_snap.has_base.insert("builtins.object".to_string());
+        int_snap.mro.push("builtins.object".to_string());
+        r.insert("builtins.int".to_string(), int_snap);
+        r.insert("builtins.object".to_string(), r_snap);
+        let t = make_instance("builtins.int", vec![]);
+        let s = make_instance("builtins.object", vec![]);
+        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        assert_eq!(result, Some(Type::UninhabitedType { ambiguous: false }));
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_consider_false_missing_right_snapshot_defers() {
+        // s Instance with no snapshot: should_restrict_to_t_no_erase defers
+        // (returns None) instead of guessing an erase parity.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        let t = make_instance("builtins.int", vec![]);
+        let s = make_instance("mymod.NotFound", vec![]);
+        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_consider_false_generic_right_defers() {
+        // s is a generic Instance (List with a type var): erase could differ
+        // (the nominal arg recursion would re-compare erased args), so defer.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        // builtins.list[list[int]] snapshot marked generic.
+        let mut list_snap = TypeInfoSnapshot {
+            fullname: "builtins.list".to_string(),
+            name: "list".to_string(),
+            type_vars_with_variance: vec![("T".to_string(), 0, 0)],
+            ..Default::default()
+        };
+        list_snap.mro.push("builtins.list".to_string());
+        r.insert("builtins.list".to_string(), list_snap);
+        let t = make_instance("builtins.int", vec![]);
+        let s = make_instance(
+            "builtins.list",
+            vec![Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }],
+        );
+        let result = restrict_subtype_away_inner(&t, &s, false, true, &r);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_union_with_non_generic_right_restricts() {
+        // Union[int, str] minus str under consider=False: int survives (not a
+        // proper subtype) while str is dropped, folding to int. Previously the
+        // per-item erase defer deferred the whole call.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        insert_plain_class(&mut r, "builtins.str");
+        let int_t = make_instance("builtins.int", vec![]);
+        let str_t = make_instance("builtins.str", vec![]);
+        let union = Type::UnionType {
+            items: vec![int_t.clone(), str_t.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let result = restrict_subtype_away_inner(&union, &str_t, false, true, &r);
+        // int survives (not a proper subtype of str), str is restricted
+        // away (it is equal to s, the "left is right" proper subtype fast
+        // path returns True), so the union folds to a single int.
+        assert_eq!(result, Some(int_t));
+    }
+
+    #[test]
+    fn test_restrict_subtype_away_union_protocol_right_defers() {
+        // s is a protocol Instance: erase could route through the protocol
+        // path, so the whole union falls back to Python.
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.int");
+        insert_plain_class(&mut r, "builtins.str");
+        let mut proto = TypeInfoSnapshot {
+            fullname: "mymod.Proto".to_string(),
+            name: "Proto".to_string(),
+            is_protocol: true,
+            ..Default::default()
+        };
+        proto.mro.push("mymod.Proto".to_string());
+        r.insert("mymod.Proto".to_string(), proto);
+        let int_t = make_instance("builtins.int", vec![]);
+        let str_t = make_instance("builtins.str", vec![]);
+        let union = Type::UnionType {
+            items: vec![int_t, str_t],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let s = make_instance("mymod.Proto", vec![]);
+        let result = restrict_subtype_away_inner(&union, &s, false, true, &r);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_should_restrict_to_t_no_erase_non_generic_instance() {
+        let mut r = TypeResolver::new();
+        insert_plain_class(&mut r, "builtins.str");
+        let s = make_instance("builtins.str", vec![]);
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), Some(true));
+    }
+
+    #[test]
+    fn test_should_restrict_to_t_no_erase_generic_instance() {
+        let mut r = TypeResolver::new();
+        let mut list_snap = TypeInfoSnapshot {
+            fullname: "builtins.list".to_string(),
+            name: "list".to_string(),
+            type_vars_with_variance: vec![("T".to_string(), 0, 0)],
+            ..Default::default()
+        };
+        list_snap.mro.push("builtins.list".to_string());
+        r.insert("builtins.list".to_string(), list_snap);
+        let s = make_instance(
+            "builtins.list",
+            vec![Type::AnyType {
+                type_of_any: 0,
+                source_any: None,
+                missing_import_name: None,
+            }],
+        );
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), Some(false));
+    }
+
+    #[test]
+    fn test_should_restrict_to_t_no_erase_protocol_instance() {
+        let mut r = TypeResolver::new();
+        let mut proto = TypeInfoSnapshot {
+            fullname: "mymod.Proto".to_string(),
+            name: "Proto".to_string(),
+            is_protocol: true,
+            ..Default::default()
+        };
+        proto.mro.push("mymod.Proto".to_string());
+        r.insert("mymod.Proto".to_string(), proto);
+        let s = make_instance("mymod.Proto", vec![]);
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), Some(false));
+    }
+
+    #[test]
+    fn test_should_restrict_to_t_no_erase_non_instance() {
+        let r = TypeResolver::new();
+        let s = Type::NoneType;
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), Some(false));
+        let s = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), Some(false));
+    }
+
+    #[test]
+    fn test_should_restrict_to_t_no_erase_missing_snapshot() {
+        let r = TypeResolver::new();
+        let s = make_instance("mymod.NotFound", vec![]);
+        assert_eq!(should_restrict_to_t_no_erase(&s, &r), None);
+    }
 
     fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
         let mut buf = WriteBuffer::new();
