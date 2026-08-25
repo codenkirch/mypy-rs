@@ -247,6 +247,23 @@ class TypeFixture:
             "GV2", mro=[self.oi], typevars=["T", "Ts", "S"], typevar_tuple_index=1
         )
 
+        # Nested classes for `rust_lookup_qualified` dot-chain parity
+        # (issue #806 D2): `out.I` nests inside `out`, `out.I.Deep` inside it.
+        self.out = self.make_type_info("out")
+        self.outi = self.out
+        self.out_I = self.make_type_info(
+            "out.I", module_name="out", mro=[self.oi], bases=[Instance(self.oi, [])]
+        )
+        self.out_Ii = self.out_I
+        self.out_I_Deep = self.make_type_info(
+            "out.I.Deep", module_name="out.I", mro=[self.oi], bases=[Instance(self.oi, [])]
+        )
+        self.out_I_Deepi = self.out_I_Deep
+        # Wire them into the namespace: out.names["I"] -> out_I, and
+        # out_I.names["Deep"] -> out_I_Deep.
+        self.out.names["I"] = SymbolTableNode(0, self.out_I)
+        self.out_I.names["Deep"] = SymbolTableNode(0, self.out_I_Deep)
+
     def _add_bool_dunder(self, type_info: TypeInfo) -> None:
         signature = CallableType([], [], [], Instance(self.bool_type_info, []), self.function)
         bool_func = FuncDef("__bool__", [], Block([]))

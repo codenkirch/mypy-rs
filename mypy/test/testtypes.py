@@ -17304,6 +17304,72 @@ class NativeLookupQualifiedVarSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLookupQualifiedNestedSuite(Suite):
+    """Parity tests for nested-TypeInfo dot-chains in `rust_lookup_qualified`.
+
+    `_collect_type_infos` (build.py) now recurses into nested class
+    namespaces (issue #806 D2), so `Outer.Inner` and
+    `Outer.Inner.Deep` TypeInfos are in the resolver snapshot and the
+    native dot-chain walk can resolve `Outer.Inner.x` / `Outer.Inner.Deep`
+    instead of deferring at the second part. Direct seam exercise on a
+    resolver built from the fixture's nested classes, independent of the
+    build-manager gate.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        from mypy.nodes import SymbolTableNode, TypeInfo, Var
+
+        self.fx = TypeFixture()
+        self._tk = _tk
+        self._SymbolTableNode = SymbolTableNode
+        self._TypeInfo = TypeInfo
+        self._Var = Var
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        # Include the explicitly-nested fixtures (out, out.I, out.I.Deep),
+        # which mirror what `_collect_type_infos` now descends into.
+        for name in ("out", "out_I", "out_I_Deep"):
+            if hasattr(self.fx, name):
+                type_infos.append(getattr(self.fx, name))
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+
+    def _call(
+        self, name: str, kind: int, fullname: str, is_any: bool
+    ) -> Any:
+        return self._tk.rust_lookup_qualified(
+            self.resolver, name, kind, fullname, is_any
+        )
+
+    def test_nested_typeinfo_dot_chain(self) -> None:
+        # `out.I` resolves as a TypeInfo member of `out`.
+        r = self._call("out.I", 0, "out", False)
+        assert r is not None
+        assert r[0] == 0
+        assert r[1] == "out.I"
+
+    def test_double_nested_typeinfo_dot_chain(self) -> None:
+        # `out.I.Deep` resolves through two nesting levels, from the
+        # top-level entry.
+        r = self._call("out.I.Deep", 0, "out", False)
+        assert r is not None
+        assert r[0] == 0
+        assert r[1] == "out.I.Deep"
+
+    def test_nested_missing_member_not_found(self) -> None:
+        # `out.I.missing`: not in the MRO of out.I -> positively not found.
+        r = self._call("out.I.missing", 0, "out", False)
+        assert r is not None
+        assert r[0] == -1
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCallableArgConstraintsSuite(Suite):
     """Parity tests for `rust_infer_callable_arguments_constraints`.
 
