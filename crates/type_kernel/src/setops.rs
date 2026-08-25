@@ -3987,7 +3987,7 @@ fn visit_union_join(
 /// Returns `None` (defer to Python) when args are present but the
 /// specific arg-shape is not handled, or when a promote/blob decode
 /// fails.
-fn visit_instance_join(
+pub(crate) fn visit_instance_join(
     s: &Type,
     t: &Type,
     ctx: &SubtypeContext,
