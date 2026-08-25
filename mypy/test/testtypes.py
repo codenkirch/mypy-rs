@@ -6584,6 +6584,245 @@ class NativeTruthinessSuite(Suite):
         assert _type_kernel.rust_true_only(d_bytes, self.resolver) is not None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeImplTruthinessSuite(Suite):
+    """Parity for the Rust `can_be_true_default`/`can_be_false_default` ports.
+
+    The byte seams (types_impl.rs `rust_can_be_true_default` /
+    `rust_can_be_false_default`) cover the type classes whose truthiness is
+    wire-portable; the resolver-backed live seams
+    (`rust_can_be_true_default_live` / `rust_can_be_false_default_live`)
+    additionally decide the TupleType `can_be_any_bool` check, the
+    TypeAliasType alias-target delegation, and the enum-LiteralType branch.
+    Python falls back to the pure-Python default when the Rust seam returns
+    None.
+
+    Every test asserts the gate-on result equals the gate-off (pure Python)
+    result via `bool(t.can_be_true)` / `bool(t.can_be_false)`, and direct
+    seam calls prove the Rust function engages (does not silently defer)
+    for the handled cases. The fixture installs the resolver with the live
+    TypeInfo map so the live-MRO `__bool__`/`__len__` walk and the
+    `is_enum` read work.
+
+    The `_VISITOR_*` seam names in mypy.types are bound only when the
+    module-level try-block succeeds. On a first import that try hits the
+    circular `from mypy.types import read_type` (read_type is defined later
+    in the module), so it fails and leaves every `_rust_*` seam None plus
+    `_VISITOR_HAS_TYPE_KERNEL` False. A module reload would bind them but
+    breaks object identity for the already-imported fixture types. Instead
+    the fixture binds the seam names directly on the live module, exactly
+    as the try-block would (mirror of mypy/types.py:4497-4534).
+    """
+
+    # Seam names stay None on first import, so the fixture binds them on
+    # the live module; see the class docstring for why binding here beats
+    # a module reload.
+    _VISITOR_SEAM_NAMES = (
+        "callable_with_ellipsis",
+        "can_be_false_default",
+        "can_be_false_default_live",
+        "can_be_true_default",
+        "can_be_true_default_live",
+        "callable_is_generic",
+        "callable_is_kw_arg",
+        "callable_is_var_arg",
+        "callable_max_possible_positional_args",
+        "callable_min_args",
+        "callable_formal_arguments",
+        "callable_argument_by_name",
+        "callable_argument_by_position",
+        "copy_type",
+        "find_unpack_in_list",
+        "flatten_nested_tuples",
+        "flatten_nested_unions",
+        "has_recursive_types",
+        "has_type_vars",
+        "is_literal_type",
+        "is_unannotated_any",
+        "copy_modified",
+        "remove_dups",
+        "split_with_prefix_and_suffix",
+        "tuple_length",
+        "type_vars_as_args",
+        "union_length",
+    )
+    _VISITOR_SEAM_RESOLVER_NAMES = ("can_be_true_default_live", "can_be_false_default_live")
+
+    def setUp(self) -> None:
+        import mypy.types as _types_mod
+
+        from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+
+        self._types_mod = _types_mod
+        # Bind the seam names the module-level try would have bound.
+        _types_mod._VisitorWriteBuffer = _WB
+        _types_mod._ReadBuffer = _RB
+        for n in self._VISITOR_SEAM_NAMES:
+            _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
+        _types_mod._VISITOR_HAS_TYPE_KERNEL = True
+
+        from mypy.types import _set_native_truthiness_resolver, _set_native_visitor_active
+
+        self.fx = TypeFixture()
+        self.type_infos = _base_infos(self.fx)
+        self.resolver = _type_kernel.build_native_resolver(self.type_infos, [])
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in self.type_infos})
+        _set_native_truthiness_resolver(self.resolver)
+        self._set_gate(True)
+
+    def tearDown(self) -> None:
+        from mypy.types import _set_native_visitor_active, _set_native_truthiness_resolver
+
+        # Restore the pre-suite state: visitor gate off and no resolver.
+        self._set_gate(False)
+        _set_native_truthiness_resolver(None)
+        self._types_mod._VISITOR_HAS_TYPE_KERNEL = False
+
+    def _set_gate(self, active: bool) -> None:
+        from mypy.types import _set_native_visitor_active
+
+        _set_native_visitor_active(active)
+
+    def _with_gate(self, active: bool, fn: Callable[[], bool]) -> bool:
+        self._set_gate(active)
+        try:
+            return fn()
+        finally:
+            self._set_gate(True)
+
+    def _assert_par(self, t: Type) -> None:
+        """Assert gate-on (Rust) == gate-off (Python) for both booleans."""
+        off_true = self._with_gate(False, lambda: t.can_be_true)
+        on_true = self._with_gate(True, lambda: t.can_be_true)
+        off_false = self._with_gate(False, lambda: t.can_be_false)
+        on_false = self._with_gate(True, lambda: t.can_be_false)
+        assert on_true == off_true, f"can_be_true parity {t!r}: {off_true} vs {on_true}"
+        assert on_false == off_false, f"can_be_false parity {t!r}: {off_false} vs {on_false}"
+
+    def _assert_values(self, t: Type, true: bool, false: bool) -> None:
+        """Assert both gate-on results equal the expected booleans."""
+        on_true = self._with_gate(True, lambda: t.can_be_true)
+        on_false = self._with_gate(True, lambda: t.can_be_false)
+        assert on_true == true, f"can_be_true {t!r}: expected {true}, got {on_true}"
+        assert on_false == false, f"can_be_false {t!r}: expected {false}, got {on_false}"
+
+    def test_uninhabited_none(self) -> None:
+        # UninhabitedType: False/False. NoneType: False/True.
+        self._assert_values(self.fx.uninhabited, False, False)
+        self._assert_values(self.fx.nonet, False, True)
+        self._assert_par(self.fx.uninhabited)
+        self._assert_par(self.fx.nonet)
+
+    def test_callable(self) -> None:
+        # CallableType: FunctionLike forces _can_be_false=False -> True/False.
+        c = CallableType([], [], [], NoneType(), self.fx.function)
+        self._assert_values(c, True, False)
+        self._assert_par(c)
+
+    def test_union(self) -> None:
+        # UnionType: any(item.can_be_*). A | None -> true/false both True.
+        from mypy.typeops import make_simplified_union
+
+        u = make_simplified_union([self.fx.a, self.fx.nonet])
+        self._assert_values(u, True, True)
+        self._assert_par(u)
+        # A | str -> true True, false True (str can_be_false via literal "").
+        u2 = make_simplified_union([self.fx.a, self.fx.str_type])
+        self._assert_par(u2)
+
+    def test_literal_non_enum(self) -> None:
+        # LiteralType non-enum: bool(value). Literal[0] -> False/True.
+        self._assert_values(self.fx.lit_false, False, True)
+        self._assert_values(self.fx.lit_true, True, False)
+        self._assert_par(self.fx.lit_false)
+        self._assert_par(self.fx.lit_true)
+        # Literal[0] -> False (int 0); Literal[0.0] -> False (Float != 0.0);
+        # Literal[""] -> False. Fixture has no int/float TypeInfos, so build
+        # them as NativeTruthinessSuite.test_int_instance does.
+        int_info = self.fx.make_type_info("int")
+        int_info._fullname = "builtins.int"
+        int_type = Instance(int_info, [])
+        float_info = self.fx.make_type_info("float")
+        float_info._fullname = "builtins.float"
+        float_type = Instance(float_info, [])
+        zero = LiteralType(0, int_type)
+        zero_float = LiteralType(0.0, float_type)
+        empty_str = LiteralType("", self.fx.str_type)
+        self._assert_values(zero, False, True)
+        self._assert_values(zero_float, False, True)
+        self._assert_values(empty_str, False, True)
+        self._assert_par(zero)
+        self._assert_par(zero_float)
+        self._assert_par(empty_str)
+
+    def test_literal_enum(self) -> None:
+        # Enum literal: fallback is_enum=True, truthiness is the Instance
+        # default (True/True); mypy does not respect __bool__/__len__.
+        en = self.fx.make_type_info("E", module_name="__main__", is_abstract=False)
+        en.is_enum = True
+        lit_member = LiteralType("a", Instance(en, []))
+        self._assert_values(lit_member, True, True)
+        self._assert_par(lit_member)
+
+    def test_tuple_builtins_tuple(self) -> None:
+        # TupleType with builtins.tuple fallback: can_be_any_bool False ->
+        # can_be_true = length > 0, can_be_false = (length parse).
+        t0 = TupleType([], self.fx.std_tuple)
+        t1 = TupleType([self.fx.a], self.fx.std_tuple)
+        t2 = TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        self._assert_values(t0, False, True)  # empty -> can_be_false True
+        self._assert_values(t1, True, False)  # len 1 non-unpack
+        self._assert_values(t2, True, False)  # len 2 -> false
+        self._assert_par(t0)
+        self._assert_par(t1)
+        self._assert_par(t2)
+
+    def test_tuple_namedtuple_with_dunder(self) -> None:
+        # TupleType with a namedtuple/custom fallback that has __bool__ in an
+        # MRO class -> can_be_any_bool True -> both True.
+        name_ti = self.fx.make_type_info("NT", module_name="__main__")
+        name_ti.is_named_tuple = True
+        # Add __bool__ returning bool.
+        from mypy.nodes import MDEF, Block, FuncDef, SymbolTableNode
+
+        sig = CallableType([], [], [], self.fx.bool_type, self.fx.function)
+        func_def = FuncDef("__bool__", [], Block([]))
+        func_def.type = sig
+        name_ti.names["__bool__"] = SymbolTableNode(MDEF, func_def)
+        nt = TupleType([self.fx.a, self.fx.b], Instance(name_ti, []))
+        self._assert_values(nt, True, True)
+        self._assert_par(nt)
+
+    def test_typealias(self) -> None:
+        # TypeAliasType: delegates to alias.target.can_be_*.
+        alias_node = TypeAliasType(
+            None,
+            self.fx.a,
+        )  # alias.target = self.fx.a (Instance A)
+        self._assert_par(alias_node)
+
+    def test_engages_via_direct_seam(self) -> None:
+        # Direct seam calls: byte/live seams engage (not defer). Byte seam
+        # defers on LiteralType (needs TypeInfo.is_enum), so only plain
+        # types engage it; live seam decides literals via the resolver.
+        from mypy.types import _serialize_type_for_visitor
+
+        for t in (self.fx.d, self.fx.nonet):
+            assert (
+                _type_kernel.rust_can_be_true_default(_serialize_type_for_visitor(t)) is not None
+            ), f"rust_can_be_true_default did not engage for {t!r}"
+            assert (
+                _type_kernel.rust_can_be_false_default(_serialize_type_for_visitor(t)) is not None
+            ), f"rust_can_be_false_default did not engage for {t!r}"
+        # Live seams engage with the resolver installed (incl. literals).
+            assert (
+                _type_kernel.rust_can_be_true_default_live(
+                    _serialize_type_for_visitor(t), self.resolver
+                )
+                is not None
+            ), f"rust_can_be_true_default_live did not engage for {t!r}"
+
+
 def _base_infos(fx: TypeFixture) -> list[TypeInfo]:
     """All fixture TypeInfos for the resolver + object."""
     return [getattr(fx, n) for n in dir(fx) if n.endswith("i") and _is_type_info(getattr(fx, n))]

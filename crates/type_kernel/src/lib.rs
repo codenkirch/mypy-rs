@@ -1784,6 +1784,9 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_tuple_length, module)?)?;
     module.add_function(wrap_pyfunction!(types_impl::rust_union_length, module)?)?;
+    // Issue #854: resolver-enabled truthiness defaults (can_be_any_bool,
+    // alias-target delegation, enum literals).
+    types_impl::extension_seams::add_seams(module)?;
     // Issue #487: CallableType/Parameters arg-query helpers.
     module.add_function(wrap_pyfunction!(
         types_impl::rust_callable_formal_arguments,
