@@ -1242,22 +1242,88 @@ fn classify_member_access_inner(typ: &Type, resolver: &TypeResolver) -> i64 {
 ///   * TypeVarType with values → needs `make_simplified_union`.
 ///   * UnboundType / Parameters / UnpackType → needs `report_missing_attribute`.
 #[pyfunction]
+#[pyo3(signature = (resolver, name, typ_bytes, self_type_bytes, is_lvalue, is_super,
+                    preserve_type_var_ids, start_raw_id, strict_optional))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_analyze_member_access(
+    py: Python<'_>,
     resolver: &NativeTypeResolver,
+    name: &str,
     typ_bytes: &[u8],
-) -> PyResult<Option<Vec<u8>>> {
-    let typ = match decode_type(typ_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
+    self_type_bytes: &[u8],
+    is_lvalue: bool,
+    is_super: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: i64,
+    strict_optional: bool,
+) -> Option<(i64, bool, Vec<u8>)> {
+    let typ = decode_type(typ_bytes)?;
+    let self_type = decode_type(self_type_bytes)?;
+    let mut next_raw_id = start_raw_id;
+    let mut changed = false;
+    let mut ctx = MemberAccessCtx {
+        py,
+        resolver,
+        name,
+        self_type: &self_type,
+        is_lvalue,
+        is_super,
+        preserve_type_var_ids,
+        next_raw_id: &mut next_raw_id,
+        changed: &mut changed,
+        strict_optional,
     };
-    Ok(analyze_member_access_inner(&typ, resolver.resolver()).and_then(|typ| encode_type(&typ)))
+    let result = analyze_member_access_inner(&typ, Some(&mut ctx), resolver.resolver())?;
+    Some((next_raw_id, changed, encode_type(&result)?))
 }
 
-fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) -> Option<Type> {
+/// Call-site context for `analyze_member_access_inner`: the dispatch data
+/// needed to route an `Instance` fallback target through the native method
+/// branch. Carried as a token so the pure type-transform branches do not
+/// pay for it. When the caller only has a resolver (the union-item and
+/// NoneType recursion paths, which Python keeps in Python), the context is
+/// `None` and an `Instance` fallback defers as before.
+struct MemberAccessCtx<'a> {
+    py: Python<'a>,
+    resolver: &'a NativeTypeResolver,
+    name: &'a str,
+    self_type: &'a Type,
+    is_lvalue: bool,
+    is_super: bool,
+    preserve_type_var_ids: bool,
+    next_raw_id: &'a mut i64,
+    changed: &'a mut bool,
+    strict_optional: bool,
+}
+
+fn analyze_member_access_inner<'a>(
+    typ: &'a Type,
+    mut ctx: Option<&mut MemberAccessCtx<'a>>,
+    resolver: &'a TypeResolver,
+) -> Option<Type> {
     match typ {
         // --- Instance ---
         Type::Instance { .. } => {
-            // Needs analyze_instance_member_access (plugin hooks, method lookup).
+            // Python: analyze_instance_member_access. With a ctx, route
+            // rvalue/non-super Instance operands (incl. fallback recursion)
+            // through the native method branch; lvalue/super stay in Python.
+            if let Some(ctx) = ctx.as_deref_mut() {
+                if !ctx.is_lvalue && !ctx.is_super {
+                    let r = dispatch_instance_member_inner(
+                        ctx.py,
+                        ctx.resolver,
+                        typ,
+                        ctx.name,
+                        None,
+                        ctx.self_type,
+                        ctx.preserve_type_var_ids,
+                        ctx.next_raw_id,
+                        ctx.changed,
+                        ctx.strict_optional,
+                    )?;
+                    return Some(r);
+                }
+            }
             None
         }
         // --- AnyType ---
@@ -1290,12 +1356,10 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
             partial_fallback, ..
         } => {
             // Python: _analyze_member_access(name, tuple_fallback(typ), mx).
-            // Fall back to the partial fallback; an Instance target would
-            // defer inside the recursion, so short-circuit it.
-            if matches!(&**partial_fallback, Type::Instance { .. }) {
-                return None;
-            }
-            analyze_member_access_inner(partial_fallback, resolver)
+            // Recurse on the partial fallback; an Instance target routes
+            // through the native method branch (or defers when there is no
+            // dispatch context / it is an lvalue/super access).
+            analyze_member_access_inner(partial_fallback, ctx.as_deref_mut(), resolver)
         }
         // --- TypedDictType ---
         Type::TypedDictType { .. } => {
@@ -1321,30 +1385,20 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
                 // Python: make_simplified_union(typ.values), mx.
                 // We cannot build a union without knowing how to join; defer.
                 None
-            } else if matches!(&**upper_bound, Type::Instance { .. }) {
-                // Python: _analyze_member_access(name, typ.upper_bound, mx);
-                // an Instance target would defer inside the recursion.
-                None
             } else {
                 // Python: _analyze_member_access(name, typ.upper_bound, mx).
-                analyze_member_access_inner(upper_bound, resolver)
+                analyze_member_access_inner(upper_bound, ctx.as_deref_mut(), resolver)
             }
         }
         // --- ParamSpecType ---
         Type::ParamSpecType { upper_bound, .. } => {
             // Python: TypeVarLikeType -> _analyze_member_access(name, typ.upper_bound, mx).
-            if matches!(&**upper_bound, Type::Instance { .. }) {
-                return None; // Instance target would defer inside the recursion
-            }
-            analyze_member_access_inner(upper_bound, resolver)
+            analyze_member_access_inner(upper_bound, ctx.as_deref_mut(), resolver)
         }
         // --- TypeVarTupleType ---
         Type::TypeVarTupleType { tuple_fallback, .. } => {
             // No upper_bound for TypeVarTuple; fall back to tuple_fallback.
-            if matches!(&**tuple_fallback, Type::Instance { .. }) {
-                return None; // Instance target would defer inside the recursion
-            }
-            analyze_member_access_inner(tuple_fallback, resolver)
+            analyze_member_access_inner(tuple_fallback, ctx.as_deref_mut(), resolver)
         }
         // --- DeletedType ---
         Type::DeletedType { .. } => {
@@ -1363,10 +1417,7 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
         // --- LiteralType ---
         Type::LiteralType { fallback, .. } => {
             // Python: _analyze_member_access(name, typ.fallback, mx).
-            if matches!(&**fallback, Type::Instance { .. }) {
-                return None; // Instance target would defer inside the recursion
-            }
-            analyze_member_access_inner(fallback, resolver)
+            analyze_member_access_inner(fallback, ctx.as_deref_mut(), resolver)
         }
         // --- CallableType ---
         Type::CallableType {
@@ -1377,12 +1428,9 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
             // lookup (mx, override_info), so defer when is_type_obj.
             if is_type_obj(fallback, ret_type, resolver) {
                 None
-            } else if matches!(&**fallback, Type::Instance { .. }) {
-                // Python: _analyze_member_access(name, typ.fallback, mx);
-                // an Instance target would defer inside the recursion.
-                None
             } else {
-                analyze_member_access_inner(fallback, resolver)
+                // Python: _analyze_member_access(name, typ.fallback, mx).
+                analyze_member_access_inner(fallback, ctx.as_deref_mut(), resolver)
             }
         }
         // --- Overloaded ---
@@ -1405,7 +1453,9 @@ fn analyze_member_access_inner<'a>(typ: &'a Type, resolver: &'a TypeResolver) ->
                             // recursion for this item; keep looking.
                             continue;
                         }
-                        if let Some(r) = analyze_member_access_inner(fallback, resolver) {
+                        if let Some(r) =
+                            analyze_member_access_inner(fallback, ctx.as_deref_mut(), resolver)
+                        {
                             return Some(r);
                         }
                     }
@@ -1496,7 +1546,12 @@ pub(crate) fn rust_analyze_union_member_access(
                     strict_optional,
                 )?
             }
-            _ => analyze_member_access_inner(item, resolver.resolver())?,
+            _ => {
+                // Non-Instance union item: route through the general path
+                // without a dispatch context (Python keeps Instance operands
+                // in Python here via `_analyze_member_access` on the item).
+                analyze_member_access_inner(item, None, resolver.resolver())?
+            }
         };
         results.push(encode_type(&r)?);
     }
@@ -1579,7 +1634,7 @@ fn analyze_none_member_access_inner(
             last_known_value: None,
             extra_attrs: None,
         };
-        analyze_member_access_inner(&object_inst, resolver)
+        analyze_member_access_inner(&object_inst, None, resolver)
     }
 }
 
@@ -2905,6 +2960,89 @@ mod tests {
             false
         )
         .is_none());
+    }
+
+    // --- analyze_member_access_inner pass-through recursion ---
+
+    #[test]
+    fn test_memacc_instance_no_ctx_defers() {
+        // Instance operand with no dispatch context (the union-item and
+        // NoneType recursion callers) defers; those paths keep Instance
+        // operands in Python.
+        let resolver = TypeResolver::new();
+        assert!(
+            analyze_member_access_inner(&make_instance("builtins.int"), None, &resolver).is_none()
+        );
+    }
+
+    #[test]
+    fn test_memacc_tuple_instance_fallback_no_ctx_defers() {
+        // A TupleType whose partial fallback is an Instance recurses into
+        // the Instance branch; without a dispatch context that defers.
+        let fb = make_instance("builtins.int");
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(fb),
+            items: vec![make_instance("builtins.int")],
+            implicit: false,
+        };
+        let resolver = TypeResolver::new();
+        assert!(analyze_member_access_inner(&tup, None, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_memacc_typevar_instance_bound_no_ctx_defers() {
+        // TypeVarType with no value restriction and an Instance upper bound
+        // recurses on the bound; without a dispatch context it defers.
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: vec![],
+            upper_bound: Box::new(make_instance("builtins.object")),
+            default: Box::new(Type::AnyType {
+                type_of_any: 12,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let resolver = TypeResolver::new();
+        assert!(analyze_member_access_inner(&tv, None, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_memacc_typevar_any_bound_recurses() {
+        // TypeVarType with an AnyType upper bound: the recursion resolves
+        // AnyType -> AnyType(from_another_any), proving the fallback
+        // threshold passes control to the pure transform.
+        let tv = Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id: 1,
+            namespace: String::new(),
+            values: vec![],
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 2,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 12,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level: 0,
+        };
+        let resolver = TypeResolver::new();
+        let result = analyze_member_access_inner(&tv, None, &resolver)
+            .expect("Any upper bound transforms natively");
+        match result {
+            Type::AnyType { type_of_any: 7, .. } => {}
+            other => panic!("expected from_another_any, got {other:?}"),
+        }
     }
 
     // --- analyze_none_member_access_inner ---
