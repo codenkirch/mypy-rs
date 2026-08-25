@@ -1315,9 +1315,14 @@ class BuildManager:
 
         The parity suites use a fixture-walk; production walks the same
         `MypyFile.names` SymbolTable entries, filtering for `TypeInfo`.
-        Safe to call from `__init__` (returns `[]` when no modules are
-        loaded yet) and from `process_stale_scc` after semantic analysis
-        populates the graph.
+        Nested classes (`Outer.Inner`) live in the parent TypeInfo's
+        `names` (issue #806 D2), so the walk recurses one level through
+        each collected TypeInfo's `names` and, for nested classes, their
+        nested `names` again (a nested TypeInfo can itself nest). This
+        keeps the resolver snapshot complete for `rust_lookup_qualified`
+        dot-chain walks through nested classes. Safe to call from
+        `__init__` (returns `[]` when no modules are loaded) and from
+        `process_stale_scc` after semantic analysis populates the graph.
         """
         from mypy.nodes import TypeInfo
 
@@ -1329,7 +1334,18 @@ class BuildManager:
                 node = sym.node
                 if isinstance(node, TypeInfo):
                     infos.append(node)
+                    self._collect_nested_type_infos(node, infos)
         return infos
+
+    def _collect_nested_type_infos(
+        self, info: TypeInfo, infos: list[TypeInfo]
+    ) -> None:
+        """Recursively collect TypeInfos nested inside `info.names`."""
+        for sym in info.names.values():
+            node = sym.node
+            if isinstance(node, TypeInfo):
+                infos.append(node)
+                self._collect_nested_type_infos(node, infos)
 
     def _collect_aliases(self) -> list[TypeAlias]:
         """Walk all loaded modules and collect every `TypeAlias` node.
