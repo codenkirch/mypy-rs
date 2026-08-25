@@ -11,14 +11,15 @@
 //!   * `restrict_subtype_away` (subtypes.py:2363) — `t minus s` for
 //!     runtime type assertions. Handles the union-literal restriction
 //!     and the non-union `consider_runtime_isinstance` / proper-subtype
-//!     branches, routing `covers_at_runtime` to the dedicated module
-//!     (covers_at_runtime.rs), which defers on paths Rust cannot decide.
-//!     The three pyfunction seams also expand top-level `TypeAliasType`
-//!     operands via the alias resolver, mirroring the Python mirrors'
-//!     `get_proper_type` calls; nested alias items still defer.
-//!   * `join_type_list` (join.py:1142) — fold-join over a list of types.
-//!     Reuses the existing `setops::join_types` wire kernel. Returns
-//!     encoded bytes so the Python shim can decode to a live `Type`.
+//!     branches. Defers (returns `None`) when `covers_at_runtime` needs
+//!     a path Rust cannot decide.
+//!   * `join_type_list` (join.py:1508) — fold-join over a list of types
+//!     (empty -> UninhabitedType, then pairwise via the setops join
+//!     kernel: Instance nominal join, union flattening, CallableType
+//!     similarity, TypeType, Literal, TypeVar default). Defers the
+//!     whole call on any LKV / fallback_to_any item or any pair the
+//!     kernel cannot decide. Returns encoded bytes so the Python shim
+//!     can decode to a live `Type`.
 //!   * `get_protocol_member` (subtypes.py:1832) — `get_protocol_member`
 //!     minus `find_member`'s attribute-hook / descriptor / error paths and
 //!     the `__call__`-on-class-object `type_object_type` computation. Rust
@@ -41,7 +42,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyList;
 
-use crate::subtypes::{is_subtype, SubtypeContext};
+use crate::subtypes::SubtypeContext;
 use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
 use crate::visitor::has_type_vars_inner;
 use crate::wire::{self, ReadBuffer, Type, WriteBuffer};
@@ -594,34 +595,41 @@ pub(crate) fn rust_restrict_subtype_away(
 }
 
 // ---------------------------------------------------------------------------
-// join_type_list (join.py:1491-1511)
+// join_type_list (join.py:1508-1529)
 // ---------------------------------------------------------------------------
 
-/// `mypy.join.join_type_list` (join.py:1491-1511): fold-join over a list.
+/// `TypeOfAny.special_form` (mypy/type_visitor.py / types.py:2682).
+const TYPE_OF_ANY_SPECIAL_FORM: i64 = 6;
+
+/// `mypy.join.join_type_list` (join.py:1508-1529): fold-join over a
+/// list, pairing each item with the accumulator through the setops join
+/// kernel (`join_one_pair`, mirroring `join_types`, join.py:1508-1510).
+/// The kernel is parity-tested for every pair shape it decides:
+/// Instance-Instance (same-type passthrough, subtype domination, common
+/// ancestor), union flattening, Any / NoneType / UninhabitedType
+/// absorption, CallableType similarity + combine, TypeType joins,
+/// Literal handling, TypedDict, and TypeVar (same-id bound join, and
+/// `default(s)` -> object for an Instance `s`).
 ///
-/// Handles the list where every item is join-safe: Instance, CallableType,
-/// TupleType, or a leaf (AnyType / NoneType / UninhabitedType /
-/// DeletedType). TypeVarLikes, TypeAliasType, unions, and recursive
-/// aliases all defer the WHOLE call to Python (join_type_list_inner
-/// returns None), because:
-///   - Python folds with join_types (join.py:1508-1510), whose
-///     TypeVarLike/TypeAlias/recursive handling carries object identity
-///     and `is_recursive` semantics the wire round-trip cannot preserve
-///     (fresh TypeVars must stay the same object across occurrences);
-///   - union items must be flattened exactly like Python
-///     (join_types swaps/merges union operands).
-///
-/// For the join-safe list the fold is pairwise:
-///   - A == B (same wire Type) -> keep A;
-///   - else is_subtype(A, B) == Some(true) -> B dominates;
-///   - else is_subtype(B, A) == Some(true) -> A dominates;
-///   - either direction undecided (None) or both false -> defer the whole
-///     call (a wrong join is worse than a deferral).
+/// The whole call defers to Python when:
+///   - any item carries a `last_known_value` (Python's join erases LKVs
+///     by rebuilding instances; the wire kernel would keep them);
+///   - any item is a class with `fallback_to_any` (a stub / unknown
+///     base; Python's join prefers those pairs' Any fallback);
+///   - any single item is not identity-safe (TypeVar/ParamSpec anywhere,
+///     or a TypeInfo snapshot is missing);
+///   - any pair the setops kernel cannot decide returns None and the
+///     whole call falls back to the pure-Python fold. Deferral is always
+///     safe: Python re-runs the identical algorithm.
 fn join_type_list_inner(
     items: &[Type],
     strict_optional: bool,
     resolver: &TypeResolver,
 ) -> Option<Type> {
+    // join.py:1519-1520: empty list -> UninhabitedType().
+    if items.is_empty() {
+        return Some(Type::UninhabitedType { ambiguous: false });
+    }
     // Single-item passthrough: Python's fold starts `joined = types[0]`,
     // so one item has no join decision. Pass through only identity-safe
     // items (resolver-resolvable, no TypeVar/ParamSpec anywhere).
@@ -631,84 +639,166 @@ fn join_type_list_inner(
     if items.len() == 1 {
         return None;
     }
-    // Skip leading NoneType guards; the fold decides on the non-None
-    // tail (None only if the tail collapses to it, e.g. [None, None]).
-    let start = items
+    // Whole-list cheap guards: Python's join erases last-known values
+    // and lets `fallback_to_any` classes absorb into Any; neither is
+    // reproducible through the wire kernel, so defer the whole call.
+    if items.iter().any(has_lkv) {
+        return None;
+    }
+    if items
         .iter()
-        .position(|t| !matches!(t, Type::NoneType))
-        .unwrap_or(items.len());
-    let items_slice = &items[start..];
-    if items_slice.is_empty() {
-        // join.py:1504-1507: empty list -> UninhabitedType(); join of
-        // only-Nones -> NoneType (join_types(None, None) -> None).
-        return if items.is_empty() {
-            Some(Type::UninhabitedType { ambiguous: false })
-        } else {
-            Some(Type::NoneType)
-        };
+        .any(|t| instance_has_fallback_to_any(t, resolver))
+    {
+        return None;
     }
     let ctx = SubtypeContext::new(false, false, false, false, false, strict_optional);
-    let mut acc = items_slice[0].clone();
-    for item in &items_slice[1..] {
-        if !is_join_safe(item, resolver) {
-            return None;
-        }
-        if *item == acc {
-            // Equal wire types: join_types returns the left operand
-            // (join.py:1508-1509 folds joined = join_types(joined, t);
-            // the Rust join_types SameS/SameT picks one side).
-            continue;
-        }
-        // Any-absorption: join_types(Any, t) returns Any (join.py:353-354).
-        // `is_subtype(Any, t)` is true for every t, so the fold below would
-        // wrongly demote Any to t. Short-circuit.
-        if matches!(acc, Type::AnyType { .. }) || matches!(item, Type::AnyType { .. }) {
-            return Some(Type::AnyType {
-                type_of_any: 7, // TypeOfAny.from_another_any
-                source_any: None,
-                missing_import_name: None,
-            });
-        }
-        // Python's join erases last-known values (Literal[2]? joins int to
-        // int); the Rust subtype-fold keeps the literal forms, so defer
-        // those pairs to Python.
-        if has_lkv(&acc) || has_lkv(item) {
-            return None;
-        }
-        // Both operands must be wire-serializable without TypeInfo;
-        // anything else defers (Python's join does not reduce to
-        // bidirectional is_subtype).
-        if !is_join_safe(&acc, resolver) {
-            return None;
-        }
-        // A fallback_to_any class is not decision-safe: Python's join
-        // gives such pairs the LEFT operand's Any fallback instead of
-        // the subtype fold; deciding here would leak a wrong join.
-        if instance_has_fallback_to_any(&acc, resolver)
-            || instance_has_fallback_to_any(item, resolver)
-        {
-            return None;
-        }
-        match is_subtype(&acc, item, &ctx, resolver) {
-            // acc <: item: item is the more general type, so it becomes
-            // the join.
-            Some(true) => acc = item.clone(),
-            Some(false) => {}
-            None => return None,
-        }
-        match is_subtype(item, &acc, &ctx, resolver) {
-            // item <: acc: acc is the more general type, keep folding.
-            Some(true) => continue,
-            Some(false) => return None, // Incomparable; Python must decide.
-            None => return None,
-        }
+    let mut acc = items[0].clone();
+    for item in &items[1..] {
+        acc = join_one_pair(&acc, item, &ctx, resolver)?;
     }
     Some(acc)
 }
 
+/// Join one pair of types, mirroring the `join.join_type_list` fold
+/// step (`join_types`, join.py:1508-1510). The args-less Instance-
+/// Instance nominal case goes through `visit_instance_join` directly
+/// (same-type, subtype -> supertype, else common ancestor), mapped back
+/// to a concrete Instance node; every other pair shape goes through the
+/// full `setops::join_types` kernel and its SetOpResult mapping.
+fn join_one_pair(
+    left: &Type,
+    right: &Type,
+    ctx: &SubtypeContext,
+    resolver: &TypeResolver,
+) -> Option<Type> {
+    // Instance-Instance args-less nominal prejoin. Python's join_types
+    // on such a pair never builds a fresh type: same-ref -> the left
+    // operand, subtype -> the supertype, else the common ancestor.
+    if let (
+        Type::Instance {
+            type_ref: l_ref,
+            args: l_args,
+            last_known_value: l_lkv,
+            ..
+        },
+        Type::Instance {
+            type_ref: r_ref,
+            args: r_args,
+            last_known_value: r_lkv,
+            ..
+        },
+    ) = (left, right)
+    {
+        if l_args.is_empty()
+            && r_args.is_empty()
+            && l_lkv.is_none()
+            && r_lkv.is_none()
+            && resolver.get(l_ref).is_some()
+            && resolver.get(r_ref).is_some()
+        {
+            if l_ref == r_ref {
+                return Some(left.clone());
+            }
+            let result = crate::setops::visit_instance_join(left, right, ctx, resolver)?;
+            return instance_join_result_to_type(&result, left, right);
+        }
+    }
+    let joined = crate::setops::join_types(left, right, ctx, resolver);
+    match joined {
+        Some(crate::setops::SetOpResult::SameS) => Some(left.clone()),
+        Some(crate::setops::SetOpResult::SameT) => Some(right.clone()),
+        Some(crate::setops::SetOpResult::Object) => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        Some(crate::setops::SetOpResult::Bottom) => Some(Type::UnionType {
+            items: vec![left.clone(), right.clone()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }),
+        Some(crate::setops::SetOpResult::Any) => Some(Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        }),
+        Some(crate::setops::SetOpResult::Ancestor(fullname)) => Some(Type::Instance {
+            type_ref: fullname,
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        Some(crate::setops::SetOpResult::SameTypeWithArgs {
+            type_ref,
+            arg_discs,
+        }) => {
+            let (Type::Instance { args: l_args, .. }, Type::Instance { args: r_args, .. }) =
+                (left, right)
+            else {
+                return None;
+            };
+            if arg_discs.len() != l_args.len() || arg_discs.len() != r_args.len() {
+                return None;
+            }
+            let final_args: Vec<Type> = arg_discs
+                .iter()
+                .enumerate()
+                .map(|(i, &d)| match d {
+                    0 => l_args[i].clone(),
+                    1 => r_args[i].clone(),
+                    _ => Type::AnyType {
+                        type_of_any: 0,
+                        source_any: None,
+                        missing_import_name: None,
+                    },
+                })
+                .collect();
+            Some(Type::Instance {
+                type_ref,
+                args: final_args,
+                last_known_value: None,
+                extra_attrs: None,
+            })
+        }
+        Some(crate::setops::SetOpResult::Encoded(bytes)) => decode_type(&bytes),
+        None => None,
+    }
+}
+
+/// Map a `visit_instance_join` result to the concrete joined `Type`
+/// for the args-less no-LKV case. The join of two args-less Instances
+/// never builds a fresh type in Python: `SameS`/`SameT` are the
+/// operands, `Ancestor`/`Object` become `Instance(fullname)` /
+/// `object`. Other results cannot arise here, so defer if seen.
+fn instance_join_result_to_type(
+    result: &crate::setops::SetOpResult,
+    left: &Type,
+    right: &Type,
+) -> Option<Type> {
+    match result {
+        crate::setops::SetOpResult::SameS => Some(left.clone()),
+        crate::setops::SetOpResult::SameT => Some(right.clone()),
+        crate::setops::SetOpResult::Ancestor(fullname) => Some(Type::Instance {
+            type_ref: fullname.clone(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        crate::setops::SetOpResult::Object => Some(Type::Instance {
+            type_ref: "builtins.object".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }),
+        _ => None,
+    }
+}
+
 /// Does `t` resolve to a class whose `fallback_to_any` is set (a stub or
 /// unknown base)? Such classes are not decision-safe for the Rust fold
-/// (see the deferral in `join_type_list_inner`).
+/// (see the whole-list guard in `join_type_list_inner`).
 fn instance_has_fallback_to_any(t: &Type, resolver: &TypeResolver) -> bool {
     if let Type::Instance { type_ref, .. } = t {
         if let Some(snap) = resolver.get(type_ref) {
@@ -718,22 +808,17 @@ fn instance_has_fallback_to_any(t: &Type, resolver: &TypeResolver) -> bool {
     false
 }
 
-/// Is this item safe for the Rust fold-join? Join-safe: Instance,
-/// non-generic CallableType, and the leaf short-circuits the Python
-/// pre-dispatch handles before the visitor (AnyType / NoneType /
-/// UninhabitedType / DeletedType). A generic CallableType is NOT
-/// join-safe: Python's `join_types` on callables goes through
-/// `TypeJoinVisitor.join_callables` ->
-/// `combine_similar_callables`/`join_similar_callables`, which can bind
-/// or erase type variables, and a plain `is_subtype` fold would leak an
-/// unresolved TypeVar or an over-eager Any into inference. A TupleType
-/// is join-safe only when it has NO UnpackType items: Python's
-/// `join_types` on a tuple pair goes through
-/// `TypeJoinVisitor.join_tuples`, whose variadic-unpack normalization
-/// (e.g. `tuple[Unpack[tuple[Any, ...]]]` -> `tuple[Any, ...]`) cannot
-/// be reproduced by a plain `is_subtype` fold, so deciding those would
-/// leak a non-normalized TupleType into inference. Everything else
-/// (TypeVarLikes, TypeAliasType, recursion, unions) defers.
+/// Is this single item safe to pass through when the list has length
+/// one? Only used by the one-item branch of `join_type_list_inner`,
+/// where there is no join decision and the item becomes the answer
+/// unchanged. Identity-safe: Instance, non-generic CallableType, and
+/// the leaf short-circuits (AnyType / NoneType / UninhabitedType /
+/// DeletedType). A generic CallableType is NOT safe: Python joins
+/// callables via `combine_similar_callables` /
+/// `join_similar_callables`, which can bind or erase type variables;
+/// a bare passthrough would leak an unresolved TypeVar or an
+/// over-eager Any into inference. A TupleType is safe only with no
+/// UnpackType items. TypeVarLikes / TypeAliasType / unions defer.
 fn is_join_safe(t: &Type, resolver: &TypeResolver) -> bool {
     if matches!(
         t,
@@ -758,8 +843,8 @@ fn is_join_safe(t: &Type, resolver: &TypeResolver) -> bool {
 
 /// Does `t` (recursively) carry a `last_known_value` on any `Instance`?
 /// Python's join erases LKVs (`Literal[2]?` joins `int` to `int`); the
-/// Rust subtype-fold would wrongly keep the literal-typed form, so
-/// defer those pairs to Python.
+/// wire kernel would keep the literal-typed form, so defer any list
+/// containing one (the whole-list guard in `join_type_list_inner`).
 fn has_lkv(t: &Type) -> bool {
     match t {
         Type::Instance {
@@ -927,8 +1012,8 @@ pub(crate) fn get_protocol_member_inner(
                 return Some(GetProtocolMemberResult::Defer);
             }
             // Plain method: analyze_instance_member_access
-            // (checkmember.py:634-776): `function_type` returns `node.type`
-            // live signature, serialized; preserve_type_var_ids = no freshen.
+            // (checkmember.py:634-776), signature via function_type
+            // with preserve_type_var_ids=True; check_self_arg + bind tail.
             let node_type_obj = match node_ref.getattr("type") {
                 Ok(t) => t,
                 Err(_) => {
@@ -1010,8 +1095,8 @@ pub(crate) fn get_protocol_member_inner(
                 }
             };
             // expand_without_binding with preserve_type_var_ids=True
-            // (checkmember.py:1498-1503): no freshen, no Self (var has no
-            // self_type). Identity map + wire path == expand_type_by_instance.
+            // (checkmember.py:1498-1503): no freshen / Self; wire fast-path
+            // + identity map == plain expand_type_by_instance.
             let mapped = Type::Instance {
                 type_ref: type_ref.to_string(),
                 args: left_args.to_vec(),
@@ -1070,8 +1155,8 @@ fn live_var_plain(
     resolver: &NativeTypeResolver,
 ) -> bool {
     // var type ready + not a property / classmethod / staticmethod /
-    // classvar / setter (analyze_var / bind rules). `get_bool_flag`
-    // returns None when missing; proceed only when every flag is readable.
+    // classvar / setter. `get_bool_flag` returns None when the attribute
+    // is missing; only proceed when every decision is readable.
     let is_ready = match get_bool_flag(py, var, "is_ready") {
         Some(b) => b,
         None => return false,
@@ -1993,10 +2078,20 @@ mod tests {
     }
 
     #[test]
-    fn test_join_type_list_union_defers() {
-        // UnionType items must be flattened like Python's join_types;
-        // the non-union fast path defers the whole call.
-        let r = TypeResolver::new();
+    fn test_join_type_list_union_flattens() {
+        // Union item: join(int, union[int, None]) -> union (int is a
+        // proper subtype of the union, so the union wins, join.py:432).
+        let mut r = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            name: "int".to_string(),
+            ..Default::default()
+        };
+        snap.mro.push("builtins.int".to_string());
+        snap.mro.push("builtins.object".to_string());
+        snap.has_base.insert("builtins.int".to_string());
+        snap.has_base.insert("builtins.object".to_string());
+        r.insert("builtins.int".to_string(), snap);
         let union = Type::UnionType {
             items: vec![make_instance("builtins.int", vec![]), Type::NoneType],
             uses_pep604_syntax: false,
@@ -2004,13 +2099,16 @@ mod tests {
             can_be_false: true,
         };
         let a = make_instance("builtins.int", vec![]);
-        assert_eq!(join_type_list_inner(&[a, union], true, &r), None);
+        assert_eq!(
+            join_type_list_inner(&[a, union.clone()], true, &r),
+            Some(union)
+        );
     }
 
     #[test]
-    fn test_join_type_list_typevar_defers() {
-        // TypeVarType item: Python's fold may join via the upper_bound
-        // with object identity semantics Rust cannot replicate. Defer.
+    fn test_join_type_list_typevar_joins_to_object() {
+        // TypeVarType item with an Instance accumulator: Python's
+        // visit_type_var falls to default(s) = object (join.py:546).
         let r = TypeResolver::new();
         let tvar = Type::TypeVarType {
             name: "T".to_string(),
@@ -2032,7 +2130,56 @@ mod tests {
             meta_level: 0,
         };
         let a = make_instance("builtins.int", vec![]);
-        assert_eq!(join_type_list_inner(&[a, tvar], true, &r), None);
+        assert_eq!(
+            join_type_list_inner(&[a, tvar], true, &r),
+            Some(make_instance("builtins.object", vec![]))
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_incomparable_joins_to_object() {
+        // int and str share only object: the nominal join returns the
+        // common ancestor (join_instances_via_supertype -> object).
+        let mut r = TypeResolver::new();
+        // Each class's `bases` is one encoded `Instance(object)` blob,
+        // mirroring how typeinfo.rs serializes TypeInfo.bases.
+        let mut wbuf = WriteBuffer::new();
+        wire::write_type(&mut wbuf, &make_instance("builtins.object", vec![])).unwrap();
+        let object_blob = wbuf.into_bytes();
+        for fullname in ["builtins.int", "builtins.str", "builtins.object"] {
+            let name = fullname.rsplit('.').next().unwrap();
+            let mut s = TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro.push(fullname.to_string());
+            s.mro.push("builtins.object".to_string());
+            s.has_base.insert(fullname.to_string());
+            s.has_base.insert("builtins.object".to_string());
+            if fullname != "builtins.object" {
+                s.bases = vec![object_blob.clone()];
+            }
+            r.insert(fullname.to_string(), s);
+        }
+        let int_t = make_instance("builtins.int", vec![]);
+        let str_t = make_instance("builtins.str", vec![]);
+        assert_eq!(
+            join_type_list_inner(&[int_t, str_t], true, &r),
+            Some(make_instance("builtins.object", vec![]))
+        );
+    }
+
+    #[test]
+    fn test_join_type_list_identical_callables() {
+        // Wire-identical CallableType pair: join_types returns the left
+        // operand (visit_join SameS short-circuit).
+        let r = TypeResolver::new();
+        let c = make_callable("builtins.function");
+        assert_eq!(
+            join_type_list_inner(&[c.clone(), c.clone()], true, &r),
+            Some(c)
+        );
     }
 
     #[test]
