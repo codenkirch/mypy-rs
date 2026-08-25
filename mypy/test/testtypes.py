@@ -12701,6 +12701,191 @@ class NativeMeetSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMeetDeferralSuite(Suite):
+    """Differential for the meet.rs alias-expansion defers (#874).
+
+    The is_overlapping_types and narrow_declared_type seams previously
+    deferred every TypeAliasType operand (get_proper returned None). They
+    now expand via the NativeTypeResolver alias snapshot. Gate on/off must
+    agree and the direct seams must engage on resolvable aliases while
+    deferring on missing snapshots.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = self._collect_type_infos()
+        self.inst_alias = TypeAlias(self.fx.a, "mod.MA", "mod", -1, -1)
+        self.union_alias = TypeAlias(
+            UnionType([self.fx.a, self.fx.b]), "mod.MU", "mod", -1, -1
+        )
+        self.resolver = _type_kernel.build_native_resolver(
+            type_infos, [self.inst_alias, self.union_alias]
+        )
+        self.live_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(self.live_map)
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(self.live_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _overlap(self, active: bool, left: Type, right: Type) -> bool:
+        import mypy.join
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            with state.strict_optional_set(True):
+                return is_overlapping_types(left, right)
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def test_is_overlapping_alias_parity(self) -> None:
+        alias = TypeAliasType(self.inst_alias, [])
+        off = self._overlap(False, alias, self.fx.a)
+        on = self._overlap(True, alias, self.fx.a)
+        self.assertEqual(on, off)
+        self.assertTrue(on)
+
+    def test_is_overlapping_alias_seam_engages(self) -> None:
+        from mypy.join import _serialize_type
+
+        alias = TypeAliasType(self.inst_alias, [])
+        r = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(alias),
+            _serialize_type(self.fx.a),
+            False,
+            False,
+            True,
+            self.resolver,
+        )
+        assert r is not None, "rust_is_overlapping_types deferred on a resolvable alias"
+        self.assertTrue(r)
+
+    def test_is_overlapping_alias_disjoint(self) -> None:
+        # Gate on/off must agree regardless of the fixture's class layout.
+        alias = TypeAliasType(self.inst_alias, [])
+        off = self._overlap(False, alias, self.fx.b)
+        on = self._overlap(True, alias, self.fx.b)
+        self.assertEqual(on, off)
+
+    def test_missing_snapshot_defers(self) -> None:
+        from mypy.join import _serialize_type
+        from mypy.nodes import TypeAlias
+
+        ghost = TypeAlias(self.fx.a, "mod.Ghost", "mod", -1, -1)
+        alias = TypeAliasType(ghost, [])
+        # Direct seam must defer (returns None) on an unresolvable alias.
+        r = _type_kernel.rust_is_overlapping_types(
+            _serialize_type(alias),
+            _serialize_type(self.fx.a),
+            False,
+            False,
+            True,
+            self.resolver,
+        )
+        assert r is None, "seam must defer on a missing-snapshot alias"
+        # Gates must still agree (Python computes both).
+        off = self._overlap(False, alias, self.fx.a)
+        on = self._overlap(True, alias, self.fx.a)
+        self.assertEqual(on, off)
+
+    def test_narrow_alias_parity(self) -> None:
+        import mypy.join
+
+        from mypy.meet import narrow_declared_type
+
+        # Python expands the alias via get_proper_type before the seam, so
+        # both gates see the proper Instance at that point; the point is that
+        # gate on/off must agree through the public function.
+        alias = TypeAliasType(self.inst_alias, [])
+        old = mypy.join._native_join_active
+        results = []
+        try:
+            for active in (False, True):
+                mypy.join._set_native_join_active(active)
+                with state.strict_optional_set(True):
+                    results.append(str(narrow_declared_type(alias, self.fx.anyt)))
+        finally:
+            mypy.join._set_native_join_active(old)
+        self.assertEqual(results[1], results[0])
+
+    def test_narrow_alias_seam_engages(self) -> None:
+        from mypy.join import _serialize_type, _deserialize_type
+
+        alias = TypeAliasType(self.inst_alias, [])
+        r = _type_kernel.rust_narrow_declared_type(
+            _serialize_type(alias),
+            _serialize_type(self.fx.anyt),
+            True,
+            self.resolver,
+        )
+        assert r is not None, "rust_narrow_declared_type deferred on a resolvable alias"
+        decoded = _deserialize_type(bytes(r))
+        assert decoded is not None
+        self.assertEqual(str(decoded), str(self.fx.anyt))
+
+    def test_get_possible_variants_alias_seam_engages(self) -> None:
+        import mypy.join
+
+        from mypy.join import _serialize_type
+        from mypy.types import read_type_list
+        from mypy.wirefixup import fixup_wire_type
+
+        alias = TypeAliasType(self.union_alias, [])
+        r = _type_kernel.rust_get_possible_variants(_serialize_type(alias), self.resolver)
+        assert r is not None, "rust_get_possible_variants deferred on a resolvable alias"
+        decoded = read_type_list(mypy.join._ReadBuffer(bytes(r)))
+        fixed = [fixup_wire_type(item) for item in decoded]
+        assert fixed and all(item is not None for item in fixed), "get_possible_variants fixup"
+        variants = [item for item in fixed if item is not None]
+        self.assertEqual(
+            {str(t) for t in variants}, {str(self.fx.a), str(self.fx.b)}
+        )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMeetUnboundSuite(Suite):
     """Parity suite for the Rust `visit_unbound_type` meet (Stage 3c M8r).
 
