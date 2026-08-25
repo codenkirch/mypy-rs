@@ -175,6 +175,44 @@ pub fn rust_format_type(
     Some(quote_type_string(&bare))
 }
 
+/// Decide the `min_verbosity` for `format_type_distinctly` (messages.py:3067-3083).
+///
+/// When the pair is two `CallableType`s and `right` has any named args, Python
+/// bumps verbosity to 1 if `is_subtype(left, right, ignore_pos_arg_names=True)`.
+/// Everything else keeps verbosity 0. Returns `None` when the native subtype
+/// solver cannot decide the Callable pair (Python falls back). Previously the
+/// calling seam deferred the whole branch whenever `right` had named args,
+/// even when `is_subtype` was False (the common incompatible-args case).
+fn callable_pair_min_verbosity(types: &[Type], resolver: &TypeResolver) -> Option<i64> {
+    if types.len() != 2 {
+        return Some(0);
+    }
+    let (left, right) = (&types[0], &types[1]);
+    if !(matches!(left, Type::CallableType { .. }) && matches!(right, Type::CallableType { .. })) {
+        return Some(0);
+    }
+    let Type::CallableType { arg_names, .. } = right else {
+        return Some(0);
+    };
+    if !arg_names.iter().any(|n| n.is_some()) {
+        return Some(0);
+    }
+    // is_subtype(left, right, ignore_pos_arg_names=True), non-proper, with the
+    // default options (strict_optional=True) Python uses when options=None.
+    let ctx = SubtypeContext::with_callable_flags(
+        false, // ignore_type_params
+        false, // ignore_declared_variance
+        false, // always_covariant
+        false, // ignore_promotions
+        false, // proper_subtype
+        true,  // strict_optional (Python default when options=None)
+        true,  // ignore_pos_arg_names
+        false, // strict_concatenate
+    );
+    let sub = is_subtype(left, right, &ctx, resolver)?;
+    Some(if sub { 1 } else { 0 })
+}
+
 /// Jointly format types to distinct strings (messages.py:2987).
 ///
 /// Mirrors `format_type_distinctly(*types, options, bare)`.
@@ -216,20 +254,8 @@ pub fn rust_format_type_distinctly(
 
     // messages.py:3067-3083: min_verbosity bump when both are CallableType,
     // right has named args, and is_subtype(left, right, ignore_pos_arg_names).
-    // We can't call is_subtype here, so defer to Python for this case.
-    if types.len() == 2 {
-        let left = &types[0];
-        let right = &types[1];
-        if matches!(left, Type::CallableType { .. }) && matches!(right, Type::CallableType { .. }) {
-            if let Type::CallableType { arg_names, .. } = right {
-                if arg_names.iter().any(|n| n.is_some()) {
-                    return None;
-                }
-            }
-        }
-    }
-
-    let min_verbosity = 0;
+    // Defer only when the native subtype solver cannot decide the pair.
+    let min_verbosity = callable_pair_min_verbosity(&types, resolver.resolver())?;
 
     let mut strs = Vec::with_capacity(types.len());
     for verbosity in min_verbosity..2 {
@@ -2240,6 +2266,135 @@ mod tests {
         assert_eq!(arg_constructor_name(3), "NamedArg");
         assert_eq!(arg_constructor_name(4), "KwArg");
         assert_eq!(arg_constructor_name(5), "DefaultNamedArg");
+    }
+
+    fn callable_(
+        arg_types: Vec<Type>,
+        arg_kinds: Vec<i64>,
+        arg_names: Vec<Option<String>>,
+        ret_type: Type,
+        name: Option<String>,
+    ) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance("builtins.function", vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types,
+            arg_kinds,
+            arg_names,
+            ret_type: Box::new(ret_type),
+            name,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    #[test]
+    fn test_callable_pair_min_verbosity_wrong_arity() {
+        // Non-pair inputs always resolve to verbosity 0 (no defer).
+        let r = TypeResolver::new();
+        let t = instance("builtins.object", vec![]);
+        assert_eq!(
+            callable_pair_min_verbosity(std::slice::from_ref(&t), &r),
+            Some(0)
+        );
+        assert_eq!(
+            callable_pair_min_verbosity(&[t.clone(), t.clone(), t.clone()], &r),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_callable_pair_min_verbosity_non_callable() {
+        // Two non-callable types: verbosity 0, never defers.
+        let r = TypeResolver::new();
+        assert_eq!(
+            callable_pair_min_verbosity(&[instance("a.A", vec![]), instance("b.B", vec![])], &r),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_callable_pair_min_verbosity_no_named_args() {
+        // Callables without named args skip the bump (verbosity 0).
+        let r = make_resolver(vec![
+            snap("builtins.object", "object"),
+            snap("builtins.function", "function"),
+        ]);
+        let left = callable_(
+            vec![instance("builtins.object", vec![])],
+            vec![0],
+            vec![None],
+            instance("builtins.object", vec![]),
+            None,
+        );
+        let right = callable_(
+            vec![instance("builtins.object", vec![])],
+            vec![0],
+            vec![None],
+            instance("builtins.object", vec![]),
+            None,
+        );
+        assert_eq!(callable_pair_min_verbosity(&[left, right], &r), Some(0));
+    }
+
+    #[test]
+    fn test_callable_pair_min_verbosity_subtype_bump() {
+        // Identical named-arg callables: is_subtype(left, right,
+        // ignore_pos_arg_names=True) is True, so verbosity bumps to 1.
+        let r = make_resolver(vec![
+            snap("builtins.object", "object"),
+            snap("builtins.function", "function"),
+        ]);
+        let left = callable_(
+            vec![instance("builtins.object", vec![])],
+            vec![3],
+            vec![Some("x".to_string())],
+            instance("builtins.object", vec![]),
+            Some("f".to_string()),
+        );
+        let right = callable_(
+            vec![instance("builtins.object", vec![])],
+            vec![3],
+            vec![Some("x".to_string())],
+            instance("builtins.object", vec![]),
+            Some("f".to_string()),
+        );
+        assert_eq!(callable_pair_min_verbosity(&[left, right], &r), Some(1));
+    }
+
+    #[test]
+    fn test_callable_pair_min_verbosity_non_subtype_no_bump() {
+        // Left has arg A, right has arg B, A and B unrelated: not a subtype,
+        // so verbosity stays 0. This is the case previously deferred.
+        let r = make_resolver(vec![
+            snap("a.A", "A"),
+            snap("b.B", "B"),
+            snap("builtins.object", "object"),
+            snap("builtins.function", "function"),
+        ]);
+        let left = callable_(
+            vec![instance("a.A", vec![])],
+            vec![3],
+            vec![Some("x".to_string())],
+            instance("builtins.object", vec![]),
+            None,
+        );
+        let right = callable_(
+            vec![instance("b.B", vec![])],
+            vec![3],
+            vec![Some("y".to_string())],
+            instance("builtins.object", vec![]),
+            None,
+        );
+        assert_eq!(callable_pair_min_verbosity(&[left, right], &r), Some(0));
     }
 
     fn make_resolver(snaps: Vec<crate::typeinfo::TypeInfoSnapshot>) -> TypeResolver {

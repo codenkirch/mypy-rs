@@ -15370,6 +15370,150 @@ class NativeMessagesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMessagesDeferralSuite(Suite):
+    """Gate-on/off differential for the messages.rs deferral ports.
+
+    `rust_format_type_distinctly` mirrors `format_type_distinctly`, including
+    the `min_verbosity` decision for a Callable/Callable pair where `right` has
+    named args: Python bumps verbosity to 1 iff
+    `is_subtype(left, right, ignore_pos_arg_names=True)`, and the Rust seam now
+    computes that natively (previously it deferred the whole branch whenever
+    `right` had any named args).
+
+    Each test compares the gate-off (pure-Python) and gate-on (Rust seam) results
+    of `format_type_distinctly` for representative pairs and asserts parity. Named-
+    arg callables still defer at the format step (pretty_callable needs FuncDef
+    data the wire cannot carry), so both gates resolve through Python there; the
+    differential guards against a regression while the Rust unit tests prove the
+    decision logic itself.
+    """
+
+    def setUp(self) -> None:
+        from mypy.options import Options
+        from mypy.test.typefixture import TypeFixture as _TypeFixture
+
+        from mypy.messages import _set_native_messages_active, _set_native_messages_resolver
+
+        self.fx = _TypeFixture()
+        self.options = Options()
+        self._set_active = _set_native_messages_active
+        self._set_resolver = _set_native_messages_resolver
+        self._buf = _WriteBuffer()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.functioni,
+        ]
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        self._buf = _WriteBuffer()
+        t.write(self._buf)
+        return self._buf.getvalue()
+
+    def _assert_distinctly_par(self, *types: Type) -> None:
+        from mypy.messages import format_type_distinctly
+
+        off = self._with_gate(
+            False,
+            lambda: format_type_distinctly(*types, options=self.options, bare=True),
+        )
+        on = self._with_gate(
+            True,
+            lambda: format_type_distinctly(*types, options=self.options, bare=True),
+        )
+        assert_equal(on, off, f"format_type_distinctly parity {types}")
+
+    def test_positional_callables(self) -> None:
+        # Plain positional callables: the common formattable path (no
+        # pretty_callable detour), both gates must agree.
+        left = CallableType(
+            [self.fx.a, self.fx.b],
+            [ARG_POS, ARG_POS],
+            [None, None],
+            self.fx.o,
+            self.fx.function,
+        )
+        right = CallableType(
+            [self.fx.c],
+            [ARG_POS],
+            [None],
+            self.fx.o,
+            self.fx.function,
+        )
+        self._assert_distinctly_par(left, right)
+
+    def test_callable_pair_named_arg_non_subtype(self) -> None:
+        # left arg A, right arg B (unrelated): is_subtype is False, so the
+        # min_verbosity decision resolves to 0 natively. Previously the seam
+        # deferred this whole branch; gate-on must still match gate-off.
+        left = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.o,
+            self.fx.function,
+        )
+        right = CallableType(
+            [self.fx.b],
+            [ARG_NAMED],
+            ["x"],
+            self.fx.o,
+            self.fx.function,
+        )
+        self._assert_distinctly_par(left, right)
+
+    def test_callable_pair_named_arg_subtype(self) -> None:
+        # Identical object args with a named arg: is_subtype(left, right,
+        # ignore_pos_arg_names=True) is True, so min_verbosity resolves to 1
+        # natively (matching Python's verbosity bump).
+        left = CallableType(
+            [self.fx.o],
+            [ARG_NAMED],
+            ["x"],
+            self.fx.o,
+            self.fx.function,
+        )
+        right = CallableType(
+            [self.fx.o],
+            [ARG_NAMED],
+            ["x"],
+            self.fx.o,
+            self.fx.function,
+        )
+        self._assert_distinctly_par(left, right)
+
+    def test_single_instance_pair(self) -> None:
+        # Non-callable pair: the decision is trivially verbosity 0 natively.
+        self._assert_distinctly_par(self.fx.a, self.fx.b)
+
+    def test_mixed_callable_instance(self) -> None:
+        # One callable, one instance: no verbosity bump, must stay in parity.
+        c = CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.o,
+            self.fx.function,
+        )
+        self._assert_distinctly_par(c, self.fx.b)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFindTypeOverlapsSuite(Suite):
     """Parity tests for the Rust find_type_overlaps port (mypy.messages).
 
