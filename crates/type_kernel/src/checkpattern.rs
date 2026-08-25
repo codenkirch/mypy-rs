@@ -81,14 +81,20 @@ fn proper_wire(t: &Type) -> Option<&Type> {
 /// `checkpattern.is_uninhabited(typ)` — whether `get_proper_type(typ)` is an
 /// `UninhabitedType`.
 ///
-/// Mirrors checkpattern.py:884-885. On the wire side, `get_proper_type` is
-/// already applied by the Python shim before serialization (the caller
-/// passes a `ProperType`), so we just match on `Type::UninhabitedType`.
-/// Returns `None` (defer) when the type is a `TypeAliasType` (cannot resolve
-/// to a proper type on the wire).
+/// Mirrors checkpattern.py:884-885. The shim passes the live type directly
+/// (possibly a `TypeAliasType`), so a top-level alias expands through the
+/// resolver before the `UninhabitedType` match. Returns `None` (defer) when
+/// the wire form cannot be decoded or the alias cannot be resolved.
 #[pyfunction]
-pub(crate) fn rust_is_uninhabited(t_bytes: &[u8]) -> Option<bool> {
+pub(crate) fn rust_is_uninhabited(
+    t_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
     let t = decode_type(t_bytes)?;
+    // Python: isinstance(get_proper_type(typ), UninhabitedType). A top-level
+    // TypeAliasType must expand through the resolver before the check; a
+    // missing snapshot or unresolvable substitution defers to Python.
+    let t = crate::checkexpr_functions::get_proper_or_expand(&t, resolver.alias_resolver())?;
     Some(matches!(t, Type::UninhabitedType { .. }))
 }
 
@@ -99,20 +105,33 @@ pub(crate) fn rust_is_uninhabited(t_bytes: &[u8]) -> Option<bool> {
 /// `try_getting_str_literals_from_type`. If the result is `None` or has
 /// length != 1, appends `None`; otherwise appends the single str value.
 ///
-/// Returns `None` (defer to Python) when the wire form cannot be decoded or
-/// contains a `TypeAliasType` (which `try_getting_str_literals_from_type`
-/// cannot resolve). Returns `Some(list)` where each element is a string or
-/// `None`.
+/// Returns `None` (defer to Python) when the wire form cannot be decoded,
+/// the type is not a `TupleType`, or an item `TypeAliasType` cannot be
+/// resolved (which changes the answer). Returns `Some(list)` where each
+/// element is a string or `None`.
 #[pyfunction]
-pub(crate) fn rust_get_match_arg_names(py: Python<'_>, t_bytes: &[u8]) -> Option<PyObject> {
+pub(crate) fn rust_get_match_arg_names(
+    py: Python<'_>,
+    t_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<PyObject> {
     let t = decode_type(t_bytes)?;
     let items = match &t {
         Type::TupleType { items, .. } => items,
         _ => return None,
     };
+    let aliases = resolver.alias_resolver();
     let mut names: Vec<PyObject> = Vec::with_capacity(items.len());
     for item in items {
-        match extract_single_str_literal(item) {
+        // An unresolvable TypeAliasType item must defer the whole call:
+        // Python's try_getting_str_literals_from_type resolves it via
+        // get_proper_type, and a missing snapshot would change the answer.
+        if matches!(item, Type::TypeAliasType { .. })
+            && crate::checkexpr_functions::get_proper_or_expand(item, aliases).is_none()
+        {
+            return None;
+        }
+        match extract_single_str_literal(item, aliases) {
             Some(s) => names.push(s.into_py(py)),
             None => names.push(py.None()),
         }
@@ -125,15 +144,22 @@ pub(crate) fn rust_get_match_arg_names(py: Python<'_>, t_bytes: &[u8]) -> Option
 ///
 /// Handles: Instance with str LKV, LiteralType with str fallback, UnionType
 /// of str literals. Returns `None` if no single str literal can be extracted
-/// (matching Python returning `None` or length != 1).
-fn extract_single_str_literal(t: &Type) -> Option<String> {
-    let candidates: Vec<&Type> = match t {
+/// (matching Python returning `None` or length != 1) or an unresolvable
+/// `TypeAliasType` item is reached.
+fn extract_single_str_literal(
+    t: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<String> {
+    // An item-level TypeAliasType expands through the resolver, mirroring the
+    // get_proper_type call inside try_getting_str_literals_from_type.
+    let t = crate::checkexpr_functions::get_proper_or_expand(t, aliases)?;
+    let candidates: Vec<&Type> = match &t {
         Type::Instance {
             last_known_value: Some(lkv),
             ..
         } => vec![lkv.as_ref()],
         Type::UnionType { items, .. } => items.iter().collect(),
-        _ => vec![t],
+        _ => vec![&t],
     };
     let mut found: Option<String> = None;
     for c in candidates {
@@ -396,6 +422,7 @@ pub(crate) fn rust_contract_starred_pattern_types(
             star_pos,
             num_patterns,
             Some(resolver.resolver()),
+            Some(resolver.alias_resolver()),
         )
     } else {
         contract_no_unpack(types, star_pos, num_patterns, Some(resolver.resolver()))
@@ -408,24 +435,33 @@ pub(crate) fn rust_contract_starred_pattern_types(
 /// collapses the middle into a single union.
 ///
 /// The resolver is only used by the `Some(star_pos)` branch (to simplify the
-/// middle union); it is `Option` so the pure logic is unit-testable offline.
+/// middle union); the alias resolver expands a top-level `TypeAliasType` on
+/// the unpack inner type before the `builtins.tuple` check. Both are
+/// `Option` so the pure logic is unit-testable offline.
 fn contract_with_unpack(
     types: Vec<Type>,
     unpack_index: usize,
     star_pos: Option<usize>,
     num_patterns: usize,
     resolver: Option<&TypeResolver>,
+    aliases: Option<&crate::aliases::TypeAliasResolver>,
 ) -> Option<Vec<Vec<u8>>> {
     let Type::UnpackType { typ: unpack_typ } = &types[unpack_index] else {
         return None;
     };
-    // Normalization in the caller guarantees Instance[builtins.tuple].
-    let unpacked = proper_wire(unpack_typ)?;
+    // Python: unpacked = get_proper_type(unpack.type). A top-level alias
+    // expands through the resolver (unresolvable -> defer); a non-alias
+    // passes through whether or not a resolver is present.
+    let unpacked = if matches!(unpack_typ.as_ref(), Type::TypeAliasType { .. }) {
+        crate::checkexpr_functions::get_proper_or_expand(unpack_typ, aliases?)?
+    } else {
+        (**unpack_typ).clone()
+    };
     let Type::Instance {
         type_ref,
         args: unpacked_args,
         ..
-    } = unpacked
+    } = &unpacked
     else {
         return None;
     };
@@ -515,16 +551,17 @@ fn contract_no_unpack(
 ///
 /// Returns `None` (defer to Python) when the list cannot be decoded, the
 /// star position is out of range, or the star item is an unresolvable
-/// `TypeAliasType` (the caller's `is_uninhabited` resolves it live). No
-/// resolver is needed: the function only re-shapes a list.
+/// `TypeAliasType` (expansion is needed to decide `is_uninhabited` before
+/// re-wrapping). Non-star aliases pass through unchanged and do not defer.
 #[pyfunction]
-#[pyo3(signature = (types_bytes, star_pos, num_types, original_unpack))]
+#[pyo3(signature = (types_bytes, star_pos, num_types, original_unpack, resolver))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rust_expand_starred_pattern_types(
     types_bytes: Vec<Vec<u8>>,
     star_pos: Option<i64>,
     num_types: i64,
     original_unpack: bool,
+    resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<Vec<u8>>> {
     let Some(pos) = star_pos else {
         // star_pos is None: types returned unchanged, no decode needed.
@@ -535,22 +572,18 @@ pub(crate) fn rust_expand_starred_pattern_types(
     }
     let pos = pos as usize;
     let types = decode_type_list(&types_bytes)?;
-    // Never extend/rewrap an alias: the caller's is_uninhabited resolves it
-    // live, and an unresolved alias has no known item to place at the star.
-    if types
-        .iter()
-        .any(|t| matches!(t, Type::TypeAliasType { .. }))
-    {
-        return None;
-    }
+    // Never rewrap an alias in the star slot: the caller's is_uninhabited
+    // resolves it live. Non-star aliases pass through unchanged, so they are
+    // not a deferral reason.
     if pos >= types.len() {
         // The star item must exist before we can expand it.
         return None;
     }
+    let aliases = resolver.alias_resolver();
     if original_unpack {
         let mut res = Vec::with_capacity(types.len());
         for (i, t) in types.into_iter().enumerate() {
-            if i != pos || matches!(t, Type::UninhabitedType { .. }) {
+            if i != pos || is_uninhabited_wire(&t, aliases)? {
                 res.push(t);
             } else {
                 res.push(Type::UnpackType {
@@ -581,6 +614,15 @@ pub(crate) fn rust_expand_starred_pattern_types(
     }
 }
 
+/// `checkpattern.is_uninhabited(typ)` on the wire: expand any top-level
+/// `TypeAliasType` operand through the alias resolver, then check for
+/// `UninhabitedType`. Returns `None` to defer when the alias cannot be
+/// resolved (missing snapshot / substitution), so the Python fallback runs.
+fn is_uninhabited_wire(t: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<bool> {
+    let t = crate::checkexpr_functions::get_proper_or_expand(t, aliases)?;
+    Some(matches!(t, Type::UninhabitedType { .. }))
+}
+
 /// `PatternChecker.construct_sequence_child(outer_type, inner_type)` — if
 /// `outer_type` is a subtype of `typing.Sequence`, produce a new instance of
 /// it whose type argument is `inner_type`; otherwise produce
@@ -607,6 +649,11 @@ pub(crate) fn rust_construct_sequence_child(
     resolver: &mut NativeTypeResolver,
 ) -> Option<Vec<u8>> {
     let outer = decode_type(outer_bytes)?;
+    // The shim serializes the original outer_type (possibly an alias) even
+    // though it gates on get_proper_type(outer_type) being an Instance, so
+    // expand a top-level alias here to mirror get_proper_type.
+    let outer =
+        crate::checkexpr_functions::get_proper_or_expand(&outer, resolver.alias_resolver())?;
     let empty_type = decode_type(empty_type_bytes)?;
     let sequence = decode_type(sequence_bytes)?;
     construct_sequence_child_inner(&outer, &empty_type, &sequence, Some(resolver.resolver()))
@@ -663,13 +710,48 @@ fn construct_sequence_child_inner(
 mod tests {
     use super::*;
 
+    fn test_resolver() -> NativeTypeResolver {
+        crate::typeinfo::NativeTypeResolver::from_resolver(crate::typeinfo::TypeResolver::new())
+    }
+
+    fn alias_resolver_with_targets(targets: &[(&str, Type)]) -> crate::aliases::TypeAliasResolver {
+        let mut r = crate::aliases::TypeAliasResolver::new();
+        for (fullname, target) in targets {
+            let mut buf = crate::wire::WriteBuffer::new();
+            crate::wire::write_type(&mut buf, target).unwrap();
+            r.insert(
+                fullname.to_string(),
+                crate::aliases::TypeAliasSnapshot {
+                    fullname: fullname.to_string(),
+                    target: buf.into_bytes(),
+                    ..Default::default()
+                },
+            );
+        }
+        r
+    }
+
+    fn type_alias(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+        }
+    }
+
+    fn resolver_with_aliases(aliases: crate::aliases::TypeAliasResolver) -> NativeTypeResolver {
+        crate::typeinfo::NativeTypeResolver::new(crate::typeinfo::TypeResolver::new(), aliases)
+    }
+
     #[test]
     fn test_is_uninhabited_uninhabited() {
         let t = Type::UninhabitedType { ambiguous: false };
         let mut buf = crate::wire::WriteBuffer::new();
         crate::wire::write_type(&mut buf, &t).unwrap();
         let bytes = buf.into_bytes();
-        assert_eq!(rust_is_uninhabited(&bytes), Some(true));
+        assert_eq!(
+            rust_is_uninhabited(&bytes, &mut test_resolver()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -678,7 +760,54 @@ mod tests {
         let mut buf = crate::wire::WriteBuffer::new();
         crate::wire::write_type(&mut buf, &t).unwrap();
         let bytes = buf.into_bytes();
-        assert_eq!(rust_is_uninhabited(&bytes), Some(false));
+        assert_eq!(
+            rust_is_uninhabited(&bytes, &mut test_resolver()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_uninhabited_alias_to_uninhabited() {
+        // A TypeAliasType resolving to UninhabitedType: Python's
+        // get_proper_type turns it into UninhabitedType, so is_uninhabited
+        // is True. The resolver must expand the alias.
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.Never",
+            Type::UninhabitedType { ambiguous: false },
+        )]);
+        let bytes = make_alias_blob("mod.Never");
+        assert_eq!(
+            rust_is_uninhabited(&bytes, &mut resolver_with_aliases(aliases)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_is_uninhabited_alias_missing_snapshot_defers() {
+        // Missing resolver snapshot: the alias cannot expand, so the seam
+        // defers (None) and Python falls back to get_proper_type.
+        let bytes = make_alias_blob("mod.Never");
+        assert_eq!(rust_is_uninhabited(&bytes, &mut test_resolver()), None);
+    }
+
+    #[test]
+    fn test_is_uninhabited_alias_resolves_to_non_uninhabited() {
+        // Alias resolving to a plain Instance: not uninhabited, Some(false).
+        let aliases = alias_resolver_with_targets(&[("mod.A", instance("builtins.int", vec![]))]);
+        let bytes = make_alias_blob("mod.A");
+        assert_eq!(
+            rust_is_uninhabited(&bytes, &mut resolver_with_aliases(aliases)),
+            Some(false)
+        );
+    }
+
+    fn make_alias_blob(type_ref: &str) -> Vec<u8> {
+        let mut b = crate::wire::WriteBuffer::new();
+        crate::wire::write_tag(&mut b, crate::wire::TYPE_ALIAS_TYPE);
+        crate::wire::write_type_list(&mut b, &[]).expect("empty args encode");
+        crate::wire::write_str(&mut b, type_ref).expect("ref encodes");
+        crate::wire::write_tag(&mut b, crate::wire::END_TAG);
+        b.into_bytes()
     }
 
     #[test]
@@ -781,7 +910,8 @@ mod tests {
             instance("builtins.str", vec![]),
         ];
         let input = blobs(&types);
-        let res = rust_expand_starred_pattern_types(input.clone(), None, 0, false);
+        let res =
+            rust_expand_starred_pattern_types(input.clone(), None, 0, false, &mut test_resolver());
         assert!(res.is_some());
         // star_pos == None returns the input bytes verbatim, no decode.
         assert_eq!(res, Some(input));
@@ -796,7 +926,14 @@ mod tests {
             instance("builtins.str", vec![]),
             instance("builtins.bool", vec![]),
         ];
-        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, true).unwrap();
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            3,
+            true,
+            &mut test_resolver(),
+        )
+        .unwrap();
         assert_eq!(res.len(), 3);
         let star = decode_one(&res[1]);
         assert_eq!(
@@ -822,7 +959,14 @@ mod tests {
             Type::UninhabitedType { ambiguous: false },
             instance("builtins.bool", vec![]),
         ];
-        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, true).unwrap();
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            3,
+            true,
+            &mut test_resolver(),
+        )
+        .unwrap();
         assert_eq!(decode_one(&res[1]), types[1]);
     }
 
@@ -833,7 +977,14 @@ mod tests {
             instance("builtins.int", vec![]),
             instance("builtins.str", vec![]),
         ];
-        let res = rust_expand_starred_pattern_types(blobs(&types), Some(1), 3, false).unwrap();
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            3,
+            false,
+            &mut test_resolver(),
+        )
+        .unwrap();
         assert_eq!(res.len(), 3);
         let expected = vec![
             instance("builtins.int", vec![]),
@@ -854,7 +1005,7 @@ mod tests {
             unpack(instance("builtins.bool", vec![])),
             instance("builtins.str", vec![]),
         ];
-        let res = contract_with_unpack(types, 1, None, 4, None).unwrap();
+        let res = contract_with_unpack(types, 1, None, 4, None, None).unwrap();
         let expected = vec![
             instance("builtins.int", vec![]),
             instance("builtins.bool", vec![]),
@@ -886,7 +1037,10 @@ mod tests {
             unpack(instance("builtins.bool", vec![])),
             instance("builtins.str", vec![]),
         ];
-        assert_eq!(contract_with_unpack(with_unpack, 1, Some(1), 4, None), None);
+        assert_eq!(
+            contract_with_unpack(with_unpack, 1, Some(1), 4, None, None),
+            None
+        );
         let no_unpack = vec![
             instance("builtins.int", vec![]),
             instance("builtins.str", vec![]),
@@ -954,5 +1108,149 @@ mod tests {
             construct_sequence_child_inner(&outer, &empty, &seq, None),
             None
         );
+    }
+
+    #[test]
+    fn test_contract_with_unpack_alias_unpack_inner() {
+        // star_pos=None broadens when the unpack inner is a TypeAliasType
+        // resolving to builtins.tuple[bool]: the alias resolver expands it
+        // (contract_with_unpack: Python unpacked = get_proper_type(u.type)).
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.Tup",
+            instance("builtins.tuple", vec![instance("builtins.bool", vec![])]),
+        )]);
+        let types = vec![
+            instance("builtins.int", vec![]),
+            Type::UnpackType {
+                typ: Box::new(type_alias("mod.Tup")),
+            },
+            instance("builtins.str", vec![]),
+        ];
+        let res = contract_with_unpack(types, 1, None, 4, None, Some(&aliases)).unwrap();
+        let expected = vec![
+            instance("builtins.int", vec![]),
+            instance("builtins.bool", vec![]),
+            instance("builtins.bool", vec![]),
+            instance("builtins.str", vec![]),
+        ];
+        let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_contract_with_unpack_alias_unpack_missing_snapshot_defers() {
+        // Missing alias snapshot: the resolver cannot expand the unpack
+        // inner, so the seam defers (None) rather than guess.
+        let types = vec![
+            instance("builtins.int", vec![]),
+            Type::UnpackType {
+                typ: Box::new(type_alias("mod.Tup")),
+            },
+            instance("builtins.str", vec![]),
+        ];
+        assert_eq!(contract_with_unpack(types, 1, None, 4, None, None), None);
+    }
+
+    #[test]
+    fn test_expand_original_unpack_star_alias_inhabited_rewraps() {
+        // original_unpack with an inhabited alias star item: Python wraps the
+        // ORIGINAL alias (not the expanded type) in UnpackType[tuple[t]]
+        // (checkpattern.py:527-533). The blanket alias rejection is gone.
+        let aliases = alias_resolver_with_targets(&[("mod.Str", instance("builtins.str", vec![]))]);
+        let types = vec![
+            instance("builtins.int", vec![]),
+            type_alias("mod.Str"),
+            instance("builtins.bool", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            3,
+            true,
+            &mut resolver_with_aliases(aliases),
+        )
+        .unwrap();
+        assert_eq!(res.len(), 3);
+        let star = decode_one(&res[1]);
+        assert_eq!(
+            star,
+            Type::UnpackType {
+                typ: Box::new(instance("builtins.tuple", vec![type_alias("mod.Str")])),
+            }
+        );
+        assert_eq!(decode_one(&res[0]), types[0]);
+        assert_eq!(decode_one(&res[2]), types[2]);
+    }
+
+    #[test]
+    fn test_expand_original_unpack_star_alias_uninhabited_keeps_alias() {
+        // original_unpack with an uninhabited alias star item: is_uninhabited
+        // resolves it, so the star item is kept untouched (not re-wrapped).
+        let aliases = alias_resolver_with_targets(&[(
+            "mod.Never",
+            Type::UninhabitedType { ambiguous: false },
+        )]);
+        let types = vec![
+            instance("builtins.int", vec![]),
+            type_alias("mod.Never"),
+            instance("builtins.bool", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            3,
+            true,
+            &mut resolver_with_aliases(aliases),
+        )
+        .unwrap();
+        assert_eq!(decode_one(&res[1]), types[1]);
+    }
+
+    #[test]
+    fn test_expand_original_unpack_star_alias_missing_snapshot_defers() {
+        // Missing snapshot for the star alias: is_uninhabited cannot be
+        // decided, so the whole call defers to Python.
+        let types = vec![
+            instance("builtins.int", vec![]),
+            type_alias("mod.Str"),
+            instance("builtins.bool", vec![]),
+        ];
+        assert_eq!(
+            rust_expand_starred_pattern_types(
+                blobs(&types),
+                Some(1),
+                3,
+                true,
+                &mut test_resolver(),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_expand_no_unpack_allows_non_star_alias() {
+        // Non-original-unpack branch: a non-star alias passes through the
+        // duplication unchanged instead of triggering the old blanket reject.
+        let types = vec![
+            type_alias("mod.A"),
+            instance("builtins.int", vec![]),
+            instance("builtins.bool", vec![]),
+        ];
+        let res = rust_expand_starred_pattern_types(
+            blobs(&types),
+            Some(1),
+            4,
+            false,
+            &mut test_resolver(),
+        )
+        .unwrap();
+        let expected = vec![
+            type_alias("mod.A"),
+            instance("builtins.int", vec![]),
+            instance("builtins.int", vec![]),
+            instance("builtins.bool", vec![]),
+        ];
+        let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
+        assert_eq!(got, expected);
     }
 }
