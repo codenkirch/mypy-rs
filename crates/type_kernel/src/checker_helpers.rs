@@ -11,8 +11,11 @@
 //!   * `restrict_subtype_away` (subtypes.py:2363) — `t minus s` for
 //!     runtime type assertions. Handles the union-literal restriction
 //!     and the non-union `consider_runtime_isinstance` / proper-subtype
-//!     branches. Defers (returns `None`) when `covers_at_runtime` needs
-//!     a path Rust cannot decide.
+//!     branches, routing `covers_at_runtime` to the dedicated module
+//!     (covers_at_runtime.rs), which defers on paths Rust cannot decide.
+//!     The three pyfunction seams also expand top-level `TypeAliasType`
+//!     operands via the alias resolver, mirroring the Python mirrors'
+//!     `get_proper_type` calls; nested alias items still defer.
 //!   * `join_type_list` (join.py:1142) — fold-join over a list of types.
 //!     Reuses the existing `setops::join_types` wire kernel. Returns
 //!     encoded bytes so the Python shim can decode to a live `Type`.
@@ -343,6 +346,9 @@ pub(crate) fn rust_custom_special_method(
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
     let typ = decode_type(type_bytes)?;
+    // Mirror typeops.py:1981 `typ = get_proper_type(typ)`: a top-level
+    // alias expands through the resolver (nested alias items defer).
+    let typ = crate::checkexpr_functions::get_proper_or_expand(&typ, resolver.alias_resolver())?;
     custom_special_method_inner(&typ, name, check_all, resolver.resolver())
 }
 
@@ -377,143 +383,15 @@ pub(crate) fn rust_has_custom_eq_checks(
     resolver: &mut NativeTypeResolver,
 ) -> Option<bool> {
     let typ = decode_type(type_bytes)?;
+    // The Python mirror routes through `custom_special_method`, whose
+    // `get_proper_type(typ)` expands a top-level alias.
+    let typ = crate::checkexpr_functions::get_proper_or_expand(&typ, resolver.alias_resolver())?;
     has_custom_eq_checks_inner(&typ, resolver.resolver())
 }
 
 // ---------------------------------------------------------------------------
 // restrict_subtype_away (subtypes.py:2363)
 // ---------------------------------------------------------------------------
-
-/// MYPYC_NATIVE_INT_NAMES (types.py:190-195).
-const MYPYC_NATIVE_INT_NAMES: &[&str] = &[
-    "mypy_extensions.i64",
-    "mypy_extensions.i32",
-    "mypy_extensions.i16",
-    "mypy_extensions.u8",
-];
-
-/// `mypy.subtypes.covers_at_runtime` (subtypes.py:2402-2435):
-/// will `isinstance(item, supertype)` always return True at runtime?
-///
-/// Defers (returns `None`) when a path Rust cannot decide is reached.
-pub(crate) fn covers_at_runtime(
-    item: &Type,
-    supertype: &Type,
-    strict_optional: bool,
-    resolver: &TypeResolver,
-) -> Option<bool> {
-    let item = get_proper_or_none(item)?;
-    let supertype_proper = get_proper_or_none(supertype)?;
-
-    // If supertype is not a type-obj FunctionLike, erase it.
-    let supertype_erased: Type;
-    let supertype_to_use: &Type = if !is_function_like_type_obj(supertype_proper, resolver) {
-        supertype_erased =
-            crate::argapprox::erase_type(supertype_proper, strict_optional, resolver)?;
-        &supertype_erased
-    } else {
-        supertype_proper
-    };
-
-    // erase_type(item) <: supertype, ignore_promotions, erase_instances.
-    let item_erased = crate::argapprox::erase_type(item, strict_optional, resolver)?;
-    let ctx =
-        crate::subtypes::SubtypeContext::new(false, false, false, true, true, strict_optional);
-    match crate::subtypes::is_subtype(&item_erased, supertype_to_use, &ctx, resolver) {
-        Some(true) => return Some(true),
-        // Defer: Rust's is_subtype could not decide; Python's
-        // is_proper_subtype would, so fall through to Python.
-        None => return None,
-        Some(false) => {}
-    }
-
-    if let Type::Instance { type_ref, .. } = supertype_to_use {
-        if let Some(snap) = resolver.get(type_ref) {
-            if snap.is_protocol {
-                // is_proper_subtype(item, supertype, ignore_promotions=True).
-                let pctx = crate::subtypes::SubtypeContext::new(
-                    false,
-                    false,
-                    false,
-                    true,
-                    true,
-                    strict_optional,
-                );
-                match crate::subtypes::is_subtype(item, supertype_to_use, &pctx, resolver) {
-                    Some(true) => return Some(true),
-                    None => return None,
-                    Some(false) => {}
-                }
-            }
-        }
-    }
-
-    // isinstance(item, TypedDictType) and supertype is builtins.dict -> True.
-    if let Type::TypedDictType { .. } = item {
-        if let Type::Instance { type_ref, .. } = supertype_to_use {
-            if type_ref == "builtins.dict" {
-                return Some(true);
-            }
-        }
-    }
-
-    // isinstance(item, TypeVarType): upper_bound <: supertype.
-    if let Type::TypeVarType { upper_bound, .. } = item {
-        let pctx =
-            crate::subtypes::SubtypeContext::new(false, false, false, true, false, strict_optional);
-        match crate::subtypes::is_subtype(upper_bound, supertype_to_use, &pctx, resolver) {
-            Some(true) => return Some(true),
-            None => return None,
-            Some(false) => {}
-        }
-    }
-
-    // isinstance(item, Instance) and supertype is builtins.int ->
-    // covers mypyc native int types.
-    if let Type::Instance {
-        type_ref: item_ref, ..
-    } = item
-    {
-        if let Type::Instance { type_ref, .. } = supertype_to_use {
-            if type_ref == "builtins.int" && MYPYC_NATIVE_INT_NAMES.contains(&item_ref.as_str()) {
-                return Some(true);
-            }
-        }
-    }
-
-    Some(false)
-}
-
-/// Whether a type is a `FunctionLike` whose `is_type_obj()` is True.
-/// The wire format lacks a unified `FunctionLike`; check both
-/// `CallableType` and `Overloaded`.
-fn is_function_like_type_obj(typ: &Type, resolver: &TypeResolver) -> bool {
-    match typ {
-        Type::CallableType {
-            fallback,
-            ret_type,
-            from_concatenate,
-            ..
-        } => is_type_obj(fallback, ret_type, *from_concatenate, resolver),
-        Type::Overloaded { items } => items
-            .first()
-            .map(|first| {
-                if let Type::CallableType {
-                    fallback,
-                    ret_type,
-                    from_concatenate,
-                    ..
-                } = first
-                {
-                    is_type_obj(fallback, ret_type, *from_concatenate, resolver)
-                } else {
-                    false
-                }
-            })
-            .unwrap_or(false),
-        _ => false,
-    }
-}
 
 /// `mypy.subtypes.restrict_subtype_away` (subtypes.py:2363-2391):
 /// return `t minus s` for runtime type assertions.
@@ -612,7 +490,15 @@ pub(crate) fn restrict_subtype_away_inner(
         }
         _ => {
             if consider_runtime_isinstance {
-                match covers_at_runtime(t, s, strict_optional, resolver) {
+                // Route through the newer covers_at_runtime module: it adds
+                // tuple-operand deferrals that fix a latent parity bug
+                // (old Rust answered Some(false) where Python answers True).
+                match crate::covers_at_runtime::covers_at_runtime_inner(
+                    t,
+                    s,
+                    strict_optional,
+                    resolver,
+                ) {
                     Some(true) => Some(Type::UninhabitedType { ambiguous: false }),
                     // covers_at_runtime returns Some(false) only when every
                     // modeled check is confident (subtypes.py covers steps
@@ -692,6 +578,11 @@ pub(crate) fn rust_restrict_subtype_away(
 ) -> Option<Vec<u8>> {
     let t = decode_type(t_bytes)?;
     let s = decode_type(s_bytes)?;
+    // Mirror subtypes.py's `_is_subtype` (subtypes.py:531), which does
+    // `get_proper_type` on both operands: top-level aliases expand via
+    // the resolver (nested alias items still defer, parity-safe).
+    let t = crate::checkexpr_functions::get_proper_or_expand(&t, resolver.alias_resolver())?;
+    let s = crate::checkexpr_functions::get_proper_or_expand(&s, resolver.alias_resolver())?;
     let result = restrict_subtype_away_inner(
         &t,
         &s,
@@ -1036,16 +927,15 @@ pub(crate) fn get_protocol_member_inner(
                 return Some(GetProtocolMemberResult::Defer);
             }
             // Plain method: analyze_instance_member_access
-            // (checkmember.py:634-776). `function_type` returns `node.type`
-            // (live signature, serialized; preserve_type_var_ids=True so no
-            // freshen runs). Same-class guard: member_method_inner's
-            // check_self_arg + bind tail mirrors checkmember.py:769-772.
+            // (checkmember.py:634-776): `function_type` returns `node.type`
+            // live signature, serialized; preserve_type_var_ids = no freshen.
             let node_type_obj = match node_ref.getattr("type") {
                 Ok(t) => t,
                 Err(_) => {
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
+            // Same-class guard: check_self_arg + bind tail (checkmember.py:769-772).
             if node_type_obj.is_none() {
                 // `function_type` falls back to building the signature
                 // from the FuncItem (Defn); defer so Python handles it.
@@ -1121,8 +1011,7 @@ pub(crate) fn get_protocol_member_inner(
             };
             // expand_without_binding with preserve_type_var_ids=True
             // (checkmember.py:1498-1503): no freshen, no Self (var has no
-            // self_type), expand_type_by_instance. Wire fast-path + no
-            // self_type + identity map == plain expand_type_by_instance.
+            // self_type). Identity map + wire path == expand_type_by_instance.
             let mapped = Type::Instance {
                 type_ref: type_ref.to_string(),
                 args: left_args.to_vec(),
@@ -1182,8 +1071,7 @@ fn live_var_plain(
 ) -> bool {
     // var type ready + not a property / classmethod / staticmethod /
     // classvar / setter (analyze_var / bind rules). `get_bool_flag`
-    // returns None when the attribute is missing; only proceed when every
-    // decision is readable (a missing flag defers).
+    // returns None when missing; proceed only when every flag is readable.
     let is_ready = match get_bool_flag(py, var, "is_ready") {
         Some(b) => b,
         None => return false,
@@ -2186,5 +2074,110 @@ mod tests {
         // whole restrict_subtype_away defers to Python.
         let result = restrict_subtype_away_inner(&t, &s, true, true, &r);
         assert_eq!(result, None);
+    }
+
+    // -- alias expansion at the pyfunction seams --
+
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn alias_type(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn make_native_with_aliases(
+        resolver: TypeResolver,
+        aliases: crate::aliases::TypeAliasResolver,
+    ) -> NativeTypeResolver {
+        NativeTypeResolver::new(resolver, aliases)
+    }
+
+    #[test]
+    fn test_seam_custom_special_method_alias_expands() {
+        let r = make_resolver_with_definer("mymod.Foo", "__eq__", 0, "mymod.Foo");
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &make_instance("mymod.Foo", vec![])),
+        );
+        let mut native = make_native_with_aliases(r, aliases);
+        let alias = alias_type("mod.Alias");
+        let bytes = encode_type(&alias).expect("alias must encode");
+        // Python mirrors call get_proper_type(typ) before the definer walk.
+        assert_eq!(
+            rust_custom_special_method(&bytes, "__eq__", false, &mut native),
+            Some(true)
+        );
+        assert_eq!(rust_has_custom_eq_checks(&bytes, &mut native), Some(true));
+    }
+
+    #[test]
+    fn test_seam_custom_special_method_alias_missing_snapshot_defers() {
+        let r = make_resolver_with_definer("mymod.Foo", "__eq__", 0, "mymod.Foo");
+        let mut native = make_native_with_aliases(r, crate::aliases::TypeAliasResolver::new());
+        let alias = alias_type("mod.Alias");
+        let bytes = encode_type(&alias).expect("alias must encode");
+        // No alias snapshot: the expansion defers, preserving the old
+        // behavior where a TypeAliasType reached the inner as-is.
+        assert_eq!(
+            rust_custom_special_method(&bytes, "__eq__", false, &mut native),
+            None
+        );
+    }
+
+    #[test]
+    fn test_seam_restrict_subtype_away_alias_expands_to_covered_t() {
+        let mut r = TypeResolver::new();
+        for (fullname, name) in [("builtins.str", "str"), ("builtins.object", "object")] {
+            let mut s = TypeInfoSnapshot {
+                fullname: fullname.to_string(),
+                name: name.to_string(),
+                ..Default::default()
+            };
+            s.mro = vec![fullname.to_string(), "builtins.object".to_string()];
+            s.has_base.insert(fullname.to_string());
+            s.has_base.insert("builtins.object".to_string());
+            r.insert(fullname.to_string(), s);
+        }
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &make_instance("builtins.str", vec![])),
+        );
+        let mut native = make_native_with_aliases(r, aliases);
+        // t = Alias -> str, s = str: covers_at_runtime(str, str) is True,
+        // so restrict_subtype_away returns UninhabitedType.
+        let t = encode_type(&alias_type("mod.Alias")).expect("t must encode");
+        let s = encode_type(&make_instance("builtins.str", vec![])).expect("s must encode");
+        let result =
+            rust_restrict_subtype_away(&t, &s, true, true, &mut native).expect("seam must decide");
+        assert_eq!(
+            decode_type(&result),
+            Some(Type::UninhabitedType { ambiguous: false })
+        );
+    }
+
+    #[test]
+    fn test_seam_restrict_subtype_away_alias_missing_snapshot_defers() {
+        let mut native = make_native_with_aliases(
+            TypeResolver::new(),
+            crate::aliases::TypeAliasResolver::new(),
+        );
+        let t = encode_type(&alias_type("mod.Alias")).expect("t must encode");
+        let s = encode_type(&make_instance("builtins.str", vec![])).expect("s must encode");
+        assert_eq!(
+            rust_restrict_subtype_away(&t, &s, true, true, &mut native),
+            None
+        );
     }
 }

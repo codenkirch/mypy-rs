@@ -70,9 +70,13 @@ fn get_proper_or_none(typ: &Type) -> Option<&Type> {
 /// Resolving variant of `get_proper_or_none`: expands a `TypeAliasType`
 /// through the alias resolver (chain-resolving, argument-substituting).
 /// Returns an owned expanded type, or `None` to defer (missing snapshot,
-/// cycle, undecodable target, unsupported substitution). Used only by
-/// seams whose Python mirror calls `get_proper_type` on the value.
-fn get_proper_or_expand(typ: &Type, aliases: &crate::aliases::TypeAliasResolver) -> Option<Type> {
+/// cycle, undecodable target, unsupported substitution). Used by seams
+/// whose Python mirror calls `get_proper_type` on the value (checkexpr
+/// callers and checker_helpers alias expansion).
+pub(crate) fn get_proper_or_expand(
+    typ: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Type> {
     match typ {
         Type::TypeAliasType { .. } => {
             let (target, _, _) = expanded_alias_target(typ, aliases)?;

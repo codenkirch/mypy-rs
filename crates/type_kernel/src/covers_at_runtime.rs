@@ -4,6 +4,9 @@
 //! then runs the proper-subtype / protocol / TypedDict / TypeVar / native-int
 //! checks. Defers (`None`) on wire-unrepresentable forms; subtype checks go
 //! through the Stage-3c kernel and erasures through the wire `erase_type`.
+//! The pyfunction seam expands top-level `TypeAliasType` operands via the
+//! alias resolver before entering the inner; the inner still defers on
+//! nested alias items (mirroring the Python `get_proper_type` calls).
 
 use pyo3::prelude::*;
 
@@ -154,6 +157,10 @@ fn is_function_like_type_obj(typ: &Type, resolver: &TypeResolver) -> bool {
 
 /// `#[pyfunction]` entry for `mypy.subtypes.covers_at_runtime`.
 /// Returns `Some(bool)` or `None` (defer to Python).
+///
+/// Top-level `TypeAliasType` operands expand through the alias resolver,
+/// mirroring `_is_subtype`'s `get_proper_type` on both sides
+/// (subtypes.py:531); nested alias items still defer in the inner.
 #[pyfunction]
 #[pyo3(signature = (item_bytes, supertype_bytes, strict_optional, resolver))]
 pub(crate) fn rust_covers_at_runtime(
@@ -164,6 +171,9 @@ pub(crate) fn rust_covers_at_runtime(
 ) -> Option<bool> {
     let item = decode_type(item_bytes)?;
     let supertype = decode_type(supertype_bytes)?;
+    let item = crate::checkexpr_functions::get_proper_or_expand(&item, resolver.alias_resolver())?;
+    let supertype =
+        crate::checkexpr_functions::get_proper_or_expand(&supertype, resolver.alias_resolver())?;
     covers_at_runtime_inner(&item, &supertype, strict_optional, resolver.resolver())
 }
 
@@ -171,6 +181,7 @@ pub(crate) fn rust_covers_at_runtime(
 mod tests {
     use super::*;
     use crate::typeinfo::TypeInfoSnapshot;
+    use crate::wire::WriteBuffer;
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
         let mut r = TypeResolver::new();
@@ -178,6 +189,65 @@ mod tests {
             r.insert(s.fullname.clone(), s);
         }
         r
+    }
+
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        crate::wire::write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
+    fn alias_type(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: type_ref.to_string(),
+        }
+    }
+
+    fn encode(t: &Type) -> Vec<u8> {
+        let mut buf = WriteBuffer::new();
+        crate::wire::write_type(&mut buf, t).expect("type must encode");
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn alias_item_and_supertype_expand_at_seam() {
+        let res = make_resolver(vec![
+            snap("builtins.str", "str"),
+            snap("builtins.object", "object"),
+        ]);
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &instance("builtins.str")),
+        );
+        let mut native = NativeTypeResolver::new(res, aliases);
+        // Both operands are the alias; the seam expands them to str so the
+        // inner proper-subtype check decides Some(true).
+        let item = alias_type("mod.Alias");
+        let supertype = alias_type("mod.Alias");
+        assert_eq!(
+            rust_covers_at_runtime(&encode(&item), &encode(&supertype), true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn alias_without_snapshot_defers_at_seam() {
+        let res = make_resolver(vec![]);
+        let mut native = NativeTypeResolver::new(res, crate::aliases::TypeAliasResolver::new());
+        let item = alias_type("mod.Alias");
+        let supertype = instance("builtins.str");
+        // The alias resolver has no snapshot for mod.Alias: the expansion
+        // defers, preserving the pre-change defer behavior.
+        assert_eq!(
+            rust_covers_at_runtime(&encode(&item), &encode(&supertype), true, &mut native),
+            None
+        );
     }
 
     fn snap(fullname: &str, name: &str) -> TypeInfoSnapshot {
