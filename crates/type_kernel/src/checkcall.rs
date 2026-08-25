@@ -368,6 +368,9 @@ pub(crate) fn rust_real_union(type_bytes: &[u8], strict_optional: bool) -> Optio
     real_union(&typ, strict_optional)
 }
 
+/// Mirror of `checkexpr.real_union` (checkexpr.py:4541-4550).
+/// TypeAliasType resolves first in Python, so the wire alias defers (None);
+/// a non-Union proper type incl. a union-bound TypeVar is Some(false).
 fn real_union(typ: &Type, strict_optional: bool) -> Option<bool> {
     let proper = get_proper_or_none(typ)?;
     match proper {
@@ -796,9 +799,9 @@ pub fn rust_solve_generic_call(
             if matches!(actual_proper, Type::TupleType { .. }) {
                 return None;
             }
-            // Python's visit_uninhabited_type on a template actual returns
-            // no constraints, so Never/NoReturn yields "Cannot infer"
-            // instead of a concrete solve. Mirror that by deferring.
+            // TypeVar templates resolve in _infer_constraints before the
+            // visitor (constraints.py:496-505), so Never yields `T :> Never`;
+            // uninhabited templates return [] and solve to Any. Defer.
             if matches!(actual_proper, Type::UninhabitedType { .. }) {
                 return None;
             }

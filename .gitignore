@@ -64,3 +64,4 @@ test_capi
 # Rust build output
 /target/
 /mypyc/lib-rt/librt/
+type_kernel.cpython-313-darwin.so

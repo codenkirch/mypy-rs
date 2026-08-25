@@ -23004,3 +23004,138 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
 
     def test_no_unpack_plain_tuple(self) -> None:
         self._assert_tuple_parity([self.fx.a, self.fx.b], seen_unpack=False, engage=True)
+
+class NativeCheckcallSetopsDeferSuite(Suite):
+    """Parity for the checkcall.rs defer sites audited in issue #844.
+
+    The audit identified `real_union` (checkexpr.py:4541) as a seam that
+    can decide more than it defers: a non-Union proper type, including a
+    TypeVar whose upper bound is a union, is `Some(false)` in the kernel
+    (Python's `isinstance(typ, UnionType)` is False on the TypeVar
+    itself). This suite locks in the parity of that native decision.
+
+    Gate-on vs gate-off must agree on the result, and direct seam calls
+    prove the Rust side engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkcall_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self._type_infos = type_infos
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._set_active = _set_native_checkexpr_active
+        self._set_checkcall_active = _set_native_checkcall_active
+        self._set_active(True)
+        self._set_checkcall_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkcall_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_checkcall_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    # --- expression checker wall for the real_union method ---
+
+    def _make_checker(self) -> ExpressionChecker:
+        """Minimal ExpressionChecker with only the fields real_union touches.
+
+        The method only reads `_CHECKEXPR_HAS_TYPE_KERNEL`,
+        `_native_checkexpr_active`, `state.strict_optional` and serializes
+        `typ`; everything else is inert for this call, so a wall with
+        `None` providers is safe (matching the existing `method_fullname`
+        suite which passes `None` for the checker).
+        """
+        from mypy.checker import TypeChecker
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+        from mypy.nodes import MypyFile, SymbolTable
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        chk = TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+        msg = MessageBuilder(errors, modules)
+        return ExpressionChecker(chk, msg, Plugin(options), {})
+
+    # --- real_union ---
+
+    def _assert_real_union_par(self, typ: Type) -> None:
+        expr = self._make_checker()
+        for strict in (True, False):
+            old = mypy.state.state.strict_optional
+            mypy.state.state.strict_optional = strict
+            try:
+                off = self._with_gate(False, lambda: expr.real_union(typ))
+                on = self._with_gate(True, lambda: expr.real_union(typ))
+            finally:
+                mypy.state.state.strict_optional = old
+            msg = f"real_union parity strict={strict} {typ}"
+            assert_equal(on, off, msg)
+
+    def _assert_real_union_engages(self, typ: Type) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        result = _type_kernel.rust_real_union(_serialize_type_for_checkexpr(typ), True)
+        assert result is not None, f"Rust real_union did not engage for {typ}"
+
+    def test_real_union_strips_none_non_strict(self) -> None:
+        # relevant_items() drops NoneType when strict_optional is False.
+        typ = UnionType([self.fx.a, self.fx.nonet])
+        self._assert_real_union_par(typ)
+        self._assert_real_union_engages(typ)
+
+    def test_real_union_keeps_none_strict(self) -> None:
+        # With strict_optional True, len(relevant_items()) is 2 -> real.
+        typ = UnionType([self.fx.a, self.fx.nonet])
+        self._assert_real_union_par(typ)
+        self._assert_real_union_engages(typ)
+
+    def test_real_union_typevar_not_union(self) -> None:
+        # A TypeVar is not an isinstance-UnionType in Python, so real_union
+        # is False even though its upper bound is a union.
+        tvar = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            UnionType([self.fx.a, self.fx.b]),
+            AnyType(TypeOfAny.special_form),
+        )
+        expr = self._make_checker()
+        for strict in (True, False):
+            old = mypy.state.state.strict_optional
+            mypy.state.state.strict_optional = strict
+            try:
+                off = self._with_gate(False, lambda: expr.real_union(tvar))
+                on = self._with_gate(True, lambda: expr.real_union(tvar))
+            finally:
+                mypy.state.state.strict_optional = old
+            assert_equal(on, off, f"real_union typevar parity strict={strict}")
+            assert off is False
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        result = _type_kernel.rust_real_union(_serialize_type_for_checkexpr(tvar), True)
+        assert result is not None and result is False
