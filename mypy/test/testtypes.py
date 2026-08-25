@@ -17164,6 +17164,160 @@ class NativeMemberAccessDispatchSuite(Suite):
         assert result is None
 
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckmemberDeferralSuite(Suite):
+    """Reduction of `analyze_member_access_inner` fallback-recursion defers (#872).
+
+    The general member-access seam previously deferred every TupleType /
+    LiteralType / CallableType / TypeVar fallback that resolved to an
+    Instance (`memacc:tuple_instance_fb` and friends, the largest
+    wire-portable defer class in checkmember.rs). It now routes rvalue,
+    non-super Instance fallbacks through the native method branch, so
+    e.g. `(a, b).method(...)` type-checks without falling back to Python.
+
+    Each test calls the seam directly: a TupleType-with-method-fallback
+    must answer natively (non-None, bound method); lvalue/super operands,
+    and fallbacks without a dispatch context, must still defer (None).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+        from librt.internal import WriteBuffer as _WB
+
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._tk = _tk
+        self._WB = _WB
+        self.fx = TypeFixture()
+        type_infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.ci,
+            self.fx.str_type_info,
+            self.fx.functioni,
+        ]
+        self.resolver = _tk.build_native_resolver(type_infos, [])
+        self.resolver.set_live_typeinfo_map({info.fullname: info for info in type_infos})
+        _set_native_checkmember_resolver(self.resolver)
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        _set_native_checkmember_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+
+        self.resolver.set_live_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+        _set_native_checkmember_resolver(None)
+        _set_native_checkmember_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = self._WB()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _add_method(
+        self, info: TypeInfo, name: str, sig: CallableType, is_trivial_self: bool = False
+    ) -> None:
+        from mypy.nodes import MDEF, FuncDef, SymbolTableNode
+
+        fn = FuncDef(name, [], None, None)
+        fn.type = sig
+        fn.info = info
+        fn.is_trivial_self = is_trivial_self
+        info.names[name] = SymbolTableNode(MDEF, fn)
+
+    def _general(
+        self,
+        typ: Type,
+        name: str,
+        *,
+        is_lvalue: bool = False,
+        is_super: bool = False,
+        start: int = 100,
+    ) -> tuple[int, bool, Type | None]:
+        from mypy.checkmember import _deserialize_type_for_checkmember
+
+        result = self._tk.rust_analyze_member_access(
+            self.resolver,
+            name,
+            self._bytes_of(typ),
+            self._bytes_of(typ),
+            is_lvalue,
+            is_super,
+            False,
+            start,
+            False,
+        )
+        if result is None:
+            return (start, False, None)
+        next_raw_id, changed, wire_bytes = result
+        decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
+        return (next_raw_id, changed, decoded)
+
+    def test_tuple_fallback_routes_and_binds(self) -> None:
+        # class A gains a trivial-self method m(self, x: int) -> A; a
+        # TupleType with fallback A must recurse into the native method
+        # branch and return the bound signature (self stripped).
+        from mypy.nodes import ARG_POS
+        from mypy.types import TupleType
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            CallableType(
+                [self.fx.o, self.fx.a],
+                [ARG_POS, ARG_POS],
+                ["self", "x"],
+                self.fx.a,
+                self.fx.function,
+            ),
+            is_trivial_self=True,
+        )
+        tup = TupleType([self.fx.a], self.fx.a)
+        _next_raw_id, changed, decoded = self._general(tup, "m")
+        assert changed is False
+        assert isinstance(decoded, CallableType)
+        assert decoded.is_bound is True
+        assert decoded.arg_types == [self.fx.a]
+        assert decoded.ret_type == self.fx.a
+
+    def test_tuple_fallback_lvalue_defers(self) -> None:
+        # An lvalue access must defer (Python owns lvalue semantics).
+        from mypy.nodes import ARG_POS
+        from mypy.types import TupleType
+
+        self._add_method(
+            self.fx.ai,
+            "m",
+            CallableType(
+                [self.fx.o], [ARG_POS], ["self"], self.fx.a, self.fx.function
+            ),
+            is_trivial_self=True,
+        )
+        tup = TupleType([self.fx.a], self.fx.a)
+        assert self._general(tup, "m", is_lvalue=True)[2] is None
+        assert self._general(tup, "m", is_super=True)[2] is None
+
+    def test_tuple_fallback_no_method_defers(self) -> None:
+        # A fallback Instance with no matching method defers (Python
+        # reports the missing-attribute diagnostic); the recursion still
+        # routes without guessing.
+        from mypy.types import TupleType
+
+        tup = TupleType([self.fx.a], self.fx.a)
+        assert self._general(tup, "missing_name")[2] is None
+
+
 # ---------------------------------------------------------------------------
 # NativeCheckexprSuite — M8c: visit_yield_expr / visit_conditional_expr /
 # visit_star_expr ports to Rust (checkexpr_functions.rs)

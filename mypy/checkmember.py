@@ -332,6 +332,46 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
     return decoded
 
 
+def _restore_native_method_definition(
+    name: str, typ: Type, decoded: Type
+) -> Type:
+    """Best-effort relink of ``definition`` for a native-decoded method type.
+
+    The general member-access seam resolves a fallback to an Instance and
+    dispatches the method branch natively, so the decoded result is a
+    method signature whose ``definition`` the wire format dropped. That link
+    drives error formatting (e.g. ``pretty_callable`` re-inserting the bound
+    ``self`` arg in overload-variant notes), so mirror the instance/union
+    seams by restoring it from the method node on the resolved class.
+    Returns ``decoded`` unchanged when no method node is resolvable.
+    """
+    from mypy.types import CallableType, Instance, TupleType
+
+    info = None
+    if isinstance(typ, Instance):
+        info = typ.type
+    elif isinstance(typ, TupleType):
+        from mypy.typeops import tuple_fallback
+
+        fallback = tuple_fallback(typ)
+        if isinstance(fallback, Instance):
+            info = fallback.type
+    elif isinstance(typ, (LiteralType, CallableType)):
+        fallback = typ.fallback
+        if isinstance(fallback, Instance):
+            info = fallback.type
+    if info is None:
+        return decoded
+    method = info.get_method(name) if name else None
+    if (
+        method is not None
+        and not isinstance(method, Decorator)
+        and getattr(method, "type", None) is not None
+    ):
+        return _restore_definition(method.type, decoded)
+    return decoded
+
+
 class MemberContext:
     """Information and objects needed to type check attribute access.
 
@@ -518,11 +558,26 @@ def _analyze_member_access(
         try:
             result = _rust_analyze_member_access(
                 _native_checkmember_resolver,
+                name,
                 _serialize_type_for_checkmember(typ),
+                _serialize_type_for_checkmember(mx.self_type),
+                mx.is_lvalue,
+                mx.is_super,
+                mx.preserve_type_var_ids,
+                TypeVarId.next_raw_id,
+                state.state.strict_optional,
             )
             if result is not None:
-                decoded = _deserialize_type_for_checkmember(bytes(result))
+                next_raw_id, changed, wire_bytes = result
+                if changed:
+                    TypeVarId.next_raw_id = next_raw_id
+                decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                 if decoded is not None:
+                    # The wire round-trip drops .definition (drives error
+                    # formatting, e.g. re-inserting the bound self arg in
+                    # overload-variant notes). Restore it for method results.
+                    if isinstance(decoded, (CallableType, Overloaded)):
+                        decoded = _restore_native_method_definition(name, typ, decoded)
                     if isinstance(decoded, ProperType):
                         decoded.line = typ.line
                         decoded.column = typ.column
