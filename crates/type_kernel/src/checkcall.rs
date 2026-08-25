@@ -811,6 +811,7 @@ pub fn rust_solve_generic_call(
                 actual_proper,
                 crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
                 resolver.resolver(),
+                resolver.alias_resolver(),
             )?;
             all_constraints.extend(constraints);
         }
