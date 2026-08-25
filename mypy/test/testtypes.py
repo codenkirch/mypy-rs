@@ -3638,6 +3638,199 @@ class NativeSubtypeTupleSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSubtypesDeferralSuite(Suite):
+    """Parity suite for the subtype-seam alias deferral reduction (#868).
+
+    `rust_is_equivalent`, `rust_is_same_type` and `rust_is_more_precise`
+    previously received `TypeAliasType` operands raw, hit the recursive
+    alias guard inside `is_subtype`, and deferred the whole call to the
+    pure-Python body. The seams now expand alias operands through the
+    alias resolver (mirroring `get_proper_type` in the Python fallbacks),
+    so alias-shaped operands answer natively.
+
+    Each test asserts a gate-on/off differential (identical result either
+    way) AND a direct seam call proving the Rust side actually decides
+    (non-None) for the alias path, so a regression back to deferral is
+    caught. Missing-snapshot operands must still defer (None), preserving
+    the pure-Python fallback.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        self.fx = TypeFixture(INVARIANT)
+        self.resolver = self._build_resolver([])
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_subtype_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+
+    def _type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _build_resolver(self, aliases: list[Any]) -> Any:
+        return _type_kernel.build_native_resolver(self._type_infos(), aliases)
+
+    def _rebuild_with_aliases(self, aliases: list[Any]) -> None:
+        from mypy.subtypes import _set_native_subtype_resolver
+
+        self.resolver = self._build_resolver(aliases)
+        _set_native_subtype_resolver(self.resolver)
+
+    def _set_gate(self, active: bool) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        _set_native_subtype_active(active)
+
+    def test_equivalent_alias_equals_target(self) -> None:
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import _serialize_type, is_equivalent
+
+        # mod.A = A (fx.a); is_equivalent(A, A) is True natively once the
+        # alias expands (previously the alias guard deferred to Python).
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        # Gate-on and gate-off give the identical result (Python's
+        # fallback expands via get_proper_type in _is_subtype).
+        self._set_gate(True)
+        assert is_equivalent(t, self.fx.a)
+        self._set_gate(False)
+        assert is_equivalent(t, self.fx.a)
+        # The direct seam call proves the alias path is native now
+        # (non-None), not deferring back to Python.
+        self._set_gate(True)
+        rusted = _type_kernel.rust_is_equivalent(
+            _serialize_type(t),
+            _serialize_type(self.fx.a),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is True
+
+    def test_equivalent_alias_missing_snapshot_defers(self) -> None:
+        # Alias not registered in the resolver: the seam defers (None) and
+        # the pure-Python fallback answers, so gate-on == gate-off.
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import _serialize_type, is_equivalent
+
+        alias = TypeAlias(self.fx.a, "mod.Missing", "mod", -1, -1)
+        t = TypeAliasType(alias, [])
+        self._set_gate(False)
+        expected = is_equivalent(t, self.fx.a)
+        self._set_gate(True)
+        assert is_equivalent(t, self.fx.a) is expected
+        rusted = _type_kernel.rust_is_equivalent(
+            _serialize_type(t),
+            _serialize_type(self.fx.a),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is None
+
+    def test_same_type_alias_expands(self) -> None:
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import _serialize_type, is_same_type
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        self._set_gate(True)
+        assert is_same_type(t, self.fx.a)
+        self._set_gate(False)
+        assert is_same_type(t, self.fx.a)
+        self._set_gate(True)
+        rusted = _type_kernel.rust_is_same_type(
+            _serialize_type(t),
+            _serialize_type(self.fx.a),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is True
+
+    def test_more_precise_alias_expands(self) -> None:
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import _serialize_type, is_more_precise
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        self._set_gate(True)
+        assert is_more_precise(t, self.fx.a)
+        self._set_gate(False)
+        assert is_more_precise(t, self.fx.a)
+        # Rust decides natively (left alias expands, proper-subtype answered).
+        self._set_gate(True)
+        rusted = _type_kernel.rust_is_more_precise(
+            _serialize_type(t),
+            _serialize_type(self.fx.a),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is True
+
+    def test_more_precise_alias_to_any(self) -> None:
+        # A = Any; is_more_precise(x, A) is True via the Any fast path once
+        # the right alias expands on the Rust side.
+        from mypy.nodes import TypeAlias
+        from mypy.subtypes import _serialize_type, is_more_precise
+
+        alias = TypeAlias(AnyType(TypeOfAny.special_form), "mod.AnyA", "mod", -1, -1)
+        self._rebuild_with_aliases([alias])
+        t = TypeAliasType(alias, [])
+        self._set_gate(True)
+        assert is_more_precise(self.fx.a, t)
+        self._set_gate(False)
+        assert is_more_precise(self.fx.a, t)
+        self._set_gate(True)
+        rusted = _type_kernel.rust_is_more_precise(
+            _serialize_type(self.fx.a),
+            _serialize_type(t),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is True
+
+    def test_plain_equal_equivalent_engages(self) -> None:
+        # A regression guard: plain (alias-free) operand pairs must still be
+        # decided natively, not newly deferred by the seam expansion.
+        from mypy.subtypes import _serialize_type, is_equivalent
+
+        self._set_gate(True)
+        assert is_equivalent(self.fx.a, self.fx.a)
+        rusted = _type_kernel.rust_is_equivalent(
+            _serialize_type(self.fx.a),
+            _serialize_type(self.fx.a),
+            False,
+            True,
+            self.resolver,
+        )
+        assert rusted is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeVariadicTupleRightSuite(Suite):
     """Parity suite for the Rust TypeVarTupleType-right subtype port.
 

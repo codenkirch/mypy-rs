@@ -2563,6 +2563,13 @@ pub(crate) fn is_more_precise(
 }
 
 /// `#[pyfunction]` entry for `is_more_precise`.
+///
+/// The Python shim passes `right` already expanded
+/// (`right = get_proper_type(right)`, subtypes.py:2899) but passes `left`
+/// raw. A top-level `left` alias would otherwise hit the recursive
+/// `is_subtype` alias guard and defer the whole call; expand aliases here
+/// (mirroring `get_proper_type` in the `is_proper_subtype` fallback), so
+/// the alias-shaped operand answers natively.
 #[pyfunction]
 pub(crate) fn rust_is_more_precise(
     left_bytes: &[u8],
@@ -2573,6 +2580,8 @@ pub(crate) fn rust_is_more_precise(
 ) -> Option<bool> {
     let left = decode_type(left_bytes)?;
     let right = decode_type(right_bytes)?;
+    let left = expand_aliases(&left, resolver.alias_resolver(), strict_optional)?;
+    let right = expand_aliases(&right, resolver.alias_resolver(), strict_optional)?;
     is_more_precise(
         &left,
         &right,
@@ -2609,6 +2618,12 @@ pub(crate) fn is_equivalent(
 }
 
 /// `#[pyfunction]` entry for `is_equivalent`.
+///
+/// `rust_is_subtype` expands both operands through the alias resolver
+/// (mirroring `_is_subtype`'s `get_proper_type`); this seam feeds
+/// `is_subtype` directly, so a `TypeAliasType` operand was reaching the
+/// recursive alias guard and deferring. Expand both operands here for
+/// parity with the `is_subtype(a, b)` fallback.
 #[pyfunction]
 pub(crate) fn rust_is_equivalent(
     a_bytes: &[u8],
@@ -2619,6 +2634,8 @@ pub(crate) fn rust_is_equivalent(
 ) -> Option<bool> {
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
+    let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
+    let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
     is_equivalent(
         &a,
         &b,
@@ -2723,8 +2740,10 @@ pub(crate) fn rust_all_same_types(
         return Some(true);
     }
     let first = decode_type(items_bytes[0])?;
+    let first = expand_aliases(&first, resolver.alias_resolver(), strict_optional)?;
     for b_bytes in items_bytes.iter().skip(1) {
         let b = decode_type(b_bytes)?;
+        let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
         match is_same_type(
             &first,
             &b,
@@ -2741,6 +2760,11 @@ pub(crate) fn rust_all_same_types(
 }
 
 /// `#[pyfunction]` entry for `is_same_type`.
+///
+/// Expand alias operands through the resolver (mirroring the
+/// `is_proper_subtype` fallback, which runs `get_proper_type` via
+/// `_is_subtype`). Without this, a `TypeAliasType` operand hit the
+/// recursive alias guard in `is_subtype` and deferred the whole call.
 #[pyfunction]
 pub(crate) fn rust_is_same_type(
     a_bytes: &[u8],
@@ -2751,6 +2775,8 @@ pub(crate) fn rust_is_same_type(
 ) -> Option<bool> {
     let a = decode_type(a_bytes)?;
     let b = decode_type(b_bytes)?;
+    let a = expand_aliases(&a, resolver.alias_resolver(), strict_optional)?;
+    let b = expand_aliases(&b, resolver.alias_resolver(), strict_optional)?;
     is_same_type(
         &a,
         &b,
@@ -4851,5 +4877,138 @@ mod tests {
         let input = alias_type(vec![], "mod.A0");
         let result = expand_aliases(&input, &ar, true);
         assert_eq!(result, None);
+    }
+
+    // -- equivalence / same-type / more-precise seam alias expansion --
+
+    /// Build a `NativeTypeResolver` carrying a `builtins.str` profile plus
+    /// the given alias snapshot table, matching how the pyfunction seams
+    /// receive their resolver.
+    fn make_native_with_alias(alias_snaps: Vec<TypeAliasSnapshot>) -> NativeTypeResolver {
+        let type_snaps = vec![
+            snap("builtins.str", "str"),
+            snap("builtins.object", "object"),
+        ];
+        NativeTypeResolver::new(make_resolver(type_snaps), make_alias_resolver(alias_snaps))
+    }
+
+    fn seam_alias_snap() -> TypeAliasSnapshot {
+        // mod.A = builtins.str
+        TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&instance("builtins.str", vec![])),
+            no_args: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_equivalent_alias_expands() {
+        // is_equivalent(A, str) with A = str answers natively: both
+        // operands expand through the alias resolver before is_subtype.
+        let mut native = make_native_with_alias(vec![seam_alias_snap()]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(
+            rust_is_equivalent(&a, &s, false, true, &mut native),
+            Some(true)
+        );
+        assert_eq!(
+            rust_is_equivalent(&s, &a, false, true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_equivalent_alias_missing_snapshot_defers() {
+        // No alias snapshot: the expansion defers (None), preserving the
+        // fall-through to the pure-Python body.
+        let mut native = make_native_with_alias(vec![]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(rust_is_equivalent(&a, &s, false, true, &mut native), None);
+    }
+
+    #[test]
+    fn test_same_type_alias_expands() {
+        let mut native = make_native_with_alias(vec![seam_alias_snap()]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(
+            rust_is_same_type(&a, &s, false, true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_same_type_alias_missing_snapshot_defers() {
+        let mut native = make_native_with_alias(vec![]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(rust_is_same_type(&a, &s, false, true, &mut native), None);
+    }
+
+    #[test]
+    fn test_more_precise_alias_expands() {
+        // is_more_precise(A, str) resolves A -> str, then is_proper_subtype
+        // (str, str) answers Some(true) natively.
+        let mut native = make_native_with_alias(vec![seam_alias_snap()]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(
+            rust_is_more_precise(&a, &s, false, true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_more_precise_alias_to_any() {
+        // A = Any; is_more_precise(Any, A): right expands to Any -> True
+        // even for a non-Instance left (previously defer via alias guard).
+        let any_snap = TypeAliasSnapshot {
+            fullname: "mod.A".to_string(),
+            target: encode_for_alias(&any_type()),
+            no_args: true,
+            ..Default::default()
+        };
+        let mut native = make_native_with_alias(vec![any_snap]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let l = encode_for_alias(&any_type());
+        assert_eq!(
+            rust_is_more_precise(&l, &a, false, true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_more_precise_alias_missing_snapshot_defers() {
+        let mut native = make_native_with_alias(vec![]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(rust_is_more_precise(&a, &s, false, true, &mut native), None);
+    }
+
+    #[test]
+    fn test_all_same_types_alias_expands() {
+        // all_same_types([A, str]) is True after the alias expands, instead
+        // of deferring on the alias operand.
+        let mut native = make_native_with_alias(vec![seam_alias_snap()]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(
+            rust_all_same_types(vec![&a, &s], false, true, &mut native),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_all_same_types_alias_missing_snapshot_defers() {
+        let mut native = make_native_with_alias(vec![]);
+        let a = encode_for_alias(&alias_type(vec![], "mod.A"));
+        let s = encode_for_alias(&instance("builtins.str", vec![]));
+        assert_eq!(
+            rust_all_same_types(vec![&a, &s], false, true, &mut native),
+            None
+        );
     }
 }
