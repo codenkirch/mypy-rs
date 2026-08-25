@@ -125,6 +125,7 @@ from mypy.typeops import (
     make_simplified_union,
     true_only,
     try_contracting_literals_in_union,
+    try_getting_instance_fallback,
 )
 from mypy.types import (
     AnyType,
@@ -4785,6 +4786,153 @@ class NativeCoerceLiteralSingletonSuite(Suite):
             _serialize_type(self.enum_inst), self._resolver
         )
         assert eq_r is True, "Rust singleton equality did not engage"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeopsDeferralSuite(Suite):
+    """Parity for TypeAliasType-operand deferral reduction in typeops.rs.
+
+    `coerce_to_literal` (typeops.py:1854-1889) and
+    `try_getting_instance_fallback` (typeops.py:2059-2084) both run
+    `get_proper_type` at the top of the Python body. The Rust seams used to
+    refuse a `TypeAliasType` operand entirely (no wire alias target), so
+    every alias call fell back to Python. Both seams now expand the alias
+    through the resolver's alias table (issue #870). This suite proves the
+    expansion keeps gate-on/off parity for a resolvable alias and that a
+    missing resolver snapshot still defers (Python computes, both gates
+    agree).
+    """
+
+    def setUp(self) -> None:
+        from mypy.nodes import TypeAlias
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        # A single-member enum: `coerce_to_literal` turns it into a Literal
+        # after the alias expands to it.
+        self.enum_info = self.fx.make_type_info("mod.Color")
+        self.enum_info.is_enum = True
+        v = Var("RED")
+        v.has_explicit_value = True
+        v.type = self.fx.o
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, v)
+        type_infos.append(self.enum_info)
+        self.enum_inst = Instance(self.enum_info, [])
+        self.str_inst = Instance(self.fx.str_type_info, [])
+
+        # Two resolvable aliases: one to the enum, one to a plain str.
+        self.rgb_alias = TypeAlias(
+            self.enum_inst, "mod.RGB", "mod", -1, -1
+        )
+        self.str_alias = TypeAlias(
+            self.str_inst, "mod.S", "mod", -1, -1
+        )
+        self.aliases = [self.rgb_alias, self.str_alias]
+
+        self._resolver = _type_kernel.build_native_resolver(type_infos, self.aliases)
+        self._resolver.set_live_typeinfo_map(
+            {info.fullname: info for info in type_infos}
+        )
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self._live_map = {info.fullname: info for info in type_infos}
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def test_coerce_alias_to_enum_parity(self) -> None:
+        # A TypeAliasType operand now expands through the resolver to the
+        # enum Instance, which coerces to Literal[Color.RED]. Both gates
+        # must agree and the Rust seam must engage (no longer defer).
+        from mypy.types import TypeAliasType
+
+        alias = TypeAliasType(self.rgb_alias, [])
+        off = self._with_gate(False, lambda: coerce_to_literal(alias))
+        on = self._with_gate(True, lambda: coerce_to_literal(alias))
+        assert_equal(str(on), str(off), f"coerce alias parity {alias}")
+        assert_equal(str(on), "Literal[mod.Color.RED]")
+
+    def test_coerce_alias_direct_seam_engages(self) -> None:
+        from mypy.typeops import _deserialize_type, _serialize_type
+        from mypy.types import TypeAliasType
+
+        # Direct seam call must return a decoded non-None result (the
+        # alias expands to the enum and coerces), not defer.
+        alias = TypeAliasType(self.rgb_alias, [])
+        r = _type_kernel.rust_coerce_to_literal(
+            _serialize_type(alias), self._resolver
+        )
+        assert r is not None, "rust_coerce_to_literal deferred on an alias"
+        decoded = _deserialize_type(bytes(r))
+        assert_equal(str(decoded), "Literal[mod.Color.RED]")
+
+    def test_instance_fallback_alias_to_str_parity(self) -> None:
+        from mypy.typeops import _serialize_type
+        from mypy.types import TypeAliasType
+
+        alias = TypeAliasType(self.str_alias, [])
+        off = self._with_gate(False, lambda: try_getting_instance_fallback(alias))
+        on = self._with_gate(True, lambda: try_getting_instance_fallback(alias))
+        assert off is not None
+        assert_equal(str(on), str(off), f"instance fallback alias parity {alias}")
+        assert on == self.str_inst
+        # Native engagement proof: the seam expands the alias and returns
+        # the fallback bytes (non-None) rather than deferring.
+        r = _type_kernel.rust_try_getting_instance_fallback(
+            _serialize_type(alias), self._resolver
+        )
+        assert r is not None, "rust_try_getting_instance_fallback deferred on an alias"
+
+    def test_instance_fallback_alias_direct_seam_engages(self) -> None:
+        from mypy.typeops import _serialize_type
+        from mypy.types import TypeAliasType
+
+        # A TypeAliasType operand expands to its Instance target and the
+        # seam returns the fallback (non-None) instead of deferring.
+        alias = TypeAliasType(self.rgb_alias, [])
+        r = _type_kernel.rust_try_getting_instance_fallback(
+            _serialize_type(alias), self._resolver
+        )
+        assert r is not None, "rust_try_getting_instance_fallback deferred on an alias"
+        # Round-tripped value equality is asserted through the public parity
+        # test; here engagement (non-None) is the point.
+
+    def test_missing_snapshot_defers_to_python(self) -> None:
+        # An alias NOT registered in the resolver cannot be expanded, so the
+        # Rust seam must defer and Python computes. Parity must still hold.
+        from mypy.nodes import TypeAlias
+        from mypy.types import TypeAliasType
+
+        ghost_alias = TypeAlias(self.str_inst, "mod.Ghost", "mod", -1, -1)
+        alias = TypeAliasType(ghost_alias, [])
+        off = self._with_gate(False, lambda: try_getting_instance_fallback(alias))
+        on = self._with_gate(True, lambda: try_getting_instance_fallback(alias))
+        assert off is not None
+        assert_equal(str(on), str(off), f"missing-snapshot fallback parity {alias}")
+        assert_equal(on, self.str_inst)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

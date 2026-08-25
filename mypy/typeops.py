@@ -2058,18 +2058,22 @@ def separate_union_literals(t: UnionType) -> tuple[Sequence[LiteralType], Sequen
 
 def try_getting_instance_fallback(typ: Type) -> Instance | None:
     """Returns the Instance fallback for this type if one exists or None."""
-    if _HAS_TYPE_KERNEL and _native_typeops_active:
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_typeops_active
+        and _native_typeops_resolver is not None
+    ):
         try:
             result = _type_kernel.rust_try_getting_instance_fallback(
-                _serialize_type(typ)
+                _serialize_type(typ), _native_typeops_resolver
             )
             if result is not None:
-                # deferred (TypeAliasType, unresolved type_ref, or no
-                # fallback): fall back to the Python walk below.
+                # deferred (missing alias snapshot, unresolved type_ref, or
+                # no fallback): fall back to the Python walk below.
                 decoded = _deserialize_type(bytes(result))
                 if isinstance(get_proper_type(decoded), Instance):
                     return decoded  # type: ignore[return-value]
-        except (AssertionError, NotImplementedError):
+        except (AssertionError, NotImplementedError, ValueError):
             pass
     typ = get_proper_type(typ)
     if isinstance(typ, Instance):

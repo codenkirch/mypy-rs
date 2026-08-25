@@ -724,9 +724,13 @@ pub(crate) fn rust_try_getting_bool_literals_from_type(
 /// (typeops.py:1525-1539). Returns the Instance fallback for the type when
 /// one exists, encoded as wire bytes, or `None` to defer to Python.
 #[pyfunction]
-pub(crate) fn rust_try_getting_instance_fallback(t_bytes: &[u8]) -> Option<Vec<u8>> {
+#[pyo3(signature = (t_bytes, resolver))]
+pub(crate) fn rust_try_getting_instance_fallback(
+    t_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
     let t = decode_type(t_bytes)?;
-    let fallback = try_getting_instance_fallback(&t)?;
+    let fallback = try_getting_instance_fallback(&t, resolver.alias_resolver())?;
     encode_type(&fallback)
 }
 
@@ -901,16 +905,30 @@ pub(crate) fn try_expanding_sum_type_to_union_inner(
 /// else: return None
 /// ```
 /// `Overloaded.fallback` is `items[0].fallback` (types.py:2758), so the
-/// Overloaded arm recurses through the first item. A TypeAliasType can't be
-/// resolved here (no target in the wire form), so it returns `None` and the
-/// caller defers to Python.
-fn try_getting_instance_fallback(t: &Type) -> Option<Type> {
-    match t {
-        Type::Instance { .. } => Some(t.clone()),
+/// Overloaded arm recurses through the first item. A `TypeAliasType`
+/// operand is expanded via the alias resolver (`get_proper_type` at the
+/// top of the Python body); a missing snapshot defers.
+fn try_getting_instance_fallback(
+    t: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Type> {
+    // Python: `t = get_proper_type(t)`. Expand a top-level alias through
+    // the resolver (nested aliases inside the target have no proper form
+    // here and defer — parity-safe, Python would recurse).
+    let proper: Type = match t {
+        Type::TypeAliasType { .. } => crate::checkexpr_functions::get_proper_or_expand(t, aliases)?,
+        _ => t.clone(),
+    };
+    match &proper {
+        Type::Instance { .. } => Some(proper.clone()),
         Type::LiteralType { fallback, .. } => Some((**fallback).clone()),
         Type::CallableType { fallback, .. } => Some((**fallback).clone()),
-        Type::Overloaded { items } => items.first().and_then(try_getting_instance_fallback),
-        Type::TypeVarType { upper_bound, .. } => try_getting_instance_fallback(upper_bound),
+        Type::Overloaded { items } => items
+            .first()
+            .and_then(|first| try_getting_instance_fallback(first, aliases)),
+        Type::TypeVarType { upper_bound, .. } => {
+            try_getting_instance_fallback(upper_bound, aliases)
+        }
         Type::TupleType {
             partial_fallback, ..
         } => Some((**partial_fallback).clone()),
@@ -1552,8 +1570,14 @@ fn coerce_to_literal_inner(
     resolver: &NativeTypeResolver,
 ) -> Option<Type> {
     match typ {
-        // get_proper_type for TypeAliasType is not expressible on the wire.
-        Type::TypeAliasType { .. } => None,
+        // Mirrors `typ = get_proper_type(typ)` at the top of the Python
+        // body (typeops.py): expand the alias through the resolver and
+        // continue. Defers (`None`) when the alias has no resolver snapshot.
+        Type::TypeAliasType { .. } => {
+            let proper =
+                crate::checkexpr_functions::get_proper_or_expand(typ, resolver.alias_resolver())?;
+            coerce_to_literal_inner(py, &proper, resolver)
+        }
         Type::UnionType { items, .. } => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
@@ -2735,6 +2759,25 @@ mod tests {
         }
     }
 
+    /// Empty alias resolver: any `TypeAliasType` expansion defers, so tests
+    /// that exercise the non-alias arms are unaffected by the resolver.
+    fn empty_aliases() -> crate::aliases::TypeAliasResolver {
+        crate::aliases::TypeAliasResolver::new()
+    }
+
+    /// Build a python-binding alias resolver snapshot for one alias. Used to
+    /// test that a `TypeAliasType` operand expands to its target before the
+    /// seam body runs (mirroring Python's `get_proper_type`).
+    fn alias_snap(fullname: &str, target: &Type) -> crate::aliases::TypeAliasSnapshot {
+        let mut buf = WriteBuffer::new();
+        wire::write_type(&mut buf, target).expect("alias target must encode");
+        crate::aliases::TypeAliasSnapshot {
+            fullname: fullname.to_string(),
+            target: buf.into_bytes(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn literal_type_like_is_true() {
         assert_eq!(is_literal_type_like(&lit_str("x")), Some(true));
@@ -3045,19 +3088,25 @@ mod tests {
     #[test]
     fn instance_fallback_returns_instance_itself() {
         let inst = plain_instance("builtins.int");
-        assert_eq!(try_getting_instance_fallback(&inst), Some(inst.clone()));
+        assert_eq!(
+            try_getting_instance_fallback(&inst, &empty_aliases()),
+            Some(inst.clone())
+        );
     }
 
     #[test]
     fn instance_fallback_unwraps_literal_to_literal_fallback() {
         let lit = lit_str("hello");
-        let result = try_getting_instance_fallback(&lit).unwrap();
+        let result = try_getting_instance_fallback(&lit, &empty_aliases()).unwrap();
         assert_eq!(result, plain_instance("builtins.str"));
     }
 
     #[test]
     fn instance_fallback_none_type_defers() {
-        assert_eq!(try_getting_instance_fallback(&Type::NoneType), None);
+        assert_eq!(
+            try_getting_instance_fallback(&Type::NoneType, &empty_aliases()),
+            None
+        );
     }
 
     #[test]
@@ -3067,7 +3116,7 @@ mod tests {
             source_any: None,
             missing_import_name: None,
         };
-        assert_eq!(try_getting_instance_fallback(&any), None);
+        assert_eq!(try_getting_instance_fallback(&any, &empty_aliases()), None);
     }
 
     #[test]
@@ -3088,7 +3137,7 @@ mod tests {
             meta_level: 1,
         };
         assert_eq!(
-            try_getting_instance_fallback(&tv),
+            try_getting_instance_fallback(&tv, &empty_aliases()),
             Some(plain_instance("builtins.object"))
         );
     }
@@ -3106,7 +3155,7 @@ mod tests {
             variance: 1,
             meta_level: 1,
         };
-        assert_eq!(try_getting_instance_fallback(&tv), None);
+        assert_eq!(try_getting_instance_fallback(&tv, &empty_aliases()), None);
     }
 
     #[test]
@@ -3117,7 +3166,7 @@ mod tests {
             implicit: true,
         };
         assert_eq!(
-            try_getting_instance_fallback(&tup),
+            try_getting_instance_fallback(&tup, &empty_aliases()),
             Some(plain_instance("builtins.tuple"))
         );
     }
@@ -3132,7 +3181,7 @@ mod tests {
             is_closed: true,
         };
         assert_eq!(
-            try_getting_instance_fallback(&td),
+            try_getting_instance_fallback(&td, &empty_aliases()),
             Some(plain_instance("builtins.dict"))
         );
     }
@@ -3159,7 +3208,7 @@ mod tests {
             type_is: None,
         };
         assert_eq!(
-            try_getting_instance_fallback(&callable),
+            try_getting_instance_fallback(&callable, &empty_aliases()),
             Some(plain_instance("builtins.function"))
         );
     }
@@ -3188,7 +3237,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            try_getting_instance_fallback(&overloaded),
+            try_getting_instance_fallback(&overloaded, &empty_aliases()),
             Some(plain_instance("builtins.function"))
         );
     }
@@ -3199,7 +3248,87 @@ mod tests {
             type_ref: "mod.Alias".to_string(),
             args: vec![],
         };
-        assert_eq!(try_getting_instance_fallback(&alias), None);
+        assert_eq!(
+            try_getting_instance_fallback(&alias, &empty_aliases()),
+            None
+        );
+    }
+
+    #[test]
+    fn instance_fallback_alias_expands_to_target() {
+        // Python's `t = get_proper_type(t)` expands a top-level alias to
+        // its Instance target before returning it as the fallback.
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &plain_instance("builtins.int")),
+        );
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Alias".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&alias, &aliases),
+            Some(plain_instance("builtins.int"))
+        );
+    }
+
+    #[test]
+    fn instance_fallback_alias_to_tuple_uses_partial_fallback() {
+        // An alias resolving to a TupleType takes the partial fallback,
+        // matching Python's recursion after get_proper_type.
+        let tuple = Type::TupleType {
+            partial_fallback: Box::new(plain_instance("builtins.tuple")),
+            items: vec![plain_instance("builtins.str")],
+            implicit: true,
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert("mod.Pair".to_string(), alias_snap("mod.Pair", &tuple));
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.Pair".to_string(),
+            args: vec![],
+        };
+        assert_eq!(
+            try_getting_instance_fallback(&alias, &aliases),
+            Some(plain_instance("builtins.tuple"))
+        );
+    }
+
+    #[test]
+    fn coerce_alias_to_literal_expands() {
+        // `coerce_to_literal`'s Python body runs get_proper_type at the top,
+        // so a bare alias resolving to a LiteralType passes through natively.
+        let lit = Type::LiteralType {
+            fallback: Box::new(plain_instance("builtins.str")),
+            value: LiteralValue::Str("x".to_string()),
+        };
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert("mod.A".to_string(), alias_snap("mod.A", &lit));
+        let resolver = NativeTypeResolver::new(TypeResolver::new(), aliases);
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        let result: Option<Type> =
+            Python::with_gil(|py| coerce_to_literal_inner(py, &alias, &resolver));
+        assert_eq!(result, Some(lit));
+    }
+
+    #[test]
+    fn coerce_alias_missing_snapshot_defers() {
+        // No alias snapshot: the expansion cannot resolve and defers,
+        // preserving the pre-expansion TypeAliasType behavior.
+        let resolver = NativeTypeResolver::new(
+            TypeResolver::new(),
+            crate::aliases::TypeAliasResolver::new(),
+        );
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.A".to_string(),
+            args: vec![],
+        };
+        let result: Option<Type> =
+            Python::with_gil(|py| coerce_to_literal_inner(py, &alias, &resolver));
+        assert!(result.is_none());
     }
 
     // ------------------------------------------------------------------
