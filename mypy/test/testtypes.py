@@ -3532,6 +3532,374 @@ class NativeJoinInstanceSuite(Suite):
         result = join_types(self.fx.ga, self.fx.ga)
         assert result == self.fx.ga
 
+class NativeSetopsJoinDiffArgsSuite(Suite):
+    """Parity for the args-bearing different-base join port
+    (setops.rs `join_diff_instances_with_args` / `via_supertype_arg_type`).
+
+    `InstanceJoiner.join_instances` (join.py:292-303, 350-427) routes an
+    argument-carrying pair with different base types through
+    `join_instances_via_supertype`, which maps `t` onto each candidate
+    base (`map_instance_to_supertype`) and recurses. The Rust port
+    (#867) mirrors that natively; previously the whole branch deferred.
+
+    Every test runs a gate-off vs gate-on differential and asserts the
+    results render identically, plus a direct seam call proving the
+    `rust_join_instances` seam decides (non-None) rather than silently
+    deferring on the diff-args shape.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.join import _set_native_join_active
+
+        _set_native_join_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_join_active(True)
+
+    def _join_str(self, s: Type, t: Type) -> str:
+        from mypy.join import join_types
+
+        return str(join_types(s, t))
+
+    def _assert_par(self, s: Type, t: Type, label: str) -> None:
+        off = self._with_gate(False, lambda: self._join_str(s, t))
+        on = self._with_gate(True, lambda: self._join_str(s, t))
+        assert_equal(on, off, f"diff-args join parity {label}")
+
+    def _engages(self, t: Type, s: Type) -> object:
+        # Direct seam call: non-None proves rust_join_instances decides
+        # for this diff-args pair (it fell through before #867).
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_join_instances(
+            _serialize_type(t),
+            _serialize_type(s),
+            True,
+            self.resolver,
+        )
+
+    def test_parity_generic_vs_unrelated(self) -> None:
+        # G[A] join B (B unrelated to G): common ancestor is object.
+        self._assert_par(self.fx.ga, self.fx.b, "G[A] vs B")
+        self._assert_par(self.fx.g2a, self.fx.b, "G2[A] vs B")
+
+    def test_parity_generic_vs_object(self) -> None:
+        # G[A] join object: object on one side -> join is object; the
+        # object fast-path decides natively (proves the seam engages).
+        self._assert_par(self.fx.ga, self.fx.o, "G[A] vs object")
+        self._assert_par(self.fx.o, self.fx.ga, "object vs G[A]")
+        assert self._engages(self.fx.ga, self.fx.o) is not None
+
+    def test_parity_subclass_shared_generic_base(self) -> None:
+        # GS2[A] join G[A]: GS2 <: G so via_supertype maps GS2 back
+        # onto G and the join is G[A]. map_instance_to_supertype may
+        # defer on the typevar base G[s1]; the differential covers both.
+        self._assert_par(self.fx.gs2a, self.fx.ga, "GS2[A] vs G[A]")
+
+    def test_parity_two_generic_unrelated(self) -> None:
+        # G2[A] join G[B]: distinct generic classes -> object (or the
+        # MRO winner the walk finds); both gates must agree.
+        self._assert_par(self.fx.g2a, self.fx.gb, "G2[A] vs G[B]")
+
+    def test_parity_generic_vs_subtype_other_way(self) -> None:
+        # G[B] join GS2[A]: unrelated order must still agree.
+        self._assert_par(self.fx.gb, self.fx.gs2a, "G[B] vs GS2[A]")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMatchGenericCallablesSuite(Suite):
+    """Parity suite for the Rust `match_generic_callables` id-renumbering
+    port (join.py:1152-1180, freshen.rs).
+
+    With the native join gate on, `match_generic_callables` routes
+    through the kernel: Rust allocates one shared batch of fresh
+    meta-level-0 ids (`TypeVarId.new(meta_level=0)`) passed to BOTH
+    operands, renumbers each operand's variables, and expands the body
+    via `expand_type` (join.py:1171-1173).
+
+    Every test runs a gate-off vs gate-on differential and asserts the
+    results render identically; the Rust seam must also engage (direct
+    kernel call) for the portable cases.
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
+        import mypy.join
+
+        old = mypy.join._native_join_active
+        mypy.join._set_native_join_active(active)
+        try:
+            return fn()
+        finally:
+            mypy.join._set_native_join_active(old)
+
+    def _generic(self, tv: TypeVarType) -> CallableType:
+        """A generic callable: `def f(tv: tv) -> tv`."""
+        return CallableType(
+            [tv], [ARG_POS], [None], tv, self.fx.function, variables=[tv]
+        )
+
+    def test_match_generic_callables_renumbers(self) -> None:
+        # def f(t: T) -> T: join(f, f) must renumber T to a fresh id so
+        # the two operands share one id space.
+        from mypy.join import match_generic_callables
+
+        c = self._generic(self.fx.t)
+        before = TypeVarId.next_raw_id
+        tc, sc = self._with_gate(True, lambda: match_generic_callables(c, c))
+        # Fresh ids were allocated (t and s both get T'raw_id fresh).
+        assert tc.variables[0].id.raw_id >= before
+        assert sc.variables[0].id.raw_id == tc.variables[0].id.raw_id
+        assert tc.variables[0].id.meta_level == 0
+        assert tc.arg_types[0].id == tc.variables[0].id
+        assert sc.arg_types[0].id == sc.variables[0].id
+        assert_equal(str(tc), str(sc))
+
+    def test_match_generic_callables_mixed_arity(self) -> None:
+        # t has 1 var, s has 2: both renumbered into the same id range.
+        from mypy.join import match_generic_callables
+
+        t = self._generic(self.fx.t)
+        s2 = TypeVarType(
+            "U", "U", TypeVarId(3), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        s2b = TypeVarType(
+            "V", "V", TypeVarId(4), [], self.fx.o, AnyType(TypeOfAny.special_form)
+        )
+        s = CallableType(
+            [s2, s2b], [ARG_POS, ARG_POS], [None, None], s2, self.fx.function, variables=[s2, s2b]
+        )
+        t_out, s_out = match_generic_callables(t, s)
+        # BOTH operands share the same fresh-id batch (join.py:1117-1120
+        # passes one `new_ids` list to both `update_callable_ids` calls):
+        # t's T and s's U both get the first fresh id, s's V the second.
+        assert t_out.variables[0].id.raw_id == s_out.variables[0].id.raw_id
+        assert s_out.variables[1].id.raw_id == s_out.variables[0].id.raw_id + 1
+        assert t_out.arg_types[0].id == t_out.variables[0].id
+        assert s_out.arg_types[0].id == s_out.variables[0].id
+        # str renders names, not ids; assert id equality on the ret types.
+        assert t_out.ret_type.id == s_out.ret_type.id
+
+    def test_match_generic_callables_min_len_zero_noop(self) -> None:
+        from mypy.join import match_generic_callables
+
+        # A non-generic callable: min_len == 0 short-circuits to the
+        # unchanged operands (join.py:1169-1170).
+        non_generic = self.fx.callable(self.fx.a, self.fx.b)
+        t_out, s_out = match_generic_callables(non_generic, non_generic)
+        assert t_out is non_generic
+        assert s_out is non_generic
+
+    def test_match_generic_callables_gate_off_differential(self) -> None:
+        from mypy.join import match_generic_callables
+
+        c = self._generic(self.fx.t)
+        off = self._with_gate(False, lambda: match_generic_callables(c, c))
+        on = self._with_gate(True, lambda: match_generic_callables(c, c))
+        assert_equal(str(on[0]), str(off[0]))
+        assert_equal(str(on[1]), str(off[1]))
+
+    def test_match_generic_callables_param_spec_defers(self) -> None:
+        from mypy.join import match_generic_callables
+
+        # ParamSpec variables keep the Python path (Rust cannot rebuild
+        # ParamSpec prefix identity); the differential must still agree.
+        p = ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        c = CallableType(
+            [p], [ARG_POS], [None], self.fx.a, self.fx.function, variables=[p]
+        )
+        off = self._with_gate(False, lambda: match_generic_callables(c, c))
+        on = self._with_gate(True, lambda: match_generic_callables(c, c))
+        assert_equal(str(on[0]), str(off[0]))
+        assert_equal(str(on[1]), str(off[1]))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeJoinInstanceSuite(Suite):
+    """Parity suite for the Rust `visit_instance` nominal join (Stage 3c M8f).
+
+    Exercises the args-less Instance-Instance nominal join: same-type,
+    direct-subtype, and common-ancestor via the MRO bases walk. The
+    fixture provides A, B(A), C(A), D (unrelated). join(B, C) finds A as
+    the common ancestor via the bases walk, which trivial_join (direct
+    subtype only) would miss (it returns object).
+    """
+
+    def setUp(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        self.fx = TypeFixture(INVARIANT)
+        type_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        _set_native_join_active(True)
+        _set_native_join_resolver(self.resolver)
+        _set_native_join_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.join import (
+            _set_native_join_active,
+            _set_native_join_resolver,
+            _set_native_join_typeinfo_map,
+        )
+        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        _set_native_join_active(False)
+        _set_native_join_resolver(None)
+        _set_native_join_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def test_join_same_type_returns_self(self) -> None:
+        # join.py:114: t.type == s.type, no args -> Instance(A, []) = A.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.a) == self.fx.a
+        assert join_types(self.fx.d, self.fx.d) == self.fx.d
+
+    def test_join_direct_subtype_returns_supertype(self) -> None:
+        # B <: A -> join(A, B) = A. The Rust path returns
+        # Ancestor("A") which the shim maps to Instance(A, []).
+        from mypy.join import join_types
+
+        assert join_types(self.fx.a, self.fx.b) == self.fx.a
+        assert join_types(self.fx.b, self.fx.a) == self.fx.a
+
+    def test_join_common_ancestor_returns_ancestor(self) -> None:
+        # B <: A, C <: A, B not <: C, C not <: B -> join(B, C) = A.
+        # trivial_join would return object (neither is a subtype of
+        # the other); the visit_instance bases walk finds A.
+        from mypy.join import join_types
+
+        assert join_types(self.fx.b, self.fx.c) == self.fx.a
+        assert join_types(self.fx.c, self.fx.b) == self.fx.a
+
+    def test_join_unrelated_defers_to_python_returns_object(self) -> None:
+        # A and D unrelated (D not <: A, A not <: D, no common base
+        # in the fixture). Rust defers; Python returns object.
+        from mypy.join import join_types
+
+        result = join_types(self.fx.a, self.fx.d)
+        assert result == self.fx.o
+
+    def test_join_with_args_returns_same_instance(self) -> None:
+        # Instance with type args (M8g): join(G[A], G[A]) where T is
+        # invariant. is_equivalent(A, A)=True, join_types(A, A)=A ->
+        # Rust returns SameTypeWithArgs (disc 6) with arg_discs=[0]
+
+        # (use s.args[0]=A). Shim reconstructs G[A].
+        from mypy.join import join_types
+
+        result = join_types(self.fx.ga, self.fx.ga)
+        assert result == self.fx.ga
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypeTupleSuite(Suite):
