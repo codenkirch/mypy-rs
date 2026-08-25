@@ -58,15 +58,15 @@ pub(crate) fn rust_expand_type(
     let _ = resolver; // reserved for future Instance.has_type_var_tuple lookups
     let typ = decode_type(type_bytes)?;
     let env = decode_env(env_bytes)?;
-    if env.is_empty() {
-        return None;
-    }
     // Wire-decoded TypeAliasType carries alias=None, which the Python graph
     // asserts against on access (types.py:362/397). Defer alias-bearing
     // inputs to Python, preserving object identity.
     if result_contains_typealias(&typ) {
         return None;
     }
+    // An empty env is fully wire-portable: no substitution happens, so
+    // typevar-free inputs complete natively while the result_has_typevar
+    // guard still defers the identity-critical leftover-TypeVar cases.
     expand_with_env(&typ, &env, strict_optional)
 }
 
@@ -1287,5 +1287,37 @@ mod tests {
         let env: HashMap<EnvKey, Type> =
             HashMap::from([((7, 0, "foo.Pair".to_string()), tuple_repl)]);
         assert!(expand_type_inner(&typ, &env, false).is_none());
+    }
+
+    #[test]
+    fn empty_env_typevar_free_succeeds_natively() {
+        // `expand_type(List[int], {})` must not defer: an empty env makes no
+        // substitution, the tree rebuilds, and no TypeVar survives. Regression
+        // for the removed `env.is_empty()` eager bail in rust_expand_type.
+        let typ = instance("builtins.list", vec![instance("builtins.int", vec![])]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        match expand_type_with_env(&typ, &env, false) {
+            Some(Type::Instance { type_ref, args, .. }) => {
+                assert_eq!(type_ref, "builtins.list");
+                match args.as_slice() {
+                    [Type::Instance { type_ref: name, .. }] => assert_eq!(name, "builtins.int"),
+                    other => panic!("expected [int] arg, got {:?}", other),
+                }
+            }
+            other => panic!(
+                "typevar-free empty-env expansion must complete, deferred={:?}",
+                other.is_none()
+            ),
+        }
+    }
+
+    #[test]
+    fn empty_env_typevar_still_defers_for_identity() {
+        // `expand_type(List[T], {})` leaves T unmatched. Python preserves the
+        // original T by object identity; a wire clone would break that, so the
+        // `result_has_typevar` guard still defers to Python.
+        let typ = instance("builtins.list", vec![tvar(0)]);
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        assert!(expand_type_with_env(&typ, &env, false).is_none());
     }
 }
