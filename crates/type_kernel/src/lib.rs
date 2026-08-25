@@ -1475,6 +1475,29 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_queries::rust_unknown_unpack,
         module
     )?)?;
+    // Issue #852: resolver-backed variants. TypeAliasType expands through
+    // the NativeTypeResolver alias snapshot instead of deferring; any
+    // undecidable expansion still returns None -> Python fallback.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_has_explicit_any_live,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_has_any_from_unimported_type_live,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_collect_all_inner_types_live,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_make_optional_type_live,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_unknown_unpack_live,
+        module
+    )?)?;
     // Issue #542: live-object query functions from typeanal.py.
     module.add_function(wrap_pyfunction!(
         typeanal_queries::rust_find_self_type,
