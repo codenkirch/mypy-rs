@@ -120,6 +120,11 @@ __all__ = [
     "rust_collect_all_inner_types",
     "rust_make_optional_type",
     "rust_unknown_unpack",
+    "rust_has_explicit_any_live",
+    "rust_has_any_from_unimported_type_live",
+    "rust_collect_all_inner_types_live",
+    "rust_make_optional_type_live",
+    "rust_unknown_unpack_live",
     "rust_flatten_nested_tuples",
     "rust_copy_type",
     "rust_apply_generic_arguments",
@@ -675,6 +680,21 @@ def rust_has_any_from_unimported_type(type_bytes: bytes) -> bool | None: ...
 def rust_collect_all_inner_types(type_bytes: bytes) -> list[bytes] | None: ...
 def rust_make_optional_type(type_bytes: bytes) -> bytes | None: ...
 def rust_unknown_unpack(type_bytes: bytes) -> bool | None: ...
+def rust_has_explicit_any_live(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bool | None: ...
+def rust_has_any_from_unimported_type_live(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bool | None: ...
+def rust_collect_all_inner_types_live(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> list[bytes] | None: ...
+def rust_make_optional_type_live(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bytes | None: ...
+def rust_unknown_unpack_live(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bool | None: ...
 def rust_flatten_nested_tuples(
     type_bytes_list: list[bytes], handle_recursive: bool
 ) -> list[bytes] | None: ...

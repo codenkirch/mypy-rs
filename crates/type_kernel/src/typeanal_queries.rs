@@ -35,8 +35,11 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PySet, PyString, PyTuple};
 
+use crate::aliases::TypeAliasResolver;
 use crate::argmap::{ARG_STAR, ARG_STAR2};
+use crate::checkexpr_functions::expanded_alias_target;
 use crate::refs::{is_instance, TypeRefs};
+use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Type, WriteBuffer};
 
 // TypeOfAny constants (mirror mypy/types.py:213-239).
@@ -108,6 +111,96 @@ fn has_explicit_any_inner(t: &Type, wanted: i64) -> Option<bool> {
             // Defer on any child that needs the alias target.
             None => return None,
             Some(false) => {}
+        }
+    }
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
+// has_explicit_any / has_any_from_unimported_type (resolver-backed)
+// ---------------------------------------------------------------------------
+
+/// Resolver-backed `rust_has_explicit_any`: a `TypeAliasType` where the
+/// byte-only seam defers (the alias target is not on the wire) expands
+/// through the `NativeTypeResolver` alias snapshot, mirroring
+/// `BoolTypeQuery.visit_type_alias_type` (type_visitor.py:599-617):
+/// the substituted target, then `t.args` for new-style (PEP 695) aliases.
+/// A repeated alias on a descent short-circuits to the ANY_STRATEGY
+/// default (false), matching `seen_aliases`. Any expansion the kernel
+/// cannot perform exactly, or a missing snapshot, defers (`None`) and the
+/// Python shim falls back to the pure-Python visitor (parity-safe).
+#[pyfunction]
+pub(crate) fn rust_has_explicit_any_live(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    match decode_type(type_bytes) {
+        Some(t) => Ok(has_explicit_any_live_inner(
+            &t,
+            EXPLICIT,
+            resolver.alias_resolver(),
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Resolver-backed `rust_has_any_from_unimported_type` — same expansion,
+/// different `type_of_any` constant.
+#[pyfunction]
+pub(crate) fn rust_has_any_from_unimported_type_live(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    match decode_type(type_bytes) {
+        Some(t) => Ok(has_explicit_any_live_inner(
+            &t,
+            FROM_UNIMPORTED_TYPE,
+            resolver.alias_resolver(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn has_explicit_any_live_inner(t: &Type, wanted: i64, aliases: &TypeAliasResolver) -> Option<bool> {
+    let mut seen: Vec<String> = Vec::new();
+    has_explicit_any_live_seen(t, wanted, aliases, &mut seen)
+}
+
+fn has_explicit_any_live_seen(
+    t: &Type,
+    wanted: i64,
+    aliases: &TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    if let Type::TypeAliasType { type_ref, .. } = t {
+        if seen.contains(type_ref) {
+            return Some(false);
+        }
+        seen.push(type_ref.clone());
+        let (target, args, python_3_12) = expanded_alias_target(t, aliases)?;
+        if has_explicit_any_live_seen(&target, wanted, aliases, seen)? {
+            return Some(true);
+        }
+        if python_3_12 {
+            for arg in &args {
+                if has_explicit_any_live_seen(arg, wanted, aliases, seen)? {
+                    return Some(true);
+                }
+            }
+        }
+        return Some(false);
+    }
+    // visit_typeddict_type -- both visitors override it to False (TypedDict
+    // is checked during its declaration, not here).
+    if matches!(t, Type::TypedDictType { .. }) {
+        return Some(false);
+    }
+    if let Type::AnyType { type_of_any, .. } = t {
+        return Some(*type_of_any == wanted);
+    }
+    for child in query_children_bool(t) {
+        if has_explicit_any_live_seen(child, wanted, aliases, seen)? {
+            return Some(true);
         }
     }
     Some(false)
@@ -219,6 +312,54 @@ fn collect_all_inner_types_inner(t: &Type) -> Option<Vec<Type>> {
     let mut out = Vec::new();
     for child in &children {
         out.extend(collect_all_inner_types_inner(child)?);
+    }
+    // Direct children of `t` (not `t` itself) are the query result.
+    for child in children {
+        out.push(child.clone());
+    }
+    Some(out)
+}
+
+/// Resolver-backed `rust_collect_all_inner_types`: a `TypeAliasType`
+/// visits the expanded target (mirroring `TypeQuery.visit_type_alias_type`,
+/// type_visitor.py:459-469, which is `get_proper_type(t).accept(self)`),
+/// with a type_ref-keyed seen set so a repeated alias on a descent returns
+/// `strategy([])` = empty, terminating recursive aliases. New-style aliases
+/// do NOT additionally visit `t.args` here (TypeQuery has no args visit;
+/// the args are already inside the substituted target).
+#[pyfunction]
+pub(crate) fn rust_collect_all_inner_types_live(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<Vec<Vec<u8>>>> {
+    let t = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let mut seen: Vec<String> = Vec::new();
+    Ok(
+        collect_all_inner_types_live_inner(&t, resolver.alias_resolver(), &mut seen)
+            .map(|ts| ts.iter().filter_map(encode_type).collect()),
+    )
+}
+
+fn collect_all_inner_types_live_inner(
+    t: &Type,
+    aliases: &TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<Vec<Type>> {
+    if let Type::TypeAliasType { type_ref, .. } = t {
+        if seen.contains(type_ref) {
+            return Some(Vec::new());
+        }
+        seen.push(type_ref.clone());
+        let (target, _, _) = expanded_alias_target(t, aliases)?;
+        return collect_all_inner_types_live_inner(&target, aliases, seen);
+    }
+    let children = query_children_type(t);
+    let mut out = Vec::new();
+    for child in &children {
+        out.extend(collect_all_inner_types_live_inner(child, aliases, seen)?);
     }
     // Direct children of `t` (not `t` itself) are the query result.
     for child in children {
@@ -376,6 +517,72 @@ fn make_optional_type_inner(t: &Type) -> Option<Type> {
     })
 }
 
+/// Resolver-backed `rust_make_optional_type`: when filtering the items of
+/// an input union, an alias item expands through the snapshot to decide
+/// whether `get_proper_type(item)` is a `NoneType` (dropped, absorbed by
+/// the appended fresh `NoneType`). Non-None aliases are kept in the output
+/// AS-IS (Python keeps the original item, not the expansion). An expansion
+/// the kernel cannot perform exactly defers the whole call (parity-safe).
+#[pyfunction]
+pub(crate) fn rust_make_optional_type_live(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<Vec<u8>>> {
+    let t = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(make_optional_type_live_inner(&t, resolver.alias_resolver())
+        .and_then(|res| encode_type(&res)))
+}
+
+fn make_optional_type_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Option<Type> {
+    // isinstance(t, ProperType) and isinstance(t, NoneType): return t.
+    if matches!(t, Type::NoneType) {
+        return Some(t.clone());
+    }
+    if let Type::UnionType {
+        items,
+        uses_pep604_syntax,
+        ..
+    } = t
+    {
+        let mut kept = Vec::with_capacity(items.len() + 1);
+        for item in items {
+            match item {
+                Type::TypeAliasType { .. } => {
+                    let (target, _, _) = expanded_alias_target(item, aliases)?;
+                    if matches!(&target, Type::NoneType) {
+                        continue;
+                    }
+                    kept.push(item.clone());
+                }
+                Type::NoneType => {}
+                _ => kept.push(item.clone()),
+            }
+        }
+        kept.push(Type::NoneType);
+        let can_be_true = kept.iter().any(crate::setops::union_item_can_be_true);
+        let can_be_false = kept.iter().any(crate::setops::union_item_can_be_false);
+        return Some(Type::UnionType {
+            items: kept,
+            uses_pep604_syntax: *uses_pep604_syntax,
+            can_be_true,
+            can_be_false,
+        });
+    }
+    // else: wrap Non-None-type values in a UnionType.
+    let items = vec![t.clone(), Type::NoneType];
+    let can_be_true = items.iter().any(crate::setops::union_item_can_be_true);
+    let can_be_false = items.iter().any(crate::setops::union_item_can_be_false);
+    Some(Type::UnionType {
+        items,
+        uses_pep604_syntax: false,
+        can_be_true,
+        can_be_false,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // unknown_unpack
 // ---------------------------------------------------------------------------
@@ -403,6 +610,38 @@ fn unknown_unpack_inner(t: &Type) -> Option<bool> {
     match typ.as_ref() {
         Type::TypeAliasType { .. } => None,
         // isinstance(unpacked, AnyType) and type_of_any == special_form.
+        Type::AnyType { type_of_any, .. } => Some(*type_of_any == SPECIAL_FORM),
+        _ => Some(false),
+    }
+}
+
+/// Resolver-backed `rust_unknown_unpack`: the unpack target's alias chain
+/// expands through the snapshot (Python `get_proper_type(t.type)`), then
+/// the same special-form AnyType check as the byte-only seam. A missing
+/// snapshot or an undecidable expansion defers (parity-safe).
+#[pyfunction]
+pub(crate) fn rust_unknown_unpack_live(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+) -> PyResult<Option<bool>> {
+    match decode_type(type_bytes) {
+        Some(t) => Ok(unknown_unpack_live_inner(&t, resolver.alias_resolver())),
+        None => Ok(None),
+    }
+}
+
+fn unknown_unpack_live_inner(t: &Type, aliases: &TypeAliasResolver) -> Option<bool> {
+    let Type::UnpackType { typ } = t else {
+        return Some(false);
+    };
+    match typ.as_ref() {
+        Type::TypeAliasType { .. } => {
+            let (target, _, _) = expanded_alias_target(typ, aliases)?;
+            match &target {
+                Type::AnyType { type_of_any, .. } => Some(*type_of_any == SPECIAL_FORM),
+                _ => Some(false),
+            }
+        }
         Type::AnyType { type_of_any, .. } => Some(*type_of_any == SPECIAL_FORM),
         _ => Some(false),
     }

@@ -908,15 +908,15 @@ class BuildManager:
         _clear_type_wire_cache()
         _set_type_wire_cache_enabled(False)
         from mypy.checker import _clear_checker_deser_cache
-        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
-        from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
+        from mypy.expandtype import _clear_expand_decode_cache
+        from mypy.maptype import _clear_map_supertype_decode_cache
         from mypy.meet import _clear_narrow_decode_cache
+        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
-        from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
@@ -976,6 +976,9 @@ class BuildManager:
         from mypy.constraints import _set_native_constraints_resolver
 
         _set_native_constraints_resolver(None)
+        from mypy.typeanal import _set_native_typeanal_resolver
+
+        _set_native_typeanal_resolver(None)
         # Stage 4 (M8ba): gate the pure-positional/named branch of
         # `map_actuals_to_formals`. The Rust path returns None for any call
         # with an ARG_STAR/ARG_STAR2 actual (deferred to the callback path),
@@ -1544,6 +1547,10 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_resolver
 
         _set_native_semanal_resolver(resolver)
+        # Issue #852: typeanal query aliases expand via the same snapshot.
+        from mypy.typeanal import _set_native_typeanal_resolver
+
+        _set_native_typeanal_resolver(resolver)
 
     def _clear_native_resolvers(self) -> None:
         """Clear all native resolver globals so the kernel defers to Python.
@@ -1563,15 +1570,15 @@ class BuildManager:
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
         from mypy.checker import _clear_checker_deser_cache
-        from mypy.erasetype import _clear_erase_decode_cache
         from mypy.checkexpr import _clear_argtypes_plan_cache
-        from mypy.expandtype import _clear_expand_decode_cache
         from mypy.checkmember import _clear_deser_cache
+        from mypy.erasetype import _clear_erase_decode_cache
+        from mypy.expandtype import _clear_expand_decode_cache
+        from mypy.maptype import _clear_map_supertype_decode_cache
         from mypy.meet import _clear_narrow_decode_cache
+        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
         from mypy.typeops import _clear_typeops_decode_cache
         from mypy.typevars import _clear_typevars_decode_cache
-        from mypy.maptype import _clear_map_supertype_decode_cache
-        from mypy.subtypes import _clear_subtype_batch, _clear_subtype_decode_cache
 
         _clear_deser_cache()
         _clear_checker_deser_cache()
@@ -1611,6 +1618,9 @@ class BuildManager:
         from mypy.checker import _set_native_checker_resolver
 
         _set_native_checker_resolver(None)
+        from mypy.typeanal import _set_native_typeanal_resolver
+
+        _set_native_typeanal_resolver(None)
         # Stage 6 (issue #425): maptype resolver shares the same snapshot
         # as the subtype/expand paths.
         from mypy.maptype import _set_native_map_resolver
@@ -5578,6 +5588,9 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
         from mypy.checker import _set_native_checker_resolver
 
         _set_native_checker_resolver(None)
+        from mypy.typeanal import _set_native_typeanal_resolver
+
+        _set_native_typeanal_resolver(None)
 
     mypy.semanal_main.semantic_analysis_for_scc(graph, scc, manager.errors)
 

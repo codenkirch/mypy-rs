@@ -5,7 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
-from typing import Final, Protocol, TypeVar
+from typing import Any, Final, Protocol, TypeVar
 
 from mypy import errorcodes as codes, message_registry, nodes
 from mypy.errorcodes import ErrorCode
@@ -3340,15 +3340,20 @@ rust_classify_special_unbound as _rust_classify_special_unbound,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
+        rust_collect_all_inner_types_live as _rust_collect_all_inner_types_live,
         rust_detect_diverging_alias as _rust_detect_diverging_alias,
         rust_find_self_type as _rust_find_self_type,
         rust_has_any_from_unimported_type as _rust_has_any_from_unimported_type,
+        rust_has_any_from_unimported_type_live as _rust_has_any_from_unimported_type_live,
         rust_has_explicit_any as _rust_has_explicit_any,
+        rust_has_explicit_any_live as _rust_has_explicit_any_live,
         rust_instantiate_type_alias as _rust_instantiate_type_alias,
         rust_is_typevar_default_recursive as _rust_is_typevar_default_recursive,
         rust_make_optional_type as _rust_make_optional_type,
+        rust_make_optional_type_live as _rust_make_optional_type_live,
         rust_type_analyze as _rust_type_analyze,
         rust_unknown_unpack as _rust_unknown_unpack,
+        rust_unknown_unpack_live as _rust_unknown_unpack_live,
         rust_validate_instance as _rust_validate_instance,
     )
 
@@ -3358,11 +3363,16 @@ rust_classify_special_unbound as _rust_classify_special_unbound,
     _TYPEANAL_HAS_KERNEL = True
 except ImportError:
     _rust_has_explicit_any = None  # type: ignore[assignment]
+    _rust_has_explicit_any_live = None  # type: ignore[assignment]
     _rust_has_any_from_unimported_type = None  # type: ignore[assignment]
+    _rust_has_any_from_unimported_type_live = None  # type: ignore[assignment]
     _rust_collect_all_inner_types = None  # type: ignore[assignment]
+    _rust_collect_all_inner_types_live = None  # type: ignore[assignment]
     _rust_make_optional_type = None  # type: ignore[assignment]
+    _rust_make_optional_type_live = None  # type: ignore[assignment]
     _rust_type_analyze = None  # type: ignore[assignment]
     _rust_unknown_unpack = None  # type: ignore[assignment]
+    _rust_unknown_unpack_live = None  # type: ignore[assignment]
     _rust_validate_instance = None  # type: ignore[assignment]
     _rust_detect_diverging_alias = None  # type: ignore[assignment]
     _rust_find_self_type = None  # type: ignore[assignment]
@@ -3384,6 +3394,18 @@ _native_typeanal_active: bool = False
 def _set_native_typeanal_active(active: bool) -> None:
     global _native_typeanal_active
     _native_typeanal_active = active
+
+
+# NativeTypeResolver shared with the typeanal query kernel for
+# TypeAliasType expansion (issue #852). Installed per build by
+# BuildManager; None keeps the byte-only seams (alias defers to Python).
+_native_typeanal_resolver: Any = None
+
+
+def _set_native_typeanal_resolver(resolver: Any) -> None:
+    """Install/clear the NativeTypeResolver for the typeanal kernel."""
+    global _native_typeanal_resolver
+    _native_typeanal_resolver = resolver
 
 
 # Front branch tags for `visit_unbound_type_nonoptional` (issue #714).
@@ -3553,7 +3575,13 @@ def has_explicit_any(t: Type) -> bool:
     """
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_has_explicit_any(_serialize_typeanal_type(t))
+            if _native_typeanal_resolver is not None:
+                result = _rust_has_explicit_any_live(
+                    _native_typeanal_resolver,
+                    _serialize_typeanal_type(t),
+                )
+            else:
+                result = _rust_has_explicit_any(_serialize_typeanal_type(t))
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):
@@ -3581,7 +3609,13 @@ def has_any_from_unimported_type(t: Type) -> bool:
     """
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_has_any_from_unimported_type(_serialize_typeanal_type(t))
+            if _native_typeanal_resolver is not None:
+                result = _rust_has_any_from_unimported_type_live(
+                    _native_typeanal_resolver,
+                    _serialize_typeanal_type(t),
+                )
+            else:
+                result = _rust_has_any_from_unimported_type(_serialize_typeanal_type(t))
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):
@@ -3607,7 +3641,13 @@ def collect_all_inner_types(t: Type) -> list[Type]:
     """
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_collect_all_inner_types(_serialize_typeanal_type(t))
+            if _native_typeanal_resolver is not None:
+                result = _rust_collect_all_inner_types_live(
+                    _native_typeanal_resolver,
+                    _serialize_typeanal_type(t),
+                )
+            else:
+                result = _rust_collect_all_inner_types(_serialize_typeanal_type(t))
             if result is not None:
                 decoded = []
                 for item in result:
@@ -3641,7 +3681,13 @@ def make_optional_type(t: Type) -> Type:
         return t
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_make_optional_type(_serialize_typeanal_type(t))
+            if _native_typeanal_resolver is not None:
+                result = _rust_make_optional_type_live(
+                    _native_typeanal_resolver,
+                    _serialize_typeanal_type(t),
+                )
+            else:
+                result = _rust_make_optional_type(_serialize_typeanal_type(t))
             if result is not None:
                 decoded = _typeanal_decode(result)
                 if decoded is not None:
@@ -3770,7 +3816,13 @@ def unknown_unpack(t: Type) -> bool:
     """
     if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
         try:
-            result = _rust_unknown_unpack(_serialize_typeanal_type(t))
+            if _native_typeanal_resolver is not None:
+                result = _rust_unknown_unpack_live(
+                    _native_typeanal_resolver,
+                    _serialize_typeanal_type(t),
+                )
+            else:
+                result = _rust_unknown_unpack(_serialize_typeanal_type(t))
             if result is not None:
                 return result
         except (AssertionError, NotImplementedError):

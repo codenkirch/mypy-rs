@@ -5382,7 +5382,7 @@ class NativeProtocolImplementationSuite(Suite):
     def test_non_matching_arg_type_returns_false(self) -> None:
         """A method returning object (A's supertype) is not an
         implementation of `f() -> A`."""
-        from mypy.types import CallableType, Instance
+        from mypy.types import Instance
 
         self._live_info = {}
         p = self._protocol("mod.P", ["f"])
@@ -12553,8 +12553,6 @@ class NativeWireFixupSuite(Suite):
         # passes ErasedType() as the target during inference). A meta-var
         # TypeVar must be replaced by the target; a class typevar untouched.
         from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
-        from mypy.erasetype import _set_native_erase_typevars_active, replace_meta_vars
-
         from mypy.types import TypeVarId
 
         meta = TypeVarType(
@@ -12761,6 +12759,241 @@ class NativeWireFixupSuite(Suite):
         actual = unknown_unpack(t)
         assert_equal(actual, expected)
         assert actual is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeanalAliasQuerySuite(Suite):
+    """Parity for the resolver-backed typeanal query seams (issue #852).
+
+    The byte-only seams defer on `TypeAliasType` (its proper expansion is
+    not on the wire). The `_live` variants expand aliases through the
+    `NativeTypeResolver` alias snapshot, mirroring `get_proper_type` plus
+    the query visitors' `seen_aliases` recursion guards. Each test runs
+    the gate-off (pure Python) and gate-on (Rust) paths and asserts they
+    agree; direct seam calls prove the live path engages where the byte
+    seam defers.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import (
+            _set_native_typeanal_active,
+            _set_native_typeanal_resolver,
+        )
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._base_infos = self._collect_type_infos()
+        self.resolver = _type_kernel.build_native_resolver(self._base_infos, [])
+        _set_native_typeanal_active(True)
+        _set_native_typeanal_resolver(self.resolver)
+        set_wire_alias_map({})
+        set_wire_typeinfo_map({info.fullname: info for info in self._base_infos})
+
+    def tearDown(self) -> None:
+        from mypy.typeanal import (
+            _set_native_typeanal_active,
+            _set_native_typeanal_resolver,
+        )
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        _set_native_typeanal_active(False)
+        _set_native_typeanal_resolver(None)
+        set_wire_alias_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _collect_type_infos(self) -> list[TypeInfo]:
+        infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _make_alias(
+        self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
+    ) -> TypeAlias:  # type: ignore[name-defined]
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(
+            target,
+            fullname,
+            "mod",
+            -1,
+            -1,
+            alias_tvars=alias_tvars or [],
+        )
+
+    def _install_aliases(self, aliases: list[TypeAlias]) -> None:  # type: ignore[name-defined]
+        from mypy.typeanal import _set_native_typeanal_resolver
+        from mypy.wirefixup import set_wire_alias_map
+
+        self.resolver = _type_kernel.build_native_resolver(self._base_infos, aliases)
+        _set_native_typeanal_resolver(self.resolver)
+        set_wire_alias_map({alias.fullname: alias for alias in aliases})
+
+    def _par(self, fn: Any, t: Type) -> tuple[Any, Any]:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        _set_native_typeanal_active(False)
+        expected = fn(t)
+        _set_native_typeanal_active(True)
+        actual = fn(t)
+        return actual, expected
+
+    def test_has_explicit_any_alias_to_explicit_any(self) -> None:
+        from type_kernel import rust_has_explicit_any, rust_has_explicit_any_live
+
+        from mypy.typeanal import _serialize_typeanal_type, has_explicit_any
+
+        alias = self._make_alias("mod.ExplicitAlias", AnyType(TypeOfAny.explicit))
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        # The byte seam defers on the alias; the live seam decides.
+        assert rust_has_explicit_any(_serialize_typeanal_type(t)) is None
+        assert (
+            rust_has_explicit_any_live(self.resolver, _serialize_typeanal_type(t)) is True
+        )
+        actual, expected = self._par(has_explicit_any, t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_alias_to_unimported_any(self) -> None:
+        from mypy.typeanal import has_explicit_any
+
+        alias = self._make_alias(
+            "mod.UnimportedAlias", AnyType(TypeOfAny.from_unimported_type)
+        )
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        actual, expected = self._par(has_explicit_any, t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_has_any_from_unimported_type_alias(self) -> None:
+        from type_kernel import (
+            rust_has_any_from_unimported_type,
+            rust_has_any_from_unimported_type_live,
+        )
+
+        from mypy.typeanal import _serialize_typeanal_type, has_any_from_unimported_type
+
+        alias = self._make_alias(
+            "mod.UnimportedAlias", AnyType(TypeOfAny.from_unimported_type)
+        )
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        assert rust_has_any_from_unimported_type(_serialize_typeanal_type(t)) is None
+        assert (
+            rust_has_any_from_unimported_type_live(
+                self.resolver, _serialize_typeanal_type(t)
+            )
+            is True
+        )
+        actual, expected = self._par(has_any_from_unimported_type, t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_alias_nested_in_instance(self) -> None:
+        from mypy.typeanal import has_explicit_any
+
+        alias = self._make_alias(
+            "mod.ListAlias",
+            Instance(self.fx.std_listi, [AnyType(TypeOfAny.explicit)]),
+        )
+        self._install_aliases([alias])
+        t = Instance(self.fx.std_listi, [TypeAliasType(alias, [])])
+        actual, expected = self._par(has_explicit_any, t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_has_explicit_any_recursive_alias(self) -> None:
+        from mypy.typeanal import has_explicit_any
+
+        alias = self._make_alias("mod.RecAlias", self.fx.b)
+        alias.target = Instance(self.fx.std_listi, [TypeAliasType(alias, [])])
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        actual, expected = self._par(has_explicit_any, t)
+        assert_equal(actual, expected)
+        assert actual is False
+
+    def test_collect_all_inner_types_alias_to_instance(self) -> None:
+        from mypy.typeanal import collect_all_inner_types
+
+        alias = self._make_alias(
+            "mod.AliasToList", Instance(self.fx.std_listi, [self.fx.b])
+        )
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        actual, expected = self._par(collect_all_inner_types, t)
+        assert_equal(actual, expected)
+        assert_equal(actual, [self.fx.b])
+
+    def test_collect_all_inner_types_recursive_alias(self) -> None:
+        from mypy.typeanal import collect_all_inner_types
+
+        alias = self._make_alias("mod.RecAlias", self.fx.b)
+        alias.target = Instance(self.fx.std_listi, [TypeAliasType(alias, [])])
+        self._install_aliases([alias])
+        t = TypeAliasType(alias, [])
+        actual, expected = self._par(collect_all_inner_types, t)
+        assert_equal(actual, expected)
+        # The repeated alias does not expand further, but it is still
+        # reported as the direct child of the containing instance.
+        assert_equal(actual, [TypeAliasType(alias, [])])
+
+    def test_make_optional_type_alias_to_none(self) -> None:
+        from mypy.typeanal import make_optional_type
+
+        alias = self._make_alias("mod.NoneAlias", NoneType())
+        self._install_aliases([alias])
+        t = UnionType([TypeAliasType(alias, []), self.fx.b])
+        actual, expected = self._par(make_optional_type, t)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
+        assert_equal(actual.items, [self.fx.b, NoneType()], f"got {actual.items!r}")
+
+    def test_make_optional_type_alias_to_other(self) -> None:
+        from mypy.typeanal import make_optional_type
+
+        alias = self._make_alias("mod.IntAlias", self.fx.a)
+        self._install_aliases([alias])
+        t = UnionType([self.fx.b, TypeAliasType(alias, [])])
+        actual, expected = self._par(make_optional_type, t)
+        assert_equal(actual, expected)
+        assert isinstance(actual, UnionType)  # type: ignore[misc]
+        # A non-None alias is kept as-is (Python does not substitute it).
+        assert_equal(
+            actual.items,
+            [self.fx.b, TypeAliasType(alias, []), NoneType()],
+            f"got {actual.items!r}",
+        )
+
+    def test_unknown_unpack_alias_to_special_form_any(self) -> None:
+        from type_kernel import rust_unknown_unpack, rust_unknown_unpack_live
+
+        from mypy.typeanal import _serialize_typeanal_type, unknown_unpack
+
+        alias = self._make_alias("mod.SpecialAlias", AnyType(TypeOfAny.special_form))
+        self._install_aliases([alias])
+        t = UnpackType(TypeAliasType(alias, []))
+        assert rust_unknown_unpack(_serialize_typeanal_type(t)) is None
+        assert rust_unknown_unpack_live(self.resolver, _serialize_typeanal_type(t)) is True
+        actual, expected = self._par(unknown_unpack, t)
+        assert_equal(actual, expected)
+        assert actual is True
+
+    def test_unknown_unpack_alias_to_other_any(self) -> None:
+        from mypy.typeanal import unknown_unpack
+
+        alias = self._make_alias("mod.PlainAlias", AnyType(TypeOfAny.unannotated))
+        self._install_aliases([alias])
+        t = UnpackType(TypeAliasType(alias, []))
+        actual, expected = self._par(unknown_unpack, t)
+        assert_equal(actual, expected)
+        assert actual is False
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -21572,7 +21805,6 @@ class NativeIsSubtypeAliasSuite(Suite):
     def test_alias_not_in_resolver_defers(self) -> None:
         # An alias whose TypeAlias is not in the resolver defers to
         # Python (expand_aliases returns None); both paths must agree.
-        from mypy.nodes import TypeAlias
 
         alias = self._make_alias("mod.Missing", self.fx.a)
         alias_t = TypeAliasType(alias, [])
@@ -23939,7 +24171,7 @@ class NativeCheckcallSetopsDeferSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkcall_active
+        from mypy.checkexpr import _set_native_checkcall_active, _set_native_checkexpr_active
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
@@ -23959,7 +24191,6 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         self._set_checkcall_active(True)
 
     def tearDown(self) -> None:
-        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkcall_active
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._set_active(False)
@@ -23984,8 +24215,8 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         `None` providers is safe (matching the existing `method_fullname`
         suite which passes `None` for the checker).
         """
-        from mypy.checkexpr import ExpressionChecker
         from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker
         from mypy.errors import Errors
         from mypy.messages import MessageBuilder
         from mypy.nodes import MypyFile, SymbolTable
