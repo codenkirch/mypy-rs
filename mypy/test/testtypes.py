@@ -23555,6 +23555,64 @@ class NativeClassDecoratorCommonSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMagicBaseSuite(Suite):
+    """Parity for the magic-base skip and core-builtin gate classifiers
+    (semanal_bases.rs). Direct seam calls only; the Python shim keeps the
+    continue / side effects.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+
+    def _is_magic(self, base_expr: Expression) -> bool:
+        from mypy.types import TPDICT_NAMES, TYPED_NAMEDTUPLE_NAMES
+
+        return self._tk.rust_is_magic_base(
+            base_expr, TYPED_NAMEDTUPLE_NAMES, TPDICT_NAMES
+        )
+
+    def test_magic_namedtuple_refexpr(self) -> None:
+        for fullname in (
+            "typing.NamedTuple",
+            "typing_extensions.NamedTuple",
+            "typing.TypedDict",
+            "typing_extensions.TypedDict",
+            "mypy_extensions.TypedDict",
+        ):
+            node = NameExpr(fullname.rsplit(".", 1)[-1])
+            node.fullname = fullname
+            assert self._is_magic(node) is True, fullname
+        node = NameExpr("Foo")
+        node.fullname = "mod.Foo"
+        assert self._is_magic(node) is False
+
+    def test_magic_tpdict_callexpr(self) -> None:
+        callee = NameExpr("TypedDict")
+        callee.fullname = "typing.TypedDict"
+        call = CallExpr(callee, [StrExpr("X")], [ARG_POS], [None])
+        assert self._is_magic(call) is True
+        callee = NameExpr("NamedTuple")
+        callee.fullname = "typing.NamedTuple"
+        call = CallExpr(callee, [StrExpr("X")], [ARG_POS], [None])
+        assert self._is_magic(call) is False
+
+    def test_core_builtin(self) -> None:
+        from mypy.semanal import CORE_BUILTIN_CLASSES
+
+        assert self._tk.rust_is_core_builtin_class(
+            "builtins", "object", CORE_BUILTIN_CLASSES
+        ) is True
+        assert self._tk.rust_is_core_builtin_class(
+            "mod", "object", CORE_BUILTIN_CLASSES
+        ) is False
+        assert self._tk.rust_is_core_builtin_class(
+            "builtins", "Foo", CORE_BUILTIN_CLASSES
+        ) is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypesCallableSuite(Suite):
     """Parity for the native Callable-vs-Callable routing in
     `rust_is_subtype` (Stage C1, #719).
