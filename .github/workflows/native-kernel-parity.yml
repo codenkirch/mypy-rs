@@ -51,7 +51,7 @@ concurrency:
 
 jobs:
   parity:
-    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -150,7 +150,7 @@ jobs:
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix
     # (#201) landed and the typeops corpus passes. Keep green before merging.
-    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
