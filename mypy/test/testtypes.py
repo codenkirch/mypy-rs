@@ -23685,6 +23685,98 @@ class NativeEnumProtocolClassifierSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypedDictCallSuite(Suite):
+    """Parity for the Rust `check_typeddict_call` dispatch classifier.
+
+    `check_typeddict_call` (mypy/checkexpr.py) picks one of four branches
+    from the call's `args` and `arg_kinds`, then routes to a kwargs/dict
+    body or reports INVALID_TYPEDDICT_ARGS. The Rust port decides that
+    structural branch from live AST objects; every branch body stays in
+    Python. The golden reference below transcribes the original isinstance
+    chain independently, so a gate-on result that differs from it, or a
+    silent deferral (None), both fail.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _python_tag(self, args: list[Expression], arg_kinds: list[ArgKind]) -> int:
+        # Golden reference: the original isinstance chain in
+        # check_typeddict_call, transcribed independently of the Rust port.
+        if args and all(ak in (ARG_NAMED, ARG_STAR2) for ak in arg_kinds):
+            return 0
+        if len(args) == 1 and arg_kinds[0] == ARG_POS:
+            unique_arg = args[0]
+            if isinstance(unique_arg, DictExpr):
+                return 1
+            if isinstance(unique_arg, CallExpr) and isinstance(
+                unique_arg.analyzed, DictExpr
+            ):
+                return 2
+        if not args:
+            return 3
+        return 4
+
+    def _assert_par(self, args: list[Expression], arg_kinds: list[ArgKind]) -> None:
+        from mypy.checkexpr import _try_native_classify_typeddict_call
+
+        expected = self._python_tag(args, arg_kinds)
+        native = _try_native_classify_typeddict_call(args, arg_kinds)
+        assert native is not None, f"native classifier deferred for tag {expected}"
+        assert native == expected, f"native tag {native} != golden {expected}"
+
+    def _assert_engages(self, args: list[Expression], arg_kinds: list[ArgKind]) -> None:
+        tag = _type_kernel.rust_classify_typeddict_call(
+            args, [ak.value for ak in arg_kinds]
+        )
+        assert tag is not None, "direct seam returned None"
+
+    def test_kwargs(self) -> None:
+        self._assert_par([StrExpr("x"), NameExpr("extras")], [ARG_NAMED, ARG_STAR2])
+
+    def test_dict_expr(self) -> None:
+        args = [DictExpr([(StrExpr("x"), StrExpr("42"))])]
+        self._assert_par(args, [ARG_POS])
+
+    def test_dict_call(self) -> None:
+        dict_expr = DictExpr([(StrExpr("x"), StrExpr("42"))])
+        callee = NameExpr("dict")
+        args = [CallExpr(callee, [StrExpr("x")], [ARG_POS], [None], analyzed=dict_expr)]
+        self._assert_par(args, [ARG_POS])
+
+    def test_empty(self) -> None:
+        self._assert_par([], [])
+
+    def test_invalid(self) -> None:
+        self._assert_par([StrExpr("x"), StrExpr("y")], [ARG_POS, ARG_POS])
+
+    def test_single_positional_non_dict(self) -> None:
+        # One positional arg that is neither DictExpr nor dict-literal.
+        self._assert_par([NameExpr("foo")], [ARG_POS])
+
+    def test_call_with_unanalyzed_callee(self) -> None:
+        # A CallExpr whose `.analyzed` is None falls through to invalid.
+        args = [CallExpr(NameExpr("dict"), [], [], [])]
+        self._assert_par(args, [ARG_POS])
+
+    def test_direct_seam_engages(self) -> None:
+        shapes = [
+            ([StrExpr("x")], [ARG_NAMED]),
+            ([DictExpr([(StrExpr("x"), StrExpr("1"))])], [ARG_POS]),
+            ([NameExpr("f")], [ARG_STAR2]),
+            ([], []),
+        ]
+        for args, arg_kinds in shapes:
+            self._assert_engages(args, arg_kinds)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypesCallableSuite(Suite):
     """Parity for the native Callable-vs-Callable routing in
     `rust_is_subtype` (Stage C1, #719).

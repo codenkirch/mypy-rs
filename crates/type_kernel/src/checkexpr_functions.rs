@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyFrozenSet, PyString, PyTuple, PyType};
+use pyo3::types::{PyBytes, PyFrozenSet, PyList, PyString, PyTuple, PyType};
 
 use crate::operators::is_operator_method_name;
 use crate::setops::is_type_obj_callable;
@@ -2856,6 +2856,60 @@ fn slice_items(
         }
     }
     result
+}
+
+/// Classify `check_typeddict_call`'s dispatch tag from live Python AST
+/// objects. `args` is the call argument expression list and `arg_kinds` the
+/// parallel list of `ArgKind.value` ints. Returns the branch tag 0..4
+/// (kwargs/dict-expr/dict-call/empty/invalid), or None to defer on a shape
+/// mismatch or unexpected arg-kind value.
+#[pyfunction]
+pub(crate) fn rust_classify_typeddict_call(
+    py: Python<'_>,
+    args: &PyList,
+    arg_kinds: &PyList,
+) -> PyResult<Option<i64>> {
+    if args.len() != arg_kinds.len() {
+        return Ok(None);
+    }
+    let mut kinds = Vec::with_capacity(arg_kinds.len());
+    for item in arg_kinds.iter() {
+        match item.extract::<i64>() {
+            Ok(k) => kinds.push(k),
+            Err(_) => return Ok(None),
+        }
+    }
+
+    // 0: kwargs — every arg is a keyword or ** unpack.
+    if !args.is_empty() && kinds.iter().all(|&k| k == ARG_NAMED || k == ARG_STAR2) {
+        return Ok(Some(0));
+    }
+
+    // 1: single positional DictExpr. 2: single positional dict-literal
+    // CallExpr whose `.analyzed` is a DictExpr.
+    if args.len() == 1 && kinds[0] == ARG_POS {
+        let unique_arg = args.get_item(0)?;
+        let nodes_mod = py.import("mypy.nodes")?;
+        let dict_expr_cls: &PyType = nodes_mod.getattr("DictExpr")?.downcast()?;
+        let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+        if unique_arg.is_instance(dict_expr_cls)? {
+            return Ok(Some(1));
+        }
+        if unique_arg.is_instance(call_expr_cls)? {
+            let analyzed = unique_arg.getattr("analyzed")?;
+            if !analyzed.is_none() && analyzed.is_instance(dict_expr_cls)? {
+                return Ok(Some(2));
+            }
+        }
+    }
+
+    // 3: no args.
+    if args.is_empty() {
+        return Ok(Some(3));
+    }
+
+    // 4: anything else is invalid.
+    Ok(Some(4))
 }
 
 #[cfg(test)]
