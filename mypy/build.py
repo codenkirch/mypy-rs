@@ -876,6 +876,12 @@ class BuildManager:
         # starts from an empty resolver and an empty typeinfo map.
         self._native_resolver: Any = None
         self._native_typeinfo_map: dict[str, TypeInfo] = {}
+        # Modules already walked for TypeInfo/TypeAlias collection.
+        # Subsequent SCCs walk only new + just-sealed + builtins modules.
+        # Cleared by `_clear_native_resolvers`.
+        self._native_walked_modules: set[str] = set()
+        # Persistent alias map, grown incrementally per SCC.
+        self._native_alias_map: dict[str, TypeAlias] = {}
         # Share same modules dictionary with the global fixer state.
         # We need to set allow_missing when doing a fine-grained cache
         # load because we need to gracefully handle missing modules.
@@ -1389,7 +1395,45 @@ class BuildManager:
         """
         return {alias.fullname: alias for alias in self._collect_aliases()}
 
-    def _build_native_resolvers(self) -> None:
+    def _collect_incremental(self, scc: list[str]) -> tuple[list[TypeInfo], list[TypeAlias]]:
+        """Collect TypeInfos and TypeAliases from new and just-sealed modules.
+
+        First call walks all loaded modules (populating
+        `_native_walked_modules`). Subsequent calls walk only:
+        (a) modules in the current SCC (just semantically analyzed —
+        TypeAlias nodes are created during semanal, not parse, so a
+        module walked before its SCC sealed misses them), and
+        (b) modules not yet seen (first appearance in `self.modules`),
+        and (c) `builtins` (promotion lists grow every SCC).
+        This avoids re-walking the full module graph (~200 modules x 537
+        SCCs) when only a few modules changed since the last call.
+        """
+        from mypy.nodes import TypeInfo
+
+        infos: list[TypeInfo] = []
+        aliases: list[TypeAlias] = []
+        walked = self._native_walked_modules
+        scc_set = set(scc)
+        for mod_id, module in self.modules.items():
+            if module is None:
+                continue  # type: ignore[unreachable]
+            in_scc = mod_id in scc_set
+            is_new = mod_id not in walked
+            is_builtins = mod_id == "builtins"
+            if not in_scc and not is_new and not is_builtins:
+                continue
+            if is_new:
+                walked.add(mod_id)
+            for sym in module.names.values():
+                node = sym.node
+                if isinstance(node, TypeInfo):
+                    infos.append(node)
+                    self._collect_nested_type_infos(node, infos)
+                elif isinstance(node, TypeAlias):
+                    aliases.append(node)
+        return infos, aliases
+
+    def _build_native_resolvers(self, scc: list[str]) -> None:
         """Build or incrementally extend the `NativeTypeResolver` snapshot
         and install it on the subtype/join shims.
 
@@ -1445,8 +1489,7 @@ class BuildManager:
         from mypy.mro import _set_native_mro_resolver
         from mypy.subtypes import _set_native_subtype_resolver
 
-        type_infos = self._collect_type_infos()
-        aliases = self._collect_aliases()
+        type_infos, aliases = self._collect_incremental(scc)
         if self._native_resolver is None:
             resolver = _type_kernel.build_native_resolver(type_infos, aliases, self.modules)
             # Grow the accumulated fullname -> TypeInfo map with this
@@ -1495,7 +1538,9 @@ class BuildManager:
         # `_clear_native_resolvers` (per-SCC resets must not drop it).
         from mypy.wirefixup import set_wire_alias_map
 
-        set_wire_alias_map(self._collect_alias_map())
+        for alias in aliases:
+            self._native_alias_map[alias.fullname] = alias
+        set_wire_alias_map(self._native_alias_map)
         # Stage 3d: expand_type is wired to production. It defers
         # (returns None) for bound methods, ParamSpec/Unpack args,
         # empty envs, and any result still carrying a TypeVar-like node,
@@ -1574,6 +1619,8 @@ class BuildManager:
             return
         self._native_resolver = None
         self._native_typeinfo_map = {}
+        self._native_walked_modules = set()
+        self._native_alias_map = {}
         # The accumulated typeinfo map is re-created for the new build;
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
@@ -5616,7 +5663,7 @@ def process_stale_scc(graph: Graph, ascc: SCC, manager: BuildManager) -> None:
     # snapshotted fullnames so the expensive per-TypeInfo reads happen
     # once per build, not once per SCC (issue #599). See
     # `_build_native_resolvers` for the kernel status.
-    manager._build_native_resolvers()
+    manager._build_native_resolvers(scc)
     # Track what modules aren't yet done, so we can finish them as soon
     # as possible, saving memory.
     unfinished_modules = set(stale)

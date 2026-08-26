@@ -469,6 +469,25 @@ taint check for str/int/bool/object no-arg Instances. Real per-call
 CPU reduction but does not move the work-share needle alone. Issue
 #891 tracks the serialize diagnosis.
 
+Measured 2026-08-26 (after PR #893, incremental resolver collection per
+SCC, fresh `type_kernel` release `.so`, cold cache, quiet machine, 3
+pairs, median-of-ratios via `scripts/measure_work_share.py`):
+
+| phase | python | native | share |
+|-------|--------|--------|-------|
+| parse_time | 6.94s | 7.05s | -0.7% |
+| semanal_time | 3.65s | 4.76s | -30.2% |
+| type_check_time | 12.54s | 22.80s | -82.4% |
+| total | 23.13s | 34.61s | -49.2% |
+
+The incremental collection cut the per-SCC full-graph walk (previously
+~200 modules x 537 SCC calls; now only new + just-sealed + builtins per
+call). Total share moved -59.7% -> -49.2% (+10.5pp). The named lever
+(a) in the 08-22 diagnosis is now shipped; lever (b) (residual wire
+serialize traffic in Python callers) remains the next target. Parity
+green: testtypes 1523p/3s, testcheck 8144p/69s/7xf, testfinegrained
+747p/27s, testmodulefinder+testgraph 27p.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):
