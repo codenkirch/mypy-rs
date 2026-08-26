@@ -163,6 +163,26 @@ def _wire_cache_enabled() -> bool:
     return _type_wire_cache_enabled
 
 
+# Serialize-side instrumentation (env-gated via MYPY_SERIALIZE_STATS).
+# Zero overhead in production: the per-call sites check the bool below.
+import os as _os
+
+_serialize_stats_on: bool = bool(_os.environ.get("MYPY_SERIALIZE_STATS"))
+_serialize_stats = {
+    "calls": 0,
+    "hits": 0,
+    "builtin": 0,
+    "writes": 0,
+    "tvar": 0,
+    "bytes": 0,
+}
+
+
+def _clear_serialize_stats() -> None:
+    for k in _serialize_stats:
+        _serialize_stats[k] = 0
+
+
 TUPLE_NAMES: Final = ("builtins.tuple", "typing.Tuple")
 TYPE_NAMES: Final = ("builtins.type", "typing.Type")
 
@@ -4596,8 +4616,67 @@ def _set_native_visitor_types_active(active: bool) -> None:
 
 
 def _serialize_type_for_visitor(t: Type) -> bytes:
+    if _serialize_stats_on:
+        _serialize_stats["calls"] += 1
+    key = id(t)
+    if _wire_cache_enabled():
+        entry = _type_wire_cache.get(key)
+        if entry is not None and entry[0] is t:
+            if _serialize_stats_on:
+                _serialize_stats["hits"] += 1
+            return entry[1]
+    fast = _encode_no_arg_instance(t, _VisitorWriteBuffer)
+    if fast is not None:
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+            if _serialize_stats_on:
+                _serialize_stats["writes"] += 1
+                _serialize_stats["bytes"] += len(fast)
+            _type_wire_cache[key] = (t, fast)
+        return fast
     buf = _VisitorWriteBuffer()
-    t.write(buf)
+    result, saw_tvar = _serialize_with_taint_check(t, buf)
+    if saw_tvar:
+        if _serialize_stats_on:
+            _serialize_stats["tvar"] += 1
+    elif _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+        if _serialize_stats_on:
+            _serialize_stats["writes"] += 1
+            _serialize_stats["bytes"] += len(result)
+        _type_wire_cache[key] = (t, result)
+    return result
+
+
+def _encode_no_arg_instance(t: Type, buf_cls) -> bytes | None:
+    """Fast-path encode a no-arg Instance, bypassing the taint check.
+
+    A no-arg Instance with no last_known_value and no extra_attrs cannot
+    contain a TypeVar-like type, so the taint check (_serialize_with_taint_check)
+    is guaranteed to return saw_tvar=False. Skipping it avoids the session
+    management overhead (depth tracking, saw_tvar reset, function call)
+    for the most common serialize target.
+
+    Returns the encoded bytes, or None if t is not a cacheable no-arg Instance.
+    """
+    if type(t) is not Instance:
+        return None
+    if t.args or t.last_known_value or t.extra_attrs:
+        return None
+    fn = t.type.fullname
+    buf = buf_cls()
+    write_tag(buf, INSTANCE)
+    if fn == "builtins.str":
+        write_tag(buf, INSTANCE_STR)
+    elif fn == "builtins.function":
+        write_tag(buf, INSTANCE_FUNCTION)
+    elif fn == "builtins.int":
+        write_tag(buf, INSTANCE_INT)
+    elif fn == "builtins.bool":
+        write_tag(buf, INSTANCE_BOOL)
+    elif fn == "builtins.object":
+        write_tag(buf, INSTANCE_OBJECT)
+    else:
+        write_tag(buf, INSTANCE_SIMPLE)
+        write_str_bare(buf, fn)
     return buf.getvalue()
 
 

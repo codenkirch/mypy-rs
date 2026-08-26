@@ -1023,7 +1023,11 @@ class BuildManager:
         # reached via #224, residual recursive-alias gap fixed via #225/#231).
         from mypy.semanal import _set_native_semanal_active
 
-        _set_native_semanal_active(self.options.native_type_kernel)
+        import os as _os_semanal
+        _set_native_semanal_active(
+            self.options.native_type_kernel
+            and bool(_os_semanal.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
+        )
         # Stage 17 typeanal query helpers. Wirefixup protection in place;
         # parity-tracked on the same native_type_kernel opt-in gate.
         from mypy.typeanal import _set_native_typeanal_active
@@ -1122,7 +1126,11 @@ class BuildManager:
         _set_native_checkpattern_active(self.options.native_type_kernel)
         from mypy.semanal import _set_native_semanal_visitor_active
 
-        _set_native_semanal_visitor_active(self.options.native_type_kernel)
+        import os as _os
+        _set_native_semanal_visitor_active(
+            self.options.native_type_kernel
+            and bool(_os.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
+        )
         from mypy.semanal_shared import _set_native_semanal_shared_active
 
         _set_native_semanal_shared_active(self.options.native_type_kernel)
@@ -1684,6 +1692,11 @@ class BuildManager:
             for freeze, misses in _deser_cache_misses.items():
                 self.stats[f"deser_cache_misses_{freeze}"] = misses[0]
             self.stats["checker_decodes"] = _checker_decode_count[0]
+            from mypy.types import _serialize_stats, _serialize_stats_on
+
+            if _serialize_stats_on:
+                for key, val in _serialize_stats.items():
+                    self.stats[f"serialize_{key}"] = val
             lines = ["Stats:"]
             for key, value in sorted(self.stats_summary().items()):
                 fmt = ".3f" if isinstance(value, float) else "d"
@@ -4164,7 +4177,8 @@ class State:
             return
         from mypy.types import _set_type_wire_cache_enabled
 
-        _set_type_wire_cache_enabled(True)
+        import os as _os
+        _set_type_wire_cache_enabled(not _os.environ.get("MYPY_NO_WIRE_CACHE"))
         t0 = time_ref()
         with self.wrap_context():
             self.type_checker().check_first_pass(recurse_into_functions=recurse_into_functions)

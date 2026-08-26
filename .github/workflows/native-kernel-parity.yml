@@ -116,6 +116,7 @@ jobs:
           MYPY_NATIVE_PARITY_INSTALL_TYPEOPS_RESOLVERS: "1"
           MYPY_NATIVE_PARITY_INSTALL_CHECKER_STMTS: "1"
           MYPY_NATIVE_PARITY_INSTALL_SEMANAL_VISITOR: "1"
+          MYPY_ENABLE_NATIVE_SEMANAL: "1"
           MYPY_NATIVE_TYPE_KERNEL_REQUIRED: "1"
         run: uv run python -m pytest mypy/test/testcheck.py -q -k "not slow" --timeout=30 --timeout-method=thread
 

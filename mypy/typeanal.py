@@ -73,6 +73,7 @@ from mypy.types import (
     TYPE_ALIAS_NAMES,
     TYPE_NAMES,
     UNPACK_TYPE_NAMES,
+    _encode_no_arg_instance,
     AnyType,
     BoolTypeQuery,
     CallableArgument,
@@ -3543,6 +3544,9 @@ def native_analyze_type(
 
 
 def _serialize_typeanal_type(t: Type) -> bytes:
+    fast = _encode_no_arg_instance(t, _TypeanalWriteBuffer)
+    if fast is not None:
+        return fast
     buf = _TypeanalWriteBuffer()
     t.write(buf)
     return buf.getvalue()

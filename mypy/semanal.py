@@ -278,6 +278,7 @@ from mypy.types import (
     TYPE_VAR_LIKE_NAMES,
     TYPED_NAMEDTUPLE_NAMES,
     UNPACK_TYPE_NAMES,
+    _encode_no_arg_instance,
     AnyType,
     CallableType,
     FunctionLike,
@@ -642,6 +643,9 @@ _ACTION_BARE_PROTOCOL = 4
 
 
 def _serialize_semanal_type(t: Type) -> bytes:
+    fast = _encode_no_arg_instance(t, _SemanalWriteBuffer)
+    if fast is not None:
+        return fast
     buf = _SemanalWriteBuffer()
     t.write(buf)
     return buf.getvalue()
