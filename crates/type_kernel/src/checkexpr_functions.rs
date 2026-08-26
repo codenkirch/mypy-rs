@@ -9,8 +9,10 @@
 //!   * Functions that call `get_proper_type` (alias expansion) defer on
 //!     `TypeAliasType` since the wire format has no resolved alias target.
 
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyFrozenSet, PyString, PyTuple, PyType};
 
 use crate::operators::is_operator_method_name;
 use crate::setops::is_type_obj_callable;
@@ -1195,6 +1197,79 @@ pub(crate) fn try_getting_literal_inner(typ: &Type) -> Option<Type> {
         } => Some(lkv.as_ref().clone()),
         _ => Some(proper.clone()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// enum-callable base + protocol-test callee classifiers
+// ---------------------------------------------------------------------------
+
+/// Mirrors checkexpr.py:2586: true when `callable_node` is a RefExpr whose
+/// fullname is an Enum base.
+#[pyfunction]
+pub(crate) fn rust_is_enum_callable_base(
+    py: Python<'_>,
+    callable_node: &PyAny,
+    enum_bases: &PyAny,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if !callable_node.is_instance(ref_expr_cls)? {
+        return Ok(false);
+    }
+    let enum_set = normalize_enum_bases(enum_bases)?;
+    let fullname = callable_node.getattr("fullname")?;
+    let fullname_str: &str = fullname.downcast::<PyString>()?.to_str()?;
+    Ok(enum_set.contains(fullname_str))
+}
+
+/// Normalize `enum_bases` (frozenset, tuple, or str) into a `HashSet`.
+fn normalize_enum_bases(enum_bases: &PyAny) -> PyResult<HashSet<String>> {
+    if let Ok(fs) = enum_bases.downcast::<PyFrozenSet>() {
+        let mut result = HashSet::with_capacity(fs.len());
+        for item in fs.iter() {
+            let s = item.downcast::<PyString>()?;
+            result.insert(s.to_str()?.to_string());
+        }
+        return Ok(result);
+    }
+    if let Ok(tup) = enum_bases.downcast::<PyTuple>() {
+        let mut result = HashSet::with_capacity(tup.len());
+        for item in tup.iter() {
+            let s = item.downcast::<PyString>()?;
+            result.insert(s.to_str()?.to_string());
+        }
+        return Ok(result);
+    }
+    let s = enum_bases.downcast::<PyString>()?;
+    Ok([s.to_str()?.to_string()].into_iter().collect())
+}
+
+/// Mirrors checkexpr.py:1467-1471: which protocol-test branch a call takes.
+/// Returns the callee tag when `n_args == 2` and `callee` is a RefExpr with
+/// a isinstance/issubclass fullname; otherwise None (defer to Python).
+#[pyfunction]
+pub(crate) fn rust_classify_protocol_test_callee(
+    py: Python<'_>,
+    callee: &PyAny,
+    n_args: usize,
+) -> PyResult<Option<String>> {
+    if n_args != 2 {
+        return Ok(None);
+    }
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if !callee.is_instance(ref_expr_cls)? {
+        return Ok(None);
+    }
+    let fullname = callee.getattr("fullname")?;
+    let fullname_str: &str = fullname.downcast::<PyString>()?.to_str()?;
+    if fullname_str == "builtins.isinstance" {
+        return Ok(Some("builtins.isinstance".to_string()));
+    }
+    if fullname_str == "builtins.issubclass" {
+        return Ok(Some("builtins.issubclass".to_string()));
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------

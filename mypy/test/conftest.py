@@ -352,6 +352,32 @@ def pytest_runtest_setup(item: Any) -> None:
     for module_name, attr in _NATIVE_GATE_GLOBALS:
         module = importlib.import_module(module_name)
         _saved_native_gates.append((module, attr, getattr(module, attr, None)))
+    _reset_wire_caches()
+
+
+def _reset_wire_caches() -> None:
+    """Clear shared wire-decoded state that the gate snapshot does not cover.
+
+    `mypy.types.instance_cache` holds SHARED compact-tag singletons
+    (str/int/bool/object/function). `read_type` hands these out for
+    INSTANCE_* tags and `_TypeRefFixer` mutates them in place, resolving
+    `.type` to whatever TypeInfo the current wire map provides and clearing
+    `type_ref`. A testcheck build therefore leaves them pointing at ITS
+    TypeInfo graph; a later Native* suite reading the same compact tag gets
+    the foreign TypeInfo (the fixer skips re-resolution because `type_ref`
+    is None), so identity/parity asserts against the fixture TypeInfo fail
+    order-dependently. The bytes-keyed deserialization caches are the same
+    leak class: they pin a TypeInfo from an earlier build's wire map. Clear
+    both before every test; the maps themselves are snapshot/restored above.
+    """
+    from mypy.checker import _clear_checker_deser_cache
+    from mypy.checkmember import _clear_deser_cache
+    from mypy.types import _clear_type_wire_cache, instance_cache
+
+    instance_cache.reset()
+    _clear_type_wire_cache()
+    _clear_checker_deser_cache()
+    _clear_deser_cache()
 
 
 def pytest_runtest_teardown(item: Any, nextitem: Any) -> None:

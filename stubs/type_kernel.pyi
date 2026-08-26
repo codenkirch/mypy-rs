@@ -158,6 +158,8 @@ __all__ = [
     "rust_star_expr",
     "rust_resolve_plugin_hook",
     "rust_method_fullname",
+    "rust_is_enum_callable_base",
+    "rust_classify_protocol_test_callee",
     "rust_format_messages_default",
     "rust_format_messages_default_pretty",
     "rust_infer_constraints",
@@ -803,6 +805,8 @@ def rust_resolve_plugin_hook(
 def rust_method_fullname(
     resolver: NativeTypeResolver, type_bytes: bytes, method_name: str
 ) -> str | None: ...
+def rust_is_enum_callable_base(callable_node: Expression | None, enum_bases: Any) -> bool: ...
+def rust_classify_protocol_test_callee(callee: Expression, n_args: int) -> str | None: ...
 def rust_format_messages_default(
     error_tuples: list[tuple[str | None, int, int, int, int, str, str, str | None]],
     show_column_numbers: bool,

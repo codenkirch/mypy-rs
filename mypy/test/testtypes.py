@@ -23613,6 +23613,78 @@ class NativeMagicBaseSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEnumProtocolClassifierSuite(Suite):
+    """Direct-seam tests for the enum-callable base and protocol-test
+    callee classifiers in checkexpr_functions.rs.
+
+    `rust_is_enum_callable_base` mirrors the Enum() early-return guard in
+    `check_call_for_callable` (checkexpr.py:2590), and
+    `rust_classify_protocol_test_callee` mirrors the isinstance/issubclass
+    protocol-test gate in `visit_call_expr_inner` (checkexpr.py:1471).
+    Both classify on live AST nodes via PyO3; Python keeps the side effects.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        self.enum_bases = frozenset((
+            "enum.Enum", "enum.IntEnum", "enum.Flag",
+            "enum.IntFlag", "enum.StrEnum",
+        ))
+
+    def test_enum_callable_base_name_expr(self) -> None:
+        n = NameExpr("Enum")
+        n.fullname = "enum.Enum"
+        assert self._tk.rust_is_enum_callable_base(n, self.enum_bases) is True
+
+    def test_enum_callable_base_str_enum(self) -> None:
+        n = NameExpr("StrEnum")
+        n.fullname = "enum.StrEnum"
+        assert self._tk.rust_is_enum_callable_base(n, self.enum_bases) is True
+
+    def test_enum_callable_base_non_enum(self) -> None:
+        n = NameExpr("Foo")
+        n.fullname = "mod.Foo"
+        assert self._tk.rust_is_enum_callable_base(n, self.enum_bases) is False
+
+    def test_enum_callable_base_member_expr(self) -> None:
+        # MemberExpr is a RefExpr; with an enum fullname it should hit.
+        m = MemberExpr(NameExpr("enum"), "Enum")
+        m.fullname = "enum.Enum"
+        assert self._tk.rust_is_enum_callable_base(m, self.enum_bases) is True
+
+    def test_enum_callable_base_call_expr(self) -> None:
+        # CallExpr is NOT a RefExpr -> always False.
+        c = CallExpr(NameExpr("Enum"), [], [], [])
+        assert self._tk.rust_is_enum_callable_base(c, self.enum_bases) is False
+
+    def test_protocol_callee_isinstance(self) -> None:
+        n = NameExpr("isinstance")
+        n.fullname = "builtins.isinstance"
+        assert self._tk.rust_classify_protocol_test_callee(n, 2) == "builtins.isinstance"
+
+    def test_protocol_callee_issubclass(self) -> None:
+        n = NameExpr("issubclass")
+        n.fullname = "builtins.issubclass"
+        assert self._tk.rust_classify_protocol_test_callee(n, 2) == "builtins.issubclass"
+
+    def test_protocol_callee_len(self) -> None:
+        n = NameExpr("len")
+        n.fullname = "builtins.len"
+        assert self._tk.rust_classify_protocol_test_callee(n, 2) is None
+
+    def test_protocol_callee_isinstance_one_arg(self) -> None:
+        n = NameExpr("isinstance")
+        n.fullname = "builtins.isinstance"
+        assert self._tk.rust_classify_protocol_test_callee(n, 1) is None
+
+    def test_protocol_callee_non_ref_expr(self) -> None:
+        c = CallExpr(NameExpr("f"), [], [], [])
+        assert self._tk.rust_classify_protocol_test_callee(c, 2) is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypesCallableSuite(Suite):
     """Parity for the native Callable-vs-Callable routing in
     `rust_is_subtype` (Stage C1, #719).
