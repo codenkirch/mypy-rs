@@ -249,6 +249,7 @@ try:
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
+        rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
@@ -318,6 +319,7 @@ except ImportError:
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
+    _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
@@ -1003,6 +1005,23 @@ def _try_native_classify_call(callee: ProperType) -> int | None:
         return None
 
 
+def _try_native_classify_typeddict_call(
+    args: list[Expression], arg_kinds: list[ArgKind]
+) -> int | None:
+    """Classify a `check_typeddict_call` dispatch tag via the Rust kernel.
+
+    Returns the branch tag 0..4 (kwargs/dict-expr/dict-call/empty/invalid)
+    or None to defer. The kernel reads the live AST objects (args) plus the
+    integer arg-kind values, so no wire serializer is involved.
+    """
+    if not (_CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active):
+        return None
+    try:
+        return _rust_classify_typeddict_call(args, [ak.value for ak in arg_kinds])
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
 def _try_native_normalize_callable(callee: ProperType) -> bool | None:
     """Parity check: does the Rust normalization agree with Python?
 
@@ -1628,7 +1647,28 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         context: Context,
         orig_callee: Type | None,
     ) -> Type:
-        if args and all(ak in (ARG_NAMED, ARG_STAR2) for ak in arg_kinds):
+        tag = _try_native_classify_typeddict_call(args, arg_kinds)
+        if tag is None:
+            # Native path inactive or deferred: re-derive the dispatch tag
+            # with the original isinstance chain.
+            if args and all(ak in (ARG_NAMED, ARG_STAR2) for ak in arg_kinds):
+                tag = 0
+            elif len(args) == 1 and arg_kinds[0] == ARG_POS:
+                unique_arg = args[0]
+                if isinstance(unique_arg, DictExpr):
+                    tag = 1
+                elif isinstance(unique_arg, CallExpr) and isinstance(
+                    unique_arg.analyzed, DictExpr
+                ):
+                    tag = 2
+                else:
+                    tag = 4
+            elif not args:
+                tag = 3
+            else:
+                tag = 4
+
+        if tag == 0:
             # ex: Point(x=42, y=1337, **extras)
             # This is a bit ugly, but this is a price for supporting all possible syntax
             # variants for TypedDict constructors.
@@ -1640,21 +1680,22 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     callee, validated_kwargs, context, orig_callee, always_present_keys
                 )
             return AnyType(TypeOfAny.from_error)
-
-        if len(args) == 1 and arg_kinds[0] == ARG_POS:
+        if tag == 1:
+            # ex: Point({'x': 42, 'y': 1337, **extras})
             unique_arg = args[0]
-            if isinstance(unique_arg, DictExpr):
-                # ex: Point({'x': 42, 'y': 1337, **extras})
-                return self.check_typeddict_call_with_dict(
-                    callee, unique_arg.items, context, orig_callee
-                )
-            if isinstance(unique_arg, CallExpr) and isinstance(unique_arg.analyzed, DictExpr):
-                # ex: Point(dict(x=42, y=1337, **extras))
-                return self.check_typeddict_call_with_dict(
-                    callee, unique_arg.analyzed.items, context, orig_callee
-                )
-
-        if not args:
+            assert isinstance(unique_arg, DictExpr)
+            return self.check_typeddict_call_with_dict(
+                callee, unique_arg.items, context, orig_callee
+            )
+        if tag == 2:
+            # ex: Point(dict(x=42, y=1337, **extras))
+            unique_arg = args[0]
+            assert isinstance(unique_arg, CallExpr)
+            assert isinstance(unique_arg.analyzed, DictExpr)
+            return self.check_typeddict_call_with_dict(
+                callee, unique_arg.analyzed.items, context, orig_callee
+            )
+        if tag == 3:
             # ex: EmptyDict()
             return self.check_typeddict_call_with_kwargs(callee, {}, context, orig_callee, set())
 
