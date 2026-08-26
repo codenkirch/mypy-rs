@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   pr-gate:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +73,7 @@ jobs:
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
           # cargo emits libtype_kernel.so (Linux) / .dylib (macOS); Python's
           # import machinery wants the EXT_SUFFIX name, so rename on copy.
-          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}"
+          cp target/release/libtype_kernel.{so,dylib} "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || true
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
