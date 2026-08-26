@@ -5887,17 +5887,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         In the case that it does require usage, returns a note to attach
         to the error message.
         """
+        # Fast path: only Instance types can require usage. Anything else
+        # short-circuits before the serialize + FFI + resolver overhead.
+        if type(typ) is not Instance:
+            return None
         note_and_code = _try_native_type_requires_usage(typ)
         if note_and_code is not None:
             return note_and_code
-        proper_type = get_proper_type(typ)
-        if isinstance(proper_type, Instance):
-            # We use different error codes for generic awaitable vs coroutine.
-            # Coroutines are on by default, whereas generic awaitables are not.
-            if proper_type.type.fullname == "typing.Coroutine":
-                return ("Are you missing an await?", UNUSED_COROUTINE)
-            if proper_type.type.get("__await__") is not None:
-                return ("Are you missing an await?", UNUSED_AWAITABLE)
+        # typ is a plain Instance (checked above); get_proper_type is
+        # redundant. Different codes: coroutine vs generic awaitable.
+        if typ.type.fullname == "typing.Coroutine":
+            return ("Are you missing an await?", UNUSED_COROUTINE)
+        if typ.type.get("__await__") is not None:
+            return ("Are you missing an await?", UNUSED_AWAITABLE)
         return None
 
     def visit_expression_stmt(self, s: ExpressionStmt) -> None:
@@ -9583,38 +9585,38 @@ def conditional_types(
         UninhabitedType means unreachable.
         None means no new information can be inferred.
     """
-    # Native fast path: the Rust port mirrors every branch below and defers
-    # (returns None) whenever a sub-step Rust cannot decide is reached.
-    if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
-        try:
-            raw = _rust_conditional_types(
-                _serialize_type_for_checker(current_type),
-                _serialize_type_ranges(proposed_type_ranges)
-                if proposed_type_ranges is not None
-                else None,
-                _serialize_type_for_checker(default) if default is not None else None,
-                consider_runtime_isinstance,
-                from_equality,
-                state.strict_optional,
-                _native_checker_resolver,
-            )
-            if raw is not None:
-                yes, no = raw
-                if yes is None:
-                    yes_typ: Type | None = None
-                else:
-                    yes_typ = _deserialize_type_from_checker(bytes(yes))
-                    if yes_typ is None:
-                        raise AssertionError("wire decode produced unresolvable type_ref")
-                if no is None:
-                    no_typ: Type | None = None
-                else:
-                    no_typ = _deserialize_type_from_checker(bytes(no))
-                    if no_typ is None:
-                        raise AssertionError("wire decode produced unresolvable type_ref")
-                return yes_typ, no_typ
-        except (AssertionError, NotImplementedError, ValueError):
-            pass
+    # Native fast path: the Rust port mirrors every branch below and
+    # defers (returns None) when it can't decide. None/empty ranges are
+    # trivial returns, cheaper in Python — skip serialize for those.
+    if proposed_type_ranges is not None and proposed_type_ranges:
+        if _CHECKER_HAS_TYPE_KERNEL and _native_checker_active and _native_checker_resolver is not None:
+            try:
+                raw = _rust_conditional_types(
+                    _serialize_type_for_checker(current_type),
+                    _serialize_type_ranges(proposed_type_ranges),
+                    _serialize_type_for_checker(default) if default is not None else None,
+                    consider_runtime_isinstance,
+                    from_equality,
+                    state.strict_optional,
+                    _native_checker_resolver,
+                )
+                if raw is not None:
+                    yes, no = raw
+                    if yes is None:
+                        yes_typ: Type | None = None
+                    else:
+                        yes_typ = _deserialize_type_from_checker(bytes(yes))
+                        if yes_typ is None:
+                            raise AssertionError("wire decode produced unresolvable type_ref")
+                    if no is None:
+                        no_typ: Type | None = None
+                    else:
+                        no_typ = _deserialize_type_from_checker(bytes(no))
+                        if no_typ is None:
+                            raise AssertionError("wire decode produced unresolvable type_ref")
+                    return yes_typ, no_typ
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
     if proposed_type_ranges is None:
         # An isinstance check, but we don't understand the type
         return current_type, default
@@ -9872,9 +9874,7 @@ def builtin_item_type(tp: Type) -> Type | None:
 
 
 def is_unreachable_map(map: TypeMap) -> bool:
-    res = _try_native_is_unreachable_map(map)
-    if res is not None:
-        return res
+    # Python is cheaper: isinstance + get_proper_type vs serialize + FFI.
     return any(isinstance(get_proper_type(v), UninhabitedType) for v in map.values())
 
 
@@ -10480,6 +10480,10 @@ def is_valid_inferred_type(
     invalid.  When doing strict Optional checking, only None and types that are
     incompletely defined (i.e. contain UninhabitedType) are invalid.
     """
+    # Fast path: Instance with no args is always valid (no recursive
+    # components to check, and it's never NoneType or UninhabitedType).
+    if type(typ) is Instance and not typ.args:
+        return True
     native = _try_native_is_valid_inferred_type(
         typ, is_lvalue_final, is_lvalue_member, options.allow_redefinition
     )
@@ -11131,6 +11135,9 @@ def partition_equality_ambiguous_types(
     still narrow the enum portion of the union, but we must keep the str portion in both
     branches.
     """
+    # Fast path: identity comparisons never produce ambiguous partitions.
+    if is_identity:
+        return current_type, None
     if (
         _CHECKER_HAS_TYPE_KERNEL
         and _native_checker_active
@@ -11166,9 +11173,6 @@ def partition_equality_ambiguous_types(
                 )
         except (AssertionError, NotImplementedError, ValueError, TypeError):
             pass
-
-    if is_identity:
-        return current_type, None
 
     typ = get_proper_type(current_type)
     items = typ.relevant_items() if isinstance(typ, UnionType) else [current_type]

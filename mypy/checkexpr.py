@@ -1517,46 +1517,25 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         """
         object_type = get_proper_type(object_type)
 
-        # M25: resolve the qualified name against the shared type-info
-        # snapshot in Rust. Defers (None) and falls back to Python for
-        # any case the kernel cannot decide.
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _native_checkexpr_resolver is not None
-        ):
-            try:
-                result = _rust_method_fullname(
-                    _native_checkexpr_resolver,
-                    _serialize_type_for_checkexpr(object_type),
-                    method_name,
-                )
-                if result is not None:
-                    return result
-            except (AssertionError, NotImplementedError):
-                pass
-
-        if isinstance(object_type, CallableType) and object_type.is_type_obj():
-            # For class method calls, object_type is a callable representing the class object.
-            # We "unwrap" it to a regular type, as the class/instance method difference doesn't
-            # affect the fully qualified name.
-            object_type = object_type.get_instance_type()
-        elif isinstance(object_type, TypeType):
-            object_type = object_type.item
-
-        type_name = None
+        # Fast path for the common types — avoids serialize + FFI overhead.
         if isinstance(object_type, Instance):
-            type_name = object_type.type.fullname
-        elif isinstance(object_type, (TypedDictType, LiteralType)):
-            info = object_type.fallback.type.get_containing_type_info(method_name)
-            type_name = info.fullname if info is not None else None
-        elif isinstance(object_type, TupleType):
-            type_name = tuple_fallback(object_type).type.fullname
-
-        if type_name:
-            return f"{type_name}.{method_name}"
-        else:
+            return f"{object_type.type.fullname}.{method_name}"
+        if isinstance(object_type, CallableType) and object_type.is_type_obj():
+            instance_type = object_type.get_instance_type()
+            if isinstance(instance_type, Instance):
+                return f"{instance_type.type.fullname}.{method_name}"
             return None
+        if isinstance(object_type, TypeType):
+            object_type = object_type.item
+            if isinstance(object_type, Instance):
+                return f"{object_type.type.fullname}.{method_name}"
+            return None
+        if isinstance(object_type, (TypedDictType, LiteralType)):
+            info = object_type.fallback.type.get_containing_type_info(method_name)
+            return f"{info.fullname}.{method_name}" if info is not None else None
+        if isinstance(object_type, TupleType):
+            return f"{tuple_fallback(object_type).type.fullname}.{method_name}"
+        return None
 
     def always_returns_none(self, node: Expression) -> bool:
         """Check if `node` refers to something explicitly annotated as only returning None."""
@@ -2474,10 +2453,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         callee = get_proper_type(callee)
 
         # Stage 4: the Rust classifier must agree with the dispatch chain;
-        # disagreement fails loudly. CALL_OTHER defers to the chain
-        # (Python recurses on TypeVar/TupleType there). Only run when CI
-        # requires native verification — the serialize cost is pure overhead
-        # on this hot path otherwise.
+        # disagreement fails loudly. Only run when CI requires native
+        # verification — the serialize cost is pure overhead otherwise.
         if (
             _CHECKEXPR_HAS_TYPE_KERNEL
             and _native_checkexpr_active
@@ -4579,20 +4556,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return result
 
     def real_union(self, typ: Type) -> bool:
-        if (
-            _CHECKEXPR_HAS_TYPE_KERNEL
-            and _native_checkexpr_active
-            and _native_checkexpr_resolver is not None
-        ):
-            try:
-                type_bytes = _serialize_type_for_checkexpr(typ)
-                result = _rust_real_union(
-                    _native_checkexpr_resolver, type_bytes, state.strict_optional
-                )
-                if result is not None:
-                    return result
-            except (AssertionError, NotImplementedError, ValueError):
-                pass
+        # Python is cheaper: isinstance + len vs serialize + FFI.
         typ = get_proper_type(typ)
         return isinstance(typ, UnionType) and len(typ.relevant_items()) > 1
 
@@ -8253,6 +8217,9 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
 def has_any_type(t: Type, ignore_in_type_obj: bool = False) -> bool:
     """Whether t contains an Any type"""
+    # Fast path: Instance with no args cannot contain Any.
+    if type(t) is Instance and not t.args:
+        return False
     if (
         _CHECKEXPR_HAS_TYPE_KERNEL
         and _native_checkexpr_active
@@ -8418,6 +8385,9 @@ class ArgInferSecondPassQuery(types.BoolTypeQuery):
 
 
 def has_erased_component(t: Type | None) -> bool:
+    # Fast path: Instance with no args cannot contain ErasedType.
+    if t is not None and type(t) is Instance and not t.args:
+        return False
     if (
         t is not None
         and _CHECKEXPR_HAS_TYPE_KERNEL
@@ -8445,6 +8415,9 @@ class HasErasedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_uninhabited_component(t: Type | None) -> bool:
+    # Fast path: Instance with no args cannot contain UninhabitedType.
+    if t is not None and type(t) is Instance and not t.args:
+        return False
     if (
         t is not None
         and _CHECKEXPR_HAS_TYPE_KERNEL
@@ -8472,6 +8445,9 @@ class HasUninhabitedComponentsQuery(types.BoolTypeQuery):
 
 
 def has_ambiguous_uninhabited_component(t: Type | None) -> bool:
+    # Fast path: Instance with no args cannot contain UninhabitedType.
+    if t is not None and type(t) is Instance and not t.args:
+        return False
     if (
         t is not None
         and _CHECKEXPR_HAS_TYPE_KERNEL
