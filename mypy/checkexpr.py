@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import enum
 import itertools
+import os
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -2474,8 +2475,14 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         # Stage 4: the Rust classifier must agree with the dispatch chain;
         # disagreement fails loudly. CALL_OTHER defers to the chain
-        # (Python recurses on TypeVar/TupleType there).
-        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+        # (Python recurses on TypeVar/TupleType there). Only run when CI
+        # requires native verification — the serialize cost is pure overhead
+        # on this hot path otherwise.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED")
+        ):
             try:
                 native_kind = _try_native_classify_call(callee)
                 if native_kind is not None and native_kind != CALL_OTHER:
