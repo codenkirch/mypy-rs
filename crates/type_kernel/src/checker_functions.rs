@@ -52,6 +52,7 @@ fn is_private(node_name: &str) -> bool {
 /// `is_known` means `base_node` is one of Var / FuncBase / Decorator;
 /// `is_var` means it is specifically a Var (needed for the
 /// `not isinstance(base_node, Var)` arm).
+#[allow(clippy::too_many_arguments)]
 fn classify_final_super(
     is_known: bool,
     is_var: bool,
