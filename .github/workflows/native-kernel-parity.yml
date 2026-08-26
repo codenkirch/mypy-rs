@@ -51,7 +51,7 @@ concurrency:
 
 jobs:
   parity:
-    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -88,7 +88,7 @@ jobs:
           cargo rustc -p mypy-type-kernel --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libtype_kernel.{so,dylib} "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || cp target/release/libtype_kernel.dylib "$SCRATCH/type_kernel${EXT_SUFFIX}"
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
@@ -97,14 +97,14 @@ jobs:
           cargo rustc -p mypy-ast-serialize --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libast_serialize.{so,dylib} "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libast_serialize.so "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}" 2>/dev/null || cp target/release/libast_serialize.dylib "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}"
 
       - name: Build module_resolver extension
         run: |
           cargo rustc -p mypy-module-resolver --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libmodule_resolver.{so,dylib} "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || cp target/release/libmodule_resolver.dylib "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
 
       - name: Parity testcheck (resolvers installed)
         env:
@@ -150,7 +150,7 @@ jobs:
   parity-typeops:
     # Gating: typeops graduation (#203, M16) shipped; the truthiness fix
     # (#201) landed and the typeops corpus passes. Keep green before merging.
-    runs-on: [self-hosted, macOS, ARM64, VidiomTM]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -187,7 +187,7 @@ jobs:
           cargo rustc -p mypy-type-kernel --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libtype_kernel.{so,dylib} "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libtype_kernel.so "$SCRATCH/type_kernel${EXT_SUFFIX}" 2>/dev/null || cp target/release/libtype_kernel.dylib "$SCRATCH/type_kernel${EXT_SUFFIX}"
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
@@ -196,14 +196,14 @@ jobs:
           cargo rustc -p mypy-ast-serialize --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libast_serialize.{so,dylib} "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libast_serialize.so "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}" 2>/dev/null || cp target/release/libast_serialize.dylib "${{ env.SCRATCH }}/ast_serialize${EXT_SUFFIX}"
 
       - name: Build module_resolver extension
         run: |
           cargo rustc -p mypy-module-resolver --features extension-module \
             --lib --crate-type cdylib --release
           EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-          cp target/release/libmodule_resolver.{so,dylib} "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || true
+          cp target/release/libmodule_resolver.so "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}" 2>/dev/null || cp target/release/libmodule_resolver.dylib "${{ env.SCRATCH }}/module_resolver${EXT_SUFFIX}"
 
       - name: Parity testcheck (typeops resolvers installed)
         env:
