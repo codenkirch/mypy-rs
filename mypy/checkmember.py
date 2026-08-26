@@ -58,6 +58,9 @@ from mypy.typeops import (
 from mypy.types import (
     AnyType,
     CallableType,
+    _encode_no_arg_instance,
+    _serialize_stats,
+    _serialize_stats_on,
     DeletedType,
     FunctionLike,
     Instance,
@@ -225,10 +228,14 @@ def _clear_deser_cache() -> None:
 
 
 def _serialize_type_for_checkmember(t: Type) -> bytes:
+    if _serialize_stats_on:
+        _serialize_stats["calls"] += 1
     key = id(t)
     if _wire_cache_enabled():
         entry = _type_wire_cache.get(key)
         if entry is not None and entry[0] is t:
+            if _serialize_stats_on:
+                _serialize_stats["hits"] += 1
             return entry[1]
     if type(t) is Instance:
         fn = t.type.fullname
@@ -238,10 +245,26 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
             and not t.extra_attrs
             and fn in _BUILTIN_INSTANCE_BYTES
         ):
+            if _serialize_stats_on:
+                _serialize_stats["builtin"] += 1
             return _BUILTIN_INSTANCE_BYTES[fn]
+    fast = _encode_no_arg_instance(t, _CheckMemberWriteBuffer)
+    if fast is not None:
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+            if _serialize_stats_on:
+                _serialize_stats["writes"] += 1
+                _serialize_stats["bytes"] += len(fast)
+            _type_wire_cache[key] = (t, fast)
+        return fast
     buf = _CheckMemberWriteBuffer()
     result, saw_tvar = _serialize_with_taint_check(t, buf)
-    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+    if saw_tvar:
+        if _serialize_stats_on:
+            _serialize_stats["tvar"] += 1
+    elif _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+        if _serialize_stats_on:
+            _serialize_stats["writes"] += 1
+            _serialize_stats["bytes"] += len(result)
         _type_wire_cache[key] = (t, result)
     return result
 

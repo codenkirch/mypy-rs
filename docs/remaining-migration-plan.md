@@ -400,6 +400,75 @@ hot-path decoders cheap) but further work-share gains must come from
 reducing serialize traffic or porting whole seam chains, not from more
 decode caching.
 
+Measured 2026-08-26 (after the 13-PR deferral-reduction swarms merged,
+fresh `type_kernel` release `.so`, cold cache, quiet machine, 3 pairs,
+median-of-ratios via `scripts/measure_work_share.py`):
+
+| phase | python | native | share |
+|-------|--------|--------|-------|
+| parse_time | 8.81s | 7.78s | +9.6% |
+| semanal_time | 4.06s | 7.29s | -79.4% |
+| type_check_time | 14.02s | 29.01s | -106.9% |
+| total | 26.89s | 44.08s | -66.8% |
+
+This is the first clean measurement since the M17 baseline (08-13). The
+deferral-reduction swarms did not move the sign: the kernel remains
+net-slower than pure Python (-66.8% total), consistent with the 08-22
+isolated-seam analysis (type_check -107% there, -107% here). The
+regression predates the 13 PRs and survives them unchanged. Root cause is
+unchanged and already diagnosed: per-SCC resolver snapshot upkeep plus
+residual wire serialize traffic on seam calls outweigh per-call Rust
+savings. The named levers remain (a) incremental `_build_native_resolvers`
+across SCCs instead of a full 537x walk, and (b) cutting residual wire
+serialize/deserialize in the not-seam-gated Python callers. Deferral
+shaving is exhausted as a lever; this is now a perf-fix, not a coverage,
+goal.
+
+Measured 2026-08-26 late (seam-level A/B on the serialize side): profiled
+the two highest-delta checkexpr seams under cProfile and gated them off
+(`check_argument_count` and `check_argument_types`), then re-ran the
+work-share A/B with the seams off vs on. The cProfile deltas (2.856s vs
+0.831s for `check_argument_count`, 8.007s vs 4.089s for
+`check_argument_types`) did NOT reproduce at the wall-clock level: native
+type_check moved 29.72s (seams on) -> 28.86s (seams off), a 0.86s shift
+at or below the run-to-run noise floor, and the total share stayed -66.9%
+vs the -66.8% baseline. Conclusion: the cProfile deltas were dominated by
+cProfile's own per-call instrumentation overhead (414k
+`check_argument_count` calls X ~1us = ~0.4s of pure artifact), not by
+real serialize work. The two seams are NOT net losses; the gate was
+reverted. Serialize-side culling is exhausted as a lever. The remaining
+diagnosed bottleneck is the per-SCC `_build_native_resolvers` full-graph
+walk (lever (a) above), which no serialize/cull change can touch.
+
+Measured 2026-08-26 late-2 (semanal seam gate A/B, quiet machine, 3
+pairs, median-of-ratios, sequential with no concurrent work): toggled
+both semanal seams (`_set_native_semanal_active` and
+`_set_native_semanal_visitor_active`) off via a temporary
+`MYPY_NO_NATIVE_SEMANAL=1` env gate, then re-ran with them on.
+
+| config | total | semanal | type_check |
+|--------|-------|---------|------------|
+| semanal OFF | -63.3% | -32.5% | -113.5% |
+| semanal ON (default) | -72.2% | -68.5% | -111.3% |
+
+The semanal seams are net losses: +8.9pp total share, semanal phase
+share cut from -68.5% to -32.5%. The semanal Rust ports
+(`rust_classify_decorators`, `rust_classify_unbound_front`,
+`rust_classify_special_unbound`) pay more in wire serialize overhead
+than they save in per-call computation, because the semanal phase has
+many short calls where the fixed wire-encode cost dominates. The gates
+are now flipped from opt-OUT (`MYPY_NO_NATIVE_SEMANAL`) to opt-IN
+(`MYPY_ENABLE_NATIVE_SEMANAL=1`), so production defaults to the fast
+Python semanal path. The Rust semanal stays behind the opt-in flag
+for future work (e.g. if the serialize cost is cut via a non-wire
+interface). Parity verified: testtypes gate-on 1523 passed, gate-off
+1523 passed; testcheck gate-on 8144 passed, gate-off 8144 passed.
+Also added: no-arg Instance serialize fast-path
+(`_encode_no_arg_instance`) to all 6 serialize entry points, bypassing
+taint check for str/int/bool/object no-arg Instances. Real per-call
+CPU reduction but does not move the work-share needle alone. Issue
+#891 tracks the serialize diagnosis.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):
