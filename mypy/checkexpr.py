@@ -248,6 +248,7 @@ try:
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
+        rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
@@ -262,6 +263,7 @@ try:
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
         rust_is_duplicate_mapping as _rust_is_duplicate_mapping,
+        rust_is_enum_callable_base as _rust_is_enum_callable_base,
         rust_is_expr_literal_type as _rust_is_expr_literal_type,
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
@@ -305,6 +307,7 @@ except ImportError:
     _rust_is_non_empty_tuple = None  # type: ignore[assignment]
     _rust_is_async_def = None  # type: ignore[assignment]
     _rust_is_duplicate_mapping = None  # type: ignore[assignment]
+    _rust_is_enum_callable_base = None  # type: ignore[assignment]
     _rust_is_expr_literal_type = None  # type: ignore[assignment]
     _rust_get_partial_instance_type = None  # type: ignore[assignment]
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
@@ -314,6 +317,7 @@ except ImportError:
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
+    _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
@@ -1464,11 +1468,26 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         ret_type = self.check_call_expr_with_callee_type(
             callee_type, e, fullname, object_type, member
         )
-        if isinstance(e.callee, RefExpr) and len(e.args) == 2:
-            if e.callee.fullname in ("builtins.isinstance", "builtins.issubclass"):
-                self.check_runtime_protocol_test(e)
-            if e.callee.fullname == "builtins.issubclass":
-                self.check_protocol_issubclass(e)
+        tag: str | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                tag = _rust_classify_protocol_test_callee(e.callee, len(e.args))
+            except (AssertionError, NotImplementedError):
+                tag = None
+        if tag in ("builtins.isinstance", "builtins.issubclass") or (
+            tag is None
+            and isinstance(e.callee, RefExpr)
+            and len(e.args) == 2
+            and e.callee.fullname in ("builtins.isinstance", "builtins.issubclass")
+        ):
+            self.check_runtime_protocol_test(e)
+        if tag == "builtins.issubclass" or (
+            tag is None
+            and isinstance(e.callee, RefExpr)
+            and len(e.args) == 2
+            and e.callee.fullname == "builtins.issubclass"
+        ):
+            self.check_protocol_issubclass(e)
         if isinstance(e.callee, MemberExpr) and e.callee.name == "format":
             self.check_str_format_call(e)
         ret_type = get_proper_type(ret_type)
@@ -2583,7 +2602,17 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             instance_type = callee.get_instance_type(force_fallback=True)
             if isinstance(instance_type, Instance):
                 callable_name = instance_type.type.fullname
-        if isinstance(callable_node, RefExpr) and callable_node.fullname in ENUM_BASES:
+        enum_hit: bool | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                enum_hit = _rust_is_enum_callable_base(callable_node, ENUM_BASES)
+            except (AssertionError, NotImplementedError):
+                enum_hit = None
+        if enum_hit is True or (
+            enum_hit is None
+            and isinstance(callable_node, RefExpr)
+            and callable_node.fullname in ENUM_BASES
+        ):
             # An Enum() call that failed SemanticAnalyzerPass2.check_enum_call().
             return callee.ret_type, callee
 
