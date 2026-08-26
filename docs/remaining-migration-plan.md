@@ -488,6 +488,31 @@ serialize traffic in Python callers) remains the next target. Parity
 green: testtypes 1523p/3s, testcheck 8144p/69s/7xf, testfinegrained
 747p/27s, testmodulefinder+testgraph 27p.
 
+Measured 2026-08-26 late-3 (after PR #894, classify_call parity
+assertion gated to CI-only via `MYPY_NATIVE_TYPE_KERNEL_REQUIRED`,
+fresh `type_kernel` `.so`, cold cache, quiet machine, 5 pairs,
+median-of-ratios via `scripts/measure_work_share.py`):
+
+| phase | python | native | share |
+|-------|--------|--------|-------|
+| parse_time | 6.72s | 6.83s | -0.8% |
+| semanal_time | 3.65s | 4.74s | -29.9% |
+| type_check_time | 12.61s | 22.48s | -78.3% |
+| total | 22.98s | 34.05s | -48.3% |
+
+The gate removed the always-on `classify_call` parity assertion from
+the production hot path (checkexpr.py `check_call`), cutting 164K
+serialize round-trips (2.03M -> 1.86M calls, -8.1%). The assertion now
+runs only under `MYPY_NATIVE_TYPE_KERNEL_REQUIRED` (CI parity
+differential), not on every call. Share moved -49.2% -> -48.3%
+(modest, within noise, but real call reduction confirmed by
+`MYPY_SERIALIZE_STATS=1`). Parity green: testtypes+testinfer 1629p/3s,
+testcheck 8144p/69s/7xf. CI workflows (pr-gate, native-kernel-parity)
+switched to the self-hosted macOS ARM64 runner
+(`[self-hosted, macOS, ARM64, VidiomTM]`) per the local-runner
+directive. Issue #891 tracks the serialize diagnosis; lever (b)
+(residual wire serialize traffic) remains the next target.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):
