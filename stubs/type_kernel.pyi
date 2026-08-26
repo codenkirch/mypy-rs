@@ -2013,6 +2013,16 @@ def rust_clean_up_bases(
     in_protocol_names: Any,
     has_args: bool,
 ) -> Any: ...
+def rust_is_magic_base(
+    base_expr: Expression,
+    namedtuple_names: tuple[str, ...],
+    tpdict_names: tuple[str, ...],
+) -> bool: ...
+def rust_is_core_builtin_class(
+    cur_mod_id: str,
+    class_name: str,
+    core_names: list[str],
+) -> bool: ...
 def rust_create_errors(
     error_tuples: Any,
 ) -> Any: ...

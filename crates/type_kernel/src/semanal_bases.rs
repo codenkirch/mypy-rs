@@ -15,7 +15,10 @@
 //! binding. A `None` result means the shim could not supply clean facts and
 //! the pure-Python checks run unchanged.
 
+use std::collections::HashSet;
+
 use pyo3::prelude::*;
+use pyo3::types::{PyList, PyString, PyTuple, PyType};
 
 /// Action tags handed to the Python shim, index-aligned with the base list:
 /// - `KEEP`: not a Generic/Protocol declaration; nothing to remove.
@@ -65,6 +68,84 @@ pub(crate) fn rust_clean_up_bases(
         }),
         Some(_) | None => Ok(ACTION_KEEP),
     }
+}
+
+/// Normalize a fullname argument (str, tuple of str, or list of str) into a
+/// set. The magic-base names arrive as tuples, the core-builtin names as a
+/// list, so all three shapes are accepted.
+fn normalize_names(names: &PyAny) -> PyResult<HashSet<String>> {
+    if let Ok(s) = names.downcast::<PyString>() {
+        return Ok([s.to_str()?.to_string()].into_iter().collect());
+    }
+    if let Ok(tup) = names.downcast::<PyTuple>() {
+        let mut result = HashSet::with_capacity(tup.len());
+        for item in tup.iter() {
+            result.insert(item.extract::<String>()?);
+        }
+        return Ok(result);
+    }
+    if let Ok(lst) = names.downcast::<PyList>() {
+        let mut result = HashSet::with_capacity(lst.len());
+        for item in lst.iter() {
+            result.insert(item.extract::<String>()?);
+        }
+        return Ok(result);
+    }
+    Ok([names.extract::<String>()?].into_iter().collect())
+}
+
+/// `analyze_base_classes` magic-base skip (semanal.py:3110-3124). A
+/// `TypedDict`/`NamedTuple` base named through a `RefExpr` (or a
+/// `TypedDict(...)` call) is skipped, not analyzed as a real base.
+#[pyfunction]
+pub(crate) fn rust_is_magic_base(
+    py: Python<'_>,
+    base_expr: &PyAny,
+    namedtuple_names: &PyAny,
+    tpdict_names: &PyAny,
+) -> PyResult<bool> {
+    let namedtuple_set = normalize_names(namedtuple_names)?;
+    let tpdict_set = normalize_names(tpdict_names)?;
+
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+
+    if base_expr.is_instance(ref_expr_cls)? {
+        let fullname = base_expr.getattr("fullname")?;
+        if let Ok(s) = fullname.downcast::<PyString>() {
+            let f = s.to_str()?;
+            if namedtuple_set.contains(f) || tpdict_set.contains(f) {
+                return Ok(true);
+            }
+        }
+    }
+
+    if base_expr.is_instance(call_expr_cls)? {
+        let callee = base_expr.getattr("callee")?;
+        if callee.is_instance(ref_expr_cls)? {
+            let fullname = callee.getattr("fullname")?;
+            if let Ok(s) = fullname.downcast::<PyString>() {
+                if tpdict_set.contains(s.to_str()?) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// `SemanticAnalyzer.is_core_builtin_class` (semanal.py:2552): true only for
+/// the builtins module and the fixed core names (object, bool, function).
+#[pyfunction]
+pub(crate) fn rust_is_core_builtin_class(
+    cur_mod_id: &str,
+    class_name: &str,
+    core_names: &PyAny,
+) -> PyResult<bool> {
+    let core_set = normalize_names(core_names)?;
+    Ok(cur_mod_id == "builtins" && core_set.contains(class_name))
 }
 
 #[cfg(test)]

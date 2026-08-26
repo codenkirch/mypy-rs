@@ -440,10 +440,12 @@ try:
         rust_get_deprecated as _rust_get_deprecated,
         rust_get_name_repr_of_expr as _rust_get_name_repr_of_expr,
         rust_get_typevarlike_declaration as _rust_get_typevarlike_declaration,
+        rust_is_core_builtin_class as _rust_is_core_builtin_class,
         rust_is_defined_type_param as _rust_is_defined_type_param,
         rust_is_final_redefinition as _rust_is_final_redefinition,
         rust_is_init_only as _rust_is_init_only,
         rust_is_initial_mangled_global as _rust_is_initial_mangled_global,
+        rust_is_magic_base as _rust_is_magic_base,
         rust_is_mangled_global as _rust_is_mangled_global,
         rust_is_same_symbol as _rust_is_same_symbol,
         rust_is_same_var_from_getattr as _rust_is_same_var_from_getattr,
@@ -549,6 +551,8 @@ except ImportError:
     _rust_get_name_repr_of_expr = None  # type: ignore[assignment]
     _rust_get_typevarlike_declaration = None  # type: ignore[assignment]
     _rust_is_defined_type_param = None  # type: ignore[assignment]
+    _rust_is_core_builtin_class = None  # type: ignore[assignment]
+    _rust_is_magic_base = None  # type: ignore[assignment]
     _rust_var_is_typing_special_form = None  # type: ignore[assignment]
     _rust_get_typevarlike_declaration = None  # type: ignore[assignment]
     _rust_parse_bool = None  # type: ignore[assignment]
@@ -2552,6 +2556,13 @@ class SemanticAnalyzer(
             assert False, f"Unexpected special alias type: {type(target)}"
 
     def is_core_builtin_class(self, defn: ClassDef) -> bool:
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                return _rust_is_core_builtin_class(
+                    self.cur_mod_id, defn.name, CORE_BUILTIN_CLASSES
+                )
+            except (AssertionError, NotImplementedError):
+                pass
         return self.cur_mod_id == "builtins" and defn.name in CORE_BUILTIN_CLASSES
 
     def analyze_class_body_common(self, defn: ClassDef) -> None:
@@ -3134,20 +3145,27 @@ class SemanticAnalyzer(
         is_error = False
         bases = []
         for i, base_expr in enumerate(base_type_exprs):
-            if (
-                isinstance(base_expr, RefExpr)
-                and base_expr.fullname in TYPED_NAMEDTUPLE_NAMES + TPDICT_NAMES
-            ) or (
-                isinstance(base_expr, CallExpr)
-                and isinstance(base_expr.callee, RefExpr)
-                and base_expr.callee.fullname in TPDICT_NAMES
+            is_magic: bool | None = None
+            if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+                try:
+                    is_magic = _rust_is_magic_base(
+                        base_expr, TYPED_NAMEDTUPLE_NAMES, TPDICT_NAMES
+                    )
+                except (AssertionError, NotImplementedError):
+                    pass
+            if (is_magic is True) or (
+                is_magic is None
+                and (
+                    isinstance(base_expr, RefExpr)
+                    and base_expr.fullname in TYPED_NAMEDTUPLE_NAMES + TPDICT_NAMES
+                    or (
+                        isinstance(base_expr, CallExpr)
+                        and isinstance(base_expr.callee, RefExpr)
+                        and base_expr.callee.fullname in TPDICT_NAMES
+                    )
+                )
             ):
                 # Ignore magic bases for now.
-                # For example:
-                #  class Foo(TypedDict): ...  # RefExpr
-
-                #  class Foo(NamedTuple): ...  # RefExpr
-                #  class Foo(TypedDict("Foo", {"a": int})): ...  # CallExpr
                 continue
 
             try:
