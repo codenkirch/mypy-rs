@@ -29,8 +29,8 @@ from mypy.build import BuildManager
 def _install_native_resolvers_patch() -> None:
     original = BuildManager._build_native_resolvers
 
-    def patched(self: BuildManager) -> None:
-        original(self)
+    def patched(self: BuildManager, scc: list[str] | None = None) -> None:
+        original(self, scc or [])
         if not self.options.native_type_kernel:
             return
         try:

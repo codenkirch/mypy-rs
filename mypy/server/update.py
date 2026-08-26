@@ -720,7 +720,7 @@ def update_module_isolated(
 
     # Rebuild the native resolver snapshot so type-checking uses a
     # fresh TypeInfo graph (Fixes #335).
-    manager._build_native_resolvers()
+    manager._build_native_resolvers([])
 
     # Merge old and new ASTs.
     new_modules_dict: dict[str, MypyFile | None] = {module: state.tree}
@@ -1120,7 +1120,7 @@ def reprocess_nodes(
     semantic_analysis_for_targets(graph[module_id], nodes, graph)
     # Rebuild the native resolver snapshot so type-checking uses a
     # fresh TypeInfo graph (Fixes #335).
-    manager._build_native_resolvers()
+    manager._build_native_resolvers([])
     # Merge symbol tables to preserve identities of AST nodes. The file node will remain
     # the same, but other nodes may have been recreated with different identities, such as
     # NamedTuples defined using assignment statements.
