@@ -129,6 +129,7 @@ __all__ = [
     "rust_copy_type",
     "rust_apply_generic_arguments",
     "rust_has_no_typevars",
+    "rust_has_abstract_type",
     "rust_has_any_type",
     "rust_has_uninhabited_component",
     "rust_has_ambiguous_uninhabited_component",
@@ -712,6 +713,9 @@ def rust_apply_generic_arguments(
 def rust_has_no_typevars(type_bytes: bytes) -> bool | None: ...
 def rust_has_any_type(
     resolver: NativeTypeResolver, type_bytes: bytes, ignore_in_type_obj: bool
+) -> bool | None: ...
+def rust_has_abstract_type(
+    caller_type: ProperType, callee_type: ProperType, allow_abstract_call: bool
 ) -> bool | None: ...
 def rust_has_uninhabited_component(
     type_bytes: bytes, resolver: NativeTypeResolver

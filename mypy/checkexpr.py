@@ -255,6 +255,7 @@ try:
         rust_container_type as _rust_container_type,
         rust_dangerous_comparison as _rust_dangerous_comparison,
         rust_get_partial_instance_type as _rust_get_partial_instance_type,
+        rust_has_abstract_type as _rust_has_abstract_type,
         rust_has_ambiguous_uninhabited_component as _rust_has_ambiguous_uninhabited_component,
         rust_has_any_type as _rust_has_any_type,
         rust_has_bytes_component as _rust_has_bytes_component,
@@ -298,6 +299,7 @@ except ImportError:
     _rust_any_causes_overload_ambiguity = None  # type: ignore[assignment]
     _rust_arg_approximate_similarity = None  # type: ignore[assignment]
     _rust_all_same_types = None  # type: ignore[assignment]
+    _rust_has_abstract_type = None  # type: ignore[assignment]
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_erased_component = None  # type: ignore[assignment]
@@ -8202,6 +8204,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return self.has_abstract_type(caller_type, callee_type)
 
     def has_abstract_type(self, caller_type: ProperType, callee_type: ProperType) -> bool:
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                result = _rust_has_abstract_type(
+                    caller_type, callee_type, self.chk.allow_abstract_call
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
         return (
             isinstance(caller_type, FunctionLike)
             and isinstance(callee_type, TypeType)
