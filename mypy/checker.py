@@ -331,6 +331,7 @@ try:
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
+        rust_classify_final_super as _rust_classify_final_super,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -397,6 +398,7 @@ except ImportError:
     _rust_builtin_item_type = None  # type: ignore[assignment]
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
+    _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -445,6 +447,15 @@ except ImportError:
 # `KIND_*` in crates/type_kernel/src/overload_override.rs.
 NATIVE_OVERLOAD_KIND_UNSAFE_OVERLAP = 0
 NATIVE_OVERLOAD_KIND_NEVER_MATCH = 1
+
+# Decision tags returned by `_rust_classify_final_super`; must match
+# `KIND_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_FINAL_SUPER_PASS_NOT_BASE = 0
+NATIVE_FINAL_SUPER_PASS_PRIVATE = 1
+NATIVE_FINAL_SUPER_CANT_OVERRIDE_FINAL = 2
+NATIVE_FINAL_SUPER_PASS_ENUM = 3
+NATIVE_FINAL_SUPER_CHECK_WRITABLE = 4
+NATIVE_FINAL_SUPER_PASS_TAIL = 5
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -4617,6 +4628,39 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
         Other situations are checked in `check_final()`.
         """
+        # Native type_kernel seam: classify the pure decision in Rust
+        # (checker_functions.rs); message + writability side effects stay
+        # here. None falls through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_final_super is not None
+        ):
+            try:
+                tag = _rust_classify_final_super(
+                    base_node,
+                    bool(node.is_final),
+                    node.name,
+                    base.fullname,
+                    list(ENUM_BASES),
+                    list(ENUM_SPECIAL_PROPS),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag in (
+                    NATIVE_FINAL_SUPER_PASS_NOT_BASE,
+                    NATIVE_FINAL_SUPER_PASS_PRIVATE,
+                    NATIVE_FINAL_SUPER_PASS_ENUM,
+                    NATIVE_FINAL_SUPER_PASS_TAIL,
+                ):
+                    return True
+                if tag == NATIVE_FINAL_SUPER_CANT_OVERRIDE_FINAL:
+                    self.msg.cant_override_final(node.name, base.name, node)
+                    return False
+                if tag == NATIVE_FINAL_SUPER_CHECK_WRITABLE:
+                    self.check_if_final_var_override_writable(node.name, base_node, node)
+                    return True
         if not isinstance(base_node, (Var, FuncBase, Decorator)):
             return True
         if is_private(node.name):
