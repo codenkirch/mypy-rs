@@ -428,6 +428,7 @@ try:
         rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_decorators as _rust_classify_decorators,
+        rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_imports as _rust_classify_imports,
         rust_clean_up_bases as _rust_clean_up_bases,
         rust_classify_member_resolution as _rust_classify_member_resolution,
@@ -534,6 +535,7 @@ except ImportError:
     _rust_remove_imported_names_from_symtable = None  # type: ignore[assignment]
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
+    _rust_classify_class_decorator = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
@@ -2738,19 +2740,44 @@ class SemanticAnalyzer(
         Called on regular classes, typeddicts, and namedtuples.
         """
         info = defn.info
-        if refers_to_fullname(decorator, FINAL_DECORATOR_NAMES):
+        # Phase E1 (#624): Rust classifies the decorator, the shim applies
+        # flag writes / fails. None defers to pure-Python, so parity holds.
+        tag: str | None = None
+        deprecated_msg: str | None = None
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            try:
+                result = _rust_classify_class_decorator(
+                    decorator,
+                    (
+                        FINAL_DECORATOR_NAMES,
+                        DISJOINT_BASE_DECORATOR_NAMES,
+                        TYPE_CHECK_ONLY_NAMES,
+                        DEPRECATED_TYPE_NAMES,
+                    ),
+                )
+                if result is not None:
+                    tag, deprecated_msg = result
+            except (AssertionError, NotImplementedError):
+                pass
+        if tag == "final" or (tag is None and refers_to_fullname(decorator, FINAL_DECORATOR_NAMES)):
             info.is_final = True
-        elif refers_to_fullname(decorator, DISJOINT_BASE_DECORATOR_NAMES):
+        elif tag == "disjoint_base" or (
+            tag is None and refers_to_fullname(decorator, DISJOINT_BASE_DECORATOR_NAMES)
+        ):
             if info.is_protocol:
                 self.fail("@disjoint_base cannot be used with protocol class", decorator)
             elif info.typeddict_type is not None:
                 self.fail("@disjoint_base cannot be used with TypedDict", decorator)
             else:
                 info.is_disjoint_base = True
-        elif refers_to_fullname(decorator, TYPE_CHECK_ONLY_NAMES):
+        elif tag == "type_check_only" or (
+            tag is None and refers_to_fullname(decorator, TYPE_CHECK_ONLY_NAMES)
+        ):
             info.is_type_check_only = True
-        elif (deprecated := self.get_deprecated(decorator)) is not None:
-            info.deprecated = f"class {defn.fullname} is deprecated: {deprecated}"
+        elif tag == "deprecated" or (
+            tag is None and (deprecated_msg := self.get_deprecated(decorator)) is not None
+        ):
+            info.deprecated = f"class {defn.fullname} is deprecated: {deprecated_msg}"
 
     def clean_up_bases_and_infer_type_variables(
         self, defn: ClassDef, base_type_exprs: list[Expression], context: Context

@@ -1271,6 +1271,15 @@ def rust_classify_decorators(
         str | tuple[str, ...],
     ],
 ) -> list[str] | None: ...
+def rust_classify_class_decorator(
+    decorator: Expression,
+    name_sets: tuple[
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+        str | tuple[str, ...],
+    ],
+) -> tuple[str, str | None] | None: ...
 def rust_classify_imports(
     ids: list[tuple[str, str | None]],
     is_stub_file: bool,

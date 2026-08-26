@@ -818,6 +818,76 @@ fn is_deprecated_call(
     Ok(true)
 }
 
+/// Extract the deprecation message from a `CallExpr` decorator, mirroring the
+/// `mypy.semanal.SemanticAnalyzer.get_deprecated` staticmethod
+/// (semanal.py:1710-1718). Returns `None` when not a deprecated call.
+fn extract_deprecated_message(
+    py: Python<'_>,
+    expression: &PyAny,
+    deprecated_names: &HashSet<String>,
+) -> PyResult<Option<String>> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let call_expr_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    let str_expr_cls: &PyType = nodes_mod.getattr("StrExpr")?.downcast()?;
+
+    if !expression.is_instance(call_expr_cls)? {
+        return Ok(None);
+    }
+    let callee = expression.getattr("callee")?;
+    if !refers_to_fullname(callee, deprecated_names)? {
+        return Ok(None);
+    }
+    let args = expression.getattr("args")?;
+    let args_list = args.downcast::<PyList>()?;
+    if args_list.is_empty() {
+        return Ok(None);
+    }
+    let first_arg = args_list.get_item(0)?;
+    if !first_arg.is_instance(str_expr_cls)? {
+        return Ok(None);
+    }
+    let value = first_arg.getattr("value")?;
+    let msg: &str = value.downcast::<PyString>()?.to_str()?;
+    Ok(Some(msg.to_string()))
+}
+
+/// `mypy.semanal.SemanticAnalyzer.analyze_class_decorator_common` classifier
+/// (semanal.py:2741-2752). Returns `Some((tag, deprecated_msg))` where `tag`
+/// is `final`, `disjoint_base`, `type_check_only`, `deprecated`, or `none`;
+/// `deprecated_msg` is `Some` only for `deprecated`. The Python shim applies
+/// the flag writes and the two `@disjoint_base` `fail`s (protocol / TypedDict).
+/// Returns `None` to defer to the pure-Python body on a name-set mismatch.
+#[pyfunction]
+#[pyo3(signature = (decorator, name_sets))]
+pub(crate) fn rust_classify_class_decorator(
+    py: Python<'_>,
+    decorator: &PyAny,
+    name_sets: &PyTuple,
+) -> PyResult<Option<(String, Option<String>)>> {
+    if name_sets.len() != 4 {
+        return Ok(None);
+    }
+    let final_names = normalize_fullnames(name_sets.get_item(0)?)?;
+    let disjoint_names = normalize_fullnames(name_sets.get_item(1)?)?;
+    let tco_names = normalize_fullnames(name_sets.get_item(2)?)?;
+    let deprecated_names = normalize_fullnames(name_sets.get_item(3)?)?;
+
+    // Branch order mirrors semanal.py:2741-2752 exactly.
+    if refers_to_fullname(decorator, &final_names)? {
+        return Ok(Some(("final".to_string(), None)));
+    }
+    if refers_to_fullname(decorator, &disjoint_names)? {
+        return Ok(Some(("disjoint_base".to_string(), None)));
+    }
+    if refers_to_fullname(decorator, &tco_names)? {
+        return Ok(Some(("type_check_only".to_string(), None)));
+    }
+    if let Some(msg) = extract_deprecated_message(py, decorator, &deprecated_names)? {
+        return Ok(Some(("deprecated".to_string(), Some(msg))));
+    }
+    Ok(Some(("none".to_string(), None)))
+}
+
 // ---------------------------------------------------------------------------
 // get_name_repr_of_expr (Issue #391)
 // ---------------------------------------------------------------------------

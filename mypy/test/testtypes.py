@@ -23405,6 +23405,156 @@ class NativeCleanUpBasesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassDecoratorCommonSuite(Suite):
+    """Parity for the Rust class-decorator classifier (Phase E1, #897).
+
+    Exercises `type_kernel.rust_classify_class_decorator` directly on
+    constructed decorators and asserts the (tag, msg) pairs match the
+    pure-Python branch order of `analyze_class_decorator_common`
+    (semanal.py:2741-2752). A gate-on/off differential on the method
+    asserts parity of the side effects (flag writes, fails, deprecation).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.types import (
+            DEPRECATED_TYPE_NAMES,
+            DISJOINT_BASE_DECORATOR_NAMES,
+            FINAL_DECORATOR_NAMES,
+            TYPE_CHECK_ONLY_NAMES,
+        )
+
+        self._name_sets = (
+            FINAL_DECORATOR_NAMES,
+            DISJOINT_BASE_DECORATOR_NAMES,
+            TYPE_CHECK_ONLY_NAMES,
+            DEPRECATED_TYPE_NAMES,
+        )
+
+    def _name(self, fullname: str) -> NameExpr:
+        node = NameExpr(fullname.rsplit(".", 1)[-1])
+        node.fullname = fullname
+        return node
+
+    def _member(self, base: str, attr: str) -> MemberExpr:
+        node = MemberExpr(self._name(base), attr)
+        node.fullname = f"{base}.{attr}"
+        return node
+
+    def _call(self, callee: Expression, args: list[Expression]) -> CallExpr:
+        kinds = [ARG_POS] * len(args)
+        return CallExpr(callee, args, kinds, [None] * len(args))
+
+    def _classify(self, decorator: Expression) -> tuple[str, str | None]:
+        result = self._tk.rust_classify_class_decorator(decorator, self._name_sets)
+        assert result is not None, f"Rust returned None for {decorator!r}"
+        return result
+
+    def test_final(self) -> None:
+        assert self._classify(self._name("typing.final")) == ("final", None)
+        assert self._classify(self._name("typing_extensions.final")) == ("final", None)
+
+    def test_disjoint_base(self) -> None:
+        assert self._classify(self._name("typing.disjoint_base")) == ("disjoint_base", None)
+        assert (
+            self._classify(self._name("typing_extensions.disjoint_base"))
+            == ("disjoint_base", None)
+        )
+
+    def test_type_check_only(self) -> None:
+        assert self._classify(self._name("typing.type_check_only")) == ("type_check_only", None)
+        assert (
+            self._classify(self._name("typing_extensions.type_check_only"))
+            == ("type_check_only", None)
+        )
+
+    def test_deprecated(self) -> None:
+        deco = self._call(self._name("warnings.deprecated"), [StrExpr("msg")])
+        assert self._classify(deco) == ("deprecated", "msg")
+
+    def test_none(self) -> None:
+        assert self._classify(self._name("some.random.decorator")) == ("none", None)
+        assert self._classify(self._member("mod", "decorator")) == ("none", None)
+
+    def test_name_set_mismatch_defers(self) -> None:
+        assert self._tk.rust_classify_class_decorator(self._name("typing.final"), ()) is None
+
+    def _run_method(
+        self,
+        decorator: Expression,
+        *,
+        is_protocol: bool = False,
+        typeddict: bool = False,
+    ) -> tuple[bool, bool, bool, str | None, list[str]]:
+        from mypy import semanal
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        class _Analyzer:
+            def __init__(self) -> None:
+                self.failures: list[str] = []
+
+            def fail(self, msg: str, _ctx: object) -> None:
+                self.failures.append(msg)
+
+            @staticmethod
+            def get_deprecated(expr: Expression) -> str | None:
+                return semanal.SemanticAnalyzer.get_deprecated(expr)
+
+        defn = ClassDef("A", Block([]), None, [])
+        defn.fullname = "mod.A"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        info.is_protocol = is_protocol
+        info.typeddict_type = object() if typeddict else None
+        defn.info = info
+        analyzer = _Analyzer()
+        semanal.SemanticAnalyzer.analyze_class_decorator_common(analyzer, defn, decorator)
+        return (
+            info.is_final,
+            info.is_disjoint_base,
+            info.is_type_check_only,
+            info.deprecated,
+            analyzer.failures,
+        )
+
+    def _assert_method_parity(self, decorator: Expression, **kwargs: bool) -> None:
+        from mypy import semanal
+
+        old = semanal._native_semanal_visitor_active
+        try:
+            semanal._native_semanal_visitor_active = False
+            off = self._run_method(decorator, **kwargs)
+            semanal._native_semanal_visitor_active = True
+            on = self._run_method(decorator, **kwargs)
+        finally:
+            semanal._native_semanal_visitor_active = old
+        assert_equal(on, off, f"analyze_class_decorator_common parity for {decorator!r}")
+
+    def test_method_final_parity(self) -> None:
+        self._assert_method_parity(self._name("typing.final"))
+
+    def test_method_disjoint_base_plain_parity(self) -> None:
+        self._assert_method_parity(self._name("typing.disjoint_base"))
+
+    def test_method_disjoint_base_protocol_parity(self) -> None:
+        self._assert_method_parity(self._name("typing.disjoint_base"), is_protocol=True)
+
+    def test_method_disjoint_base_typeddict_parity(self) -> None:
+        self._assert_method_parity(self._name("typing.disjoint_base"), typeddict=True)
+
+    def test_method_type_check_only_parity(self) -> None:
+        self._assert_method_parity(self._name("typing.type_check_only"))
+
+    def test_method_deprecated_parity(self) -> None:
+        deco = self._call(self._name("warnings.deprecated"), [StrExpr("gone")])
+        self._assert_method_parity(deco)
+
+    def test_method_none_parity(self) -> None:
+        self._assert_method_parity(self._name("some.random.decorator"))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypesCallableSuite(Suite):
     """Parity for the native Callable-vs-Callable routing in
     `rust_is_subtype` (Stage C1, #719).
