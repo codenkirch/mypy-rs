@@ -29029,3 +29029,197 @@ class NativeLiteralParamSuite(Suite):
             False, False, False, True, False,
         )
         assert tag == 1, f"expected TAG_STR_LITERAL, got {tag}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMetaclassCompatibilitySuite(Suite):
+    """Parity for the Rust `check_metaclass_compatibility` decision-head port.
+
+    `TypeChecker.check_metaclass_compatibility` (checker.py:3918-3941) first
+    exempts metaclasses, protocols, named tuples, enums, and TypedDicts,
+    then flags a metaclass conflict when the class has no metaclass but a
+    base does. The Rust classifier (`checker_functions.rs`) reads the live
+    `TypeInfo` facts via PyO3 and returns a branch tag; the Python shim
+    applies the `self.fail` (METACLASS code) and `explain_metaclass_conflict`
+    + `self.note` side effects, and keeps the pure-Python body as fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off vs
+    gate-on differential drives the real TypeChecker method through a stub
+    fail/note recorder and asserts identical (fail, note) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(
+        self,
+        *,
+        fullname: str = "mod.A",
+        is_metaclass: bool = False,
+        is_protocol: bool = False,
+        is_named_tuple: bool = False,
+        is_enum: bool = False,
+        typeddict_type: object = None,
+        metaclass_type: object = None,
+        bases: list[Any] | None = None,
+    ) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.is_protocol = is_protocol
+        info.is_named_tuple = is_named_tuple
+        info.is_enum = is_enum
+        info.typeddict_type = typeddict_type
+        info.metaclass_type = metaclass_type
+        info.bases = list(bases) if bases is not None else []
+        # Give info a minimal MRO so is_metaclass() (which calls has_base)
+        # does not crash: [info] alone suffices for the non-metaclass cases.
+        info.mro = [info]
+        return info
+
+    def _base_instance(self, base_type: TypeInfo) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type=base_type)
+
+    def _tag(self, typ: TypeInfo) -> int | None:
+        return _type_kernel.rust_classify_metaclass_compat(typ)
+
+    def test_seam_exempt_metaclass(self) -> None:
+        # A TypeInfo that is a metaclass: pass. We approximate by giving it
+        # `builtins.type` in its MRO so is_metaclass() returns True.
+        t = self._typeinfo(fullname="builtins.type")
+        t.mro.append(t)  # harmless; is_metaclass short-circuits on has_base
+        # Force has_base to True by appending a fake base with the fullname.
+        from types import SimpleNamespace
+
+        fake_type = SimpleNamespace(fullname="builtins.type")
+        t.mro = [t, fake_type]
+        assert self._tag(t) == 0
+
+    def test_seam_exempt_protocol(self) -> None:
+        t = self._typeinfo(is_protocol=True)
+        assert self._tag(t) == 0
+
+    def test_seam_exempt_named_tuple(self) -> None:
+        t = self._typeinfo(is_named_tuple=True)
+        assert self._tag(t) == 0
+
+    def test_seam_exempt_enum(self) -> None:
+        t = self._typeinfo(is_enum=True)
+        assert self._tag(t) == 0
+
+    def test_seam_exempt_typeddict(self) -> None:
+        from types import SimpleNamespace
+
+        td = SimpleNamespace()  # non-None placeholder
+        t = self._typeinfo(typeddict_type=td)
+        assert self._tag(t) == 0
+
+    def test_seam_conflict(self) -> None:
+        from types import SimpleNamespace
+
+        base_type = self._typeinfo(fullname="mod.Meta")
+        base_type.metaclass_type = SimpleNamespace()  # non-None
+        base = self._base_instance(base_type)
+        t = self._typeinfo(bases=[base])
+        assert self._tag(t) == 1
+
+    def test_seam_no_conflict_class_has_metaclass(self) -> None:
+        from types import SimpleNamespace
+
+        base_type = self._typeinfo(fullname="mod.Meta")
+        base_type.metaclass_type = SimpleNamespace()
+        base = self._base_instance(base_type)
+        mc = SimpleNamespace()
+        t = self._typeinfo(metaclass_type=mc, bases=[base])
+        assert self._tag(t) == 0
+
+    def test_seam_no_conflict_no_base_metaclass(self) -> None:
+        base_type = self._typeinfo(fullname="mod.Base")
+        base = self._base_instance(base_type)
+        t = self._typeinfo(bases=[base])
+        assert self._tag(t) == 0
+
+    def test_seam_exempt_wins_over_conflict(self) -> None:
+        from types import SimpleNamespace
+
+        base_type = self._typeinfo(fullname="mod.Meta")
+        base_type.metaclass_type = SimpleNamespace()
+        base = self._base_instance(base_type)
+        # Protocol + conflict-shape: exemption short-circuits.
+        t = self._typeinfo(is_protocol=True, bases=[base])
+        assert self._tag(t) == 0
+
+    def _run(self, typ: TypeInfo) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[list[str], list[str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            fails: list[str] = []
+            notes: list[str] = []
+            chk.fail = lambda msg, ctx, *, code=None: fails.append(msg)  # type: ignore
+            chk.note = lambda msg, ctx, *, code=None: notes.append(msg)  # type: ignore
+            chk.check_metaclass_compatibility(typ)
+            return fails, notes
+
+        return check_one()  # type: ignore[return-value]
+
+    def _assert_par(self, typ: TypeInfo) -> None:
+        off = self._with_gate(False, lambda: self._run(typ))
+        on = self._with_gate(True, lambda: self._run(typ))
+        assert_equal(on, off, f"check_metaclass_compatibility parity for {typ!r}")
+
+    def test_parity_exempt_protocol(self) -> None:
+        t = self._typeinfo(is_protocol=True)
+        self._assert_par(t)
+
+    def test_parity_exempt_enum(self) -> None:
+        t = self._typeinfo(is_enum=True)
+        self._assert_par(t)
+
+    def test_parity_exempt_named_tuple(self) -> None:
+        t = self._typeinfo(is_named_tuple=True)
+        self._assert_par(t)
+
+    def test_parity_conflict(self) -> None:
+        from types import SimpleNamespace
+
+        base_type = self._typeinfo(fullname="mod.Meta")
+        base_type.metaclass_type = SimpleNamespace()
+        base = self._base_instance(base_type)
+        t = self._typeinfo(bases=[base])
+        self._assert_par(t)
+
+    def test_parity_no_conflict(self) -> None:
+        base_type = self._typeinfo(fullname="mod.Base")
+        base = self._base_instance(base_type)
+        t = self._typeinfo(bases=[base])
+        self._assert_par(t)
+
+    def test_parity_no_conflict_class_has_metaclass(self) -> None:
+        from types import SimpleNamespace
+
+        base_type = self._typeinfo(fullname="mod.Meta")
+        base_type.metaclass_type = SimpleNamespace()
+        base = self._base_instance(base_type)
+        mc = SimpleNamespace()
+        t = self._typeinfo(metaclass_type=mc, bases=[base])
+        self._assert_par(t)

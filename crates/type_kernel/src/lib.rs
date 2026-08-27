@@ -2819,6 +2819,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check_metaclass_compatibility decision-head port.
+    // Rust classifies the exempt/conflict predicate into a branch tag; the
+    // METACLASS fail + note stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_metaclass_compat,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

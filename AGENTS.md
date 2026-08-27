@@ -411,6 +411,21 @@ including:
   by `_native_checker_active` and covered by `NativeFuncDefOverrideSuite`
   in `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs
   gate-on differential).
+- `rust_classify_metaclass_compat` (issue #922) — mirrors the pure bool
+  predicate head of `TypeChecker.check_metaclass_compatibility`
+  (checker.py:3918-3941): Rust reads the exempt flags off the live
+  `TypeInfo` via PyO3 (`is_metaclass` computed via
+  `rust_typeinfo_is_metaclass`, plus `is_protocol`/`is_named_tuple`/
+  `is_enum`/`typeddict_type`/`metaclass_type`) and walks `info.bases` to
+  test whether any base carries a metaclass. Returns a branch tag:
+  0 = exempt/no-conflict, 1 = conflict-needs-fail. The Python shim applies
+  the `self.fail` (METACLASS code) and `explain_metaclass_conflict()` +
+  `self.note` side effects and keeps the pure-Python body as the fallback.
+  Defers (`None`) only on an unreadable attribute. Gated by
+  `_native_checker_active` (wired from `mypy/build.py`) and covered by
+  `NativeMetaclassCompatibilitySuite` in `mypy/test/testtypes.py` (direct
+  seam tag tests + gate-off vs gate-on differential on fail/note pairs),
+  plus pure decision unit tests in `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub
