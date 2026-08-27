@@ -333,6 +333,7 @@ try:
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
+        rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
@@ -402,6 +403,7 @@ except ImportError:
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
+    _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -473,6 +475,8 @@ NATIVE_FUNC_DEF_OVERRIDE_FILL_PARTIAL = 2
 NATIVE_FUNC_DEF_OVERRIDE_PARTIAL_INVALID = 3
 NATIVE_FUNC_DEF_OVERRIDE_BINDER_ASSIGN = 4
 NATIVE_FUNC_DEF_OVERRIDE_NO_OP = 5
+NATIVE_METACLASS_COMPAT_PASS = 0
+NATIVE_METACLASS_COMPAT_CONFLICT = 1
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -4042,6 +4046,31 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_metaclass_compatibility(self, typ: TypeInfo) -> None:
         """Ensures that metaclasses of all parent types are compatible."""
+        # Native type_kernel seam: classify the pure decision in Rust
+        # (checker_functions.rs); fail + note side effects stay here.
+        # None falls through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_metaclass_compat is not None
+        ):
+            try:
+                tag = _rust_classify_metaclass_compat(typ)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_METACLASS_COMPAT_CONFLICT:
+                    self.fail(
+                        "Metaclass conflict: the metaclass of a derived class "
+                        "must be a (non-strict) subclass of the metaclasses of "
+                        "all its bases",
+                        typ,
+                        code=codes.METACLASS,
+                    )
+                    explanation = typ.explain_metaclass_conflict()
+                    if explanation:
+                        self.note(explanation, typ, code=codes.METACLASS)
+                return
         if (
             typ.is_metaclass()
             or typ.is_protocol

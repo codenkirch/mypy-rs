@@ -423,3 +423,252 @@ mod tests {
         );
     }
 }
+
+// `TypeChecker.check_metaclass_compatibility` decision-head port
+// (checker.py:3918-3941); fail + note side effects stay in Python.
+
+/// Decision tags; values must match `NATIVE_METACLASS_COMPAT_*` in
+/// mypy/checker.py.
+const KIND_METACLASS_PASS: i64 = 0;
+const KIND_METACLASS_CONFLICT: i64 = 1;
+
+/// The pure decision over resolved facts. Kept separate from the PyO3
+/// entry so the branch algebra is unit-testable without a Python runtime.
+///
+/// `typeddict_type_is_none` is the inverted `typeddict_type is not None`
+/// test from Python (True means the attr is None, i.e. not a TypedDict).
+/// `metaclass_type_is_none` is `typ.metaclass_type is None`. The last
+/// argument is `any(base.type.metaclass_type is not None for base in bases)`.
+fn classify_metaclass_compat(
+    is_metaclass: bool,
+    is_protocol: bool,
+    is_named_tuple: bool,
+    is_enum: bool,
+    typeddict_type_is_none: bool,
+    metaclass_type_is_none: bool,
+    any_base_has_metaclass: bool,
+) -> i64 {
+    // checker.py:3920-3927: exempt metaclasses, protocols, named tuples,
+    // enums, and TypedDicts from the check.
+    if is_metaclass || is_protocol || is_named_tuple || is_enum || !typeddict_type_is_none {
+        return KIND_METACLASS_PASS;
+    }
+    // checker.py:3929-3931: conflict iff the class has no metaclass but a
+    // base does.
+    if metaclass_type_is_none && any_base_has_metaclass {
+        return KIND_METACLASS_CONFLICT;
+    }
+    KIND_METACLASS_PASS
+}
+
+/// Read a bool flag attribute off a live Python object; return `None` to
+/// defer on any read/truthiness failure (strangler-fig fallback).
+fn read_bool_attr(obj: &PyAny, name: &str) -> PyResult<Option<bool>> {
+    match obj.getattr(name) {
+        Ok(v) => match v.is_true() {
+            Ok(b) => Ok(Some(b)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// Read an attribute and report whether it is Python `None`; return `None`
+/// to defer on any read failure.
+fn read_attr_is_none(obj: &PyAny, name: &str) -> PyResult<Option<bool>> {
+    match obj.getattr(name) {
+        Ok(v) => Ok(Some(v.is_none())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_metaclass_compatibility`
+/// (mypy/checker.py:3918-3941).
+///
+/// `info` is the live `TypeInfo` under check. Rust reads the exempt flags
+/// (`is_metaclass` computed via `rust_typeinfo_is_metaclass`, the stored
+/// `is_protocol` / `is_named_tuple` / `is_enum` flags, and the
+/// `typeddict_type`/`metaclass_type` None tests) and walks `info.bases` to
+/// test whether any base carries a metaclass. Returns `Some(tag)` for the
+/// two reachable branches, or `None` to defer (an unreadable attribute).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_metaclass_compat(
+    py: Python<'_>,
+    info: &PyAny,
+) -> PyResult<Option<i64>> {
+    // `is_metaclass` is a computed method (not a stored flag), so mirror it
+    // via the existing native helper (has_base + fullname + fallback_to_any)
+    // with precise=False, matching the Python default at the call site.
+    let is_metaclass = match crate::checker_visitor::rust_typeinfo_is_metaclass(py, info, false) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    let is_protocol = match read_bool_attr(info, "is_protocol")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let is_named_tuple = match read_bool_attr(info, "is_named_tuple")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let is_enum = match read_bool_attr(info, "is_enum")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let typeddict_type_is_none = match read_attr_is_none(info, "typeddict_type")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let metaclass_type_is_none = match read_attr_is_none(info, "metaclass_type")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    // Walk `info.bases` (a list of Instance); for each base read
+    // `base.type.metaclass_type` and test `is not None`. Defer on any read
+    // failure so a malformed live object falls back to Python.
+    let any_base_has_metaclass = {
+        let bases = match info.getattr("bases") {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let bases_list = match bases.downcast::<pyo3::types::PyList>() {
+            Ok(l) => l,
+            Err(_) => return Ok(None),
+        };
+        let mut found = false;
+        for base in bases_list.iter() {
+            let base_type = match base.getattr("type") {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            let mc = match base_type.getattr("metaclass_type") {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            if !mc.is_none() {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    Ok(Some(classify_metaclass_compat(
+        is_metaclass,
+        is_protocol,
+        is_named_tuple,
+        is_enum,
+        typeddict_type_is_none,
+        metaclass_type_is_none,
+        any_base_has_metaclass,
+    )))
+}
+
+#[cfg(test)]
+mod metaclass_compat_tests {
+    use super::*;
+
+    fn classify(
+        is_metaclass: bool,
+        is_protocol: bool,
+        is_named_tuple: bool,
+        is_enum: bool,
+        typeddict_type_is_none: bool,
+        metaclass_type_is_none: bool,
+        any_base_has_metaclass: bool,
+    ) -> i64 {
+        classify_metaclass_compat(
+            is_metaclass,
+            is_protocol,
+            is_named_tuple,
+            is_enum,
+            typeddict_type_is_none,
+            metaclass_type_is_none,
+            any_base_has_metaclass,
+        )
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_metaclass() {
+        assert_eq!(
+            classify(true, false, false, false, true, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_protocol() {
+        assert_eq!(
+            classify(false, true, false, false, true, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_named_tuple() {
+        assert_eq!(
+            classify(false, false, true, false, true, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_enum() {
+        assert_eq!(
+            classify(false, false, false, true, true, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_typeddict() {
+        // typeddict_type is not None -> typeddict_type_is_none == False.
+        assert_eq!(
+            classify(false, false, false, false, false, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_conflict() {
+        // No exempt flag, class has no metaclass, a base has one.
+        assert_eq!(
+            classify(false, false, false, false, true, true, true),
+            KIND_METACLASS_CONFLICT
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_no_conflict_class_has_metaclass() {
+        // Class already has a metaclass: no conflict even if a base has one.
+        assert_eq!(
+            classify(false, false, false, false, true, false, true),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_no_conflict_no_base_metaclass() {
+        // No base carries a metaclass: no conflict.
+        assert_eq!(
+            classify(false, false, false, false, true, true, false),
+            KIND_METACLASS_PASS
+        );
+    }
+
+    #[test]
+    fn test_classify_metaclass_compat_exempt_wins_over_conflict() {
+        // Exemption short-circuits before the conflict arm.
+        assert_eq!(
+            classify(true, false, false, false, true, true, true),
+            KIND_METACLASS_PASS
+        );
+        assert_eq!(
+            classify(false, false, false, false, false, true, true),
+            KIND_METACLASS_PASS
+        );
+    }
+}
