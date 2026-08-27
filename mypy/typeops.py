@@ -253,6 +253,21 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
     here, but this function is called in very hot code, so we try to keep it simple
     and return True only in cases we know may have problems.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
+        s_is_rec = isinstance(s, TypeAliasType) and s.is_recursive
+        t_is_rec = isinstance(t, TypeAliasType) and t.is_recursive
+        try:
+            result = _type_kernel.rust_is_recursive_pair(
+                _serialize_type(s),
+                _serialize_type(t),
+                s_is_rec,
+                t_is_rec,
+                _native_typeops_resolver,
+            )
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError):
+            pass
     if isinstance(s, TypeAliasType) and s.is_recursive:
         return (
             isinstance(get_proper_type(t), (Instance, UnionType))

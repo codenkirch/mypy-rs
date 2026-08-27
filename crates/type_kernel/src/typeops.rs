@@ -2646,6 +2646,93 @@ pub(crate) fn is_disjoint_base_inner(info: &PyAny) -> PyResult<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// is_recursive_pair
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeops.is_recursive_pair` (typeops.py:249-274): pure bool
+/// predicate, hot path in `join_types` / `meet_types` / `is_subtype`.
+///
+/// Rust classifies two wire Type bytes plus the live `is_recursive` flags
+/// (which the wire format does not carry). The alias-chain expansion
+/// (`get_proper_type`) runs through the snapshot alias resolver; when a
+/// snapshot is missing or an alias cycle is detected, the corresponding
+/// branch defers (returns `None`) and the Python caller falls back.
+///
+/// Python's `or` chain is short-circuit, so we check the resolver-free
+/// branch (`t_rec` / `s_rec`) first, then try the resolver-dependent
+/// branches. If a needed branch cannot decide, we defer only when no
+/// earlier branch already returned `True`.
+#[pyfunction]
+pub(crate) fn rust_is_recursive_pair(
+    s_bytes: &[u8],
+    t_bytes: &[u8],
+    s_is_recursive: bool,
+    t_is_recursive: bool,
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let s = decode_type(s_bytes)?;
+    let t = decode_type(t_bytes)?;
+    let aliases = resolver.alias_resolver();
+
+    let s_rec = matches!(s, Type::TypeAliasType { .. }) && s_is_recursive;
+    let t_rec = matches!(t, Type::TypeAliasType { .. }) && t_is_recursive;
+
+    if s_rec {
+        // Branch b: t is a recursive alias (resolver-free).
+        if t_rec {
+            return Some(true);
+        }
+        // Branch a: get_proper_type(t) is Instance or UnionType.
+        match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+            Some(Type::Instance { .. } | Type::UnionType { .. }) => {
+                return Some(true);
+            }
+            Some(_) => {
+                // Branch a is False, branch b is False.
+                // Branch c: get_proper_type(s) is TupleType.
+                match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+                    Some(Type::TupleType { .. }) => return Some(true),
+                    Some(_) => return Some(false),
+                    None => return None,
+                }
+            }
+            None => {
+                // Branch a undecidable. If branch c is True, the `or`
+                // is True regardless; otherwise defer (a could be True).
+                match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+                    Some(Type::TupleType { .. }) => return Some(true),
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    if t_rec {
+        // s_rec is False here (block 1 would have handled it).
+        // Branch a: get_proper_type(s) is Instance or UnionType.
+        match crate::checkexpr_functions::expand_alias_shape(&s, aliases) {
+            Some(Type::Instance { .. } | Type::UnionType { .. }) => {
+                return Some(true);
+            }
+            Some(_) => {
+                // Branch a is False. Branch c: get_proper_type(t) is TupleType.
+                match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+                    Some(Type::TupleType { .. }) => return Some(true),
+                    Some(_) => return Some(false),
+                    None => return None,
+                }
+            }
+            None => match crate::checkexpr_functions::expand_alias_shape(&t, aliases) {
+                Some(Type::TupleType { .. }) => return Some(true),
+                _ => return None,
+            },
+        }
+    }
+
+    Some(false)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4105,5 +4192,106 @@ mod tests {
             .unwrap();
             assert_eq!(ret, explicit);
         }
+    }
+
+    // --- is_recursive_pair unit tests ---
+
+    fn recursive_alias(name: &str) -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn is_recursive_pair_neither_alias_false() {
+        let s = plain_instance("A");
+        let t = plain_instance("B");
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            false,
+            false,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, Some(false));
+    }
+
+    #[test]
+    fn is_recursive_pair_s_rec_t_instance_true() {
+        let s = recursive_alias("A");
+        let t = plain_instance("B");
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            true,
+            false,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, Some(true));
+    }
+
+    #[test]
+    fn is_recursive_pair_s_rec_t_union_true() {
+        let s = recursive_alias("A");
+        let t = Type::UnionType {
+            items: vec![plain_instance("B"), plain_instance("C")],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            true,
+            false,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, Some(true));
+    }
+
+    #[test]
+    fn is_recursive_pair_both_rec_true() {
+        let s = recursive_alias("A");
+        let t = recursive_alias("B");
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            true,
+            true,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, Some(true));
+    }
+
+    #[test]
+    fn is_recursive_pair_s_not_rec_t_rec_with_instance_s_true() {
+        let s = plain_instance("A");
+        let t = recursive_alias("B");
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            false,
+            true,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, Some(true));
+    }
+
+    #[test]
+    fn is_recursive_pair_s_rec_t_other_defers_without_resolver() {
+        // s is recursive alias, t is NoneType (not Instance/Union, not rec
+        // alias). Branch c needs get_proper_type(s) which needs the alias
+        // resolver; empty resolver has no snapshot -> defer.
+        let s = recursive_alias("A");
+        let t = Type::NoneType;
+        let r = rust_is_recursive_pair(
+            &encode_type(&s).unwrap(),
+            &encode_type(&t).unwrap(),
+            true,
+            false,
+            &mut empty_resolver(),
+        );
+        assert_eq!(r, None);
     }
 }

@@ -32199,3 +32199,128 @@ class NativeEnumCheckSuite(Suite):
         off, on = self._run(info, is_stub=True)
         assert_equal(on, off, "all three arms")
 
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsRecursivePairSuite(Suite):
+    """Parity for the Rust ``rust_is_recursive_pair`` port (mypy.typeops).
+
+    Mirrors ``is_recursive_pair`` (typeops.py:249-274): a pure bool
+    predicate gating ``join_types`` / ``meet_types`` / ``is_subtype``
+    against infinite recursion.  Each test runs the public function
+    gate-off (pure Python) and gate-on (Rust seam) and asserts equal
+    answers; a direct seam call proves the Rust function engages rather
+    than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self._type_infos = [
+            self.fx.oi, self.fx.ai, self.fx.bi, self.fx.ci, self.fx.di,
+            self.fx.std_tuplei, self.fx.std_listi, self.fx.str_type_info,
+        ]
+        self._aliases: list[Any] = []
+        self._resolver = _type_kernel.build_native_resolver(self._type_infos, [])
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        self._resolver.set_live_typeinfo_map(
+            {info.fullname: info for info in self._type_infos}
+        )
+        _set_native_typeops_active(True)
+        _set_native_typeops_resolver(self._resolver)
+
+    def tearDown(self) -> None:
+        from mypy.typeops import _set_native_typeops_active, _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        _set_native_typeops_active(False)
+        _set_native_typeops_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _rebuild_resolver(self, aliases: list[Any]) -> None:
+        from mypy.typeops import _set_native_typeops_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._resolver = _type_kernel.build_native_resolver(
+            self._type_infos, aliases
+        )
+        set_wire_typeinfo_map({info.fullname: info for info in self._type_infos})
+        self._resolver.set_live_typeinfo_map(
+            {info.fullname: info for info in self._type_infos}
+        )
+        _set_native_typeops_resolver(self._resolver)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.typeops import _set_native_typeops_active
+
+        _set_native_typeops_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_typeops_active(True)
+
+    def _assert_par(self, s: Type, t: Type) -> None:
+        from mypy.typeops import is_recursive_pair
+
+        off = self._with_gate(False, lambda: is_recursive_pair(s, t))
+        on = self._with_gate(True, lambda: is_recursive_pair(s, t))
+        assert_equal(on, off, f"is_recursive_pair parity: {s} vs {t}")
+
+    def _seam(self, s: Type, t: Type) -> bool | None:
+        from mypy.typeops import _serialize_type
+
+        return _type_kernel.rust_is_recursive_pair(
+            _serialize_type(s),
+            _serialize_type(t),
+            isinstance(s, TypeAliasType) and s.is_recursive,
+            isinstance(t, TypeAliasType) and t.is_recursive,
+            self._resolver,
+        )
+
+    def test_neither_alias_false(self) -> None:
+        s = self.fx.a
+        t = self.fx.b
+        self._assert_par(s, t)
+        assert self._seam(s, t) is False
+
+    def test_s_rec_t_instance_true(self) -> None:
+        # s = recursive alias, t = Instance -> branch a True.
+        s, _ = self.fx.def_alias_1(self.fx.a)
+        t = self.fx.b
+        self._assert_par(s, t)
+
+    def test_s_rec_t_union_true(self) -> None:
+        # s = recursive alias, t = Union -> branch a True.
+        s, _ = self.fx.def_alias_1(self.fx.a)
+        t = UnionType([self.fx.a, self.fx.b])
+        self._assert_par(s, t)
+
+    def test_both_rec_true(self) -> None:
+        # Both recursive -> branch b True (resolver-free).
+        s, _ = self.fx.def_alias_1(self.fx.a)
+        t, _ = self.fx.def_alias_2(self.fx.b)
+        self._assert_par(s, t)
+
+    def test_t_rec_s_instance_true(self) -> None:
+        # t = recursive alias, s = Instance -> branch a True.
+        s = self.fx.a
+        t, _ = self.fx.def_alias_2(self.fx.b)
+        self._assert_par(s, t)
+
+    def test_non_recursive_alias_not_rec_false(self) -> None:
+        # A non-recursive TypeAliasType is not "recursive", so the
+        # predicate returns False (matches Python: is_recursive is False).
+        s = self.fx.non_rec_alias(self.fx.a)
+        t = self.fx.b
+        self._assert_par(s, t)
+
+    def test_missing_alias_snapshot_defers(self) -> None:
+        # No alias snapshot for s; t = NoneType (not Instance/Union) so
+        # branch a fails and branch c needs get_proper_type(s) -> defer.
+        # Parity holds: the shim falls back to Python on None.
+        s, _ = self.fx.def_alias_1(self.fx.a)
+        t = NoneType()
+        assert self._seam(s, t) is None
+        self._assert_par(s, t)
