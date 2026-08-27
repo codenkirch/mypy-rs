@@ -2116,6 +2116,11 @@ def fixup_partial_type(typ: Type) -> Type:
 
 def _is_disjoint_base(info: TypeInfo) -> bool:
     # It either has the @disjoint_base decorator or defines nonempty __slots__.
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            return _type_kernel.rust_is_disjoint_base(info)
+        except (AssertionError, NotImplementedError):
+            pass
     if info.is_disjoint_base:
         return True
     if not info.slots:

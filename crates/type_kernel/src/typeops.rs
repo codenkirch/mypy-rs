@@ -2594,6 +2594,58 @@ pub(crate) fn rust_is_valid_constructor(py: Python<'_>, n: &PyAny) -> PyResult<b
 }
 
 // ---------------------------------------------------------------------------
+// _is_disjoint_base
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeops._is_disjoint_base` (typeops.py:2110-2124) — does the type
+/// have the `@disjoint_base` decorator or define non-empty `__slots__`?
+///
+/// A slot is "own" when no direct base class declares it. Bases whose
+/// `slots` is `None` declare nothing. Mirrors `rust_is_magic_base`: takes
+/// a live `TypeInfo` object and reads its attributes via PyO3.
+#[pyfunction]
+pub(crate) fn rust_is_disjoint_base(info: &PyAny) -> PyResult<bool> {
+    is_disjoint_base_inner(info)
+}
+
+/// Pure decision: is `info` a disjoint base? Shared by the `#[pyfunction]`
+/// entry and `rust_can_have_shared_disjoint_base` (checker_visitor.rs).
+pub(crate) fn is_disjoint_base_inner(info: &PyAny) -> PyResult<bool> {
+    if info.getattr("is_disjoint_base")?.is_true()? {
+        return Ok(true);
+    }
+    let slots = info.getattr("slots")?;
+    if slots.is_none() {
+        return Ok(false);
+    }
+    let bases_list = info.getattr("bases")?.downcast::<PyList>()?;
+    for slot_result in slots.iter()? {
+        let slot_str: String = slot_result?.extract()?;
+        let mut owned = true;
+        for base in bases_list.iter() {
+            let base_slots = base.getattr("type")?.getattr("slots")?;
+            if base_slots.is_none() {
+                continue;
+            }
+            for base_slot_result in base_slots.iter()? {
+                let base_slot_str: String = base_slot_result?.extract()?;
+                if base_slot_str == slot_str {
+                    owned = false;
+                    break;
+                }
+            }
+            if !owned {
+                break;
+            }
+        }
+        if owned {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
