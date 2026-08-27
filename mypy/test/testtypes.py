@@ -14530,6 +14530,29 @@ class NativeTraverserSuite(Suite):
         fdef = self._find_func(tree, "f")
         assert has_return_statement(fdef) is True
 
+    def test_has_return_statement_bare_func_item(self) -> None:
+        # A bare FuncItem has no wire tag, so the serializer emits a bare
+        # LITERAL_NONE and Rust cannot see the body: the seam must defer
+        # (None) instead of silently answering False. (#1030)
+        import pytest
+
+        from mypy.nodes import ARG_POS, Argument, Block, FuncItem, ReturnStmt, StrExpr, Var
+        from mypy.traverser import (  # type: ignore[attr-defined]
+            _rust_has_return_statement,
+            _serialize_ast_node,
+        )
+
+        fi = FuncItem(  # type: ignore[abstract]
+            [Argument(Var("self"), None, None, ARG_POS)],
+            Block([ReturnStmt(StrExpr("x"))]),
+        )
+        assert _rust_has_return_statement(_serialize_ast_node(fi)) is None
+        # The pure-Python fallback cannot visit a bare FuncItem either
+        # (FuncItem.accept is not implemented): kernel-on must match that
+        # kernel-off reference exactly, not silently return False.
+        with pytest.raises(RuntimeError):
+            has_return_statement(fi)
+
     def test_has_str_expression_simple(self) -> None:
         tree = self._parse("x = 'hello'\n")
         assert has_str_expression(tree) is True

@@ -46,13 +46,19 @@ use crate::astwire::{
 /// (expr field is None/ChildField::None) from `return <expr>` (expr field
 /// is a Node). This matches the Python seeker which checks
 /// `stmt.expr is not None`.
+///
+/// Returns `None` (defer) when the root does not decode: the Python
+/// serializer emits a bare LITERAL_NONE for a node kind it has no wire
+/// tag for (e.g. a bare `FuncItem`, whose `body` therefore never reaches
+/// us), and answering `false` there would diverge from the pure-Python
+/// seeker. The Python shim falls back to `ReturnSeeker` on `None`.
 #[pyfunction]
-pub(crate) fn rust_has_return_statement(node_bytes: &[u8]) -> PyResult<bool> {
+pub(crate) fn rust_has_return_statement(node_bytes: &[u8]) -> PyResult<Option<bool>> {
     let node = match decode_node(node_bytes) {
         Some(n) => n,
-        None => return Ok(false),
+        None => return Ok(None),
     };
-    Ok(has_return_statement_inner(&node))
+    Ok(Some(has_return_statement_inner(&node)))
 }
 
 fn has_return_statement_inner(node: &AstNode) -> bool {
@@ -805,6 +811,14 @@ mod tests {
     fn test_has_return_statement_with_expr() {
         let block = make_block(vec![make_return(Some(make_int()))]);
         assert!(has_return_statement_inner(&block));
+    }
+
+    #[test]
+    fn test_decode_bare_literal_none_defers() {
+        // A bare FuncItem has no wire tag, so the Python serializer emits
+        // a bare LITERAL_NONE (tag 2). decode_node must return None so
+        // rust_has_return_statement defers instead of answering false (#1030).
+        assert!(decode_node(&[2]).is_none());
     }
 
     #[test]
