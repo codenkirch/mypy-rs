@@ -899,6 +899,23 @@ including:
   `NativeMatchArgsSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
   differential plus direct seam calls), and 5 pure decision unit tests in
   `checker_functions.rs`.
+- `rust_is_valid_constructor` (issue #967) — mirrors
+  `mypy.typeops.is_valid_constructor` (typeops.py:445-455): a pure bool
+  predicate, True for `OverloadedFuncDef`/`FuncDef`
+  (`SYMBOL_FUNCBASE_TYPES`) or for a `Decorator` whose
+  `get_proper_type(var.type)` is a `FunctionLike`. Rust reads the live
+  node via PyO3 isinstance (mirrors `rust_is_magic_base`); the Decorator
+  arm calls `mypy.types.get_proper_type(n.type)` then serializes the
+  proper type to the wire format and checks the tag is `CallableType` or
+  `Overloaded` (the wire form of `FunctionLike`), with a PyO3
+  `isinstance(..., FunctionLike)` fallback if serialization unexpectedly
+  fails. A `None` type (unanalyzed decorator) yields `False`. Always
+  returns a bool, never defers: no resolver / inference / checker
+  callbacks. Gated by `_native_typeops_active` (wired from
+  `mypy/build.py`) and covered by `NativeIsValidConstructorSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls across all branches: FuncDef, OverloadedFuncDef, Decorator
+  with CallableType/Overloaded/Instance/None type, Var, None node).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
