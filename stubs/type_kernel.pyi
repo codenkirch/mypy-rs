@@ -202,6 +202,7 @@ __all__ = [
     "rust_classify_new_signature",
     "rust_classify_func_def_override",
     "rust_classify_enum_new",
+    "rust_classify_enum_bases",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -797,6 +798,7 @@ def rust_classify_func_def_override(
     is_invalid_redefinition: bool,
 ) -> int: ...
 def rust_classify_enum_new(bases: Any) -> list[int] | None: ...
+def rust_classify_enum_bases(bases: Any) -> tuple[int, int] | None: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes
 ) -> bool | None: ...

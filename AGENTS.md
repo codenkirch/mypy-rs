@@ -451,6 +451,16 @@ including:
   the Python shim applies `self.fail` and tracks `has_new`, keeping the
   pure-Python body as the fallback. Gated by `_native_checker_active` and
   covered by `NativeEnumNewSuite` in `mypy/test/testtypes.py`.
+- `rust_classify_enum_bases` (issue #937): the Rust fold in
+  `checker_functions.rs` mirrors `TypeChecker.check_enum_bases`
+  (checker.py:3850-3876): once an enum base is seen, a later non-enum
+  mixin base is an error. Rust reads each `base.type.is_enum` bool via
+  PyO3 and returns `(enum_base_idx, violating_idx)` where
+  `violating_idx` is the index of the first non-enum base after an enum
+  base (-1 if none); the Python shim applies `self.fail` with the
+  offending enum base's `str_with_options`, keeping the pure-Python body
+  as the fallback. Gated by `_native_checker_active` and covered by
+  `NativeEnumBasesSuite` in `mypy/test/testtypes.py`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

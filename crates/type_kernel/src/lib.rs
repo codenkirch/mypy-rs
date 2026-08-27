@@ -2842,6 +2842,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #937: check_enum_bases fold. Rust classifies the first
+    // non-enum base after an enum base; self.fail stays Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_enum_bases,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,
