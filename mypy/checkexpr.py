@@ -250,6 +250,7 @@ try:
         rust_classify_call as _rust_classify_call,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
+        rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -323,6 +324,7 @@ except ImportError:
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_classify_reveal_imported = None  # type: ignore[assignment]
+    _rust_classify_super_arg_types = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -349,6 +351,18 @@ except ImportError:
     _CHECKEXPR_HAS_TYPE_KERNEL = False
 
 _native_checkexpr_active: bool = False
+
+# Decision tags returned by `_rust_classify_super_arg_types`; must match
+# the `SUPER_ARG_*` constants in checkexpr_functions.rs.
+NATIVE_SUPER_ARG_NOT_CHECKED = 0
+NATIVE_SUPER_ARG_ZERO_ARG_NO_INFO = 1
+NATIVE_SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD = 2
+NATIVE_SUPER_ARG_ZERO_ARG_OK = 3
+NATIVE_SUPER_ARG_VARARGS = 4
+NATIVE_SUPER_ARG_NON_POSITIONAL = 5
+NATIVE_SUPER_ARG_SINGLE_ARG = 6
+NATIVE_SUPER_ARG_TWO_ARG_OK = 7
+NATIVE_SUPER_ARG_TOO_MANY = 8
 
 # Stage 9 checkcall gate: when active, generic callable solving
 # (normalize + map + infer + solve + apply) routes through the Rust kernel.
@@ -7444,38 +7458,85 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         super expression when possible (for errors, anys), otherwise the pair of computed types.
         """
 
-        if not self.chk.in_checked_function():
-            return AnyType(TypeOfAny.unannotated)
-        elif len(e.call.args) == 0:
-            if not e.info:
-                # This has already been reported by the semantic analyzer.
-                return AnyType(TypeOfAny.from_error)
-            elif self.chk.scope.active_class():
-                self.chk.fail(message_registry.SUPER_OUTSIDE_OF_METHOD_NOT_SUPPORTED, e)
-                return AnyType(TypeOfAny.from_error)
+        # Native type_kernel seam (issue #956): Rust classifies the stage-1
+        # arity + scope dispatch into a branch tag. None defers to the
+        # pure-Python stage-1 body below.
+        tag: int | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                tag = _rust_classify_super_arg_types(self.chk, e)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
 
+        if tag is None:
+            if not self.chk.in_checked_function():
+                return AnyType(TypeOfAny.unannotated)
+            elif len(e.call.args) == 0:
+                if not e.info:
+                    # This has already been reported by the semantic analyzer.
+                    return AnyType(TypeOfAny.from_error)
+                elif self.chk.scope.active_class():
+                    self.chk.fail(message_registry.SUPER_OUTSIDE_OF_METHOD_NOT_SUPPORTED, e)
+                    return AnyType(TypeOfAny.from_error)
+
+                # Zero-argument super() is like super(<current class>, <self>)
+                current_type = fill_typevars(e.info)
+                type_type: ProperType = TypeType(current_type)
+
+                # Use the type of the self argument, in case it was annotated
+                method = self.chk.scope.current_function()
+                assert method is not None
+                if method.arguments:
+                    instance_type: Type = method.arguments[0].variable.type or current_type
+                else:
+                    self.chk.fail(message_registry.SUPER_ENCLOSING_POSITIONAL_ARGS_REQUIRED, e)
+                    return AnyType(TypeOfAny.from_error)
+            elif ARG_STAR in e.call.arg_kinds:
+                self.chk.fail(message_registry.SUPER_VARARGS_NOT_SUPPORTED, e)
+                return AnyType(TypeOfAny.from_error)
+            elif set(e.call.arg_kinds) != {ARG_POS}:
+                self.chk.fail(message_registry.SUPER_POSITIONAL_ARGS_REQUIRED, e)
+                return AnyType(TypeOfAny.from_error)
+            elif len(e.call.args) == 1:
+                self.chk.fail(message_registry.SUPER_WITH_SINGLE_ARG_NOT_SUPPORTED, e)
+                return AnyType(TypeOfAny.from_error)
+            elif len(e.call.args) == 2:
+                type_type = get_proper_type(self.accept(e.call.args[0]))
+                instance_type = self.accept(e.call.args[1])
+            else:
+                self.chk.fail(message_registry.TOO_MANY_ARGS_FOR_SUPER, e)
+                return AnyType(TypeOfAny.from_error)
+        elif tag == NATIVE_SUPER_ARG_NOT_CHECKED:
+            return AnyType(TypeOfAny.unannotated)
+        elif tag == NATIVE_SUPER_ARG_ZERO_ARG_NO_INFO:
+            return AnyType(TypeOfAny.from_error)
+        elif tag == NATIVE_SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD:
+            self.chk.fail(message_registry.SUPER_OUTSIDE_OF_METHOD_NOT_SUPPORTED, e)
+            return AnyType(TypeOfAny.from_error)
+        elif tag == NATIVE_SUPER_ARG_ZERO_ARG_OK:
             # Zero-argument super() is like super(<current class>, <self>)
+            assert e.info is not None
             current_type = fill_typevars(e.info)
-            type_type: ProperType = TypeType(current_type)
+            type_type = TypeType(current_type)
 
             # Use the type of the self argument, in case it was annotated
             method = self.chk.scope.current_function()
             assert method is not None
             if method.arguments:
-                instance_type: Type = method.arguments[0].variable.type or current_type
+                instance_type = method.arguments[0].variable.type or current_type
             else:
                 self.chk.fail(message_registry.SUPER_ENCLOSING_POSITIONAL_ARGS_REQUIRED, e)
                 return AnyType(TypeOfAny.from_error)
-        elif ARG_STAR in e.call.arg_kinds:
+        elif tag == NATIVE_SUPER_ARG_VARARGS:
             self.chk.fail(message_registry.SUPER_VARARGS_NOT_SUPPORTED, e)
             return AnyType(TypeOfAny.from_error)
-        elif set(e.call.arg_kinds) != {ARG_POS}:
+        elif tag == NATIVE_SUPER_ARG_NON_POSITIONAL:
             self.chk.fail(message_registry.SUPER_POSITIONAL_ARGS_REQUIRED, e)
             return AnyType(TypeOfAny.from_error)
-        elif len(e.call.args) == 1:
+        elif tag == NATIVE_SUPER_ARG_SINGLE_ARG:
             self.chk.fail(message_registry.SUPER_WITH_SINGLE_ARG_NOT_SUPPORTED, e)
             return AnyType(TypeOfAny.from_error)
-        elif len(e.call.args) == 2:
+        elif tag == NATIVE_SUPER_ARG_TWO_ARG_OK:
             type_type = get_proper_type(self.accept(e.call.args[0]))
             instance_type = self.accept(e.call.args[1])
         else:

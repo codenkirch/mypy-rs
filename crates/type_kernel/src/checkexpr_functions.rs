@@ -5678,3 +5678,226 @@ mod classify_reveal_imported_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_super_arg_types
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `_super_arg_types` stage-1 dispatch; must match
+/// `NATIVE_SUPER_ARG_*` in mypy/checkexpr.py.
+const SUPER_ARG_NOT_CHECKED: i64 = 0;
+const SUPER_ARG_ZERO_ARG_NO_INFO: i64 = 1;
+const SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD: i64 = 2;
+const SUPER_ARG_ZERO_ARG_OK: i64 = 3;
+const SUPER_ARG_VARARGS: i64 = 4;
+const SUPER_ARG_NON_POSITIONAL: i64 = 5;
+const SUPER_ARG_SINGLE_ARG: i64 = 6;
+const SUPER_ARG_TWO_ARG_OK: i64 = 7;
+const SUPER_ARG_TOO_MANY: i64 = 8;
+
+/// `_super_arg_types` stage-1 dispatch head (checkexpr.py:7447-7483).
+///
+/// Mirrors the arity + scope gate chain that produces the seven
+/// early-error returns and the two fall-through bodies computing
+/// `type_type`/`instance_type` for stage 2 (proper-type dispatch, which
+/// stays in Python). Rust classifies which branch stage 1 hits from live
+/// checker/expression facts read via PyO3; the shim applies the
+/// `self.fail` / `fill_typevars` / `accept` side effects. Defers (`None`)
+/// on any unreadable fact.
+#[pyfunction]
+#[pyo3(signature = (chk, super_expr))]
+pub(crate) fn rust_classify_super_arg_types(
+    chk: &PyAny,
+    super_expr: &PyAny,
+) -> PyResult<Option<i64>> {
+    // Read facts lazily in Python branch order so a deferred read never
+    // fires for a branch that short-circuits before it.
+    let in_checked: bool = match chk.call_method0("in_checked_function") {
+        Ok(v) => match v.extract() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    if !in_checked {
+        return Ok(Some(SUPER_ARG_NOT_CHECKED));
+    }
+
+    let call = match super_expr.getattr("call") {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    let args = match call.getattr("args") {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    let n_args: i64 = match args.len() {
+        Ok(n) => n as i64,
+        Err(_) => return Ok(None),
+    };
+
+    if n_args == 0 {
+        let info = match super_expr.getattr("info") {
+            Ok(i) => i,
+            Err(_) => return Ok(None),
+        };
+        if info.is_none() {
+            return Ok(Some(SUPER_ARG_ZERO_ARG_NO_INFO));
+        }
+        let scope = match chk.getattr("scope") {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        let active_obj = match scope.call_method0("active_class") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        if !active_obj.is_none() {
+            return Ok(Some(SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD));
+        }
+        return Ok(Some(SUPER_ARG_ZERO_ARG_OK));
+    }
+
+    let kinds_obj = match call.getattr("arg_kinds") {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    let kinds = match arg_kind_values(kinds_obj) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if kinds.contains(&ARG_STAR) {
+        return Ok(Some(SUPER_ARG_VARARGS));
+    }
+    // set(arg_kinds) != {ARG_POS}; n_args >= 1 here so no empty case.
+    if kinds.iter().any(|&k| k != ARG_POS) {
+        return Ok(Some(SUPER_ARG_NON_POSITIONAL));
+    }
+    if n_args == 1 {
+        return Ok(Some(SUPER_ARG_SINGLE_ARG));
+    }
+    if n_args == 2 {
+        return Ok(Some(SUPER_ARG_TWO_ARG_OK));
+    }
+    Ok(Some(SUPER_ARG_TOO_MANY))
+}
+
+/// Read `e.call.arg_kinds` (a list of `ArgKind`) as the int `.value`s.
+/// Returns `None` on any read failure so the caller defers.
+fn arg_kind_values(list: &PyAny) -> Option<Vec<i64>> {
+    let seq = list.downcast::<PyList>().ok()?;
+    let mut out = Vec::with_capacity(seq.len());
+    for item in seq.iter() {
+        let v: i64 = item.getattr("value").ok()?.extract().ok()?;
+        out.push(v);
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod classify_super_arg_types_tests {
+    use super::*;
+
+    fn classify(
+        in_checked: bool,
+        n_args: i64,
+        info_present: bool,
+        active_class: bool,
+        arg_kinds: &[i64],
+    ) -> i64 {
+        if !in_checked {
+            return SUPER_ARG_NOT_CHECKED;
+        }
+        if n_args == 0 {
+            if !info_present {
+                return SUPER_ARG_ZERO_ARG_NO_INFO;
+            }
+            if active_class {
+                return SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD;
+            }
+            return SUPER_ARG_ZERO_ARG_OK;
+        }
+        if arg_kinds.contains(&ARG_STAR) {
+            return SUPER_ARG_VARARGS;
+        }
+        if arg_kinds.iter().any(|&k| k != ARG_POS) {
+            return SUPER_ARG_NON_POSITIONAL;
+        }
+        if n_args == 1 {
+            return SUPER_ARG_SINGLE_ARG;
+        }
+        if n_args == 2 {
+            return SUPER_ARG_TWO_ARG_OK;
+        }
+        SUPER_ARG_TOO_MANY
+    }
+
+    #[test]
+    fn test_not_checked() {
+        assert_eq!(
+            classify(false, 2, true, false, &[0, 0]),
+            SUPER_ARG_NOT_CHECKED
+        );
+    }
+
+    #[test]
+    fn test_zero_arg_no_info() {
+        assert_eq!(
+            classify(true, 0, false, false, &[]),
+            SUPER_ARG_ZERO_ARG_NO_INFO
+        );
+    }
+
+    #[test]
+    fn test_zero_arg_outside_method() {
+        assert_eq!(
+            classify(true, 0, true, true, &[]),
+            SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD
+        );
+    }
+
+    #[test]
+    fn test_zero_arg_ok() {
+        assert_eq!(classify(true, 0, true, false, &[]), SUPER_ARG_ZERO_ARG_OK);
+    }
+
+    #[test]
+    fn test_varargs() {
+        // ARG_STAR (2) beats the positional-set check.
+        assert_eq!(classify(true, 1, true, false, &[2]), SUPER_ARG_VARARGS);
+        assert_eq!(classify(true, 2, true, false, &[0, 2]), SUPER_ARG_VARARGS);
+    }
+
+    #[test]
+    fn test_non_positional() {
+        assert_eq!(
+            classify(true, 1, true, false, &[3]),
+            SUPER_ARG_NON_POSITIONAL
+        );
+        assert_eq!(
+            classify(true, 2, true, false, &[0, 4]),
+            SUPER_ARG_NON_POSITIONAL
+        );
+    }
+
+    #[test]
+    fn test_single_arg() {
+        assert_eq!(classify(true, 1, true, false, &[0]), SUPER_ARG_SINGLE_ARG);
+    }
+
+    #[test]
+    fn test_two_arg_ok() {
+        assert_eq!(
+            classify(true, 2, true, false, &[0, 0]),
+            SUPER_ARG_TWO_ARG_OK
+        );
+    }
+
+    #[test]
+    fn test_too_many() {
+        assert_eq!(
+            classify(true, 3, true, false, &[0, 0, 0]),
+            SUPER_ARG_TOO_MANY
+        );
+    }
+}

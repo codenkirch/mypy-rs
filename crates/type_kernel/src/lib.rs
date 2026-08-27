@@ -559,6 +559,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_reveal_imported,
         module
     )?)?;
+    // Issue #956: _super_arg_types stage-1 dispatch. Rust classifies the
+    // arity + scope gate into a branch tag; the fail / fill_typevars /
+    // accept side effects and stage 2 stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_super_arg_types,
+        module
+    )?)?;
     // Issue #489: overload-result family (combine_function_signatures body).
     module.add_function(wrap_pyfunction!(
         checkexpr_overload::rust_combine_function_signatures,
