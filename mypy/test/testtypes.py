@@ -34199,3 +34199,133 @@ class NativeTypeParameterSuite(Suite):
         fx = TypeFixture()
         self._assert_par(fx.a, fx.a, 7, False)
         self._assert_par(fx.a, fx.b, 7, True)
+
+
+class NativeCheckUnpacksInListSuite(Suite):
+    """Parity for the Rust `check_unpacks_in_list` filter.
+
+    `TypeAnalyser.check_unpacks_in_list` (typeanal.py:2991) counts the
+    non-tuple `Unpack` items in a type-arg list: the first passes through,
+    later ones are dropped, and more than one emits "More than one
+    variadic Unpack in a type is not allowed" with the final unpack's
+    inner type as context. Rust returns the kept indices plus the final
+    unpack index; Python applies the fail and rebuilds the list.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _analyser(self) -> tuple[Any, Any]:
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.errors: list[str] = []
+
+            def fail(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.options = Options()
+        return ta, api
+
+    def _variadic_unpack(self) -> UnpackType:
+        # Unpack[Any]: the TODO-documented forward-reference shape; the
+        # proper type is not a TupleType, so it counts as variadic.
+        return UnpackType(AnyType(TypeOfAny.from_error))
+
+    def _tuple_unpack(self) -> UnpackType:
+        # Unpack[tuple[X, ...]] with a proper TupleType inner: an ordinary
+        # item here, not a variadic unpack.
+        return UnpackType(TupleType([self.fx.a], fallback=Instance(self.fx.std_tuplei, [])))
+
+    def _tuple_instance_unpack(self) -> UnpackType:
+        # Unpack[Instance(tuple, [X])]: the proper type is an Instance, not
+        # a TupleType, so Python still counts it as a variadic unpack.
+        return UnpackType(Instance(self.fx.std_tuplei, [self.fx.a]))
+
+    def _assert_parity(self, items: list[Type]) -> None:
+        off_ta, off_api = self._analyser()
+        self._set_active(False)
+        off = off_ta.check_unpacks_in_list(list(items))
+        off_msgs = list(off_api.errors)
+        self._set_active(True)
+        on_ta, on_api = self._analyser()
+        on = on_ta.check_unpacks_in_list(list(items))
+        on_msgs = list(on_api.errors)
+        assert_equal([str(t) for t in on], [str(t) for t in off], f"result {items!r}")
+        assert_equal(on_msgs, off_msgs, f"messages {items!r}")
+
+    def test_no_unpacks(self) -> None:
+        self._assert_parity([self.fx.a, self.fx.str_type])
+
+    def test_one_tuple_unpack_is_ordinary(self) -> None:
+        # Unpack[tuple[X, ...]] passes through; no error either way.
+        self._assert_parity([self.fx.a, self._tuple_unpack()])
+
+    def test_one_variadic_unpack(self) -> None:
+        self._assert_parity([self._variadic_unpack(), self.fx.a])
+
+    def test_two_variadic_unpacks_fail(self) -> None:
+        self._assert_parity([self._variadic_unpack(), self._variadic_unpack()])
+
+    def test_three_variadic_unpacks_keep_first_only(self) -> None:
+        self._assert_parity(
+            [self._variadic_unpack(), self._variadic_unpack(), self._variadic_unpack()]
+        )
+
+    def test_tuple_unpack_between_variadic_ones(self) -> None:
+        # A tuple unpack in the middle is an ordinary item; the variadic
+        # count only sees the non-tuple unpacks.
+        self._assert_parity(
+            [self._variadic_unpack(), self._tuple_unpack(), self._variadic_unpack()]
+        )
+
+    def test_alias_unpack_expands_to_tuple(self) -> None:
+        # Unpack[Tup] where Tup is a TypeAliasType wrapping a tuple
+        # Instance: get_proper_type resolves it, so it is an ordinary
+        # item in both paths (Rust resolves via the live Python fn).
+        from mypy.nodes import TypeAlias
+        from mypy.types import TypeAliasType
+
+        alias = TypeAlias(Instance(self.fx.std_tuplei, [self.fx.a]), "mod.Tup", "mod", -1, -1)
+        item = UnpackType(TypeAliasType(alias, []))
+        self._assert_parity([item, self.fx.a])
+
+    def test_direct_seam(self) -> None:
+        from mypy.typeanal import _rust_check_unpacks_in_list
+
+        va, tb = self._variadic_unpack(), self._tuple_unpack()
+        assert _rust_check_unpacks_in_list([self.fx.a]) == ([0], None)
+        assert _rust_check_unpacks_in_list([va]) == ([0], None)
+        assert _rust_check_unpacks_in_list([va, self.fx.a, va]) == ([0, 1], 2)
+        assert _rust_check_unpacks_in_list([self.fx.a, tb, va, va]) == ([0, 1, 2], 3)
+
+    def test_tuple_instance_unpack_counts_variadic(self) -> None:
+        # Unpack[Instance(tuple, [X])] is NOT a TupleType proper, so both
+        # paths count it as a variadic unpack (not an ordinary item).
+        self._assert_parity(
+            [self._tuple_instance_unpack(), self._tuple_instance_unpack()]
+        )
+
+    def test_engagement(self) -> None:
+        # The gate-on differential must exercise the Rust path, not just
+        # agree with Python: the seam returns kept indices directly.
+        from mypy.typeanal import _rust_check_unpacks_in_list
+
+        result = _rust_check_unpacks_in_list([self._variadic_unpack(), self._variadic_unpack()])
+        assert result is not None
+        keep, final_unpack_idx = result
+        assert keep == [0]
+        assert final_unpack_idx == 1
