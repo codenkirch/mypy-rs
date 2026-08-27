@@ -491,6 +491,25 @@ including:
   `NativeUntypedDecoratorSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus pure decision unit
   tests in `checker_functions.rs`.
+- `rust_check_explicit_override_decorator` (issue #939) — mirrors the
+  5-flag bool conjunction head of
+  `TypeChecker.check_explicit_override_decorator` (checker.py:3139-3160):
+  `not plugin_generated and found_method_base_classes and not
+  defn.is_explicit_override and defn.name not in ("__init__", "__new__")
+  and not is_private(defn.name)`. Rust reads the 5 scalar flags via PyO3
+  (`plugin_generated` from `defn.info.get(defn.name).plugin_generated`,
+  `found_method_base_classes` truthiness, `defn.is_explicit_override`,
+  `defn.name` dunder membership, and `is_private(name)` via the local
+  helper) and returns a bool; the Python shim emits
+  `self.msg.explicit_override_decorator_missing(name, base_fullname,
+  context)` when true and keeps the pure-Python body as the fallback.
+  Returns `false` (defer) when `defn.info` is None, the symbol lookup is
+  None, or any flag is unreadable, mirroring the Python default for
+  `plugin_generated`. Gated by `_native_checker_active` (wired from
+  `mypy/build.py`) and covered by `NativeExplicitOverrideDecoratorSuite`
+  in `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
+  captured message records plus direct seam calls proving engagement),
+  and pure decision unit tests in `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

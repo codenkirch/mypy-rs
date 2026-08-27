@@ -1243,3 +1243,161 @@ mod check_untyped_decorator_tests {
         assert_eq!(decide(true, Some(true), Some(true), true), Some(false));
     }
 }
+
+// `TypeChecker.check_explicit_override_decorator` conjunction port
+// (checker.py:3137-3158); the message emission stays in Python.
+
+/// The pure 5-flag conjunction of `check_explicit_override_decorator`
+/// (checker.py:3149-3155). Kept separate from the PyO3 entry so the
+/// predicate is unit-testable without a Python runtime.
+fn check_explicit_override_decorator(
+    plugin_generated: bool,
+    found_method_base_classes: bool,
+    is_explicit_override: bool,
+    is_init_or_new: bool,
+    is_private_name: bool,
+) -> bool {
+    !plugin_generated
+        && found_method_base_classes
+        && !is_explicit_override
+        && !is_init_or_new
+        && !is_private_name
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_explicit_override_decorator`
+/// (mypy/checker.py:3137-3158).
+///
+/// `defn` is the live `FuncDef`/`OverloadedFuncDef`; `found_method_base_classes`
+/// is the live `list[TypeInfo] | None`. Rust reads the 5 scalar flags via PyO3:
+/// `plugin_generated` (from `defn.info.get(defn.name).plugin_generated`),
+/// `found_method_base_classes` non-empty, `defn.is_explicit_override`,
+/// `defn.name` membership in {"__init__", "__new__"}, and `is_private(name)`.
+/// Returns `true` when the full conjunction holds (the shim emits the missing
+/// decorator message); returns `false` to defer to the pure-Python body when a
+/// flag is None or unreadable, mirroring the Python default for `plugin_generated`.
+#[pyfunction]
+pub(crate) fn rust_check_explicit_override_decorator(
+    defn: &PyAny,
+    found_method_base_classes: &PyAny,
+) -> PyResult<bool> {
+    // `defn.name`: needed for the dunder check, `is_private`, and the symbol
+    // lookup into `defn.info`.
+    let name: String = match defn.getattr("name") {
+        Ok(v) => match v.extract() {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        },
+        Err(_) => return Ok(false),
+    };
+
+    // `plugin_generated` (checker.py:3143-3147): true only when `defn.info`,
+    // `defn.info.get(defn.name)`, and the symbol node's `plugin_generated`
+    // attr are all truthy; a None lookup or unreadable attr defers to Python.
+    let info = match defn.getattr("info") {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    if info.is_none() {
+        return Ok(false);
+    }
+    let node = match info.call_method1("get", (&name,)) {
+        Ok(v) => v,
+        Err(_) => return Ok(false),
+    };
+    if node.is_none() {
+        return Ok(false);
+    }
+    let plugin_generated: bool = match node.getattr("plugin_generated") {
+        Ok(v) => match v.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(false),
+        },
+        Err(_) => return Ok(false),
+    };
+
+    // `found_method_base_classes` truthiness: a non-empty list.
+    let found = match found_method_base_classes.is_true() {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+
+    // `defn.is_explicit_override`.
+    let is_explicit_override: bool = match defn.getattr("is_explicit_override") {
+        Ok(v) => match v.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(false),
+        },
+        Err(_) => return Ok(false),
+    };
+
+    let is_init_or_new = name == "__init__" || name == "__new__";
+    let is_private_name = is_private(&name);
+
+    Ok(check_explicit_override_decorator(
+        plugin_generated,
+        found,
+        is_explicit_override,
+        is_init_or_new,
+        is_private_name,
+    ))
+}
+
+#[cfg(test)]
+mod explicit_override_decorator_tests {
+    use super::check_explicit_override_decorator;
+
+    fn classify(
+        plugin_generated: bool,
+        found: bool,
+        is_explicit_override: bool,
+        name: &str,
+    ) -> bool {
+        check_explicit_override_decorator(
+            plugin_generated,
+            found,
+            is_explicit_override,
+            name == "__init__" || name == "__new__",
+            name.starts_with("__") && !name.ends_with("__"),
+        )
+    }
+
+    #[test]
+    fn test_emit_plain_override_public_name() {
+        // All flags false except found: emit.
+        assert!(classify(false, true, false, "override"));
+    }
+
+    #[test]
+    fn test_plugin_generated_suppresses() {
+        // plugin-generated methods are exempt even with a base class.
+        assert!(!classify(true, true, false, "override"));
+    }
+
+    #[test]
+    fn test_no_base_class_does_not_emit() {
+        // found is falsy: no method base classes.
+        assert!(!classify(false, false, false, "override"));
+        assert!(!classify(false, false, false, "__init__"));
+    }
+
+    #[test]
+    fn test_explicit_override_suppresses() {
+        assert!(!classify(false, true, true, "override"));
+    }
+
+    #[test]
+    fn test_init_and_new_suppress() {
+        assert!(!classify(false, true, false, "__init__"));
+        assert!(!classify(false, true, false, "__new__"));
+    }
+
+    #[test]
+    fn test_private_name_suppresses() {
+        // `is_private` requires starts_with("__") and not ends_with("__").
+        assert!(!classify(false, true, false, "__private"));
+        // Single underscore is NOT private by mypy's definition.
+        assert!(classify(false, true, false, "_single"));
+        // Dunder names are not private either.
+        assert!(classify(false, true, false, "__dunder__"));
+    }
+}
