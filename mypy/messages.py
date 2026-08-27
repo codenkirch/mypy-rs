@@ -3779,6 +3779,26 @@ def make_inferred_type_note(
     """
     subtype = get_proper_type(subtype)
     supertype = get_proper_type(supertype)
+    if _HAS_TYPE_KERNEL and _native_messages_active:
+        try:
+            if isinstance(subtype, Instance) and isinstance(supertype, Instance):
+                arg_results = [
+                    is_subtype(sub_arg, sup_arg)
+                    for sub_arg, sup_arg in zip(subtype.args, supertype.args)
+                ]
+                if _type_kernel.rust_make_inferred_type_note(
+                    _serialize_type_for_messages(subtype),
+                    _serialize_type_for_messages(supertype),
+                    arg_results,
+                    context,
+                ):
+                    var_name = context.expr.name
+                    return 'Perhaps you need a type annotation for "{}"? Suggestion: {}'.format(
+                        var_name, supertype_str
+                    )
+                return ""
+        except (AssertionError, NotImplementedError):
+            pass
     if (
         isinstance(subtype, Instance)
         and isinstance(supertype, Instance)

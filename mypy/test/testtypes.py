@@ -33348,3 +33348,119 @@ class NativeValidVarArgSuite(Suite):
         a, _ = self.fx.def_alias_1(self.fx.a)
         assert self._seam_var(a, True) is None
         assert self._seam_kwarg(a, False, True, True) is None
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInferredTypeNoteSuite(Suite):
+    """Gate-on/off differential for the make_inferred_type_note port (#982).
+
+    `rust_make_inferred_type_note` mirrors the pure bool decision of
+    `mypy.messages.make_inferred_type_note` (messages.py:3770-3800): two
+    same-fullname generic Instances whose every per-arg `is_subtype` result
+    is true, in a `ReturnStmt` whose expression is an inferred `Var` via a
+    `NameExpr`. Python keeps note emission. Each test compares gate-off
+    (pure-Python) and gate-on (Rust decision + Python emission) results,
+    plus direct seam calls proving engagement.
+    """
+
+    def setUp(self) -> None:
+        from mypy.messages import _set_native_messages_active
+        from mypy.test.typefixture import TypeFixture as _TypeFixture
+
+        self.fx = _TypeFixture()
+        self._set_active = _set_native_messages_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    @staticmethod
+    def _return_ctx(name: str = "x", inferred: bool = True) -> Context:
+        from mypy.nodes import ReturnStmt
+
+        expr = NameExpr(name)
+        var = Var(name)
+        var.is_inferred = inferred
+        expr.node = var
+        return ReturnStmt(expr)
+
+    def _note(self, context: Context, subtype: Type, supertype: Type) -> str:
+        from mypy.messages import make_inferred_type_note
+
+        return make_inferred_type_note(context, subtype, supertype, "list[A]")
+
+    def _assert_par(self, context: Context, subtype: Type, supertype: Type) -> None:
+        self._set_active(False)
+        off = self._note(context, subtype, supertype)
+        self._set_active(True)
+        on = self._note(context, subtype, supertype)
+        assert_equal(on, off, f"inferred type note mismatch {subtype} vs {supertype}")
+
+    def test_note_fires(self) -> None:
+        # List[B] returned where list[A] is expected, B <: A, inferred var:
+        # the note fires and both gates produce the identical message.
+        ctx = self._return_ctx("x")
+        expected = 'Perhaps you need a type annotation for "x"? Suggestion: list[A]'
+        self._assert_par(ctx, self.fx.lstb, self.fx.lsta)
+        self._set_active(True)
+        assert_equal(self._note(ctx, self.fx.lstb, self.fx.lsta), expected)
+
+    def test_var_not_inferred(self) -> None:
+        self._assert_par(self._return_ctx("x", inferred=False), self.fx.lstb, self.fx.lsta)
+
+    def test_context_not_return_stmt(self) -> None:
+        self._assert_par(NameExpr("x"), self.fx.lstb, self.fx.lsta)
+
+    def test_expr_not_name_expr(self) -> None:
+        from mypy.nodes import ReturnStmt
+
+        self._assert_par(ReturnStmt(IntExpr(1)), self.fx.lstb, self.fx.lsta)
+
+    def test_node_not_var(self) -> None:
+        from mypy.nodes import ReturnStmt
+
+        expr = NameExpr("x")
+        expr.node = self.fx.a  # a TypeInfo, not a Var
+        self._assert_par(ReturnStmt(expr), self.fx.lstb, self.fx.lsta)
+
+    def test_different_fullnames(self) -> None:
+        # Both generic Instances but different classes: no note.
+        self._assert_par(self._return_ctx(), self.fx.ga, self.fx.gb)
+
+    def test_arg_not_subtype(self) -> None:
+        # List[A] vs List[B]: A is not a subtype of B.
+        self._assert_par(self._return_ctx(), self.fx.lsta, self.fx.lstb)
+
+    def test_non_instance_types(self) -> None:
+        # AnyType and non-generic Instances never produce the note.
+        self._assert_par(self._return_ctx(), AnyType(TypeOfAny.special_form), self.fx.lsta)
+        self._assert_par(self._return_ctx(), self.fx.a, self.fx.b)
+
+    def test_direct_seam_engagement(self) -> None:
+        subtype = self.fx.lstb
+        supertype = self.fx.lsta
+        buf = _WriteBuffer()
+        subtype.write(buf)
+        sub_bytes = buf.getvalue()
+        buf = _WriteBuffer()
+        supertype.write(buf)
+        sup_bytes = buf.getvalue()
+        fires = _type_kernel.rust_make_inferred_type_note(
+            sub_bytes, sup_bytes, [True], self._return_ctx("y")
+        )
+        self.assertTrue(fires, "seam should decide True for List[B] vs List[A] in return")
+        not_fires = _type_kernel.rust_make_inferred_type_note(
+            sub_bytes, sup_bytes, [False], self._return_ctx("y")
+        )
+        self.assertFalse(not_fires, "seam should decide False on a false per-arg result")
+        self.assertFalse(
+            _type_kernel.rust_make_inferred_type_note(
+                sub_bytes, sup_bytes, [True], NameExpr("y")
+            ),
+            "seam should decide False for a non-ReturnStmt context",
+        )

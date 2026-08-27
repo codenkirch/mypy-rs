@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 use crate::subtypes::{is_subtype, SubtypeContext};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
@@ -1894,6 +1895,120 @@ pub fn rust_pretty_callable(
 }
 
 // ---------------------------------------------------------------------------
+// make_inferred_type_note decision (Issue #982, messages.py:3770-3800)
+// ---------------------------------------------------------------------------
+
+/// Pure wire decision core of `make_inferred_type_note`. Both types must be
+/// same-fullname Instances with non-empty args, and every per-arg subtype
+/// result must hold. `arg_results` is the zip'd list the Python shim computed
+/// with the already-native `is_subtype`, mirroring
+/// `zip(subtype.args, supertype.args)` (arg-count mismatches only require the
+/// min-length prefix to pass, exactly like the Python loop).
+fn inferred_note_wire_decision(subtype: &Type, supertype: &Type, arg_results: &[bool]) -> bool {
+    match (subtype, supertype) {
+        (
+            Type::Instance {
+                type_ref: sub_ref,
+                args: sub_args,
+                ..
+            },
+            Type::Instance {
+                type_ref: sup_ref,
+                args: sup_args,
+                ..
+            },
+        ) => {
+            sub_ref == sup_ref
+                && !sub_args.is_empty()
+                && !sup_args.is_empty()
+                && arg_results.iter().all(|&ok| ok)
+        }
+        _ => false,
+    }
+}
+
+/// Context classifier for `make_inferred_type_note` (messages.py:3788-3791):
+/// the note only fires for a `return` statement returning an inferred local
+/// variable (`ReturnStmt` -> `NameExpr` -> `Var.is_inferred`). Mirrors
+/// `rust_is_magic_base` (pure PyO3 node predicate, never defers): an
+/// unreadable node fact decides `false`.
+fn inferred_note_context_fires(py: Python<'_>, context: &PyAny) -> PyResult<bool> {
+    let nodes = py.import("mypy.nodes")?;
+    let return_stmt: &PyType = nodes.getattr("ReturnStmt")?.downcast()?;
+    let name_expr: &PyType = nodes.getattr("NameExpr")?.downcast()?;
+    let var_cls: &PyType = nodes.getattr("Var")?.downcast()?;
+
+    if !context.is_instance(return_stmt)? {
+        return Ok(false);
+    }
+    let expr = match context.getattr("expr") {
+        Ok(expr) => expr,
+        Err(_) => return Ok(false),
+    };
+    if !expr.is_instance(name_expr)? {
+        return Ok(false);
+    }
+    let node = match expr.getattr("node") {
+        Ok(node) => node,
+        Err(_) => return Ok(false),
+    };
+    if !node.is_instance(var_cls)? {
+        return Ok(false);
+    }
+    let is_inferred = match node
+        .getattr("is_inferred")
+        .and_then(|v| v.extract::<bool>())
+    {
+        Ok(b) => b,
+        Err(_) => return Ok(false),
+    };
+    if !is_inferred {
+        return Ok(false);
+    }
+    // node.name is part of the fact chain (the Python shim formats the note
+    // from `context.expr.name`); an unreadable name decides false.
+    if node.getattr("name").is_err() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Decision of `make_inferred_type_note` (messages.py:3770-3800, issue #982),
+/// called from checker.py:9046 on inferred-return mismatches.
+///
+/// Rust owns the pure bool decision: same-fullname generic Instances whose
+/// every per-arg subtype result (computed by the shim with the already-native
+/// `is_subtype`) is true, in a `return` statement returning an inferred local
+/// variable. Python keeps note emission (formats the message from
+/// `context.expr.name` + the supertype string) and runs the pure-Python body
+/// as the fallback on the gate-off path.
+///
+/// Never defers: undecodable wire bytes or an unreadable node fact decide
+/// `false` (note absent), matching the total-predicate shape of
+/// `rust_is_magic_base`.
+#[pyfunction]
+pub fn rust_make_inferred_type_note(
+    py: Python<'_>,
+    subtype_bytes: &[u8],
+    supertype_bytes: &[u8],
+    arg_results: Vec<bool>,
+    context: &PyAny,
+) -> PyResult<bool> {
+    let subtype = match wire::read_type(&mut ReadBuffer::new(subtype_bytes), None) {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    let supertype = match wire::read_type(&mut ReadBuffer::new(supertype_bytes), None) {
+        Ok(t) => t,
+        Err(_) => return Ok(false),
+    };
+    if !inferred_note_wire_decision(&subtype, &supertype, &arg_results) {
+        return Ok(false);
+    }
+    inferred_note_context_fires(py, context)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -2709,5 +2824,57 @@ mod tests {
             ),
             "Signature of \"f\" incompatible with supertype \"A\""
         );
+    }
+
+    fn wire_instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn wire_any() -> Type {
+        Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    #[test]
+    fn test_inferred_note_wire_decision() {
+        let lst_int = wire_instance("builtins.list", vec![wire_instance("builtins.int", vec![])]);
+        let lst_str = wire_instance("builtins.list", vec![wire_instance("builtins.str", vec![])]);
+        let set_int = wire_instance("builtins.set", vec![wire_instance("builtins.int", vec![])]);
+        let bare_list = wire_instance("builtins.list", vec![]);
+
+        // Same fullname, non-empty args, all per-arg results true.
+        assert!(inferred_note_wire_decision(&lst_int, &lst_int, &[true]));
+        // A false per-arg result suppresses the note.
+        assert!(!inferred_note_wire_decision(&lst_int, &lst_str, &[false]));
+        // Different fullnames.
+        assert!(!inferred_note_wire_decision(&lst_int, &set_int, &[true]));
+        // Non-Instance subtype or supertype.
+        assert!(!inferred_note_wire_decision(&wire_any(), &lst_int, &[true]));
+        assert!(!inferred_note_wire_decision(&lst_int, &wire_any(), &[true]));
+        // Empty args on either side.
+        assert!(!inferred_note_wire_decision(&bare_list, &bare_list, &[]));
+        assert!(!inferred_note_wire_decision(&lst_int, &bare_list, &[true]));
+        // Arg-count mismatch: only the zip'd prefix must pass.
+        let lst_int_int = wire_instance(
+            "builtins.list",
+            vec![
+                wire_instance("builtins.int", vec![]),
+                wire_instance("builtins.int", vec![]),
+            ],
+        );
+        assert!(inferred_note_wire_decision(&lst_int, &lst_int_int, &[true]));
+        assert!(!inferred_note_wire_decision(
+            &lst_int,
+            &lst_int_int,
+            &[true, false]
+        ));
     }
 }
