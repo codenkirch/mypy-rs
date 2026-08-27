@@ -37635,3 +37635,173 @@ class NativeTypeGuardArgSuite(Suite):
             "typeis fail payload",
         )
         assert_equal(off, on, "typeis fail parity")
+
+class NativeRemoveUnpackKwargsSuite(Suite):
+    """Parity for the Rust `remove_unpack_kwargs` arbitration port (#1044).
+
+    `SemanticAnalyzer.remove_unpack_kwargs` (semanal.py:1586) arbitrates a
+    `**kw: Unpack[TypedDict]` signature: PASSTHROUGH when the last kind is
+    not ARG_STAR2 or the last type is not an UnpackType, NOT_TD_FAIL when
+    the Unpack target is not a TypedDict, OVERLAP_FAIL on the sorted
+    param/TypedDict-key overlap (minus the trailing kwargs name), and OK
+    (rewrite with the TypedDict + unpack_kwargs=True). The Rust classifier
+    (`semanal_checks.rs`) decides the tag from the live CallableType's
+    arg_kinds/arg_names plus one wire serialization of the last arg type;
+    Python applies both fails and all rewrites. Direct seam calls assert
+    the exact (tag, names) tuple for every branch; the gate-off vs gate-on
+    differential drives the real method through a stub fail recorder and
+    asserts identical (str(result), unpack_kwargs, fail messages).
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        self.fx = TypeFixture()
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _td(self, keys: list[str]) -> TypedDictType:
+        return TypedDictType(
+            {k: self.fx.o for k in keys}, set(keys), set(), Instance(self.fx.ai, [])
+        )
+
+    def _callable(
+        self,
+        arg_names: list[str | None],
+        last_type: Type,
+        arg_kinds: list[ArgKind] | None = None,
+    ) -> CallableType:
+        if arg_kinds is None:
+            arg_kinds = [ARG_POS] * (len(arg_names) - 1) + [ARG_STAR2] if arg_names else []
+        arg_types: list[Type] = [self.fx.a] * len(arg_names)
+        if arg_names:
+            arg_types[-1] = last_type
+        return CallableType(
+            arg_types,
+            arg_kinds,
+            list(arg_names),
+            self.fx.a,
+            self.fx.function,
+        )
+
+    def _wire(self, t: Type) -> bytes | None:
+        from mypy.semanal import _serialize_semanal_type
+
+        try:
+            return _serialize_semanal_type(t)
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            return None
+
+    def _seam(
+        self, arg_names: list[str | None], last_type: Type, wire: bytes | None = None
+    ) -> tuple[int, list[str]] | None:
+        typ = self._callable(arg_names, last_type)
+        # Mirror the shim: serialize the last arg type unless the caller
+        # explicitly passes None to test the missing-wire deferral.
+        if wire is None and arg_names:
+            wire = self._wire(last_type)
+        return self._tk.rust_classify_remove_unpack_kwargs(typ, wire)
+
+    def _run(
+        self, arg_names: list[str | None], last_type: Type
+    ) -> tuple[tuple[str, bool, list[str]], tuple[str, bool, list[str]]]:
+        from mypy import semanal
+
+        def check_one() -> tuple[str, bool, list[str]]:
+            typ = self._callable(arg_names, last_type)
+            failures: list[str] = []
+
+            class _Analyzer:
+                def fail(self, msg: str, ctx: object, *, code: object = None) -> None:
+                    failures.append(str(msg))
+
+            ret = semanal.SemanticAnalyzer.remove_unpack_kwargs(
+                _Analyzer(), object(), typ  # type: ignore[arg-type]
+            )
+            return str(ret), ret.unpack_kwargs, failures
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self, arg_names: list[str | None], last_type: Type, label: str
+    ) -> None:
+        off, on = self._run(arg_names, last_type)
+        assert_equal(on, off, f"remove_unpack_kwargs parity {label}")
+
+    # --- direct seam calls ---
+
+    def test_seam_passthrough(self) -> None:
+        assert self._seam([], self.fx.a, None) == (0, [])
+        plain = self._callable(["x", "kw"], self.fx.a)
+        plain.arg_kinds = [ARG_POS, ARG_POS]
+        assert self._tk.rust_classify_remove_unpack_kwargs(plain, None) == (0, [])
+        assert self._seam(["x", "kw"], self.fx.a) == (0, [])
+
+    def test_seam_not_td_fail(self) -> None:
+        assert self._seam(["x", "kw"], UnpackType(self.fx.a)) == (1, [])
+
+    def test_seam_overlap_fail(self) -> None:
+        # Overlap is param names ∩ TD keys ("z" is only a TD key, "kw" only
+        # a param name), minus the trailing kwargs name, sorted.
+        assert self._seam(["a", "kw"], UnpackType(self._td(["z", "a"]))) == (2, ["a"])
+
+    def test_seam_ok(self) -> None:
+        assert self._seam(["x", "kw"], UnpackType(self._td(["y"]))) == (3, [])
+        # The 'kwargs' key is OK: it equals arg_names[-1] and is discarded.
+        assert self._seam(["a", "kw"], UnpackType(self._td(["kw"]))) == (3, [])
+
+    def test_seam_defers_on_missing_wire(self) -> None:
+        # last kind is ARG_STAR2 but serialization failed: defer (None).
+        typ = self._callable(["x", "kw"], UnpackType(self._td(["y"])))
+        assert self._tk.rust_classify_remove_unpack_kwargs(typ, None) is None
+
+    # --- gate-off vs gate-on differential ---
+
+    def test_parity_passthrough(self) -> None:
+        self._assert_par(["x", "kw"], self.fx.a, "not unpack")
+        self._assert_par([], self.fx.a, "empty kinds")
+
+    def test_parity_not_td(self) -> None:
+        self._assert_par(["x", "kw"], UnpackType(self.fx.a), "not typeddict")
+
+    def test_parity_overlap(self) -> None:
+        self._assert_par(["a", "kw"], UnpackType(self._td(["z", "a"])), "overlap")
+        # Order of the formatted names is sorted across both gates.
+        self._assert_par(["b", "a", "kw"], UnpackType(self._td(["b", "a"])), "two overlap")
+
+    def test_parity_ok(self) -> None:
+        self._assert_par(["x", "kw"], UnpackType(self._td(["y"])), "ok")
+        # TypedDict key named 'kwargs' is fine.
+        self._assert_par(["a", "kw"], UnpackType(self._td(["kw"])), "kwargs key")
+
+    def test_gate_on_engages(self) -> None:
+        from mypy import semanal
+
+        typ = self._callable(["x", "kw"], UnpackType(self._td(["y"])))
+        decided = self._tk.rust_classify_remove_unpack_kwargs(typ, self._wire(typ.arg_types[-1]))
+        assert decided is not None, "direct seam returned None"
+
+        class _FailRecorder:
+            def fail(self, msg: str, ctx: object, *, code: object = None) -> None:
+                pass
+
+        ret = semanal.SemanticAnalyzer.remove_unpack_kwargs(
+            _FailRecorder(), object(), typ  # type: ignore[arg-type]
+        )
+        assert ret.unpack_kwargs
+        assert isinstance(get_proper_type(ret.arg_types[-1]), TypedDictType)

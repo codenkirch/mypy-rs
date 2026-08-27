@@ -1575,6 +1575,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_classify_method_signature,
         module
     )?)?;
+    // semanal_checks: remove_unpack_kwargs unpack-kwargs arbitration.
+    // Rust classifies the guard chain + overlap set; side effects in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_classify_remove_unpack_kwargs,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,
