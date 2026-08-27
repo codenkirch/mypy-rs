@@ -52,6 +52,7 @@ mod builtin_item;
 mod cache;
 mod callable_compat;
 mod checkcall;
+mod checker_functions;
 mod checker_helpers;
 mod checker_stmts;
 mod checker_visitor;
@@ -2763,6 +2764,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // and the message emission stay in Python.
     module.add_function(wrap_pyfunction!(
         overload_override::rust_check_overlapping_overloads,
+        module
+    )?)?;
+
+    // checker_functions: check_compatibility_final_super decision-head port.
+    // Rust classifies the final-super override into a branch tag; the message
+    // emission and writability side effects stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_final_super,
         module
     )?)?;
 

@@ -346,6 +346,20 @@ including:
   (wired from `mypy/build.py`) and covered by
   `NativeOverloadingOverloadsSuite` in `mypy/test/testtypes.py` (gate-off
   vs gate-on differential on the decision lists).
+- `rust_classify_final_super` (mypy.checker): the Rust classifier in
+  `checker_functions.rs` ports the pure decision of
+  `TypeChecker.check_compatibility_final_super` (checker.py:4608-4636):
+  the base-node kind gate (`Var`/`FuncBase`/`Decorator` via PyO3
+  `is_instance`), the `is_private(name)` pass, the
+  `base_node.is_final and (node.is_final or not Var)` cant-override arm,
+  the enum-base / enum-special-prop pass, the writability arm, and the
+  trailing pass. Rust returns a branch tag; the Python shim applies the
+  `cant_override_final` message and `check_if_final_var_override_writable`
+  side effects and keeps the pure-Python body as the fallback. Defers
+  (`None`) only on an unreadable `base_node.is_final`. Gated by
+  `_native_checker_active` and covered by `NativeFinalSuperSuite` in
+  `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs gate-on
+  differential).
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

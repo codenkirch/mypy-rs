@@ -23683,6 +23683,164 @@ class NativeEnumProtocolClassifierSuite(Suite):
         c = CallExpr(NameExpr("f"), [], [], [])
         assert self._tk.rust_classify_protocol_test_callee(c, 2) is None
 
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFinalSuperSuite(Suite):
+    """Parity for the Rust `check_compatibility_final_super` decision-head port.
+
+    `TypeChecker.check_compatibility_final_super` (checker.py:4608-4636) is a
+    pure decision over the base attribute node shape (Var / FuncBase /
+    Decorator), the two `is_final` flags, the overriding name, the base
+    fullname, and the enum allowlists. The Rust classifier
+    (`checker_functions.rs`) turns those facts into a branch tag; the Python
+    shim applies the side effects (cant_override_final message,
+    check_if_final_var_override_writable) and keeps the pure-Python body as
+    the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off vs
+    gate-on differential drives the real TypeChecker method through a stub
+    message recorder and asserts identical (return, messages) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _var(self, name: str, is_final: bool) -> Var:
+        v = Var(name)
+        v.is_final = is_final
+        return v
+
+    def _funcdef(self, name: str, is_final: bool) -> FuncDef:
+        f = FuncDef(name)
+        f.is_final = is_final
+        return f
+
+    def _decorator(self, name: str, is_final: bool) -> Decorator:
+        f = FuncDef(name)
+        f.is_final = is_final
+        return Decorator(f, [], self._var(name, is_final))
+
+    def _base(self, fullname: str, name: str = "Base") -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(name=name, fullname=fullname)
+
+    def _tag(
+        self, base_node: Any, node_is_final: bool, node_name: str, base_fullname: str
+    ) -> int | None:
+        from mypy.semanal_enum import ENUM_BASES, ENUM_SPECIAL_PROPS
+
+        return _type_kernel.rust_classify_final_super(
+            base_node,
+            node_is_final,
+            node_name,
+            base_fullname,
+            list(ENUM_BASES),
+            list(ENUM_SPECIAL_PROPS),
+        )
+
+    def _run(
+        self, node: Any, base: Any, base_node: Any, *, writable: bool = True
+    ) -> tuple[bool, list[tuple[str, str]]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[bool, list[tuple[str, str]]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, str]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                cant_override_final=lambda n, bn, ctx: msgs.append(("cant_override", n)),
+                final_cant_override_writable=lambda n, ctx: msgs.append(
+                    ("writable", n)
+                ),
+            )
+            chk.is_writable_attribute = lambda base_n: writable  # type: ignore[assignment]
+            ret = chk.check_compatibility_final_super(node, base, base_node)
+            return ret, msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, node: Any, base: Any, base_node: Any) -> None:
+        off, on = self._run(node, base, base_node)
+        assert_equal(on, off, f"check_compatibility_final_super parity for base_node={base_node!r}")
+
+    def test_seam_none_base_node(self) -> None:
+        assert self._tag(None, False, "attr", "mod.Base") == 0
+        assert self._tag(None, True, "attr", "mod.Base") == 0
+
+    def test_seam_private_name(self) -> None:
+        base_node = self._var("base_attr", True)
+        assert self._tag(base_node, True, "__priv", "mod.Base") == 1
+
+    def test_seam_cant_override_final_var(self) -> None:
+        base_node = self._var("base_attr", True)
+        assert self._tag(base_node, True, "attr", "mod.Base") == 2
+
+    def test_seam_cant_override_final_method(self) -> None:
+        base_node = self._funcdef("base_method", True)
+        assert self._tag(base_node, False, "attr", "mod.Base") == 2
+
+    def test_seam_enum_base(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, True, "attr", "enum.Enum") == 3
+
+    def test_seam_enum_special_prop(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, True, "name", "mod.Base") == 3
+
+    def test_seam_check_writable(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, True, "attr", "mod.Base") == 4
+
+    def test_seam_tail_pass(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, False, "attr", "mod.Base") == 5
+
+    def test_decorator_base_is_not_var(self) -> None:
+        # A final decorated base method overridden by a final var: error.
+        base_node = self._decorator("base_method", True)
+        assert self._tag(base_node, True, "attr", "mod.Base") == 2
+
+    def test_parity_every_branch(self) -> None:
+        node_final = self._var("attr", True)
+        node_plain = self._var("attr", False)
+        base = self._base("mod.Base")
+        # None base node: pass.
+        self._assert_par(node_plain, base, None)
+        # Private name: pass.
+        node_private = self._var("__priv", True)
+        self._assert_par(node_private, base, self._var("base_attr", True))
+        # Final var overriding final var: error.
+        self._assert_par(node_final, base, self._var("base_attr", True))
+        # Final var overriding final method (FuncBase, not Var): error.
+        self._assert_par(node_plain, base, self._funcdef("base_method", True))
+        # Enum base: pass (no writability check).
+        self._assert_par(node_final, self._base("enum.Enum"), self._var("base_attr", False))
+        # Enum special prop: pass.
+        node_name = self._var("name", True)
+        self._assert_par(node_name, base, self._var("base_attr", False))
+        # Plain final override of writable base attr: writability check emitted.
+        self._assert_par(node_final, base, self._var("base_attr", False))
+        # Non-final override of non-final base var: trailing pass, no message.
+        self._assert_par(node_plain, base, self._var("base_attr", False))
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
