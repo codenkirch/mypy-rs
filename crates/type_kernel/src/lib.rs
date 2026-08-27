@@ -1412,6 +1412,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_classify_function_signature,
         module
     )?)?;
+    // semanal_checks: check_decorated_function_is_method predicate port.
+    // Rust reads live analyzer state (self.type, is_func_scope()) and
+    // returns the method/non-method decision; the self.fail stays in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_check_decorated_function_is_method,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,

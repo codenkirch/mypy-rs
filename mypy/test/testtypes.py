@@ -29796,3 +29796,101 @@ class NativeMetaclassCompatibilitySuite(Suite):
         mc = SimpleNamespace()
         t = self._typeinfo(metaclass_type=mc, bases=[base])
         self._assert_par(t)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDecoratedFunctionIsMethodSuite(Suite):
+    """Parity for the Rust `check_decorated_function_is_method` predicate port.
+
+    `SemanticAnalyzer.check_decorated_function_is_method`
+    (semanal.py:2256-2258) is a single bool conjunction:
+    `not self.type or self.is_func_scope()`. When true the decorator is
+    used outside a method context and `self.fail` fires; when false the
+    function is a method and nothing happens. The Rust seam
+    (`semanal_checks.rs`) reads live analyzer state (`self.type`,
+    `is_func_scope()`) via PyO3 and returns the negation: `Some(true)` =
+    method (no-op), `Some(false)` = non-method (fail), `None` = defer.
+
+    Direct seam calls assert the exact decision for every branch; the
+    gate-off vs gate-on differential drives the real method through a
+    stub fail recorder and asserts identical (fail) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyzer(self, *, has_type: bool, func_scope: bool) -> Any:
+        from types import SimpleNamespace
+
+        ns = SimpleNamespace()
+        ns.type = object() if has_type else None
+        ns.is_func_scope = lambda: func_scope
+        ns._fail: list[str] = []
+        ns.fail = lambda msg, ctx: ns._fail.append(msg)
+        return ns
+
+    def _seam(self, *, has_type: bool, func_scope: bool) -> bool | None:
+        ns = self._analyzer(has_type=has_type, func_scope=func_scope)
+        return _type_kernel.rust_check_decorated_function_is_method(ns)
+
+    def _run(
+        self, *, has_type: bool, func_scope: bool
+    ) -> tuple[list[str], list[str]]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> list[str]:
+            ns = self._analyzer(has_type=has_type, func_scope=func_scope)
+            SemanticAnalyzer.check_decorated_function_is_method(
+                ns, "abstractmethod", None
+            )
+            return ns._fail
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, *, has_type: bool, func_scope: bool) -> None:
+        off, on = self._run(has_type=has_type, func_scope=func_scope)
+        assert_equal(
+            on,
+            off,
+            f"check_decorated_function_is_method parity "
+            f"(has_type={has_type}, func_scope={func_scope})",
+        )
+
+    def test_seam_method_in_class_body(self) -> None:
+        assert self._seam(has_type=True, func_scope=False) is True
+
+    def test_seam_not_method_outside_class(self) -> None:
+        assert self._seam(has_type=False, func_scope=False) is False
+
+    def test_seam_not_method_in_func_scope(self) -> None:
+        assert self._seam(has_type=True, func_scope=True) is False
+
+    def test_seam_not_method_outside_class_and_func(self) -> None:
+        assert self._seam(has_type=False, func_scope=True) is False
+
+    def test_parity_method_no_fail(self) -> None:
+        self._assert_par(has_type=True, func_scope=False)
+
+    def test_parity_outside_class_fails(self) -> None:
+        self._assert_par(has_type=False, func_scope=False)
+
+    def test_parity_func_scope_fails(self) -> None:
+        self._assert_par(has_type=True, func_scope=True)
+
+    def test_parity_both_fail(self) -> None:
+        self._assert_par(has_type=False, func_scope=True)
