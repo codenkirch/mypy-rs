@@ -266,6 +266,7 @@ try:
         rust_has_bytes_component as _rust_has_bytes_component,
         rust_has_coroutine_decorator as _rust_has_coroutine_decorator,
         rust_has_erased_component as _rust_has_erased_component,
+        rust_get_arg_infer_passes as _rust_get_arg_infer_passes,
         rust_has_uninhabited_component as _rust_has_uninhabited_component,
         rust_infer_function_type_arguments as _rust_infer_function_type_arguments,
         rust_is_async_def as _rust_is_async_def,
@@ -310,6 +311,7 @@ except ImportError:
     _rust_has_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_ambiguous_uninhabited_component = None  # type: ignore[assignment]
     _rust_has_erased_component = None  # type: ignore[assignment]
+    _rust_get_arg_infer_passes = None  # type: ignore[assignment]
     _rust_infer_function_type_arguments = None  # type: ignore[assignment]
     _rust_allow_fast_container_literal = None  # type: ignore[assignment]
     _rust_check_operator = None  # type: ignore[assignment]
@@ -3597,6 +3599,29 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         Two-pass argument type inference primarily lets us infer types of
         lambdas more effectively.
         """
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _native_checkexpr_resolver is not None
+        ):
+            try:
+                formal_bytes = [
+                    _serialize_type_for_checkexpr(t) for t in callee.arg_types
+                ]
+                actual_bytes = [_serialize_type_for_checkexpr(t) for t in arg_types]
+                lambda_flags = [isinstance(a, LambdaExpr) for a in args]
+                res = _rust_get_arg_infer_passes(
+                    _native_checkexpr_resolver,
+                    formal_bytes,
+                    actual_bytes,
+                    lambda_flags,
+                    formal_to_actual,
+                    num_actuals,
+                )
+                if res is not None:
+                    return res
+            except (AssertionError, NotImplementedError):
+                pass
         res = [1] * num_actuals
         for i, arg in enumerate(callee.arg_types):
             skip_param_spec = False

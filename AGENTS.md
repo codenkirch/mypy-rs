@@ -1218,6 +1218,30 @@ including:
   seam tag tests + gate-off vs gate-on differential over int/str/float/
   bool/complex/fold-failure/final-var-ref/inside-function), plus pure
   decision unit tests in `semanal_visitor.rs`.
+- `rust_get_arg_infer_passes` (issue #1000, `checkcall.rs`) — mirrors
+  `ExpressionChecker.get_arg_infer_passes` (checkexpr.py:3563-3633)
+  wholesale: a pure two-pass argument-inference classifier with zero
+  side effects. For each formal Rust decides pass 1 vs pass 2: the
+  ParamSpec arm (a `CallableType.param_spec()`-shaped formal whose
+  actuals include a non-generic non-lambda CallableType suppresses the
+  second pass, with Instance actuals resolved via
+  `find_member_call_is_plain_callable`, a restricted
+  `find_member("__call__", ..., is_operator=True)` fed through the
+  existing resolver seam and `member_method_inner`), plus the
+  `ArgInferSecondPassQuery` fold (`BoolTypeQuery(ANY_STRATEGY)` with the
+  `visit_callable_type` override and an exact `HasTypeVars` mirror that,
+  unlike the visitor kernel, never walks callable `variables` or
+  Instance `last_known_value`). Python keeps the result application;
+  the function is pure so nothing else stays Python-side. Defers
+  (`None`) on undecodable blobs, alias-expansion failures (missing
+  snapshot / cycle), out-of-range indices, extra_attrs, non-plain
+  `__call__` members (property/Decorator/Var), and any fact the kernel
+  cannot read. Hot path: once per generic-call inference from
+  `infer_function_type_arguments`. Gated by `_native_checkexpr_active`
+  (existing wiring, no build.py change) and covered by
+  `NativeArgInferPassesSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls), and 14 pure decision
+  unit tests in `checkcall.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

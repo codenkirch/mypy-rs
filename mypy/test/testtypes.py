@@ -34765,3 +34765,286 @@ class NativeConstraintHelpersSuite(Suite):
             assert _try_native_filter_satisfiable([self.Constraint(t, 0, self.fx.a)]) is None
         finally:
             self._set_active(False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeArgInferPassesSuite(Suite):
+    """Parity for the Rust `get_arg_infer_passes` port (mypy.checkexpr).
+
+    The Rust seam (`rust_get_arg_infer_passes` in checkcall.rs) decides
+    the pass-1/pass-2 classification for every formal: the
+    ArgInferSecondPassQuery fold and the ParamSpec skip trigger, including
+    the `find_member("__call__", ...)` restricted subset for Instance
+    actuals. Python keeps the result application. Toggling the checkexpr
+    gate off (pure Python) and on (Rust seam) must produce identical pass
+    lists, and direct seam calls prove each decidable case engages
+    natively.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        # A class with a plain non-generic `__call__` method:
+        # def __call__(self) -> Any.
+        self.callablei = self.fx.make_type_info("mod.Callee", mro=[self.fx.oi])
+        fn = FuncDef(
+            "__call__",
+            [],
+            None,
+            CallableType(
+                [Instance(self.callablei, [])],
+                [ARG_POS],
+                [None],
+                self.fx.anyt,
+                self.fx.function,
+            ),
+        )
+        fn.info = self.callablei
+        self.callablei.names["__call__"] = SymbolTableNode(MDEF, fn)
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.append(self.callablei)
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(typeinfo_map)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        # Live seam lookups (find_member on Instance actuals) read the
+        # live map installed on the resolver, as build.py does.
+        self.resolver.set_live_typeinfo_map(typeinfo_map)
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self.resolver.set_live_typeinfo_map(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        self._set_resolver(self.resolver if active else None)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+            self._set_resolver(self.resolver)
+
+    def _assert_par(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+        args: list[Expression] | None = None,
+    ) -> None:
+        from mypy.checkexpr import ExpressionChecker
+
+        if args is None:
+            args = [NameExpr(f"x{i}") for i in range(len(arg_types))]
+        num_actuals = len(arg_types)
+        off = self._with_gate(
+            False,
+            lambda: ExpressionChecker.get_arg_infer_passes(
+                None,  # type: ignore[arg-type]
+                callee,
+                args,
+                arg_types,
+                formal_to_actual,
+                num_actuals,
+            ),
+        )
+        on = self._with_gate(
+            True,
+            lambda: ExpressionChecker.get_arg_infer_passes(
+                None,  # type: ignore[arg-type]
+                callee,
+                args,
+                arg_types,
+                formal_to_actual,
+                num_actuals,
+            ),
+        )
+        assert off == on, f"arg infer passes parity: off={off} on={on}"
+
+    def _assert_engages(
+        self,
+        formals: list[Type],
+        actuals: list[Type],
+        lambda_flags: list[bool],
+        formal_to_actual: list[list[int]],
+        expected: list[int],
+    ) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        result = _type_kernel.rust_get_arg_infer_passes(
+            self.resolver,
+            [_serialize_type_for_checkexpr(t) for t in formals],
+            [_serialize_type_for_checkexpr(t) for t in actuals],
+            lambda_flags,
+            formal_to_actual,
+            len(actuals),
+        )
+        assert result is not None, "rust_get_arg_infer_passes did not engage"
+        assert result == expected, f"{result} != {expected}"
+
+    def _tvar_callable_ret(self, *arg_types: Type) -> CallableType:
+        """A callable formal whose return type is the fixture TypeVar."""
+        return CallableType(
+            list(arg_types),
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            self.fx.t,
+            self.fx.function,
+        )
+
+    def _param_spec(self) -> ParamSpecType:
+        from mypy.types import ParamSpecFlavor, TypeVarId
+
+        return ParamSpecType(
+            "P",
+            "mod.P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            self.fx.o,
+        )
+
+    def _param_spec_formal(self, ret: Type) -> CallableType:
+        """A `Callable[P, ret]` formal with the trailing P.args/P.kwargs
+        shape that CallableType.param_spec() recognizes."""
+        from mypy.types import ParamSpecFlavor
+
+        ps = self._param_spec()
+        return CallableType(
+            [ps.with_flavor(ParamSpecFlavor.ARGS), ps.with_flavor(ParamSpecFlavor.KWARGS)],
+            [ARG_STAR, ARG_STAR2],
+            [None, None],
+            ret,
+            self.fx.function,
+            name=None,
+            variables=[ps],
+        )
+
+    def test_plain_formal_pass_one(self) -> None:
+        callee = self.fx.callable(self.fx.a, self.fx.anyt)
+        self._assert_par(callee, [self.fx.anyt], [[0]])
+        self._assert_engages(callee.arg_types, [self.fx.anyt], [False], [[0]], [1])
+
+    def test_typevar_in_ret_promotes_pass_two(self) -> None:
+        # def f(cb: Callable[[], T]) -> ...: the typevar in the callable
+        # return promotes the actual to pass 2.
+        callee = self.fx.callable(self._tvar_callable_ret(), self.fx.anyt)
+        self._assert_par(callee, [self.fx.anyt], [[0]])
+        self._assert_engages(callee.arg_types, [self.fx.anyt], [False], [[0]], [2])
+
+    def test_nested_typevar_callable_arg_pass_two(self) -> None:
+        # The typevar hides in a nested callable argument position.
+        inner = self._tvar_callable_ret()
+        outer = CallableType(
+            [inner], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+        callee = self.fx.callable(outer, self.fx.anyt)
+        self._assert_par(callee, [self.fx.anyt], [[0]])
+
+    def test_generic_callable_formal_pass_one(self) -> None:
+        # A generic callable formal with a concrete arg/ret stays pass 1:
+        # HasTypeVars does not walk callable `variables`.
+        generic = self.fx.callable(self.fx.a, self.fx.anyt)
+        generic.variables = (self.fx.t,)
+        callee = self.fx.callable(generic, self.fx.anyt)
+        self._assert_par(callee, [self.fx.anyt], [[0]])
+
+    def test_lambda_actual_flagged(self) -> None:
+        # The lambda flag only matters inside the ParamSpec arm; a plain
+        # callable formal with a typevar ret still promotes the lambda.
+        from mypy.nodes import Block, LambdaExpr, ReturnStmt
+
+        lam = LambdaExpr(arguments=[], body=Block([ReturnStmt(NameExpr("x"))]), typ=None)
+        callee = self.fx.callable(self._tvar_callable_ret(), self.fx.anyt)
+        self._assert_par(callee, [self.fx.anyt], [[0]], args=[lam])
+
+    def test_param_spec_plain_callable_skips_pass_two(self) -> None:
+        # run(Callable[P, None], *args: P.args, **kwargs: P.kwargs);
+        # run(test, 1, 2): a concrete non-lambda actual suppresses pass 2.
+        # The P-shaped callable is the callee's nested formal.
+        from mypy.nodes import Block, LambdaExpr, ReturnStmt
+
+        lam = LambdaExpr(arguments=[], body=Block([ReturnStmt(NameExpr("x"))]), typ=None)
+        ps_formal = self._param_spec_formal(self.fx.anyt)
+        callee = self.fx.callable(ps_formal, self.fx.anyt)
+        plain_actual = self.fx.callable(self.fx.a, self.fx.anyt)
+        self._assert_par(callee, [plain_actual], [[0]])
+        self._assert_engages(callee.arg_types, [plain_actual], [False], [[0]], [1])
+        # A lambda actual never triggers the skip: promoted to pass 2.
+        self._assert_par(callee, [self.fx.anyt], [[0]], args=[lam])
+        self._assert_engages(callee.arg_types, [self.fx.anyt], [True], [[0]], [2])
+
+    def test_param_spec_instance_actual_with_call(self) -> None:
+        # An Instance actual with a plain non-generic __call__ method
+        # triggers the skip via find_member on both sides.
+        ps_formal = self._param_spec_formal(self.fx.anyt)
+        callee = self.fx.callable(ps_formal, self.fx.anyt)
+        inst_actual = Instance(self.callablei, [])
+        self._assert_par(callee, [inst_actual], [[0]])
+        self._assert_engages(callee.arg_types, [inst_actual], [False], [[0]], [1])
+
+    def test_param_spec_generic_callable_pass_two(self) -> None:
+        # A generic callable actual cannot trigger the skip; the ParamSpec
+        # formal itself has typevars in its args -> pass 2.
+        ps_formal = self._param_spec_formal(self.fx.anyt)
+        callee = self.fx.callable(ps_formal, self.fx.anyt)
+        generic_actual = self.fx.callable(self.fx.a, self.fx.anyt)
+        generic_actual.variables = (self.fx.t,)
+        self._assert_par(callee, [generic_actual], [[0]])
+        self._assert_engages(callee.arg_types, [generic_actual], [False], [[0]], [2])
+
+    def test_param_spec_multiple_actuals(self) -> None:
+        # Two actuals for one ParamSpec formal: the concrete one decides
+        # the skip for the whole formal (both stay pass 1).
+        ps_formal = self._param_spec_formal(self.fx.anyt)
+        callee = self.fx.callable(ps_formal, self.fx.anyt)
+        plain_actual = self.fx.callable(self.fx.a, self.fx.anyt)
+        generic_actual = self.fx.callable(self.fx.a, self.fx.anyt)
+        generic_actual.variables = (self.fx.t,)
+        self._assert_par(callee, [generic_actual, plain_actual], [[0, 1]])
+
+    def test_plain_and_typevar_formals_mixed(self) -> None:
+        # One callee with a plain formal and a typevar-ret formal: only
+        # the actual of the latter is promoted.
+        formals: list[Type] = [self._tvar_callable_ret(), self.fx.a]
+        callee = CallableType(
+            formals, [ARG_POS, ARG_POS], [None, None], self.fx.anyt, self.fx.function
+        )
+        self._assert_par(callee, [self.fx.anyt, self.fx.anyt], [[0], [1]])
+        self._assert_engages(
+            formals, [self.fx.anyt, self.fx.anyt], [False, False], [[0], [1]], [2, 1]
+        )
+
+    def test_param_spec_class_direct(self) -> None:
+        # Direct seam call with the nested ParamSpec formal and an
+        # Instance actual; the method is non-generic -> skip (1).
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        ps_formal = self._param_spec_formal(self.fx.anyt)
+        inst_actual = Instance(self.callablei, [])
+        result = _type_kernel.rust_get_arg_infer_passes(
+            self.resolver,
+            [_serialize_type_for_checkexpr(ps_formal)],
+            [_serialize_type_for_checkexpr(inst_actual)],
+            [False],
+            [[0]],
+            1,
+        )
+        assert result == [1], f"expected skip result [1], got {result}"

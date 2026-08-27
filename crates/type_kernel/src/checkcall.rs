@@ -1147,6 +1147,256 @@ fn serialize_optional_types(types: &[Option<Type>]) -> Option<Vec<u8>> {
     Some(buf.into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// get_arg_infer_passes (checkexpr.py:3561)
+// ---------------------------------------------------------------------------
+
+/// `ArgInferSecondPassQuery` (checkexpr.py:8569): a `BoolTypeQuery` with
+/// `ANY_STRATEGY` whose only override is `visit_callable_type`
+/// (`query_types(t.arg_types) or has_type_vars(t)`); every other node kind
+/// takes the base `BoolTypeQuery` walk. Returns `None` when the walk hits
+/// an alias node the wire cannot decide (missing snapshot, cycle, or a
+/// substitution the kernel cannot mirror) so the caller defers. `seen`
+/// mirrors the visitor's `seen_aliases` cycle guard.
+fn arg_infer_second_pass(
+    t: &Type,
+    aliases: &crate::aliases::TypeAliasResolver,
+    seen: &mut Vec<String>,
+) -> Option<bool> {
+    // ANY_STRATEGY fold with Python's `any()` short-circuit: an earlier
+    // True wins before a later deferring item is ever consulted.
+    fn any_second_pass(
+        types: &[Type],
+        aliases: &crate::aliases::TypeAliasResolver,
+        seen: &mut Vec<String>,
+    ) -> Option<bool> {
+        for t in types {
+            if arg_infer_second_pass(t, aliases, seen)? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+    match t {
+        Type::CallableType { arg_types, .. } => {
+            // visit_callable_type override: arg walk or has_type_vars(t).
+            // has_type_vars covers ret_type + instance_type recursively.
+            if any_second_pass(arg_types, aliases, seen)? {
+                return Some(true);
+            }
+            Some(has_type_vars_arg_query(t))
+        }
+        Type::TypeAliasType { type_ref, args, .. } => {
+            // visit_type_alias_type (type_visitor.py:601): expand via
+            // get_proper_type, guard cycles with `seen_aliases`, then
+            // `res or (python_3_12_type_alias and query_types(t.args))`.
+            if seen.contains(type_ref) {
+                return Some(false);
+            }
+            seen.push(type_ref.clone());
+            let (target, _, py312) = crate::checkexpr_functions::expanded_alias_target(t, aliases)?;
+            let mut res = arg_infer_second_pass(&target, aliases, seen)?;
+            if !res && py312 {
+                res = any_second_pass(args, aliases, seen)?;
+            }
+            Some(res)
+        }
+        Type::UnboundType { args, .. } => any_second_pass(args, aliases, seen),
+        Type::TypeVarType {
+            upper_bound,
+            default,
+            values,
+            ..
+        } => Some(
+            arg_infer_second_pass(upper_bound, aliases, seen)?
+                || arg_infer_second_pass(default, aliases, seen)?
+                || any_second_pass(values, aliases, seen)?,
+        ),
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => Some(
+            arg_infer_second_pass(upper_bound, aliases, seen)?
+                || arg_infer_second_pass(default, aliases, seen)?
+                || any_second_pass(&prefix.arg_types, aliases, seen)?,
+        ),
+        Type::TypeVarTupleType {
+            upper_bound,
+            default,
+            ..
+        } => Some(
+            arg_infer_second_pass(upper_bound, aliases, seen)?
+                || arg_infer_second_pass(default, aliases, seen)?,
+        ),
+        Type::UnpackType { typ } => arg_infer_second_pass(typ, aliases, seen),
+        Type::Parameters(p) => any_second_pass(&p.arg_types, aliases, seen),
+        Type::Instance { args, .. } => any_second_pass(args, aliases, seen),
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => Some(
+            arg_infer_second_pass(partial_fallback, aliases, seen)?
+                || any_second_pass(items, aliases, seen)?,
+        ),
+        // TypedDict: item values only (no fallback in BoolTypeQuery).
+        Type::TypedDictType { items, .. } => {
+            let values: Vec<Type> = items.iter().map(|(_, t)| t.clone()).collect();
+            any_second_pass(&values, aliases, seen)
+        }
+        Type::UnionType { items, .. } => any_second_pass(items, aliases, seen),
+        Type::Overloaded { items } => any_second_pass(items, aliases, seen),
+        Type::TypeType { item, .. } => arg_infer_second_pass(item, aliases, seen),
+        // AnyType, UninhabitedType, NoneType, ErasedType, DeletedType,
+        // LiteralType, RawExpressionType, EllipsisType: BoolTypeQuery
+        // defaults, all False under ANY_STRATEGY.
+        _ => Some(false),
+    }
+}
+
+/// `mypy.types.HasTypeVars` semantics exactly (skip_alias_target=True,
+/// typevar-like leaves are True, base `BoolTypeQuery` walk otherwise).
+/// Unlike `visitor::has_type_vars_inner`, this never walks callable
+/// `variables`, Instance `last_known_value`, `AnyType.source_any`, or
+/// TypedDict/Tuple/ literal fallbacks, mirroring the Python visitor.
+fn has_type_vars_arg_query(t: &Type) -> bool {
+    match t {
+        Type::TypeVarType { .. } | Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => {
+            true
+        }
+        Type::UnboundType { args, .. } => args.iter().any(has_type_vars_arg_query),
+        Type::UnpackType { typ } => has_type_vars_arg_query(typ),
+        Type::Parameters(p) => p.arg_types.iter().any(has_type_vars_arg_query),
+        Type::Instance { args, .. } => args.iter().any(has_type_vars_arg_query),
+        Type::CallableType {
+            arg_types,
+            ret_type,
+            instance_type,
+            ..
+        } => {
+            arg_types.iter().any(has_type_vars_arg_query)
+                || has_type_vars_arg_query(ret_type)
+                || instance_type
+                    .as_ref()
+                    .is_some_and(|t| has_type_vars_arg_query(t))
+        }
+        Type::Overloaded { items } => items.iter().any(has_type_vars_arg_query),
+        Type::TupleType {
+            items,
+            partial_fallback,
+            ..
+        } => items.iter().any(has_type_vars_arg_query) || has_type_vars_arg_query(partial_fallback),
+        Type::TypedDictType { items, .. } => items.iter().any(|(_, t)| has_type_vars_arg_query(t)),
+        Type::UnionType { items, .. } => items.iter().any(has_type_vars_arg_query),
+        Type::TypeType { item, .. } => has_type_vars_arg_query(item),
+        Type::TypeAliasType { args, .. } => {
+            // skip_alias_target: wire has no alias target; args only.
+            args.iter().any(has_type_vars_arg_query)
+        }
+        // Leaves: AnyType, UninhabitedType, NoneType, ErasedType,
+        // DeletedType, LiteralType. Base BoolTypeQuery returns the default
+        // (False under ANY_STRATEGY) without recursion.
+        _ => false,
+    }
+}
+
+/// `ExpressionChecker.get_arg_infer_passes` (checkexpr.py:3561-3608):
+/// two-pass argument-inference classification. For each formal of the
+/// callee, decide pass 1 vs pass 2 for its actuals:
+///   * a ParamSpec-carrying CallableType formal whose actuals are all
+///     "concrete" (a non-generic non-lambda CallableType, possibly after
+///     `find_member("__call__", ...)` on an Instance actual) suppresses
+///     the second pass for that formal;
+///   * otherwise `ArgInferSecondPassQuery(formal)` promotes its actuals
+///     to pass 2.
+///
+/// Pure decision: Python keeps the result application and every side
+/// effect. Defers (`None`) on any undecodable blob, alias-expansion
+/// failure, out-of-range index, or a `find_member` case the kernel
+/// cannot decide (see `find_member_call_is_plain_callable`).
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+pub fn rust_get_arg_infer_passes(
+    py: Python<'_>,
+    resolver: &crate::typeinfo::NativeTypeResolver,
+    formal_bytes: Vec<Vec<u8>>,
+    actual_bytes: Vec<Vec<u8>>,
+    lambda_flags: Vec<bool>,
+    formal_to_actual: Vec<Vec<i64>>,
+    num_actuals: usize,
+) -> Option<Vec<i64>> {
+    let decode_blob = |b: &[u8]| -> Option<Type> {
+        let mut buf = ReadBuffer::new(b);
+        read_type(&mut buf, None).ok()
+    };
+    const ARG_STAR: i64 = 2;
+    const ARG_STAR2: i64 = 4;
+    let formals: Vec<Type> = formal_bytes
+        .iter()
+        .map(|b| decode_blob(b))
+        .collect::<Option<Vec<_>>>()?;
+    let actuals: Vec<Type> = actual_bytes
+        .iter()
+        .map(|b| decode_blob(b))
+        .collect::<Option<Vec<_>>>()?;
+    let mut res = vec![1i64; num_actuals];
+    let aliases = resolver.alias_resolver();
+    for (i, formal) in formals.iter().enumerate() {
+        // p_formal = get_proper_type(callee.arg_types[i]).
+        let (p_formal, _, _) = crate::checkexpr_functions::expanded_alias_target(formal, aliases)?;
+        // CallableType.param_spec() gate (types.py:2701-2721): the last two
+        // parameters must be *args: P.args, **kwargs: P.kwargs.
+        let has_param_spec = match &p_formal {
+            Type::CallableType {
+                arg_types,
+                arg_kinds,
+                ..
+            } if arg_types.len() >= 2
+                && arg_kinds.get(arg_types.len() - 2) == Some(&ARG_STAR)
+                && arg_kinds.last() == Some(&ARG_STAR2) =>
+            {
+                matches!(arg_types[arg_types.len() - 2], Type::ParamSpecType { .. })
+            }
+            _ => false,
+        };
+        let mut skip_param_spec = false;
+        if has_param_spec {
+            for &j in formal_to_actual.get(i)? {
+                let j = usize::try_from(j).ok()?;
+                let lambda_flag = *lambda_flags.get(j)?;
+                let p_actual = &actuals.get(j)?;
+                let trigger = match p_actual {
+                    Type::Instance { .. } => {
+                        crate::checker_helpers::find_member_call_is_plain_callable(
+                            py, p_actual, resolver,
+                        )? && !lambda_flag
+                    }
+                    Type::CallableType { variables, .. } => variables.is_empty() && !lambda_flag,
+                    _ => false,
+                };
+                if trigger {
+                    skip_param_spec = true;
+                    break;
+                }
+            }
+        }
+        if !skip_param_spec {
+            // Fresh query per formal: Python builds a new
+            // ArgInferSecondPassQuery for each `arg.accept(...)` call.
+            let mut seen: Vec<String> = Vec::new();
+            if arg_infer_second_pass(formal, aliases, &mut seen)? {
+                for &j in formal_to_actual.get(i)? {
+                    let j = usize::try_from(j).ok()?;
+                    *res.get_mut(j)? = 2;
+                }
+            }
+        }
+    }
+    Some(res)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2061,5 +2311,303 @@ mod tests {
             solved_typevar(&resolved),
             "expected fully-resolved callable with T=Any"
         );
+    }
+
+    fn param_spec() -> Type {
+        Type::ParamSpecType {
+            name: "P".to_string(),
+            fullname: "mod.P".to_string(),
+            raw_id: 2,
+            namespace: "mod".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(any_type()),
+            default: Box::new(any_type()),
+            prefix: Box::new(crate::wire::Parameters {
+                arg_types: Vec::new(),
+                arg_kinds: Vec::new(),
+                arg_names: Vec::new(),
+                variables: Vec::new(),
+                imprecise_arg_kinds: false,
+            }),
+        }
+    }
+
+    fn callable_ret_with_args(arg_types: Vec<Type>, ret: Type) -> Type {
+        let mut t = callable_with_args(arg_types);
+        if let Type::CallableType { ret_type, .. } = &mut t {
+            **ret_type = ret;
+        }
+        t
+    }
+
+    /// `Callable[P, Any]` in the shape CallableType.param_spec() accepts:
+    /// trailing *args: P.args, **kwargs: P.kwargs and variables=[P].
+    fn param_spec_callable() -> Type {
+        let mut t = callable_with_args(vec![param_spec(), param_spec()]);
+        if let Type::CallableType {
+            arg_kinds,
+            variables,
+            ..
+        } = &mut t
+        {
+            *arg_kinds = vec![2, 4]; // ARG_STAR, ARG_STAR2
+            *variables = vec![param_spec()];
+        }
+        t
+    }
+
+    fn infer_passes(
+        formals: &[Type],
+        actuals: &[Type],
+        lambda_flags: Vec<bool>,
+        formal_to_actual: Vec<Vec<i64>>,
+        num_actuals: usize,
+        resolver: &crate::typeinfo::NativeTypeResolver,
+    ) -> Option<Vec<i64>> {
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            rust_get_arg_infer_passes(
+                py,
+                resolver,
+                formals.iter().map(encode).collect(),
+                actuals.iter().map(encode).collect(),
+                lambda_flags,
+                formal_to_actual,
+                num_actuals,
+            )
+        })
+    }
+
+    #[test]
+    fn arg_infer_plain_formal_pass_one() {
+        // No typevars anywhere in the formal: every actual stays pass 1.
+        let out = infer_passes(
+            &[callable(0)],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_plain_typevar_formal_pass_one() {
+        // A bare TypeVarType formal stays pass 1: BoolTypeQuery walks only
+        // its upper_bound/default/values (all Any here), not the typevar
+        // itself. Promotion comes from typevars in callable returns.
+        let out = infer_passes(
+            &[type_var()],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_typevar_in_callable_ret_pass_two() {
+        // Callable[[], T] (typevar in a nested callable return) promotes
+        // its actual to pass 2.
+        let formal = callable_with_args(vec![callable_ret_with_args(Vec::new(), type_var())]);
+        let out = infer_passes(
+            &[formal],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![2]));
+    }
+
+    #[test]
+    fn arg_infer_callable_typevar_in_variables_pass_one() {
+        // Python's HasTypeVars never walks callable `variables`: a generic
+        // callable formal whose variables are only declared (not used in
+        // arg/ret types) stays pass 1.
+        let formal = callable(1);
+        let out = infer_passes(
+            &[formal],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_alias_typevar_target_pass_two() {
+        // Alias expanding to a TypeVar-carrying callable promotes pass 2.
+        let target = callable_with_args(vec![type_var()]);
+        let res = resolver_with_alias("mod.A", &target);
+        let out = infer_passes(
+            &[alias_type("mod.A")],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &res,
+        );
+        assert_eq!(out, Some(vec![2]));
+    }
+
+    #[test]
+    fn arg_infer_recursive_alias_formal_pass_one() {
+        // A self-referential alias terminates via the seen guard: the
+        // cycle contributes False and the formal stays pass 1.
+        let target = callable_with_args(vec![alias_type("mod.R")]);
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert("mod.R".to_string(), alias_snap("mod.R", &target));
+        let res =
+            crate::typeinfo::NativeTypeResolver::new(crate::typeinfo::TypeResolver::new(), aliases);
+        let out = infer_passes(
+            &[alias_type("mod.R")],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &res,
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_alias_missing_snapshot_defers() {
+        let out = infer_passes(
+            &[alias_type("mod.Missing")],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn arg_infer_undecodable_formal_defers() {
+        pyo3::prepare_freethreaded_python();
+        pyo3::Python::with_gil(|py| {
+            let out = rust_get_arg_infer_passes(
+                py,
+                &empty_resolver(),
+                vec![b"\xff\xff".to_vec()],
+                vec![encode(&any_type())],
+                vec![false],
+                vec![vec![0]],
+                1,
+            );
+            assert_eq!(out, None);
+        });
+    }
+
+    #[test]
+    fn arg_infer_param_spec_plain_callable_skips_pass_two() {
+        // ParamSpec formal + non-generic CallableType actual: the skip
+        // trigger suppresses the second pass (result stays 1).
+        let formal = param_spec_callable();
+        let actual = callable(0);
+        let out = infer_passes(
+            &[formal],
+            &[actual],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_param_spec_wrong_shape_pass_one() {
+        // ParamSpec only in `variables`, without the trailing
+        // *args: P.args, **kwargs: P.kwargs shape: param_spec() returns
+        // None, so no skip arm and no promotion (ret is Any).
+        let mut formal = callable_with_args(vec![any_type()]);
+        if let Type::CallableType { variables: v, .. } = &mut formal {
+            *v = vec![param_spec()];
+        }
+        let actual = callable(0);
+        let out = infer_passes(
+            &[formal],
+            &[actual],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1]));
+    }
+
+    #[test]
+    fn arg_infer_param_spec_lambda_pass_two() {
+        // A lambda actual never triggers the ParamSpec skip; the formal
+        // carries a ParamSpec in its args -> has_type_vars -> pass 2.
+        let formal = param_spec_callable();
+        let actual = callable(0);
+        let out = infer_passes(
+            &[formal],
+            &[actual],
+            vec![true],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![2]));
+    }
+
+    #[test]
+    fn arg_infer_param_spec_other_actual_pass_two() {
+        // A non-callable, non-instance actual (e.g. AnyType) cannot
+        // trigger the skip; the ParamSpec formal promotes pass 2.
+        let formal = param_spec_callable();
+        let out = infer_passes(
+            &[formal],
+            &[any_type()],
+            vec![false],
+            vec![vec![0]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![2]));
+    }
+
+    #[test]
+    fn arg_infer_param_spec_multiple_actuals_skip() {
+        // Two actuals for one ParamSpec formal: both promoted, then both
+        // suppressed back to 1 by the skip trigger.
+        let formal = param_spec_callable();
+        let plain = callable(0);
+        let out = infer_passes(
+            &[formal],
+            &[plain.clone(), plain],
+            vec![false, false],
+            vec![vec![0, 1]],
+            2,
+            &empty_resolver(),
+        );
+        assert_eq!(out, Some(vec![1, 1]));
+    }
+
+    #[test]
+    fn arg_infer_out_of_range_actual_defers() {
+        // A promoted actual index out of range cannot happen in Python
+        // (list assignment would raise); the seam defers instead.
+        let formal = callable_with_args(vec![callable_ret_with_args(Vec::new(), type_var())]);
+        let out = infer_passes(
+            &[formal],
+            &[any_type()],
+            vec![false],
+            vec![vec![7]],
+            1,
+            &empty_resolver(),
+        );
+        assert_eq!(out, None);
     }
 }

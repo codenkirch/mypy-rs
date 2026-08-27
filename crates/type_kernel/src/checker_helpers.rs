@@ -1345,6 +1345,99 @@ pub(crate) fn rust_get_protocol_member(
 }
 
 // ---------------------------------------------------------------------------
+// find_member("__call__") skip-trigger decision (checkexpr.py:3594-3604)
+// ---------------------------------------------------------------------------
+
+/// Decision core of the ParamSpec arm of `get_arg_infer_passes`
+/// (checkexpr.py:3594-3604): for an Instance actual, mirror
+/// `find_member("__call__", ity, ity, is_operator=True)` (subtypes.py:1960)
+/// restricted to the decidable subset, and return whether the resulting
+/// member type is a plain non-generic `CallableType` (the skip trigger).
+///
+/// Decidable subset: the member is missing (find_member returns None, or
+/// AnyType via fallback_to_any; both leave the actual non-callable), or it
+/// is a plain non-property `FuncDef` / `OverloadedFuncDef` signature read
+/// from the live node and bound + expanded via `member_method_inner`.
+/// Defers (`None`) on extra_attrs, property / Decorator / Var members,
+/// inherited methods (the same-class guard), and any unreadable fact.
+pub(crate) fn find_member_call_is_plain_callable(
+    py: Python<'_>,
+    instance: &Type,
+    resolver: &NativeTypeResolver,
+) -> Option<bool> {
+    let Type::Instance {
+        type_ref,
+        extra_attrs,
+        ..
+    } = instance
+    else {
+        return None;
+    };
+    if extra_attrs.is_some() {
+        // find_member consults itype.extra_attrs; defer instead of guessing.
+        return None;
+    }
+    let info = resolver.live_typeinfo(py, type_ref)?;
+    if info.is_none() {
+        return None;
+    }
+    let (sym_info, sym_node) = match mro_get(py, info, "__call__") {
+        Some(pair) => pair,
+        // Member absent: is_operator=True skips the __getattribute__ /
+        // __getattr__ loop, so find_member returns None (or AnyType on
+        // fallback_to_any); either way the actual is not a CallableType.
+        None => return Some(false),
+    };
+    let sym_info_ref = sym_info.as_ref(py);
+    let node = sym_node.as_ref(py).getattr("node").ok()?;
+    if node.is_none() {
+        // Unfilled cross-ref behaves like a missing member in find_member.
+        return Some(false);
+    }
+    let class_name = node.get_type().name().unwrap_or("").to_string();
+    match class_name.as_str() {
+        "FuncDef" | "OverloadedFuncDef" => {
+            // A property is an OverloadedFuncDef with is_property=True;
+            // its member type is the getter value -> defer.
+            if get_bool_flag(py, node, "is_property") == Some(true) {
+                return None;
+            }
+            let sig_obj = node.getattr("type").ok()?;
+            if sig_obj.is_none() {
+                // function_type would fall back to the FuncItem body.
+                return None;
+            }
+            let sig_bytes = serialize_type_to_bytes(py, sig_obj)?;
+            let mut buf = ReadBuffer::new(&sig_bytes);
+            let signature = wire::read_type(&mut buf, None).ok()?;
+            let method_fullname = get_opt_str_attr(sym_info_ref, "fullname")?;
+            // is_operator=True, is_lvalue=False, class_obj=False; errors
+            // are suppressed on the Python side, which member_method_inner
+            // never emits anyway.
+            let result = crate::checkmember::member_method_inner(
+                instance,
+                &signature,
+                &method_fullname,
+                instance,
+                "__call__",
+                resolver.resolver(),
+                live_strict_optional(py),
+                false, // is_class
+            )?;
+            Some(matches!(
+                result,
+                Type::CallableType { variables, .. } if variables.is_empty()
+            ))
+        }
+        _ => {
+            // Decorator, Var, TypeInfo, MypyFile, ... need analyze_var /
+            // find_node_type paths Rust does not run here -> defer.
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests
 // ---------------------------------------------------------------------------
 
