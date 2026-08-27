@@ -92,6 +92,7 @@ try:
 
     _rust_infer_variance_member = _type_kernel.rust_infer_variance_member
     _rust_are_args_compatible = _type_kernel.rust_are_args_compatible
+    _rust_classify_type_parameter = _type_kernel.rust_classify_type_parameter
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
@@ -100,6 +101,7 @@ except ImportError:
     _read_type = None  # type: ignore[assignment]
     _rust_infer_variance_member = None  # type: ignore[assignment]
     _rust_are_args_compatible = None  # type: ignore[assignment]
+    _rust_classify_type_parameter = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
@@ -163,6 +165,25 @@ def _native_are_args_compatible_active() -> bool:
         _HAS_TYPE_KERNEL
         and _native_subtype_active
         and _rust_are_args_compatible is not None
+    )
+
+
+# Decision tags returned by `_rust_classify_type_parameter`; must match
+# the `KIND_TYPEPARAM_*` constants in crates/type_kernel/src/subtypes.rs.
+NATIVE_TYPEPARAM_SUBTYPE = 0
+NATIVE_TYPEPARAM_SUBTYPE_SWAP = 1
+NATIVE_TYPEPARAM_PROPER_SUBTYPE = 2
+NATIVE_TYPEPARAM_PROPER_SWAP = 3
+NATIVE_TYPEPARAM_SAME = 4
+NATIVE_TYPEPARAM_EQUIVALENT = 5
+
+
+def _native_type_parameter_active() -> bool:
+    """Guard for the `check_type_parameter` dispatch seam."""
+    return (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _rust_classify_type_parameter is not None
     )
 
 
@@ -891,6 +912,25 @@ def _is_subtype(
 def check_type_parameter(
     left: Type, right: Type, variance: int, proper_subtype: bool, subtype_context: SubtypeContext
 ) -> bool:
+    # Issue #998: Rust classifies the variance-dispatch head (including
+    # the ambiguous-Uninhabited invariant-to-covariant upgrade) into a
+    # leaf tag; Python applies the leaf call. None defers to the body.
+    if _native_type_parameter_active():
+        tag = _rust_classify_type_parameter(left, variance, proper_subtype)
+        if tag == NATIVE_TYPEPARAM_SUBTYPE:
+            return is_subtype(left, right, subtype_context=subtype_context)
+        if tag == NATIVE_TYPEPARAM_SUBTYPE_SWAP:
+            return is_subtype(right, left, subtype_context=subtype_context)
+        if tag == NATIVE_TYPEPARAM_PROPER_SUBTYPE:
+            return is_proper_subtype(left, right, subtype_context=subtype_context)
+        if tag == NATIVE_TYPEPARAM_PROPER_SWAP:
+            return is_proper_subtype(right, left, subtype_context=subtype_context)
+        if tag == NATIVE_TYPEPARAM_SAME:
+            return is_same_type(
+                left, right, ignore_promotions=False, subtype_context=subtype_context
+            )
+        if tag == NATIVE_TYPEPARAM_EQUIVALENT:
+            return is_equivalent(left, right, subtype_context=subtype_context)
     # It is safe to consider empty collection literals and similar as covariant, since
     # such type can't be stored in a variable, see checker.is_valid_inferred_type().
     if variance == INVARIANT:

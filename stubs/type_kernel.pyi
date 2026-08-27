@@ -239,6 +239,7 @@ __all__ = [
     "rust_infer_function_type_arguments",
     "rust_callables_compatible",
     "rust_are_args_compatible",
+    "rust_classify_type_parameter",
     "rust_are_parameters_compatible",
     "rust_is_overlapping_types",
     "rust_refers_to_fullname",
@@ -1237,6 +1238,11 @@ def rust_are_args_compatible(
     ignore_pos_arg_names: bool,
     allow_partial_overlap: bool,
     allow_imprecise_kinds: bool,
+) -> int | None: ...
+def rust_classify_type_parameter(
+    left: Any,
+    variance: int,
+    proper_subtype: bool,
 ) -> int | None: ...
 def rust_is_overlapping_types(
     left_bytes: bytes,
