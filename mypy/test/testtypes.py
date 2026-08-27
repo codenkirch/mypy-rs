@@ -34329,3 +34329,174 @@ class NativeCheckUnpacksInListSuite(Suite):
         keep, final_unpack_idx = result
         assert keep == [0]
         assert final_unpack_idx == 1
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckWarnDeprecatedSuite(Suite):
+    """Parity for the Rust `check_and_warn_deprecated` arbitration head.
+
+    The deprecation-warning gate chain (deprecated string present,
+    typeshed-stub gate, same-class exemption, prefix-exclusion list,
+    ImportFrom-presence scan) is decided in Rust from scalar facts; the
+    Python shim applies the `self.note` / `self.fail` side effect for the
+    tag Rust returns (note when `report_deprecated_as_note`, else fail).
+    Every fact is a scalar or string, so the seam never defers.
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical captured (kind, message) pairs, and direct seam calls
+    prove the silent/note/fail outcomes on every gate branch.
+    """
+
+    def setUp(self) -> None:
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(
+        self,
+        *,
+        exclude: Sequence[str] = (),
+        report_note: bool = True,
+        api_type: object = None,
+        imports: Sequence[object] = (),
+        stub: bool = False,
+    ) -> tuple[object, list[tuple[str, str]]]:
+        from mypy.typeanal import TypeAnalyser
+
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        captured: list[tuple[str, str]] = []
+        ta.fail_func = lambda msg, ctx, code=None: captured.append(("fail", msg))
+        ta.note_func = lambda msg, ctx, code=None: captured.append(("note", msg))
+
+        class FakeApi:
+            type = api_type
+
+        ta.api = FakeApi()
+        ta.is_typeshed_stub = stub
+        ta.options = SimpleNamespace(
+            deprecated_calls_exclude=list(exclude),
+            report_deprecated_as_note=report_note,
+        )
+        ta.cur_mod_node = SimpleNamespace(imports=list(imports))
+        ta._captured = captured
+        return ta, captured
+
+    def _deprecated_info(
+        self,
+        fullname: str = "mod.Dep",
+        deprecated: str | None = "use mod.B instead",
+    ) -> TypeInfo:
+        info = self.fx.make_type_info(fullname.rsplit(".", 1)[-1], module_name="mod")
+        info._fullname = fullname
+        info.deprecated = deprecated
+        return info
+
+    def _assert_par(self, **kwargs: object) -> list[tuple[str, str]]:
+        exclude = kwargs.pop("exclude", ())
+        report_note = kwargs.pop("report_note", True)
+        api_type = kwargs.pop("api_type", None)
+        imports = kwargs.pop("imports", ())
+        stub = kwargs.pop("stub", False)
+        info = self._deprecated_info(**kwargs)
+        off_ta, _ = self._analyser(
+            exclude=exclude, report_note=report_note, api_type=api_type,
+            imports=imports, stub=stub,
+        )
+        off = self._with_gate(False, lambda: self._call(off_ta, info))
+        on_ta, _ = self._analyser(
+            exclude=exclude, report_note=report_note, api_type=api_type,
+            imports=imports, stub=stub,
+        )
+        on = self._with_gate(True, lambda: self._call(on_ta, info))
+        assert_equal(on, off, f"deprecated parity {info.fullname}")
+        return on
+
+    def _call(self, ta: object, info: TypeInfo) -> list[tuple[str, str]]:
+        ta.check_and_warn_deprecated(info, Context())
+        return list(ta._captured)
+
+    def test_warns_as_note_by_default(self) -> None:
+        captured = self._assert_par()
+        assert_equal(captured, [("note", "use mod.B instead")])
+
+    def test_warns_as_fail_when_notes_off(self) -> None:
+        captured = self._assert_par(report_note=False)
+        assert_equal(captured, [("fail", "use mod.B instead")])
+
+    def test_no_deprecated_string_is_silent(self) -> None:
+        captured = self._assert_par(deprecated=None)
+        assert_equal(captured, [])
+
+    def test_typeshed_stub_is_silent(self) -> None:
+        captured = self._assert_par(stub=True)
+        assert_equal(captured, [])
+
+    def test_same_class_is_exempt(self) -> None:
+        info = self._deprecated_info()
+        captured = self._assert_par(api_type=info)
+        assert_equal(captured, [])
+
+    def test_exclude_exact_and_prefix(self) -> None:
+        captured = self._assert_par(exclude=["mod.Dep"])
+        assert_equal(captured, [])
+        captured = self._assert_par(exclude=["mod"], fullname="mod.Dep.sub")
+        assert_equal(captured, [])
+
+    def test_exclude_respects_dot_boundary(self) -> None:
+        # "mod.DepX" must not match an exclusion of "mod.Dep".
+        captured = self._assert_par(exclude=["mod.Dep"], fullname="mod.DepX")
+        assert_equal(captured, [("note", "use mod.B instead")])
+
+    def test_import_from_suppresses_warning(self) -> None:
+        from mypy.nodes import ImportFrom
+
+        captured = self._assert_par(imports=[ImportFrom("mod", 0, [("Dep", None)])])
+        assert_equal(captured, [])
+
+    def test_import_from_other_name_warns(self) -> None:
+        from mypy.nodes import ImportFrom
+
+        captured = self._assert_par(imports=[ImportFrom("other", 0, [("X", None)])])
+        assert_equal(captured, [("note", "use mod.B instead")])
+
+    def _assert_direct(self, tag: int, **kwargs: object) -> None:
+        from mypy.typeanal import _rust_classify_check_warn_deprecated
+
+        result = _rust_classify_check_warn_deprecated(
+            kwargs.get("deprecated", "x"),
+            kwargs.get("stub", False),
+            kwargs.get("api_fullname"),
+            kwargs.get("fullname", "mod.Dep"),
+            kwargs.get("name", "Dep"),
+            kwargs.get("exclude", []),
+            kwargs.get("report_note", True),
+            kwargs.get("imports", []),
+        )
+        assert_equal(result, tag, f"direct seam {kwargs}")
+
+    def test_direct_silent_paths(self) -> None:
+        from mypy.typeanal import _DEPRECATED_TAG_SILENT
+
+        self._assert_direct(_DEPRECATED_TAG_SILENT, deprecated=None)
+        self._assert_direct(_DEPRECATED_TAG_SILENT, deprecated="")
+        self._assert_direct(_DEPRECATED_TAG_SILENT, stub=True)
+        self._assert_direct(_DEPRECATED_TAG_SILENT, api_fullname="mod.Dep")
+        self._assert_direct(_DEPRECATED_TAG_SILENT, exclude=["mod.Dep"])
+        self._assert_direct(_DEPRECATED_TAG_SILENT, imports=["Dep"])
+
+    def test_direct_note_and_fail(self) -> None:
+        from mypy.typeanal import _DEPRECATED_TAG_FAIL, _DEPRECATED_TAG_NOTE
+
+        self._assert_direct(_DEPRECATED_TAG_NOTE, report_note=True)
+        self._assert_direct(_DEPRECATED_TAG_FAIL, report_note=False)
+

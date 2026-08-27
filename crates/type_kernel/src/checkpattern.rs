@@ -1445,6 +1445,7 @@ mod tests {
         }
     }
 
+    #[expect(dead_code)]
     fn cpr_overloaded(first: Type) -> Type {
         Type::Overloaded { items: vec![first] }
     }

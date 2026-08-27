@@ -5325,6 +5325,7 @@ mod tests {
 
     // `are_args_compatible` pure-decision tests. Tag values must match
     // KIND_ARE_ARGS_* in this file and NATIVE_ARE_ARGS_* in subtypes.py.
+    #[allow(clippy::too_many_arguments)]
     fn are_args(
         left_name: Option<&str>,
         right_name: Option<&str>,

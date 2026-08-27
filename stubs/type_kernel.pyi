@@ -1848,6 +1848,16 @@ def rust_classify_raw_expression_type(
     base_type_name: str,
     note_is_none: bool,
 ) -> int | None: ...
+def rust_classify_check_warn_deprecated(
+    deprecated: str | None,
+    is_typeshed_stub: bool,
+    api_type_fullname: str | None,
+    info_fullname: str,
+    info_name: str,
+    deprecated_calls_exclude: list[str],
+    report_deprecated_as_note: bool,
+    import_from_names: list[str],
+) -> int | None: ...
 def rust_classify_analyze_callable_type(
     arg_count: int,
     arg0_is_type_list: bool,

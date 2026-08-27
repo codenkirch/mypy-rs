@@ -1466,6 +1466,14 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def check_and_warn_deprecated(self, info: TypeInfo, ctx: Context) -> None:
         """Similar logic to `TypeChecker.check_deprecated` and `TypeChecker.warn_deprecated."""
 
+        tag = self._native_deprecated_warn_tag(info)
+        if tag is not None:
+            if tag == _DEPRECATED_TAG_NOTE:
+                self.note(info.deprecated, ctx, code=codes.DEPRECATED)
+            elif tag == _DEPRECATED_TAG_FAIL:
+                self.fail(info.deprecated, ctx, code=codes.DEPRECATED)
+            return
+
         if (
             (deprecated := info.deprecated)
             and not self.is_typeshed_stub
@@ -1481,6 +1489,40 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             else:
                 warn = self.note if self.options.report_deprecated_as_note else self.fail
                 warn(deprecated, ctx, code=codes.DEPRECATED)
+
+    def _native_deprecated_warn_tag(self, info: TypeInfo) -> int | None:
+        """Classify the `check_and_warn_deprecated` arbitration head in Rust.
+
+        Rust decides silent/note/fail from scalar facts; Python applies the
+        self.note / self.fail side effects with the live info.deprecated
+        string. None defers to the pure-Python body. Tag table in
+        crates/type_kernel/src/typeanal_deprec.rs.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        if not info.deprecated:
+            # Short-circuit on the falsy head fact so the eager fact reads
+            # below (api.type, cur_mod_node.imports) stay as lazy as the
+            # `deprecated and ...` chain of the pure-Python body.
+            return None
+        try:
+            return _rust_classify_check_warn_deprecated(
+                info.deprecated,
+                self.is_typeshed_stub,
+                self.api.type.fullname if self.api.type else None,
+                info.fullname,
+                info.name,
+                self.options.deprecated_calls_exclude,
+                self.options.report_deprecated_as_note,
+                [
+                    n[0]
+                    for imp in self.cur_mod_node.imports
+                    if isinstance(imp, ImportFrom)
+                    for n in imp.names
+                ],
+            )
+        except (AssertionError, NotImplementedError):
+            return None
 
     def analyze_type_with_type_info(
         self, info: TypeInfo, args: Sequence[Type], ctx: Context, empty_tuple_index: bool
@@ -3617,6 +3659,7 @@ try:
         rust_check_unpacks_in_list as _rust_check_unpacks_in_list,
         rust_check_vec_type_args as _rust_check_vec_type_args,
         rust_classify_analyze_callable_type as _rust_classify_analyze_callable_type,
+        rust_classify_check_warn_deprecated as _rust_classify_check_warn_deprecated,
         rust_classify_literal_param as _rust_classify_literal_param,
         rust_classify_raw_expression_type as _rust_classify_raw_expression_type,
         rust_classify_special_unbound as _rust_classify_special_unbound,
@@ -3668,8 +3711,10 @@ except ImportError:
     _rust_classify_type_with_info = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
+    _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
     _rust_classify_literal_param = None  # type: ignore[assignment]
     _rust_classify_raw_expression_type = None  # type: ignore[assignment]
+    _rust_classify_check_warn_deprecated = None  # type: ignore[assignment]
     _rust_classify_analyze_callable_type = None  # type: ignore[assignment]
     _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
@@ -3804,6 +3849,13 @@ _RAW_EXPR_TAG_LITERAL = 0
 _RAW_EXPR_TAG_NUMERIC_LITERALS = 1
 _RAW_EXPR_TAG_GENERIC = 2
 
+# Result tags for `check_and_warn_deprecated` (issue #1002). Mirrored in
+# crates/type_kernel/src/typeanal_deprec.rs; Python applies the note/fail
+# side effect for the tag Rust returns.
+_DEPRECATED_TAG_SILENT = 0
+_DEPRECATED_TAG_NOTE = 1
+_DEPRECATED_TAG_FAIL = 2
+
 # Message tags for `visit_tuple_type` (issue #983). Mirrored in
 # crates/type_kernel/src/typeanal_special.rs; Python applies the
 # self.fail + one-of-three note and, on OK, the reconstruction.
@@ -3821,13 +3873,6 @@ _CALLABLE_TAG_ELLIPSIS = 2
 _CALLABLE_TAG_PARAMSPEC = 3
 _CALLABLE_TAG_INVALID_DISALLOW = 4
 _CALLABLE_TAG_INVALID_ALLOW = 5
-# Message tags for `visit_tuple_type` (issue #983). Mirrored in
-# crates/type_kernel/src/typeanal_special.rs; Python applies the
-# self.fail + one-of-three note and, on OK, the reconstruction.
-_TUPLE_TAG_OK = 0
-_TUPLE_TAG_EMPTY = 1
-_TUPLE_TAG_SINGLE = 2
-_TUPLE_TAG_MULTI = 3
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
