@@ -2923,6 +2923,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check_getattr_method 4-way dispatch-head port.
+    // Rust classifies module/getattribute/class/pass from Scope facts.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_getattr_method,
+        module
+    )?)?;
+
     // checker_functions: check_func_def_override 5-way dispatch port. Rust
     // classifies the override into a branch tag from scalar facts; bodies stay
     // in Python.

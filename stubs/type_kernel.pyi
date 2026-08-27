@@ -809,6 +809,7 @@ def rust_classify_check_lvalue(
 def rust_classify_new_signature(
     is_metaclass: bool, is_instance_ret: bool
 ) -> int | None: ...
+def rust_classify_getattr_method(scope: Any, name: str) -> int | None: ...
 def rust_classify_func_def_override(
     is_funcdef: bool,
     orig_type_is_none: bool,

@@ -343,6 +343,7 @@ try:
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
+        rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
@@ -419,6 +420,7 @@ except ImportError:
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_rvalue_count = None  # type: ignore[assignment]
+    _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
@@ -1080,6 +1082,11 @@ class LocalTypeMap:
         self.chk._type_maps.pop()
         return False
 
+
+NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE = 0
+NATIVE_GETATTR_METHOD_MODULE = 1
+NATIVE_GETATTR_METHOD_CLASS = 2
+NATIVE_GETATTR_METHOD_PASS = 3
 
 class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     """Mypy type checker.
@@ -3084,6 +3091,43 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 self.msg.signatures_incompatible(method, other_method, defn)
 
     def check_getattr_method(self, typ: Type, context: Context, name: str) -> None:
+        # Native type_kernel seam: classify the 4-way dispatch head in Rust
+        # (checker_functions.rs); the fixed CallableType build (named_type),
+        # the is_subtype check, and the message emission stay here.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_getattr_method is not None
+        ):
+            try:
+                tag = _rust_classify_getattr_method(self.scope, name)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE:
+                    self.fail(message_registry.MODULE_LEVEL_GETATTRIBUTE, context)
+                    return
+                if tag == NATIVE_GETATTR_METHOD_PASS:
+                    return
+                if tag == NATIVE_GETATTR_METHOD_MODULE:
+                    method_type = CallableType(
+                        [self.named_type("builtins.str")],
+                        [nodes.ARG_POS],
+                        [None],
+                        AnyType(TypeOfAny.special_form),
+                        self.named_type("builtins.function"),
+                    )
+                else:
+                    method_type = CallableType(
+                        [AnyType(TypeOfAny.special_form), self.named_type("builtins.str")],
+                        [nodes.ARG_POS, nodes.ARG_POS],
+                        [None, None],
+                        AnyType(TypeOfAny.special_form),
+                        self.named_type("builtins.function"),
+                    )
+                if not is_subtype(typ, method_type):
+                    self.msg.invalid_signature_for_special_method(typ, context, name)
+                return
         if len(self.scope.stack) == 1:
             # module scope
             if name == "__getattribute__":
