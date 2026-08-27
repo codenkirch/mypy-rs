@@ -474,6 +474,24 @@ including:
   offending enum base's `str_with_options`, keeping the pure-Python body
   as the fallback. Gated by `_native_checker_active` and covered by
   `NativeEnumBasesSuite` in `mypy/test/testtypes.py`.
+- `rust_classify_enum` (issue #971): the Rust classifier in
+  `checker_functions.rs` mirrors the three arms of
+  `TypeChecker.check_enum` (checker.py:3843-3870): (a) `__members__`
+  override fail, (c) the final-enum base loop over `mro[1:-1]`, and
+  (b) the stub-empty-enum fail+note. Rust reads the live `defn.info`
+  (`names` as a dict, `fullname`, `mro` as a list, `enum_members`) via
+  PyO3 plus scalar facts (`is_stub`, `tree_fullname`, and the
+  `ENUM_BASES` allowlist) and returns `(tag, base_names)`: tag is a
+  bit flag (1 = members-override, 2 = stub-empty) and base_names are
+  the arm-(c) offending base fullnames. The Python shim applies
+  `self.fail` / `self.note` / `check_final_enum` and then calls
+  `check_enum_bases` / `check_enum_new`, keeping the pure-Python body
+  as the fallback. Defers (`None`) on a non-dict `names` or non-list
+  `mro`, or an unreadable `Var.has_explicit_value` / `enum_members`.
+  Gated by `_native_checker_active` and covered by
+  `NativeEnumCheckSuite` in `mypy/test/testtypes.py` (direct seam tag
+  tests + gate-off vs gate-on differential), plus pure decision unit
+  tests in `checker_functions.rs`.
 - `rust_is_final_enum_value` (issue #936) — mirrors
   `TypeChecker.is_final_enum_value` (checker.py:3825-3848): a pure bool
   predicate over a `SymbolTableNode`. FuncBase/Decorator -> False (a

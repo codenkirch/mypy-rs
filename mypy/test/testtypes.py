@@ -31972,3 +31972,230 @@ class NativeIsDisjointBaseSuite(Suite):
         self._set_active(True)
         on = _is_disjoint_base(info)
         assert off == on
+
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEnumCheckSuite(Suite):
+    """Parity for the Rust `check_enum` multi-arm classifier port.
+
+    `TypeChecker.check_enum` (checker.py:3843) has three arms:
+    (a) `__members__` override fail, (c) final-enum base loop,
+    (b) stub-empty-enum fail+note. The Rust classifier
+    (`checker_functions.rs`) returns `(tag, base_names)` where
+    tag is a bit flag and base_names are the arm-(c) offending
+    base fullnames. Direct seam calls assert exact tags and
+    base-name lists; gate-off vs gate-on parity compares recorded
+    fail/note message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(
+        self, name: str, *, is_enum: bool = True,
+        mro: list[TypeInfo] | None = None,
+    ) -> TypeInfo:
+        info = self.fx.make_type_info(name, mro=mro)
+        info.is_enum = is_enum
+        return info
+
+    def _seam(
+        self, info: TypeInfo, *, is_stub: bool = False,
+        tree_fullname: str = "mod.sub",
+    ) -> tuple[int, list[str]] | None:
+        from mypy.semanal_enum import ENUM_BASES
+
+        return _type_kernel.rust_classify_enum(
+            info, is_stub, tree_fullname, list(ENUM_BASES),
+        )
+
+    def _var_sym(self, has_explicit_value: bool) -> SymbolTableNode:
+        var = Var("__members__")
+        var.has_explicit_value = has_explicit_value
+        return SymbolTableNode(MDEF, var)
+
+    def _sub(self, info: TypeInfo) -> Any:
+        info.defn.info = info
+        return info.defn
+
+    def _run(
+        self, info: TypeInfo, *, is_stub: bool = False,
+        tree_fullname: str = "mod.sub",
+    ) -> tuple[Any, Any]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[tuple[str, object]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, object]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                fail=lambda msg, ctx, code=None: msgs.append((str(msg), code))
+            )
+            chk.note = (  # type: ignore[assignment]
+                lambda msg, ctx, code=None: msgs.append(("NOTE: " + str(msg), code))
+            )
+            chk.options = Options()
+            chk.is_stub = is_stub
+            chk.tree = SimpleNamespace(fullname=tree_fullname)
+            defn = self._sub(info)
+            chk.check_enum(defn)
+            return msgs
+
+        return self._with_gate(False, check_one), self._with_gate(True, check_one)
+
+    # --- Direct seam tests ---
+
+    def test_seam_no_arms(self) -> None:
+        info = self._info("mod.Sub")
+        result = self._seam(info)
+        assert result is not None
+        tag, base_names = result
+        assert tag == 0
+        assert base_names == []
+
+    def test_seam_members_override(self) -> None:
+        info = self._info("mod.Sub")
+        info.names["__members__"] = self._var_sym(True)
+        result = self._seam(info)
+        assert result is not None
+        tag, _ = result
+        assert tag & 1 == 1
+
+    def test_seam_members_not_var(self) -> None:
+        info = self._info("mod.Sub")
+        info.names["__members__"] = SymbolTableNode(MDEF, FuncDef("__members__"))
+        result = self._seam(info)
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_members_no_explicit_value(self) -> None:
+        info = self._info("mod.Sub")
+        info.names["__members__"] = self._var_sym(False)
+        result = self._seam(info)
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_members_in_enum_base(self) -> None:
+        info = self._info("enum.Enum")
+        info.names["__members__"] = self._var_sym(True)
+        result = self._seam(info)
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_final_enum_base(self) -> None:
+        enum_base = self._info("mod.Parent", is_enum=True)
+        info = self._info("mod.Sub", mro=[enum_base, self.fx.oi])
+        result = self._seam(info)
+        assert result is not None
+        tag, base_names = result
+        assert tag == 0
+        assert base_names == ["mod.Parent"]
+
+    def test_seam_enum_base_in_enum_bases(self) -> None:
+        enum_base = self._info("enum.Enum", is_enum=True)
+        info = self._info("mod.Sub", mro=[enum_base, self.fx.oi])
+        result = self._seam(info)
+        assert result is not None
+        _, base_names = result
+        assert base_names == []
+
+    def test_seam_stub_empty(self) -> None:
+        info = self._info("mod.Sub")
+        result = self._seam(info, is_stub=True, tree_fullname="mod.sub")
+        assert result is not None
+        tag, _ = result
+        assert tag & 2 == 2
+
+    def test_seam_stub_not_empty(self) -> None:
+        info = self._info("mod.Sub")
+        # Add an enum member: a Var with has_explicit_value
+        var = Var("MEMBER")
+        var.has_explicit_value = True
+        info.names["MEMBER"] = SymbolTableNode(MDEF, var)
+        result = self._seam(info, is_stub=True)
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_stub_in_enum_module(self) -> None:
+        info = self._info("mod.Sub")
+        result = self._seam(info, is_stub=True, tree_fullname="enum")
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_stub_in_typeshed(self) -> None:
+        info = self._info("mod.Sub")
+        result = self._seam(info, is_stub=True, tree_fullname="_typeshed")
+        assert result is not None
+        tag, _ = result
+        assert tag == 0
+
+    def test_seam_all_three_arms(self) -> None:
+        enum_base = self._info("mod.Parent", is_enum=True)
+        info = self._info("mod.Sub", mro=[enum_base, self.fx.oi])
+        info.names["__members__"] = self._var_sym(True)
+        result = self._seam(info, is_stub=True)
+        assert result is not None
+        tag, base_names = result
+        assert tag & 1 == 1
+        assert tag & 2 == 2
+        assert base_names == ["mod.Parent"]
+
+    # --- Gate-off vs gate-on parity tests ---
+
+    def test_parity_no_arms(self) -> None:
+        info = self._info("mod.Sub")
+        off, on = self._run(info)
+        assert_equal(on, off, "no arms")
+
+    def test_parity_members_override(self) -> None:
+        info = self._info("mod.Sub")
+        info.names["__members__"] = self._var_sym(True)
+        off, on = self._run(info)
+        assert_equal(on, off, "members override")
+
+    def test_parity_final_enum_base(self) -> None:
+        enum_base = self._info("mod.Parent", is_enum=True)
+        # Give it enum_members so check_final_enum fires
+        var = Var("MEMBER")
+        var.has_explicit_value = True
+        enum_base.names["MEMBER"] = SymbolTableNode(MDEF, var)
+        info = self._info("mod.Sub", mro=[enum_base, self.fx.oi])
+        off, on = self._run(info)
+        assert_equal(on, off, "final enum base")
+
+    def test_parity_stub_empty(self) -> None:
+        info = self._info("mod.Sub")
+        off, on = self._run(info, is_stub=True)
+        assert_equal(on, off, "stub empty enum")
+
+    def test_parity_all_three(self) -> None:
+        enum_base = self._info("mod.Parent", is_enum=True)
+        var = Var("MEMBER")
+        var.has_explicit_value = True
+        enum_base.names["MEMBER"] = SymbolTableNode(MDEF, var)
+        info = self._info("mod.Sub", mro=[enum_base, self.fx.oi])
+        info.names["__members__"] = self._var_sym(True)
+        off, on = self._run(info, is_stub=True)
+        assert_equal(on, off, "all three arms")
+
