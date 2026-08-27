@@ -219,6 +219,7 @@ __all__ = [
     "rust_check_match_args",
     "rust_classify_rvalue_count",
     "rust_classify_truthy_type",
+    "rust_classify_missing_annotations",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_conditional_types",
@@ -857,6 +858,21 @@ def rust_classify_rvalue_count(
     lvalues: Any, rvalue_count: int, rvalue_unpack: int | None
 ) -> int | None: ...
 def rust_classify_truthy_type(t: Any) -> int | None: ...
+def rust_classify_missing_annotations(
+    is_typeshed_stub: bool,
+    warn_incomplete_stub: bool,
+    disallow_untyped_defs: bool,
+    disallow_incomplete_defs: bool,
+    type_tag: int,
+    arguments_len: int,
+    arg_names: list[str | None],
+    is_generator: bool,
+    is_coroutine: bool,
+    ret_type_bytes: bytes | None,
+    arg_type_blobs: list[bytes],
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> tuple[int, bool] | None: ...
 def rust_classify_lvalue_validity(node: Any) -> int: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes

@@ -1393,4 +1393,25 @@ directly to `main`.
   `mypy/build.py`) and covered by `NativeTruthyTypeSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
   captured fail messages plus direct seam calls), plus 9 pure decision
+- `rust_classify_missing_annotations` (issue #1009, mypy.checker) — mirrors
+  the decision head of `TypeChecker.check_for_missing_annotations`
+  (checker.py:2722-2771): the `show_untyped` gate, the
+  `has_explicit_annotation` scan (any non-`is_unannotated_any` site among
+  arg_types + ret_type) feeding `check_incomplete_defs`, the self/cls-only
+  special case for an untyped def, and the per-site return/param Any-ness
+  including generator/coroutine ret unwrapping (reusing the existing
+  `get_generator_return_type_inner` / `get_coroutine_return_type_inner`
+  ports). Rust reads the option bools, the shim's `fdef.type` isinstance
+  tag, `len(fdef.arguments)` / `arg_names`, the generator/coroutine flags,
+  and the raw ret/arg types as wire bytes, and returns `(tag, param_fail)`
+  (KIND_MISSING_ANN_NONE / RETURN_UNTYPED / FUNC_TYPE_EXPECTED /
+  RETURN_EXPECTED). The Python shim applies the fail/note side effects
+  (the RETURN_UNTYPED note decision routes through the existing
+  `rust_has_return_statement` seam) and keeps the pure-Python body as the
+  fallback. Defers (`None`) on an undecodable wire blob, a
+  `TypeAliasType` ret type (Python's `get_proper_type` expands it from
+  the live alias node), or an undecided generator unwrap. Gated by
+  `_native_checker_active` (wired from `mypy/build.py`) and covered by
+  `NativeMissingAnnotationsSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls), plus 12 pure decision
   unit tests in `checker_functions.rs`.

@@ -36,6 +36,7 @@ from mypy.nodes import (
     ARG_STAR2,
     CONTRAVARIANT,
     COVARIANT,
+    GDEF,
     INVARIANT,
     MDEF,
     ArgKind,
@@ -50,6 +51,7 @@ from mypy.nodes import (
     Expression,
     FuncBase,
     FuncDef,
+    FuncItem,
     IndexExpr,
     IntExpr,
     ListExpr,
@@ -35715,4 +35717,404 @@ class NativeCheckFinalSuite(Suite):
             self._cls(),
             is_stub=True,
             s_type=AnyType(TypeOfAny.explicit),
+        )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMissingAnnotationsSuite(Suite):
+    """Parity for the Rust `check_for_missing_annotations` head port (#1009).
+
+    `TypeChecker.check_for_missing_annotations` (checker.py:2722-2771)
+    arbitrates annotation completeness for every function def: the
+    `show_untyped` gate, the `has_explicit_annotation` scan feeding
+    `check_incomplete_defs`, the self/cls-only special case for an untyped
+    def, and the per-site return/param Any-ness (including the generator /
+    coroutine ret-type unwrapping). The Rust classifier
+    (`checker_functions.rs`) turns those facts into `(tag, param_fail)`;
+    the Python shim applies the fail/note side effects (the RETURN_UNTYPED
+    note decision routes through the existing `rust_has_return_statement`
+    seam) and keeps the pure-Python body as the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a
+    stub fail/note recorder and asserts identical message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import (
+            _set_native_checker_active,
+            _set_native_checker_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.geni = self.fx.make_type_info(
+            "typing.Generator",
+            mro=[self.fx.oi],
+            typevars=["T", "T2", "T3"],
+            variances=[COVARIANT] * 3,
+        )
+        self.coroi = self.fx.make_type_info(
+            "typing.Coroutine",
+            mro=[self.fx.oi],
+            typevars=["T", "T2", "T3"],
+            variances=[COVARIANT] * 3,
+        )
+        types_to_resolve = [
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.oi,
+            self.fx.str_type_info,
+            self.geni,
+            self.coroi,
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in types_to_resolve})
+        self.resolver = _type_kernel.build_native_resolver(types_to_resolve, [])
+        self._set_active = _set_native_checker_active
+        self._set_resolver = _set_native_checker_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_checker_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _fdef(
+        self,
+        typ: ProperType | None,
+        arg_names: tuple[str | None, ...] = ("x",),
+        is_generator: bool = False,
+        is_coroutine: bool = False,
+    ) -> FuncItem:
+        from mypy.nodes import FuncDef
+
+        arguments = []
+        for name in arg_names:
+            var = Var(name or "_")
+            arg = Argument(var, None, None, ARG_POS)
+            if name is None:
+                arg.pos_only = True
+            arguments.append(arg)
+        # FuncDef (a concrete FuncItem subclass): production only ever
+        # passes FuncDef into check_for_missing_annotations.
+        f = FuncDef("f", arguments)
+        f.type = typ
+        f.is_generator = is_generator
+        f.is_coroutine = is_coroutine
+        return f
+
+    def _callable(self, ret: Type, arg_types: list[Type]) -> CallableType:
+        return CallableType(
+            arg_types,
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            ret,
+            self.fx.function,
+            name="f",
+        )
+
+    def _run(
+        self,
+        fdef: FuncItem,
+        *,
+        is_typeshed_stub: bool = False,
+        warn_incomplete_stub: bool = False,
+        disallow_untyped_defs: bool = True,
+        disallow_incomplete_defs: bool = False,
+    ) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[list[str], list[str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            chk.options.warn_incomplete_stub = warn_incomplete_stub
+            chk.options.disallow_untyped_defs = disallow_untyped_defs
+            chk.options.disallow_incomplete_defs = disallow_incomplete_defs
+            chk.is_typeshed_stub = is_typeshed_stub
+            # Minimal lookup plumbing: the pure-Python fallback path calls
+            # named_generic_type -> lookup_qualified -> self.modules when
+            # unwrapping generator/coroutine declared return types.
+            from mypy.nodes import MypyFile, SymbolTableNode
+
+            mod = MypyFile([], [], False)
+            mod.names = SymbolTable(
+                {
+                    "Generator": SymbolTableNode(GDEF, self.geni),
+                    "Coroutine": SymbolTableNode(GDEF, self.coroi),
+                }
+            )
+            chk.modules = {"typing": mod}
+            msgs: list[str] = []
+            notes: list[str] = []
+
+            class _Msg:
+                def fail(self, msg: str, _ctx: Any, **_kw: Any) -> None:
+                    msgs.append(str(msg))
+
+                def note(self, msg: str, _ctx: Any, **_kw: Any) -> None:
+                    notes.append(str(msg))
+
+            chk.msg = _Msg()  # type: ignore[assignment]
+            chk.check_for_missing_annotations(fdef)
+            return msgs, notes
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off, f"check_for_missing_annotations parity for {fdef!r}")
+        return off
+
+    def _assert_par(
+        self,
+        fdef: FuncItem,
+        expected_msgs: list[str],
+        expected_notes: list[str],
+        **kw: Any,
+    ) -> None:
+        msgs, notes = self._run(fdef, **kw)
+        assert msgs == expected_msgs, f"{msgs!r} != {expected_msgs!r}"
+        assert notes == expected_notes, f"{notes!r} != {expected_notes!r}"
+
+    def _gen(self, args: list[Type]) -> Instance:
+        return Instance(self.geni, args)
+
+    def _coro(self, args: list[Type]) -> Instance:
+        return Instance(self.coroi, args)
+
+    # -- direct seam calls --
+
+    def _seam(self, fdef: FuncItem, **kw: Any) -> Any:
+        from mypy.checker import _serialize_type_for_checker
+
+        is_typeshed_stub = kw.get("is_typeshed_stub", False)
+        warn_incomplete_stub = kw.get("warn_incomplete_stub", False)
+        disallow_untyped_defs = kw.get("disallow_untyped_defs", True)
+        disallow_incomplete_defs = kw.get("disallow_incomplete_defs", False)
+        if fdef.type is None:
+            type_tag, ret_bytes, arg_blobs = 0, None, []
+        else:
+            type_tag = 1
+            assert isinstance(fdef.type, CallableType)
+            ret_bytes = _serialize_type_for_checker(fdef.type.ret_type)
+            arg_blobs = [_serialize_type_for_checker(t) for t in fdef.type.arg_types]
+        return _type_kernel.rust_classify_missing_annotations(
+            is_typeshed_stub,
+            warn_incomplete_stub,
+            disallow_untyped_defs,
+            disallow_incomplete_defs,
+            type_tag,
+            len(fdef.arguments),
+            list(fdef.arg_names),
+            bool(fdef.is_generator),
+            bool(fdef.is_coroutine),
+            ret_bytes,
+            arg_blobs,
+            state.strict_optional,
+            self.resolver,
+        )
+
+    def test_seam_untyped_no_args(self) -> None:
+        res = self._seam(self._fdef(None, ()))
+        assert res == (1, False)
+
+    def test_seam_untyped_self_only(self) -> None:
+        res = self._seam(self._fdef(None, ("self",)))
+        assert res == (1, False)
+
+    def test_seam_untyped_cls_only(self) -> None:
+        res = self._seam(self._fdef(None, ("cls",)))
+        assert res == (1, False)
+
+    def test_seam_untyped_regular_args(self) -> None:
+        res = self._seam(self._fdef(None, ("x",)))
+        assert res == (2, False)
+        res = self._seam(self._fdef(None, ("self", "x")))
+        assert res == (2, False)
+
+    def test_seam_unannotated_return_and_param(self) -> None:
+        fdef = self._fdef(
+            self._callable(AnyType(TypeOfAny.unannotated), [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        res = self._seam(fdef)
+        assert res == (3, True)
+
+    def test_seam_generator_unannotated_tr(self) -> None:
+        fdef = self._fdef(
+            self._callable(
+                self._gen(
+                    [
+                        self.fx.a,
+                        self.fx.a,
+                        AnyType(TypeOfAny.unannotated),
+                    ]
+                ),
+                [],
+            ),
+            (),
+            is_generator=True,
+        )
+        res = self._seam(fdef)
+        assert res == (3, False)
+
+    def test_seam_defers_on_alias_return(self) -> None:
+        # TypeAliasType has no resolved alias target on the wire, so the
+        # classifier defers and the Python body handles the type.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        fdef = self._fdef(self._callable(TypeAliasType(alias, []), []), ())
+        res = self._seam(fdef)
+        assert res is None
+
+    # -- gate-off vs gate-on differentials --
+
+    def test_untyped_def_no_args(self) -> None:
+        fdef = self._fdef(None, ())
+        self._assert_par(
+            fdef,
+            ["Function is missing a return type annotation"],
+            ['Use "-> None" if function does not return a value'],
+        )
+
+    def test_untyped_def_self_only(self) -> None:
+        fdef = self._fdef(None, ("self",))
+        self._assert_par(
+            fdef,
+            ["Function is missing a return type annotation"],
+            ['Use "-> None" if function does not return a value'],
+        )
+
+    def test_untyped_def_cls_only(self) -> None:
+        fdef = self._fdef(None, ("cls",))
+        self._assert_par(
+            fdef,
+            ["Function is missing a return type annotation"],
+            ['Use "-> None" if function does not return a value'],
+        )
+
+    def test_untyped_def_regular_args(self) -> None:
+        fdef = self._fdef(None, ("x",))
+        self._assert_par(fdef, ["Function is missing a type annotation"], [])
+        fdef = self._fdef(None, ("self", "x"))
+        self._assert_par(fdef, ["Function is missing a type annotation"], [])
+
+    def test_untyped_def_generator_no_note(self) -> None:
+        # A generator gets the fail but not the "-> None" note.
+        fdef = self._fdef(None, (), is_generator=True)
+        self._assert_par(
+            fdef,
+            ["Function is missing a return type annotation"],
+            [],
+        )
+
+    def test_untyped_def_with_return_statement_no_note(self) -> None:
+        # A non-trivial return suppresses the note; the self-only case routes
+        # through the return-annotation branch. Must be a FuncDef (production
+        # only passes FuncDef; the AST serializer drops bare FuncItem bodies).
+        from mypy.nodes import Block, FuncDef, ReturnStmt, StrExpr
+
+        f = FuncDef(
+            "f", [Argument(Var("self"), None, None, ARG_POS)], Block([ReturnStmt(StrExpr("x"))])
+        )
+        f.type = None
+        self._assert_par(
+            f,
+            ["Function is missing a return type annotation"],
+            [],
+        )
+
+    def test_callable_unannotated_return(self) -> None:
+        fdef = self._fdef(
+            self._callable(AnyType(TypeOfAny.unannotated), [self.fx.a]),
+            ("x",),
+        )
+        self._assert_par(fdef, ["Function is missing a return type annotation"], [])
+
+    def test_callable_unannotated_param(self) -> None:
+        fdef = self._fdef(
+            self._callable(self.fx.o, [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        self._assert_par(
+            fdef,
+            ["Function is missing a type annotation for one or more parameters"],
+            [],
+        )
+
+    def test_callable_annotated_no_messages(self) -> None:
+        fdef = self._fdef(self._callable(self.fx.o, [self.fx.o]), ("x",))
+        self._assert_par(fdef, [], [], disallow_untyped_defs=True, disallow_incomplete_defs=True)
+
+    def test_gate_off_all_unannotated_incomplete_only(self) -> None:
+        # has_explicit_annotation is False when every site is unannotated
+        # Any, so check_incomplete_defs alone leaves the gate off.
+        fdef = self._fdef(
+            self._callable(AnyType(TypeOfAny.unannotated), [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        self._assert_par(fdef, [], [], disallow_untyped_defs=False, disallow_incomplete_defs=True)
+
+    def test_callable_generator_unannotated_tr(self) -> None:
+        fdef = self._fdef(
+            self._callable(self._gen([self.fx.a, self.fx.a, AnyType(TypeOfAny.unannotated)]), []),
+            (),
+            is_generator=True,
+        )
+        self._assert_par(fdef, ["Function is missing a return type annotation"], [])
+
+    def test_callable_generator_annotated_tr(self) -> None:
+        fdef = self._fdef(
+            self._callable(self._gen([self.fx.a, self.fx.a, self.fx.str_type]), []),
+            (),
+            is_generator=True,
+        )
+        self._assert_par(fdef, [], [])
+
+    def test_callable_coroutine_unannotated_tr(self) -> None:
+        fdef = self._fdef(
+            self._callable(self._coro([self.fx.a, self.fx.a, AnyType(TypeOfAny.unannotated)]), []),
+            (),
+            is_coroutine=True,
+        )
+        self._assert_par(fdef, ["Function is missing a return type annotation"], [])
+
+    def test_callable_coroutine_annotated_tr(self) -> None:
+        fdef = self._fdef(
+            self._callable(self._coro([self.fx.a, self.fx.a, self.fx.str_type]), []),
+            (),
+            is_coroutine=True,
+        )
+        self._assert_par(fdef, [], [])
+
+    def test_typeshed_stub_no_warn_noop(self) -> None:
+        fdef = self._fdef(None, ())
+        self._assert_par(fdef, [], [], is_typeshed_stub=True)
+        fdef = self._fdef(
+            self._callable(AnyType(TypeOfAny.unannotated), [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        self._assert_par(fdef, [], [], is_typeshed_stub=True)
+
+    def test_typeshed_stub_warn_incomplete(self) -> None:
+        fdef = self._fdef(
+            self._callable(self.fx.o, [AnyType(TypeOfAny.unannotated)]),
+            ("x",),
+        )
+        self._assert_par(
+            fdef,
+            ["Function is missing a type annotation for one or more parameters"],
+            [],
+            is_typeshed_stub=True,
+            warn_incomplete_stub=True,
         )
