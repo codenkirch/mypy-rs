@@ -1946,3 +1946,179 @@ mod classify_enum_tests {
         assert_eq!(bases, vec!["mod.A"]);
     }
 }
+
+// ---------------------------------------------------------------------------
+// check_rvalue_count_in_assignment dispatch port (issue #1003)
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `check_rvalue_count_in_assignment`; must match
+/// `NATIVE_RVALUE_COUNT_*` in mypy/checker.py.
+const RVALUE_COUNT_PASS: i64 = 0;
+const RVALUE_COUNT_FAIL_STAR_REQUIRED: i64 = 1;
+const RVALUE_COUNT_FAIL_TOO_MANY: i64 = 2;
+const RVALUE_COUNT_WARN_TOO_MANY: i64 = 3;
+const RVALUE_COUNT_FAIL_WRONG_STAR: i64 = 4;
+const RVALUE_COUNT_FAIL_WRONG: i64 = 5;
+
+/// Pure decision mirroring `TypeChecker.check_rvalue_count_in_assignment`
+/// (checker.py:5319-5354). The variadic arm (`rvalue_unpack` set) requires
+/// a star target, rejects too many targets, and flags asymmetric
+/// prefix/suffix unpack while still succeeding. The plain arms check the
+/// star-lvalue count (`len - 1`) or the exact count.
+fn classify_rvalue_count(
+    has_star: bool,
+    star_index: i64,
+    lvalues_len: i64,
+    rvalue_count: i64,
+    rvalue_unpack: Option<i64>,
+) -> i64 {
+    if let Some(rv_unpack) = rvalue_unpack {
+        if !has_star {
+            return RVALUE_COUNT_FAIL_STAR_REQUIRED;
+        }
+        if lvalues_len > rvalue_count {
+            return RVALUE_COUNT_FAIL_TOO_MANY;
+        }
+        let left_prefix = star_index;
+        let left_suffix = lvalues_len - star_index - 1;
+        let right_prefix = rv_unpack;
+        let right_suffix = rvalue_count - rv_unpack - 1;
+        if left_suffix > right_suffix || left_prefix > right_prefix {
+            return RVALUE_COUNT_WARN_TOO_MANY;
+        }
+        return RVALUE_COUNT_PASS;
+    }
+    if has_star {
+        if lvalues_len - 1 > rvalue_count {
+            return RVALUE_COUNT_FAIL_WRONG_STAR;
+        }
+    } else if rvalue_count != lvalues_len {
+        return RVALUE_COUNT_FAIL_WRONG;
+    }
+    RVALUE_COUNT_PASS
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_rvalue_count_in_assignment`
+/// (mypy/checker.py:5319-5354). Reads the live `lvalues` list via PyO3
+/// (StarExpr isinstance scan) plus the scalar `rvalue_count` and optional
+/// `rvalue_unpack` arity. Returns `Some(tag)` for every reachable branch,
+/// or `None` when `lvalues` is not a list (deferral). The Python shim
+/// applies the fail / wrong-number side effects.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_rvalue_count(
+    py: Python<'_>,
+    lvalues: &PyAny,
+    rvalue_count: i64,
+    rvalue_unpack: Option<i64>,
+) -> PyResult<Option<i64>> {
+    let list = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let star_cls = nodes_class(py, "StarExpr")?;
+    let mut has_star = false;
+    let mut star_index = 0i64;
+    for (i, lv) in list.iter().enumerate() {
+        if !has_star && lv.is_instance(star_cls)? {
+            has_star = true;
+            star_index = i as i64;
+        }
+    }
+    Ok(Some(classify_rvalue_count(
+        has_star,
+        star_index,
+        list.len() as i64,
+        rvalue_count,
+        rvalue_unpack,
+    )))
+}
+
+#[cfg(test)]
+mod rvalue_count_tests {
+    use super::classify_rvalue_count;
+    use super::{
+        RVALUE_COUNT_FAIL_STAR_REQUIRED, RVALUE_COUNT_FAIL_TOO_MANY, RVALUE_COUNT_FAIL_WRONG,
+        RVALUE_COUNT_FAIL_WRONG_STAR, RVALUE_COUNT_PASS, RVALUE_COUNT_WARN_TOO_MANY,
+    };
+
+    #[test]
+    fn test_variadic_no_star_fails() {
+        assert_eq!(
+            classify_rvalue_count(false, 0, 3, 4, Some(2)),
+            RVALUE_COUNT_FAIL_STAR_REQUIRED
+        );
+    }
+
+    #[test]
+    fn test_variadic_too_many_targets() {
+        assert_eq!(
+            classify_rvalue_count(true, 1, 5, 4, Some(2)),
+            RVALUE_COUNT_FAIL_TOO_MANY
+        );
+    }
+
+    #[test]
+    fn test_variadic_asymmetric_suffix() {
+        // left_suffix 2 > right_suffix 1: warns but succeeds.
+        assert_eq!(
+            classify_rvalue_count(true, 0, 4, 5, Some(3)),
+            RVALUE_COUNT_WARN_TOO_MANY
+        );
+    }
+
+    #[test]
+    fn test_variadic_asymmetric_prefix() {
+        // left_prefix 2 > right_prefix 1: warns but succeeds.
+        assert_eq!(
+            classify_rvalue_count(true, 2, 4, 5, Some(1)),
+            RVALUE_COUNT_WARN_TOO_MANY
+        );
+    }
+
+    #[test]
+    fn test_variadic_symmetric_passes() {
+        assert_eq!(
+            classify_rvalue_count(true, 1, 4, 4, Some(1)),
+            RVALUE_COUNT_PASS
+        );
+        // Right suffix longer than left is fine.
+        assert_eq!(
+            classify_rvalue_count(true, 0, 2, 4, Some(2)),
+            RVALUE_COUNT_PASS
+        );
+    }
+
+    #[test]
+    fn test_star_lvalue_count_fail() {
+        // len - 1 = 3 > rvalue_count 2.
+        assert_eq!(
+            classify_rvalue_count(true, 0, 4, 2, None),
+            RVALUE_COUNT_FAIL_WRONG_STAR
+        );
+    }
+
+    #[test]
+    fn test_star_lvalue_count_pass() {
+        assert_eq!(
+            classify_rvalue_count(true, 0, 3, 2, None),
+            RVALUE_COUNT_PASS
+        );
+    }
+
+    #[test]
+    fn test_exact_count_fail() {
+        assert_eq!(
+            classify_rvalue_count(false, 0, 3, 2, None),
+            RVALUE_COUNT_FAIL_WRONG
+        );
+    }
+
+    #[test]
+    fn test_exact_count_pass() {
+        assert_eq!(
+            classify_rvalue_count(false, 0, 3, 3, None),
+            RVALUE_COUNT_PASS
+        );
+    }
+}

@@ -329,20 +329,21 @@ try:
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
+        rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
+        rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
-        rust_classify_enum_new as _rust_classify_enum_new,
-        rust_classify_enum_bases as _rust_classify_enum_bases,
+        rust_classify_check_lvalue as _rust_classify_check_lvalue,
+        rust_classify_classvar_super as _rust_classify_classvar_super,
         rust_classify_enum as _rust_classify_enum,
+        rust_classify_enum_bases as _rust_classify_enum_bases,
+        rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
-        rust_classify_classvar_super as _rust_classify_classvar_super,
-        rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_func_def_override as _rust_classify_func_def_override,
-        rust_check_match_args as _rust_check_match_args,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
-        rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
+        rust_classify_rvalue_count as _rust_classify_rvalue_count,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -417,6 +418,7 @@ except ImportError:
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_check_match_args = None  # type: ignore[assignment]
+    _rust_classify_rvalue_count = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
@@ -525,6 +527,15 @@ NATIVE_LVALUE_NAME = 4
 NATIVE_LVALUE_TUPLE_LIST = 5
 NATIVE_LVALUE_STAR = 6
 NATIVE_LVALUE_ELSE = 7
+
+# Decision tags returned by `_rust_classify_rvalue_count`; must match
+# `RVALUE_COUNT_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_RVALUE_COUNT_PASS = 0
+NATIVE_RVALUE_COUNT_FAIL_STAR_REQUIRED = 1
+NATIVE_RVALUE_COUNT_FAIL_TOO_MANY = 2
+NATIVE_RVALUE_COUNT_WARN_TOO_MANY = 3
+NATIVE_RVALUE_COUNT_FAIL_WRONG_STAR = 4
+NATIVE_RVALUE_COUNT_FAIL_WRONG = 5
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -5323,6 +5334,36 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         context: Context,
         rvalue_unpack: int | None = None,
     ) -> bool:
+        # Native type_kernel seam: classify the arity/star dispatch in
+        # Rust (checker_functions.rs); the fail / wrong-number messages
+        # stay here. None falls through to the pure-Python body.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_rvalue_count is not None
+        ):
+            try:
+                tag = _rust_classify_rvalue_count(lvalues, rvalue_count, rvalue_unpack)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag == NATIVE_RVALUE_COUNT_FAIL_STAR_REQUIRED:
+                self.fail("Variadic tuple unpacking requires a star target", context)
+                return False
+            if tag == NATIVE_RVALUE_COUNT_FAIL_TOO_MANY:
+                self.fail(message_registry.TOO_MANY_TARGETS_FOR_VARIADIC_UNPACK, context)
+                return False
+            if tag == NATIVE_RVALUE_COUNT_WARN_TOO_MANY:
+                self.fail(message_registry.TOO_MANY_TARGETS_FOR_VARIADIC_UNPACK, context)
+                return True
+            if tag == NATIVE_RVALUE_COUNT_FAIL_WRONG_STAR:
+                self.msg.wrong_number_values_to_unpack(rvalue_count, len(lvalues) - 1, context)
+                return False
+            if tag == NATIVE_RVALUE_COUNT_FAIL_WRONG:
+                self.msg.wrong_number_values_to_unpack(rvalue_count, len(lvalues), context)
+                return False
+            if tag == NATIVE_RVALUE_COUNT_PASS:
+                return True
+
         if rvalue_unpack is not None:
             if not any(isinstance(e, StarExpr) for e in lvalues):
                 self.fail("Variadic tuple unpacking requires a star target", context)

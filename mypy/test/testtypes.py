@@ -33464,3 +33464,159 @@ class NativeInferredTypeNoteSuite(Suite):
             ),
             "seam should decide False for a non-ReturnStmt context",
         )
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRvalueCountSuite(Suite):
+    """Parity for the Rust `check_rvalue_count_in_assignment` dispatch port.
+
+    `TypeChecker.check_rvalue_count_in_assignment` (checker.py:5319)
+    classifies the unpacking-arity decision: the variadic-unpack arm
+    (star target required, too-many-targets, prefix/suffix asymmetry) and
+    the plain star-count / exact-count arms. The Rust classifier
+    (`checker_functions.rs`) returns a branch tag from the live lvalues
+    list plus scalar counts; the Python shim applies the fail /
+    wrong-number messages and keeps the pure-Python body as the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real TypeChecker method and asserts
+    identical (return, messages) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _seam(
+        self, lvalues: object, rvalue_count: int, rvalue_unpack: int | None
+    ) -> int | None:
+        return _type_kernel.rust_classify_rvalue_count(lvalues, rvalue_count, rvalue_unpack)
+
+    def _lv(self, n: int, star_at: int | None = None) -> list[NameExpr | StarExpr]:
+        out: list[NameExpr | StarExpr] = []
+        for i in range(n):
+            if i == star_at:
+                out.append(StarExpr(NameExpr("xs")))
+            else:
+                out.append(NameExpr(f"v{i}"))
+        return out
+
+    def _run(
+        self,
+        lvalues: list[NameExpr | StarExpr],
+        rvalue_count: int,
+        rvalue_unpack: int | None,
+    ) -> tuple[object, object]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[object, object]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, str]] = []
+            chk.fail = lambda msg, ctx, code=None: msgs.append(  # type: ignore[method-assign]
+                ("fail", str(msg))
+            )
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                wrong_number_values_to_unpack=lambda received, expected, ctx: msgs.append(
+                    ("wrong_number", f"{received}:{expected}")
+                )
+            )
+            result = chk.check_rvalue_count_in_assignment(
+                lvalues, rvalue_count, Context(), rvalue_unpack=rvalue_unpack
+            )
+            return result, msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_parity(
+        self,
+        lvalues: list[NameExpr | StarExpr],
+        rvalue_count: int,
+        rvalue_unpack: int | None,
+        label: str,
+    ) -> None:
+        off, on = self._run(lvalues, rvalue_count, rvalue_unpack)
+        assert_equal(on, off, f"rvalue count parity: {label}")
+
+    # --- direct seam tests ---
+
+    def test_seam_non_list_defers(self) -> None:
+        assert self._seam("nope", 1, None) is None  # type: ignore[arg-type]
+
+    def test_seam_variadic_no_star(self) -> None:
+        assert self._seam(self._lv(2), 4, 2) == 1
+
+    def test_seam_variadic_too_many(self) -> None:
+        assert self._seam(self._lv(5, star_at=1), 4, 2) == 2
+
+    def test_seam_variadic_asymmetric_suffix(self) -> None:
+        # star first: left_suffix 3 > right_suffix 1.
+        assert self._seam(self._lv(4, star_at=0), 5, 3) == 3
+
+    def test_seam_variadic_asymmetric_prefix(self) -> None:
+        # left_prefix 2 > right_prefix 1.
+        assert self._seam(self._lv(4, star_at=2), 5, 1) == 3
+
+    def test_seam_variadic_pass(self) -> None:
+        assert self._seam(self._lv(4, star_at=1), 4, 1) == 0
+        # Right side longer than left is fine.
+        assert self._seam(self._lv(2, star_at=0), 4, 2) == 0
+
+    def test_seam_star_count(self) -> None:
+        # len - 1 = 3 > 2.
+        assert self._seam(self._lv(4, star_at=0), 2, None) == 4
+        assert self._seam(self._lv(3, star_at=0), 2, None) == 0
+
+    def test_seam_exact_count(self) -> None:
+        assert self._seam(self._lv(3), 2, None) == 5
+        assert self._seam(self._lv(3), 3, None) == 0
+
+    # --- gate-off vs gate-on differential tests ---
+
+    def test_parity_variadic_no_star(self) -> None:
+        self._assert_parity(self._lv(2), 2, 2, "variadic without star target")
+
+    def test_parity_variadic_too_many(self) -> None:
+        self._assert_parity(self._lv(5, star_at=1), 4, 2, "variadic too many targets")
+
+    def test_parity_variadic_asymmetric(self) -> None:
+        self._assert_parity(self._lv(4, star_at=0), 5, 3, "asymmetric suffix")
+        self._assert_parity(self._lv(4, star_at=2), 5, 1, "asymmetric prefix")
+
+    def test_parity_variadic_symmetric(self) -> None:
+        self._assert_parity(self._lv(4, star_at=1), 4, 1, "symmetric variadic")
+        self._assert_parity(self._lv(2, star_at=0), 4, 2, "short prefix/suffix")
+
+    def test_parity_star_count(self) -> None:
+        self._assert_parity(self._lv(4, star_at=0), 2, None, "star too few rvalues")
+        self._assert_parity(self._lv(3, star_at=0), 2, None, "star exact count")
+
+    def test_parity_exact_count(self) -> None:
+        self._assert_parity(self._lv(3), 2, None, "plain too few rvalues")
+        self._assert_parity(self._lv(3), 3, None, "plain exact count")
+
+    def test_parity_message_contents(self) -> None:
+        # The fail / wrong-number side effects carry the same messages.
+        off, on = self._run(self._lv(2), 2, 2)
+        assert_equal(on, off, "variadic no star message")
+        assert on[1] == [("fail", "Variadic tuple unpacking requires a star target")]
+
+        off, on = self._run(self._lv(3), 2, None)
+        assert_equal(on, off, "exact count message")
+        assert on[1] == [("wrong_number", "2:3")]
