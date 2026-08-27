@@ -851,6 +851,31 @@ fn extract_deprecated_message(
     Ok(Some(msg.to_string()))
 }
 
+/// Pure decision core for `rust_classify_class_decorator`, mirroring the
+/// branch order of `analyze_class_decorator_common` (semanal.py:2741-2752):
+/// the first matching name-set wins, a deprecated call decides only when no
+/// earlier set matched, and everything else is the `none` tag.
+pub(crate) fn classify_class_decorator_inner(
+    is_final: bool,
+    is_disjoint_base: bool,
+    is_type_check_only: bool,
+    deprecated_msg: Option<String>,
+) -> (&'static str, Option<String>) {
+    if is_final {
+        return ("final", None);
+    }
+    if is_disjoint_base {
+        return ("disjoint_base", None);
+    }
+    if is_type_check_only {
+        return ("type_check_only", None);
+    }
+    match deprecated_msg {
+        Some(msg) => ("deprecated", Some(msg)),
+        None => ("none", None),
+    }
+}
+
 /// `mypy.semanal.SemanticAnalyzer.analyze_class_decorator_common` classifier
 /// (semanal.py:2741-2752). Returns `Some((tag, deprecated_msg))` where `tag`
 /// is `final`, `disjoint_base`, `type_check_only`, `deprecated`, or `none`;
@@ -872,20 +897,25 @@ pub(crate) fn rust_classify_class_decorator(
     let tco_names = normalize_fullnames(name_sets.get_item(2)?)?;
     let deprecated_names = normalize_fullnames(name_sets.get_item(3)?)?;
 
-    // Branch order mirrors semanal.py:2741-2752 exactly.
-    if refers_to_fullname(decorator, &final_names)? {
-        return Ok(Some(("final".to_string(), None)));
-    }
-    if refers_to_fullname(decorator, &disjoint_names)? {
-        return Ok(Some(("disjoint_base".to_string(), None)));
-    }
-    if refers_to_fullname(decorator, &tco_names)? {
-        return Ok(Some(("type_check_only".to_string(), None)));
-    }
-    if let Some(msg) = extract_deprecated_message(py, decorator, &deprecated_names)? {
-        return Ok(Some(("deprecated".to_string(), Some(msg))));
-    }
-    Ok(Some(("none".to_string(), None)))
+    // Branch order mirrors semanal.py:2741-2752 exactly: each set is only
+    // consulted when the earlier ones missed, and the deprecated call is
+    // extracted only when no name-set matched.
+    let is_final = refers_to_fullname(decorator, &final_names)?;
+    let is_disjoint_base = !is_final && refers_to_fullname(decorator, &disjoint_names)?;
+    let is_type_check_only =
+        !is_final && !is_disjoint_base && refers_to_fullname(decorator, &tco_names)?;
+    let deprecated_msg = if is_final || is_disjoint_base || is_type_check_only {
+        None
+    } else {
+        extract_deprecated_message(py, decorator, &deprecated_names)?
+    };
+    let (tag, msg) = classify_class_decorator_inner(
+        is_final,
+        is_disjoint_base,
+        is_type_check_only,
+        deprecated_msg,
+    );
+    Ok(Some((tag.to_string(), msg)))
 }
 
 // ---------------------------------------------------------------------------
@@ -5647,5 +5677,54 @@ mod tests {
         assert!(is_never_name("typing_extensions.Never"));
         assert!(!is_never_name("typing.Any"));
         assert!(!is_never_name("builtins.None"));
+    }
+
+    // --- classify_class_decorator_inner ---
+
+    #[test]
+    fn test_class_decorator_tags() {
+        assert_eq!(
+            classify_class_decorator_inner(true, false, false, None),
+            ("final", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, true, false, None),
+            ("disjoint_base", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, false, true, None),
+            ("type_check_only", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, false, false, None),
+            ("none", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, false, false, Some("gone".to_string())),
+            ("deprecated", Some("gone".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_class_decorator_first_match_wins() {
+        // Branch order of analyze_class_decorator_common: final beats
+        // disjoint_base beats type_check_only beats deprecated.
+        assert_eq!(
+            classify_class_decorator_inner(true, true, true, Some("gone".to_string())),
+            ("final", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, true, true, Some("gone".to_string())),
+            ("disjoint_base", None)
+        );
+        assert_eq!(
+            classify_class_decorator_inner(false, false, true, Some("gone".to_string())),
+            ("type_check_only", None)
+        );
+        // A deprecated message is only carried on the deprecated tag.
+        assert_eq!(
+            classify_class_decorator_inner(true, false, false, Some("gone".to_string())),
+            ("final", None)
+        );
     }
 }
