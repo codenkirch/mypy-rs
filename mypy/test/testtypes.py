@@ -31578,3 +31578,177 @@ class NativeIsValidConstructorSuite(Suite):
     def test_parity_var(self) -> None:
         self._assert_par(Var("x"), False)
 
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsDescriptorSuite(Suite):
+    """Parity for the Rust `is_descriptor` port (mypy.subtypes).
+
+    `is_descriptor` (subtypes.py:2177-2183) is a recursive bool predicate:
+    an Instance is a descriptor when its class (via MRO) has a `__get__`
+    member; a UnionType is a descriptor when all relevant items are
+    descriptors; all other types return False. The Rust port walks the
+    wire Type and checks `__get__` member presence via the resolver
+    snapshots, reusing `has_readable_member_by_ref` from checkmember.
+    Toggling the subtype gate off (pure Python) and on (Rust seam) must
+    produce identical results, and a direct seam call proves engagement.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        # Build a descriptor class: has `__get__` in its names dict.
+        self.desci = self.fx.make_type_info("mod.Desc", mro=[self.fx.oi])
+        self.desci.names["__get__"] = SymbolTableNode(MDEF, Var("__get__"))
+        # A subclass inherits __get__ via MRO.
+        self.subdesci = self.fx.make_type_info(
+            "mod.SubDesc", mro=[self.desci, self.fx.oi]
+        )
+        # A non-descriptor class without __get__.
+        self.plaini = self.fx.make_type_info("mod.Plain", mro=[self.fx.oi])
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.desci, self.subdesci, self.plaini])
+        self.typeinfo_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(self.typeinfo_map)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_subtype_active
+        self._set_resolver = _set_native_subtype_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        self._set_resolver(self.resolver if active else None)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+            self._set_resolver(self.resolver)
+
+    def _assert_par(self, typ: Type | None) -> None:
+        from mypy.subtypes import is_descriptor
+
+        off = self._with_gate(False, lambda: is_descriptor(typ))
+        on = self._with_gate(True, lambda: is_descriptor(typ))
+        assert off == on, f"is_descriptor({typ}): gate-off={off}, gate-on={on}"
+
+    def _assert_engages(self, typ: Type | None, expected: bool) -> None:
+        from mypy.subtypes import _serialize_type
+
+        result = _type_kernel.rust_is_descriptor(
+            self.resolver, _serialize_type(typ), True
+        )
+        assert result is not None, f"rust_is_descriptor did not engage for {typ}"
+        assert result == expected, (
+            f"rust_is_descriptor({typ}) = {result}, expected {expected}"
+        )
+
+    def test_instance_with_get(self) -> None:
+        typ = Instance(self.desci, [])
+        self._assert_par(typ)
+        self._assert_engages(typ, True)
+
+    def test_instance_inherited_get(self) -> None:
+        typ = Instance(self.subdesci, [])
+        self._assert_par(typ)
+        self._assert_engages(typ, True)
+
+    def test_instance_without_get(self) -> None:
+        typ = Instance(self.plaini, [])
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_plain_instance_no_get(self) -> None:
+        # The fixture's A class has no __get__.
+        typ = self.fx.a
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_none_type(self) -> None:
+        typ = NoneType()
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_any_type(self) -> None:
+        typ = self.fx.anyt
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_callable_type(self) -> None:
+        typ = self.fx.callable(self.fx.a, self.fx.b)
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_none_input(self) -> None:
+        # is_descriptor(None) -> get_proper_type(None) -> None -> not
+        # Instance/UnionType -> False.
+        self._assert_par(None)
+
+    def test_union_all_descriptors(self) -> None:
+        typ = UnionType.make_union([Instance(self.desci, []), Instance(self.desci, [])])
+        self._assert_par(typ)
+        self._assert_engages(typ, True)
+
+    def test_union_one_non_descriptor(self) -> None:
+        typ = UnionType.make_union([Instance(self.desci, []), self.fx.a])
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_union_all_non_descriptors(self) -> None:
+        typ = UnionType.make_union([self.fx.a, self.fx.b])
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_union_with_none_strict_optional(self) -> None:
+        # strict_optional=True: NoneType is relevant -> not a descriptor.
+        from mypy.subtypes import _serialize_type
+
+        typ = UnionType.make_union([Instance(self.desci, []), NoneType()])
+        off = self._with_gate(False, lambda: _serialize_type(typ))
+        on = self._with_gate(True, lambda: _serialize_type(typ))
+        # Both serialize the same way; the gate toggle doesn't change
+        # serialization. Just check parity of is_descriptor.
+        self._assert_par(typ)
+        result = _type_kernel.rust_is_descriptor(
+            self.resolver, _serialize_type(typ), True
+        )
+        assert result is not None
+        assert result is False
+
+    def test_union_empty_items(self) -> None:
+        # UnionType.make_union([]) collapses to UninhabitedType (Never),
+        # which is not a descriptor. Parity must still hold.
+        typ = UnionType.make_union([])
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_union_nested(self) -> None:
+        # Union[Union[Desc, A], B] -> not all are descriptors.
+        inner = UnionType.make_union([Instance(self.desci, []), self.fx.a])
+        typ = UnionType.make_union([inner, self.fx.b])
+        self._assert_par(typ)
+        self._assert_engages(typ, False)
+
+    def test_union_nested_all_descriptors(self) -> None:
+        inner = UnionType.make_union([Instance(self.desci, []), Instance(self.desci, [])])
+        typ = UnionType.make_union([inner, Instance(self.subdesci, [])])
+        self._assert_par(typ)
+        self._assert_engages(typ, True)
