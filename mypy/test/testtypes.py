@@ -36118,3 +36118,348 @@ class NativeMissingAnnotationsSuite(Suite):
             is_typeshed_stub=True,
             warn_incomplete_stub=True,
         )
+class NativeReturnStmtSuite(Suite):
+    """Parity for the Rust `check_return_stmt` two-phase decision port.
+
+    `TypeChecker.check_return_stmt` (checker.py:6546) is a two-phase seam:
+    phase 1 picks the return-type variant (generator / coroutine / plain)
+    and fires NO_RETURN_EXPECTED on a non-ambiguous UninhabitedType; the
+    accept() call and its binder side effects stay in Python; phase 2
+    classifies the post-accept arms (async-generator fail, warn_return_any
+    gate, declared-None exemptions) and the empty-return arms. The shim
+    applies the four distinct fail messages plus the
+    incorrectly_returning_any note; the pure-Python classification tail is
+    the fallback.
+
+    Direct seam calls assert the variant tags, the phase-1 bool, the
+    phase-2 tags, and the None deferrals on undecodable bytes; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a
+    stub message recorder and asserts identical message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(t)
+
+    def _defn(
+        self,
+        *,
+        is_generator: bool = False,
+        is_coroutine: bool = False,
+        is_async_generator: bool = False,
+        name: str = "f",
+        lambda_: bool = False,
+    ) -> Any:
+        if lambda_:
+            from mypy.nodes import LambdaExpr
+
+            defn: Any = LambdaExpr.__new__(LambdaExpr)
+        else:
+            defn = SimpleNamespace()
+        defn.is_generator = is_generator
+        defn.is_coroutine = is_coroutine
+        defn.is_async_generator = is_async_generator
+        if not lambda_:
+            # LambdaExpr.name is a read-only property (returns LAMBDA_NAME).
+            defn.name = name
+        return defn
+
+    def _run(
+        self,
+        defn: Any,
+        return_type: Type,
+        *,
+        expr_type: Type | None = None,
+        warn_return_any: bool = False,
+        deferred: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Run check_return_stmt with stubbed checker state; empty return
+        when expr_type is None, else a NameExpr whose accept returns
+        expr_type."""
+        from mypy.nodes import NameExpr
+
+        s_expr: Any = None
+        if expr_type is not None:
+            s_expr = NameExpr("x")
+        return self._run_with_expr_node(
+            defn,
+            s_expr,
+            return_type,
+            accept_result=expr_type,
+            warn_return_any=warn_return_any,
+            deferred=deferred,
+        )
+
+    def _run_with_expr_node(
+        self,
+        defn: Any,
+        s_expr: Any,
+        return_type: Type,
+        *,
+        accept_result: Type | None = None,
+        warn_return_any: bool = False,
+        deferred: bool = False,
+    ) -> list[tuple[str, str]]:
+        """Run check_return_stmt with an explicit expression node (None for
+        an empty return) through a stubbed checker, gate-off vs gate-on."""
+        from mypy.checker import TypeChecker
+        from mypy.nodes import ReturnStmt
+
+        def check_one() -> list[tuple[str, str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            chk.options.warn_return_any = warn_return_any
+            msgs: list[tuple[str, str]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                fail=lambda msg, ctx, **kw: msgs.append(("fail", str(msg))),
+                incorrectly_returning_any=lambda typ, ctx: msgs.append(
+                    ("warn_any", str(typ))
+                ),
+            )
+            chk.scope = SimpleNamespace(current_function=lambda: defn)  # type: ignore[assignment]
+            chk.return_types = [return_type]
+            chk.current_node_deferred = deferred
+            chk.dynamic_funcs = []
+            chk.check_subtype = lambda **kw: msgs.append(("subtype", str(kw["subtype"])))  # type: ignore[method-assign,assignment]
+            if s_expr is not None:
+                s: ReturnStmt = ReturnStmt(s_expr)
+                chk._expr_checker = SimpleNamespace(  # type: ignore[assignment]
+                    accept=lambda *args, **kwargs: accept_result
+                )
+            else:
+                s = ReturnStmt(None)
+            chk.check_return_stmt(s)
+            return msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off, f"check_return_stmt parity for {defn!r}")
+        return on
+
+    # -- direct seam calls -------------------------------------------------
+
+    def test_seam_variant_tags(self) -> None:
+        assert _type_kernel.rust_classify_return_stmt_variant(False, False) == 3
+        assert _type_kernel.rust_classify_return_stmt_variant(True, False) == 1
+        assert _type_kernel.rust_classify_return_stmt_variant(False, True) == 2
+        assert _type_kernel.rust_classify_return_stmt_variant(True, True) == 1
+
+    def test_seam_pre_uninhabited(self) -> None:
+        never = self._bytes_of(UninhabitedType())
+        assert _type_kernel.rust_classify_return_stmt_pre(never, False) is True
+
+    def test_seam_pre_uninhabited_ambiguous(self) -> None:
+        ambiguous = self._bytes_of(UninhabitedType(ambiguous=True))
+        assert _type_kernel.rust_classify_return_stmt_pre(ambiguous, False) is False
+
+    def test_seam_pre_lambda_suppresses(self) -> None:
+        never = self._bytes_of(UninhabitedType())
+        assert _type_kernel.rust_classify_return_stmt_pre(never, True) is False
+
+    def test_seam_pre_plain_types_proceed(self) -> None:
+        assert _type_kernel.rust_classify_return_stmt_pre(self._bytes_of(self.fx.str_type), False) is False
+        assert _type_kernel.rust_classify_return_stmt_pre(self._bytes_of(NoneType()), False) is False
+        assert (
+            _type_kernel.rust_classify_return_stmt_pre(
+                self._bytes_of(AnyType(TypeOfAny.special_form)), False
+            )
+            is False
+        )
+
+    def test_seam_pre_defers_on_garbage(self) -> None:
+        assert _type_kernel.rust_classify_return_stmt_pre(b"\xff\xff\xff", False) is None
+
+    def test_seam_post_tags(self) -> None:
+        post = _type_kernel.rust_classify_return_stmt_post
+        ret_str = self._bytes_of(self.fx.str_type)
+        ret_none = self._bytes_of(NoneType())
+        ret_any = self._bytes_of(AnyType(TypeOfAny.unannotated))
+        ret_obj = self._bytes_of(self.fx.o)
+        typ_int = self._bytes_of(self.fx.a)
+        typ_any = self._bytes_of(AnyType(TypeOfAny.unannotated))
+        # Post-accept arms.
+        assert post(typ_any, ret_str, False, False, False, False, False, False, False, False, False, True) == 4
+        assert post(typ_any, ret_str, False, False, False, False, True, False, False, False, False, True) == 3
+        assert post(typ_any, ret_any, False, False, False, False, True, False, False, False, False, True) == 4
+        assert post(typ_any, ret_obj, False, False, False, False, True, False, False, False, False, True) == 4
+        assert post(typ_int, ret_none, False, False, False, True, False, False, False, False, False, True) == 6
+        assert post(typ_int, ret_none, False, False, False, False, False, False, False, False, False, True) == 7
+        # Empty-return arms (typ_bytes None).
+        assert post(None, ret_any, False, True, False, False, False, False, False, False, False, True) == 8
+        assert post(None, ret_none, False, False, False, False, False, False, False, False, False, True) == 8
+        assert post(None, ret_str, False, False, False, False, False, False, False, False, False, True) == 9
+
+    def test_seam_post_defers_on_garbage(self) -> None:
+        post = _type_kernel.rust_classify_return_stmt_post
+        ret_str = self._bytes_of(self.fx.str_type)
+        assert post(self._bytes_of(self.fx.a), b"\xff\xff\xff", False, False, False, False, False, False, False, False, False, True) is None
+        assert post(b"\xff\xff\xff", ret_str, False, False, False, False, False, False, False, False, False, True) is None
+
+    # -- gate-off vs gate-on differentials ---------------------------------
+
+    def test_parity_empty_return_checked_fail(self) -> None:
+        msgs = self._run(self._defn(), self.fx.str_type)
+        assert len(msgs) == 1 and msgs[0][0] == "fail"
+
+    def test_parity_empty_return_none_decl(self) -> None:
+        assert self._run(self._defn(), NoneType()) == []
+
+    def test_parity_empty_return_any_decl(self) -> None:
+        assert self._run(self._defn(), AnyType(TypeOfAny.unannotated)) == []
+
+    def test_parity_empty_return_generator_any(self) -> None:
+        assert self._run(self._defn(is_generator=True), AnyType(TypeOfAny.unannotated)) == []
+
+    def test_parity_empty_return_coroutine_any(self) -> None:
+        assert self._run(self._defn(is_coroutine=True), AnyType(TypeOfAny.unannotated)) == []
+
+    def test_parity_no_return_expected(self) -> None:
+        msgs = self._run(self._defn(), UninhabitedType())
+        assert len(msgs) == 1 and msgs[0][0] == "fail"
+        assert "does not return" in msgs[0][1]
+
+    def test_parity_no_return_expected_ambiguous(self) -> None:
+        # Ambiguous UninhabitedType falls through to the empty-return arms.
+        msgs = self._run(
+            self._defn(), UninhabitedType(ambiguous=True), expr_type=self.fx.a
+        )
+        assert len(msgs) == 1 and msgs[0][0] == "subtype"
+
+    def test_parity_no_return_expected_lambda(self) -> None:
+        # Lambda suppresses NO_RETURN_EXPECTED; empty return then hits the
+        # checked-function fail.
+        msgs = self._run(self._defn(lambda_=True), UninhabitedType())
+        assert len(msgs) == 1 and msgs[0][0] == "fail"
+        assert "return a value" in msgs[0][1] or "Never" not in msgs[0][1]
+
+    def test_parity_async_generator_fail(self) -> None:
+        msgs = self._run(
+            self._defn(is_async_generator=True), self.fx.str_type, expr_type=self.fx.a
+        )
+        assert len(msgs) == 1 and msgs[0][0] == "fail"
+        assert "async generator" in msgs[0][1]
+
+    def test_parity_warn_return_any(self) -> None:
+        msgs = self._run(
+            self._defn(),
+            self.fx.str_type,
+            expr_type=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+        )
+        assert len(msgs) == 1 and msgs[0][0] == "warn_any"
+
+    def test_parity_warn_return_any_silent_ret_any(self) -> None:
+        msgs = self._run(
+            self._defn(),
+            AnyType(TypeOfAny.unannotated),
+            expr_type=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+        )
+        assert msgs == []
+
+    def test_parity_warn_return_any_silent_object(self) -> None:
+        msgs = self._run(
+            self._defn(),
+            self.fx.o,
+            expr_type=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+        )
+        assert msgs == []
+
+    def test_parity_warn_return_any_silent_lambda(self) -> None:
+        msgs = self._run(
+            self._defn(lambda_=True),
+            self.fx.str_type,
+            expr_type=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+        )
+        assert msgs == []
+
+    def test_parity_warn_return_any_silent_deferred(self) -> None:
+        msgs = self._run(
+            self._defn(),
+            self.fx.str_type,
+            expr_type=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+            deferred=True,
+        )
+        assert msgs == []
+
+    def test_parity_warn_return_any_off(self) -> None:
+        msgs = self._run(
+            self._defn(),
+            self.fx.str_type,
+            expr_type=AnyType(TypeOfAny.unannotated),
+        )
+        assert msgs == []
+
+    def test_parity_binary_magic_not_implemented_silent(self) -> None:
+        from mypy.nodes import NameExpr
+
+        # __add__ is a binary magic method; `return NotImplemented` is the
+        # sanctioned escape hatch. The stub accept returns the AnyType that
+        # NotImplemented rewrites to, so the warn must stay silent.
+        expr = NameExpr("NotImplemented")
+        expr.fullname = "builtins.NotImplemented"
+        defn = self._defn(name="__add__")
+        msgs = self._run_with_expr_node(
+            defn,
+            expr,
+            AnyType(TypeOfAny.special_form),
+            accept_result=AnyType(TypeOfAny.special_form),
+            warn_return_any=True,
+        )
+        assert msgs == []
+
+    def test_parity_binary_magic_plain_expr_warns(self) -> None:
+        from mypy.nodes import NameExpr
+
+        # Same binary-magic function, but the expression is not the
+        # NotImplemented literal: the warn fires.
+        defn = self._defn(name="__add__")
+        msgs = self._run_with_expr_node(
+            defn,
+            NameExpr("x"),
+            self.fx.str_type,
+            accept_result=AnyType(TypeOfAny.unannotated),
+            warn_return_any=True,
+        )
+        assert len(msgs) == 1 and msgs[0][0] == "warn_any"
+
+    def test_parity_none_declared_none_value_ok(self) -> None:
+        msgs = self._run(
+            self._defn(), NoneType(), expr_type=NoneType()
+        )
+        assert msgs == []
+
+    def test_parity_none_declared_fail(self) -> None:
+        msgs = self._run(self._defn(), NoneType(), expr_type=self.fx.a)
+        assert len(msgs) == 1 and msgs[0][0] == "fail"
+
+    def test_parity_none_declared_lambda_ok(self) -> None:
+        msgs = self._run(
+            self._defn(lambda_=True), NoneType(), expr_type=self.fx.a
+        )
+        assert msgs == []
+
+    def test_parity_check_subtype(self) -> None:
+        msgs = self._run(self._defn(), self.fx.str_type, expr_type=self.fx.a)
+        assert len(msgs) == 1 and msgs[0][0] == "subtype"
