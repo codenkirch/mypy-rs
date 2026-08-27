@@ -2297,6 +2297,17 @@ def rust_classify_add_metaclass(
     args_len: int,
     arg_kind_0_positional: bool,
 ) -> int: ...
+def rust_classify_configure_bases(
+    bases_wire: list[bytes],
+    is_newtypes: list[bool],
+    disallow_subclassing_any: bool,
+    disallow_any_unimported: bool,
+    disallow_any_explicit: bool,
+    is_typeshed_stub_file: bool,
+) -> list[tuple[int, bool, bool]] | None: ...
+def rust_classify_configure_mro(
+    info: TypeInfo,
+) -> tuple[int, list[int], str | None] | None: ...
 def rust_classify_function_signature(
     sig_arg_types_len: int,
     arguments_len: int,

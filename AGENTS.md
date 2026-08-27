@@ -293,6 +293,25 @@ including:
   `NativeLvalueValiditySuite` in `mypy/test/testtypes.py` (direct seam
   tag tests + gate-off vs gate-on differential on the fail message
   list), plus pure decision unit tests in `semanal_bases.rs`.
+- `rust_classify_configure_bases` + `rust_classify_configure_mro`
+  (issue #1035) — mirror the per-base dispatch and MRO tail of
+  `SemanticAnalyzer.configure_base_classes` (semanal.py:3395-3436).
+  Rust classifies every base from wire bytes plus the `is_newtype`
+  scalars (tuple / instance / newtype-fail / Any ok / Any fail /
+  TypedDict-fallback / invalid) and folds the
+  `disallow_any_unimported` walk and `check_for_explicit_any` flag
+  into per-base emit flags; the MRO call folds `verify_base_classes`
+  (identity `is_base_class` walk, PyO3 `.is()`) and
+  `verify_duplicate_base_classes` (`rich_compare` Eq, mirroring
+  `find_duplicate`) into a tail tag with cyclic indices and the
+  duplicate name. Python applies every fail, `unimported_type_becomes_any`
+  / `explicit_any`, `fallback_to_any`, `info.bases`, the implicit-object
+  append, `configure_tuple_base_class`, and the `set_dummy_mro` /
+  `set_any_mro` / `calculate_class_mro` writes; a `None` tail or unreadable
+  attribute defers to the pure body. Gated by the semanal_visitor gate
+  and covered by `NativeConfigureBasesSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests + gate-off vs gate-on differential), plus pure
+  decision unit tests in `semanal_bases.rs`.
 - `rust_bind_self` (issue #492) — mirrors `mypy.typeops.bind_self`'s
   non-generic fast path (typeops.py:540-641): strips the first parameter
   and sets `is_bound=True` for non-variable-carrying `CallableType`s. Rust

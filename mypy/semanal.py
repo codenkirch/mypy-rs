@@ -430,6 +430,8 @@ try:
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_add_metaclass as _rust_classify_add_metaclass,
         rust_classify_class_decorator as _rust_classify_class_decorator,
+        rust_classify_configure_bases as _rust_classify_configure_bases,
+        rust_classify_configure_mro as _rust_classify_configure_mro,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_fixed_args as _rust_classify_fixed_args,
         rust_classify_function_signature as _rust_classify_function_signature,
@@ -546,6 +548,8 @@ except ImportError:
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_class_decorator = None  # type: ignore[assignment]
+    _rust_classify_configure_bases = None  # type: ignore[assignment]
+    _rust_classify_configure_mro = None  # type: ignore[assignment]
     _rust_classify_function_signature = None  # type: ignore[assignment]
     _rust_classify_with_metaclass = None  # type: ignore[assignment]
     _rust_classify_add_metaclass = None  # type: ignore[assignment]
@@ -715,6 +719,24 @@ _LVALUE_KIND_TYPEINFO = 2
 NATIVE_FIXED_ARGS_OK = 0
 NATIVE_FIXED_ARGS_WRONG_COUNT = 1
 NATIVE_FIXED_ARGS_WRONG_KINDS = 2
+
+# configure_base_classes per-base tags (see semanal_bases.rs). Each tag maps
+# to one Python side effect: tuple handling, instance append, newtype fail,
+# fallback_to_any (with optional subclass-Any fail), or invalid-base fail.
+_CONFIGURE_TUPLE = 1
+_CONFIGURE_INSTANCE = 2
+_CONFIGURE_INSTANCE_NEWTYPE_FAIL = 3
+_CONFIGURE_ANY_OK = 4
+_CONFIGURE_ANY_FAIL = 5
+_CONFIGURE_TYPEDDICT_FALLBACK = 6
+_CONFIGURE_INVALID_BASE = 7
+
+# configure_base_classes MRO-tail tags (verify_base_classes folded with
+# verify_duplicate_base_classes): DUMMY cycles to set_dummy_mro, ANY is a
+# duplicate base (set_any_mro), PROCEED calculates the real MRO.
+_CONFIGURE_MRO_DUMMY = 1
+_CONFIGURE_MRO_ANY = 2
+_CONFIGURE_MRO_PROCEED = 3
 
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
@@ -3342,6 +3364,19 @@ class SemanticAnalyzer(
         related to the base classes: defn.info.bases, defn.info.mro, and
         miscellaneous others (at least tuple_type, fallback_to_any, and is_enum.)
         """
+        # Native semanal seam: Rust classifies every base from the wire
+        # ProperType plus the any-walk predicates and folds the MRO tail; the
+        # side effects stay here. None defers to the pure-Python body below.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_configure_bases is not None
+        ):
+            try:
+                if self._native_configure_base_classes(defn, bases):
+                    return
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         base_types: list[Instance] = []
         info = defn.info
 
@@ -3395,6 +3430,103 @@ class SemanticAnalyzer(
             # so, we just insert `Any` as the base class and show an error.
             self.set_any_mro(defn.info)
         self.calculate_class_mro(defn, self.object_type)
+
+    def _native_configure_base_classes(
+        self, defn: ClassDef, bases: list[tuple[ProperType, Expression]]
+    ) -> bool:
+        """Apply the Rust configure_base_classes classification.
+
+        Returns True when the seam decided every base and the MRO tail;
+        False defers to the pure-Python body of configure_base_classes.
+        """
+        base_list = [base for base, _ in bases]
+        is_newtypes = []
+        for base in base_list:
+            try:
+                is_newtypes.append(isinstance(base, Instance) and bool(base.type.is_newtype))
+            except (AssertionError, NotImplementedError, AttributeError):
+                return False
+        result = _rust_classify_configure_bases(
+            [_serialize_semanal_type(base) for base in base_list],
+            is_newtypes,
+            self.options.disallow_subclassing_any,
+            self.options.disallow_any_unimported,
+            self.options.disallow_any_explicit,
+            self.is_typeshed_stub_file,
+        )
+        if result is None or len(result) != len(bases):
+            return False
+        info = defn.info
+        base_types: list[Instance] = []
+        for (tag, unimported, explicit), (base, base_expr) in zip(result, bases):
+            if tag == _CONFIGURE_TUPLE:
+                assert isinstance(base, TupleType)
+                base_types.append(self.configure_tuple_base_class(defn, base))
+            elif tag == _CONFIGURE_INSTANCE:
+                assert isinstance(base, Instance)
+                base_types.append(base)
+            elif tag == _CONFIGURE_INSTANCE_NEWTYPE_FAIL:
+                assert isinstance(base, Instance)
+                self.fail('Cannot subclass "NewType"', defn)
+                base_types.append(base)
+            elif tag == _CONFIGURE_ANY_OK:
+                info.fallback_to_any = True
+            elif tag == _CONFIGURE_ANY_FAIL:
+                if isinstance(base_expr, (NameExpr, MemberExpr)):
+                    msg = f'Class cannot subclass "{base_expr.name}" (has type "Any")'
+                else:
+                    msg = 'Class cannot subclass value of type "Any"'
+                self.fail(msg, base_expr)
+                info.fallback_to_any = True
+            elif tag == _CONFIGURE_TYPEDDICT_FALLBACK:
+                assert isinstance(base, TypedDictType)
+                base_types.append(base.fallback)
+            else:
+                msg = "Invalid base class"
+                name = self.get_name_repr_of_expr(base_expr)
+                if name:
+                    msg += f' "{name}"'
+                self.fail(msg, base_expr)
+                info.fallback_to_any = True
+            if unimported:
+                if isinstance(base_expr, (NameExpr, MemberExpr)):
+                    prefix = f"Base type {base_expr.name}"
+                else:
+                    prefix = "Base type"
+                self.msg.unimported_type_becomes_any(prefix, base, base_expr)
+            if explicit:
+                self.msg.explicit_any(base_expr)
+        # Add 'object' as implicit base if there is no other base class.
+        if not base_types and defn.fullname != "builtins.object":
+            base_types.append(self.object_type())
+        info.bases = base_types
+        # MRO tail: verify_base_classes + verify_duplicate_base_classes in
+        # one Rust fold; None defers to the pure-Python verify methods.
+        tail = None
+        if _rust_classify_configure_mro is not None:
+            try:
+                tail = _rust_classify_configure_mro(info)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tail = None
+        if tail is None:
+            if not self.verify_base_classes(defn):
+                self.set_dummy_mro(defn.info)
+                return True
+            if not self.verify_duplicate_base_classes(defn):
+                self.set_any_mro(defn.info)
+            self.calculate_class_mro(defn, self.object_type)
+            return True
+        tail_tag, cyclic, dup_name = tail
+        if tail_tag == _CONFIGURE_MRO_DUMMY:
+            for _ in cyclic:
+                self.fail("Cycle in inheritance hierarchy", defn)
+            self.set_dummy_mro(defn.info)
+            return True
+        if tail_tag == _CONFIGURE_MRO_ANY:
+            self.fail(f'Duplicate base class "{dup_name}"', defn)
+            self.set_any_mro(defn.info)
+        self.calculate_class_mro(defn, self.object_type)
+        return True
 
     def configure_tuple_base_class(self, defn: ClassDef, base: TupleType) -> Instance:
         info = defn.info
