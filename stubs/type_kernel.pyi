@@ -42,6 +42,7 @@ from mypy.nodes import (
     SymbolTableNode,
     TypeAlias,
     TypeInfo,
+    Var,
 )
 from mypy.types import ProperType, TupleType, Type, TypeVarLikeType
 
@@ -1635,6 +1636,7 @@ def rust_descriptor_has_get_set(
     resolver: NativeTypeResolver, descriptor_bytes: bytes
 ) -> tuple[bool, bool] | None: ...
 def rust_classify_type_type_member_access(typ: Any) -> int | None: ...
+def rust_is_instance_var(var: Var) -> bool | None: ...
 def rust_check_self_arg(
     resolver: NativeTypeResolver,
     functype_bytes: bytes,

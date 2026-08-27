@@ -1739,6 +1739,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkmember::rust_descriptor_has_get_set,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(checkmember::rust_is_instance_var, module)?)?;
     module.add_function(wrap_pyfunction!(
         checkmember::rust_classify_type_type_member_access,
         module

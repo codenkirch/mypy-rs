@@ -2721,6 +2721,42 @@ fn classify_type_type_member_access_inner(py: Python<'_>, typ: &PyAny) -> PyResu
 // Tests
 // ---------------------------------------------------------------------------
 
+/// `is_instance_var` (checkmember.py:1502-1511): the PEP 526
+/// instance-variable predicate. Reads `var.name`, `var.info.names`,
+/// `var.is_classvar`, and `var.is_inferred` via PyO3 and mirrors the
+/// four-clause conjunction exactly. Defers (`None`) when any attribute
+/// is unreadable, so the Python caller falls back to the pure-Python
+/// predicate.
+#[pyfunction]
+pub(crate) fn rust_is_instance_var(var: &PyAny) -> PyResult<Option<bool>> {
+    is_instance_var_inner(var).map(Some).or(Ok(None))
+}
+
+fn is_instance_var_inner(var: &PyAny) -> PyResult<bool> {
+    let info = var.getattr("info")?;
+    let name: String = var.getattr("name")?.extract()?;
+    let names = info.getattr("names")?;
+    // Clause 1: `var.name in var.info.names`. A missing key raises
+    // KeyError, which short-circuits to False (clause 1 fails).
+    let entry = match names.get_item(name.as_str()) {
+        Ok(e) => e,
+        Err(_) => return Ok(false),
+    };
+    // Clause 2: `var.info.names[var.name].node is var`.
+    let node = entry.getattr("node")?;
+    if !node.is(var) {
+        return Ok(false);
+    }
+    // Clause 3: `not var.is_classvar`.
+    let is_classvar: bool = var.getattr("is_classvar")?.extract()?;
+    if is_classvar {
+        return Ok(false);
+    }
+    // Clause 4: `not var.is_inferred`.
+    let is_inferred: bool = var.getattr("is_inferred")?.extract()?;
+    Ok(!is_inferred)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4132,5 +4168,18 @@ mod tests {
             classify_type_type_member_access(TtItemKind::Other, false, false, TtUbKind::Other),
             TT_NONE
         );
+    }
+
+    #[test]
+    fn is_instance_var_defers_on_non_var() {
+        // A plain int has no `info`/`name` attrs, so the seam defers
+        // (returns None) instead of raising, mirroring the strangler-fig
+        // per-call gate.
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let obj = py.eval("1", None, None).unwrap();
+            let result = rust_is_instance_var(obj).unwrap();
+            assert_eq!(result, None);
+        });
     }
 }

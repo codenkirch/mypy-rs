@@ -31752,3 +31752,111 @@ class NativeIsDescriptorSuite(Suite):
         typ = UnionType.make_union([inner, Instance(self.subdesci, [])])
         self._assert_par(typ)
         self._assert_engages(typ, True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsInstanceVarSuite(Suite):
+    """Parity for the Rust `is_instance_var` port (mypy.checkmember).
+
+    `is_instance_var` (checkmember.py:1502-1511) is a pure boolean
+    conjunction over a live `Var`: `var.name in var.info.names`,
+    `var.info.names[var.name].node is var`, `not var.is_classvar`, and
+    `not var.is_inferred`. The Rust seam reads the live attrs via PyO3
+    and returns a plain bool on every well-formed Var; it defers
+    (None) only when an attribute is unreadable (e.g. a Var whose
+    `info` is the FakeInfo placeholder). Gate-off vs gate-on runs must
+    agree and the direct seam call must engage (non-None).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkmember import _set_native_checkmember_active
+
+        self._set_active = _set_native_checkmember_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _make_var(
+        self,
+        name: str = "x",
+        *,
+        is_classvar: bool = False,
+        is_inferred: bool = False,
+        node: Var | None = None,
+        info: TypeInfo | None = None,
+    ) -> Var:
+        var = Var(name)
+        if info is None:
+            info = self._typeinfo()
+        var.info = info
+        var.is_classvar = is_classvar
+        var.is_inferred = is_inferred
+        registered = node if node is not None else var
+        info.names[name] = SymbolTableNode(MDEF, registered)
+        return var
+
+    def _assert_par(self, var: Var, expected: bool) -> None:
+        from mypy.checkmember import is_instance_var
+
+        off = self._with_gate(False, lambda: is_instance_var(var))
+        on = self._with_gate(True, lambda: is_instance_var(var))
+        assert off == expected, f"gate-off: {off} != {expected}"
+        assert on == expected, f"gate-on: {on} != {expected}"
+
+    def _assert_seam(self, var: Var, expected: bool) -> None:
+        result = _type_kernel.rust_is_instance_var(var)
+        assert result is not None, f"Rust deferred on {var!r}"
+        assert result == expected, f"Rust seam: {result} != {expected}"
+
+    def test_true_instance_var(self) -> None:
+        var = self._make_var("x")
+        self._assert_par(var, True)
+        self._assert_seam(var, True)
+
+    def test_name_not_in_names_false(self) -> None:
+        var = self._make_var("x")
+        var.info.names.pop("x")
+        self._assert_par(var, False)
+        self._assert_seam(var, False)
+
+    def test_node_not_var_false(self) -> None:
+        other = Var("x")
+        var = self._make_var("x", node=other)
+        self._assert_par(var, False)
+        self._assert_seam(var, False)
+
+    def test_is_classvar_false(self) -> None:
+        var = self._make_var("x", is_classvar=True)
+        self._assert_par(var, False)
+        self._assert_seam(var, False)
+
+    def test_is_inferred_false(self) -> None:
+        var = self._make_var("x", is_inferred=True)
+        self._assert_par(var, False)
+        self._assert_seam(var, False)
+
+    def test_seam_defers_on_fake_info(self) -> None:
+        # A Var whose `info` is the FakeInfo placeholder: any attr read
+        # on info raises AssertionError, so the Rust seam defers (None).
+        # The Python predicate would raise too, so seam-only here.
+        var = Var("x")
+        result = _type_kernel.rust_is_instance_var(var)
+        assert result is None, f"expected defer, got {result}"

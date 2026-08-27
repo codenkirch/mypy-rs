@@ -929,6 +929,20 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls across all branches: FuncDef, OverloadedFuncDef, Decorator
   with CallableType/Overloaded/Instance/None type, Var, None node).
+- `rust_is_instance_var` (issue #965) — mirrors the pure bool predicate
+  `is_instance_var` (checkmember.py:1502-1511): the PEP 526
+  instance-variable conjunction `var.name in var.info.names and
+  var.info.names[var.name].node is var and not var.is_classvar and
+  not var.is_inferred`. Rust reads `var.name`/`var.info.names`/
+  `var.is_classvar`/`var.is_inferred` via PyO3 and short-circuits each
+  clause in order, returning a plain bool; defers (`None`) only when an
+  attribute is unreadable (e.g. `info` is the `VAR_NO_INFO` FakeInfo
+  placeholder, whose `__getattribute__` raises `AssertionError`), so the
+  Python caller falls back to the pure-Python predicate. Gated by
+  `_native_checkmember_active` (wired from `mypy/build.py`) and covered
+  by `NativeIsInstanceVarSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls), plus a Rust unit test
+  proving the deferral path in `checkmember.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
