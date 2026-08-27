@@ -869,6 +869,22 @@ including:
   `NativeDecoratedFunctionIsMethodSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential on the fail list plus direct seam
   calls), and 4 pure decision unit tests in `semanal_checks.rs`.
+- `rust_should_wait_rhs` (issue #1008) — mirrors the rvalue-wait predicate
+  `SemanticAnalyzer.should_wait_rhs` (semanal.py:4179-4206): Rust reads
+  `final_iteration` and the rvalue node-kind isinstance tags
+  (NameExpr / MemberExpr / IndexExpr / CallExpr / RefExpr /
+  PlaceholderNode) via PyO3 and dispatches with a bounded descent through
+  `IndexExpr.base` and `CallExpr.callee` (defers `None` past the bound).
+  The ported `get_member_expr_fullname` chain walk and the
+  placeholder-not-typeinfo lookup-result classification are pure Rust;
+  the symbol lookups ride the real `lookup` / `lookup_qualified` methods
+  called via PyO3 (resolver-seam pattern), so error emission and
+  module_refs recording stay Python-side. The Python shim keeps the
+  pure-Python body as the fallback on `None`. Gated by
+  `_native_semanal_active` (wired from `mypy/build.py`) and covered by
+  `NativeShouldWaitRhsSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential on results and lookup traffic plus direct seam
+  calls), plus pure decision unit tests in `semanal_checks.rs`.
 - `rust_are_args_compatible` (issue #954) — mirrors the dispatch head of
   `mypy.subtypes.are_args_compatible` (subtypes.py:2627-2681): the
   name-mismatch gate (`is_different(left.name, right.name, ...)`,

@@ -468,6 +468,7 @@ try:
         rust_refers_to_class_or_function as _rust_refers_to_class_or_function,
         rust_refers_to_fullname as _rust_refers_to_fullname,
         rust_remove_imported_names_from_symtable as _rust_remove_imported_names_from_symtable,
+        rust_should_wait_rhs as _rust_should_wait_rhs,
         rust_var_is_typing_special_form as _rust_var_is_typing_special_form,
         rust_visit_as_pattern as _rust_visit_as_pattern,
         rust_visit_assert_stmt as _rust_visit_assert_stmt,
@@ -556,6 +557,7 @@ except ImportError:
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
+    _rust_should_wait_rhs = None  # type: ignore[assignment]
     _rust_lookup = None  # type: ignore[assignment]
     _rust_lookup_qualified = None  # type: ignore[assignment]
     _rust_is_init_only = None  # type: ignore[assignment]
@@ -4184,6 +4186,20 @@ class SemanticAnalyzer(
         Always return False if this is a final iteration. This will typically cause
         the lvalue to be classified as a variable plus emit an error.
         """
+        # Native type_kernel seam (issue #1008): Rust walks the rvalue
+        # node chain; the symbol lookups ride the real lookup methods.
+        # None defers to the pure-Python body below.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_should_wait_rhs is not None
+        ):
+            try:
+                wait = _rust_should_wait_rhs(self, rv)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                wait = None
+            if wait is not None:
+                return wait
         if self.final_iteration:
             # No chance, nothing has changed.
             return False
