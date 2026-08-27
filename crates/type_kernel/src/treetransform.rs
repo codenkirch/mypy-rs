@@ -1704,6 +1704,7 @@ mod tests {
     use super::*;
     use pyo3::types::PyDict;
 
+    #[ignore = "requires librt built in venv; see AGENTS.md 'Type kernel build order'"]
     #[test]
     fn transform_int_expr_creates_copy() {
         pyo3::prepare_freethreaded_python();
@@ -1731,6 +1732,7 @@ node.set_line(7)
         });
     }
 
+    #[ignore = "requires librt built in venv; see AGENTS.md 'Type kernel build order'"]
     #[test]
     fn transform_name_expr_copies_ref() {
         pyo3::prepare_freethreaded_python();
@@ -1772,6 +1774,7 @@ node.set_line(3)
         });
     }
 
+    #[ignore = "requires librt built in venv; see AGENTS.md 'Type kernel build order'"]
     #[test]
     fn transform_var_uses_var_map() {
         pyo3::prepare_freethreaded_python();
