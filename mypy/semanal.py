@@ -278,7 +278,6 @@ from mypy.types import (
     TYPE_VAR_LIKE_NAMES,
     TYPED_NAMEDTUPLE_NAMES,
     UNPACK_TYPE_NAMES,
-    _encode_no_arg_instance,
     AnyType,
     CallableType,
     FunctionLike,
@@ -305,6 +304,7 @@ from mypy.types import (
     UnboundType,
     UnionType,
     UnpackType,
+    _encode_no_arg_instance,
     flatten_nested_tuples,
     get_proper_type,
     get_proper_types,
@@ -427,14 +427,15 @@ try:
         rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
         rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
-        rust_classify_decorators as _rust_classify_decorators,
+        rust_classify_add_metaclass as _rust_classify_add_metaclass,
         rust_classify_class_decorator as _rust_classify_class_decorator,
-        rust_classify_with_metaclass as _rust_classify_with_metaclass,
+        rust_classify_decorators as _rust_classify_decorators,
         rust_classify_imports as _rust_classify_imports,
-        rust_clean_up_bases as _rust_clean_up_bases,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_type_expression as _rust_classify_type_expression,
+        rust_classify_with_metaclass as _rust_classify_with_metaclass,
+        rust_clean_up_bases as _rust_clean_up_bases,
         rust_erase_func_annotations as _rust_erase_func_annotations,
         rust_extract_typevarlike_name as _rust_extract_typevarlike_name,
         rust_find_duplicate as _rust_find_duplicate,
@@ -540,6 +541,7 @@ except ImportError:
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_class_decorator = None  # type: ignore[assignment]
     _rust_classify_with_metaclass = None  # type: ignore[assignment]
+    _rust_classify_add_metaclass = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
@@ -655,6 +657,12 @@ _ACTION_BARE_PROTOCOL = 4
 _ACTION_NOT_WITH_METACLASS = 0
 _ACTION_WITH_METACLASS = 1
 
+# six.add_metaclass decorator-side tags (see semanal_bases.rs).
+# NOT_ADD_METACLASS: decorator is not six.add_metaclass; ADD_METACLASS:
+# Python captures args[0] and breaks.
+_ACTION_NOT_ADD_METACLASS = 0
+_ACTION_ADD_METACLASS = 1
+
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
     if not (_SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active):
@@ -666,6 +674,21 @@ def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
             base_expr.callee.fullname,
             len(base_expr.args),
             all(kind == ARG_POS for kind in base_expr.arg_kinds),
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
+
+
+def _native_add_metaclass_classification(dec_expr: CallExpr) -> int | None:
+    if not (_SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active):
+        return None
+    if not isinstance(dec_expr.callee, RefExpr):
+        return None
+    try:
+        return _rust_classify_add_metaclass(
+            dec_expr.callee.fullname,
+            len(dec_expr.args),
+            dec_expr.arg_kinds[0] == ARG_POS if dec_expr.arg_kinds else False,
         )
     except (AssertionError, NotImplementedError, ValueError):
         return None
@@ -3370,11 +3393,16 @@ class SemanticAnalyzer(
         for dec_expr in defn.decorators:
             if isinstance(dec_expr, CallExpr) and isinstance(dec_expr.callee, RefExpr):
                 dec_expr.callee.accept(self)
-                if (
-                    dec_expr.callee.fullname == "six.add_metaclass"
-                    and len(dec_expr.args) == 1
-                    and dec_expr.arg_kinds[0] == ARG_POS
-                ):
+                native_action = _native_add_metaclass_classification(dec_expr)
+                if native_action is None:
+                    is_add_meta = (
+                        dec_expr.callee.fullname == "six.add_metaclass"
+                        and len(dec_expr.args) == 1
+                        and dec_expr.arg_kinds[0] == ARG_POS
+                    )
+                else:
+                    is_add_meta = native_action == _ACTION_ADD_METACLASS
+                if is_add_meta:
                     add_meta_expr = dec_expr.args[0]
                     break
 

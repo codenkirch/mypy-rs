@@ -209,6 +209,58 @@ pub(crate) fn rust_classify_with_metaclass(
     ))
 }
 
+/// Action tags for the `@six.add_metaclass(M)` decorator-side classifier:
+/// - `ACTION_NOT_ADD_METACLASS`: decorator is not `six.add_metaclass`.
+/// - `ACTION_ADD_METACLASS`: Python captures `args[0]` and breaks.
+pub(crate) const ACTION_NOT_ADD_METACLASS: i64 = 0;
+pub(crate) const ACTION_ADD_METACLASS: i64 = 1;
+
+/// The fullname matched by the decorator-side block (semanal.py:3374).
+const ADD_METACLASS_FULLNAME: &str = "six.add_metaclass";
+
+/// Pure decision core of the `@six.add_metaclass(M)` decorator-side
+/// classifier (semanal.py:3373-3377). The Python shim runs
+/// `dec_expr.callee.accept(self)` unconditionally first (it pops the callee
+/// ref), then passes the fullname plus the two scalar facts. Matches
+/// `six.add_metaclass` with exactly 1 positional arg ->
+/// `ACTION_ADD_METACLASS`, else `ACTION_NOT_ADD_METACLASS`.
+fn classify_add_metaclass_inner(
+    fullname: Option<&str>,
+    args_len: usize,
+    arg_kind_0_positional: bool,
+) -> i64 {
+    match fullname {
+        Some(ADD_METACLASS_FULLNAME) => {
+            if args_len == 1 && arg_kind_0_positional {
+                ACTION_ADD_METACLASS
+            } else {
+                ACTION_NOT_ADD_METACLASS
+            }
+        }
+        _ => ACTION_NOT_ADD_METACLASS,
+    }
+}
+
+/// `infer_metaclass_and_bases_from_compat_helpers` decorator-side
+/// classifier (semanal.py:3369-3379). The Python shim runs
+/// `dec_expr.callee.accept(self)` unconditionally before calling this,
+/// then applies the side effect (`add_meta_expr = args[0]`, break) on
+/// `ACTION_ADD_METACLASS`. Module-level like
+/// `rust_classify_with_metaclass`.
+#[pyfunction]
+#[pyo3(signature = (fullname, args_len, arg_kind_0_positional))]
+pub(crate) fn rust_classify_add_metaclass(
+    fullname: Option<String>,
+    args_len: usize,
+    arg_kind_0_positional: bool,
+) -> PyResult<i64> {
+    Ok(classify_add_metaclass_inner(
+        fullname.as_deref(),
+        args_len,
+        arg_kind_0_positional,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +380,58 @@ mod tests {
     #[test]
     fn none_fullname_not_matched() {
         assert_eq!(classify_meta(None, 2, true), ACTION_NOT_WITH_METACLASS);
+    }
+
+    fn classify_add_meta(
+        fullname: Option<&str>,
+        args_len: usize,
+        arg_kind_0_positional: bool,
+    ) -> i64 {
+        classify_add_metaclass_inner(fullname, args_len, arg_kind_0_positional)
+    }
+
+    #[test]
+    fn test_classify_add_metaclass_matches() {
+        assert_eq!(
+            classify_add_meta(Some("six.add_metaclass"), 1, true),
+            ACTION_ADD_METACLASS
+        );
+    }
+
+    #[test]
+    fn test_classify_add_metaclass_wrong_name() {
+        assert_eq!(
+            classify_add_meta(Some("six.with_metaclass"), 1, true),
+            ACTION_NOT_ADD_METACLASS
+        );
+        assert_eq!(
+            classify_add_meta(Some("mod.Other"), 1, true),
+            ACTION_NOT_ADD_METACLASS
+        );
+    }
+
+    #[test]
+    fn test_classify_add_metaclass_wrong_arity() {
+        assert_eq!(
+            classify_add_meta(Some("six.add_metaclass"), 0, true),
+            ACTION_NOT_ADD_METACLASS
+        );
+        assert_eq!(
+            classify_add_meta(Some("six.add_metaclass"), 2, true),
+            ACTION_NOT_ADD_METACLASS
+        );
+    }
+
+    #[test]
+    fn test_classify_add_metaclass_non_positional() {
+        assert_eq!(
+            classify_add_meta(Some("six.add_metaclass"), 1, false),
+            ACTION_NOT_ADD_METACLASS
+        );
+    }
+
+    #[test]
+    fn test_classify_add_metaclass_none_fullname() {
+        assert_eq!(classify_add_meta(None, 1, true), ACTION_NOT_ADD_METACLASS);
     }
 }
