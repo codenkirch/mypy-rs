@@ -2316,6 +2316,13 @@ def rust_classify_configure_bases(
 def rust_classify_configure_mro(
     info: TypeInfo,
 ) -> tuple[int, list[int], str | None] | None: ...
+def rust_classify_declared_metaclass(
+    mc_name: str | None,
+    sym_node: Any,
+    var_type_wire: bytes | None,
+    meta_info: Any,
+) -> int | None: ...
+def rust_classify_recalculate_metaclass(defn: Any) -> int | None: ...
 def rust_classify_function_signature(
     sig_arg_types_len: int,
     arguments_len: int,
