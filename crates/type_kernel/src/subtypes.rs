@@ -3107,6 +3107,88 @@ pub(crate) fn rust_are_args_compatible(
 }
 
 // =====================================================================
+// Issue #998: check_type_parameter variance dispatch (subtypes.py:891)
+// =====================================================================
+
+/// Decision tags returned by `rust_classify_type_parameter`; must match
+/// the `NATIVE_TYPEPARAM_*` constants in mypy/subtypes.py.
+pub(crate) const KIND_TYPEPARAM_SUBTYPE: i64 = 0;
+pub(crate) const KIND_TYPEPARAM_SUBTYPE_SWAP: i64 = 1;
+pub(crate) const KIND_TYPEPARAM_PROPER_SUBTYPE: i64 = 2;
+pub(crate) const KIND_TYPEPARAM_PROPER_SWAP: i64 = 3;
+pub(crate) const KIND_TYPEPARAM_SAME: i64 = 4;
+pub(crate) const KIND_TYPEPARAM_EQUIVALENT: i64 = 5;
+
+/// Pure variance-dispatch tail of `check_type_parameter`
+/// (subtypes.py:903-922): map the (upgraded) variance plus the
+/// `proper_subtype` flag onto the leaf-call tag.
+fn classify_type_parameter_dispatch(variance: i64, proper_subtype: bool) -> i64 {
+    if variance == COVARIANT || variance == VARIANCE_NOT_READY {
+        if proper_subtype {
+            KIND_TYPEPARAM_PROPER_SUBTYPE
+        } else {
+            KIND_TYPEPARAM_SUBTYPE
+        }
+    } else if variance == CONTRAVARIANT {
+        if proper_subtype {
+            KIND_TYPEPARAM_PROPER_SWAP
+        } else {
+            KIND_TYPEPARAM_SUBTYPE_SWAP
+        }
+    } else if proper_subtype {
+        KIND_TYPEPARAM_SAME
+    } else {
+        KIND_TYPEPARAM_EQUIVALENT
+    }
+}
+
+/// `#[pyfunction]` entry for `mypy.subtypes.check_type_parameter`
+/// (subtypes.py:891-922).
+///
+/// Reads the scalar `variance` / `proper_subtype` facts plus the live
+/// `left` type via PyO3 (a `get_proper_type` call, an `isinstance`
+/// against `mypy.types.UninhabitedType`, and the `ambiguous` bool) to
+/// run the invariant-to-covariant upgrade, then returns the leaf tag:
+/// which subtype leaf to call and with which argument order. Python
+/// applies the leaf call (`is_subtype`, `is_proper_subtype`,
+/// `is_same_type`, `is_equivalent`), keeping the pure-Python body as
+/// the fallback. `None` defers on any unreadable PyO3 fact.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_type_parameter(
+    py: Python<'_>,
+    left: &PyAny,
+    variance: i64,
+    proper_subtype: bool,
+) -> PyResult<Option<i64>> {
+    Ok(classify_type_parameter(py, left, variance, proper_subtype))
+}
+
+fn classify_type_parameter(
+    py: Python<'_>,
+    left: &PyAny,
+    mut variance: i64,
+    proper_subtype: bool,
+) -> Option<i64> {
+    // subtypes.py:896-899: an ambiguous UninhabitedType on the left is
+    // treated as covariant even under an invariant typevar, since such
+    // a type can never be stored (checker.is_valid_inferred_type).
+    if variance == INVARIANT {
+        let mypy_types = py.import("mypy.types").ok()?;
+        let get_proper_type = mypy_types.getattr("get_proper_type").ok()?;
+        let p_left = get_proper_type.call1((left,)).ok()?;
+        let uninhabited = mypy_types.getattr("UninhabitedType").ok()?;
+        if p_left.is_instance(uninhabited).ok()? {
+            let ambiguous = read_bool_attr(p_left, "ambiguous").ok()??;
+            if ambiguous {
+                variance = COVARIANT;
+            }
+        }
+    }
+    Some(classify_type_parameter_dispatch(variance, proper_subtype))
+}
+
+// =====================================================================
 // Issue #968: is_descriptor (subtypes.py:2177-2183)
 // =====================================================================
 
@@ -5471,6 +5553,60 @@ mod tests {
                 false
             ),
             KIND_ARE_ARGS_TRUE
+        );
+    }
+
+    #[test]
+    fn test_typeparam_covariant_subtype() {
+        assert_eq!(
+            classify_type_parameter_dispatch(COVARIANT, false),
+            KIND_TYPEPARAM_SUBTYPE
+        );
+        assert_eq!(
+            classify_type_parameter_dispatch(COVARIANT, true),
+            KIND_TYPEPARAM_PROPER_SUBTYPE
+        );
+    }
+
+    #[test]
+    fn test_typeparam_variance_not_ready_defaults_covariant() {
+        // Lenient default: not-ready variance routes like covariance.
+        assert_eq!(
+            classify_type_parameter_dispatch(VARIANCE_NOT_READY, false),
+            KIND_TYPEPARAM_SUBTYPE
+        );
+        assert_eq!(
+            classify_type_parameter_dispatch(VARIANCE_NOT_READY, true),
+            KIND_TYPEPARAM_PROPER_SUBTYPE
+        );
+    }
+
+    #[test]
+    fn test_typeparam_contravariant_swaps_args() {
+        assert_eq!(
+            classify_type_parameter_dispatch(CONTRAVARIANT, false),
+            KIND_TYPEPARAM_SUBTYPE_SWAP
+        );
+        assert_eq!(
+            classify_type_parameter_dispatch(CONTRAVARIANT, true),
+            KIND_TYPEPARAM_PROPER_SWAP
+        );
+    }
+
+    #[test]
+    fn test_typeparam_other_variance_equality_leaves() {
+        // The else arm (e.g. bivariant) uses equality leaves.
+        assert_eq!(
+            classify_type_parameter_dispatch(INVARIANT, false),
+            KIND_TYPEPARAM_EQUIVALENT
+        );
+        assert_eq!(
+            classify_type_parameter_dispatch(INVARIANT, true),
+            KIND_TYPEPARAM_SAME
+        );
+        assert_eq!(
+            classify_type_parameter_dispatch(7, false),
+            KIND_TYPEPARAM_EQUIVALENT
         );
     }
 }

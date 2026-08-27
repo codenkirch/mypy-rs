@@ -34027,3 +34027,175 @@ def _make_getattr_sig(ok: bool, cls: bool = False) -> object:
         AnyType(TypeOfAny.special_form),
         Instance(fx.make_type_info("builtins.function"), []),
     )
+
+
+class NativeTypeParameterSuite(Suite):
+    """Parity for the Rust `check_type_parameter` dispatch-head port.
+
+    `mypy.subtypes.check_type_parameter` (subtypes.py:891-943) upgrades an
+    INVARIANT variance to COVARIANT when the left arg is an ambiguous
+    UninhabitedType, then routes to one of four subtype leaves by
+    variance (covariant / contravariant arg-order swap / equality).
+    The Rust classifier (`subtypes.rs`) reads the scalar variance and
+    `proper_subtype` flags plus the live `left` via PyO3 and returns a
+    leaf tag; the Python shim applies the leaf call and keeps the
+    pure-Python body as the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real function over live types and
+    asserts identical results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        self._set_active = _set_native_subtype_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, left: Type, variance: int, proper_subtype: bool) -> int | None:
+        return _type_kernel.rust_classify_type_parameter(left, variance, proper_subtype)
+
+    def _run(
+        self, left: Type, right: Type, variance: int, proper_subtype: bool
+    ) -> tuple[bool, bool]:
+        from mypy.subtypes import SubtypeContext, check_type_parameter
+
+        ctx = SubtypeContext()
+
+        def call() -> bool:
+            return check_type_parameter(left, right, variance, proper_subtype, ctx)
+
+        off = self._with_gate(False, call)
+        on = self._with_gate(True, call)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(
+        self, left: Type, right: Type, variance: int, proper_subtype: bool
+    ) -> None:
+        off, on = self._run(left, right, variance, proper_subtype)
+        assert_equal(
+            on,
+            off,
+            f"check_type_parameter parity for left={left!r} right={right!r} "
+            f"variance={variance} proper_subtype={proper_subtype}",
+        )
+
+    def test_seam_covariant_tag(self) -> None:
+        from mypy.nodes import COVARIANT
+        from mypy.subtypes import NATIVE_TYPEPARAM_SUBTYPE
+
+        assert self._tag(UninhabitedType(), COVARIANT, False) == (
+            NATIVE_TYPEPARAM_SUBTYPE
+        )
+
+    def test_seam_variance_not_ready_tag(self) -> None:
+        # VARIANCE_NOT_READY is leniently treated as covariant.
+        from mypy.nodes import VARIANCE_NOT_READY
+        from mypy.subtypes import NATIVE_TYPEPARAM_PROPER_SUBTYPE
+
+        assert self._tag(UninhabitedType(), VARIANCE_NOT_READY, True) == (
+            NATIVE_TYPEPARAM_PROPER_SUBTYPE
+        )
+
+    def test_seam_ambiguous_uninhabited_upgrades_to_covariant(self) -> None:
+        from mypy.nodes import INVARIANT
+        from mypy.subtypes import NATIVE_TYPEPARAM_SUBTYPE
+
+        assert self._tag(UninhabitedType(ambiguous=True), INVARIANT, False) == (
+            NATIVE_TYPEPARAM_SUBTYPE
+        )
+
+    def test_seam_unambiguous_uninhabited_stays_invariant(self) -> None:
+        from mypy.nodes import INVARIANT
+        from mypy.subtypes import NATIVE_TYPEPARAM_EQUIVALENT
+
+        assert self._tag(UninhabitedType(), INVARIANT, False) == (
+            NATIVE_TYPEPARAM_EQUIVALENT
+        )
+
+    def test_seam_ambiguous_uninhabited_proper_subtype(self) -> None:
+        from mypy.nodes import INVARIANT
+        from mypy.subtypes import NATIVE_TYPEPARAM_PROPER_SUBTYPE
+
+        assert self._tag(UninhabitedType(ambiguous=True), INVARIANT, True) == (
+            NATIVE_TYPEPARAM_PROPER_SUBTYPE
+        )
+
+    def test_seam_contravariant_tags(self) -> None:
+        from mypy.nodes import CONTRAVARIANT
+        from mypy.subtypes import NATIVE_TYPEPARAM_PROPER_SWAP, NATIVE_TYPEPARAM_SUBTYPE_SWAP
+
+        assert self._tag(UninhabitedType(), CONTRAVARIANT, False) == (
+            NATIVE_TYPEPARAM_SUBTYPE_SWAP
+        )
+        assert self._tag(UninhabitedType(), CONTRAVARIANT, True) == (
+            NATIVE_TYPEPARAM_PROPER_SWAP
+        )
+
+    def test_seam_alias_left_expands_through_get_proper_type(self) -> None:
+        # get_proper_type must unwrap an alias before the UninhabitedType
+        # isinstance; a live alias expands through the same call, so the
+        # seam still decides (tag matches the expanded variance check).
+        from mypy.nodes import INVARIANT, TypeAlias
+        from mypy.subtypes import NATIVE_TYPEPARAM_SUBTYPE
+
+        alias = TypeAlias(UninhabitedType(ambiguous=True), "mod.A", "mod", -1, -1)
+        assert self._tag(TypeAliasType(alias, []), INVARIANT, False) == (
+            NATIVE_TYPEPARAM_SUBTYPE
+        )
+
+    def test_seam_defers_on_expanding_alias_left(self) -> None:
+        # A hand-rolled TypeAliasType whose expansion raises defers (None)
+        # and the Python body raises the identical AttributeError, keeping
+        # the raise behavior on both sides of the gate.
+        from mypy.nodes import INVARIANT
+
+        assert self._tag(TypeAliasType("A", UninhabitedType(), []), INVARIANT, False) is None
+
+    def test_par_covariant_types(self) -> None:
+        from mypy.nodes import COVARIANT
+
+        fx = TypeFixture()
+        self._assert_par(fx.a, fx.b, COVARIANT, False)
+        self._assert_par(fx.a, fx.b, COVARIANT, True)
+
+    def test_par_contravariant_types(self) -> None:
+        from mypy.nodes import CONTRAVARIANT
+
+        fx = TypeFixture()
+        self._assert_par(fx.a, fx.o, CONTRAVARIANT, False)
+        self._assert_par(fx.a, fx.o, CONTRAVARIANT, True)
+
+    def test_par_invariant_equality(self) -> None:
+        from mypy.nodes import INVARIANT
+
+        fx = TypeFixture()
+        self._assert_par(fx.a, fx.a, INVARIANT, False)
+        self._assert_par(fx.a, fx.a, INVARIANT, True)
+        self._assert_par(fx.a, fx.b, INVARIANT, False)
+        self._assert_par(fx.a, fx.b, INVARIANT, True)
+
+    def test_par_ambiguous_uninhabited_invariant(self) -> None:
+        from mypy.nodes import INVARIANT, VARIANCE_NOT_READY
+
+        fx = TypeFixture()
+        amb = UninhabitedType(ambiguous=True)
+        self._assert_par(amb, fx.a, INVARIANT, False)
+        self._assert_par(amb, fx.a, INVARIANT, True)
+        self._assert_par(amb, fx.o, VARIANCE_NOT_READY, False)
+
+    def test_par_nonstandard_variance_equality_leaves(self) -> None:
+        # A non-standard variance int falls into the equality leaves.
+        fx = TypeFixture()
+        self._assert_par(fx.a, fx.a, 7, False)
+        self._assert_par(fx.a, fx.b, 7, True)
