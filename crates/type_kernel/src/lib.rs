@@ -693,6 +693,19 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         constraints_select::rust_repack_callable_args,
         module
     )?)?;
+    // Issue #1001: standalone constraint-list helper seams.
+    module.add_function(wrap_pyfunction!(
+        constraints_select::rust_merge_with_any,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_select::rust_filter_satisfiable,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        constraints_select::rust_is_same_constraints,
+        module
+    )?)?;
     // Issue #474: pure constraint-list filtering functions.
     module.add_function(wrap_pyfunction!(
         constraints_filter::rust_skip_reverse_union_constraints,

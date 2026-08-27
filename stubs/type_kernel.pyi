@@ -171,6 +171,9 @@ __all__ = [
     "rust_is_similar_constraints",
     "rust_any_constraints",
     "rust_repack_callable_args",
+    "rust_merge_with_any",
+    "rust_filter_satisfiable",
+    "rust_is_same_constraints",
     "rust_classify_call",
     "rust_classify_typeddict_call",
     "rust_classify_reveal_imported",
@@ -915,6 +918,13 @@ def rust_any_constraints(
 def rust_repack_callable_args(
     callable_bytes: bytes, resolver: NativeTypeResolver
 ) -> list[bytes] | None: ...
+def rust_merge_with_any(constraint_bytes: bytes) -> bool | None: ...
+def rust_filter_satisfiable(
+    option_bytes: bytes, resolver: NativeTypeResolver
+) -> bytes | None: ...
+def rust_is_same_constraints(
+    x_bytes: bytes, y_bytes: bytes, resolver: NativeTypeResolver
+) -> bool | None: ...
 def rust_filter_imprecise_kinds(constraints_bytes: bytes) -> bytes | None: ...
 def rust_infer_directed_arg_constraints(
     resolver: NativeTypeResolver,

@@ -133,10 +133,13 @@ fn merge_with_any(constraint: &ConstraintRep) -> Option<ConstraintRep> {
 }
 
 /// `types_utils.is_union_with_any` (types_utils.py:110-119): a plain Any
-/// or a union with an Any item. Recursive.
+/// or a union with an Any item. Recursive. `TypeAliasType` anywhere in the
+/// tree defers (`None`) because `get_proper_type` cannot expand aliases on
+/// the wire (mirrors `is_any_target`).
 fn is_union_with_any(tp: &Type) -> Option<bool> {
     match tp {
         Type::AnyType { .. } => Some(true),
+        Type::TypeAliasType { .. } => None,
         Type::UnionType { items, .. } => {
             for item in items {
                 match is_union_with_any(item) {
@@ -510,6 +513,103 @@ pub(crate) fn rust_any_constraints(
 
 fn write_constraint_op(buf: &mut WriteBuffer, op: i64) -> Result<(), WireError> {
     wire::write_int(buf, op)
+}
+
+/// Read a single option blob: bare count + M× constraint.
+fn read_option_list(bytes: &[u8]) -> Option<Vec<ConstraintRep>> {
+    let mut buf = ReadBuffer::new(bytes);
+    let n = read_size(&mut buf)?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        out.push(read_constraint(&mut buf)?);
+    }
+    Some(out)
+}
+
+/// Standalone seam for `merge_with_any` (constraints.py:924-936), Issue
+/// #1001. Rust only decides whether the target already contains Any:
+/// `true` = a union with Any is needed, `false` = the target already
+/// contains Any and the constraint is kept intact. Python applies the
+/// decision so the live target and origin type var keep their identity.
+/// Wire in: one constraint (origin Type | op int | target Type). Defers
+/// (`None`) on a `TypeAliasType` target, which `get_proper_type` cannot
+/// expand on the wire.
+#[pyfunction]
+pub(crate) fn rust_merge_with_any(constraint_bytes: &[u8]) -> Option<bool> {
+    let mut buf = ReadBuffer::new(constraint_bytes);
+    let constraint = read_constraint(&mut buf)?;
+    is_union_with_any(&constraint.target).map(|has_any| !has_any)
+}
+
+/// Standalone seam for `filter_satisfiable` (constraints.py:1020-1041),
+/// Issue #1001: keep only constraints that can possibly be satisfied
+/// given the origin's values / upper bound. Wire out: kept constraint
+/// indices as bare ints (empty = all filtered, Python returns `None`).
+/// Defers (`None`) on non-`TypeVarType` origins (ParamSpec /
+/// TypeVarTuple) and subtype checks the engine cannot decide.
+#[pyfunction]
+pub(crate) fn rust_filter_satisfiable(
+    option_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<u8>> {
+    let option = read_option_list(option_bytes)?;
+    // Matches the pure-Python `is_subtype` defaults (subtypes.py:260-270):
+    // all flags False except strict_optional, which follows the state
+    // default True.
+    let ctx = SubtypeContext::new(false, false, false, false, false, true);
+    let mut kept = Vec::with_capacity(option.len());
+    for (i, c) in option.iter().enumerate() {
+        let Type::TypeVarType {
+            values,
+            upper_bound,
+            ..
+        } = &c.origin
+        else {
+            return None; // no TypeVarType origin (ParamSpec etc.) for this path
+        };
+        let satisfiable = if values.is_empty() {
+            is_subtype(&c.target, upper_bound, &ctx, resolver.resolver())?
+        } else {
+            let mut any_value = false;
+            for value in values {
+                match is_subtype(&c.target, value, &ctx, resolver.resolver()) {
+                    Some(true) => {
+                        any_value = true;
+                        break;
+                    }
+                    Some(false) => {}
+                    None => return None,
+                }
+            }
+            any_value
+        };
+        if satisfiable {
+            kept.push(i as i64);
+        }
+    }
+    let mut output = WriteBuffer::new();
+    crate::wire::write_int_bare(&mut output, kept.len() as i64).ok()?;
+    for index in &kept {
+        crate::wire::write_int_bare(&mut output, *index).ok()?;
+    }
+    Some(output.into_bytes())
+}
+
+/// Standalone seam for `is_same_constraints` (constraints.py:1060-1067),
+/// Issue #1001: two lists are the same when every constraint in each has
+/// a same one in the other (same type var, op unless both targets are
+/// Any, and `is_same_type` on targets). Wire in: two option blobs. Defers
+/// (`None`) on any undecidable pairwise check (alias targets, non-TypeVar
+/// origins, subtype deferrals).
+#[pyfunction]
+pub(crate) fn rust_is_same_constraints(
+    x_bytes: &[u8],
+    y_bytes: &[u8],
+    resolver: &mut NativeTypeResolver,
+) -> Option<bool> {
+    let x = read_option_list(x_bytes)?;
+    let y = read_option_list(y_bytes)?;
+    is_same_constraints(&x, &y, resolver.resolver())
 }
 
 /// `repack_callable_args` (constraints.py:1871-1894): present a callable's
