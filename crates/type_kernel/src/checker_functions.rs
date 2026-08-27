@@ -334,6 +334,49 @@ pub(crate) fn rust_classify_enum_new(bases: &PyAny) -> PyResult<Option<Vec<i64>>
     Ok(Some(classify_enum_new(&facts)))
 }
 
+// ---------------------------------------------------------------------------
+// check_enum_bases fold port (issue #937)
+// ---------------------------------------------------------------------------
+
+/// Pure fold mirroring `check_enum_bases` (checker.py:3850-3876) over the
+/// resolved per-base `is_enum` facts. Returns `(enum_base_idx,
+/// violating_idx)`: `enum_base_idx` is the index of the first enum base
+/// (-1 if none); `violating_idx` is the index of the first non-enum base
+/// after an enum base (-1 if none).
+fn classify_enum_bases(is_enums: &[bool]) -> (i64, i64) {
+    let mut enum_base_idx: i64 = -1;
+    for (i, &is_enum) in is_enums.iter().enumerate() {
+        if enum_base_idx < 0 && is_enum {
+            enum_base_idx = i as i64;
+        } else if enum_base_idx >= 0 && !is_enum {
+            return (enum_base_idx, i as i64);
+        }
+    }
+    (enum_base_idx, -1)
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_enum_bases`
+/// (mypy/checker.py:3850-3876). Reads `defn.info.bases` (a list of
+/// `Instance`) via PyO3, extracts each `base.type.is_enum` bool, and runs
+/// the fold natively. Returns `Some((enum_base_idx, violating_idx))` or
+/// `None` when `bases` is not a list (deferral). The Python shim applies
+/// `self.fail` with the offending enum base's `str_with_options`.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_enum_bases(bases: &PyAny) -> PyResult<Option<(i64, i64)>> {
+    let list = match bases.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let mut is_enums = Vec::with_capacity(list.len());
+    for base in list.iter() {
+        let base_type = base.getattr("type")?;
+        let is_enum: bool = base_type.getattr("is_enum")?.extract()?;
+        is_enums.push(is_enum);
+    }
+    Ok(Some(classify_enum_bases(&is_enums)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +649,50 @@ mod tests {
                 KIND_ENUM_NEW_CONFLICT,
             ]
         );
+    }
+
+    // --- check_enum_bases fold tests (issue #937) ---
+
+    #[test]
+    fn test_classify_enum_bases_no_enum() {
+        // No enum base: no violation, enum_base_idx = -1.
+        assert_eq!(classify_enum_bases(&[false, false]), (-1, -1));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_enum_only() {
+        // Single enum base, no non-enum after it.
+        assert_eq!(classify_enum_bases(&[true]), (0, -1));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_enum_then_enum() {
+        // Multiple enum bases: all fine.
+        assert_eq!(classify_enum_bases(&[true, true]), (0, -1));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_nonenum_then_enum() {
+        // Non-enum before enum: fine, no violation.
+        assert_eq!(classify_enum_bases(&[false, true]), (1, -1));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_enum_then_nonenum() {
+        // Enum then non-enum: violation at index 1.
+        assert_eq!(classify_enum_bases(&[true, false]), (0, 1));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_nonenum_enum_nonenum() {
+        // Non-enum, enum, non-enum: violation at index 2.
+        assert_eq!(classify_enum_bases(&[false, true, false]), (1, 2));
+    }
+
+    #[test]
+    fn test_classify_enum_bases_empty() {
+        // Empty bases: no violation.
+        assert_eq!(classify_enum_bases(&[]), (-1, -1));
     }
 }
 

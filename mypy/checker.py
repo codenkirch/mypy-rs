@@ -331,6 +331,7 @@ try:
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_enum_new as _rust_classify_enum_new,
+        rust_classify_enum_bases as _rust_classify_enum_bases,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
@@ -406,6 +407,7 @@ except ImportError:
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
+    _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -3863,6 +3865,30 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 def __new__(cls, val): ...
             class Baz(int, Foo, Bar, enum.Flag): ...
         """
+        # Native type_kernel seam: classify the fold in Rust
+        # (checker_functions.rs); self.fail stays here. None or a
+        # sentinel -1 for violating_idx falls through.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_enum_bases is not None
+        ):
+            bases = defn.info.bases
+            try:
+                result = _rust_classify_enum_bases(bases)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                enum_base_idx, violating_idx = result
+                if violating_idx >= 0:
+                    enum_base = bases[enum_base_idx]
+                    self.fail(
+                        f'No non-enum mixin classes are allowed after '
+                        f'"{enum_base.str_with_options(self.options)}"',
+                        defn,
+                    )
+                return
+
         enum_base: Instance | None = None
         for base in defn.info.bases:
             if enum_base is None and base.type.is_enum:
