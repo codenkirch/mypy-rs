@@ -1128,6 +1128,131 @@ pub(crate) fn rust_check_for_untyped_decorator(
     ))
 }
 
+/// `TypeChecker.check_match_args` (checker.py:3128-3141): the type
+/// predicate head. Python keeps the `scope.active_class()` gate and the
+/// LITERAL_REQ note emission; Rust reads one wire Type and returns
+/// `isinstance(typ, TupleType) and all(is_string_literal(item))` as a
+/// plain bool, mirroring `rust_is_final_enum_value` (pure bool, no
+/// checker callbacks). Defers (`None`) on an undecodable blob, an alias
+/// type (`get_proper_type` would unwrap it on the Python side), or any
+/// tuple item whose string-literal check defers.
+#[pyfunction]
+pub(crate) fn rust_check_match_args(type_bytes: &[u8]) -> PyResult<Option<bool>> {
+    let typ = match crate::checkmember::decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(check_match_args_inner(&typ))
+}
+
+pub(crate) fn check_match_args_inner(typ: &Type) -> Option<bool> {
+    let proper = crate::checker_helpers::get_proper_or_none(typ)?;
+    let items = match proper {
+        Type::TupleType { items, .. } => items,
+        _ => return Some(false),
+    };
+    let mut all_str = true;
+    for item in items.iter() {
+        match crate::checkexpr_functions::is_string_literal_inner(item) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => {
+                // An undecidable item means Python's `is_string_literal`
+                // fallback (try_getting_str_literals_from_type) may still
+                // answer; defer.
+                all_str = false;
+                break;
+            }
+        }
+    }
+    if all_str {
+        return Some(true);
+    }
+    None
+}
+
+#[cfg(test)]
+mod match_args_tests {
+    use super::*;
+    use crate::wire::LiteralValue;
+
+    fn make_instance(type_ref: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn make_str_literal(s: &str) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(make_instance("builtins.str", vec![])),
+            value: LiteralValue::Str(s.to_string()),
+        }
+    }
+
+    fn make_int_literal(v: i64) -> Type {
+        Type::LiteralType {
+            fallback: Box::new(make_instance("builtins.int", vec![])),
+            value: LiteralValue::Int(v),
+        }
+    }
+
+    fn make_tuple(items: Vec<Type>) -> Type {
+        Type::TupleType {
+            items,
+            partial_fallback: Box::new(make_instance("builtins.tuple", vec![])),
+            implicit: false,
+        }
+    }
+
+    #[test]
+    fn test_non_tuple_defers_to_false() {
+        // Not a tuple -> note is emitted -> Some(false).
+        assert_eq!(
+            check_match_args_inner(&make_instance("int", vec![])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_empty_tuple_is_valid_match_args() {
+        assert_eq!(check_match_args_inner(&make_tuple(vec![])), Some(true));
+    }
+
+    #[test]
+    fn test_all_string_literals() {
+        let t = make_tuple(vec![make_str_literal("a"), make_str_literal("b")]);
+        assert_eq!(check_match_args_inner(&t), Some(true));
+    }
+
+    #[test]
+    fn test_int_literal_item_fails() {
+        let t = make_tuple(vec![make_str_literal("a"), make_int_literal(1)]);
+        assert_eq!(check_match_args_inner(&t), Some(false));
+    }
+
+    #[test]
+    fn test_alias_item_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "A".to_string(),
+        };
+        let t = make_tuple(vec![alias]);
+        assert_eq!(check_match_args_inner(&t), None);
+    }
+
+    #[test]
+    fn test_alias_type_defers() {
+        let alias = Type::TypeAliasType {
+            args: vec![],
+            type_ref: "T".to_string(),
+        };
+        assert_eq!(check_match_args_inner(&alias), None);
+    }
+}
+
 #[cfg(test)]
 mod metaclass_compat_tests {
     use super::*;
@@ -1706,81 +1831,6 @@ pub(crate) fn rust_check_explicit_override_decorator(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// check_match_args (checker.py:3128) predicate-head port.
-// ---------------------------------------------------------------------------
-
-/// Decision tags for `check_match_args`; must match
-/// `NATIVE_MATCH_ARGS_*` in mypy/checker.py.
-const KIND_MATCH_ARGS_SKIP: i64 = 0;
-const KIND_MATCH_ARGS_OK: i64 = 1;
-const KIND_MATCH_ARGS_FAIL: i64 = 2;
-
-/// The pure decision over resolved facts. `active_class` mirrors
-/// `self.scope.active_class()` (truthy = inside a class); `is_tuple` means
-/// `get_proper_type(typ)` is a `TupleType`; `items` are the per-item
-/// `is_string_literal` results (`None` = undecidable on the wire).
-///
-/// Branch order mirrors `check_match_args` (checker.py:3128-3141):
-/// not in a class -> skip; not a TupleType or any non-literal item ->
-/// fail (emit note); all items literal -> ok.
-fn classify_match_args(active_class: bool, is_tuple: bool, items: &[Option<bool>]) -> Option<i64> {
-    if !active_class {
-        return Some(KIND_MATCH_ARGS_SKIP);
-    }
-    if !is_tuple {
-        return Some(KIND_MATCH_ARGS_FAIL);
-    }
-    for &item in items {
-        match item {
-            None => return None,
-            Some(false) => return Some(KIND_MATCH_ARGS_FAIL),
-            Some(true) => {}
-        }
-    }
-    Some(KIND_MATCH_ARGS_OK)
-}
-
-/// `#[pyfunction]` entry for `TypeChecker.check_match_args`
-/// (mypy/checker.py:3128-3141). The shim passes `active_class`
-/// (truthy `self.scope.active_class()`) and the serialized `typ` bytes.
-/// Rust decodes the wire type, resolves the proper type (defers on an
-/// unresolved `TypeAliasType`), checks the `TupleType` kind, and reuses
-/// `is_string_literal_inner` per item. Returns `Some(tag)` for every
-/// reachable branch, or `None` to defer (decode failure or an item the
-/// string-literal kernel cannot decide). The Python shim emits the note.
-#[pyfunction]
-#[allow(clippy::needless_pass_by_value)]
-pub(crate) fn rust_classify_match_args(
-    active_class: bool,
-    type_bytes: &[u8],
-) -> PyResult<Option<i64>> {
-    if !active_class {
-        return Ok(Some(KIND_MATCH_ARGS_SKIP));
-    }
-    let typ = match crate::checkmember::decode_type(type_bytes) {
-        Some(t) => t,
-        None => return Ok(None),
-    };
-    let proper = match crate::checker_helpers::get_proper_or_none(&typ) {
-        Some(p) => p,
-        None => return Ok(None),
-    };
-    match proper {
-        Type::TupleType { items, .. } => {
-            let mut results: Vec<Option<bool>> = Vec::with_capacity(items.len());
-            for item in items {
-                match crate::checkexpr_functions::is_string_literal_inner(item) {
-                    Some(b) => results.push(Some(b)),
-                    None => return Ok(None),
-                }
-            }
-            Ok(classify_match_args(true, true, &results))
-        }
-        _ => Ok(Some(KIND_MATCH_ARGS_FAIL)),
-    }
-}
-
 #[cfg(test)]
 mod explicit_override_decorator_tests {
     use super::check_explicit_override_decorator;
@@ -1838,65 +1888,6 @@ mod explicit_override_decorator_tests {
         assert!(classify(false, true, false, "_single"));
         // Dunder names are not private either.
         assert!(classify(false, true, false, "__dunder__"));
-    }
-}
-
-#[cfg(test)]
-mod match_args_tests {
-    use super::{
-        classify_match_args, KIND_MATCH_ARGS_FAIL, KIND_MATCH_ARGS_OK, KIND_MATCH_ARGS_SKIP,
-    };
-
-    #[test]
-    fn test_skip_when_not_active_class() {
-        assert_eq!(
-            classify_match_args(false, false, &[]),
-            Some(KIND_MATCH_ARGS_SKIP)
-        );
-        // Even a tuple skips when not inside a class.
-        assert_eq!(
-            classify_match_args(false, true, &[Some(true)]),
-            Some(KIND_MATCH_ARGS_SKIP)
-        );
-    }
-
-    #[test]
-    fn test_fail_when_not_tuple() {
-        assert_eq!(
-            classify_match_args(true, false, &[]),
-            Some(KIND_MATCH_ARGS_FAIL)
-        );
-    }
-
-    #[test]
-    fn test_ok_when_all_string_literals() {
-        assert_eq!(
-            classify_match_args(true, true, &[Some(true), Some(true)]),
-            Some(KIND_MATCH_ARGS_OK)
-        );
-        // Empty tuple: all([]) is True in Python -> ok.
-        assert_eq!(
-            classify_match_args(true, true, &[]),
-            Some(KIND_MATCH_ARGS_OK)
-        );
-    }
-
-    #[test]
-    fn test_fail_on_any_non_literal_item() {
-        assert_eq!(
-            classify_match_args(true, true, &[Some(true), Some(false)]),
-            Some(KIND_MATCH_ARGS_FAIL)
-        );
-        assert_eq!(
-            classify_match_args(true, true, &[Some(false)]),
-            Some(KIND_MATCH_ARGS_FAIL)
-        );
-    }
-
-    #[test]
-    fn test_defer_on_undecidable_item() {
-        assert_eq!(classify_match_args(true, true, &[Some(true), None]), None);
-        assert_eq!(classify_match_args(true, true, &[None]), None);
     }
 }
 

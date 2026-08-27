@@ -210,6 +210,7 @@ __all__ = [
     "rust_is_final_enum_value",
     "rust_check_for_untyped_decorator",
     "rust_check_explicit_override_decorator",
+    "rust_check_match_args",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_conditional_types",
@@ -823,6 +824,7 @@ def rust_check_for_untyped_decorator(
 def rust_check_explicit_override_decorator(
     defn: Any, found_method_base_classes: Any
 ) -> bool: ...
+def rust_check_match_args(type_bytes: bytes) -> bool | None: ...
 def rust_classify_lvalue_validity(node: Any) -> int: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes
