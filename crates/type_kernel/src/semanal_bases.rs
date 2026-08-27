@@ -485,7 +485,10 @@ fn decode_type(bytes: &[u8]) -> Option<Type> {
 /// `verify_base_classes` + `verify_duplicate_base_classes` folded into one
 /// 3-way tag. Cyclic bases win (dummy MRO, early return in Python), then a
 /// duplicate direct base (Any MRO), else proceed.
-fn configure_mro_tail_inner(cyclic: &[usize], dup: Option<&str>) -> (i64, Vec<usize>, Option<String>) {
+fn configure_mro_tail_inner(
+    cyclic: &[usize],
+    dup: Option<&str>,
+) -> (i64, Vec<usize>, Option<String>) {
     if !cyclic.is_empty() {
         (MRO_DUMMY, cyclic.to_vec(), None)
     } else if let Some(d) = dup {
