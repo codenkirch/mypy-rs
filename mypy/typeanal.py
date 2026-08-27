@@ -3787,6 +3787,14 @@ _RAW_EXPR_TAG_LITERAL = 0
 _RAW_EXPR_TAG_NUMERIC_LITERALS = 1
 _RAW_EXPR_TAG_GENERIC = 2
 
+# Message tags for `visit_tuple_type` (issue #983). Mirrored in
+# crates/type_kernel/src/typeanal_special.rs; Python applies the
+# self.fail + one-of-three note and, on OK, the reconstruction.
+_TUPLE_TAG_OK = 0
+_TUPLE_TAG_EMPTY = 1
+_TUPLE_TAG_SINGLE = 2
+_TUPLE_TAG_MULTI = 3
+
 # Branch tags for `analyze_callable_type` (issue #958), mirrored in
 # crates/type_kernel/src/typeanal_callable.rs; Python builds the live
 # CallableType / enters tvar_scope / emits fail/note for each tag.

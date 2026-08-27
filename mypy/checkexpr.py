@@ -274,6 +274,8 @@ try:
         rust_is_non_empty_tuple as _rust_is_non_empty_tuple,
         rust_is_operator_method as _rust_is_operator_method,
         rust_is_type_type_context as _rust_is_type_type_context,
+        rust_is_valid_keyword_var_arg as _rust_is_valid_keyword_var_arg,
+        rust_is_valid_var_arg as _rust_is_valid_var_arg,
         rust_merge_typevars_in_callables_by_name as _rust_merge_typevars_in_callables_by_name,
         rust_method_fullname as _rust_method_fullname,
         rust_normalize_callable as _rust_normalize_callable,
@@ -320,6 +322,8 @@ except ImportError:
     _rust_has_coroutine_decorator = None  # type: ignore[assignment]
     _rust_is_operator_method = None  # type: ignore[assignment]
     _rust_is_type_type_context = None  # type: ignore[assignment]
+    _rust_is_valid_keyword_var_arg = None  # type: ignore[assignment]
+    _rust_is_valid_var_arg = None  # type: ignore[assignment]
     _rust_merge_typevars_in_callables_by_name = None  # type: ignore[assignment]
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
@@ -8025,6 +8029,23 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def is_valid_var_arg(self, typ: Type) -> bool:
         """Is a type valid as a *args argument?"""
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                # The is_subtype acceptance is resolver-backed and already
+                # native; pass its result in as a boolean (see
+                # rust_class_callable for the pattern).
+                proper = get_proper_type(typ)
+                iterable_ok = is_subtype(
+                    proper,
+                    self.chk.named_generic_type(
+                        "typing.Iterable", [AnyType(TypeOfAny.special_form)]
+                    ),
+                )
+                result = _rust_is_valid_var_arg(_serialize_type_for_checkexpr(typ), iterable_ok)
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         typ = get_proper_type(typ)
         return isinstance(typ, (TupleType, AnyType, ParamSpecType, UnpackType)) or is_subtype(
             typ, self.chk.named_generic_type("typing.Iterable", [AnyType(TypeOfAny.special_form)])
@@ -8032,6 +8053,43 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def is_valid_keyword_var_arg(self, typ: Type) -> bool:
         """Is a type valid as a **kwargs argument?"""
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                proper = get_proper_type(typ)
+                # The three is_subtype acceptance calls are resolver-backed
+                # and already native; pass their results in as booleans.
+                # Python's or-chain short-circuits, but these are pure.
+                dict_str_keys_ok = False
+                if (
+                    isinstance(proper, Instance)
+                    and proper.type.fullname == "builtins.dict"
+                    and proper.args
+                ):
+                    dict_str_keys_ok = is_subtype(proper.args[0], self.named_type("builtins.str"))
+                skag_str_ok = is_subtype(
+                    proper,
+                    self.chk.named_generic_type(
+                        "_typeshed.SupportsKeysAndGetItem",
+                        [self.named_type("builtins.str"), AnyType(TypeOfAny.special_form)],
+                    ),
+                )
+                skag_never_ok = is_subtype(
+                    proper,
+                    self.chk.named_generic_type(
+                        "_typeshed.SupportsKeysAndGetItem",
+                        [UninhabitedType(), UninhabitedType()],
+                    ),
+                )
+                result = _rust_is_valid_keyword_var_arg(
+                    _serialize_type_for_checkexpr(typ),
+                    dict_str_keys_ok,
+                    skag_str_ok,
+                    skag_never_ok,
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         typ = get_proper_type(typ)
         return (
             (

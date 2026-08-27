@@ -493,6 +493,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_is_valid_var_arg,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_is_valid_keyword_var_arg,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_try_getting_literal,
         module
     )?)?;
@@ -1677,6 +1685,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // returns a tag; Python formats the message. None defers to Python.
     module.add_function(wrap_pyfunction!(
         typeanal_rawexpr::rust_classify_raw_expression_type,
+        module
+    )?)?;
+    // visit_tuple_type: implicit-tuple message arbitration (OK / EMPTY /
+    // SINGLE / MULTI). Rust owns the three-scalar branch; Python applies
+    // the fail + one-of-three note and the reconstruction on OK.
+    module.add_function(wrap_pyfunction!(
+        typeanal_special::rust_classify_tuple_type_implicit,
         module
     )?)?;
     // analyze_callable_type: two-level dispatch (arity + arg0 kind). Rust

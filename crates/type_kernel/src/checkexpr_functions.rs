@@ -6177,3 +6177,229 @@ mod refers_to_typeddict_tests {
         ));
     }
 }
+
+// ---------------------------------------------------------------------------
+// is_valid_var_arg / is_valid_keyword_var_arg (issue #981)
+// ---------------------------------------------------------------------------
+
+/// `is_valid_var_arg` (checkexpr.py:8010): is a type valid as `*args`?
+/// `iterable_ok` is the resolver-backed is_subtype(Iterable[Any]) verdict.
+/// Defers on undecodable wire bytes or a `TypeAliasType` (no alias target).
+#[pyfunction]
+pub(crate) fn rust_is_valid_var_arg(
+    type_bytes: &[u8],
+    iterable_ok: bool,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(is_valid_var_arg_inner(&typ, iterable_ok))
+}
+
+pub(crate) fn is_valid_var_arg_inner(typ: &Type, iterable_ok: bool) -> Option<bool> {
+    let proper = get_proper_or_none(typ)?;
+    Some(
+        matches!(
+            proper,
+            Type::TupleType { .. }
+                | Type::AnyType { .. }
+                | Type::ParamSpecType { .. }
+                | Type::UnpackType { .. }
+        ) || iterable_ok,
+    )
+}
+
+/// `is_valid_keyword_var_arg` (checkexpr.py:8017): is a type valid as
+/// `**kwargs`? The `dict_str_keys_ok` / `skag_*_ok` args carry the
+/// resolver-backed is_subtype verdicts; isinstance facts come from wire.
+/// Defers on undecodable wire bytes, a `TypeAliasType` (no alias target),
+/// and a dict Instance with no args (Python would index `args[0]`).
+#[pyfunction]
+pub(crate) fn rust_is_valid_keyword_var_arg(
+    type_bytes: &[u8],
+    dict_str_keys_ok: bool,
+    skag_str_ok: bool,
+    skag_never_ok: bool,
+) -> PyResult<Option<bool>> {
+    let typ = match decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(is_valid_keyword_var_arg_inner(
+        &typ,
+        dict_str_keys_ok,
+        skag_str_ok,
+        skag_never_ok,
+    ))
+}
+
+pub(crate) fn is_valid_keyword_var_arg_inner(
+    typ: &Type,
+    dict_str_keys_ok: bool,
+    skag_str_ok: bool,
+    skag_never_ok: bool,
+) -> Option<bool> {
+    let proper = get_proper_or_none(typ)?;
+    match proper {
+        Type::Instance { type_ref, args, .. } if type_ref == "builtins.dict" => {
+            if args.is_empty() {
+                return None;
+            }
+            return Some(dict_str_keys_ok || skag_str_ok || skag_never_ok);
+        }
+        Type::ParamSpecType { .. } => return Some(true),
+        _ => {}
+    }
+    Some(skag_str_ok || skag_never_ok)
+}
+
+#[cfg(test)]
+mod is_valid_var_arg_tests {
+    use super::*;
+    use crate::wire::Parameters;
+
+    fn var_arg(typ: &Type, iterable_ok: bool) -> Option<bool> {
+        is_valid_var_arg_inner(typ, iterable_ok)
+    }
+
+    fn kwarg(typ: &Type, dict_ok: bool, skag_str: bool, skag_never: bool) -> Option<bool> {
+        is_valid_keyword_var_arg_inner(typ, dict_ok, skag_str, skag_never)
+    }
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: TYPE_OF_ANY_SPECIAL_FORM,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn instance(fullname: &str) -> Type {
+        Type::Instance {
+            type_ref: fullname.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn paramspec() -> Type {
+        Type::ParamSpecType {
+            prefix: Box::new(Parameters {
+                arg_types: vec![],
+                arg_kinds: vec![],
+                arg_names: vec![],
+                variables: vec![],
+                imprecise_arg_kinds: false,
+            }),
+            name: "P".to_string(),
+            fullname: "P".to_string(),
+            raw_id: 1,
+            namespace: "".to_string(),
+            flavor: 0,
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(any_type()),
+        }
+    }
+
+    fn tuple_type() -> Type {
+        Type::TupleType {
+            partial_fallback: Box::new(instance("builtins.tuple")),
+            items: vec![],
+            implicit: false,
+        }
+    }
+
+    fn alias() -> Type {
+        Type::TypeAliasType {
+            args: vec![],
+            type_ref: "m.A".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_var_arg_accepts_tag_types() {
+        assert_eq!(var_arg(&tuple_type(), false), Some(true));
+        assert_eq!(var_arg(&any_type(), false), Some(true));
+        assert_eq!(var_arg(&paramspec(), false), Some(true));
+        assert_eq!(
+            var_arg(
+                &Type::UnpackType {
+                    typ: Box::new(instance("builtins.list")),
+                },
+                false
+            ),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_var_arg_falls_to_iterable_boolean() {
+        assert_eq!(var_arg(&instance("builtins.list"), false), Some(false));
+        assert_eq!(var_arg(&instance("builtins.list"), true), Some(true));
+        assert_eq!(var_arg(&Type::NoneType, true), Some(true));
+    }
+
+    #[test]
+    fn test_var_arg_defers_on_alias() {
+        assert_eq!(var_arg(&alias(), true), None);
+    }
+
+    #[test]
+    fn test_kwarg_dict_str_keys() {
+        // Dict with str keys: the Python or-chain short-circuits on the
+        // dict arm; the OR of the passed booleans gives the same value.
+        let d_str = Type::Instance {
+            type_ref: "builtins.dict".to_string(),
+            args: vec![instance("builtins.str"), any_type()],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(kwarg(&d_str, true, false, false), Some(true));
+        // Dict with non-str keys: A false; the skag booleans complete the
+        // Python or-chain (both false here).
+        let d_int = Type::Instance {
+            type_ref: "builtins.dict".to_string(),
+            args: vec![instance("builtins.int"), any_type()],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert_eq!(kwarg(&d_int, false, false, false), Some(false));
+    }
+
+    #[test]
+    fn test_kwarg_dict_empty_args_defers() {
+        assert_eq!(kwarg(&instance("builtins.dict"), false, true, true), None);
+    }
+
+    #[test]
+    fn test_kwarg_paramspec() {
+        assert_eq!(kwarg(&paramspec(), false, false, false), Some(true));
+    }
+
+    #[test]
+    fn test_kwarg_other_instance_uses_skag_booleans() {
+        assert_eq!(
+            kwarg(&instance("builtins.list"), false, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            kwarg(&instance("builtins.list"), false, true, false),
+            Some(true)
+        );
+        // dict_str_keys_ok is only consulted for a dict instance: a
+        // non-dict Instance with dict_ok=true stays False (the Python
+        // isinstance(Instance) and fullname gate owns that fact).
+        assert_eq!(
+            kwarg(&instance("typing.Mapping"), true, false, false),
+            Some(false)
+        );
+        assert_eq!(kwarg(&Type::NoneType, false, false, true), Some(true));
+    }
+
+    #[test]
+    fn test_kwarg_defers_on_alias() {
+        assert_eq!(kwarg(&alias(), false, true, true), None);
+    }
+}
