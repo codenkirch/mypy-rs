@@ -6663,6 +6663,88 @@ class NativeSuperArgTypesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeVisitOpExprSuite(Suite):
+    """Parity for `rust_classify_visit_op_expr` (issue #959).
+
+    `ExpressionChecker.visit_op_expr` (checkexpr.py:5014-5044) dispatches a
+    5-way branch: `e.analyzed` passthrough, `and`/`or` boolean op,
+    `*` with `ListExpr` list multiply, `%` with `BytesExpr`/`StrExpr` str
+    interpolation, else `check_op`. The Rust seam classifies the whole
+    dispatch head from live `e.analyzed`, `e.op`, and `e.left` isinstance
+    facts and returns a branch tag; Python delegates to the original
+    branch body. Direct seam calls assert the exact tag for every branch;
+    toggling the checkexpr gate off vs on must produce identical results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, e: OpExpr) -> int | None:
+        return _type_kernel.rust_classify_visit_op_expr(e)
+
+    def test_seam_analyzed_passthrough(self) -> None:
+        e = OpExpr("|", NameExpr("X"), NameExpr("Y"))
+        e.analyzed = NameExpr("Analyzed")
+        assert self._tag(e) == 0
+
+    def test_seam_boolean_and(self) -> None:
+        e = OpExpr("and", NameExpr("X"), NameExpr("Y"))
+        assert self._tag(e) == 1
+
+    def test_seam_boolean_or(self) -> None:
+        e = OpExpr("or", NameExpr("X"), NameExpr("Y"))
+        assert self._tag(e) == 1
+
+    def test_seam_list_multiply(self) -> None:
+        e = OpExpr("*", ListExpr([]), NameExpr("N"))
+        assert self._tag(e) == 2
+
+    def test_seam_str_interp_bytes(self) -> None:
+        e = OpExpr("%", BytesExpr(b"%s"), NameExpr("Y"))
+        assert self._tag(e) == 3
+
+    def test_seam_str_interp_str(self) -> None:
+        e = OpExpr("%", StrExpr("%s"), NameExpr("Y"))
+        assert self._tag(e) == 3
+
+    def test_seam_check_op_default(self) -> None:
+        assert self._tag(OpExpr("+", NameExpr("X"), NameExpr("Y"))) == 4
+        assert self._tag(OpExpr("|", NameExpr("X"), NameExpr("Y"))) == 4
+        assert self._tag(OpExpr("-", NameExpr("X"), NameExpr("Y"))) == 4
+
+    def test_seam_star_not_list(self) -> None:
+        e = OpExpr("*", NameExpr("X"), NameExpr("Y"))
+        assert self._tag(e) == 4
+
+    def test_seam_percent_not_bytes_str(self) -> None:
+        e = OpExpr("%", NameExpr("X"), NameExpr("Y"))
+        assert self._tag(e) == 4
+
+    def test_seam_and_overrides_list(self) -> None:
+        # "and" takes precedence over isinstance checks.
+        e = OpExpr("and", ListExpr([]), NameExpr("Y"))
+        assert self._tag(e) == 1
+
+    def test_seam_star_bytes_not_list_multiply(self) -> None:
+        # "*" with BytesExpr left goes to check_op, not list multiply.
+        e = OpExpr("*", BytesExpr(b"x"), NameExpr("Y"))
+        assert self._tag(e) == 4
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSemanalClassPropSuite(Suite):
     """Parity for the Rust `semanal_classprop` ports (Issue #538).
 

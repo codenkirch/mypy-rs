@@ -251,6 +251,7 @@ try:
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
+        rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -325,6 +326,7 @@ except ImportError:
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_classify_reveal_imported = None  # type: ignore[assignment]
     _rust_classify_super_arg_types = None  # type: ignore[assignment]
+    _rust_classify_visit_op_expr = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -363,6 +365,14 @@ NATIVE_SUPER_ARG_NON_POSITIONAL = 5
 NATIVE_SUPER_ARG_SINGLE_ARG = 6
 NATIVE_SUPER_ARG_TWO_ARG_OK = 7
 NATIVE_SUPER_ARG_TOO_MANY = 8
+
+# Decision tags returned by `_rust_classify_visit_op_expr`; must match
+# `VISIT_OP_EXPR_*` in crates/type_kernel/src/checkexpr_functions.rs.
+NATIVE_VISIT_OP_EXPR_ANALYZED = 0
+NATIVE_VISIT_OP_EXPR_BOOLEAN = 1
+NATIVE_VISIT_OP_EXPR_LIST_MULTIPLY = 2
+NATIVE_VISIT_OP_EXPR_STR_INTERP = 3
+NATIVE_VISIT_OP_EXPR_CHECK_OP = 4
 
 # Stage 9 checkcall gate: when active, generic callable solving
 # (normalize + map + infer + solve + apply) routes through the Rust kernel.
@@ -5017,6 +5027,24 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
     def visit_op_expr(self, e: OpExpr) -> Type:
         """Type check a binary operator expression."""
+        # Native type_kernel seam: classify the 5-way dispatch in Rust
+        # (checkexpr_functions.rs); the side-effect bodies stay here.
+        # None falls through to the pure-Python body below.
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                tag = _rust_classify_visit_op_expr(e)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_VISIT_OP_EXPR_ANALYZED:
+                    return self.accept(e.analyzed)
+                if tag == NATIVE_VISIT_OP_EXPR_BOOLEAN:
+                    return self.check_boolean_op(e)
+                if tag == NATIVE_VISIT_OP_EXPR_LIST_MULTIPLY:
+                    return self.check_list_multiply(e)
+                if tag == NATIVE_VISIT_OP_EXPR_STR_INTERP:
+                    return self.strfrm_checker.check_str_interpolation(e.left, e.right)
+                # tag == NATIVE_VISIT_OP_EXPR_CHECK_OP: fall through.
         if e.analyzed:
             # It's actually a type expression X | Y.
             return self.accept(e.analyzed)

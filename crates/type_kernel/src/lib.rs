@@ -566,6 +566,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_super_arg_types,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_visit_op_expr,
+        module
+    )?)?;
     // Issue #489: overload-result family (combine_function_signatures body).
     module.add_function(wrap_pyfunction!(
         checkexpr_overload::rust_combine_function_signatures,
