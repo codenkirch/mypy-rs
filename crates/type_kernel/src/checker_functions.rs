@@ -2411,7 +2411,7 @@ mod missing_annotations_tests {
         TYPE_TAG_NONE, TYPE_TAG_OTHER,
     };
     use crate::subtypes::COVARIANT;
-    use crate::typeinfo::{TypeResolver, TypeInfoSnapshot};
+    use crate::typeinfo::{TypeInfoSnapshot, TypeResolver};
     use crate::wire::Type;
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
@@ -2512,7 +2512,19 @@ mod missing_annotations_tests {
     fn test_typeshed_stub_no_warn_noop() {
         // show_untyped is False: is_typeshed_stub and not warn_incomplete_stub.
         assert_eq!(
-            decide(true, false, true, true, TYPE_TAG_NONE, 0, vec![], false, false, None, vec![]),
+            decide(
+                true,
+                false,
+                true,
+                true,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
             Some((KIND_MISSING_ANN_NONE, false))
         );
         assert_eq!(
@@ -2597,7 +2609,19 @@ mod missing_annotations_tests {
     fn test_untyped_def_self_cls_only() {
         // No arguments at all.
         assert_eq!(
-            decide(false, false, true, false, TYPE_TAG_NONE, 0, vec![], false, false, None, vec![]),
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
             Some((KIND_MISSING_ANN_RETURN_UNTYPED, false))
         );
         // Single self / cls argument.
@@ -2838,10 +2862,7 @@ mod missing_annotations_tests {
             Some((KIND_MISSING_ANN_RETURN_EXPECTED, false))
         );
         // Generator[int, Any, str]: tr is annotated, no fail.
-        let gen = instance(
-            "typing.Generator",
-            vec![int_(), explicit_any(), int_()],
-        );
+        let gen = instance("typing.Generator", vec![int_(), explicit_any(), int_()]);
         assert_eq!(
             decide(
                 false,
