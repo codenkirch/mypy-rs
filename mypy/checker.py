@@ -265,9 +265,6 @@ from mypy.types import (
     ANY_STRATEGY,
     MYPYC_NATIVE_INT_NAMES,
     NOT_IMPLEMENTED_TYPE_NAMES,
-    _encode_no_arg_instance,
-    _serialize_stats,
-    _serialize_stats_on,
     OVERLOAD_NAMES,
     AnyType,
     BoolTypeQuery,
@@ -276,9 +273,6 @@ from mypy.types import (
     ErasedType,
     FunctionLike,
     Instance,
-    _serialize_with_taint_check,
-    _type_wire_cache,
-    _wire_cache_enabled,
     LiteralType,
     NoneType,
     Overloaded,
@@ -300,6 +294,12 @@ from mypy.types import (
     UninhabitedType,
     UnionType,
     UnpackType,
+    _encode_no_arg_instance,
+    _serialize_stats,
+    _serialize_stats_on,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
     find_unpack_in_list,
     flatten_nested_unions,
     get_proper_type,
@@ -332,6 +332,7 @@ try:
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
+        rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
@@ -348,13 +349,14 @@ try:
         rust_is_async_generator_return_type as _rust_is_async_generator_return_type,
         rust_is_classmethod_node as _rust_is_classmethod_node,
         rust_is_custom_settable_property as _rust_is_custom_settable_property,
+        rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
         rust_is_false_literal as _rust_is_false_literal,
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
-        rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_method as _rust_is_method,
+        rust_is_more_general_arg_prefix as _rust_is_more_general_arg_prefix,
         rust_is_node_static as _rust_is_node_static,
         rust_is_private as _rust_is_private,
         rust_is_property as _rust_is_property,
@@ -365,11 +367,9 @@ try:
         rust_is_typed_callable as _rust_is_typed_callable,
         rust_is_typeddict_type_context as _rust_is_typeddict_type_context,
         rust_is_unreachable_map as _rust_is_unreachable_map,
-        rust_is_unsafe_overlapping_overload_signatures
-        as _rust_is_unsafe_overlapping_overload_signatures,
+        rust_is_unsafe_overlapping_overload_signatures as _rust_is_unsafe_overlapping_overload_signatures,
         rust_is_untyped_decorator as _rust_is_untyped_decorator,
         rust_is_valid_inferred_type as _rust_is_valid_inferred_type,
-        rust_is_more_general_arg_prefix as _rust_is_more_general_arg_prefix,
         rust_narrow_type_by_identity_equality as _rust_narrow_type_by_identity_equality,
         rust_narrow_with_len as _rust_narrow_with_len,
         rust_or_conditional_maps as _rust_or_conditional_maps,
@@ -401,6 +401,7 @@ except ImportError:
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
+    _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -463,6 +464,15 @@ NATIVE_FINAL_SUPER_PASS_TAIL = 5
 NATIVE_NEW_SIGNATURE_METACLASS = 0
 NATIVE_NEW_SIGNATURE_NON_INSTANCE = 1
 NATIVE_NEW_SIGNATURE_INSTANCE = 2
+
+# Decision tags returned by `_rust_classify_func_def_override`; must match
+# `KIND_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_FUNC_DEF_OVERRIDE_FUNC_OVER_FUNC = 0
+NATIVE_FUNC_DEF_OVERRIDE_ORIG_TYPE_NONE = 1
+NATIVE_FUNC_DEF_OVERRIDE_FILL_PARTIAL = 2
+NATIVE_FUNC_DEF_OVERRIDE_PARTIAL_INVALID = 3
+NATIVE_FUNC_DEF_OVERRIDE_BINDER_ASSIGN = 4
+NATIVE_FUNC_DEF_OVERRIDE_NO_OP = 5
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -2101,6 +2111,68 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_func_def_override(self, defn: FuncDef, new_type: FunctionLike) -> None:
         assert defn.original_def is not None
+        # Native type_kernel seam: classify the 5-way dispatch head in
+        # Rust (checker_functions.rs); branch bodies stay here. None falls
+        # through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_func_def_override is not None
+        ):
+            orig_def = defn.original_def
+            is_funcdef = isinstance(orig_def, FuncDef)
+            orig_type = orig_def.type
+            is_partial = isinstance(orig_type, PartialType)
+            partial_type_is_none = isinstance(orig_type, PartialType) and orig_type.type is None
+            try:
+                tag = _rust_classify_func_def_override(
+                    is_funcdef,
+                    orig_type is None,
+                    is_partial,
+                    partial_type_is_none,
+                    bool(defn.is_invalid_redefinition),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_FUNC_DEF_OVERRIDE_FUNC_OVER_FUNC:
+                    old_type = self.function_type(defn.original_def)  # type: ignore[arg-type]
+                    if not is_same_type(new_type, old_type):
+                        self.msg.incompatible_conditional_function_def(
+                            defn, old_type, new_type
+                        )
+                    return
+                if tag == NATIVE_FUNC_DEF_OVERRIDE_ORIG_TYPE_NONE:
+                    return
+                if tag == NATIVE_FUNC_DEF_OVERRIDE_FILL_PARTIAL:
+                    if isinstance(orig_def, Decorator):
+                        var = orig_def.var
+                    else:
+                        var = orig_def
+                    partial_types = self.find_partial_types(var)  # type: ignore[arg-type]
+                    if partial_types is not None:
+                        var.type = new_type
+                        del partial_types[var]  # type: ignore[arg-type]
+                    return
+                if tag == NATIVE_FUNC_DEF_OVERRIDE_PARTIAL_INVALID:
+                    defn.is_invalid_redefinition = True
+                    self.fail(message_registry.INCOMPATIBLE_REDEFINITION, defn)
+                    return
+                if tag == NATIVE_FUNC_DEF_OVERRIDE_BINDER_ASSIGN:
+                    name_expr = NameExpr(defn.name)
+                    name_expr.node = defn.original_def
+                    self.binder.assign_type(name_expr, new_type, orig_type)
+                    self.check_subtype(
+                        new_type,
+                        orig_type,  # type: ignore[arg-type]
+                        defn,
+                        message_registry.INCOMPATIBLE_REDEFINITION,
+                        "redefinition with type",
+                        "original type",
+                    )
+                    return
+                # tag == NO_OP: nothing to do.
+                return
         if isinstance(defn.original_def, FuncDef):
             # Function definition overrides function definition.
             old_type = self.function_type(defn.original_def)

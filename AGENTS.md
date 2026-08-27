@@ -395,6 +395,22 @@ including:
   `NativeNewSignatureSuite` in `mypy/test/testtypes.py` (direct seam tag
   tests + gate-off vs gate-on differential), plus 3 pure decision unit
   tests in `checker_functions.rs`.
+- `rust_classify_func_def_override` (issue #921, mypy.checker): the Rust
+  classifier in `checker_functions.rs` ports the 5-way dispatch head of
+  `TypeChecker.check_func_def_override` (checker.py:2106-2162): the
+  function-overrides-function arm (`isinstance(original_def, FuncDef)`),
+  the `orig_type is None` return, the `PartialType` fill arm, the
+  `PartialType` invalid-redefinition arm, the binder-assign +
+  `check_subtype` arm, and the implicit no-op tail for an already-invalid
+  redefinition. The Python shim extracts five scalar bools
+  (`is_funcdef`, `orig_type_is_none`, `is_partial`,
+  `partial_type_is_none`, `is_invalid_redefinition`) and applies the
+  branch body in Python (`function_type`/`is_same_type`,
+  `find_partial_types`, `binder.assign_type`, `check_subtype`, error
+  emission). Never defers (`None` only on arg-decoding failure). Gated
+  by `_native_checker_active` and covered by `NativeFuncDefOverrideSuite`
+  in `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs
+  gate-on differential).
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

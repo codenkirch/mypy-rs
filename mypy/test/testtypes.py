@@ -24406,6 +24406,213 @@ class NativeNewSignatureSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFuncDefOverrideSuite(Suite):
+    """Parity for the Rust `check_func_def_override` 5-way dispatch port.
+
+    `TypeChecker.check_func_def_override` (checker.py:2106-2162) classifies
+    the override into five arms plus an implicit no-op from scalar facts:
+    original_def is a FuncDef, orig_type is None, orig_type is a partial
+    with/without a resolved type, and the invalid-redefinition flag. The Rust
+    classifier (`checker_functions.rs`) returns a branch tag; every branch
+    body (function_type/is_same_type, partial fill, binder assign,
+    check_subtype, error emission) stays in Python. Direct seam calls assert
+    the exact tag; the gate-off vs gate-on differential drives the real
+    TypeChecker method through stubs and asserts identical observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(
+        self,
+        is_funcdef: bool,
+        orig_none: bool,
+        is_partial: bool,
+        partial_none: bool,
+        invalid: bool,
+    ) -> int:
+        return _type_kernel.rust_classify_func_def_override(
+            is_funcdef, orig_none, is_partial, partial_none, invalid
+        )
+
+    def _any(self) -> Any:
+        return AnyType(TypeOfAny.explicit)
+
+    def _run(
+        self,
+        make: Callable[[], tuple[FuncDef, Any]],
+        old_type_fn: Callable[[], Any] | None = None,
+    ) -> tuple[object, object]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[object, ...]:
+            defn, new_type = make()
+            chk = TypeChecker.__new__(TypeChecker)
+            obs: list[object] = []
+            old_type = old_type_fn() if old_type_fn is not None else new_type
+            chk.function_type = lambda d: old_type  # type: ignore[assignment]
+            chk.msg = SimpleNamespace(
+                incompatible_conditional_function_def=lambda d, ot, nt: obs.append(
+                    ("incompatible_cond", d.name)
+                )
+            )
+            chk.find_partial_types = lambda var: {var: True}  # type: ignore[assignment]
+            chk.fail = lambda msg, ctx: obs.append(("fail", msg))
+            chk.binder = SimpleNamespace(
+                assign_type=lambda expr, nt, ot: obs.append(("assign", expr.name))
+            )
+            chk.check_subtype = lambda nt, ot, ctx, msg, d1, d2: obs.append(("subtype",))
+            chk.check_func_def_override(defn, new_type)
+            orig_def = defn.original_def
+            if isinstance(orig_def, FuncDef):
+                orig_type_repr = "FuncDef"
+            else:
+                orig_type_repr = repr(orig_def.type)
+            return (tuple(obs), defn.is_invalid_redefinition, orig_type_repr)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        make: Callable[[], tuple[FuncDef, Any]],
+        old_type_fn: Callable[[], Any] | None = None,
+    ) -> None:
+        off, on = self._run(make, old_type_fn)
+        assert_equal(on, off, "check_func_def_override parity")
+
+    # ---- direct seam tag tests ----
+
+    def test_seam_func_over_func(self) -> None:
+        assert self._tag(True, False, False, False, False) == 0
+        assert self._tag(True, True, True, True, True) == 0
+
+    def test_seam_orig_type_none(self) -> None:
+        assert self._tag(False, True, False, False, False) == 1
+
+    def test_seam_fill_partial(self) -> None:
+        assert self._tag(False, False, True, True, False) == 2
+
+    def test_seam_partial_invalid(self) -> None:
+        assert self._tag(False, False, True, False, False) == 3
+
+    def test_seam_binder_assign(self) -> None:
+        assert self._tag(False, False, False, False, False) == 4
+
+    def test_seam_no_op(self) -> None:
+        assert self._tag(False, False, False, False, True) == 5
+
+    # ---- gate-off vs gate-on differential tests ----
+
+    def _func_over_func(self) -> tuple[FuncDef, Any]:
+        orig = FuncDef("old")
+        defn = FuncDef("f")
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_func_over_func(self) -> None:
+        self._assert_par(self._func_over_func)
+
+    def test_parity_func_over_func_incompatible(self) -> None:
+        self._assert_par(self._func_over_func, lambda: NoneType())
+
+    def _orig_none(self) -> tuple[FuncDef, Any]:
+        orig = Var("v")
+        orig.type = None
+        defn = FuncDef("f")
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_orig_none(self) -> None:
+        self._assert_par(self._orig_none)
+
+    def _fill_partial(self) -> tuple[FuncDef, Any]:
+        from mypy.types import PartialType
+
+        orig = Var("v")
+        orig.type = PartialType(None, orig)
+        defn = FuncDef("f")
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_fill_partial(self) -> None:
+        self._assert_par(self._fill_partial)
+
+    def _partial_invalid(self) -> tuple[FuncDef, Any]:
+        from mypy.types import PartialType
+
+        orig = Var("v")
+        info = self._fake_info()
+        orig.type = PartialType(info, orig)
+        defn = FuncDef("f")
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_partial_invalid(self) -> None:
+        self._assert_par(self._partial_invalid)
+
+    def _binder_assign(self) -> tuple[FuncDef, Any]:
+        orig = Var("v")
+        orig.type = self._any()
+        defn = FuncDef("f")
+        defn.is_invalid_redefinition = False
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_binder_assign(self) -> None:
+        self._assert_par(self._binder_assign)
+
+    def _no_op(self) -> tuple[FuncDef, Any]:
+        orig = Var("v")
+        orig.type = self._any()
+        defn = FuncDef("f")
+        defn.is_invalid_redefinition = True
+        defn.original_def = orig
+        return defn, self._any()
+
+    def test_parity_no_op(self) -> None:
+        self._assert_par(self._no_op)
+
+    def _fill_partial_decorator(self) -> tuple[FuncDef, Any]:
+        from mypy.types import PartialType
+
+        inner = FuncDef("old")
+        var = Var("v")
+        var.type = PartialType(None, var)
+        decorator = Decorator(inner, [], var)
+        defn = FuncDef("f")
+        defn.original_def = decorator
+        return defn, self._any()
+
+    def test_parity_fill_partial_decorator(self) -> None:
+        self._assert_par(self._fill_partial_decorator)
+
+    def _fake_info(self) -> Any:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo as _TypeInfo
+
+        defn = ClassDef("List", Block([]), None, [])
+        defn.fullname = "builtins.list"
+        info = _TypeInfo(SymbolTable(), defn, "builtins")
+        return info
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
 

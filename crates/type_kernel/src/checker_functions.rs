@@ -169,6 +169,68 @@ pub(crate) fn rust_classify_new_signature(
     Ok(Some(classify_new_signature(is_metaclass, is_instance_ret)))
 }
 
+/// Decision tags; values must match `NATIVE_FUNC_DEF_OVERRIDE_*` in
+/// mypy/checker.py.
+const KIND_FUNC_OVER_FUNC: i64 = 0;
+const KIND_ORIG_TYPE_NONE: i64 = 1;
+const KIND_FILL_PARTIAL: i64 = 2;
+const KIND_PARTIAL_INVALID: i64 = 3;
+const KIND_BINDER_ASSIGN: i64 = 4;
+const KIND_NO_OP: i64 = 5;
+
+/// The pure branch-order match over scalar facts for
+/// `TypeChecker.check_func_def_override` (checker.py:2095-2137). The
+/// five dispatch arms plus the implicit no-op (invalid-redefinition tail).
+/// Kept separate from the PyO3 entry so the branch algebra is unit-testable
+/// without a Python runtime.
+fn classify_func_def_override(
+    is_funcdef: bool,
+    orig_type_is_none: bool,
+    is_partial: bool,
+    partial_type_is_none: bool,
+    is_invalid_redefinition: bool,
+) -> i64 {
+    if is_funcdef {
+        return KIND_FUNC_OVER_FUNC;
+    }
+    if orig_type_is_none {
+        return KIND_ORIG_TYPE_NONE;
+    }
+    if is_partial {
+        if partial_type_is_none {
+            return KIND_FILL_PARTIAL;
+        }
+        return KIND_PARTIAL_INVALID;
+    }
+    if !is_invalid_redefinition {
+        return KIND_BINDER_ASSIGN;
+    }
+    KIND_NO_OP
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_func_def_override`
+/// (mypy/checker.py:2095-2137). The shim extracts five scalar facts from the
+/// live `defn` and passes them in; Rust returns a tag for every input
+/// combination (never defers). Branch bodies stay in Python, so the only
+/// error mode is argument decoding, which the shim guards with a
+/// `try/except` and falls back to the pure-Python body on failure.
+#[pyfunction]
+pub(crate) fn rust_classify_func_def_override(
+    is_funcdef: bool,
+    orig_type_is_none: bool,
+    is_partial: bool,
+    partial_type_is_none: bool,
+    is_invalid_redefinition: bool,
+) -> i64 {
+    classify_func_def_override(
+        is_funcdef,
+        orig_type_is_none,
+        is_partial,
+        partial_type_is_none,
+        is_invalid_redefinition,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +360,66 @@ mod tests {
         // Non-metaclass + Any/Instance/Tuple/Uninhabited/Literal: subtype
         // of the class.
         assert_eq!(classify_new_signature(false, true), NEW_SIGNATURE_INSTANCE);
+    }
+
+    // ---- classify_func_def_override unit tests ----
+
+    #[test]
+    fn test_classify_func_def_override_func_over_func() {
+        // (a) original_def is a FuncDef: function-overrides-function arm.
+        assert_eq!(
+            classify_func_def_override(true, false, false, false, false),
+            KIND_FUNC_OVER_FUNC
+        );
+        // orig_type facts are irrelevant when is_funcdef is True.
+        assert_eq!(
+            classify_func_def_override(true, true, true, true, true),
+            KIND_FUNC_OVER_FUNC
+        );
+    }
+
+    #[test]
+    fn test_classify_func_def_override_orig_type_none() {
+        // (b) original_def is not a FuncDef, orig_type is None: return.
+        assert_eq!(
+            classify_func_def_override(false, true, false, false, false),
+            KIND_ORIG_TYPE_NONE
+        );
+    }
+
+    #[test]
+    fn test_classify_func_def_override_fill_partial() {
+        // (c) orig_type is a PartialType with type None: fill it.
+        assert_eq!(
+            classify_func_def_override(false, false, true, true, false),
+            KIND_FILL_PARTIAL
+        );
+    }
+
+    #[test]
+    fn test_classify_func_def_override_partial_invalid() {
+        // (d) orig_type is a PartialType with type not None: invalid.
+        assert_eq!(
+            classify_func_def_override(false, false, true, false, false),
+            KIND_PARTIAL_INVALID
+        );
+    }
+
+    #[test]
+    fn test_classify_func_def_override_binder_assign() {
+        // (e) not partial, not invalid: binder.assign_type + check_subtype.
+        assert_eq!(
+            classify_func_def_override(false, false, false, false, false),
+            KIND_BINDER_ASSIGN
+        );
+    }
+
+    #[test]
+    fn test_classify_func_def_override_no_op() {
+        // implicit: not partial, is_invalid_redefinition: no-op.
+        assert_eq!(
+            classify_func_def_override(false, false, false, false, true),
+            KIND_NO_OP
+        );
     }
 }
