@@ -4250,3 +4250,136 @@ mod return_stmt_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_type_check_raise
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `type_check_raise`; must match `NATIVE_RAISE_*`
+/// in mypy/checker.py.
+const RAISE_DELETED: i64 = 0;
+const RAISE_PLAIN: i64 = 1;
+const RAISE_NOT_IMPLEMENTED: i64 = 2;
+
+/// `mypy.types.NOT_IMPLEMENTED_TYPE_NAMES` (types.py:288).
+const NOT_IMPLEMENTED_TYPE_NAMES: [&str; 2] =
+    ["builtins._NotImplementedType", "types.NotImplementedType"];
+
+/// Pure 3-way dispatch of `TypeChecker.type_check_raise`
+/// (checker.py:6971-7002). `typ` is the decoded wire form of the proper
+/// type of the raised expression; `callee_fullname` is the shim's scalar
+/// fact for the `CallExpr` + `RefExpr` callee guard (None when `e` is
+/// not a call of a named reference). The DeletedType arm short-circuits
+/// ahead of the not-implemented guard, mirroring the Python order. The
+/// BaseException subtype check and the zero-arg `check_call` on a
+/// FunctionLike stay Python-side (the subtype resolver is already
+/// native; check_call recursion stays Python).
+fn classify_type_check_raise(typ: &Type, callee_fullname: Option<&str>) -> i64 {
+    if matches!(typ, Type::DeletedType { .. }) {
+        return RAISE_DELETED;
+    }
+    let is_notimpl_instance = match typ {
+        Type::Instance { type_ref, .. } => NOT_IMPLEMENTED_TYPE_NAMES.contains(&type_ref.as_str()),
+        _ => false,
+    };
+    let is_notimpl_callee = callee_fullname == Some("builtins.NotImplemented");
+    if is_notimpl_instance || is_notimpl_callee {
+        RAISE_NOT_IMPLEMENTED
+    } else {
+        RAISE_PLAIN
+    }
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.type_check_raise`
+/// (checker.py:6971-7002). Rust decides ONLY the tag from the wire type
+/// plus the callee fullname fact; the shim applies all side effects
+/// (deleted_as_rvalue / INVALID_EXCEPTION fail / the
+/// "did you mean NotImplementedError" fail) and runs `check_subtype`
+/// plus the FunctionLike `check_call`. Defers (`None`) on undecodable
+/// wire bytes; never otherwise.
+#[pyfunction]
+#[pyo3(signature = (type_bytes, callee_fullname))]
+pub(crate) fn rust_classify_type_check_raise(
+    type_bytes: &[u8],
+    callee_fullname: Option<String>,
+) -> PyResult<Option<i64>> {
+    let typ = match crate::checkmember::decode_type(type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(Some(classify_type_check_raise(
+        &typ,
+        callee_fullname.as_deref(),
+    )))
+}
+
+#[cfg(test)]
+mod classify_type_check_raise_tests {
+    use super::*;
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn test_deleted_wins() {
+        // DeletedType is checked first: the callee fact is irrelevant.
+        let deleted = Type::DeletedType { source: None };
+        assert_eq!(classify_type_check_raise(&deleted, None), RAISE_DELETED);
+        assert_eq!(
+            classify_type_check_raise(&deleted, Some("builtins.NotImplemented")),
+            RAISE_DELETED
+        );
+    }
+
+    #[test]
+    fn test_plain_instance() {
+        assert_eq!(
+            classify_type_check_raise(&instance("builtins.BaseException"), None),
+            RAISE_PLAIN
+        );
+    }
+
+    #[test]
+    fn test_notimpl_instance_names() {
+        for name in NOT_IMPLEMENTED_TYPE_NAMES {
+            assert_eq!(
+                classify_type_check_raise(&instance(name), None),
+                RAISE_NOT_IMPLEMENTED
+            );
+        }
+    }
+
+    #[test]
+    fn test_notimpl_callee_fact() {
+        assert_eq!(
+            classify_type_check_raise(
+                &instance("builtins.BaseException"),
+                Some("builtins.NotImplemented")
+            ),
+            RAISE_NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            classify_type_check_raise(
+                &instance("builtins.BaseException"),
+                Some("builtins.NotImplementedError")
+            ),
+            RAISE_PLAIN
+        );
+    }
+
+    #[test]
+    fn test_non_instance_type_is_plain() {
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(classify_type_check_raise(&any, None), RAISE_PLAIN);
+    }
+}
