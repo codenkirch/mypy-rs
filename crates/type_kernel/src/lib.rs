@@ -2869,6 +2869,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #939: check_explicit_override_decorator 5-flag conjunction.
+    // Rust evaluates the predicate; message emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_explicit_override_decorator,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

@@ -24579,6 +24579,173 @@ class NativeUntypedDecoratorSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeExplicitOverrideDecoratorSuite(Suite):
+    """Parity for the Rust `check_explicit_override_decorator` conjunction port.
+
+    `TypeChecker.check_explicit_override_decorator` (checker.py:3139) is a
+    pure 5-flag conjunction over `plugin_generated`, `found_method_base_classes`
+    truthiness, `defn.is_explicit_override`, `defn.name` membership in
+    {"__init__", "__new__"}, and `is_private(defn.name)`. When true, the method
+    emits `self.msg.explicit_override_decorator_missing(name, base_fullname,
+    context)`. The Rust predicate (`checker_functions.rs`) evaluates the
+    conjunction; the Python shim emits the message. `False` defers to the
+    pure-Python body (mirrors the Python default for `plugin_generated`).
+
+    Direct seam calls assert the bool for every flag combination; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a stub
+    message recorder and asserts identical message records.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, name: str = "A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = f"mod.{name}"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        # `info.get(name)` walks `info.mro`; seed it with the class itself
+        # so the symbol-table entries are discoverable.
+        info.mro.append(info)
+        return info
+
+    def _defn(
+        self,
+        name: str,
+        info: TypeInfo | None,
+        is_explicit_override: bool = False,
+        plugin_generated: bool = False,
+    ) -> FuncDef:
+        from mypy.nodes import GDEF, SymbolTableNode, Var
+
+        if info is None:
+            info = self._info()
+        fdef = FuncDef(name)
+        fdef.info = info
+        fdef.is_explicit_override = is_explicit_override
+        # `plugin_generated` lives on the SymbolTableNode, not on Var.
+        node = Var(name)
+        info.names[name] = SymbolTableNode(GDEF, node, plugin_generated=plugin_generated)
+        return fdef
+
+    def _bases(self, fullname: str = "mod.Base") -> list[TypeInfo]:
+        return [self._info("Base")]
+
+    def _run(
+        self,
+        defn: FuncDef,
+        found: list[TypeInfo] | None,
+    ) -> list[tuple[str, str]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[tuple[str, str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, str]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                explicit_override_decorator_missing=(
+                    lambda n, bn, ctx: msgs.append(("missing", n, bn))
+                ),
+            )
+            chk.check_explicit_override_decorator(defn, found, defn)
+            return msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, defn: FuncDef, found: list[TypeInfo] | None) -> None:
+        off, on = self._run(defn, found)
+        assert_equal(
+            on,
+            off,
+            f"check_explicit_override_decorator parity for name={defn.name!r}",
+        )
+
+    def test_seam_emit_plain_override(self) -> None:
+        fdef = self._defn("override", None)
+        assert _type_kernel.rust_check_explicit_override_decorator(
+            fdef, self._bases()
+        )
+
+    def test_seam_plugin_generated_suppresses(self) -> None:
+        fdef = self._defn("override", None, plugin_generated=True)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef, self._bases()
+        )
+
+    def test_seam_no_base_classes(self) -> None:
+        fdef = self._defn("override", None)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef, None
+        )
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef, []
+        )
+
+    def test_seam_explicit_override_suppresses(self) -> None:
+        fdef = self._defn("override", None, is_explicit_override=True)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef, self._bases()
+        )
+
+    def test_seam_init_and_new_suppress(self) -> None:
+        fdef_init = self._defn("__init__", None)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef_init, self._bases()
+        )
+        fdef_new = self._defn("__new__", None)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef_new, self._bases()
+        )
+
+    def test_seam_private_name_suppresses(self) -> None:
+        fdef = self._defn("__private", None)
+        assert not _type_kernel.rust_check_explicit_override_decorator(
+            fdef, self._bases()
+        )
+
+    def test_parity_every_branch(self) -> None:
+        # Emit: plain public override with a base class.
+        self._assert_par(self._defn("override", None), self._bases())
+        # Suppress: plugin-generated method.
+        self._assert_par(
+            self._defn("override", None, plugin_generated=True), self._bases()
+        )
+        # Suppress: no base classes (None and empty list).
+        self._assert_par(self._defn("override", None), None)
+        self._assert_par(self._defn("override", None), [])
+        # Suppress: is_explicit_override.
+        self._assert_par(
+            self._defn("override", None, is_explicit_override=True), self._bases()
+        )
+        # Suppress: __init__ / __new__.
+        self._assert_par(self._defn("__init__", None), self._bases())
+        self._assert_par(self._defn("__new__", None), self._bases())
+        # Suppress: private name.
+        self._assert_par(self._defn("__private", None), self._bases())
+        # Suppress: single-underscore name (not private by mypy's def,
+        # so this should emit, confirming the boundary).
+        self._assert_par(self._defn("_single", None), self._bases())
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCompatibilityClassvarSuperSuite(Suite):
     """Parity for the Rust `check_compatibility_classvar_super` 2x2 predicate port.
 

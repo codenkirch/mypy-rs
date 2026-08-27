@@ -339,6 +339,7 @@ try:
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
+        rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -413,6 +414,7 @@ except ImportError:
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
+    _rust_check_explicit_override_decorator = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -3155,6 +3157,27 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         found_method_base_classes: list[TypeInfo] | None,
         context: Context | None = None,
     ) -> None:
+        # Native type_kernel seam: classify the 5-flag conjunction in Rust
+        # (checker_functions.rs); the message emission stays here. `False`
+        # defers to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_explicit_override_decorator is not None
+        ):
+            try:
+                if _rust_check_explicit_override_decorator(
+                    defn, found_method_base_classes
+                ):
+                    self.msg.explicit_override_decorator_missing(
+                        defn.name,
+                        found_method_base_classes[0].fullname,
+                        context or defn,
+                    )
+                    return
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
+
         plugin_generated = False
         if defn.info and (node := defn.info.get(defn.name)) and node.plugin_generated:
             # Do not report issues for plugin generated nodes,
