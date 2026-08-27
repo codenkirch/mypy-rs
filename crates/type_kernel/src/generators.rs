@@ -315,7 +315,7 @@ fn get_generator_receive_type_inner(
 /// `get_coroutine_return_type` (checker.py:1523-1529). Pure Type-in/Type-out;
 /// ported. `return_type` is asserted by the caller to be a `Coroutine`
 /// Instance, so no generator classification runs here.
-fn get_coroutine_return_type_inner(return_type: &Type) -> Option<Type> {
+pub(crate) fn get_coroutine_return_type_inner(return_type: &Type) -> Option<Type> {
     let return_type = get_proper_or_defer(return_type)?;
     match return_type {
         Type::AnyType { .. } => Some(any_type(
@@ -338,7 +338,7 @@ fn get_coroutine_return_type_inner(return_type: &Type) -> Option<Type> {
 /// check `is_async_generator_return_type` (only yield/receive do), and the
 /// two final branches are ordered `Awaitable`-with-exactly-1-arg THEN
 /// Generator/AwaitableGenerator-with->=3-args THEN `NoneType`. Copied exactly.
-fn get_generator_return_type_inner(
+pub(crate) fn get_generator_return_type_inner(
     return_type: &Type,
     is_coroutine: bool,
     strict_optional: bool,

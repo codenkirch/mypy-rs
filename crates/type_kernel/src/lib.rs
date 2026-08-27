@@ -3096,6 +3096,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1009: check_for_missing_annotations decision-head port. Rust
+    // arbitrates the annotation-completeness gates; the fail/note emission
+    // stays in Python. Tag contract in checker_functions.rs.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_missing_annotations,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

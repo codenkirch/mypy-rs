@@ -343,6 +343,7 @@ try:
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
+        rust_classify_missing_annotations as _rust_classify_missing_annotations,
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
@@ -424,6 +425,7 @@ except ImportError:
     _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_rvalue_count = None  # type: ignore[assignment]
     _rust_classify_truthy_type = None  # type: ignore[assignment]
+    _rust_classify_missing_annotations = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
@@ -550,6 +552,19 @@ NATIVE_TRUTHY_FUNCTION = 1
 NATIVE_TRUTHY_UNION = 2
 NATIVE_TRUTHY_ITERABLE = 3
 NATIVE_TRUTHY_OTHER = 4
+
+# Decision tags returned by `_rust_classify_missing_annotations`; must match
+# `KIND_MISSING_ANN_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_MISSING_ANN_NONE = 0
+NATIVE_MISSING_ANN_RETURN_UNTYPED = 1
+NATIVE_MISSING_ANN_FUNC_TYPE_EXPECTED = 2
+NATIVE_MISSING_ANN_RETURN_EXPECTED = 3
+
+# The shim's `fdef.type` isinstance classification; must match
+# `TYPE_TAG_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_MISSING_ANN_TYPE_NONE = 0
+NATIVE_MISSING_ANN_TYPE_CALLABLE = 1
+NATIVE_MISSING_ANN_TYPE_OTHER = 2
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -2742,6 +2757,62 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         return method_name in operators.reverse_op_method_set
 
     def check_for_missing_annotations(self, fdef: FuncItem) -> None:
+        # Native type_kernel seam: the annotation-completeness arbitration
+        # (checker_functions.rs) runs in Rust; the fail/note emission stays
+        # here. None falls through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _native_checker_resolver is not None
+            and _rust_classify_missing_annotations is not None
+        ):
+            try:
+                if fdef.type is None:
+                    type_tag = NATIVE_MISSING_ANN_TYPE_NONE
+                    ret_bytes = None
+                    arg_blobs: list[bytes] = []
+                elif isinstance(fdef.type, CallableType):
+                    type_tag = NATIVE_MISSING_ANN_TYPE_CALLABLE
+                    ret_bytes = _serialize_type_for_checker(fdef.type.ret_type)
+                    arg_blobs = [_serialize_type_for_checker(t) for t in fdef.type.arg_types]
+                else:
+                    type_tag = NATIVE_MISSING_ANN_TYPE_OTHER
+                    ret_bytes = None
+                    arg_blobs = []
+                res = _rust_classify_missing_annotations(
+                    bool(self.is_typeshed_stub),
+                    self.options.warn_incomplete_stub,
+                    self.options.disallow_untyped_defs,
+                    self.options.disallow_incomplete_defs,
+                    type_tag,
+                    len(fdef.arguments),
+                    list(fdef.arg_names),
+                    bool(fdef.is_generator),
+                    bool(fdef.is_coroutine),
+                    ret_bytes,
+                    arg_blobs,
+                    state.strict_optional,
+                    _native_checker_resolver,
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                res = None
+            if res is not None:
+                tag, param_fail = res
+                if tag == NATIVE_MISSING_ANN_RETURN_UNTYPED:
+                    self.fail(message_registry.RETURN_TYPE_EXPECTED, fdef)
+                    if not has_return_statement(fdef) and not fdef.is_generator:
+                        self.note(
+                            'Use "-> None" if function does not return a value',
+                            fdef,
+                            code=codes.NO_UNTYPED_DEF,
+                        )
+                elif tag == NATIVE_MISSING_ANN_FUNC_TYPE_EXPECTED:
+                    self.fail(message_registry.FUNCTION_TYPE_EXPECTED, fdef)
+                elif tag == NATIVE_MISSING_ANN_RETURN_EXPECTED:
+                    self.fail(message_registry.RETURN_TYPE_EXPECTED, fdef)
+                if param_fail:
+                    self.fail(message_registry.PARAM_TYPE_EXPECTED, fdef)
+                return
         show_untyped = not self.is_typeshed_stub or self.options.warn_incomplete_stub
         if not show_untyped:
             return

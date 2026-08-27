@@ -23,6 +23,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList, PyType};
 use std::collections::HashSet;
 
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::wire::Type;
 
 /// Decision tags; values must match `NATIVE_FINAL_SUPER_*` in
@@ -2120,6 +2121,191 @@ pub(crate) fn rust_classify_rvalue_count(
     )))
 }
 
+/// Decision tags; values must match `NATIVE_MISSING_ANN_*` in
+/// mypy/checker.py.
+const KIND_MISSING_ANN_NONE: i64 = 0;
+const KIND_MISSING_ANN_RETURN_UNTYPED: i64 = 1;
+const KIND_MISSING_ANN_FUNC_TYPE_EXPECTED: i64 = 2;
+const KIND_MISSING_ANN_RETURN_EXPECTED: i64 = 3;
+
+/// The shim's `fdef.type` isinstance classification; values must match
+/// `NATIVE_MISSING_ANN_TYPE_*` in mypy/checker.py. `TYPE_TAG_OTHER` is
+/// produced by the Python shim only.
+#[allow(dead_code)]
+const TYPE_TAG_NONE: i64 = 0;
+#[allow(dead_code)]
+const TYPE_TAG_CALLABLE: i64 = 1;
+#[allow(dead_code)]
+const TYPE_TAG_OTHER: i64 = 2;
+
+/// The pure decision behind `TypeChecker.check_for_missing_annotations`
+/// (checker.py:2722-2771). Kept separate from the PyO3 entry so the branch
+/// algebra is unit-testable without a Python runtime.
+///
+/// Mirrors the Python order exactly: the `show_untyped` gate, the
+/// `has_explicit_annotation` scan (raw ret/arg types; aliases are never
+/// unannotated-any, matching `is_unannotated_any` on a non-ProperType),
+/// the `disallow_untyped_defs or check_incomplete_defs` gate, the
+/// self/cls-only special case for an untyped def, and the per-site
+/// return/param Any-ness with generator/coroutine ret unwrapping (reusing
+/// the `get_generator_return_type` / `get_coroutine_return_type` ports).
+/// Returns `(tag, param_fail)`: `tag` selects the untyped-def /
+/// return-site failure, `param_fail` is the independent
+/// PARAM_TYPE_EXPECTED site. `None` defers to the pure-Python body
+/// (alias ret type, decode failure, or an undecided generator unwrap).
+#[allow(clippy::too_many_arguments)]
+fn classify_missing_annotations(
+    is_typeshed_stub: bool,
+    warn_incomplete_stub: bool,
+    disallow_untyped_defs: bool,
+    disallow_incomplete_defs: bool,
+    type_tag: i64,
+    arguments_len: usize,
+    arg_names: &[Option<String>],
+    is_generator: bool,
+    is_coroutine: bool,
+    ret_type: Option<&Type>,
+    arg_types: &[Type],
+    strict_optional: bool,
+    res: &TypeResolver,
+) -> Option<(i64, bool)> {
+    // show_untyped = not is_typeshed_stub or warn_incomplete_stub.
+    if is_typeshed_stub && !warn_incomplete_stub {
+        return Some((KIND_MISSING_ANN_NONE, false));
+    }
+    let mut has_explicit_annotation = false;
+    if type_tag == TYPE_TAG_CALLABLE {
+        for t in arg_types {
+            if !crate::visitor::is_unannotated_any_inner(t) {
+                has_explicit_annotation = true;
+                break;
+            }
+        }
+        if !has_explicit_annotation {
+            if let Some(ret) = ret_type {
+                if !crate::visitor::is_unannotated_any_inner(ret) {
+                    has_explicit_annotation = true;
+                }
+            }
+        }
+    }
+    let check_incomplete_defs = disallow_incomplete_defs && has_explicit_annotation;
+    if !(disallow_untyped_defs || check_incomplete_defs) {
+        return Some((KIND_MISSING_ANN_NONE, false));
+    }
+    if type_tag == TYPE_TAG_NONE && disallow_untyped_defs {
+        let self_cls_only = arguments_len == 0
+            || (arguments_len == 1
+                && matches!(arg_names.first(), Some(Some(name)) if name == "self" || name == "cls"));
+        return Some((
+            if self_cls_only {
+                KIND_MISSING_ANN_RETURN_UNTYPED
+            } else {
+                KIND_MISSING_ANN_FUNC_TYPE_EXPECTED
+            },
+            false,
+        ));
+    }
+    if type_tag == TYPE_TAG_CALLABLE {
+        let ret = ret_type?;
+        // get_proper_type(fdef.type.ret_type): an alias expands on the
+        // Python side (the wire carries no alias target), so defer.
+        if matches!(ret, Type::TypeAliasType { .. }) {
+            return None;
+        }
+        let ret_fail = if crate::visitor::is_unannotated_any_inner(ret) {
+            true
+        } else if is_generator {
+            let g = crate::generators::get_generator_return_type_inner(
+                ret,
+                is_coroutine,
+                strict_optional,
+                res,
+            )?;
+            crate::visitor::is_unannotated_any_inner(&g)
+        } else if is_coroutine && matches!(ret, Type::Instance { .. }) {
+            let c = crate::generators::get_coroutine_return_type_inner(ret)?;
+            crate::visitor::is_unannotated_any_inner(&c)
+        } else {
+            false
+        };
+        let param_fail = arg_types
+            .iter()
+            .any(crate::visitor::is_unannotated_any_inner);
+        return Some((
+            if ret_fail {
+                KIND_MISSING_ANN_RETURN_EXPECTED
+            } else {
+                KIND_MISSING_ANN_NONE
+            },
+            param_fail,
+        ));
+    }
+    Some((KIND_MISSING_ANN_NONE, false))
+}
+
+/// `TypeChecker.check_for_missing_annotations` (checker.py:2722-2771): the
+/// annotation-completeness decision head, ported. Rust reads the option
+/// bools, the shim's `fdef.type` isinstance tag, `len(fdef.arguments)` /
+/// `arg_names` (for the self/cls-only special case), the generator /
+/// coroutine flags, and the raw ret/arg types as wire bytes
+/// (`is_unannotated_any` is already native; generator/coroutine ret
+/// unwrapping reuses the existing ports). Returns `(tag, param_fail)`;
+/// the Python shim applies the fail/note side effects (the RETURN_UNTYPED
+/// note decision routes through the existing `rust_has_return_statement`
+/// seam) and keeps the pure-Python body as the fallback. Defers (`None`)
+/// on an undecodable blob, a `TypeAliasType` ret type, or an undecided
+/// generator unwrap.
+#[pyfunction]
+#[pyo3(signature = (is_typeshed_stub, warn_incomplete_stub, disallow_untyped_defs, disallow_incomplete_defs, type_tag, arguments_len, arg_names, is_generator, is_coroutine, ret_type_bytes, arg_type_blobs, strict_optional, resolver))]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_missing_annotations(
+    is_typeshed_stub: bool,
+    warn_incomplete_stub: bool,
+    disallow_untyped_defs: bool,
+    disallow_incomplete_defs: bool,
+    type_tag: i64,
+    arguments_len: usize,
+    arg_names: Vec<Option<String>>,
+    is_generator: bool,
+    is_coroutine: bool,
+    ret_type_bytes: Option<&[u8]>,
+    arg_type_blobs: Vec<Vec<u8>>,
+    strict_optional: bool,
+    resolver: &mut NativeTypeResolver,
+) -> PyResult<Option<(i64, bool)>> {
+    let ret_type = match ret_type_bytes {
+        None => None,
+        Some(bytes) => match crate::checkmember::decode_type(bytes) {
+            Some(t) => Some(t),
+            None => return Ok(None),
+        },
+    };
+    let mut arg_types = Vec::with_capacity(arg_type_blobs.len());
+    for blob in &arg_type_blobs {
+        match crate::checkmember::decode_type(blob) {
+            Some(t) => arg_types.push(t),
+            None => return Ok(None),
+        }
+    }
+    Ok(classify_missing_annotations(
+        is_typeshed_stub,
+        warn_incomplete_stub,
+        disallow_untyped_defs,
+        disallow_incomplete_defs,
+        type_tag,
+        arguments_len,
+        &arg_names,
+        is_generator,
+        is_coroutine,
+        ret_type.as_ref(),
+        &arg_types,
+        strict_optional,
+        resolver.resolver(),
+    ))
+}
+
 #[cfg(test)]
 mod rvalue_count_tests {
     use super::classify_rvalue_count;
@@ -2205,6 +2391,575 @@ mod rvalue_count_tests {
         assert_eq!(
             classify_rvalue_count(false, 0, 3, 3, None),
             RVALUE_COUNT_PASS
+        );
+    }
+}
+
+#[cfg(test)]
+mod missing_annotations_tests {
+    use super::classify_missing_annotations;
+    use super::{
+        KIND_MISSING_ANN_FUNC_TYPE_EXPECTED, KIND_MISSING_ANN_NONE,
+        KIND_MISSING_ANN_RETURN_EXPECTED, KIND_MISSING_ANN_RETURN_UNTYPED, TYPE_TAG_CALLABLE,
+        TYPE_TAG_NONE, TYPE_TAG_OTHER,
+    };
+    use crate::subtypes::COVARIANT;
+    use crate::typeinfo::{TypeInfoSnapshot, TypeResolver};
+    use crate::wire::Type;
+
+    fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {
+        let mut r = TypeResolver::new();
+        for s in snaps {
+            r.insert(s.fullname.clone(), s);
+        }
+        r
+    }
+
+    /// A snapshot with its own fullname in mro/has_base and `n` covariant
+    /// type vars `(Ti, COVARIANT, kind=0)`, so an exactly-matching Instance
+    /// with `n` args can be judged by the nominal path.
+    fn generic_snap(fullname: &str, name: &str, n_tvars: usize) -> TypeInfoSnapshot {
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: name.to_string(),
+            ..Default::default()
+        };
+        s.mro.push(fullname.to_string());
+        s.has_base.insert(fullname.to_string());
+        s.type_vars_with_variance = (0..n_tvars)
+            .map(|i| (format!("T{i}"), COVARIANT, 0))
+            .collect();
+        s
+    }
+
+    fn generator_snap() -> TypeInfoSnapshot {
+        generic_snap("typing.Generator", "Generator", 3)
+    }
+
+    fn instance(ref_name: &str, args: Vec<Type>) -> Type {
+        Type::Instance {
+            type_ref: ref_name.to_string(),
+            args,
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn unannotated_any() -> Type {
+        Type::AnyType {
+            type_of_any: 1, // TypeOfAny.unannotated
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn explicit_any() -> Type {
+        Type::AnyType {
+            type_of_any: 2, // TypeOfAny.explicit
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decide(
+        is_typeshed_stub: bool,
+        warn_incomplete_stub: bool,
+        disallow_untyped_defs: bool,
+        disallow_incomplete_defs: bool,
+        type_tag: i64,
+        arguments_len: usize,
+        arg_names: Vec<Option<String>>,
+        is_generator: bool,
+        is_coroutine: bool,
+        ret: Option<Type>,
+        args: Vec<Type>,
+    ) -> Option<(i64, bool)> {
+        let res = make_resolver(vec![generator_snap(), instance_snap()]);
+        classify_missing_annotations(
+            is_typeshed_stub,
+            warn_incomplete_stub,
+            disallow_untyped_defs,
+            disallow_incomplete_defs,
+            type_tag,
+            arguments_len,
+            &arg_names,
+            is_generator,
+            is_coroutine,
+            ret.as_ref(),
+            &args,
+            true,
+            &res,
+        )
+    }
+
+    fn instance_snap() -> TypeInfoSnapshot {
+        generic_snap("builtins.int", "int", 0)
+    }
+
+    fn int_() -> Type {
+        instance("builtins.int", vec![])
+    }
+
+    #[test]
+    fn test_typeshed_stub_no_warn_noop() {
+        // show_untyped is False: is_typeshed_stub and not warn_incomplete_stub.
+        assert_eq!(
+            decide(
+                true,
+                false,
+                true,
+                true,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+        assert_eq!(
+            decide(
+                true,
+                false,
+                true,
+                true,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(unannotated_any()),
+                vec![unannotated_any()]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_typeshed_stub_with_warn_proceeds() {
+        // warn_incomplete_stub flips show_untyped back on.
+        assert_eq!(
+            decide(
+                true,
+                true,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_UNTYPED, false))
+        );
+    }
+
+    #[test]
+    fn test_no_gates_noop() {
+        // Neither disallow flag: the gate is off even with unannotated args.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                false,
+                false,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(explicit_any()),
+                vec![unannotated_any()]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+        // Untyped def with only disallow_incomplete_defs: has_explicit is
+        // False (non-callable fdef.type), so check_incomplete_defs is off.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                false,
+                true,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_untyped_def_self_cls_only() {
+        // No arguments at all.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                0,
+                vec![],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_UNTYPED, false))
+        );
+        // Single self / cls argument.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                1,
+                vec![Some("self".into())],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_UNTYPED, false))
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                1,
+                vec![Some("cls".into())],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_UNTYPED, false))
+        );
+    }
+
+    #[test]
+    fn test_untyped_def_other_args() {
+        // A single non-self/cls arg, or two args: FUNCTION_TYPE_EXPECTED.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_FUNC_TYPE_EXPECTED, false))
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                2,
+                vec![Some("self".into()), Some("x".into())],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_FUNC_TYPE_EXPECTED, false))
+        );
+        // A positional-only first arg (None name) is not self/cls.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_NONE,
+                1,
+                vec![None],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_FUNC_TYPE_EXPECTED, false))
+        );
+    }
+
+    #[test]
+    fn test_non_callable_other_tag_noop() {
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_OTHER,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                None,
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_callable_fully_annotated_noop() {
+        // Fully annotated: no fail on either site, both under
+        // disallow_untyped_defs and under check_incomplete_defs.
+        let fully = (
+            TYPE_TAG_CALLABLE,
+            vec![Some("x".into())],
+            Some(int_()),
+            vec![int_()],
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                fully.0,
+                1,
+                fully.1.clone(),
+                false,
+                false,
+                fully.2,
+                fully.3
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+        // check_incomplete_defs alone turns the gate on (ret is explicit),
+        // but an annotated body emits nothing.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                false,
+                true,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(int_()),
+                vec![int_()]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_callable_unannotated_return() {
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(unannotated_any()),
+                vec![int_()]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_EXPECTED, false))
+        );
+    }
+
+    #[test]
+    fn test_callable_unannotated_param() {
+        // Annotated ret, unannotated param: only the param site fires.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(int_()),
+                vec![unannotated_any()]
+            ),
+            Some((KIND_MISSING_ANN_NONE, true))
+        );
+        // Both sites fire together.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                1,
+                vec![Some("x".into())],
+                false,
+                false,
+                Some(unannotated_any()),
+                vec![unannotated_any()]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_EXPECTED, true))
+        );
+    }
+
+    #[test]
+    fn test_generator_unannotated_tr() {
+        // Generator[int, Any, Any(unannotated)]: the unwrapped return type
+        // is unannotated Any, so the return site fires.
+        let gen = instance(
+            "typing.Generator",
+            vec![int_(), explicit_any(), unannotated_any()],
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                true,
+                false,
+                Some(gen),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_EXPECTED, false))
+        );
+        // Generator[int, Any, str]: tr is annotated, no fail.
+        let gen = instance("typing.Generator", vec![int_(), explicit_any(), int_()]);
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                true,
+                false,
+                Some(gen),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_coroutine_unannotated_tr() {
+        // Coroutine[Any, Any, Any(unannotated)]: fires.
+        let coro = instance(
+            "typing.Coroutine",
+            vec![explicit_any(), explicit_any(), unannotated_any()],
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                false,
+                true,
+                Some(coro),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_EXPECTED, false))
+        );
+        // Coroutine[Any, Any, str]: no fail.
+        let coro = instance(
+            "typing.Coroutine",
+            vec![explicit_any(), explicit_any(), int_()],
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                false,
+                true,
+                Some(coro),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+        // Coroutine ret on a non-coroutine function: neither generator nor
+        // coroutine arm runs; an unannotated-any ret fires directly.
+        let coro = instance(
+            "typing.Coroutine",
+            vec![explicit_any(), explicit_any(), int_()],
+        );
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                false,
+                false,
+                Some(coro),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_NONE, false))
+        );
+    }
+
+    #[test]
+    fn test_generator_decided_by_unannotated_ret_before_unwrap() {
+        // ret is Any(unannotated) directly: fires before the generator arm.
+        assert_eq!(
+            decide(
+                false,
+                false,
+                true,
+                false,
+                TYPE_TAG_CALLABLE,
+                0,
+                vec![],
+                true,
+                false,
+                Some(unannotated_any()),
+                vec![]
+            ),
+            Some((KIND_MISSING_ANN_RETURN_EXPECTED, false))
         );
     }
 }
