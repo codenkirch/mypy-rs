@@ -433,6 +433,7 @@ try:
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_function_signature as _rust_classify_function_signature,
         rust_classify_imports as _rust_classify_imports,
+        rust_classify_lvalue_validity as _rust_classify_lvalue_validity,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -546,6 +547,7 @@ except ImportError:
     _rust_classify_with_metaclass = None  # type: ignore[assignment]
     _rust_classify_add_metaclass = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
+    _rust_classify_lvalue_validity = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
@@ -673,6 +675,13 @@ _ACTION_ADD_METACLASS = 1
 _NATIVE_FUNC_SIG_OK = 0
 _NATIVE_FUNC_SIG_TOO_FEW = 1
 _NATIVE_FUNC_SIG_TOO_MANY = 2
+
+# check_lvalue_validity dispatch tags (see semanal_bases.rs). PASS: node
+# is neither TypeVarExpr nor TypeInfo; TYPEVAR: fail "Invalid assignment
+# target"; TYPEINFO: fail CANNOT_ASSIGN_TO_TYPE.
+_LVALUE_KIND_PASS = 0
+_LVALUE_KIND_TYPEVAR = 1
+_LVALUE_KIND_TYPEINFO = 2
 
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
@@ -5496,6 +5505,23 @@ class SemanticAnalyzer(
         return isinstance(node, Var) and node.is_self
 
     def check_lvalue_validity(self, node: Expression | SymbolNode | None, ctx: Context) -> None:
+        # Native type_kernel seam: classify the pure dispatch in Rust
+        # (semanal_bases.rs); the self.fail side effects stay here.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_lvalue_validity is not None
+        ):
+            try:
+                tag = _rust_classify_lvalue_validity(node)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == _LVALUE_KIND_TYPEVAR:
+                    self.fail("Invalid assignment target", ctx)
+                elif tag == _LVALUE_KIND_TYPEINFO:
+                    self.fail(message_registry.CANNOT_ASSIGN_TO_TYPE, ctx)
+                return
         if isinstance(node, TypeVarExpr):
             self.fail("Invalid assignment target", ctx)
         elif isinstance(node, TypeInfo):
