@@ -1191,6 +1191,254 @@ mod final_enum_value_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// check_lvalue dispatch port (issue #955)
+// ---------------------------------------------------------------------------
+
+/// Decision tags; values must match `NATIVE_LVALUE_*` in mypy/checker.py.
+const KIND_LVALUE_NAME_DEF: i64 = 0;
+const KIND_LVALUE_MEMBER_DEF: i64 = 1;
+const KIND_LVALUE_INDEX: i64 = 2;
+const KIND_LVALUE_MEMBER: i64 = 3;
+const KIND_LVALUE_NAME: i64 = 4;
+const KIND_LVALUE_TUPLE_LIST: i64 = 5;
+const KIND_LVALUE_STAR: i64 = 6;
+const KIND_LVALUE_ELSE: i64 = 7;
+
+/// The pure decision over resolved facts. Kept separate from the PyO3
+/// entry so the branch algebra is unit-testable without a Python runtime.
+///
+/// `is_definition` is `self.is_definition(lvalue)` (passed from Python);
+/// `is_name` / `is_member` / `is_index` / `is_tuple` / `is_list` / `is_star`
+/// are the lvalue node-kind tags; `node_is_var` is `isinstance(lvalue.node,
+/// Var)` (meaningful only when `is_name`); `skip_definition` mirrors the
+/// Python conjunction. Branch order matches the Python `if/elif` chain.
+#[allow(clippy::too_many_arguments)]
+fn classify_check_lvalue(
+    is_definition: bool,
+    is_name: bool,
+    is_member: bool,
+    is_index: bool,
+    is_tuple: bool,
+    is_list: bool,
+    is_star: bool,
+    node_is_var: bool,
+    skip_definition: bool,
+) -> i64 {
+    if is_definition && (!is_name || node_is_var) && !skip_definition {
+        if is_name {
+            KIND_LVALUE_NAME_DEF
+        } else {
+            KIND_LVALUE_MEMBER_DEF
+        }
+    } else if is_index {
+        KIND_LVALUE_INDEX
+    } else if is_member {
+        KIND_LVALUE_MEMBER
+    } else if is_name {
+        KIND_LVALUE_NAME
+    } else if is_tuple || is_list {
+        KIND_LVALUE_TUPLE_LIST
+    } else if is_star {
+        KIND_LVALUE_STAR
+    } else {
+        KIND_LVALUE_ELSE
+    }
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_lvalue`
+/// (mypy/checker.py:5568-5632). Reads the live `lvalue` node-kind tags and
+/// the `Var` node facts needed for `skip_definition` via PyO3;
+/// `is_definition` (`self.is_definition(lvalue)`) and `allow_redefinition`
+/// (`self.options.allow_redefinition`) arrive as plain bools. Returns
+/// `Some(tag)` for every reachable branch, or `None` to defer (an unreadable
+/// node fact, mirroring the Python `try/except` shim).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_check_lvalue(
+    py: Python<'_>,
+    lvalue: &PyAny,
+    allow_redefinition: bool,
+    is_definition: bool,
+) -> PyResult<Option<i64>> {
+    let name_cls = nodes_class(py, "NameExpr")?;
+    let member_cls = nodes_class(py, "MemberExpr")?;
+    let index_cls = nodes_class(py, "IndexExpr")?;
+    let tuple_cls = nodes_class(py, "TupleExpr")?;
+    let list_cls = nodes_class(py, "ListExpr")?;
+    let star_cls = nodes_class(py, "StarExpr")?;
+    let var_cls = nodes_class(py, "Var")?;
+    let partial_type_cls = py
+        .import("mypy.types")?
+        .getattr("PartialType")?
+        .downcast::<PyType>()?;
+
+    let is_name = lvalue.is_instance(name_cls)?;
+    let is_member = lvalue.is_instance(member_cls)?;
+    let is_index = lvalue.is_instance(index_cls)?;
+    let is_tuple = lvalue.is_instance(tuple_cls)?;
+    let is_list = lvalue.is_instance(list_cls)?;
+    let is_star = lvalue.is_instance(star_cls)?;
+
+    // `node_is_var` and `skip_definition` only matter when `is_name`; for
+    // other node kinds the Python top-condition short-circuits and
+    // `skip_definition` is False.
+    let (node_is_var, skip_definition) = if is_name {
+        let node = match lvalue.getattr("node") {
+            Ok(n) => n,
+            Err(_) => return Ok(None),
+        };
+        let node_is_var = node.is_instance(var_cls)?;
+        let skip_definition = if allow_redefinition && node_is_var {
+            let is_inferred = match read_bool_attr(node, "is_inferred")? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            if !is_inferred {
+                false
+            } else {
+                let node_type = match node.getattr("type") {
+                    Ok(t) => t,
+                    Err(_) => return Ok(None),
+                };
+                if node_type.is_none() {
+                    false
+                } else {
+                    let type_is_partial = node_type.is_instance(partial_type_cls)?;
+                    if type_is_partial {
+                        false
+                    } else {
+                        match read_bool_attr(node, "is_index_var")? {
+                            Some(b) => !b,
+                            None => return Ok(None),
+                        }
+                    }
+                }
+            }
+        } else {
+            false
+        };
+        (node_is_var, skip_definition)
+    } else {
+        (false, false)
+    };
+
+    Ok(Some(classify_check_lvalue(
+        is_definition,
+        is_name,
+        is_member,
+        is_index,
+        is_tuple,
+        is_list,
+        is_star,
+        node_is_var,
+        skip_definition,
+    )))
+}
+
+#[cfg(test)]
+mod check_lvalue_tests {
+    use super::*;
+
+    fn classify(args: [bool; 9]) -> i64 {
+        classify_check_lvalue(
+            args[0], args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8],
+        )
+    }
+
+    #[test]
+    fn test_name_def() {
+        // is_definition, NameExpr, node is Var, not skip -> NAME_DEF.
+        assert_eq!(
+            classify([true, true, false, false, false, false, false, true, false]),
+            KIND_LVALUE_NAME_DEF
+        );
+    }
+
+    #[test]
+    fn test_member_def() {
+        // is_definition, not NameExpr (MemberExpr) -> MEMBER_DEF.
+        assert_eq!(
+            classify([true, false, true, false, false, false, false, false, false]),
+            KIND_LVALUE_MEMBER_DEF
+        );
+    }
+
+    #[test]
+    fn test_name_def_skipped_falls_to_name() {
+        // is_definition True but skip True -> falls to the NameExpr branch.
+        assert_eq!(
+            classify([true, true, false, false, false, false, false, true, true]),
+            KIND_LVALUE_NAME
+        );
+    }
+
+    #[test]
+    fn test_name_def_node_not_var_falls_to_name() {
+        // is_definition True, NameExpr, node not Var -> NAME branch.
+        assert_eq!(
+            classify([true, true, false, false, false, false, false, false, false]),
+            KIND_LVALUE_NAME
+        );
+    }
+
+    #[test]
+    fn test_index() {
+        assert_eq!(
+            classify([false, false, false, true, false, false, false, false, false]),
+            KIND_LVALUE_INDEX
+        );
+    }
+
+    #[test]
+    fn test_member() {
+        assert_eq!(
+            classify([false, false, true, false, false, false, false, false, false]),
+            KIND_LVALUE_MEMBER
+        );
+    }
+
+    #[test]
+    fn test_name() {
+        assert_eq!(
+            classify([false, true, false, false, false, false, false, false, false]),
+            KIND_LVALUE_NAME
+        );
+    }
+
+    #[test]
+    fn test_tuple() {
+        assert_eq!(
+            classify([false, false, false, false, true, false, false, false, false]),
+            KIND_LVALUE_TUPLE_LIST
+        );
+    }
+
+    #[test]
+    fn test_list() {
+        assert_eq!(
+            classify([false, false, false, false, false, true, false, false, false]),
+            KIND_LVALUE_TUPLE_LIST
+        );
+    }
+
+    #[test]
+    fn test_star() {
+        assert_eq!(
+            classify([false, false, false, false, false, false, true, false, false]),
+            KIND_LVALUE_STAR
+        );
+    }
+
+    #[test]
+    fn test_else() {
+        assert_eq!(
+            classify([false, false, false, false, false, false, false, false, false]),
+            KIND_LVALUE_ELSE
+        );
+    }
+}
+
 #[cfg(test)]
 mod check_untyped_decorator_tests {
     use super::*;

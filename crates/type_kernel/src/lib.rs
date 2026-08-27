@@ -2905,6 +2905,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #955: check_lvalue dispatch port. Rust classifies the lvalue
+    // node kind into a branch tag; the per-branch bodies stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_check_lvalue,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,
