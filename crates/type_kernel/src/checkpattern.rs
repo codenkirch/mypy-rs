@@ -25,6 +25,9 @@
 //! * `rust_construct_sequence_child` — mirrors
 //!   `PatternChecker.construct_sequence_child`, producing the inner sequence
 //!   type used to recurse into a sequence pattern's items.
+//! * `rust_classify_class_pattern_ranges` — mirrors the dispatch of
+//!   `PatternChecker.get_class_pattern_type_ranges` (issue #987): one branch
+//!   tag per leaf item, union recursion on the wire.
 //!
 //! Each function takes wire-format bytes (serialized `Type` objects) and a
 //! `NativeTypeResolver` for subtyping checks. Returns `None` to defer to
@@ -33,6 +36,7 @@
 //! module implements (the strangler-fig per-call gate).
 
 use pyo3::prelude::*;
+use pyo3::types::PyType;
 
 use crate::setops::make_simplified_union;
 use crate::subtypes::{is_subtype, SubtypeContext};
@@ -43,6 +47,15 @@ use crate::wire::{self, LiteralValue, ReadBuffer, Type};
 fn decode_type(bytes: &[u8]) -> Option<Type> {
     let mut buf = ReadBuffer::new(bytes);
     wire::read_type(&mut buf, None).ok()
+}
+
+/// Fetch a class from `mypy.nodes`. Mirrors the private helper in
+/// `semanal_bases.rs` / `checker_functions.rs`.
+fn nodes_class<'py>(py: Python<'py>, name: &str) -> PyResult<&'py PyType> {
+    py.import("mypy.nodes")?
+        .getattr(name)?
+        .downcast::<PyType>()
+        .map_err(Into::into)
 }
 
 /// Encode a `Type` via `write_type`. Returns `None` if the variant is not
@@ -706,6 +719,161 @@ fn construct_sequence_child_inner(
     encode_type(&final_t)
 }
 
+// ---------------------------------------------------------------------------
+// rust_classify_class_pattern_ranges (issue #987)
+// ---------------------------------------------------------------------------
+
+/// Branch tags returned to the Python shim for
+/// `PatternChecker.get_class_pattern_type_ranges` (checkpattern.py:794-832):
+/// - `FAIL`: no arm matched; Python reports CLASS_PATTERN_TYPE_REQUIRED.
+/// - `TYPE_OBJ`: FunctionLike type object; Python builds
+///   `TypeRange(fill_typevars_with_any(p_typ.type_object()), False)`.
+/// - `CALLABLE_VAR`: class_ref is a `typing.Callable` Var; Python builds a
+///   `Callable[..., Any]` range via `callable_with_ellipsis`.
+/// - `TYPE_TYPE`: `TypeRange(p_typ.item, True)`.
+/// - `ANY`: `TypeRange(p_typ, False)`.
+pub(crate) const CPR_FAIL: i64 = 0;
+pub(crate) const CPR_TYPE_OBJ: i64 = 1;
+pub(crate) const CPR_CALLABLE_VAR: i64 = 2;
+pub(crate) const CPR_TYPE_TYPE: i64 = 3;
+pub(crate) const CPR_ANY: i64 = 4;
+
+/// `PatternChecker.get_class_pattern_type_ranges(typ, o)` — classify each
+/// leaf item into a branch tag; union recursion happens here on the wire.
+///
+/// Python checks, per recursive call: UnionType (recurse per item),
+/// FunctionLike + is_type_obj, then the scalar class-ref condition
+/// (`isinstance(o.class_ref.node, Var)` + `node.type is not None` +
+/// `node.fullname == "typing.Callable"`), then TypeType, AnyType, and the
+/// fail tail. Rust mirrors the same order and returns one tag per leaf in
+/// union pre-order; the Python shim zips them with the identically
+/// flattened live items, builds the TypeRanges, and applies `self.msg.fail`
+/// for FAIL tags. Returns `None` (defer) on any wire decode failure, a
+/// `TypeAliasType` anywhere (get_proper_type would expand it from live
+/// TypeInfo), or a type-object callable whose fallback is not provably
+/// `builtins.type` (is_metaclass needs the live fallback TypeInfo).
+#[pyfunction]
+pub(crate) fn rust_classify_class_pattern_ranges(
+    py: Python<'_>,
+    typ_bytes: &[u8],
+    class_ref_node: Option<&PyAny>,
+) -> PyResult<Option<Vec<i64>>> {
+    let typ = match decode_type(typ_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let (is_var, node_typed, is_callable_ref) = match class_ref_facts(py, class_ref_node)? {
+        Some(facts) => facts,
+        None => return Ok(None),
+    };
+    let callable_var = is_var && node_typed && is_callable_ref;
+    let mut tags = Vec::new();
+    if classify_class_pattern_inner(&typ, callable_var, &mut tags).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(tags))
+}
+
+/// Scalar facts of `o.class_ref.node` read via PyO3: is a `Var`, has a
+/// non-None `type`, and has fullname `typing.Callable`. A missing/None node
+/// is a plain non-Var; an unreadable attribute defers (`None`).
+fn class_ref_facts(py: Python<'_>, node: Option<&PyAny>) -> PyResult<Option<(bool, bool, bool)>> {
+    let node = match node {
+        Some(n) if !n.is_none() => n,
+        _ => return Ok(Some((false, false, false))),
+    };
+    let var_cls = match nodes_class(py, "Var") {
+        Ok(cls) => cls,
+        Err(_) => return Ok(None),
+    };
+    let is_var = match node.is_instance(var_cls) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if !is_var {
+        return Ok(Some((false, false, false)));
+    }
+    let node_typed = match node.getattr("type") {
+        Ok(t) => !t.is_none(),
+        Err(_) => return Ok(None),
+    };
+    let fullname = match node.getattr("fullname") {
+        Ok(f) => f,
+        Err(_) => return Ok(None),
+    };
+    let is_callable_ref = match fullname.extract::<String>() {
+        Ok(f) => f == "typing.Callable",
+        Err(_) => return Ok(None),
+    };
+    Ok(Some((true, node_typed, is_callable_ref)))
+}
+
+/// Union pre-order walk mirroring the Python recursion; every leaf pushes
+/// exactly one tag, or the whole call defers.
+fn classify_class_pattern_inner(typ: &Type, callable_var: bool, tags: &mut Vec<i64>) -> Option<()> {
+    // Python runs get_proper_type at each recursion level; a wire alias
+    // cannot be expanded, so defer.
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    if let Type::UnionType { items, .. } = typ {
+        for item in items {
+            classify_class_pattern_inner(item, callable_var, tags)?;
+        }
+        return Some(());
+    }
+    tags.push(classify_class_pattern_leaf(typ, callable_var)?);
+    Some(())
+}
+
+fn classify_class_pattern_leaf(typ: &Type, callable_var: bool) -> Option<i64> {
+    // Python: isinstance(p_typ, FunctionLike) and p_typ.is_type_obj().
+    match typ {
+        Type::CallableType {
+            fallback, ret_type, ..
+        } => match callable_is_type_obj(fallback, ret_type)? {
+            true => Some(CPR_TYPE_OBJ),
+            false if callable_var => Some(CPR_CALLABLE_VAR),
+            false => Some(CPR_FAIL),
+        },
+        Type::Overloaded { items } => {
+            // Overloaded.is_type_obj() queries only the first item.
+            match items.first()? {
+                Type::CallableType {
+                    fallback, ret_type, ..
+                } => match callable_is_type_obj(fallback, ret_type)? {
+                    true => Some(CPR_TYPE_OBJ),
+                    false if callable_var => Some(CPR_CALLABLE_VAR),
+                    false => Some(CPR_FAIL),
+                },
+                _ => None,
+            }
+        }
+        _ if callable_var => Some(CPR_CALLABLE_VAR),
+        Type::TypeType { .. } => Some(CPR_TYPE_TYPE),
+        Type::AnyType { .. } => Some(CPR_ANY),
+        _ => Some(CPR_FAIL),
+    }
+}
+
+/// `CallableType.is_type_obj()`: `fallback.type.is_metaclass()` and the
+/// return type is not Uninhabited. From the wire only a `builtins.type`
+/// fallback is provably a metaclass; any other fallback (a custom
+/// metaclass Instance, an alias) defers. An alias ret_type also defers:
+/// Python would expand it before the Uninhabited check.
+fn callable_is_type_obj(fallback: &Type, ret_type: &Type) -> Option<bool> {
+    if matches!(ret_type, Type::UninhabitedType { .. }) {
+        return Some(false);
+    }
+    if matches!(ret_type, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    match fallback {
+        Type::Instance { type_ref, .. } if type_ref == "builtins.type" => Some(true),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,5 +1420,145 @@ mod tests {
         ];
         let got: Vec<Type> = res.iter().map(|b| decode_one(b)).collect();
         assert_eq!(got, expected);
+    }
+    // ----- rust_classify_class_pattern_ranges pure decision tests -----
+
+    fn cpr_callable(fallback: &str, ret: Type) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance(fallback, vec![])),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: vec![],
+            arg_kinds: vec![],
+            arg_names: vec![],
+            ret_type: Box::new(ret),
+            name: None,
+            variables: vec![],
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn cpr_overloaded(first: Type) -> Type {
+        Type::Overloaded { items: vec![first] }
+    }
+
+    fn cpr_union(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    #[test]
+    fn test_cpr_leaf_type_obj() {
+        let t = cpr_callable("builtins.type", instance("builtins.int", vec![]));
+        assert_eq!(classify_class_pattern_leaf(&t, false), Some(CPR_TYPE_OBJ));
+    }
+
+    #[test]
+    fn test_cpr_leaf_type_obj_uninhabited_ret_is_not_type_obj() {
+        let t = cpr_callable("builtins.type", Type::UninhabitedType { ambiguous: false });
+        assert_eq!(classify_class_pattern_leaf(&t, false), Some(CPR_FAIL));
+    }
+
+    #[test]
+    fn test_cpr_leaf_callable_var_arm() {
+        // is_type_obj is False when the ret type is Uninhabited, so the
+        // scalar class-ref arm decides: CALLABLE_VAR or FAIL.
+        let t = cpr_callable(
+            "builtins.function",
+            Type::UninhabitedType { ambiguous: false },
+        );
+        assert_eq!(
+            classify_class_pattern_leaf(&t, true),
+            Some(CPR_CALLABLE_VAR)
+        );
+        assert_eq!(classify_class_pattern_leaf(&t, false), Some(CPR_FAIL));
+    }
+
+    #[test]
+    fn test_cpr_leaf_function_fallback_defers() {
+        // fallback.type.is_metaclass() needs the live TypeInfo, so a
+        // function-fallback callable cannot be decided on the wire.
+        let t = cpr_callable("builtins.function", instance("builtins.int", vec![]));
+        assert_eq!(classify_class_pattern_leaf(&t, true), None);
+        assert_eq!(classify_class_pattern_leaf(&t, false), None);
+    }
+
+    #[test]
+    fn test_cpr_leaf_custom_metaclass_fallback_defers() {
+        // fallback.type.is_metaclass() needs the live TypeInfo: defer.
+        let t = cpr_callable("mymeta.Meta", instance("builtins.int", vec![]));
+        assert_eq!(classify_class_pattern_leaf(&t, false), None);
+    }
+
+    #[test]
+    fn test_cpr_leaf_overloaded_first_item_decides() {
+        let t = Type::Overloaded {
+            items: vec![
+                cpr_callable("builtins.type", instance("builtins.int", vec![])),
+                cpr_callable("builtins.function", instance("builtins.int", vec![])),
+            ],
+        };
+        assert_eq!(classify_class_pattern_leaf(&t, false), Some(CPR_TYPE_OBJ));
+    }
+
+    #[test]
+    fn test_cpr_leaf_scalar_arms() {
+        assert_eq!(
+            classify_class_pattern_leaf(&instance("builtins.int", vec![]), false),
+            Some(CPR_FAIL)
+        );
+        assert_eq!(
+            classify_class_pattern_leaf(&instance("builtins.int", vec![]), true),
+            Some(CPR_CALLABLE_VAR)
+        );
+        let tt = Type::TypeType {
+            item: Box::new(instance("builtins.int", vec![])),
+            is_type_form: false,
+        };
+        assert_eq!(classify_class_pattern_leaf(&tt, false), Some(CPR_TYPE_TYPE));
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(classify_class_pattern_leaf(&any, false), Some(CPR_ANY));
+    }
+
+    #[test]
+    fn test_cpr_inner_union_preorder_and_alias_defer() {
+        let any = Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let tt = Type::TypeType {
+            item: Box::new(instance("builtins.int", vec![])),
+            is_type_form: false,
+        };
+        let union = cpr_union(vec![any.clone(), cpr_union(vec![tt, any.clone()])]);
+        let mut tags = Vec::new();
+        assert!(classify_class_pattern_inner(&union, false, &mut tags).is_some());
+        assert_eq!(tags, vec![CPR_ANY, CPR_TYPE_TYPE, CPR_ANY]);
+        // A nested alias defers the whole call.
+        let union_alias = cpr_union(vec![any.clone(), type_alias("mod.A")]);
+        let mut tags2 = Vec::new();
+        assert!(classify_class_pattern_inner(&union_alias, false, &mut tags2).is_none());
+    }
+
+    #[test]
+    fn test_cpr_alias_ret_type_defers() {
+        let t = cpr_callable("builtins.type", type_alias("mod.A"));
+        assert_eq!(classify_class_pattern_leaf(&t, false), None);
     }
 }
