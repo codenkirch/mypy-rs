@@ -198,6 +198,7 @@ __all__ = [
     "rust_check_overlapping_overloads",
     "rust_classify_except_handler_tests",
     "rust_classify_final_super",
+    "rust_classify_classvar_super",
     "rust_classify_new_signature",
     "rust_classify_func_def_override",
     "rust_classify_enum_new",
@@ -780,6 +781,10 @@ def rust_classify_final_super(
     base_fullname: str,
     enum_bases: list[str],
     enum_special_props: list[str],
+) -> int | None: ...
+def rust_classify_classvar_super(
+    base_node: Any,
+    node_is_classvar: bool,
 ) -> int | None: ...
 def rust_classify_new_signature(
     is_metaclass: bool, is_instance_ret: bool

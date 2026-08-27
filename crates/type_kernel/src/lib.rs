@@ -2803,6 +2803,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check_compatibility_classvar_super 2x2 predicate port.
+    // Rust classifies the classvar override into a branch tag; the message
+    // emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_classvar_super,
+        module
+    )?)?;
+
     // checker_functions: check___new___signature 3-way return-type port.
     // Rust classifies metaclass / non-instance / instance from two scalar
     // facts; the check_subtype calls and message emission stay in Python.

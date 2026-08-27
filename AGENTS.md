@@ -381,6 +381,22 @@ including:
   `_native_checker_active` and covered by `NativeFinalSuperSuite` in
   `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs gate-on
   differential).
+- `rust_classify_classvar_super` (mypy.checker, issue #938): the Rust
+  classifier in `checker_functions.rs` ports the pure 2x2 predicate of
+  `TypeChecker.check_compatibility_classvar_super` (checker.py:4796-4807):
+  the `not isinstance(base_node, Var)` pass, then the
+  `node.is_classvar and not base_node.is_classvar` instance-var violation,
+  then the `not node.is_classvar and base_node.is_classvar` class-var
+  violation, then the trailing pass. Rust reads `isinstance(base_node,
+  Var)` and `base_node.is_classvar` via PyO3 and returns a branch tag;
+  the Python shim applies the `CANNOT_OVERRIDE_INSTANCE_VAR` /
+  `CANNOT_OVERRIDE_CLASS_VAR` `self.fail` side effects and keeps the
+  pure-Python body as the fallback. Defers (`None`) only on an
+  unreadable `base_node.is_classvar`. Gated by `_native_checker_active`
+  and covered by `NativeCompatibilityClassvarSuperSuite` in
+  `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs gate-on
+  differential), plus 5 pure decision unit tests in
+  `checker_functions.rs`.
 - `rust_classify_new_signature` (mypy.checker, issue #920) — ports the
   3-way `__new__` return-type decision head of
   `TypeChecker.check___new___signature` (checker.py:2630-2664): Rust

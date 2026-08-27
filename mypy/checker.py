@@ -333,6 +333,7 @@ try:
         rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
+        rust_classify_classvar_super as _rust_classify_classvar_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
@@ -402,6 +403,7 @@ except ImportError:
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
+    _rust_classify_classvar_super = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
@@ -463,6 +465,13 @@ NATIVE_FINAL_SUPER_CANT_OVERRIDE_FINAL = 2
 NATIVE_FINAL_SUPER_PASS_ENUM = 3
 NATIVE_FINAL_SUPER_CHECK_WRITABLE = 4
 NATIVE_FINAL_SUPER_PASS_TAIL = 5
+
+# Decision tags returned by `_rust_classify_classvar_super`; must match
+# `KIND_CLASSVAR_SUPER_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_CLASSVAR_SUPER_NOT_VAR = 0
+NATIVE_CLASSVAR_SUPER_OK = 1
+NATIVE_CLASSVAR_SUPER_INSTANCE_VAR = 2
+NATIVE_CLASSVAR_SUPER_CLASS_VAR = 3
 
 # Decision tags returned by `_rust_classify_new_signature`; must match
 # `NEW_SIGNATURE_*` in crates/type_kernel/src/checker_functions.rs.
@@ -4796,6 +4805,35 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check_compatibility_classvar_super(
         self, node: Var, base: TypeInfo, base_node: Node | None
     ) -> bool:
+        # Native type_kernel seam: classify the 2x2 classvar predicate in
+        # Rust (checker_functions.rs); message emission stays here.
+        # None falls through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_classvar_super is not None
+        ):
+            try:
+                tag = _rust_classify_classvar_super(
+                    base_node, bool(node.is_classvar)
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag in (NATIVE_CLASSVAR_SUPER_NOT_VAR, NATIVE_CLASSVAR_SUPER_OK):
+                    return True
+                if tag == NATIVE_CLASSVAR_SUPER_INSTANCE_VAR:
+                    self.fail(
+                        message_registry.CANNOT_OVERRIDE_INSTANCE_VAR.format(base.name),
+                        node,
+                    )
+                    return False
+                if tag == NATIVE_CLASSVAR_SUPER_CLASS_VAR:
+                    self.fail(
+                        message_registry.CANNOT_OVERRIDE_CLASS_VAR.format(base.name),
+                        node,
+                    )
+                    return False
         if not isinstance(base_node, Var):
             return True
         if node.is_classvar and not base_node.is_classvar:
