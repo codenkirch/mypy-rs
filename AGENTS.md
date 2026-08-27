@@ -1108,6 +1108,26 @@ including:
   `try_getting_str_literals_from_type` fallback may still answer). Gated
   differential plus direct seam and alias-deferral calls), and 6 pure
   unit tests in `checker_functions.rs`.
+- `rust_classify_check_final` (issue #1011) — mirrors the decision head of
+  `TypeChecker.check_final` (checker.py:5095-5196): after the shim computes
+  `flatten_lvalues` and `is_final_decl`, everything left is a pure sequence
+  of message decisions. Rust reads the live lvalues via PyO3 (RefExpr ->
+  Var isinstance gate), the `final_without_value` scalar facts
+  (`final_unset_in_class`, `final_set_in_init`, `is_stub`, `s.type is not
+  None`, `active_class.is_named_tuple`), and the per-lvalue arbitration:
+  the MRO walk over `cls.mro[1:]` looking up `base.names[name]` for a
+  final base Var (emit-once + break) and the own `lv.node.is_final` check
+  (both messages can fire for one lvalue). Rust returns
+  `(without_value, [(name, info_is_none), ...])`; the Python shim applies
+  the `final_without_value` / `cant_assign_to_final` emissions and keeps
+  the pure-Python body as the fallback. Defers (`None`) on any unreadable
+  fact and when the `is_final_decl` pre-check would hit a Python `assert`
+  (non-RefExpr first lvalue / non-Var node) so the original body re-runs
+  and surfaces the same error. The fast no-final path exits after one
+  lookup. Gated by `_native_checker_active` (wired from `mypy/build.py`)
+  and covered by `NativeCheckFinalSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `checker_functions.rs`.
 - `rust_classify_class_pattern_ranges` (issue #987) — mirrors the dispatch
   of `PatternChecker.get_class_pattern_type_ranges`
   (checkpattern.py:794-832): Rust decodes the wire `typ` and recurses over
@@ -1195,6 +1215,26 @@ including:
   `try_getting_str_literals_from_type` fallback may still answer). Gated
   differential plus direct seam and alias-deferral calls), and 6 pure
   unit tests in `checker_functions.rs`.
+- `rust_classify_check_final` (issue #1011) — mirrors the decision head of
+  `TypeChecker.check_final` (checker.py:5095-5196): after the shim computes
+  `flatten_lvalues` and `is_final_decl`, everything left is a pure sequence
+  of message decisions. Rust reads the live lvalues via PyO3 (RefExpr ->
+  Var isinstance gate), the `final_without_value` scalar facts
+  (`final_unset_in_class`, `final_set_in_init`, `is_stub`, `s.type is not
+  None`, `active_class.is_named_tuple`), and the per-lvalue arbitration:
+  the MRO walk over `cls.mro[1:]` looking up `base.names[name]` for a
+  final base Var (emit-once + break) and the own `lv.node.is_final` check
+  (both messages can fire for one lvalue). Rust returns
+  `(without_value, [(name, info_is_none), ...])`; the Python shim applies
+  the `final_without_value` / `cant_assign_to_final` emissions and keeps
+  the pure-Python body as the fallback. Defers (`None`) on any unreadable
+  fact and when the `is_final_decl` pre-check would hit a Python `assert`
+  (non-RefExpr first lvalue / non-Var node) so the original body re-runs
+  and surfaces the same error. The fast no-final path exits after one
+  lookup. Gated by `_native_checker_active` (wired from `mypy/build.py`)
+  and covered by `NativeCheckFinalSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `checker_functions.rs`.
 - `rust_classify_class_pattern_ranges` (issue #987) — mirrors the dispatch
   of `PatternChecker.get_class_pattern_type_ranges`
   (checkpattern.py:794-832): Rust decodes the wire `typ` and recurses over

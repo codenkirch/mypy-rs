@@ -2415,3 +2415,231 @@ mod truthy_type_tests {
         assert_eq!(dispatch_truthy_tag(false, false, false), TRUTHY_OTHER);
     }
 }
+
+// `TypeChecker.check_final` decision-head port (mypy.checker:5095).
+// ---------------------------------------------------------------------------
+
+/// The pure `final_without_value` conjunction: a final declaration at class
+/// scope without a value emits the extra message only when the initializer
+/// was unset in the class body, never set in `__init__`, we are not in a
+/// stub file, the statement is an `AssignmentStmt` with a declared type,
+/// and the active class is not a NamedTuple.
+fn final_without_value(
+    final_unset_in_class: bool,
+    final_set_in_init: bool,
+    is_stub: bool,
+    is_assignment_stmt: bool,
+    s_type_is_none: bool,
+    is_named_tuple: bool,
+) -> bool {
+    final_unset_in_class
+        && !final_set_in_init
+        && !is_stub
+        && is_assignment_stmt
+        && !s_type_is_none
+        && !is_named_tuple
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_final`
+/// (mypy/checker.py:5095-5196). Everything after the shim's
+/// `flatten_lvalues` / `is_final_decl` computation is a pure sequence of
+/// message-emission decisions, so Rust owns the whole front:
+///
+/// - the `final_without_value` gate over scalar Var/statement/class facts;
+/// - the per-lvalue arbitration: RefExpr -> Var gate, the MRO walk over
+///   `cls.mro[1:]` looking up `base.names[name]` for a final base Var
+///   (emit + break), and the own `lv.node.is_final` check.
+///
+/// `lvalues` is the flattened lvalue list, `cls` the live active class
+/// (`TypeInfo` or None), and the remaining scalars mirror the Python
+/// guards. Returns `Some((without_value, msgs))` where `msgs` is the
+/// ordered `cant_assign_to_final` emission list of `(name, info_is_none)`;
+/// the Python shim applies the emissions and keeps the pure-Python body
+/// as the fallback. `None` defers on any unreadable fact, or when the
+/// `is_final_decl` preconditions would trip a Python `assert` (a non-
+/// RefExpr first lvalue or a non-Var node) so the shim re-runs the
+/// original body and surfaces the same assertion.
+#[pyfunction]
+#[pyo3(signature = (lvalues, is_final_decl, cls, is_stub, s_type_is_none, is_assignment_stmt))]
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::type_complexity)]
+pub(crate) fn rust_classify_check_final(
+    lvalues: &PyAny,
+    is_final_decl: bool,
+    cls: Option<&PyAny>,
+    is_stub: bool,
+    s_type_is_none: bool,
+    is_assignment_stmt: bool,
+) -> PyResult<Option<(bool, Vec<(String, bool)>)>> {
+    let py = lvalues.py();
+    let lvs = match lvalues.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let var_cls = nodes_class(py, "Var")?;
+    let refexpr_cls = nodes_class(py, "RefExpr")?;
+
+    // The `final_without_value` gate (only reachable with an active class).
+    let mut without_value = false;
+    if is_final_decl {
+        if let Some(active_class) = cls {
+            // Python asserts the first lvalue is a RefExpr; defer so the shim
+            // re-runs the original body and raises the same AssertionError.
+            let lv0 = match lvs.get_item(0) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            if !lv0.is_instance(refexpr_cls)? {
+                return Ok(None);
+            }
+            let node = lv0.getattr("node")?;
+            if !node.is_none() {
+                if !node.is_instance(var_cls)? {
+                    return Ok(None);
+                }
+                let final_unset_in_class = match read_bool_attr(node, "final_unset_in_class")? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                let final_set_in_init = match read_bool_attr(node, "final_set_in_init")? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                let is_named_tuple = match read_bool_attr(active_class, "is_named_tuple")? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                without_value = final_without_value(
+                    final_unset_in_class,
+                    final_set_in_init,
+                    is_stub,
+                    is_assignment_stmt,
+                    s_type_is_none,
+                    is_named_tuple,
+                );
+            }
+        }
+    }
+
+    // The per-lvalue final-assignment arbitration.
+    let mut msgs: Vec<(String, bool)> = Vec::new();
+    for lv in lvs.iter() {
+        if !lv.is_instance(refexpr_cls)? {
+            continue;
+        }
+        let node = lv.getattr("node")?;
+        if node.is_none() || !node.is_instance(var_cls)? {
+            continue;
+        }
+        let name: String = match node.getattr("name") {
+            Ok(n) => match n.extract() {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        if let Some(active) = cls {
+            // These additional checks exist to give more error messages
+            // even if the final attribute was overridden with a new symbol
+            // (which is itself an error); overriding a final method is
+            // caught in `check_compatibility_final_super()` instead.
+            let mro = match active.getattr("mro") {
+                Ok(m) => m,
+                Err(_) => return Ok(None),
+            };
+            let mro_list = match mro.downcast::<PyList>() {
+                Ok(l) => l,
+                Err(_) => return Ok(None),
+            };
+            for base in mro_list.iter().skip(1) {
+                let names = match base.getattr("names") {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                let sym = match names.call_method1("get", (name.as_str(),)) {
+                    Ok(s) => s,
+                    Err(_) => return Ok(None),
+                };
+                if sym.is_none() {
+                    continue;
+                }
+                let sym_node = match sym.getattr("node") {
+                    Ok(n) => n,
+                    Err(_) => return Ok(None),
+                };
+                if !sym_node.is_instance(var_cls)? {
+                    continue;
+                }
+                let base_is_final = match read_bool_attr(sym_node, "is_final")? {
+                    Some(b) => b,
+                    None => return Ok(None),
+                };
+                if base_is_final && !is_final_decl {
+                    let info_is_none = match read_attr_is_none(sym_node, "info")? {
+                        Some(b) => b,
+                        None => return Ok(None),
+                    };
+                    msgs.push((name.clone(), info_is_none));
+                    // ...but only once
+                    break;
+                }
+            }
+        }
+        let own_is_final = match read_bool_attr(node, "is_final")? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        if own_is_final && !is_final_decl {
+            let info_is_none = match read_attr_is_none(node, "info")? {
+                Some(b) => b,
+                None => return Ok(None),
+            };
+            msgs.push((name, info_is_none));
+        }
+    }
+    Ok(Some((without_value, msgs)))
+}
+
+#[cfg(test)]
+mod check_final_tests {
+    use super::*;
+
+    #[test]
+    fn test_without_value_all_facts_true() {
+        assert!(final_without_value(true, false, false, true, false, false));
+    }
+
+    #[test]
+    fn test_without_value_set_in_init() {
+        assert!(!final_without_value(true, true, false, true, false, false));
+    }
+
+    #[test]
+    fn test_without_value_unset_in_class() {
+        assert!(!final_without_value(
+            false, false, false, true, false, false
+        ));
+    }
+
+    #[test]
+    fn test_without_value_stub_file() {
+        assert!(!final_without_value(true, false, true, true, false, false));
+    }
+
+    #[test]
+    fn test_without_value_not_assignment_stmt() {
+        assert!(!final_without_value(
+            true, false, false, false, false, false
+        ));
+    }
+
+    #[test]
+    fn test_without_value_no_type_annotation() {
+        assert!(!final_without_value(true, false, false, true, true, false));
+    }
+
+    #[test]
+    fn test_without_value_named_tuple() {
+        assert!(!final_without_value(true, false, false, true, false, true));
+    }
+}

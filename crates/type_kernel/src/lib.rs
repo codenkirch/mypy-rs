@@ -2974,6 +2974,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check_final decision-head port. Rust classifies the
+    // final_without_value gate and the per-lvalue final-assignment
+    // arbitration (MRO walk + is_final flags); the message emissions stay
+    // in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_check_final,
+        module
+    )?)?;
     // checker_functions: check_compatibility_classvar_super 2x2 predicate port.
     // Rust classifies the classvar override into a branch tag; the message
     // emission stays in Python.

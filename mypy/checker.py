@@ -333,6 +333,7 @@ try:
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
+        rust_classify_check_final as _rust_classify_check_final,
         rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_classvar_super as _rust_classify_classvar_super,
         rust_classify_enum as _rust_classify_enum,
@@ -415,6 +416,7 @@ except ImportError:
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_classvar_super = None  # type: ignore[assignment]
+    _rust_classify_check_final = None  # type: ignore[assignment]
     _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
@@ -5165,6 +5167,34 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         else:
             lvs = [s.lvalue]
         is_final_decl = s.is_final_def if isinstance(s, AssignmentStmt) else False
+        # Native type_kernel seam: classify the final_without_value gate and
+        # the per-lvalue final-assignment arbitration (MRO walk + is_final
+        # flags) in Rust (checker_functions.rs); the final_without_value and
+        # cant_assign_to_final emissions stay here. None falls through to the
+        # pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_check_final is not None
+        ):
+            try:
+                res = _rust_classify_check_final(
+                    lvs,
+                    is_final_decl,
+                    self.scope.active_class(),
+                    self.is_stub,
+                    s.type is None if isinstance(s, AssignmentStmt) else True,
+                    isinstance(s, AssignmentStmt),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                res = None
+            if res is not None:
+                without_value, assign_msgs = res
+                if without_value:
+                    self.msg.final_without_value(s)
+                for name, info_is_none in assign_msgs:
+                    self.msg.cant_assign_to_final(name, info_is_none, s)
+                return
         if is_final_decl and (active_class := self.scope.active_class()):
             lv = lvs[0]
             assert isinstance(lv, RefExpr)

@@ -35432,3 +35432,287 @@ class NativeShouldWaitRhsSuite(Suite):
         # level down (short lookup, not qualified).
         off, on = self._run("index", sym=None)
         assert on[1] == [("lookup", "x", False)]
+
+class NativeCheckFinalSuite(Suite):
+    """Parity for the Rust `check_final` decision-head port.
+
+    `TypeChecker.check_final` (checker.py:5095) is, after the shim's
+    flatten_lvalues / is_final_decl computation, a pure sequence of message
+    decisions: the `final_without_value` gate (scalar Var / statement /
+    class facts) and the per-lvalue final-assignment arbitration (RefExpr
+    -> Var gate, the MRO walk over `cls.mro[1:]` looking up a final base
+    Var, and the own `lv.node.is_final` check). The Rust port
+    (`checker_functions.rs`) walks the live lvalues and MRO via PyO3 and
+    returns `(without_value, [(name, info_is_none), ...])`; the Python shim
+    applies the final_without_value / cant_assign_to_final emissions and
+    keeps the pure-Python body as the fallback.
+
+    Direct seam calls assert the exact (without_value, msgs) pairs; the
+    gate-off vs gate-on differential drives the real TypeChecker method
+    through a stub message recorder and asserts identical message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _var(self, name: str, is_final: bool = False) -> Any:
+        from mypy.nodes import Var
+
+        v = Var(name)
+        v.is_final = is_final
+        return v
+
+    def _ref(self, node: Any) -> Any:
+        from mypy.nodes import NameExpr
+
+        lv = NameExpr(node.name)
+        lv.node = node
+        return lv
+
+    def _cls(
+        self, names: dict[str, Any] | None = None, *, is_named_tuple: bool = False
+    ) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            fullname="mod.Base",
+            mro=[SimpleNamespace(names={}), SimpleNamespace(names=names or {})],
+            is_named_tuple=is_named_tuple,
+        )
+
+    def _seam(
+        self,
+        lvs: list[Any],
+        is_final_decl: bool,
+        cls: Any,
+        is_stub: bool = False,
+        s_type_is_none: bool = False,
+        is_assignment_stmt: bool = True,
+    ) -> Any:
+        return _type_kernel.rust_classify_check_final(
+            lvs, is_final_decl, cls, is_stub, s_type_is_none, is_assignment_stmt
+        )
+
+    def _run(
+        self,
+        lvs: list[Any],
+        is_final_decl: bool,
+        cls: Any,
+        *,
+        is_stub: bool = False,
+        s_type: Any = None,
+    ) -> tuple[list[str], list[str]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+        from mypy.nodes import TempNode
+
+        def check_one() -> list[str]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[str] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                final_without_value=lambda ctx: msgs.append("final_without_value"),
+                cant_assign_to_final=lambda n, info_is_none, ctx: msgs.append(
+                    f"cant_assign:{n}:{info_is_none}"
+                ),
+            )
+            chk.is_stub = is_stub
+            chk.scope = SimpleNamespace(active_class=lambda: cls)  # type: ignore[assignment]
+            s = AssignmentStmt(lvs, TempNode(AnyType(TypeOfAny.explicit)), type=s_type)
+            s.is_final_def = is_final_decl
+            chk.check_final(s)
+            return msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        lvs: list[Any],
+        is_final_decl: bool,
+        cls: Any,
+        *,
+        is_stub: bool = False,
+        s_type: Any = None,
+    ) -> None:
+        off, on = self._run(lvs, is_final_decl, cls, is_stub=is_stub, s_type=s_type)
+        assert_equal(on, off, f"check_final parity for lvs={lvs!r} cls={cls!r}")
+
+    def test_seam_non_refexpr_lvalue(self) -> None:
+        from mypy.nodes import TempNode
+
+        res = self._seam([TempNode(AnyType(TypeOfAny.explicit))], False, None)
+        assert res == (False, [])
+
+    def test_seam_node_none(self) -> None:
+        from mypy.nodes import NameExpr
+
+        lv = NameExpr("x")
+        lv.node = None
+        res = self._seam([lv], False, None)
+        assert res == (False, [])
+
+    def test_seam_non_var_node(self) -> None:
+        from mypy.nodes import FuncDef
+
+        res = self._seam([self._ref(FuncDef("f"))], False, None)
+        assert res == (False, [])
+
+    def test_seam_plain_assignment(self) -> None:
+        # The fast no-final path: one lookup, no messages.
+        res = self._seam([self._ref(self._var("x"))], False, None)
+        assert res == (False, [])
+
+    def test_seam_own_final(self) -> None:
+        res = self._seam([self._ref(self._var("x", True))], False, None)
+        assert res == (False, [("x", False)])
+
+    def test_seam_own_final_decl_no_msg(self) -> None:
+        res = self._seam([self._ref(self._var("x", True))], True, None)
+        assert res == (False, [])
+
+    def test_seam_base_final(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        cls = self._cls({"x": sym})
+        res = self._seam([self._ref(self._var("x"))], False, cls)
+        assert res == (False, [("x", False)])
+
+    def test_seam_base_final_decl_suppressed(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        cls = self._cls({"x": sym})
+        res = self._seam([self._ref(self._var("x", True))], True, cls)
+        assert res == (False, [])
+
+    def test_seam_base_and_own_both_msg(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        cls = self._cls({"x": sym})
+        res = self._seam([self._ref(self._var("x", True))], False, cls)
+        assert res == (False, [("x", False), ("x", False)])
+
+    def test_seam_base_method_not_var(self) -> None:
+        from mypy.nodes import MDEF, FuncDef, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, FuncDef("x"))
+        cls = self._cls({"x": sym})
+        res = self._seam([self._ref(self._var("x"))], False, cls)
+        assert res == (False, [])
+
+    def test_seam_base_var_no_info(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        # A fresh Var carries the VAR_NO_INFO FakeInfo, so `info is None`
+        # is False and the message flag is False.
+        base_final = self._var("x", True)
+        sym = SymbolTableNode(MDEF, base_final)
+        cls = self._cls({"x": sym})
+        res = self._seam([self._ref(self._var("x"))], False, cls)
+        assert res == (False, [("x", False)])
+
+    def test_seam_final_without_value(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = False
+        res = self._seam([self._ref(v)], True, self._cls(), s_type_is_none=False)
+        assert res == (True, [])
+
+    def test_seam_final_without_value_named_tuple(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = False
+        res = self._seam(
+            [self._ref(v)],
+            True,
+            self._cls(is_named_tuple=True),
+            s_type_is_none=False,
+        )
+        assert res == (False, [])
+
+    def test_seam_final_without_value_stub(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = False
+        res = self._seam(
+            [self._ref(v)], True, self._cls(), is_stub=True, s_type_is_none=False
+        )
+        assert res == (False, [])
+
+    def test_seam_final_without_value_set_in_init(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = True
+        res = self._seam([self._ref(v)], True, self._cls(), s_type_is_none=False)
+        assert res == (False, [])
+
+    def test_differential_plain_assignment(self) -> None:
+        self._assert_par([self._ref(self._var("x"))], False, None)
+
+    def test_differential_own_final(self) -> None:
+        self._assert_par([self._ref(self._var("x", True))], False, None)
+
+    def test_differential_own_final_decl(self) -> None:
+        self._assert_par([self._ref(self._var("x", True))], True, None)
+
+    def test_differential_base_final(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        self._assert_par([self._ref(self._var("x"))], False, self._cls({"x": sym}))
+
+    def test_differential_base_and_own(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        self._assert_par(
+            [self._ref(self._var("x", True))], False, self._cls({"x": sym})
+        )
+
+    def test_differential_tuple_lvalues(self) -> None:
+        from mypy.nodes import MDEF, SymbolTableNode, TupleExpr
+
+        sym = SymbolTableNode(MDEF, self._var("x", True))
+        cls = self._cls({"x": sym})
+        lv1 = self._ref(self._var("x", True))
+        lv2 = self._ref(self._var("y"))
+        off, on = self._run([TupleExpr([lv1, lv2])], False, cls)
+        assert_equal(on, off, "check_final tuple lvalues parity")
+
+    def test_differential_final_without_value(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = False
+        self._assert_par(
+            [self._ref(v)], True, self._cls(), s_type=AnyType(TypeOfAny.explicit)
+        )
+
+    def test_differential_final_without_value_stub(self) -> None:
+        v = self._var("x", True)
+        v.final_unset_in_class = True
+        v.final_set_in_init = False
+        self._assert_par(
+            [self._ref(v)],
+            True,
+            self._cls(),
+            is_stub=True,
+            s_type=AnyType(TypeOfAny.explicit),
+        )
