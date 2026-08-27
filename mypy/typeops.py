@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, TypeVar, cast
+from typing import Any, Final, TypeVar, cast
 
 from mypy.checker_state import checker_state
 from mypy.copytype import copy_type
@@ -69,6 +69,9 @@ from mypy.types import (
     get_proper_types,
     instance_cache,
     remove_dups,
+    _serialize_with_taint_check,
+    _type_wire_cache,
+    _wire_cache_enabled,
 )
 from mypy.typetraverser import TypeTraverserVisitor
 from mypy.typevars import fill_typevars
@@ -164,10 +167,38 @@ def _has_mutated_truthiness(t: Type) -> bool:
     return False
 
 
+# Argless built-in instances serialize to fixed bytes; mirroring the
+# fast path in checker.py / checkexpr.py / subtypes.py.
+_BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
+    "builtins.str": b"\x50\x53",
+    "builtins.function": b"\x50\x54",
+    "builtins.int": b"\x50\x55",
+    "builtins.bool": b"\x50\x56",
+    "builtins.object": b"\x50\x57",
+}
+
+
 def _serialize_type(t: Type) -> bytes:
+    """Serialize a `Type` to its wire-format bytes for the Rust reader."""
+    key = id(t)
+    if _wire_cache_enabled():
+        entry = _type_wire_cache.get(key)
+        if entry is not None and entry[0] is t:
+            return entry[1]
+    if type(t) is Instance:
+        fn = t.type.fullname
+        if (
+            not t.args
+            and not t.last_known_value
+            and not t.extra_attrs
+            and fn in _BUILTIN_INSTANCE_BYTES
+        ):
+            return _BUILTIN_INSTANCE_BYTES[fn]
     buf = _WriteBuffer()
-    t.write(buf)
-    return buf.getvalue()
+    result, saw_tvar = _serialize_with_taint_check(t, buf)
+    if not saw_tvar and _wire_cache_enabled() and (not isinstance(t, Instance) or t.type_ref is None):  # type: ignore[misc]
+        _type_wire_cache[key] = (t, result)
+    return result
 
 
 def _serialize_type_list(items: Sequence[Type]) -> bytes:
@@ -258,20 +289,24 @@ def is_recursive_pair(s: Type, t: Type) -> bool:
     and return True only in cases we know may have problems.
     """
     if _HAS_TYPE_KERNEL and _native_typeops_active and _native_typeops_resolver is not None:
-        s_is_rec = isinstance(s, TypeAliasType) and s.is_recursive
-        t_is_rec = isinstance(t, TypeAliasType) and t.is_recursive
-        try:
-            result = _type_kernel.rust_is_recursive_pair(
-                _serialize_type(s),
-                _serialize_type(t),
-                s_is_rec,
-                t_is_rec,
-                _native_typeops_resolver,
-            )
-            if result is not None:
-                return result
-        except (AssertionError, NotImplementedError):
-            pass
+        # Only recursive alias pairs (or the TupleType-fallback arm, which
+        # also needs a recursive alias) can be recursive, so skip the wire
+        # round-trip for non-alias pairs: the Python fallback is False.
+        if isinstance(s, TypeAliasType) or isinstance(t, TypeAliasType):
+            s_is_rec = isinstance(s, TypeAliasType) and s.is_recursive
+            t_is_rec = isinstance(t, TypeAliasType) and t.is_recursive
+            try:
+                result = _type_kernel.rust_is_recursive_pair(
+                    _serialize_type(s),
+                    _serialize_type(t),
+                    s_is_rec,
+                    t_is_rec,
+                    _native_typeops_resolver,
+                )
+                if result is not None:
+                    return result
+            except (AssertionError, NotImplementedError):
+                pass
     if isinstance(s, TypeAliasType) and s.is_recursive:
         return (
             isinstance(get_proper_type(t), (Instance, UnionType))
