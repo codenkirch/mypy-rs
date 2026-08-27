@@ -32667,3 +32667,162 @@ class NativeClassPatternRangesSuite(Suite):
         if ranges is None:
             return []
         return [(str(r.item), r.is_upper_bound) for r in ranges]
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRefersToTypedDictSuite(Suite):
+    """Parity for `rust_refers_to_typeddict` (issue #980).
+
+    `ExpressionChecker.refers_to_typeddict` (checkexpr.py:1385-1393)
+    is a pure bool predicate run for every call expression. The Rust
+    seam reads the node classes off the live base via PyO3
+    (is_instance against mypy.nodes RefExpr / TypeInfo / TypeAlias) and
+    matches the TypeAlias target against the TypedDictType wire tag;
+    the Python shim serializes the target's proper type to wire bytes.
+    Direct seam calls must agree with the expected bool, and toggling
+    the checkexpr gate off vs on must produce identical results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.Movie") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _typeddict_info(self) -> TypeInfo:
+        info = self._typeinfo("mod.Movie")
+        info.typeddict_type = TypedDictType({}, set(), set(), Instance(info, []))
+        return info
+
+    def _ref(self, node: object) -> NameExpr:
+        from mypy.nodes import NameExpr
+
+        expr = NameExpr("td")
+        expr.node = node  # type: ignore[assignment]
+        return expr
+
+    def _alias_bytes(self, target: Type) -> bytes:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _serialize_type_for_checkexpr(get_proper_type(target))
+
+    def _alias(self, target: Type) -> object:
+        from mypy.nodes import TypeAlias
+
+        return TypeAlias(target, "mod.Alias", "mod", 1, 0)
+
+    def _assert_par(self, base: Expression, expected: bool) -> None:
+        from mypy.checkexpr import ExpressionChecker
+
+        ec = ExpressionChecker(self._make_checker(), None, None, None)  # type: ignore[arg-type]
+        off = self._with_gate(False, lambda: ec.refers_to_typeddict(base))
+        on = self._with_gate(True, lambda: ec.refers_to_typeddict(base))
+        assert off == expected, f"gate-off: {off} != {expected}"
+        assert on == expected, f"gate-on: {on} != {expected}"
+
+    def _assert_seam(self, base: Expression, expected: bool) -> None:
+        from mypy.nodes import TypeAlias
+
+        target_bytes: bytes | None = None
+        node = getattr(base, "node", None)
+        if isinstance(node, TypeAlias):
+            target_bytes = self._alias_bytes(node.target)
+        result = _type_kernel.rust_refers_to_typeddict(base, target_bytes)
+        assert result == expected, f"seam: {result} != {expected}"
+
+    def _make_checker(self) -> object:
+        from mypy.checker import TypeChecker
+        from mypy.errors import Errors
+        from mypy.nodes import MypyFile, SymbolTable
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        return TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+
+    def test_direct_typeddict_info(self) -> None:
+        # RefExpr -> TypeInfo with typeddict_type: direct reference.
+        expr = self._ref(self._typeddict_info())
+        self._assert_seam(expr, True)
+        self._assert_par(expr, True)
+
+    def test_plain_typeinfo_false(self) -> None:
+        # RefExpr -> TypeInfo without typeddict_type.
+        expr = self._ref(self._typeinfo())
+        self._assert_seam(expr, False)
+        self._assert_par(expr, False)
+
+    def test_alias_to_typeddict_true(self) -> None:
+        # RefExpr -> TypeAlias whose target proper-type is TypedDictType.
+        info = self._typeinfo()
+        td = TypedDictType({}, set(), set(), Instance(info, []))
+        expr = self._ref(self._alias(td))
+        self._assert_seam(expr, True)
+        self._assert_par(expr, True)
+
+    def test_alias_to_instance_false(self) -> None:
+        # RefExpr -> TypeAlias targeting a plain Instance.
+        info = self._typeinfo()
+        expr = self._ref(self._alias(Instance(info, [])))
+        self._assert_seam(expr, False)
+        self._assert_par(expr, False)
+
+    def test_var_node_false(self) -> None:
+        # RefExpr -> Var: neither TypeInfo nor TypeAlias arm fires.
+        from mypy.nodes import Var
+
+        expr = self._ref(Var("x"))
+        self._assert_seam(expr, False)
+        self._assert_par(expr, False)
+
+    def test_node_none_false(self) -> None:
+        # RefExpr with an unresolved node.
+        expr = self._ref(None)
+        self._assert_seam(expr, False)
+        self._assert_par(expr, False)
+
+    def test_non_refexpr_false(self) -> None:
+        # IntExpr has no `.node`; the shim's getattr must not raise and
+        # the seam returns False for a non-RefExpr base.
+        from mypy.nodes import IntExpr
+
+        base: Expression = IntExpr(3)
+        self._assert_seam(base, False)
+        self._assert_par(base, False)
+
+    def test_seam_alias_missing_bytes_raises(self) -> None:
+        # A TypeAlias node without target bytes is unreachable through
+        # the shim; the seam must not silently return False.
+        info = self._typeinfo()
+        td = TypedDictType({}, set(), set(), Instance(info, []))
+        expr = self._ref(self._alias(td))
+        try:
+            _type_kernel.rust_refers_to_typeddict(expr, None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("expected ValueError for missing alias bytes")

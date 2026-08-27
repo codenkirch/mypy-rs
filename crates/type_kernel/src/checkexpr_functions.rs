@@ -3002,6 +3002,51 @@ pub(crate) fn rust_classify_typeddict_call(
     Ok(Some(4))
 }
 
+/// `ExpressionChecker.refers_to_typeddict` (checkexpr.py:1385-1393).
+/// Pure bool predicate over the live callee expression, mirrored after
+/// `rust_classify_lvalue_validity`'s PyO3 `is_instance` shape. Rust
+/// reads `mypy.nodes.RefExpr` / `TypeInfo` / `TypeAlias` off the live
+/// `base`; the TypeAlias target is handed over as wire bytes of its
+/// proper type (serialized by the Python shim) and matched against
+/// `Type::TypedDictType`. Never defers: every reachable branch returns
+/// a bool. A TypeAlias node without decodable target bytes raises, an
+/// unreachable-by-construction case the Python shim treats as a
+/// fallback to the pure-Python body.
+#[pyfunction]
+#[pyo3(signature = (base, target_bytes=None))]
+pub(crate) fn rust_refers_to_typeddict(
+    py: Python<'_>,
+    base: &PyAny,
+    target_bytes: Option<&[u8]>,
+) -> PyResult<bool> {
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ref_expr_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    if !base.is_instance(ref_expr_cls)? {
+        return Ok(false);
+    }
+    let node = base.getattr("node")?;
+    if node.is_none() {
+        return Ok(false);
+    }
+    let typeinfo_cls: &PyType = nodes_mod.getattr("TypeInfo")?.downcast()?;
+    if node.is_instance(typeinfo_cls)? {
+        return Ok(!node.getattr("typeddict_type")?.is_none());
+    }
+    let typealias_cls: &PyType = nodes_mod.getattr("TypeAlias")?.downcast()?;
+    if node.is_instance(typealias_cls)? {
+        let bytes = target_bytes
+            .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("missing alias target"))?;
+        return match decode_type(bytes) {
+            Some(Type::TypedDictType { .. }) => Ok(true),
+            Some(_) => Ok(false),
+            None => Err(pyo3::exceptions::PyValueError::new_err(
+                "undecodable alias target",
+            )),
+        };
+    }
+    Ok(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6076,5 +6121,59 @@ mod classify_super_arg_types_tests {
             classify(true, 3, true, false, &[0, 0, 0]),
             SUPER_ARG_TOO_MANY
         );
+    }
+}
+
+#[cfg(test)]
+mod refers_to_typeddict_tests {
+    use super::*;
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    #[test]
+    fn test_alias_target_typeddict_wire() {
+        // A TypeAlias whose proper-type target is a TypedDictType: the
+        // wire round-trip preserves the TypedDictType tag the seam
+        // matches on.
+        let td = Type::TypedDictType {
+            items: vec![("x".to_string(), any_type())],
+            required_keys: HashSet::new(),
+            readonly_keys: HashSet::new(),
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.dict".to_string(),
+                args: vec![any_type(), any_type()],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            is_closed: false,
+        };
+        let bytes = encode_type(&td).unwrap();
+        assert!(matches!(
+            decode_type(&bytes).unwrap(),
+            Type::TypedDictType { .. }
+        ));
+    }
+
+    #[test]
+    fn test_alias_target_instance_wire() {
+        // A non-TypedDictType alias target decodes to a different
+        // variant -> the seam must return false, not true.
+        let inst = Type::Instance {
+            type_ref: "mod.Cls".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        let bytes = encode_type(&inst).unwrap();
+        assert!(!matches!(
+            decode_type(&bytes).unwrap(),
+            Type::TypedDictType { .. }
+        ));
     }
 }
