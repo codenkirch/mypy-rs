@@ -562,6 +562,92 @@ pub(crate) fn rust_classify_enum(
     )))
 }
 
+// ---------------------------------------------------------------------------
+// check_getattr_method 4-way dispatch-head port (issue #985)
+// ---------------------------------------------------------------------------
+
+/// Decision tags; values must match `NATIVE_GETATTR_METHOD_*` in
+/// mypy/checker.py.
+const KIND_GETATTR_MODULE_GETATTRIBUTE: i64 = 0;
+const KIND_GETATTR_MODULE: i64 = 1;
+const KIND_GETATTR_CLASS: i64 = 2;
+const KIND_GETATTR_PASS: i64 = 3;
+
+/// The pure 4-way dispatch for `TypeChecker.check_getattr_method`
+/// (checker.py:3066-3093). Kept separate from the PyO3 entry so the branch
+/// algebra is unit-testable without a Python runtime.
+fn classify_getattr_method(module_scope: bool, is_getattribute: bool, active_class: bool) -> i64 {
+    if module_scope {
+        if is_getattribute {
+            return KIND_GETATTR_MODULE_GETATTRIBUTE;
+        }
+        return KIND_GETATTR_MODULE;
+    }
+    if active_class {
+        return KIND_GETATTR_CLASS;
+    }
+    KIND_GETATTR_PASS
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_getattr_method`
+/// (mypy/checker.py:3066-3093). Reads the live `Scope` via PyO3
+/// (`len(scope.stack) == 1` and `scope.active_class()`); `name` arrives as a
+/// scalar string. Returns `Some(tag)` for every reachable branch, or `None`
+/// to defer (an unreadable `scope.stack` / `active_class()` result). The
+/// Python shim builds the fixed `CallableType` via `named_type`, runs the
+/// (already native) `is_subtype`, and applies the
+/// MODULE_LEVEL_GETATTRIBUTE / invalid_signature_for_special_method
+/// emission.
+#[pyfunction]
+pub(crate) fn rust_classify_getattr_method(scope: &PyAny, name: &str) -> PyResult<Option<i64>> {
+    let stack = match scope.getattr("stack") {
+        Ok(s) => s,
+        Err(_) => return Ok(None),
+    };
+    let module_scope = match stack.len() {
+        Ok(len) => len == 1,
+        Err(_) => return Ok(None),
+    };
+    let active_class = match scope.call_method0("active_class") {
+        Ok(v) => match v.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(classify_getattr_method(
+        module_scope,
+        name == "__getattribute__",
+        active_class,
+    )))
+}
+
+#[cfg(test)]
+mod classify_getattr_method_tests {
+    use super::*;
+
+    #[test]
+    fn test_module_getattribute() {
+        assert_eq!(classify_getattr_method(true, true, false), 0);
+    }
+
+    #[test]
+    fn test_module_other_name() {
+        assert_eq!(classify_getattr_method(true, false, false), 1);
+    }
+
+    #[test]
+    fn test_class_scope() {
+        assert_eq!(classify_getattr_method(false, false, true), 2);
+        assert_eq!(classify_getattr_method(false, true, true), 2);
+    }
+
+    #[test]
+    fn test_pass() {
+        assert_eq!(classify_getattr_method(false, false, false), 3);
+        assert_eq!(classify_getattr_method(false, true, false), 3);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

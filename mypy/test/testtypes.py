@@ -33843,3 +33843,187 @@ class NativeIndexWithTypeSuite(Suite):
 
     def test_par_type_obj_fallthrough(self) -> None:
         self._assert_par(self.fx.callable_type(self.fx.a), NameExpr("k"))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeGetattrMethodSuite(Suite):
+    """Parity for the Rust `check_getattr_method` 4-way dispatch head.
+
+    `rust_classify_getattr_method` classifies module/getattribute/class/pass
+    from the live `Scope` facts (`len(scope.stack) == 1`,
+    `scope.active_class()`); the Python shim builds the fixed CallableType
+    via `named_type`, runs `is_subtype`, and emits the messages. Direct seam
+    calls assert the tag for every branch; the gate-off vs gate-on
+    differential drives the real `check_getattr_method` through a minimal
+    fake checker capturing fail/note records.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(
+        self,
+        module: bool,
+        name: str,
+        ok: bool,
+        cls: bool = False,
+    ) -> None:
+        """Run the real check through gate-off and gate-on checkers; compare."""
+        typ = self._typ(name, ok, cls)
+        off_scope = _FakeScope(module=module, cls=cls)
+        off = self._with_gate(False, lambda: _run_check(off_scope, typ, name))
+        on_scope = _FakeScope(module=module, cls=cls)
+        self._set_active(True)
+        on = _run_check(on_scope, typ, name)
+        assert_equal(off, on, f"getattr-method parity module={module} cls={cls} {name}")
+        has_fail = bool(off[0]) or bool(off[1])
+        assert has_fail == expect_fail_check(module, name, ok, cls), (off, on)
+
+    def _typ(self, name: str, ok: bool, cls: bool = False) -> object:
+        return _make_getattr_sig(ok, cls)
+
+    # -- direct seam calls -------------------------------------------------
+
+    def test_seam_module_scope_getattribute(self) -> None:
+        from mypy.checker import NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
+        from mypy.checker import _rust_classify_getattr_method
+
+        assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattribute__") == (
+            NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
+        )
+
+    def test_seam_module_scope_getattr(self) -> None:
+        from mypy.checker import NATIVE_GETATTR_METHOD_MODULE
+        from mypy.checker import _rust_classify_getattr_method
+
+        assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattr__") == (
+            NATIVE_GETATTR_METHOD_MODULE
+        )
+
+    def test_seam_class_scope(self) -> None:
+        from mypy.checker import NATIVE_GETATTR_METHOD_CLASS
+        from mypy.checker import _rust_classify_getattr_method
+
+        assert _rust_classify_getattr_method(_FakeScope(module=False, cls=True), "__getattr__") == (
+            NATIVE_GETATTR_METHOD_CLASS
+        )
+
+    def test_seam_other_scope_pass(self) -> None:
+        from mypy.checker import NATIVE_GETATTR_METHOD_PASS
+        from mypy.checker import _rust_classify_getattr_method
+
+        assert _rust_classify_getattr_method(_FakeScope(module=False, cls=False), "__getattr__") == (
+            NATIVE_GETATTR_METHOD_PASS
+        )
+
+    # -- gate-off vs gate-on differentials ---------------------------------
+
+    def test_parity_module_getattribute(self) -> None:
+        self._assert_par(module=True, name="__getattribute__", ok=False)
+
+    def test_parity_module_getattr_valid(self) -> None:
+        self._assert_par(module=True, name="__getattr__", ok=True)
+
+    def test_parity_module_getattr_invalid(self) -> None:
+        self._assert_par(module=True, name="__getattr__", ok=False)
+
+    def test_parity_class_scope_valid(self) -> None:
+        self._assert_par(module=False, cls=True, name="__getattr__", ok=True)
+
+    def test_parity_class_scope_invalid(self) -> None:
+        self._assert_par(module=False, cls=True, name="__getattr__", ok=False)
+
+    def test_parity_other_scope_noop(self) -> None:
+        self._assert_par(module=False, cls=False, name="__getattr__", ok=True)
+
+
+class _FakeScope:
+    """Minimal `Scope` stand-in exposing `stack` and `active_class()`."""
+
+    def __init__(self, module: bool, cls: bool = False) -> None:
+        self.stack = [object()] if module else [object(), object()]
+        self._cls = cls
+
+    def active_class(self) -> bool:
+        return self._cls
+
+
+class _FakeMsg:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, object]] = []
+
+    def invalid_signature_for_special_method(self, typ: object, context: object, name: str) -> None:
+        self.records.append(("invalid_signature", name))
+
+
+class _FakeChecker:
+    """Wires the real `check_getattr_method` onto fake scope/msg state."""
+
+    def __init__(self, scope: _FakeScope, fx: TypeFixture) -> None:
+        from mypy.checker import TypeChecker
+
+        self.scope = scope
+        self.msg = _FakeMsg()
+        self._failures: list[str] = []
+        self._checker_cls = TypeChecker
+        self._fx = fx
+
+    def named_type(self, name: str) -> Instance:
+        if "[" in name:
+            raise AssertionError(f"named_type got parameterized {name}")
+        return Instance(self._fx.make_type_info(name), [])
+
+    def fail(self, msg: str, ctx: object) -> None:
+        self._failures.append(msg)
+
+
+def _run_check(scope: _FakeScope, typ: object, name: str) -> tuple[list[str], list[tuple[str, object]]]:
+    """Call the real `check_getattr_method` body against a fake checker."""
+    from mypy.checker import TypeChecker
+
+    chk = _FakeChecker(scope, TypeFixture())
+    TypeChecker.check_getattr_method(chk, typ, context=None, name=name)  # type: ignore[arg-type]
+    return chk._failures, chk.msg.records
+
+
+def expect_fail_check(module: bool, name: str, ok: bool, cls: bool) -> bool:
+    """Does a check with these facts produce any failure record?"""
+    if module and name == "__getattribute__":
+        return True
+    if not module and not cls:
+        return False
+    return not ok
+
+
+def _make_getattr_sig(ok: bool, cls: bool = False) -> object:
+    """A `__getattr__` signature matching the arity the method expects."""
+    from mypy.nodes import ARG_POS
+    from mypy.types import AnyType, CallableType, Instance, TypeOfAny
+    from mypy.test.typefixture import TypeFixture
+
+    fx = TypeFixture()
+    args: list[object] = [Instance(fx.make_type_info("builtins.str"), [])]
+    if cls:
+        args = [AnyType(TypeOfAny.special_form), Instance(fx.make_type_info("builtins.str"), [])]
+    if not ok:
+        args[0 if not cls else 1] = Instance(fx.make_type_info("builtins.int"), [])
+    return CallableType(
+        args,
+        [ARG_POS] * len(args),
+        [None] * len(args),
+        AnyType(TypeOfAny.special_form),
+        Instance(fx.make_type_info("builtins.function"), []),
+    )

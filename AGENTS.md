@@ -440,6 +440,21 @@ including:
   by `_native_checker_active` and covered by `NativeFuncDefOverrideSuite`
   in `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs
   gate-on differential).
+- `rust_classify_getattr_method` (issue #985, mypy.checker): the Rust
+  classifier in `checker_functions.rs` ports the 4-way dispatch head of
+  `TypeChecker.check_getattr_method` (checker.py:3066-3093): module scope
+  + `__getattribute__` -> fail; module scope -> 1-arg expected signature;
+  class scope -> 2-arg; else pass. Rust reads the live `Scope` via PyO3
+  (`len(scope.stack) == 1`, `scope.active_class()`) plus the `name`
+  string and returns a branch tag; the Python shim builds the fixed
+  `CallableType` via `named_type`, runs `is_subtype` (already native),
+  and emits MODULE_LEVEL_GETATTRIBUTE /
+  invalid_signature_for_special_method. Defers (`None`) on an unreadable
+  `scope.stack` or `active_class()` result. Gated by
+  `_native_checker_active` and covered by `NativeGetattrMethodSuite` in
+  `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs gate-on
+  differential), plus 4 pure decision unit tests in
+  `checker_functions.rs`.
 - `rust_classify_metaclass_compat` (issue #922) — mirrors the pure bool
   predicate head of `TypeChecker.check_metaclass_compatibility`
   (checker.py:3918-3941): Rust reads the exempt flags off the live
