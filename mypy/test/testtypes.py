@@ -33179,3 +33179,172 @@ class NativeAnalyzeCallableTypeSuite(Suite):
         assert _rust_classify_analyze_callable_type(2, False, False, False) == _CALLABLE_TAG_PARAMSPEC
         assert _rust_classify_analyze_callable_type(1, False, False, True) == _CALLABLE_TAG_INVALID_DISALLOW
         assert _rust_classify_analyze_callable_type(1, False, False, False) == _CALLABLE_TAG_INVALID_ALLOW
+
+
+class _ValidVarArgStubChk:
+    """Minimal TypeChecker stand-in for the var-arg predicate tests.
+
+    Only `named_type` / `named_generic_type` are needed: the two
+    `ExpressionChecker.is_valid_*_var_arg` methods are the only things the
+    differential touches.
+    """
+
+    def __init__(self, infos: dict[str, TypeInfo]) -> None:
+        self._infos = infos
+
+    def named_type(self, name: str) -> Instance:
+        return Instance(self._infos[name], [])
+
+    def named_generic_type(self, name: str, args: list[Type]) -> Instance:
+        return Instance(self._infos[name], tuple(args))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeValidVarArgSuite(Suite):
+    """Parity for the Rust is_valid_var_arg / is_valid_keyword_var_arg
+    ports (mypy.checkexpr, issue #981).
+
+    The two bool predicates run on every call with star args. The Python
+    shim computes the resolver-backed is_subtype acceptance booleans and
+    passes them to Rust; Rust decides the isinstance disjunction from the
+    wire bytes. Toggling the checkexpr gate off (pure Python) and on (Rust
+    seam) must produce identical results; direct seam calls prove the Rust
+    functions engage, and alias inputs prove the deferral path.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import ExpressionChecker, _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+        self.ec = ExpressionChecker.__new__(ExpressionChecker)
+        self.ec.chk = _ValidVarArgStubChk(
+            {
+                "builtins.str": self.fx.str_type_info,
+                "typing.Iterable": self.fx.make_type_info(
+                    "typing.Iterable", typevars=["T"], mro=[self.fx.oi]
+                ),
+                "_typeshed.SupportsKeysAndGetItem": self.fx.make_type_info(
+                    "_typeshed.SupportsKeysAndGetItem",
+                    typevars=["K", "V"],
+                    mro=[self.fx.oi],
+                ),
+            }
+        )
+        self.dict_info = self.fx.make_type_info(
+            "builtins.dict", typevars=["K", "V"], mro=[self.fx.oi]
+        )
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par_var(self, typ: Type) -> None:
+        off = self._with_gate(False, lambda: self.ec.is_valid_var_arg(typ))
+        on = self._with_gate(True, lambda: self.ec.is_valid_var_arg(typ))
+        assert_equal(off, on, f"is_valid_var_arg parity {typ}")
+        assert isinstance(off, bool), off
+
+    def _assert_par_kwarg(self, typ: Type) -> None:
+        off = self._with_gate(False, lambda: self.ec.is_valid_keyword_var_arg(typ))
+        on = self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(typ))
+        assert_equal(off, on, f"is_valid_keyword_var_arg parity {typ}")
+        assert isinstance(off, bool), off
+
+    # -- is_valid_var_arg -------------------------------------------------
+
+    def test_var_arg_tuple(self) -> None:
+        tup = TupleType([], self.fx.std_tuple)
+        self._assert_par_var(tup)
+        assert self._with_gate(True, lambda: self.ec.is_valid_var_arg(tup)) is True
+
+    def test_var_arg_any(self) -> None:
+        self._assert_par_var(self.fx.anyt)
+        assert self._with_gate(True, lambda: self.ec.is_valid_var_arg(self.fx.anyt)) is True
+
+    def test_var_arg_non_iterable_instance(self) -> None:
+        # A is unrelated to the stub Iterable, so the is_subtype acceptance
+        # boolean is False and the Instance tag falls through to it.
+        self._assert_par_var(self.fx.a)
+        assert self._with_gate(True, lambda: self.ec.is_valid_var_arg(self.fx.a)) is False
+
+    def test_var_arg_union(self) -> None:
+        u = UnionType([self.fx.a, self.fx.nonet])
+        self._assert_par_var(u)
+
+    def test_var_arg_alias_defers(self) -> None:
+        # TypeAliasType defers on the wire (no resolved alias target);
+        # parity holds because the shim falls back to the Python body.
+        a, _ = self.fx.def_alias_1(self.fx.a)
+        self._assert_par_var(a)
+
+    # -- is_valid_keyword_var_arg -----------------------------------------
+
+    def test_kwarg_dict_str_keys(self) -> None:
+        d = Instance(self.dict_info, [self.fx.str_type, self.fx.a])
+        self._assert_par_kwarg(d)
+        assert self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(d)) is True
+
+    def test_kwarg_dict_non_str_keys(self) -> None:
+        d = Instance(self.dict_info, [self.fx.a, self.fx.a])
+        self._assert_par_kwarg(d)
+        assert self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(d)) is False
+
+    def test_kwarg_any(self) -> None:
+        # Any passes the SupportsKeysAndGetItem[str, Any] acceptance.
+        self._assert_par_kwarg(self.fx.anyt)
+        assert (
+            self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(self.fx.anyt)) is True
+        )
+
+    def test_kwarg_none(self) -> None:
+        self._assert_par_kwarg(self.fx.nonet)
+        assert (
+            self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(self.fx.nonet)) is False
+        )
+
+    def test_kwarg_plain_instance(self) -> None:
+        # A is unrelated to the stub SKAG protocol, all booleans False.
+        self._assert_par_kwarg(self.fx.a)
+        assert self._with_gate(True, lambda: self.ec.is_valid_keyword_var_arg(self.fx.a)) is False
+
+    def test_kwarg_alias_defers(self) -> None:
+        a, _ = self.fx.def_alias_1(self.fx.a)
+        self._assert_par_kwarg(a)
+
+    # -- direct seam calls --------------------------------------------------
+
+    def _seam_var(self, typ: Type, iterable_ok: bool) -> object:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _type_kernel.rust_is_valid_var_arg(_serialize_type_for_checkexpr(typ), iterable_ok)
+
+    def _seam_kwarg(self, typ: Type, dict_ok: bool, skag_str: bool, skag_never: bool) -> object:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _type_kernel.rust_is_valid_keyword_var_arg(
+            _serialize_type_for_checkexpr(typ), dict_ok, skag_str, skag_never
+        )
+
+    def test_seam_var_engages(self) -> None:
+        assert self._seam_var(self.fx.a, False) is False
+        assert self._seam_var(self.fx.anyt, False) is True
+        assert self._seam_var(self.fx.a, True) is True
+
+    def test_seam_kwarg_engages(self) -> None:
+        d = Instance(self.dict_info, [self.fx.str_type, self.fx.a])
+        assert self._seam_kwarg(d, True, False, False) is True
+        assert self._seam_kwarg(self.fx.a, False, False, False) is False
+        assert self._seam_kwarg(self.fx.a, False, True, False) is True
+
+    def test_seam_alias_defers(self) -> None:
+        a, _ = self.fx.def_alias_1(self.fx.a)
+        assert self._seam_var(a, True) is None
+        assert self._seam_kwarg(a, False, True, True) is None

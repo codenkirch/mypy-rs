@@ -1009,6 +1009,26 @@ including:
   `mypy/build.py`) and covered by `NativeIsRecursivePairSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus 6 pure decision unit tests in `typeops.rs`.
+- `rust_is_valid_var_arg` / `rust_is_valid_keyword_var_arg` (issue #981) —
+  mirrors the two bool predicates `ExpressionChecker.is_valid_var_arg` /
+  `is_valid_keyword_var_arg` (checkexpr.py:8010-8042), called on every call
+  with star args (check_var_args_kwargs, visit_comparison_expr). Rust
+  reads the proper type's wire bytes and decides the isinstance
+  disjunctions (Tuple/Any/ParamSpec/Unpack tags; `builtins.dict` fullname
+  for the kwargs dict arm). The four `is_subtype` acceptance calls
+  (Iterable[Any], dict args[0] vs str, SKAG[str, Any], SKAG[Never, Never])
+  are resolver-backed and already native; the shims pass their results in
+  as booleans (`rust_class_callable` pattern). Python's or-chain
+  short-circuit is value-preserving under eager boolean evaluation because
+  the booleans are pure. Defers (`None`) on undecodable wire bytes, a
+  `TypeAliasType` (no resolved alias target on the wire), and a dict
+  Instance with no args (Python indexes `typ.args[0]`; defer preserves the
+  fallback behavior). Python keeps the `invalid_var_arg` /
+  `invalid_keyword_var_arg` error emission at the call sites. Gated by the
+  existing `_native_checkexpr_active` (wired from `mypy/build.py`) and
+  covered by `NativeValidVarArgSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `checkexpr_functions.rs`.
 
 - `rust_refers_to_typeddict` (issue #980, mypy.checkexpr) — mirrors the
   pure bool predicate `ExpressionChecker.refers_to_typeddict`
