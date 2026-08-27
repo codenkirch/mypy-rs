@@ -34848,3 +34848,121 @@ class NativeHasNoAttrSuite(Suite):
         code, captured = self._assert_par(inst, inst, "add", disable_type_names=True)
         assert code is not None and code.code == "attr-defined"
         assert captured[0][0] == '"C" has no attribute "add"'
+
+
+@skipUnless(
+    _NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext"
+)
+class NativeAttributeTriggersSuite(Suite):
+    """Parity tests for the Rust `attribute_triggers` port (#1007).
+
+    Mirrors the structure of `NativeServerDepsSuite`: each test calls
+    `DependencyVisitor.attribute_triggers` with the Rust gate on and off and
+    asserts identical trigger lists. The Rust path reads live `Type` objects
+    via PyO3 and defers (`None`) on unreadable facts, in which case the
+    Python method runs instead, so parity holds by construction; these tests
+    verify the Rust path actually handles each case and produces the same
+    result.
+    """
+
+    def setUp(self) -> None:
+        from mypy.server.deps import _set_native_server_deps_active
+        from mypy.server.trigger import make_trigger
+
+        self._set_active = _set_native_server_deps_active
+        self.make_trigger = make_trigger
+        self.fx = TypeFixture()
+        self.v = self._make_visitor()
+
+    def _make_visitor(self) -> Any:
+        from mypy.server.deps import DependencyVisitor
+
+        # attribute_triggers only reads types; no AST walk state is needed.
+        return DependencyVisitor.__new__(DependencyVisitor)
+
+    def _triggers(self, typ: Any, name: str = "x") -> list[str]:
+        self._set_active(False)
+        py = self.v.attribute_triggers(typ, name)
+        self._set_active(True)
+        rs = self.v.attribute_triggers(typ, name)
+        assert_equal(rs, py, f"Rust/Python mismatch for {typ!r} (name={name!r})")
+        return rs
+
+    def test_instance(self) -> None:
+        assert_equal(self._triggers(self.fx.a), [self.make_trigger("A.x")])
+
+    def test_type_var_unwraps_upper_bound(self) -> None:
+        # fx.t's upper bound is object.
+        assert_equal(
+            self._triggers(self.fx.t), [self.make_trigger("builtins.object.x")]
+        )
+
+    def test_tuple_type_uses_partial_fallback(self) -> None:
+        assert_equal(self._triggers(self.fx.std_tuple), [self.make_trigger("builtins.tuple.x")])
+
+    def test_none_type_is_empty(self) -> None:
+        assert_equal(self._triggers(self.fx.nonet), [])
+
+    def test_any_type_is_empty(self) -> None:
+        assert_equal(self._triggers(self.fx.anyt), [])
+
+    def test_type_type_of_instance(self) -> None:
+        # No metaclass: only the item trigger.
+        assert_equal(self._triggers(self.fx.type_a), [self.make_trigger("A.x")])
+
+    def test_type_type_with_metaclass(self) -> None:
+        cls = self.fx.make_type_info("Cls")
+        meta = self.fx.make_type_info("Meta")
+        cls.metaclass_type = Instance(meta, [])
+        assert_equal(
+            self._triggers(TypeType.make_normalized(Instance(cls, [])), "m"),
+            [self.make_trigger("Cls.m"), self.make_trigger("Meta.m")],
+        )
+
+    def test_type_object_callable(self) -> None:
+        # A callable whose ret_type is an Instance is a type object: member
+        # trigger from the ret_type's type, then recursion on the fallback.
+        c = CallableType([], [], [], self.fx.a, self.fx.type_type)
+        assert_equal(
+            self._triggers(c), [self.make_trigger("A.x"), self.make_trigger("builtins.type.x")]
+        )
+
+    def test_union_flattens(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b])
+        assert_equal(
+            self._triggers(u), [self.make_trigger("A.x"), self.make_trigger("B.x")]
+        )
+
+    def test_union_with_empty_arm(self) -> None:
+        u = UnionType([self.fx.a, self.fx.nonet])
+        assert_equal(self._triggers(u), [self.make_trigger("A.x")])
+
+    def test_direct_seam(self) -> None:
+        import type_kernel as tk
+
+        assert_equal(tk.rust_attribute_triggers(self.fx.a, "x"), [self.make_trigger("A.x")])
+        assert_equal(tk.rust_attribute_triggers(self.fx.nonet, "x"), [])
+        assert_equal(tk.rust_attribute_triggers(self.fx.t, "y"), [self.make_trigger("builtins.object.y")])
+        # Metaclass and type-object branches must be natively decided too
+        # (not silently deferred to the Python fallback).
+        cls = self.fx.make_type_info("Cls")
+        meta = self.fx.make_type_info("Meta")
+        cls.metaclass_type = Instance(meta, [])
+        assert_equal(
+            tk.rust_attribute_triggers(TypeType.make_normalized(Instance(cls, [])), "m"),
+            [self.make_trigger("Cls.m"), self.make_trigger("Meta.m")],
+        )
+        c = CallableType([], [], [], self.fx.a, self.fx.type_type)
+        assert_equal(
+            tk.rust_attribute_triggers(c, "x"),
+            [self.make_trigger("A.x"), self.make_trigger("builtins.type.x")],
+        )
+
+    def test_gate_off_matches_python(self) -> None:
+        from mypy.server.deps import _HAS_TYPE_KERNEL, DependencyVisitor
+
+        assert _HAS_TYPE_KERNEL
+        self._set_active(False)
+        triggers = self.v.attribute_triggers(self.fx.a, "x")
+        self._set_active(True)
+        self.assertEqual(triggers, [self.make_trigger("A.x")])

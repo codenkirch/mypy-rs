@@ -407,6 +407,145 @@ fn class_name_is(obj: &PyAny, expected: &str) -> bool {
 }
 
 // ====================================================================
+// Issue #1007: attribute_triggers port
+// ====================================================================
+
+/// Shared state threaded through the attribute-trigger recursion.
+struct AttrTriggerCtx<'a> {
+    name: &'a str,
+    refs: &'a TypeRefs<'a>,
+    make_trigger: &'a PyAny,
+    get_proper_type: &'a PyAny,
+}
+
+impl AttrTriggerCtx<'_> {
+    fn make_trigger_str(&self, member: &str) -> Result<String, DeferError> {
+        let result = self.make_trigger.call1((member,)).map_err(|_| DeferError)?;
+        let s: &PyString = result.downcast().map_err(|_| DeferError)?;
+        s.to_str().map(|s| s.to_string()).map_err(|_| DeferError)
+    }
+
+    /// Mirrors `mypy.types.get_proper_type` by calling the Python helper, so
+    /// alias-expansion edge cases (no_args aliases, TypeGuardedType) behave
+    /// identically.
+    fn proper_type(&self, obj: &PyAny) -> Result<&PyAny, DeferError> {
+        let expanded = self.get_proper_type.call1((obj,)).map_err(|_| DeferError)?;
+        Ok(expanded)
+    }
+}
+
+/// Native `attribute_triggers(typ, name) -> list[str] | None`.
+///
+/// Mirrors `mypy.server.deps.DependencyVisitor.attribute_triggers`: returns
+/// the member trigger strings for an attribute access on `typ`. Unreadable
+/// facts defer (`None`) so the Python caller falls back to the pure-Python
+/// method; the AST walk (DependencyVisitor) stays Python-side.
+#[pyfunction]
+pub(crate) fn rust_attribute_triggers(
+    py: Python<'_>,
+    typ: &PyAny,
+    name: &PyString,
+) -> PyResult<Option<PyObject>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    let name = match name.to_str() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let trigger_mod = py.import("mypy.server.trigger")?;
+    let make_trigger = trigger_mod.getattr("make_trigger")?;
+    let get_proper_type = py.import("mypy.types")?.getattr("get_proper_type")?;
+    let ctx = AttrTriggerCtx {
+        name,
+        refs: &refs,
+        make_trigger,
+        get_proper_type,
+    };
+    match attribute_triggers_walk(py, typ, &ctx) {
+        Ok(triggers) => Ok(Some(PyList::new(py, &triggers).into())),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+/// The decision body of `DependencyVisitor.attribute_triggers`, recursion
+/// included: type-kind dispatch producing member trigger strings.
+fn attribute_triggers_walk(
+    py: Python<'_>,
+    typ: &PyAny,
+    ctx: &AttrTriggerCtx<'_>,
+) -> Result<Vec<String>, DeferError> {
+    let refs = ctx.refs;
+    let name = ctx.name;
+
+    // Entry unwraps mirror the Python method exactly: get_proper_type, then
+    // a single TypeVarType upper-bound unwrap, then a TupleType
+    // partial-fallback unwrap (no re-dispatch on the rebound kinds).
+    let mut typ = ctx.proper_type(typ)?;
+    if is_instance(typ, refs.type_var_type) {
+        let ub = get_attr_or_defer(typ, "upper_bound")?;
+        typ = ctx.proper_type(ub)?;
+    }
+    if is_instance(typ, refs.tuple_type) {
+        typ = get_attr_or_defer(typ, "partial_fallback")?;
+    }
+
+    if is_instance(typ, refs.instance) {
+        let info = get_attr_or_defer(typ, "type")?;
+        let fullname = get_str_attr_or_defer(py, info, "fullname")?;
+        let member = format!("{fullname}.{name}");
+        return Ok(vec![ctx.make_trigger_str(&member)?]);
+    }
+
+    if is_instance(typ, refs.function_like) {
+        // Python: `elif isinstance(typ, FunctionLike) and typ.is_type_obj():`.
+        // is_type_obj()/type_object() are Python method calls on the live
+        // object; a raise defers and the Python fallback re-raises it.
+        let is_tobj = typ.call_method0("is_type_obj").map_err(|_| DeferError)?;
+        if is_tobj.is_true().map_err(|_| DeferError)? {
+            let tinfo = typ.call_method0("type_object").map_err(|_| DeferError)?;
+            let fullname = get_str_attr_or_defer(py, tinfo, "fullname")?;
+            let member = format!("{fullname}.{name}");
+            let mut triggers = vec![ctx.make_trigger_str(&member)?];
+            let fb = get_attr_or_defer(typ, "fallback")?;
+            triggers.extend(attribute_triggers_walk(py, fb, ctx)?);
+            return Ok(triggers);
+        }
+        // FunctionLike but not a type object falls through the Python
+        // elif-chain to the empty tail.
+        return Ok(Vec::new());
+    }
+
+    if is_instance(typ, refs.union_type) {
+        let items = get_attr_or_defer(typ, "items")?;
+        let mut out: Vec<String> = Vec::new();
+        for item in iter_seq(items)? {
+            out.extend(attribute_triggers_walk(py, item, ctx)?);
+        }
+        return Ok(out);
+    }
+
+    if is_instance(typ, refs.type_type) {
+        let item = get_attr_or_defer(typ, "item")?;
+        let mut triggers = attribute_triggers_walk(py, item, ctx)?;
+        if is_instance(item, refs.instance) {
+            let itype = get_attr_or_defer(item, "type")?;
+            let mt = itype.getattr("metaclass_type").map_err(|_| DeferError)?;
+            if !mt.is_none() {
+                let mt_type = get_attr_or_defer(mt, "type")?;
+                let mt_fullname = get_str_attr_or_defer(py, mt_type, "fullname")?;
+                let member = format!("{mt_fullname}.{name}");
+                triggers.push(ctx.make_trigger_str(&member)?);
+            }
+        }
+        return Ok(triggers);
+    }
+
+    Ok(Vec::new())
+}
+
+// ====================================================================
 // M354: Pure server trigger/target computation
 // ====================================================================
 

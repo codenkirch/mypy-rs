@@ -581,6 +581,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_refers_to_typeddict,
         module
     )?)?;
+    // Issue #1007: attribute_triggers port (member triggers for attribute access)
+    module.add_function(wrap_pyfunction!(
+        serverdeps::rust_attribute_triggers,
+        module
+    )?)?;
     // check_unpacks_in_list: filters non-tuple Unpack items from a type-arg
     // list and reports the final unpack index. Python applies the fail and
     // rebuilds the item list from the kept indices. None defers.
