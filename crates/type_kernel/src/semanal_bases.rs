@@ -498,6 +498,9 @@ fn configure_mro_tail_inner(
     }
 }
 
+/// MRO tail decision: tag, cyclic base indices, duplicate base name.
+type MroTail = (i64, Vec<i64>, Option<String>);
+
 /// `SemanticAnalyzer.is_base_class` (semanal.py:3528-3542) over live
 /// TypeInfos: search the base-class graph of `s` for `t`, without the mro.
 /// Python compares TypeInfos with `==` (identity for mypy TypeInfo); the
@@ -534,9 +537,7 @@ fn is_base_class_walk(t: &PyAny, s: &PyAny) -> Option<bool> {
 /// live). Defers (`None`) on any unreadable attribute, mirroring the
 /// exception-only deferral of the sibling classifiers.
 #[pyfunction]
-pub(crate) fn rust_classify_configure_mro(
-    info: &PyAny,
-) -> PyResult<Option<(i64, Vec<i64>, Option<String>)>> {
+pub(crate) fn rust_classify_configure_mro(info: &PyAny) -> PyResult<Option<MroTail>> {
     let bases = match info.getattr("bases") {
         Ok(b) => b,
         Err(_) => return Ok(None),
