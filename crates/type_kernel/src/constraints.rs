@@ -1675,7 +1675,7 @@ mod tests {
         Type::TypeVarType {
             name: name.to_string(),
             fullname: format!("mod.{}", name),
-            raw_id: raw_id,
+            raw_id,
             namespace: "fn".to_string(),
             values: Vec::new(),
             upper_bound: Box::new(any_type()),
@@ -1767,45 +1767,6 @@ mod tests {
             arg_kinds: vec![0], // ARG_POS
             arg_names: vec![None],
             ret_type: Box::new(ret),
-            name: None,
-            variables: vec![type_var(1, "T")],
-            type_guard: None,
-            type_is: None,
-        }
-    }
-
-    fn param_spec_callable() -> Type {
-        // Callable[..., T] with ParamSpec P (*args: P.args, **kwargs: P.kwargs)
-        let ps = Type::ParamSpecType {
-            prefix: Box::new(crate::wire::Parameters {
-                arg_types: Vec::new(),
-                arg_kinds: Vec::new(),
-                arg_names: Vec::new(),
-                variables: Vec::new(),
-                imprecise_arg_kinds: false,
-            }),
-            name: "P".to_string(),
-            fullname: "mod.P".to_string(),
-            raw_id: 5,
-            namespace: "fn".to_string(),
-            flavor: 0,
-            upper_bound: Box::new(any_type()),
-            default: Box::new(any_type()),
-        };
-        Type::CallableType {
-            fallback: Box::new(instance_builtins_object()),
-            instance_type: None,
-            is_ellipsis_args: false,
-            implicit: false,
-            is_bound: false,
-            from_concatenate: false,
-            imprecise_arg_kinds: false,
-            unpack_kwargs: false,
-            from_type_type: false,
-            arg_types: vec![ps.clone(), ps],
-            arg_kinds: vec![2, 4], // ARG_STAR, ARG_STAR2
-            arg_names: vec![None, None],
-            ret_type: Box::new(type_var(1, "T")),
             name: None,
             variables: vec![type_var(1, "T")],
             type_guard: None,

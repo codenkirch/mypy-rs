@@ -530,7 +530,7 @@ pub(crate) fn rust_get_coroutine_return_type<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::subtypes::{COVARIANT, INVARIANT};
+    use crate::subtypes::COVARIANT;
     use crate::typeinfo::TypeInfoSnapshot;
 
     fn make_resolver(snaps: Vec<TypeInfoSnapshot>) -> TypeResolver {

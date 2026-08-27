@@ -2550,7 +2550,7 @@ mod tests {
     use super::*;
     use crate::typeinfo::NativeTypeResolver;
     use crate::typeinfo::TypeInfoSnapshot;
-    use crate::wire::{LiteralValue, Parameters, Type};
+    use crate::wire::{LiteralValue, Type};
 
     /// Empty resolver for truthiness unit tests: every case these tests
     /// exercise decides at steps 1-5, so step 6's live MRO walk never runs.
@@ -3339,13 +3339,17 @@ mod tests {
         let mut r = TypeResolver::new();
         // builtins.int must resolve (as a non-enum) for non-target Instance
         // branches: otherwise lookup fails and the whole expansion defers.
-        let mut int_snap = TypeInfoSnapshot::default();
-        int_snap.fullname = "builtins.int".to_string();
+        let int_snap = TypeInfoSnapshot {
+            fullname: "builtins.int".to_string(),
+            ..Default::default()
+        };
         r.insert("builtins.int".to_string(), int_snap);
-        let mut color = TypeInfoSnapshot::default();
-        color.fullname = "tests.Color".to_string();
-        color.is_enum = true;
-        color.enum_members = members;
+        let color = TypeInfoSnapshot {
+            fullname: "tests.Color".to_string(),
+            is_enum: true,
+            enum_members: members,
+            ..Default::default()
+        };
         r.insert("tests.Color".to_string(), color);
         r
     }

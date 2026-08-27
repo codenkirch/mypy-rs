@@ -5198,7 +5198,7 @@ mod tests {
     fn test_join_type_list_single_passthrough() {
         let i = make_instance("builtins.int", vec![]);
         assert_eq!(
-            join_type_list_inner(&[i.clone()], &make_native_resolver()),
+            join_type_list_inner(std::slice::from_ref(&i), &make_native_resolver()),
             Some(i)
         );
     }
@@ -5445,7 +5445,7 @@ mod tests {
     fn test_first_or_join_fast_item_single_instance() {
         let i = make_instance("builtins.int", vec![]);
         assert_eq!(
-            first_or_join_fast_item_inner(&[i.clone()], &make_native_resolver()),
+            first_or_join_fast_item_inner(std::slice::from_ref(&i), &make_native_resolver()),
             Some(i)
         );
     }
