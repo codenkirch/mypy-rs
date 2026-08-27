@@ -2229,7 +2229,14 @@ mod tests {
             source_any: None,
             missing_import_name: Some("mod.thing".to_string()),
         };
-        let out = solve_one_inner(std::slice::from_ref(&any), std::slice::from_ref(&any), false, true, &r).unwrap();
+        let out = solve_one_inner(
+            std::slice::from_ref(&any),
+            std::slice::from_ref(&any),
+            false,
+            true,
+            &r,
+        )
+        .unwrap();
         assert_eq!(out.0, 3);
         let decoded = decode_type(&out.1.unwrap()).unwrap();
         let Type::AnyType {

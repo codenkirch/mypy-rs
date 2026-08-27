@@ -2013,7 +2013,10 @@ mod tests {
         };
         r.insert("builtins.int".to_string(), snap);
         let inst = make_instance("builtins.int", vec![]);
-        assert_eq!(join_type_list_inner(std::slice::from_ref(&inst), true, &r), Some(inst));
+        assert_eq!(
+            join_type_list_inner(std::slice::from_ref(&inst), true, &r),
+            Some(inst)
+        );
         let none_t = Type::NoneType;
         assert_eq!(
             join_type_list_inner(std::slice::from_ref(&none_t), true, &r),
