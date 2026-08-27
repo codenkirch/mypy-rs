@@ -37541,9 +37541,10 @@ class NativeTypeGuardArgSuite(Suite):
         # lookup_qualified stub: resolve the unbound name to a node whose
         # fullname is the name itself (the wrappers precompute it Python-
         # side; only the _arg methods hit the seam).
-        ta.lookup_qualified = lambda name, ctx, suppress_errors=False: SimpleNamespace(
-            node=SimpleNamespace(fullname=name)
-        )
+        def lookup_stub(name: str, ctx: Context, suppress_errors: bool = False) -> Any:
+            return SimpleNamespace(node=SimpleNamespace(fullname=name))
+
+        ta.lookup_qualified = lookup_stub  # type: ignore[method-assign]
         return ta
 
     def _make_t(self, fullname: str, n_args: int) -> UnboundType:
