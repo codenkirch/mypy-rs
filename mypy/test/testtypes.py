@@ -24663,6 +24663,110 @@ class NativeNewSignatureSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFunctionSignatureSuite(Suite):
+    """Parity for the Rust `check_function_signature` count-arbitration port.
+
+    `SemanticAnalyzer.check_function_signature` (semanal.py:2072) compares
+    `len(sig.arg_types)` against `len(fdef.arguments)` and picks one of
+    three branches: too few (extend sig.arg_types with dummy Any + fail),
+    too many (fail blocker=True), or ok (no-op). The Rust classifier
+    (`semanal_checks.rs`) turns the two counts into a branch tag; the Python
+    shim applies the side effects and keeps the pure-Python body as the
+    fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real SemanticAnalyzer method through
+    a stub fail recorder and asserts identical (fail records, sig length)
+    pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, sig_len: int, args_len: int) -> int | None:
+        return _type_kernel.rust_classify_function_signature(sig_len, args_len)
+
+    def _fdef(self, n_args: int, sig_arg_types: list[Type]) -> FuncDef:
+        fx = TypeFixture()
+        ret = AnyType(TypeOfAny.special_form)
+        sig = CallableType(
+            list(sig_arg_types),
+            [ARG_POS] * len(sig_arg_types),
+            [None] * len(sig_arg_types),
+            ret,
+            fx.function,
+        )
+        args = [Argument(Var(f"a{i}"), None, None, ARG_POS) for i in range(n_args)]
+        fdef = FuncDef("f", args, None, sig)
+        return fdef
+
+    def _run(self, n_args: int, sig_arg_types: list[Type]) -> tuple[object, object]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> tuple[object, object]:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            msgs: list[tuple[str, bool]] = []
+            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: msgs.append(  # type: ignore[method-assign]
+                (str(msg), blocker)
+            )
+            fdef = self._fdef(n_args, list(sig_arg_types))
+            sa.check_function_signature(fdef)
+            sig = fdef.type
+            assert isinstance(sig, CallableType)
+            return (list(msgs), len(sig.arg_types))
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, n_args: int, sig_arg_types: list[Type]) -> None:
+        off, on = self._run(n_args, sig_arg_types)
+        assert_equal(
+            on, off, f"check_function_signature parity n_args={n_args} sig={sig_arg_types}"
+        )
+
+    def test_seam_ok(self) -> None:
+        assert self._tag(0, 0) == 0
+        assert self._tag(3, 3) == 0
+
+    def test_seam_too_few(self) -> None:
+        assert self._tag(0, 1) == 1
+        assert self._tag(2, 5) == 1
+
+    def test_seam_too_many(self) -> None:
+        assert self._tag(1, 0) == 2
+        assert self._tag(5, 2) == 2
+
+    def test_parity_ok(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(2, [fx.a, fx.b])
+
+    def test_parity_too_few(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(3, [fx.a, fx.b])
+
+    def test_parity_too_many(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(1, [fx.a, fx.b])
+
+    def test_parity_zero_zero(self) -> None:
+        self._assert_par(0, [])
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeFuncDefOverrideSuite(Suite):
     """Parity for the Rust `check_func_def_override` 5-way dispatch port.
 

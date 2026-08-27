@@ -683,6 +683,21 @@ including:
   covered by `NativeRawExpressionTypeSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), and pure
   decision unit tests in `typeanal_rawexpr.rs`.
+- `rust_classify_function_signature` (issue #940) — mirrors the count
+  arbitration of `SemanticAnalyzer.check_function_signature`
+  (semanal.py:2072): compares `len(sig.arg_types)` against
+  `len(fdef.arguments)` and returns a branch tag (0 ok / 1 too-few /
+  2 too-many). The Python shim applies the side effects (too-few extends
+  `sig.arg_types` with dummy `AnyType(TypeOfAny.from_error)` arguments +
+  `self.fail`; too-many `self.fail(blocker=True)`) and keeps the
+  pure-Python body as the fallback. Always decidable; never defers
+  (`None` only on a Python-side exception). Gated by the
+  `semanal_visitor` gate (`_SEMANAL_VISITOR_HAS_KERNEL` +
+  `_native_semanal_visitor_active`, wired from `mypy/build.py`) and
+  covered by `NativeFunctionSignatureSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential on fail records and sig length,
+  plus direct seam calls), and 3 pure decision unit tests in
+  `semanal_checks.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

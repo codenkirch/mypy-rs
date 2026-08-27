@@ -2082,6 +2082,10 @@ def rust_classify_add_metaclass(
     args_len: int,
     arg_kind_0_positional: bool,
 ) -> int: ...
+def rust_classify_function_signature(
+    sig_arg_types_len: int,
+    arguments_len: int,
+) -> int: ...
 def rust_create_errors(
     error_tuples: Any,
 ) -> Any: ...
