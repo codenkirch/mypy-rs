@@ -441,6 +441,7 @@ try:
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_method_signature as _rust_classify_method_signature,
         rust_classify_recalculate_metaclass as _rust_classify_recalculate_metaclass,
+        rust_classify_remove_unpack_kwargs as _rust_classify_remove_unpack_kwargs,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_simple_literal_type as _rust_classify_simple_literal_type,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -564,6 +565,7 @@ except ImportError:
     _rust_classify_method_signature = None  # type: ignore[assignment]
     _rust_classify_declared_metaclass = None  # type: ignore[assignment]
     _rust_classify_recalculate_metaclass = None  # type: ignore[assignment]
+    _rust_classify_remove_unpack_kwargs = None  # type: ignore[assignment]
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
@@ -735,6 +737,14 @@ _LVALUE_KIND_TYPEINFO = 2
 NATIVE_FIXED_ARGS_OK = 0
 NATIVE_FIXED_ARGS_WRONG_COUNT = 1
 NATIVE_FIXED_ARGS_WRONG_KINDS = 2
+
+# remove_unpack_kwargs dispatch tags (see semanal_checks.rs). PASSTHROUGH:
+# return typ unchanged; NOT_TD_FAIL: Unpack item not a TypedDict; OVERLAP_FAIL:
+# param/TypedDict-key overlap (names come back sorted); OK: full rewrite.
+_NATIVE_UNPACK_KW_PASSTHROUGH = 0
+_NATIVE_UNPACK_KW_NOT_TD_FAIL = 1
+_NATIVE_UNPACK_KW_OVERLAP_FAIL = 2
+_NATIVE_UNPACK_KW_OK = 3
 
 # configure_base_classes per-base tags (see semanal_bases.rs). Each tag maps
 # to one Python side effect: tuple handling, instance append, newtype fail,
@@ -1573,6 +1583,42 @@ class SemanticAnalyzer(
         self.pop_type_args(defn.type_args)
 
     def remove_unpack_kwargs(self, defn: FuncDef, typ: CallableType) -> CallableType:
+        # Issue #1044: native unpack-kwargs arbitration (strangler-fig).
+        # Rust classifies the guard chain + overlap set from the live CallableType
+        # facts + one wire blob; fails and rewrites stay here. None -> Python body.
+        if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
+            # Only **kw signatures reach the wire encode; the kind check
+            # mirrors the first Python guard to keep the encode cold-path.
+            last_type_wire: bytes | None = None
+            if typ.arg_kinds and typ.arg_kinds[-1] is ArgKind.ARG_STAR2:
+                try:
+                    last_type_wire = _serialize_semanal_type(typ.arg_types[-1])
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    last_type_wire = None
+            decided = _rust_classify_remove_unpack_kwargs(typ, last_type_wire)
+            if decided is not None:
+                tag, overlapped_names = decided
+                if tag == _NATIVE_UNPACK_KW_PASSTHROUGH:
+                    return typ
+                last_type = typ.arg_types[-1]
+                if tag == _NATIVE_UNPACK_KW_NOT_TD_FAIL:
+                    self.fail("Unpack item in ** parameter must be a TypedDict", last_type)
+                    new_arg_types = typ.arg_types[:-1] + [AnyType(TypeOfAny.from_error)]
+                    return typ.copy_modified(arg_types=new_arg_types)
+                if tag == _NATIVE_UNPACK_KW_OVERLAP_FAIL:
+                    overlapped = ", ".join(f'"{name}"' for name in overlapped_names)
+                    self.fail(
+                        f"Overlap between parameter names and ** TypedDict items: {overlapped}",
+                        defn,
+                    )
+                    new_arg_types = typ.arg_types[:-1] + [AnyType(TypeOfAny.from_error)]
+                    return typ.copy_modified(arg_types=new_arg_types)
+                assert tag == _NATIVE_UNPACK_KW_OK
+                p_last_type = get_proper_type(
+                    cast(UnpackType, typ.arg_types[-1]).type
+                )
+                new_arg_types = typ.arg_types[:-1] + [p_last_type]
+                return typ.copy_modified(arg_types=new_arg_types, unpack_kwargs=True)
         if not typ.arg_kinds or typ.arg_kinds[-1] is not ArgKind.ARG_STAR2:
             return typ
         last_type = typ.arg_types[-1]

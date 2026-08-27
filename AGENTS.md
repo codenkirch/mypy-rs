@@ -1561,3 +1561,17 @@ directly to `main`.
   `NativeTypeGuardArgSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
   differential plus direct seam calls), plus pure decision unit tests in
   `typeanal_special.rs`.
+- `rust_classify_remove_unpack_kwargs` (issue #1044) — mirrors the guard
+  chain + overlap-set arbitration head of
+  `SemanticAnalyzer.remove_unpack_kwargs` (semanal.py:1586-1620): Rust
+  reads the live `CallableType` `arg_kinds`/`arg_names` via PyO3 plus one
+  wire serialization of the last arg type (UnpackType tag, then the
+  target proper-type tag == TypedDictType) and returns a 4-way tag
+  (PASSTHROUGH / NOT_TD_FAIL / OVERLAP_FAIL with the sorted overlap list
+  minus the trailing kwargs name / OK). Python applies both `self.fail`
+  emissions, the AnyType(from_error) rewrites, and the OK-path
+  `arg_types[:-1] + [p_last_type]` + `unpack_kwargs=True` rewrite. Defers
+  (None) on a failed/undecodable last-arg wire serialization or an alias
+  target (`get_proper_type` needs the live alias). Gated by
+  `_native_semanal_visitor_active` and covered by
+  `NativeRemoveUnpackKwargsSuite` in `mypy/test/testtypes.py`.

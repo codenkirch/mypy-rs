@@ -44,7 +44,7 @@ from mypy.nodes import (
     TypeInfo,
     Var,
 )
-from mypy.types import ProperType, TupleType, Type, TypeVarLikeType
+from mypy.types import CallableType, ProperType, TupleType, Type, TypeVarLikeType
 
 T = TypeVar("T")
 
@@ -265,6 +265,7 @@ __all__ = [
     "rust_classify_decorators",
     "rust_classify_imports",
     "rust_classify_setup_type_vars",
+    "rust_classify_remove_unpack_kwargs",
     "rust_visit_list_set_expr",
     "rust_visit_dict_expr",
     "rust_visit_template_str_expr",
@@ -1563,6 +1564,10 @@ def rust_classify_method_signature(
     expected_self: bool | None,
     has_self_type: bool,
 ) -> tuple[bool, bool, int] | None: ...
+def rust_classify_remove_unpack_kwargs(
+    typ: CallableType,
+    last_type_wire: bytes | None,
+) -> tuple[int, list[str]] | None: ...
 def rust_extract_typevarlike_name(
     s: AssignmentStmt,
     call: CallExpr,
