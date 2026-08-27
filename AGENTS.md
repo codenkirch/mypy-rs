@@ -512,6 +512,16 @@ including:
   Measured (self-check): 18623 calls, 13049 decided (70% native).
   Covered by `NativeProtocolImplementationSuite` in
   `mypy/test/testtypes.py`.
+- `rust_has_abstract_type` (mypy.checkexpr) — mirrors
+  `TypeChecker.has_abstract_type` (checkexpr.py:8134-8143): a pure
+  boolean conjunction over live types. The seam reads live Python
+  objects via PyO3 (isinstance against `FunctionLike`/`TypeType`/
+  `Instance`, `is_type_obj`/`type_object` method calls, `is_abstract`/
+  `is_protocol` bool attrs) and short-circuits on `allow_abstract_call`,
+  so it never defers and always returns a plain bool. Gated by
+  `_native_checkexpr_active` (wired from `mypy/build.py`) and covered by
+  `NativeHasAbstractTypeSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

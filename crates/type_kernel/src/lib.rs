@@ -409,6 +409,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(applytype::rust_has_no_typevars, module)?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_has_abstract_type,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_has_any_type,
         module
     )?)?;

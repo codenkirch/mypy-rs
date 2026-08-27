@@ -23777,6 +23777,195 @@ class NativeTypedDictCallSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeHasAbstractTypeSuite(Suite):
+    """Parity for the Rust `has_abstract_type` port (mypy.checkexpr).
+
+    `has_abstract_type` (checkexpr.py:8134-8143) is a pure boolean
+    conjunction over live types: caller must be a FunctionLike whose
+    `is_type_obj()` is True, whose `type_object()` is abstract or protocol;
+    callee must be a TypeType whose item Instance is abstract or protocol;
+    and `allow_abstract_call` must be False. The Rust seam reads the live
+    Python objects (isinstance, is_type_obj/type_object method calls,
+    is_abstract/is_protocol bool reads) and never defers, so every decided
+    case returns a plain bool. Gate-off vs gate-on runs must agree and the
+    direct seam call must engage (non-None).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        _set_native_checkexpr_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(False)
+
+    def _info(
+        self, fullname: str, *, abstract: bool = False, protocol: bool = False
+    ) -> TypeInfo:
+        info = self.fx.make_type_info(fullname)
+        info.is_abstract = abstract
+        info.is_protocol = protocol
+        return info
+
+    def _caller(self, ret_info: TypeInfo) -> CallableType:
+        # fallback.type is builtins.type (is_metaclass() True) and ret_type
+        # is an Instance, so is_type_obj() is True and type_object()
+        # resolves force_fallback(ret_type).type == ret_info.
+        return CallableType(
+            [], [], [], Instance(ret_info, []), Instance(self.fx.type_typei, [])
+        )
+
+    def _callee(self, info: TypeInfo) -> TypeType:
+        return TypeType(Instance(info, []))
+
+    def _make_checker(self) -> ExpressionChecker:  # type: ignore[name-defined]
+        from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+        from mypy.nodes import MypyFile, SymbolTable
+        from mypy.plugin import Plugin
+
+        options = Options()
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        chk = TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+        msg = MessageBuilder(errors, modules)
+        return ExpressionChecker(chk, msg, Plugin(options), {})
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        _set_native_checkexpr_active(active)
+        try:
+            return fn()
+        finally:
+            _set_native_checkexpr_active(True)
+
+    def _assert_par(
+        self, caller: ProperType, callee: ProperType, allow: bool, expected: bool
+    ) -> None:
+        expr = self._make_checker()
+        expr.chk.allow_abstract_call = allow
+        off = self._with_gate(False, lambda: expr.has_abstract_type(caller, callee))
+        on = self._with_gate(True, lambda: expr.has_abstract_type(caller, callee))
+        assert off == expected, f"gate-off {caller!r}/{callee!r}: {off} != {expected}"
+        assert on == expected, f"gate-on {caller!r}/{callee!r}: {on} != {expected}"
+
+    def _assert_seam(
+        self, caller: ProperType, callee: ProperType, allow: bool, expected: bool
+    ) -> None:
+        result = _type_kernel.rust_has_abstract_type(caller, callee, allow)
+        assert result is not None, f"Rust deferred on {caller!r}/{callee!r}"
+        assert result == expected, f"Rust seam {caller!r}/{callee!r}: {result} != {expected}"
+
+    def test_abstract_to_protocol_true(self) -> None:
+        caller = self._caller(self._info("mod.Abs", abstract=True))
+        callee = self._callee(self._info("mod.Proto", protocol=True))
+        self._assert_par(caller, callee, False, True)
+        self._assert_seam(caller, callee, False, True)
+
+    def test_allow_abstract_call_short_circuits(self) -> None:
+        caller = self._caller(self._info("mod.Abs", abstract=True))
+        callee = self._callee(self._info("mod.Proto", protocol=True))
+        self._assert_par(caller, callee, True, False)
+        self._assert_seam(caller, callee, True, False)
+
+    def test_caller_not_functionlike_false(self) -> None:
+        caller = Instance(self._info("mod.A"), [])
+        callee = self._callee(self._info("mod.Proto", protocol=True))
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_callee_not_typetype_false(self) -> None:
+        caller = self._caller(self._info("mod.Abs", abstract=True))
+        callee = Instance(self._info("mod.Proto", protocol=True), [])
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_caller_not_type_obj_false(self) -> None:
+        caller = CallableType(
+            [],
+            [],
+            [],
+            Instance(self._info("mod.Abs", abstract=True), []),
+            Instance(self.fx.functioni, []),
+        )
+        callee = self._callee(self._info("mod.Proto", protocol=True))
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_caller_type_object_not_abstract_false(self) -> None:
+        caller = self._caller(self._info("mod.Concrete"))
+        callee = self._callee(self._info("mod.Proto", protocol=True))
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_callee_item_not_instance_false(self) -> None:
+        caller = self._caller(self._info("mod.Abs", abstract=True))
+        callee = TypeType(AnyType(TypeOfAny.special_form))
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_callee_item_not_abstract_false(self) -> None:
+        caller = self._caller(self._info("mod.Abs", abstract=True))
+        callee = self._callee(self._info("mod.Concrete"))
+        self._assert_par(caller, callee, False, False)
+        self._assert_seam(caller, callee, False, False)
+
+    def test_protocol_to_abstract_true(self) -> None:
+        caller = self._caller(self._info("mod.Proto", protocol=True))
+        callee = self._callee(self._info("mod.Abs", abstract=True))
+        self._assert_par(caller, callee, False, True)
+        self._assert_seam(caller, callee, False, True)
+
+    def test_tuple_part_propagates_true(self) -> None:
+        # The TupleType branch zips items pairwise through
+        # has_abstract_type: each caller item must be a class-object
+        # callable and each callee item a TypeType(Instance).
+        caller = TupleType(
+            [
+                self._caller(self._info("mod.Abs", abstract=True)),
+                self._caller(self._info("mod.Concrete")),
+            ],
+            self.fx.std_tuple,
+        )
+        callee = TupleType(
+            [
+                self._callee(self._info("mod.Proto", protocol=True)),
+                self._callee(self._info("mod.Concrete2")),
+            ],
+            self.fx.std_tuple,
+        )
+        expr = self._make_checker()
+        off = self._with_gate(False, lambda: expr.has_abstract_type_part(caller, callee))
+        on = self._with_gate(True, lambda: expr.has_abstract_type_part(caller, callee))
+        assert off is True, f"gate-off tuple {off} != True"
+        assert on is True, f"gate-on tuple {on} != True"
+
+    def test_tuple_part_no_match_false(self) -> None:
+        caller = TupleType(
+            [self._caller(self._info("mod.Concrete"))],
+            self.fx.std_tuple,
+        )
+        callee = TupleType(
+            [self._callee(self._info("mod.Concrete2"))],
+            self.fx.std_tuple,
+        )
+        expr = self._make_checker()
+        off = self._with_gate(False, lambda: expr.has_abstract_type_part(caller, callee))
+        on = self._with_gate(True, lambda: expr.has_abstract_type_part(caller, callee))
+        assert off is False, f"gate-off tuple {off} != False"
+        assert on is False, f"gate-on tuple {on} != False"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSubtypesCallableSuite(Suite):
     """Parity for the native Callable-vs-Callable routing in
     `rust_is_subtype` (Stage C1, #719).

@@ -732,6 +732,96 @@ fn has_erased_component_inner_seen(
 }
 
 // ---------------------------------------------------------------------------
+// has_abstract_type
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.ExpressionChecker.has_abstract_type`
+/// (checkexpr.py:8134-8143): pure boolean conjunction on two live
+/// `mypy.types.ProperType` objects.
+///
+/// Mirrors the Python body:
+///   isinstance(caller_type, FunctionLike)
+///   and isinstance(callee_type, TypeType)
+///   and caller_type.is_type_obj()
+///   and (caller_type.type_object().is_abstract
+///        or caller_type.type_object().is_protocol)
+///   and isinstance(callee_type.item, Instance)
+///   and (callee_type.item.type.is_abstract
+///        or callee_type.item.type.is_protocol)
+///   and not allow_abstract_call
+///
+/// `is_type_obj()` and `type_object()` are read by calling the live
+/// Python methods: `is_type_obj` walks `fallback.type.is_metaclass()`'s
+/// MRO and `get_proper_type(ret_type)`, while `type_object` runs the
+/// `force_fallback` coercion chain in `get_instance_type`. The wire
+/// format cannot reconstruct those without a resolver, so this seam
+/// delegates them to the same live methods the pure-Python body calls.
+/// Reading `is_abstract` / `is_protocol` is a plain `bool` attribute
+/// read on the live `TypeInfo`, so the truth value reduces to scalar
+/// bools and the function never defers.
+#[pyfunction]
+pub(crate) fn rust_has_abstract_type(
+    py: Python<'_>,
+    caller_type: &PyAny,
+    callee_type: &PyAny,
+    allow_abstract_call: bool,
+) -> PyResult<Option<bool>> {
+    Ok(has_abstract_type_inner(
+        py,
+        caller_type,
+        callee_type,
+        allow_abstract_call,
+    ))
+}
+
+fn has_abstract_type_inner(
+    py: Python<'_>,
+    caller_type: &PyAny,
+    callee_type: &PyAny,
+    allow_abstract_call: bool,
+) -> Option<bool> {
+    use crate::typeinfo::read_bool_attr;
+    if allow_abstract_call {
+        return Some(false);
+    }
+    let mypy_types = py.import("mypy.types").ok()?;
+    let function_like = mypy_types.getattr("FunctionLike").ok()?;
+    if !caller_type.is_instance(function_like).ok()? {
+        return Some(false);
+    }
+    let type_type = mypy_types.getattr("TypeType").ok()?;
+    if !callee_type.is_instance(type_type).ok()? {
+        return Some(false);
+    }
+    let is_type_obj: bool = caller_type
+        .call_method0("is_type_obj")
+        .ok()?
+        .extract()
+        .ok()?;
+    if !is_type_obj {
+        return Some(false);
+    }
+    let type_obj = caller_type.call_method0("type_object").ok()?;
+    if !read_bool_attr(type_obj, "is_abstract").unwrap_or(false)
+        && !read_bool_attr(type_obj, "is_protocol").unwrap_or(false)
+    {
+        return Some(false);
+    }
+    let item = callee_type.getattr("item").ok()?;
+    let instance_cls = mypy_types.getattr("Instance").ok()?;
+    if !item.is_instance(instance_cls).ok()? {
+        return Some(false);
+    }
+    let item_type = item.getattr("type").ok()?;
+    if !read_bool_attr(item_type, "is_abstract").unwrap_or(false)
+        && !read_bool_attr(item_type, "is_protocol").unwrap_or(false)
+    {
+        return Some(false);
+    }
+    Some(true)
+}
+
+// ---------------------------------------------------------------------------
 // has_bytes_component
 // ---------------------------------------------------------------------------
 
