@@ -1393,7 +1393,11 @@ mod explicit_override_decorator_tests {
 
     #[test]
     fn test_private_name_suppresses() {
+        // `is_private` requires starts_with("__") and not ends_with("__").
         assert!(!classify(false, true, false, "__private"));
-        assert!(!classify(false, true, false, "_single"));
+        // Single underscore is NOT private by mypy's definition.
+        assert!(classify(false, true, false, "_single"));
+        // Dunder names are not private either.
+        assert!(classify(false, true, false, "__dunder__"));
     }
 }
