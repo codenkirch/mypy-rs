@@ -1000,6 +1000,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        messages::rust_classify_has_no_attr,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkstrformat::rust_is_numeric_format_type,
         module
     )?)?;

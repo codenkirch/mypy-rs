@@ -34500,3 +34500,351 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         self._assert_direct(_DEPRECATED_TAG_NOTE, report_note=True)
         self._assert_direct(_DEPRECATED_TAG_FAIL, report_note=False)
 
+
+
+class NativeHasNoAttrSuite(Suite):
+    """Gate-on/off differential for rust_classify_has_no_attr (issue #1006).
+
+    Rust arbitrates the `Messages.has_no_attr` dispatch head
+    (mypy/messages.py:364-569) from scalar facts and returns a
+    (tag, op, matches) triple; Python applies the fail / note /
+    unsupported_left_operand side effects and all formatting. Each
+    differential test runs has_no_attr with the gate off (pure-Python
+    body) and on (the shim) and asserts identical messages and codes.
+    Direct seam tests pin every tag.
+    """
+
+    def setUp(self) -> None:
+        from mypy.messages import _set_native_messages_active
+
+        self.fx = TypeFixture()
+        self.options = Options()
+        self._set_active = _set_native_messages_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _make_builder(self) -> tuple[object, list[tuple[str, object]]]:
+        from mypy import errorcodes as codes
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+
+        errors = Errors(self.options)
+        builder = MessageBuilder(errors, {})
+        captured: list[tuple[str, object]] = []
+        builder.fail = (  # type: ignore[assignment]
+            lambda msg, ctx, code=None, **kw: captured.append((msg, code))
+        )
+        builder.note = (  # type: ignore[assignment]
+            lambda msg, ctx, offset=0, code=None, **kw: captured.append((msg, code))
+        )
+        builder.unsupported_left_operand = (  # type: ignore[assignment]
+            lambda op, typ, ctx: captured.append(("__left__:" + op, codes.OPERATOR))
+        )
+        return builder, captured
+
+    def _assert_par(
+        self,
+        original_type: Type,
+        typ: Type,
+        member: str,
+        module_symbol_table: SymbolTable | None = None,
+        disable_type_names: bool = False,
+    ) -> list[tuple[str, object]]:
+        results = []
+        for active in (False, True):
+            self._set_active(active)
+            builder, captured = self._make_builder()
+            if disable_type_names:
+                builder._disable_type_names = [True]
+            code = builder.has_no_attr(
+                original_type, typ, member, Context(), module_symbol_table
+            )
+            results.append((code, captured))
+        self._set_active(True)
+        assert_equal(
+            results[1], results[0], f"has_no_attr({original_type}, {member!r}) parity"
+        )
+        return results[0]
+
+    def _seam(
+        self,
+        member: str,
+        is_instance: bool = False,
+        is_function_like: bool = False,
+        is_type_obj: bool = False,
+        is_union: bool = False,
+        is_typevar: bool = False,
+        typevar_bound_is_union: bool = False,
+        has_readable_member: bool = False,
+        instance_fullname: str = "",
+        are_type_names_disabled: bool = False,
+        instance_has_names: bool = False,
+        module_private: bool = False,
+        instance_names: list[str] | None = None,
+        module_public_names: list[str] | None = None,
+    ) -> tuple[int, str, list[str]]:
+        return _type_kernel.rust_classify_has_no_attr(
+            member,
+            is_instance,
+            is_function_like,
+            is_type_obj,
+            is_union,
+            is_typevar,
+            typevar_bound_is_union,
+            has_readable_member,
+            instance_fullname,
+            are_type_names_disabled,
+            instance_has_names,
+            module_private,
+            instance_names or [],
+            module_public_names or [],
+        )
+
+    def _info(self, fullname: str, names: dict[str, str]) -> Instance:
+        # Build a live TypeInfo with the given member names (all Vars).
+        from mypy.nodes import Block, ClassDef
+
+        short = fullname.split(".")[-1]
+        class_def = ClassDef(short, Block([]), None, [])
+        class_def.fullname = fullname
+        info = TypeInfo(SymbolTable(), class_def, fullname.split(".")[0])
+        info.mro = [info]
+        info.bases = []
+        for name in names:
+            info.names[name] = SymbolTableNode(MDEF, Var(name, self.fx.a))
+        return Instance(info, [])
+
+    def _module_table(self, entries: dict[str, bool]) -> SymbolTable:
+        # SymbolTableNode.module_public defaults to None (falsy); only the
+        # entries listed as public get an explicit True.
+        table = SymbolTable()
+        for name, public in entries.items():
+            node = SymbolTableNode(MDEF, Var(name, self.fx.a))
+            node.module_public = public
+            table[name] = node
+        return table
+
+    # -- direct seam tests ------------------------------------------------
+
+    def test_seam_not_assignable(self) -> None:
+        assert self._seam("x", is_instance=True, has_readable_member=True)[0] == 0
+
+    def test_seam_operators(self) -> None:
+        assert self._seam("__contains__")[0] == 1
+        tag, op, _ = self._seam("__add__")
+        assert (tag, op) == (2, "+")
+        assert self._seam("__neg__")[0] == 3
+        assert self._seam("__pos__")[0] == 4
+        assert self._seam("__invert__")[0] == 5
+
+    def test_seam_index_and_call(self) -> None:
+        assert (
+            self._seam("__getitem__", is_function_like=True, is_type_obj=True)[0] == 6
+        )
+        assert self._seam("__getitem__", is_function_like=True)[0] == 7
+        assert self._seam("__getitem__")[0] == 7
+        assert self._seam("__setitem__")[0] == 8
+        assert self._seam("__call__", is_instance=True, instance_fullname="builtins.function")[0] == 9
+        assert self._seam("__call__")[0] == 10
+
+    def test_seam_suggestions(self) -> None:
+        # COMMON_MISTAKES["add"] = ("append", "extend").
+        tag, _, matches = self._seam(
+            "add",
+            is_instance=True,
+            instance_has_names=True,
+            instance_names=["append"],
+        )
+        assert (tag, matches) == (12, ["append"])
+        # Matches may also come from public module names.
+        tag, _, matches = self._seam(
+            "appnd",
+            is_instance=True,
+            instance_has_names=True,
+            instance_names=["apend"],
+            module_public_names=["append"],
+        )
+        assert tag == 12
+        assert "append" in matches and "apend" in matches
+
+    def test_seam_tail_tags(self) -> None:
+        assert self._seam("x", is_instance=True, instance_has_names=True, module_private=True)[0] == 11
+        assert self._seam("zz", is_instance=True, instance_has_names=True, instance_names=["a"])[0] == 13
+        assert self._seam("x", is_instance=True, instance_has_names=False)[0] == 16
+        # With type names enabled, union and typevar shapes land in the
+        # plain else-branch; their own messages need the names-disabled
+        # mode.
+        assert self._seam("x", is_union=True)[0] == 16
+        assert self._seam("x", is_typevar=True, typevar_bound_is_union=True)[0] == 16
+        assert self._seam("x", is_typevar=True, typevar_bound_is_union=False)[0] == 16
+        # Disabled: union item, typevar union bound, silent typevar, plain.
+        assert self._seam("x", is_union=True, are_type_names_disabled=True)[0] == 14
+        assert (
+            self._seam(
+                "x", is_typevar=True, typevar_bound_is_union=True, are_type_names_disabled=True
+            )[0]
+            == 15
+        )
+        assert (
+            self._seam(
+                "x", is_typevar=True, typevar_bound_is_union=False, are_type_names_disabled=True
+            )[0]
+            == 17
+        )
+        assert self._seam("zz", is_instance=True, are_type_names_disabled=True)[0] == 16
+
+    # -- gate-off vs gate-on differentials ---------------------------------
+
+    def test_not_assignable(self) -> None:
+        inst = self._info("mod.C", {"x": "var"})
+        code, captured = self._assert_par(inst, inst, "x")
+        assert code is None
+        assert captured == [('Member "x" is not assignable', None)]
+
+    def test_contains(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__contains__")
+        assert code == codes.OPERATOR
+        assert captured[0][0] == 'Unsupported right operand type for in ("A")'
+
+    def test_binary_op_method(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__add__")
+        assert code == codes.OPERATOR
+        assert captured == [("__left__:+", codes.OPERATOR)]
+
+    def test_unary_operators(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__neg__")
+        assert code == codes.OPERATOR
+        assert captured[0][0] == 'Unsupported operand type for unary - ("A")'
+        self._assert_par(self.fx.a, self.fx.a, "__pos__")
+        self._assert_par(self.fx.a, self.fx.a, "__invert__")
+
+    def test_getitem_type_obj(self) -> None:
+        # A class object: FunctionLike with is_type_obj() True.
+        type_obj = CallableType([], [], [], self.fx.a, self.fx.type_type)
+        code, captured = self._assert_par(type_obj, type_obj, "__getitem__")
+        assert code is None
+        assert "not generic and not indexable" in captured[0][0]
+
+    def test_getitem_not_indexable(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__getitem__")
+        assert code == codes.INDEX
+        assert captured[0][0] == 'Value of type "A" is not indexable'
+
+    def test_setitem(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__setitem__")
+        assert code == codes.INDEX
+        assert "Unsupported target for indexed assignment" in captured[0][0]
+
+    def test_call(self) -> None:
+        from mypy import errorcodes as codes
+
+        code, captured = self._assert_par(self.fx.a, self.fx.a, "__call__")
+        assert code == codes.OPERATOR
+        assert captured[0][0] == '"A" not callable'
+        code, captured = self._assert_par(self.fx.function, self.fx.function, "__call__")
+        assert code == codes.OPERATOR
+        assert captured[0][0] == "Cannot call function of unknown type"
+
+    def test_module_private_export(self) -> None:
+        from mypy import errorcodes as codes
+
+        inst = self._info("other.mod.C", {"a": "var"})
+        table = self._module_table({"x": False})
+        code, captured = self._assert_par(inst, inst, "x", table)
+        assert code == codes.ATTR_DEFINED
+        assert 'does not explicitly export attribute "x"' in captured[0][0]
+
+    def test_suggestion_message(self) -> None:
+        from mypy import errorcodes as codes
+
+        inst = self._info("m.C", {"append": "var"})
+        code, captured = self._assert_par(inst, inst, "add")
+        assert code == codes.ATTR_DEFINED
+        assert captured[0][0] == '"C" has no attribute "add"; maybe "append"?'
+
+    def test_plain_attribute(self) -> None:
+        from mypy import errorcodes as codes
+
+        inst = self._info("m.C", {"append": "var"})
+        code, captured = self._assert_par(inst, inst, "zz")
+        assert code == codes.ATTR_DEFINED
+        assert captured[0][0] == '"C" has no attribute "zz"'
+
+    def test_union_item(self) -> None:
+        from mypy import errorcodes as codes
+
+        u = UnionType([self.fx.a, self.fx.nonet])
+        # The union-item message only fires with type names disabled; the
+        # not-disabled tail produces the plain attr-defined message.
+        code, captured = self._assert_par(u, self.fx.a, "x", disable_type_names=True)
+        assert code == codes.UNION_ATTR
+        assert captured[0][0] == 'Item "A" of "A | None" has no attribute "x"'
+        code, captured = self._assert_par(u, self.fx.a, "x")
+        assert code == codes.ATTR_DEFINED
+        assert captured[0][0] == '"A | None" has no attribute "x"'
+
+    def test_union_none_swap(self) -> None:
+        from mypy import errorcodes as codes
+
+        # The None-swap needs typ_format == '"object"'; find_type_overlaps
+        # forces fullnames here ("builtins.object"), so the swap does not
+        # trigger under this fixture and both gate sides render fullnames.
+        u = UnionType([self.fx.o, self.fx.nonet])
+        code, captured = self._assert_par(u, self.fx.o, "x", disable_type_names=True)
+        assert code == codes.UNION_ATTR
+        assert captured[0][0] == 'Item "builtins.object" of "builtins.object | None" has no attribute "x"'
+
+    def test_typevar_union_bound(self) -> None:
+        from mypy import errorcodes as codes
+
+        tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            UnionType([self.fx.a, self.fx.nonet]),
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        code, captured = self._assert_par(tv, self.fx.a, "x", disable_type_names=True)
+        assert code == codes.UNION_ATTR
+        assert captured[0][0] == (
+            'Item "A" of the upper bound "A | None" of type variable "T" has no attribute "x"'
+        )
+
+    def test_typevar_plain_bound_silent(self) -> None:
+        # Only the names-disabled tail is silent for a non-union bound; the
+        # not-disabled tail produces the plain attr-defined message.
+        tv = TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+        code, captured = self._assert_par(tv, self.fx.a, "x", disable_type_names=True)
+        assert code is None
+        assert captured == []
+        code, captured = self._assert_par(tv, self.fx.a, "x")
+        assert captured[0][0] == '"T" has no attribute "x"'
+
+    def test_type_names_disabled(self) -> None:
+        # With type names disabled the tail switches to the disabled
+        # dispatch chain; a suggestion-capable Instance gets the plain
+        # message instead of the suggestion.
+        inst = self._info("m.C", {"append": "var"})
+        code, captured = self._assert_par(inst, inst, "add", disable_type_names=True)
+        assert code is not None and code.code == "attr-defined"
+        assert captured[0][0] == '"C" has no attribute "add"'

@@ -388,6 +388,38 @@ class MessageBuilder:
         original_type = get_proper_type(original_type)
         typ = get_proper_type(typ)
 
+        if _HAS_TYPE_KERNEL and _native_messages_active:
+            try:
+                tag, op, matches = _type_kernel.rust_classify_has_no_attr(
+                    member,
+                    isinstance(original_type, Instance),
+                    isinstance(original_type, FunctionLike),
+                    isinstance(original_type, FunctionLike) and original_type.is_type_obj(),
+                    isinstance(original_type, UnionType),
+                    isinstance(original_type, TypeVarType),
+                    isinstance(original_type, TypeVarType)
+                    and isinstance(get_proper_type(original_type.upper_bound), UnionType),
+                    isinstance(original_type, Instance)
+                    and original_type.type.has_readable_member(member),
+                    original_type.type.fullname if isinstance(original_type, Instance) else "",
+                    self.are_type_names_disabled(),
+                    isinstance(original_type, Instance) and bool(original_type.type.names),
+                    module_symbol_table is not None
+                    and member in module_symbol_table
+                    and not module_symbol_table[member].module_public,
+                    list(original_type.type.names) if isinstance(original_type, Instance) else [],
+                    (
+                        [k for k, v in module_symbol_table.items() if v.module_public]
+                        if module_symbol_table is not None
+                        else []
+                    ),
+                )
+                return self._apply_has_no_attr(
+                    tag, op, matches, original_type, typ, member, context
+                )
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
+
         if isinstance(original_type, Instance) and original_type.type.has_readable_member(member):
             self.fail(f'Member "{member}" is not assignable', context)
             return None
@@ -566,6 +598,148 @@ class MessageBuilder:
                     code=codes.ATTR_DEFINED,
                 )
                 return codes.ATTR_DEFINED
+        return None
+
+    def _apply_has_no_attr(
+        self,
+        tag: int,
+        op: str,
+        matches: list[str],
+        original_type: ProperType,
+        typ: Type,
+        member: str,
+        context: Context,
+    ) -> ErrorCode | None:
+        """Apply the branch chosen by rust_classify_has_no_attr.
+
+        Tag meanings: 0 not-assignable, 1 `in`, 2 binary op method (`op` is
+        the operator), 3/4/5 unary -, +, ~, 6/7 getitem (type-obj/index),
+        8 setitem, 9/10 call (unknown-type/not-callable), 11 module-private
+        export, 12 suggestion (`matches` non-empty), 13 plain Instance miss,
+        14 union item, 15 typevar union upper bound, 16 plain fallback,
+        17 no message (only a typevar with a non-union bound). Formatting
+        stays here because it needs live types/options.
+        """
+        extra = ""
+        if member == "__iter__":
+            extra = " (not iterable)"
+        elif member == "__aiter__":
+            extra = " (not async iterable)"
+        if tag == 0:
+            self.fail(f'Member "{member}" is not assignable', context)
+            return None
+        if tag == 1:
+            self.fail(
+                f"Unsupported right operand type for in ({format_type(original_type, self.options)})",
+                context,
+                code=codes.OPERATOR,
+            )
+            return codes.OPERATOR
+        if tag == 2:
+            self.unsupported_left_operand(op, original_type, context)
+            return codes.OPERATOR
+        if tag in (3, 4, 5):
+            # Python renders ~ without the "unary" qualifier (messages.py:422).
+            symbol = {3: "unary -", 4: "unary +", 5: "~"}[tag]
+            self.fail(
+                f"Unsupported operand type for {symbol} "
+                f"({format_type(original_type, self.options)})",
+                context,
+                code=codes.OPERATOR,
+            )
+            return codes.OPERATOR
+        if tag == 6:
+            self.fail(
+                "The type {} is not generic and not indexable".format(
+                    format_type(original_type, self.options)
+                ),
+                context,
+            )
+            return None
+        if tag == 7:
+            self.fail(
+                f"Value of type {format_type(original_type, self.options)} is not indexable",
+                context,
+                code=codes.INDEX,
+            )
+            return codes.INDEX
+        if tag == 8:
+            self.fail(
+                "Unsupported target for indexed assignment ({})".format(
+                    format_type(original_type, self.options)
+                ),
+                context,
+                code=codes.INDEX,
+            )
+            return codes.INDEX
+        if tag == 9:
+            self.fail("Cannot call function of unknown type", context, code=codes.OPERATOR)
+            return codes.OPERATOR
+        if tag == 10:
+            self.fail(
+                message_registry.NOT_CALLABLE.format(format_type(original_type, self.options)),
+                context,
+                code=codes.OPERATOR,
+            )
+            return codes.OPERATOR
+        if tag == 11:
+            self.fail(
+                f"{format_type(original_type, self.options, module_names=True)} does not "
+                f'explicitly export attribute "{member}"',
+                context,
+                code=codes.ATTR_DEFINED,
+            )
+            return codes.ATTR_DEFINED
+        if tag == 12:
+            self.fail(
+                '{} has no attribute "{}"; maybe {}?{}'.format(
+                    format_type(original_type, self.options),
+                    member,
+                    pretty_seq(matches, "or"),
+                    extra,
+                ),
+                context,
+                code=codes.ATTR_DEFINED,
+            )
+            return codes.ATTR_DEFINED
+        if tag in (13, 16):
+            self.fail(
+                '{} has no attribute "{}"{}'.format(
+                    format_type(original_type, self.options), member, extra
+                ),
+                context,
+                code=codes.ATTR_DEFINED,
+            )
+            return codes.ATTR_DEFINED
+        if tag == 14:
+            typ_format, orig_type_format = format_type_distinctly(
+                typ, original_type, options=self.options
+            )
+            # The checker passes "object" in lieu of "None" for attribute
+            # checks, so we manually convert it back.
+            if typ_format == '"object"' and any(
+                type(item) == NoneType for item in original_type.items
+            ):
+                typ_format = '"None"'
+            self.fail(
+                'Item {} of {} has no attribute "{}"{}'.format(
+                    typ_format, orig_type_format, member, extra
+                ),
+                context,
+                code=codes.UNION_ATTR,
+            )
+            return codes.UNION_ATTR
+        if tag == 15:
+            bound = get_proper_type(original_type.upper_bound)
+            typ_fmt, bound_fmt = format_type_distinctly(typ, bound, options=self.options)
+            original_type_fmt = format_type(original_type, self.options)
+            self.fail(
+                "Item {} of the upper bound {} of type variable {} has no "
+                'attribute "{}"{}'.format(typ_fmt, bound_fmt, original_type_fmt, member, extra),
+                context,
+                code=codes.UNION_ATTR,
+            )
+            return codes.UNION_ATTR
         return None
 
     def unsupported_operand_types(
