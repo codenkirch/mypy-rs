@@ -2898,6 +2898,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #971: check_enum multi-arm classifier. Rust classifies the
+    // three arms (a/b/c) and returns bit flags + offending base names;
+    // self.fail/note stay Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_enum,
+        module
+    )?)?;
+
     // Issue #936: is_final_enum_value pure bool predicate. Rust reads the
     // live SymbolTableNode via PyO3 and returns the bool directly.
     module.add_function(wrap_pyfunction!(

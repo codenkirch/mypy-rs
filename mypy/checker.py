@@ -333,6 +333,7 @@ try:
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_enum_bases as _rust_classify_enum_bases,
+        rust_classify_enum as _rust_classify_enum,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_classvar_super as _rust_classify_classvar_super,
@@ -418,6 +419,7 @@ except ImportError:
     _rust_classify_match_args = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
+    _rust_classify_enum = None  # type: ignore[assignment]
     _rust_check_explicit_override_decorator = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
@@ -507,6 +509,11 @@ NATIVE_METACLASS_COMPAT_CONFLICT = 1
 NATIVE_ENUM_NEW_SKIP = 0
 NATIVE_ENUM_NEW_ADVANCE = 1
 NATIVE_ENUM_NEW_CONFLICT = 2
+
+# Bit-flag tags returned by `_rust_classify_enum`; must match
+# `ENUM_CHECK_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_ENUM_CHECK_MEMBERS_OVERRIDE = 1
+NATIVE_ENUM_CHECK_STUB_EMPTY = 2
 
 # Decision tags returned by `_rust_classify_check_lvalue`; must match
 # `KIND_LVALUE_*` in crates/type_kernel/src/checker_functions.rs.
@@ -3874,6 +3881,50 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_enum(self, defn: ClassDef) -> None:
         assert defn.info.is_enum
+        # Native type_kernel seam: classify the three arms in Rust
+        # (checker_functions.rs); self.fail/note stay here. None
+        # falls through to the pure-Python body.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_enum is not None
+        ):
+            try:
+                result = _rust_classify_enum(
+                    defn.info, self.is_stub, self.tree.fullname,
+                    list(ENUM_BASES),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                result = None
+            if result is not None:
+                tag, base_names = result
+                if tag & NATIVE_ENUM_CHECK_MEMBERS_OVERRIDE:
+                    sym = defn.info.names["__members__"]
+                    self.fail(
+                        message_registry.ENUM_MEMBERS_ATTR_WILL_BE_OVERRIDDEN,
+                        sym.node,
+                    )
+                base_name_set = set(base_names)
+                for base in defn.info.mro[1:-1]:
+                    if base.fullname in base_name_set:
+                        self.check_final_enum(defn, base)
+                if tag & NATIVE_ENUM_CHECK_STUB_EMPTY:
+                    self.fail(
+                        f'Detected enum "{defn.info.fullname}" in a type stub '
+                        "with zero members. There is a chance this is due to a "
+                        "recent change in the semantics of enum membership. If "
+                        "so, use `member = value` to mark an enum member, "
+                        "instead of `member: type`",
+                        defn,
+                    )
+                    self.note(
+                        "See https://typing.readthedocs.io/en/latest/spec/enums.html#defining-members",
+                        defn,
+                    )
+                self.check_enum_bases(defn)
+                self.check_enum_new(defn)
+                return
+
         if defn.info.fullname not in ENUM_BASES and "__members__" in defn.info.names:
             sym = defn.info.names["__members__"]
             if isinstance(sym.node, Var) and sym.node.has_explicit_value:

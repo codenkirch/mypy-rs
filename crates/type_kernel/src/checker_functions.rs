@@ -20,7 +20,7 @@
 //! classified, including the implicit trailing `return True`.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyList, PyType};
+use pyo3::types::{PyAny, PyDict, PyList, PyType};
 use std::collections::HashSet;
 
 use crate::wire::Type;
@@ -446,6 +446,120 @@ pub(crate) fn rust_classify_enum_bases(bases: &PyAny) -> PyResult<Option<(i64, i
         is_enums.push(is_enum);
     }
     Ok(Some(classify_enum_bases(&is_enums)))
+}
+
+// ---------------------------------------------------------------------------
+// check_enum multi-arm classifier port (issue #971)
+// ---------------------------------------------------------------------------
+
+/// Bit-flag tags for `check_enum` arms; must match
+/// `NATIVE_ENUM_CHECK_*` in mypy/checker.py.
+const ENUM_CHECK_MEMBERS_OVERRIDE: i64 = 1;
+const ENUM_CHECK_STUB_EMPTY: i64 = 2;
+
+/// Pure decision mirroring `TypeChecker.check_enum`
+/// (checker.py:3843-3870). `members_override` is arm (a);
+/// `stub_empty` is arm (b). Arm (c) passes through the list of
+/// offending base fullnames unchanged. Returns `(tag, base_names)`.
+fn classify_enum(
+    members_override: bool,
+    stub_empty: bool,
+    final_enum_bases: Vec<String>,
+) -> (i64, Vec<String>) {
+    let mut tag = 0i64;
+    if members_override {
+        tag |= ENUM_CHECK_MEMBERS_OVERRIDE;
+    }
+    if stub_empty {
+        tag |= ENUM_CHECK_STUB_EMPTY;
+    }
+    (tag, final_enum_bases)
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_enum`
+/// (checker.py:3843-3870). Reads the live `defn.info` (TypeInfo),
+/// `is_stub`, `tree_fullname`, and `ENUM_BASES` via PyO3. Classifies
+/// three arms: (a) `__members__` override, (c) final-enum base
+/// loop, (b) stub-empty-enum. Returns `Some((tag, base_names))`
+/// where tag is a bit flag and base_names are the arm-(c) offending
+/// base fullnames. Returns `None` to defer (non-dict `names` or
+/// non-list `mro`). The Python shim applies `self.fail` / `self.note`
+/// and calls `check_final_enum` / `check_enum_bases` /
+/// `check_enum_new`.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_enum(
+    py: Python<'_>,
+    info: &PyAny,
+    is_stub: bool,
+    tree_fullname: &str,
+    enum_bases: Vec<String>,
+) -> PyResult<Option<(i64, Vec<String>)>> {
+    let names = match info.getattr("names")?.downcast::<PyDict>() {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    let fullname: String = info.getattr("fullname")?.extract()?;
+    let enum_bases_set: HashSet<String> = enum_bases.into_iter().collect();
+
+    // Arm (a): __members__ override.
+    let members_override =
+        if !enum_bases_set.contains(&fullname) && names.contains("__members__")? {
+            let sym = match names.get_item("__members__")? {
+                Some(s) => s,
+                None => return Ok(None),
+            };
+            let node = sym.getattr("node")?;
+            if node.is_none() {
+                false
+            } else {
+                let var_cls = nodes_class(py, "Var")?;
+                if !node.is_instance(var_cls)? {
+                    false
+                } else {
+                    match read_bool_attr(node, "has_explicit_value")? {
+                        Some(b) => b,
+                        None => return Ok(None),
+                    }
+                }
+            }
+        } else {
+            false
+        };
+
+    // Arm (c): final-enum base loop over mro[1:-1].
+    let mro = match info.getattr("mro")?.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let mut final_enum_bases = Vec::new();
+    let n = mro.len();
+    if n > 2 {
+        for base in mro.iter().skip(1).take(n - 2) {
+            let is_enum: bool = base.getattr("is_enum")?.extract()?;
+            let base_fullname: String = base.getattr("fullname")?.extract()?;
+            if is_enum && !enum_bases_set.contains(&base_fullname) {
+                final_enum_bases.push(base_fullname);
+            }
+        }
+    }
+
+    // Arm (b): stub-empty-enum.
+    let stub_empty = if is_stub && tree_fullname != "enum" && tree_fullname != "_typeshed" {
+        let members = info.getattr("enum_members")?;
+        match members.is_true() {
+            Ok(has) => !has,
+            Err(_) => return Ok(None),
+        }
+    } else {
+        false
+    };
+
+    Ok(Some(classify_enum(
+        members_override,
+        stub_empty,
+        final_enum_bases,
+    )))
 }
 
 #[cfg(test)]
@@ -1783,5 +1897,61 @@ mod match_args_tests {
     fn test_defer_on_undecidable_item() {
         assert_eq!(classify_match_args(true, true, &[Some(true), None]), None);
         assert_eq!(classify_match_args(true, true, &[None]), None);
+    }
+}
+
+#[cfg(test)]
+mod classify_enum_tests {
+    use super::*;
+
+    fn classify(
+        members_override: bool,
+        stub_empty: bool,
+        final_enum_bases: Vec<&str>,
+    ) -> (i64, Vec<String>) {
+        classify_enum(
+            members_override,
+            stub_empty,
+            final_enum_bases.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn test_no_arms() {
+        let (tag, bases) = classify(false, false, vec![]);
+        assert_eq!(tag, 0);
+        assert!(bases.is_empty());
+    }
+
+    #[test]
+    fn test_members_override_only() {
+        let (tag, _) = classify(true, false, vec![]);
+        assert_eq!(tag, ENUM_CHECK_MEMBERS_OVERRIDE);
+    }
+
+    #[test]
+    fn test_stub_empty_only() {
+        let (tag, _) = classify(false, true, vec![]);
+        assert_eq!(tag, ENUM_CHECK_STUB_EMPTY);
+    }
+
+    #[test]
+    fn test_members_and_stub() {
+        let (tag, _) = classify(true, true, vec![]);
+        assert_eq!(tag, ENUM_CHECK_MEMBERS_OVERRIDE | ENUM_CHECK_STUB_EMPTY);
+    }
+
+    #[test]
+    fn test_final_enum_bases() {
+        let (tag, bases) = classify(false, false, vec!["mod.A", "mod.B"]);
+        assert_eq!(tag, 0);
+        assert_eq!(bases, vec!["mod.A", "mod.B"]);
+    }
+
+    #[test]
+    fn test_all_three() {
+        let (tag, bases) = classify(true, true, vec!["mod.A"]);
+        assert_eq!(tag, ENUM_CHECK_MEMBERS_OVERRIDE | ENUM_CHECK_STUB_EMPTY);
+        assert_eq!(bases, vec!["mod.A"]);
     }
 }
