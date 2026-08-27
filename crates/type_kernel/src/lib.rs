@@ -2991,6 +2991,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1003: check_rvalue_count_in_assignment dispatch port. Rust
+    // classifies the arity/star decision into a branch tag; the fail and
+    // wrong-number messages stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_rvalue_count,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,
