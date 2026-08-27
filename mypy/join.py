@@ -145,8 +145,12 @@ def _serialize_type(t: Type) -> bytes:
     return result
 
 
-def _deserialize_type(data: bytes) -> Type | None:
-    """Deserialize wire bytes to a Type, fixing type_ref strings."""
+def _deserialize_type(data: bytes) -> ProperType | None:
+    """Deserialize wire bytes to a Type, fixing type_ref strings.
+
+    A non-None result is structurally a proper-type tree: fixup_wire_type
+    defers on any TypeAliasType.
+    """
     from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
 
@@ -156,10 +160,13 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.bool_type = None
     instance_cache.object_type = None
     instance_cache.function_type = None
-    return fixup_wire_type(decoded)
+    fixed = fixup_wire_type(decoded)
+    if fixed is None:
+        return None
+    return cast(ProperType, fixed)
 
 
-def _try_native_object_or_any_from_type(typ: ProperType) -> Type | None:
+def _try_native_object_or_any_from_type(typ: ProperType) -> ProperType | None:
     """Try `object_or_any_from_type` in Rust; None defers to Python.
 
     Serializes the proper type, calls the kernel, and deserializes the
@@ -180,7 +187,7 @@ def _try_native_object_or_any_from_type(typ: ProperType) -> Type | None:
 
 def _try_native_combine_similar_callables(
     t: CallableType, s: CallableType
-) -> Type | None:
+) -> CallableType | None:
     """Try `combine_similar_callables` in Rust; None defers to Python.
 
     The kernel returns None for the both-generic case (Rust cannot
@@ -198,7 +205,7 @@ def _try_native_combine_similar_callables(
         return None
     if result is None:
         return None
-    return _deserialize_type(bytes(result))
+    return cast(CallableType, _deserialize_type(bytes(result)))
 
 
 class InstanceJoiner:
@@ -214,19 +221,19 @@ class InstanceJoiner:
             and (s, t) not in self.seen_instances
         ):
             try:
-                result = _type_kernel.rust_join_instances(
+                native_result = _type_kernel.rust_join_instances(
                     _serialize_type(t),
                     _serialize_type(s),
                     state.strict_optional,
                     _native_join_resolver,
                 )
             except (AssertionError, NotImplementedError, ValueError, AttributeError):
-                result = None
-            if result is not None:
+                native_result = None
+            if native_result is not None:
                 # Disc identical to rust_join_types: 0/1 return s/t,
                 # 2=Object, 5=Ancestor, 6=SameTypeWithArgs (arg_discs
                 # 0/1 pick s.args/t.args[i]), 7=Encoded.
-                disc, fullname, arg_discs, encoded = result
+                disc, fullname, arg_discs, encoded = native_result
                 if disc == 0:
                     return s
                 elif disc == 1:
@@ -251,7 +258,7 @@ class InstanceJoiner:
                     instance_cache.function_type = None
                     fixed = fixup_wire_type(decoded)
                     if fixed is not None:
-                        return fixed
+                        return cast(ProperType, fixed)
                     # Fall through to Python.
                 elif disc == 5:
                     if _native_join_typeinfo_map is not None and fullname in _native_join_typeinfo_map:
@@ -263,8 +270,8 @@ class InstanceJoiner:
                         pass
                     else:
                         type_info = _native_join_typeinfo_map[fullname]
-                        s_args = s.args if isinstance(s, Instance) else []
-                        t_args = t.args if isinstance(t, Instance) else []
+                        s_args = s.args
+                        t_args = t.args
                         new_args: list[Type] = []
                         for i, ad in enumerate(arg_discs):
                             if ad == 0:
@@ -557,6 +564,9 @@ def join_types(s: Type, t: Type, instance_joiner: InstanceJoiner | None = None) 
                 instance_cache.function_type = None
                 fixed = fixup_wire_type(decoded)
                 if fixed is not None:
+                    # This seam only emits fully-resolved Rust-built
+                    # types, so the fixup result is a proper-type tree.
+                    fixed = cast(ProperType, fixed)
                     # Rust-built callable joins (combine_similar_callables
                     # / join_similar_callables) encode a fresh wire
                     # CallableType that cannot carry `definition` (only

@@ -62,6 +62,7 @@ from mypy.types import (
     TypeOfAny,
     TypeType,
     TypeVarTupleType,
+    TypeVarLikeType,
     TypeVarType,
     TypeVisitor,
     UnboundType,
@@ -88,11 +89,13 @@ try:
     import type_kernel as _type_kernel
     from librt.internal import ReadBuffer as _ReadBuffer, WriteBuffer as _WriteBuffer
 
+    from type_kernel import (
+        rust_are_args_compatible as _rust_are_args_compatible,
+        rust_classify_type_parameter as _rust_classify_type_parameter,
+        rust_infer_variance_member as _rust_infer_variance_member,
+    )
     from mypy.types import read_type as _read_type
 
-    _rust_infer_variance_member = _type_kernel.rust_infer_variance_member
-    _rust_are_args_compatible = _type_kernel.rust_are_args_compatible
-    _rust_classify_type_parameter = _type_kernel.rust_classify_type_parameter
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
@@ -188,7 +191,7 @@ def _native_type_parameter_active() -> bool:
 
 
 def _native_infer_variance_member(
-    typ: Type, self_type: Type, object_type: Instance, tvar: TypeVarType
+    typ: Type, self_type: Type, object_type: Instance, tvar: TypeVarLikeType
 ) -> int | None:
     """Run the Rust per-member `infer_variance` decision, or None to defer.
 
@@ -248,18 +251,19 @@ def _serialize_type(t: Type) -> bytes:
 
 # wire-bytes -> decoded+fixed Type cache for the subtype-seam decodes
 # (171K calls, ~85% identical bytes); callers only read the result.
-_subtype_decode_cache: dict[bytes, Type] = {}
+_subtype_decode_cache: dict[bytes, ProperType] = {}
 
 
 def _clear_subtype_decode_cache() -> None:
     _subtype_decode_cache.clear()
 
 
-def _deserialize_type(data: bytes) -> Type | None:
+def _deserialize_type(data: bytes) -> ProperType | None:
     """Deserialize wire bytes to a Type, fixing type_ref strings.
 
     Returns None if any type_ref cannot be resolved to a live TypeInfo
-    (so the caller defers to Python).
+    (so the caller defers to Python). A non-None result is structurally a
+    proper-type tree: fixup_wire_type defers on any TypeAliasType.
     """
     from mypy.types import instance_cache
     from mypy.wirefixup import fixup_wire_type
@@ -275,12 +279,14 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.function_type = None
     fixed = fixup_wire_type(decoded)
     if fixed is not None:
-        _subtype_decode_cache[data] = fixed
+        proper = cast(ProperType, fixed)
+        _subtype_decode_cache[data] = proper
+        return proper
     return fixed
 
 
 def _restore_protocol_member_definition(
-    left: Instance, member: str, decoded: Type
+    left: Instance, member: str, decoded: ProperType
 ) -> Type:
     """Restore ``definition`` links lost in the wire round-trip.
 
@@ -294,7 +300,7 @@ def _restore_protocol_member_definition(
     from mypy.checkmember import _restore_definition
     from mypy.types import CallableType, FunctionLike, Overloaded
 
-    if not isinstance(decoded, FunctionLike):  # type: ignore[misc]
+    if not isinstance(decoded, FunctionLike):
         return decoded
     sym = left.type.get(member)
     node = sym.node if sym else None
@@ -303,7 +309,7 @@ def _restore_protocol_member_definition(
     node_type = getattr(node, "type", None)
     if not isinstance(node_type, (CallableType, Overloaded)):
         return decoded
-    return _restore_definition(node_type, decoded)  # type: ignore[return-value]
+    return _restore_definition(node_type, decoded)
 
 
 # Batch accumulator for the native `_is_subtype` path (measurement: ~171K
@@ -863,49 +869,6 @@ def _is_subtype(
             result = None
         if result is not None:
             return result
-        # Protocol-right native seam (protocols.rs) disabled: the
-        # member-compat loop drops `definition` links, causing
-        # `pretty_callable` to omit `self` from error messages.
-        if (
-            False
-            and _HAS_TYPE_KERNEL
-            and _native_subtype_active
-            and _native_subtype_resolver is not None
-            and checker_state.type_checker is not None
-            and isinstance(left, Instance)
-            and isinstance(right, Instance)
-            and right.type.is_protocol
-            and not left.type.is_protocol
-        ):
-            try:
-                protocol_result = _type_kernel.rust_is_protocol_implementation(
-                    _serialize_type(left),
-                    _serialize_type(right),
-                    [],  # skip: callers pass explicit skip only via is_protocol_implementation
-                    subtype_context.ignore_type_params,
-                    subtype_context.ignore_declared_variance,
-                    subtype_context.always_covariant,
-                    subtype_context.ignore_promotions,
-                    proper_subtype,
-                    state.strict_optional,
-                    subtype_context.ignore_pos_arg_names,
-                    (subtype_context.options.strict_concatenate if subtype_context.options else False),
-                    _native_subtype_resolver,
-                )
-            except (AssertionError, NotImplementedError, ValueError, AttributeError):
-                protocol_result = None
-            if protocol_result is not None:
-                # Mirror is_protocol_implementation's bookkeeping so
-                # fine-grained rechecks and the positive subtype cache
-                # observe the native decision.
-                type_state.record_protocol_subtype_check(left.type, right.type)
-                if protocol_result:
-                    type_state.record_subtype_cache_entry(
-                        SubtypeVisitor.build_subtype_kind(subtype_context, proper_subtype),
-                        left,
-                        right,
-                    )
-                return protocol_result
     return left.accept(SubtypeVisitor(orig_right, subtype_context, proper_subtype))
 
 
@@ -2215,7 +2178,7 @@ def get_member_flags(name: str, itype: Instance, class_obj: bool = False) -> set
 
 
 def is_descriptor(typ: Type | None) -> bool:
-    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+    if typ is not None and _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
         try:
             type_bytes = _serialize_type(typ)
         except Exception:

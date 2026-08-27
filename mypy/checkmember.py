@@ -234,7 +234,7 @@ _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
 # bytes -> fixed Type cache for checkmember deserialize, split into
 # freeze/non-freeze pools: freeze callers (bind_self_fast and friends)
 # mutate CallableType.variables in place and share nothing with member path.
-_deser_caches: dict[bool, dict[bytes, Type]] = {False: {}, True: {}}
+_deser_caches: dict[bool, dict[bytes, ProperType]] = {False: {}, True: {}}
 _deser_cache_hits: dict[bool, list[int]] = {False: [0], True: [0]}
 _deser_cache_misses: dict[bool, list[int]] = {False: [0], True: [0]}
 
@@ -271,7 +271,7 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     fast = _encode_no_arg_instance(t, _CheckMemberWriteBuffer)
     if fast is not None:
-        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[attr-defined]
             if _serialize_stats_on:
                 _serialize_stats["writes"] += 1
                 _serialize_stats["bytes"] += len(fast)
@@ -290,7 +290,9 @@ def _serialize_type_for_checkmember(t: Type) -> bytes:
     return result
 
 
-def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Type | None:
+def _deserialize_type_for_checkmember(
+    data: bytes, freeze: bool = False
+) -> ProperType | None:
     """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
 
     Returns None when a type_ref is unresolvable so callers defer to Python.
@@ -331,11 +333,14 @@ def _deserialize_type_for_checkmember(data: bytes, freeze: bool = False) -> Type
     # occurrences before returning (mirrors expandtype.py:463-467).
     fixed = canonicalize_fresh_vars(fixed)
     if fixed is not None:
-        _deser_caches[freeze][data] = fixed
-    return fixed
+        # fixup_wire_type defers (returns None) on any TypeAliasType, so a
+        # non-None result is structurally a proper-type tree.
+        proper = cast(ProperType, fixed)
+        _deser_caches[freeze][data] = proper
+        return proper
 
 
-def _restore_definition(original: Type, decoded: Type) -> Type:
+def _restore_definition(original: Type, decoded: ProperType) -> ProperType:
     """Copy the ``definition`` link from ``original`` onto ``decoded``.
 
     The wire format drops ``CallableType.definition`` (only used for error
@@ -346,12 +351,13 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
     live object, mirroring how ``bind_self_fast`` preserves non-wire fields
     via ``copy_modified`` on the original object.
     """
-    from mypy.types import CallableType, Overloaded
+    from mypy.types import CallableType, Overloaded, get_proper_type
 
-    if isinstance(original, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
+    original = get_proper_type(original)
+    if isinstance(original, CallableType) and isinstance(decoded, CallableType):
         if original.definition is not None and decoded.definition is None:
             return decoded.copy_modified(definition=original.definition)
-    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
+    elif isinstance(original, Overloaded) and isinstance(decoded, Overloaded):
         if len(original.items) == len(decoded.items):
             new_items = []
             changed = False
@@ -363,7 +369,7 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
                     new_items.append(dec)
             if changed:
                 return Overloaded(new_items)
-    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):  # type: ignore[misc]
+    elif isinstance(original, Overloaded) and isinstance(decoded, CallableType):
         # check_self_arg filters an Overloaded to a single CallableType;
         # find the matching item by arg-type signature to restore its
         # definition link.
@@ -377,8 +383,8 @@ def _restore_definition(original: Type, decoded: Type) -> Type:
 
 
 def _restore_native_method_definition(
-    name: str, typ: Type, decoded: Type
-) -> Type:
+    name: str, typ: Type, decoded: ProperType
+) -> ProperType:
     """Best-effort relink of ``definition`` for a native-decoded method type.
 
     The general member-access seam resolves a fallback to an Instance and
@@ -389,8 +395,9 @@ def _restore_native_method_definition(
     seams by restoring it from the method node on the resolved class.
     Returns ``decoded`` unchanged when no method node is resolvable.
     """
-    from mypy.types import CallableType, Instance, TupleType
+    from mypy.types import CallableType, Instance, TupleType, get_proper_type
 
+    typ = get_proper_type(typ)
     info = None
     if isinstance(typ, Instance):
         info = typ.type
@@ -410,7 +417,7 @@ def _restore_native_method_definition(
     if (
         method is not None
         and not isinstance(method, Decorator)
-        and getattr(method, "type", None) is not None
+        and method.type is not None
     ):
         return _restore_definition(method.type, decoded)
     return decoded
@@ -593,7 +600,6 @@ def _analyze_member_access(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
-        and _rust_analyze_member_access is not None
         and not isinstance(
             typ,
             (Instance, UnionType, TypeType, TypedDictType, NoneType, DeletedType, TypeAliasType),
@@ -738,7 +744,6 @@ def analyze_instance_member_access(
         _HAS_TYPE_KERNEL
         and _native_checkmember_active
         and _native_checkmember_resolver is not None
-        and _rust_analyze_instance_member_dispatch is not None
         and method is not None
         and not isinstance(method, Decorator)
         and not method.is_property
@@ -768,7 +773,7 @@ def analyze_instance_member_access(
                     if isinstance(decoded, CallableType):
                         decoded.fallback.line = decoded.line
                 method_sig = getattr(method, "type", None)
-                if method_sig is not None:
+                if method_sig is not None and decoded is not None:
                     decoded = _restore_definition(method_sig, decoded)
                 instance_cache.int_type = None
                 instance_cache.str_type = None
@@ -987,7 +992,7 @@ def analyze_type_type_member_access(
     name: str, typ: TypeType, mx: MemberContext, override_info: TypeInfo | None
 ) -> Type:
     # Similar to analyze_type_callable_attribute_access.
-    item = None
+    item: Instance | None = None
     fallback = mx.named_type("builtins.type")
     # Issue-#957: classify the 9-way dispatch head in Rust
     # (checkmember.rs); terminal branches stay here. None falls
@@ -1003,15 +1008,20 @@ def analyze_type_type_member_access(
         except (AssertionError, NotImplementedError, ValueError, TypeError):
             tag = None
         if tag is not None:
+            # The Rust tags are only decided after the same isinstance
+            # facts the Python tail checks, so the casts below mirror the
+            # runtime guarantees of each branch.
             if tag == NATIVE_TT_ITEM_INSTANCE:
-                item = typ.item
+                item = cast(Instance, typ.item)
             elif tag == NATIVE_TT_ITEM_ANY:
                 with mx.msg.filter_errors():
                     return _analyze_member_access(name, fallback, mx, override_info)
             elif tag == NATIVE_TT_TV_UB_INSTANCE:
-                item = get_proper_type(typ.item.upper_bound)
+                item = cast(
+                    Instance, get_proper_type(cast(TypeVarType, typ.item).upper_bound)
+                )
             elif tag == NATIVE_TT_TV_UB_UNION:
-                upper_bound = get_proper_type(typ.item.upper_bound)
+                upper_bound = get_proper_type(cast(TypeVarType, typ.item).upper_bound)
                 return _analyze_member_access(
                     name,
                     TypeType.make_normalized(
@@ -1021,16 +1031,18 @@ def analyze_type_type_member_access(
                     override_info,
                 )
             elif tag == NATIVE_TT_TV_UB_TUPLE:
-                item = tuple_fallback(get_proper_type(typ.item.upper_bound))
+                item = tuple_fallback(
+                    cast(TupleType, get_proper_type(cast(TypeVarType, typ.item).upper_bound))
+                )
             elif tag == NATIVE_TT_TV_UB_ANY:
                 with mx.msg.filter_errors():
                     return _analyze_member_access(name, fallback, mx, override_info)
             elif tag == NATIVE_TT_ITEM_TUPLE:
-                item = tuple_fallback(typ.item)
+                item = tuple_fallback(cast(TupleType, typ.item))
             elif tag == NATIVE_TT_ITEM_FUNC_TYPEOBJ:
-                item = typ.item.fallback
+                item = cast(FunctionLike, typ.item).fallback
             elif tag == NATIVE_TT_ITEM_TYPE_TYPE_INSTANCE:
-                item = typ.item.item.type.metaclass_type
+                item = cast(Instance, cast(TypeType, typ.item).item).type.metaclass_type
             # tags NONE / TV_UB_OTHER / FUNC_NOT_TYPEOBJ /
             # TYPE_TYPE_OTHER: item stays None, fall through to tail.
     if item is None and tag is None:
@@ -1120,12 +1132,13 @@ def analyze_union_member_access(name: str, typ: UnionType, mx: MemberContext) ->
                             decoded = _deserialize_type_for_checkmember(bytes(item_bytes))
                             if decoded is None:
                                 break
-                            if isinstance(subtype, Instance):
-                                method = subtype.type.get_method(name)
+                            subtype_proper = get_proper_type(subtype)
+                            if isinstance(subtype_proper, Instance):
+                                method = subtype_proper.type.get_method(name)
                                 if (
                                     method is not None
                                     and not isinstance(method, Decorator)
-                                    and getattr(method, "type", None) is not None
+                                    and method.type is not None
                                 ):
                                     decoded = _restore_definition(method.type, decoded)
                             decoded_items.append(decoded)
@@ -2487,7 +2500,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
         if result is not None:
             decoded = _deserialize_type_for_checkmember(bytes(result))
             if decoded is not None:
-                if isinstance(method, CallableType) and isinstance(decoded, CallableType):  # type: ignore[misc]
+                if isinstance(method, CallableType) and isinstance(decoded, CallableType):
                     if not method.arg_types or method.arg_kinds[0] in (ARG_STAR, ARG_STAR2):
                         return method
                     return cast(
@@ -2499,7 +2512,7 @@ def bind_self_fast(method: F, original_type: Type | None = None) -> F:
                             is_bound=True,
                         ),
                     )
-                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):  # type: ignore[misc]
+                elif isinstance(method, Overloaded) and isinstance(decoded, Overloaded):
                     if not method.items:
                         return method
                     items: list[CallableType] = []
@@ -2586,7 +2599,7 @@ def instance_fallback(typ: ProperType) -> Instance:
                 # Rust mirrors Python: Literal/TypedDict return their fallback
                 # (always an Instance); a TupleType whose partial fallback is
                 # not an Instance already deferred. Only trust an Instance.
-                if decoded is not None and isinstance(decoded, Instance):  # type: ignore[misc]
+                if decoded is not None and isinstance(decoded, Instance):
                     return decoded
         except (AssertionError, NotImplementedError):
             pass

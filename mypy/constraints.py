@@ -2065,7 +2065,7 @@ def _try_native_find_matching_overload_items(
     if not raw:
         # Rust decided nothing matched: Python falls back to all items
         # (constraints.py:1955-1958) to keep backward compatibility.
-        return items.copy()
+        return list(items)
 
     result: list[CallableType] = []
     for index in raw:

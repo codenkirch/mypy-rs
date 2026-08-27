@@ -712,6 +712,8 @@ class MessageBuilder:
             )
             return codes.ATTR_DEFINED
         if tag == 14:
+            # Tag 14 is only emitted for unions (rust_classify_has_no_attr).
+            assert isinstance(original_type, UnionType)
             typ_format, orig_type_format = format_type_distinctly(
                 typ, original_type, options=self.options
             )
@@ -730,6 +732,8 @@ class MessageBuilder:
             )
             return codes.UNION_ATTR
         if tag == 15:
+            # Tag 15 is only the typevar-with-union-upper-bound case.
+            assert isinstance(original_type, TypeVarType)
             bound = get_proper_type(original_type.upper_bound)
             typ_fmt, bound_fmt = format_type_distinctly(typ, bound, options=self.options)
             original_type_fmt = format_type(original_type, self.options)
@@ -3966,6 +3970,10 @@ def make_inferred_type_note(
                     arg_results,
                     context,
                 ):
+                    # The Rust gate already verified ReturnStmt + NameExpr
+                    # (inferred_note_context_fires), so narrow for mypy.
+                    assert isinstance(context, ReturnStmt)
+                    assert isinstance(context.expr, NameExpr)
                     var_name = context.expr.name
                     return 'Perhaps you need a type annotation for "{}"? Suggestion: {}'.format(
                         var_name, supertype_str

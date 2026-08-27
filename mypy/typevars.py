@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import cast
+
 from mypy.erasetype import erase_typevars
 from mypy.nodes import TypeInfo
 from mypy.types import (
@@ -42,20 +44,22 @@ def _set_native_typevars_active(active: bool) -> None:
 # bytes -> decoded wire-Type cache for the typevars seam.  Byte-identical
 # blobs repeat heavily (~97% of 90K calls), so memoizing read_type +
 # fixup_wire_type cuts decode cost.  Mirrors other deser caches.
-_typevars_decode_cache: dict[bytes, Type] = {}
+_typevars_decode_cache: dict[bytes, ProperType] = {}
 
 
 def _clear_typevars_decode_cache() -> None:
     _typevars_decode_cache.clear()
 
 
-def _native_decode_well_formed(data: bytes) -> Type | None:
+def _native_decode_well_formed(data: bytes) -> ProperType | None:
     """Decode wire bytes for the fill_typevars seam.
 
     Mirrors mypy/typeops.py::_deserialize_type plus a check_no_fake_info
     guard: the global wire typeinfo map can hold stale or fake entries
     across fine-grained refreshes, so a decoded tree with any residual
-    fake TypeInfo defers to Python.
+    fake TypeInfo defers to Python. A non-None result is structurally a
+    proper-type tree: this seam only passes fully-resolved Rust-built
+    types, and fixup_wire_type defers on any TypeAliasType.
     """
     cached = _typevars_decode_cache.get(data)
     if cached is not None:
@@ -74,8 +78,9 @@ def _native_decode_well_formed(data: bytes) -> Type | None:
     fixed = fixup_wire_type(decoded)
     if fixed is None or not check_no_fake_info(fixed):
         return None
-    _typevars_decode_cache[data] = fixed
-    return fixed
+    proper = cast(ProperType, fixed)
+    _typevars_decode_cache[data] = proper
+    return proper
 
 
 def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
@@ -91,7 +96,7 @@ def fill_typevars(typ: TypeInfo) -> Instance | TupleType:
             result = _type_kernel.rust_fill_typevars(typ)
             if result is not None:
                 decoded = _native_decode_well_formed(bytes(result))
-                if decoded is not None and isinstance(decoded, (Instance, TupleType)):  # type: ignore[misc]
+                if decoded is not None and isinstance(decoded, (Instance, TupleType)):
                     root = decoded if isinstance(decoded, Instance) else decoded.partial_fallback
                     inst = Instance(typ, root.args)
                     if typ.tuple_type is None:

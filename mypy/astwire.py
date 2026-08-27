@@ -198,7 +198,7 @@ def _get_all_slots(cls: type) -> list[str]:
             seen.add(s)
             out.append(s)
     _SLOT_CACHE[cls] = out
-    return tuple(out)
+    return out
 
 
 def serialize_node(node: nodes.Node | None, buf: WriteBuffer) -> None:

@@ -572,7 +572,7 @@ _checker_decode_count: list[int] = [0]
 _checker_deser_template: dict[bytes, Type] = {}
 # bytes -> decoded list-of-Types cache for the partition/ambiguous
 # variants seam (13K calls, ~94% repeat). Read-only consumers.
-_checker_deser_list_cache: dict[bytes, list[Type]] = {}
+_checker_deser_list_cache: dict[bytes, list[ProperType]] = {}
 
 
 def _clear_checker_deser_cache() -> None:
@@ -863,8 +863,6 @@ def _try_native_except_handler_tests(
                 # fixup_wire_type cannot resolve a type_ref to a live
                 # TypeInfo (class still being analyzed); defer.
                 return None
-            if t is None:
-                return None
             pairs.append((tag, t))
     return pairs
 
@@ -927,7 +925,7 @@ def _serialize_type_for_checker(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     fast = _encode_no_arg_instance(t, _CheckerWriteBuffer)
     if fast is not None:
-        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[attr-defined]
             if _serialize_stats_on:
                 _serialize_stats["writes"] += 1
                 _serialize_stats["bytes"] += len(fast)
@@ -965,21 +963,6 @@ def _deserialize_type_from_checker(b: bytes) -> Type:
     return t
 
 
-def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
-    """Decode a wire-format type list from the checker kernel, resolving
-    type_ref to live TypeInfo via wirefixup.
-    """
-    from mypy.types import read_type_list
-    from mypy.wirefixup import fixup_wire_type
-
-    out: list[Type] = []
-    for decoded in read_type_list(_CheckerReadBuffer(b)):
-        t = fixup_wire_type(decoded)
-        assert t is not None, "checker wire list decode produced unresolvable type_ref"
-        out.append(t)
-    return out
-
-
 def _serialize_type_list(items: Sequence[Type]) -> bytes:
     """Serialize a list of types to the wire-format type-list blob."""
     from mypy.types import write_type_list
@@ -989,7 +972,7 @@ def _serialize_type_list(items: Sequence[Type]) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
+def _deserialize_type_list_from_checker(b: bytes) -> list[ProperType]:
     """Decode a wire type-list blob from the checker kernel, resolving each
     item's type_ref to live TypeInfo via wirefixup. An unresolvable item
     asserts so the caller defers to the pure-Python path.
@@ -1000,11 +983,13 @@ def _deserialize_type_list_from_checker(b: bytes) -> list[Type]:
     from mypy.types import read_type_list
     from mypy.wirefixup import fixup_wire_type
 
-    result: list[Type] = []
+    result: list[ProperType] = []
     for item in read_type_list(_CheckerReadBuffer(b)):
         fixed = fixup_wire_type(item)
         assert fixed is not None, "native partition produced unresolvable type_ref"
-        result.append(fixed)
+        # The checker kernel only emits fully-resolved wire types; the fixup
+        # defers (assert above) on anything else, so this is a ProperType.
+        result.append(cast(ProperType, fixed))
     _checker_deser_list_cache[b] = result
     return result
 
@@ -1775,16 +1760,19 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 for item in defn.items:
                     assert isinstance(item, Decorator)
                     sig_types.append(get_proper_type(item.var.type))
-                if all(isinstance(t, CallableType) for t in sig_types):
-                    current_class = self.scope.active_class()
-                    type_vars = current_class.defn.type_vars if current_class else []
-                    overlap_decisions = _rust_check_overlapping_overloads(
-                        [_serialize_type_for_checker(t) for t in sig_types],
-                        _serialize_type_list(type_vars),
-                        bool(is_descriptor_get),
-                        state.strict_optional,
-                        _native_checker_resolver,
-                    )
+                callable_sigs: list[CallableType] = []
+                for t in sig_types:
+                    assert isinstance(t, CallableType)
+                    callable_sigs.append(t)
+                current_class = self.scope.active_class()
+                type_vars = current_class.defn.type_vars if current_class else []
+                overlap_decisions = _rust_check_overlapping_overloads(
+                    [_serialize_type_for_checker(t) for t in callable_sigs],
+                    _serialize_type_list(type_vars),
+                    bool(is_descriptor_get),
+                    state.strict_optional,
+                    _native_checker_resolver,
+                )
             except (AssertionError, NotImplementedError, ValueError):
                 overlap_decisions = None
 
@@ -1839,12 +1827,16 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 for i2, j2, kind, flip_note in overlap_decisions:
                     if i2 == i:
                         if kind == NATIVE_OVERLOAD_KIND_NEVER_MATCH:
+                            never_item = defn.items[i2 + j2 + 1]
+                            assert isinstance(never_item, Decorator)
                             self.msg.overloaded_signature_will_never_match(
-                                i2 + 1, i2 + j2 + 2, defn.items[i2 + j2 + 1].func
+                                i2 + 1, i2 + j2 + 2, never_item.func
                             )
                         else:
+                            overlap_item = defn.items[i2]
+                            assert isinstance(overlap_item, Decorator)
                             self.msg.overloaded_signatures_overlap(
-                                i2 + 1, i2 + j2 + 2, flip_note, defn.items[i2].func
+                                i2 + 1, i2 + j2 + 2, flip_note, overlap_item.func
                             )
 
             if impl_type is not None:
@@ -3267,6 +3259,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 if _rust_check_explicit_override_decorator(
                     defn, found_method_base_classes
                 ):
+                    assert found_method_base_classes
                     self.msg.explicit_override_decorator_missing(
                         defn.name,
                         found_method_base_classes[0].fullname,
@@ -3946,6 +3939,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 tag, base_names = result
                 if tag & NATIVE_ENUM_CHECK_MEMBERS_OVERRIDE:
                     sym = defn.info.names["__members__"]
+                    assert sym.node is not None
                     self.fail(
                         message_registry.ENUM_MEMBERS_ATTR_WILL_BE_OVERRIDDEN,
                         sym.node,
@@ -4070,10 +4064,10 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if result is not None:
                 enum_base_idx, violating_idx = result
                 if violating_idx >= 0:
-                    enum_base = bases[enum_base_idx]
+                    offending_enum = bases[enum_base_idx]
                     self.fail(
                         f'No non-enum mixin classes are allowed after '
-                        f'"{enum_base.str_with_options(self.options)}"',
+                        f'"{offending_enum.str_with_options(self.options)}"',
                         defn,
                     )
                 return
@@ -5785,6 +5779,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 tag = None
             if tag is not None:
                 if tag == NATIVE_LVALUE_NAME_DEF:
+                    assert isinstance(lvalue, NameExpr)
                     assert isinstance(lvalue.node, Var)
                     inferred = lvalue.node
                 elif tag == NATIVE_LVALUE_MEMBER_DEF:
@@ -5792,13 +5787,16 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     self.expr_checker.accept(lvalue.expr)
                     inferred = lvalue.def_var
                 elif tag == NATIVE_LVALUE_INDEX:
+                    assert isinstance(lvalue, IndexExpr)
                     index_lvalue = lvalue
                 elif tag == NATIVE_LVALUE_MEMBER:
+                    assert isinstance(lvalue, MemberExpr)
                     lvalue_type = self.expr_checker.analyze_ordinary_member_access(
                         lvalue, True, rvalue
                     )
                     self.store_type(lvalue, lvalue_type)
                 elif tag == NATIVE_LVALUE_NAME:
+                    assert isinstance(lvalue, NameExpr)
                     lvalue_type = self.expr_checker.analyze_ref_expr(lvalue, lvalue=True)
                     if (
                         self.options.allow_redefinition
@@ -5811,6 +5809,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         inferred = lvalue.node
                     self.store_type(lvalue, lvalue_type)
                 elif tag == NATIVE_LVALUE_TUPLE_LIST:
+                    assert isinstance(lvalue, (TupleExpr, ListExpr))
                     types = [
                         self.check_lvalue(sub_expr)[0]
                         or
@@ -5821,6 +5820,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     ]
                     lvalue_type = TupleType(types, self.named_type("builtins.tuple"))
                 elif tag == NATIVE_LVALUE_STAR:
+                    assert isinstance(lvalue, StarExpr)
                     lvalue_type, _, _ = self.check_lvalue(lvalue.expr)
                 else:
                     lvalue_type = self.expr_checker.accept(lvalue)
@@ -6941,7 +6941,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             try:
                 types = [_deserialize_type_from_checker(b) for b in res]
             except (AssertionError, NotImplementedError, ValueError):
-                types = None  # type: ignore[assignment]
+                types = None
             if types is not None:
                 for t in types:
                     t.accept(TypeFixer(self.modules, allow_missing=True))
@@ -7224,7 +7224,8 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     _serialize_type_for_checker(func.type) if func.type is not None else None
                 )
                 dec_type_bytes = (
-                    _serialize_type_for_checker(dec_type) if dec_type is not None else None
+                    # accept() is annotated Type but can return None at runtime
+                    _serialize_type_for_checker(dec_type) if dec_type is not None else None  # type: ignore[redundant-expr]
                 )
                 res = _rust_check_for_untyped_decorator(
                     self.options.disallow_untyped_decorators,
@@ -8996,8 +8997,7 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     yes_bytes, no_bytes = result
                     yes_type = _deserialize_type_from_checker(bytes(yes_bytes))
                     no_type = _deserialize_type_from_checker(bytes(no_bytes))
-                    if yes_type is not None and no_type is not None:
-                        return yes_type, no_type
+                    return yes_type, no_type
             except (AssertionError, NotImplementedError):
                 pass
         typ = get_proper_type(typ)
@@ -10776,21 +10776,20 @@ def expand_callable_variants(c: CallableType) -> list[CallableType]:
             )
             if raw is not None:
                 decoded_variants = _deserialize_type_list_from_checker(bytes(raw))
-                if decoded_variants is not None:
-                    variants: list[CallableType] = []
-                    for v in decoded_variants:
-                        assert isinstance(v, CallableType)
-                        variants.append(
-                            c.copy_modified(
-                                arg_types=v.arg_types,
-                                ret_type=v.ret_type,
-                                type_guard=v.type_guard,
-                                type_is=v.type_is,
-                                instance_type=v.instance_type,
-                                variables=[],
-                            )
+                variants: list[CallableType] = []
+                for v in decoded_variants:
+                    assert isinstance(v, CallableType)
+                    variants.append(
+                        c.copy_modified(
+                            arg_types=v.arg_types,
+                            ret_type=v.ret_type,
+                            type_guard=v.type_guard,
+                            type_is=v.type_is,
+                            instance_type=v.instance_type,
+                            variables=[],
                         )
-                    return variants
+                    )
+                return variants
         except (AssertionError, NotImplementedError):
             pass
     for tv in c.variables:
@@ -10935,8 +10934,11 @@ def detach_callable(typ: CallableType, class_type_vars: list[TypeVarLikeType]) -
             )
             if raw is not None:
                 new_vars = [_deserialize_type_from_checker(bytes(b)) for b in raw]
-                if None not in new_vars:
-                    return typ.copy_modified(variables=new_vars)
+                tvars: list[TypeVarLikeType] = []
+                for v in new_vars:
+                    assert isinstance(v, TypeVarLikeType)
+                    tvars.append(v)
+                return typ.copy_modified(variables=tvars)
         except (AssertionError, NotImplementedError, ValueError):
             pass
     return typ.copy_modified(variables=list(typ.variables) + class_type_vars)
@@ -11757,8 +11759,6 @@ def partition_equality_ambiguous_types(
                     if ambiguous_blob is not None
                     else []
                 )
-                if narrowable is None or ambiguous is None:
-                    raise AssertionError("partition equality decode failed")
                 # Same make_union calls as the pure-Python body: len > 1 folds
                 # into a fresh UnionType, len == 1 collapses to the bare item.
                 return (

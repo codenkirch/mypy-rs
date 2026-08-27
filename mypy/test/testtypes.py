@@ -7,7 +7,7 @@ import re
 import sys
 from collections.abc import Callable, Sequence
 from types import SimpleNamespace
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from unittest import TestCase, skipIf, skipUnless
 
 from mypy.erasetype import _set_native_erase_active, erase_type, remove_instance_last_known_values
@@ -167,6 +167,12 @@ from mypy.types import (
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
 from mypy.checker_shared import TypeRange
+from mypy.checker import TypeChecker, TypeMap
+from mypy.checkexpr import ExpressionChecker
+from mypy.constraints import Constraint
+from mypy.errorcodes import ErrorCode
+from mypy.nodes import Lvalue, SuperExpr, TypeAlias
+from mypy.patterns import ClassPattern
 from mypy.checkstrformat import ConversionSpecifier
 
 
@@ -2212,7 +2218,7 @@ class NativeFillTypevarsSuite(Suite):
         self._set_native_typevars_active(False)
         set_wire_typeinfo_map(None)
 
-    def _decode(self, result: bytes) -> Type | None:
+    def _decode(self, result: bytes) -> ProperType | None:
         from mypy.types import instance_cache, read_type as _read_type
         from mypy.wirefixup import fixup_wire_type
 
@@ -2224,7 +2230,12 @@ class NativeFillTypevarsSuite(Suite):
         instance_cache.bool_type = None
         instance_cache.object_type = None
         instance_cache.function_type = None
-        return fixup_wire_type(decoded)
+        # The test seams only emit fully-resolved wire types, so a
+        # successful fixup is always a ProperType (never an alias target).
+        fixed = fixup_wire_type(decoded)
+        if fixed is None:
+            return None
+        return cast(ProperType, fixed)
 
     def _pure_python(self, info: TypeInfo) -> Instance | TupleType:
         from mypy.typevars import fill_typevars
@@ -2365,7 +2376,7 @@ class NativeFillTypevarsWithAnySuite(Suite):
         self._set_native_typevars_active(False)
         set_wire_typeinfo_map(None)
 
-    def _decode(self, result: bytes) -> Type | None:
+    def _decode(self, result: bytes) -> ProperType | None:
         from mypy.types import instance_cache, read_type as _read_type
         from mypy.wirefixup import fixup_wire_type
 
@@ -2375,7 +2386,12 @@ class NativeFillTypevarsWithAnySuite(Suite):
         instance_cache.bool_type = None
         instance_cache.object_type = None
         instance_cache.function_type = None
-        return fixup_wire_type(decoded)
+        # The test seams only emit fully-resolved wire types, so a
+        # successful fixup is always a ProperType (never an alias target).
+        fixed = fixup_wire_type(decoded)
+        if fixed is None:
+            return None
+        return cast(ProperType, fixed)
 
     def _pure_python(self, info: TypeInfo) -> Instance | TupleType:
         from mypy.typevars import fill_typevars_with_any
@@ -2417,7 +2433,7 @@ class NativeFillTypevarsWithAnySuite(Suite):
         decoded = self._decode(result)
         assert isinstance(decoded, Instance)
         assert len(decoded.args) == 1
-        arg = decoded.args[0]
+        arg = get_proper_type(decoded.args[0])
         assert isinstance(arg, AnyType)
         assert arg.type_of_any == TypeOfAny.special_form
 
@@ -3073,216 +3089,6 @@ class NativeJoinTypesSuite(Suite):
         # returns s (UninhabitedType).
         from mypy.join import join_types
 
-        bottom = UninhabitedType()
-        with state.strict_optional_set(True):
-            assert join_types(bottom, UninhabitedType()) == bottom
-
-    def test_join_instance_none_strict_defers_to_python(self) -> None:
-        # s=Instance, t=None, strict_optional: visit_none_type else
-        # branch -> make_simplified_union (Python). Result is a union.
-        from mypy.join import join_types
-
-        with state.strict_optional_set(True):
-            result = join_types(self.fx.a, self.fx.nonet)
-            # Python falls through and builds a union of A and None.
-            assert isinstance(result, UnionType)
-
-    def test_join_instance_none_non_strict_returns_instance(self) -> None:
-        # Non-strict-optional: visit_none_type returns s (Instance).
-        from mypy.join import join_types
-
-        with state.strict_optional_set(False):
-            assert join_types(self.fx.a, self.fx.nonet) == self.fx.a
-
-    def test_join_instance_uninhabited_returns_instance(self) -> None:
-        # s=Instance, t=Uninhabited: visit_uninhabited returns s.
-        from mypy.join import join_types
-
-        with state.strict_optional_set(True):
-            assert join_types(self.fx.a, UninhabitedType()) == self.fx.a
-
-    def test_join_instance_instance_defers_to_python(self) -> None:
-        # visit_instance needs InstanceJoiner + protocol checks ->
-        # defer (None). Python computes the nominal join (A <: A -> A).
-        from mypy.join import join_types
-
-        assert join_types(self.fx.a, self.fx.a) == self.fx.a
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeJoinTypeListSuite(Suite):
-    """Parity suite for the Rust `rust_join_type_list` fold
-    (join.py:1508-1529, the join_type_list native hook).
-
-    With the native join gate on, `join_type_list` serializes the whole
-    list and lets Rust fold it through the setops join kernel
-    (`join_one_pair`, checker_helpers.rs). Rust returns `None`
-    (whole-call defer) on any LKV / fallback_to_any item, a
-    non-identity-safe single item, or any undecidable pair; Python then
-    re-runs the pure-Python fold, so every result matches Python.
-
-    Every test runs a gate-off vs gate-on differential on
-    `str(join_type_list(...))`; the portable cases also require the
-    direct seam to engage (non-None).
-    """
-
-    def setUp(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        self.fx = TypeFixture(INVARIANT)
-        type_infos = self._collect_type_infos()
-        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
-        typeinfo_map = {info.fullname: info for info in type_infos}
-        _set_native_subtype_active(True)
-        _set_native_subtype_resolver(self.resolver)
-        _set_native_join_active(True)
-        _set_native_join_resolver(self.resolver)
-        _set_native_join_typeinfo_map(typeinfo_map)
-
-    def tearDown(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        _set_native_subtype_active(False)
-        _set_native_subtype_resolver(None)
-        _set_native_join_active(False)
-        _set_native_join_resolver(None)
-        _set_native_join_typeinfo_map(None)
-
-    def _collect_type_infos(self) -> list[TypeInfo]:
-        infos = []
-        for name in dir(self.fx):
-            if not name.endswith("i"):
-                continue
-            value = getattr(self.fx, name)
-            if _is_type_info(value):
-                infos.append(value)
-        return infos
-
-    def _join(self, active: bool, *types: Type) -> Type:
-        import mypy.join
-        from mypy.join import join_type_list
-
-        old = mypy.join._native_join_active
-        mypy.join._set_native_join_active(active)
-        try:
-            with state.strict_optional_set(True):
-                return join_type_list(list(types))
-        finally:
-            mypy.join._set_native_join_active(old)
-
-    def _seam(self, *types: Type) -> bytes | None:
-        from mypy.join import _serialize_type
-
-        return _type_kernel.rust_join_type_list(
-            [_serialize_type(t) for t in types], True, self.resolver
-        )
-
-    def _assert_parity(self, engage: bool, *types: Type) -> None:
-        from mypy.join import _deserialize_type
-
-        py = self._join(False, *types)
-        native = self._join(True, *types)
-        assert str(native) == str(py), f"{types}: native {native!r} != py {py!r}"
-        seam = self._seam(*types)
-        if engage:
-            assert seam is not None, f"{types}: seam did not engage"
-            decoded = _deserialize_type(bytes(seam))
-            assert decoded is not None
-            assert str(decoded) == str(py), f"{types}: seam {decoded!r} != py {py!r}"
-        else:
-            assert seam is None, f"{types}: seam should defer"
-
-    def test_join_type_list_empty_returns_uninhabited(self) -> None:
-        from mypy.types import UninhabitedType
-
-        py = self._join(False)
-        assert isinstance(py, UninhabitedType)
-        self._assert_parity(True)
-
-    def test_join_type_list_single_item(self) -> None:
-        self._assert_parity(True, self.fx.a)
-
-    def test_join_type_list_same_pair(self) -> None:
-        self._assert_parity(True, self.fx.a, self.fx.a)
-
-    def test_join_type_list_subtype_pair(self) -> None:
-        # A <: object -> the join is object.
-        self._assert_parity(True, self.fx.a, self.fx.o)
-
-    def test_join_type_list_incomparable_common_ancestor(self) -> None:
-        # Unrelated A and B join to their common ancestor (object).
-        self._assert_parity(True, self.fx.a, self.fx.b)
-
-    def test_join_type_list_union_item(self) -> None:
-        # join(A, A | None) -> A | None (A <: the union, join.py:432).
-        self._assert_parity(
-            True, self.fx.a, UnionType([self.fx.a, self.fx.nonet])
-        )
-
-    def test_join_type_list_leading_none(self) -> None:
-        # join(None, A) strict -> A | None; the fold must NOT skip the
-        # leading None (the old conservative fold did).
-        self._assert_parity(True, self.fx.nonet, self.fx.a)
-
-    def test_join_type_list_any_absorption(self) -> None:
-        self._assert_parity(True, self.fx.anyt, self.fx.a)
-
-    def test_join_type_list_typevar_item(self) -> None:
-        # join(A, T) -> default(A) = object (join.py:546).
-        self._assert_parity(True, self.fx.a, self.fx.t)
-
-    def test_join_type_list_identical_callables(self) -> None:
-        c1 = CallableType(
-            [self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function
-        )
-        self._assert_parity(True, c1, c1)
-
-    def test_join_type_list_named_similar_callables(self) -> None:
-        # Similar but not equivalent callables (different kwarg names):
-        # the fold copies the last element's shape; the `definition`
-        # restore is covered by the check-inference test suite.
-        ca = CallableType(
-            [self.fx.a], [ARG_NAMED], ["k"], self.fx.a, self.fx.function
-        )
-        cb = CallableType(
-            [self.fx.a], [ARG_NAMED], ["m"], self.fx.a, self.fx.function
-        )
-        self._assert_parity(True, ca, cb)
-
-    def test_join_type_list_lkv_defers(self) -> None:
-        # A Literal-typed item carries a last_known_value; Rust defers
-        # the whole call (has_lkv guard) and Python joins via the
-        # literal's fallback instance.
-        self._assert_parity(False, self.fx.lit1, self.fx.a)
-
-    def test_rust_seam_engages_on_basic_cases(self) -> None:
-        # Engagement measurement for the join_type_list seam: how many
-        # representative pairs the Rust fold decides (non-None).
-        cases = [
-            [self.fx.a, self.fx.a],
-            [self.fx.a, self.fx.o],
-            [self.fx.a, self.fx.b],
-            [self.fx.a, self.fx.nonet],
-            [self.fx.anyt, self.fx.a],
-            [self.fx.a, self.fx.t],
-        ]
-        c1 = CallableType(
-            [self.fx.a], [ARG_POS], [None], self.fx.a, self.fx.function
-        )
-        cases.append([c1, c1])
-        engaged = sum(1 for ts in cases if self._seam(*ts) is not None)
-        assert engaged >= 6, f"seam engaged on only {engaged}/{len(cases)} cases"
-
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMatchGenericCallablesSuite(Suite):
@@ -3342,7 +3148,7 @@ class NativeMatchGenericCallablesSuite(Suite):
                 infos.append(value)
         return infos
 
-    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         import mypy.join
 
         old = mypy.join._native_join_active
@@ -3370,6 +3176,8 @@ class NativeMatchGenericCallablesSuite(Suite):
         assert tc.variables[0].id.raw_id >= before
         assert sc.variables[0].id.raw_id == tc.variables[0].id.raw_id
         assert tc.variables[0].id.meta_level == 0
+        assert isinstance(tc.arg_types[0], TypeVarType)
+        assert isinstance(sc.arg_types[0], TypeVarType)
         assert tc.arg_types[0].id == tc.variables[0].id
         assert sc.arg_types[0].id == sc.variables[0].id
         assert_equal(str(tc), str(sc))
@@ -3394,378 +3202,13 @@ class NativeMatchGenericCallablesSuite(Suite):
         # t's T and s's U both get the first fresh id, s's V the second.
         assert t_out.variables[0].id.raw_id == s_out.variables[0].id.raw_id
         assert s_out.variables[1].id.raw_id == s_out.variables[0].id.raw_id + 1
+        assert isinstance(t_out.arg_types[0], TypeVarType)
+        assert isinstance(s_out.arg_types[0], TypeVarType)
         assert t_out.arg_types[0].id == t_out.variables[0].id
         assert s_out.arg_types[0].id == s_out.variables[0].id
         # str renders names, not ids; assert id equality on the ret types.
-        assert t_out.ret_type.id == s_out.ret_type.id
-
-    def test_match_generic_callables_min_len_zero_noop(self) -> None:
-        from mypy.join import match_generic_callables
-
-        # A non-generic callable: min_len == 0 short-circuits to the
-        # unchanged operands (join.py:1169-1170).
-        non_generic = self.fx.callable(self.fx.a, self.fx.b)
-        t_out, s_out = match_generic_callables(non_generic, non_generic)
-        assert t_out is non_generic
-        assert s_out is non_generic
-
-    def test_match_generic_callables_gate_off_differential(self) -> None:
-        from mypy.join import match_generic_callables
-
-        c = self._generic(self.fx.t)
-        off = self._with_gate(False, lambda: match_generic_callables(c, c))
-        on = self._with_gate(True, lambda: match_generic_callables(c, c))
-        assert_equal(str(on[0]), str(off[0]))
-        assert_equal(str(on[1]), str(off[1]))
-
-    def test_match_generic_callables_param_spec_defers(self) -> None:
-        from mypy.join import match_generic_callables
-
-        # ParamSpec variables keep the Python path (Rust cannot rebuild
-        # ParamSpec prefix identity); the differential must still agree.
-        p = ParamSpecType(
-            "P",
-            "P",
-            TypeVarId(1),
-            ParamSpecFlavor.BARE,
-            self.fx.o,
-            AnyType(TypeOfAny.from_omitted_generics),
-        )
-        c = CallableType(
-            [p], [ARG_POS], [None], self.fx.a, self.fx.function, variables=[p]
-        )
-        off = self._with_gate(False, lambda: match_generic_callables(c, c))
-        on = self._with_gate(True, lambda: match_generic_callables(c, c))
-        assert_equal(str(on[0]), str(off[0]))
-        assert_equal(str(on[1]), str(off[1]))
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeJoinInstanceSuite(Suite):
-    """Parity suite for the Rust `visit_instance` nominal join (Stage 3c M8f).
-
-    Exercises the args-less Instance-Instance nominal join: same-type,
-    direct-subtype, and common-ancestor via the MRO bases walk. The
-    fixture provides A, B(A), C(A), D (unrelated). join(B, C) finds A as
-    the common ancestor via the bases walk, which trivial_join (direct
-    subtype only) would miss (it returns object).
-    """
-
-    def setUp(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        self.fx = TypeFixture(INVARIANT)
-        type_infos = self._collect_type_infos()
-        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
-        typeinfo_map = {info.fullname: info for info in type_infos}
-        _set_native_subtype_active(True)
-        _set_native_subtype_resolver(self.resolver)
-        _set_native_join_active(True)
-        _set_native_join_resolver(self.resolver)
-        _set_native_join_typeinfo_map(typeinfo_map)
-
-    def tearDown(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        _set_native_subtype_active(False)
-        _set_native_subtype_resolver(None)
-        _set_native_join_active(False)
-        _set_native_join_resolver(None)
-        _set_native_join_typeinfo_map(None)
-
-    def _collect_type_infos(self) -> list[TypeInfo]:
-        infos = []
-        for name in dir(self.fx):
-            if not name.endswith("i"):
-                continue
-            value = getattr(self.fx, name)
-            if _is_type_info(value):
-                infos.append(value)
-        return infos
-
-    def test_join_same_type_returns_self(self) -> None:
-        # join.py:114: t.type == s.type, no args -> Instance(A, []) = A.
-        from mypy.join import join_types
-
-        assert join_types(self.fx.a, self.fx.a) == self.fx.a
-        assert join_types(self.fx.d, self.fx.d) == self.fx.d
-
-    def test_join_direct_subtype_returns_supertype(self) -> None:
-        # B <: A -> join(A, B) = A. The Rust path returns
-        # Ancestor("A") which the shim maps to Instance(A, []).
-        from mypy.join import join_types
-
-        assert join_types(self.fx.a, self.fx.b) == self.fx.a
-        assert join_types(self.fx.b, self.fx.a) == self.fx.a
-
-    def test_join_common_ancestor_returns_ancestor(self) -> None:
-        # B <: A, C <: A, B not <: C, C not <: B -> join(B, C) = A.
-        # trivial_join would return object (neither is a subtype of
-        # the other); the visit_instance bases walk finds A.
-        from mypy.join import join_types
-
-        assert join_types(self.fx.b, self.fx.c) == self.fx.a
-        assert join_types(self.fx.c, self.fx.b) == self.fx.a
-
-    def test_join_unrelated_defers_to_python_returns_object(self) -> None:
-        # A and D unrelated (D not <: A, A not <: D, no common base
-        # in the fixture). Rust defers; Python returns object.
-        from mypy.join import join_types
-
-        result = join_types(self.fx.a, self.fx.d)
-        assert result == self.fx.o
-
-    def test_join_with_args_returns_same_instance(self) -> None:
-        # Instance with type args (M8g): join(G[A], G[A]) where T is
-        # invariant. is_equivalent(A, A)=True, join_types(A, A)=A ->
-        # Rust returns SameTypeWithArgs (disc 6) with arg_discs=[0]
-
-        # (use s.args[0]=A). Shim reconstructs G[A].
-        from mypy.join import join_types
-
-        result = join_types(self.fx.ga, self.fx.ga)
-        assert result == self.fx.ga
-
-class NativeSetopsJoinDiffArgsSuite(Suite):
-    """Parity for the args-bearing different-base join port
-    (setops.rs `join_diff_instances_with_args` / `via_supertype_arg_type`).
-
-    `InstanceJoiner.join_instances` (join.py:292-303, 350-427) routes an
-    argument-carrying pair with different base types through
-    `join_instances_via_supertype`, which maps `t` onto each candidate
-    base (`map_instance_to_supertype`) and recurses. The Rust port
-    (#867) mirrors that natively; previously the whole branch deferred.
-
-    Every test runs a gate-off vs gate-on differential and asserts the
-    results render identically, plus a direct seam call proving the
-    `rust_join_instances` seam decides (non-None) rather than silently
-    deferring on the diff-args shape.
-    """
-
-    def setUp(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        self.fx = TypeFixture(INVARIANT)
-        type_infos = self._collect_type_infos()
-        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
-        typeinfo_map = {info.fullname: info for info in type_infos}
-        _set_native_subtype_active(True)
-        _set_native_subtype_resolver(self.resolver)
-        _set_native_join_active(True)
-        _set_native_join_resolver(self.resolver)
-        _set_native_join_typeinfo_map(typeinfo_map)
-
-    def tearDown(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        _set_native_subtype_active(False)
-        _set_native_subtype_resolver(None)
-        _set_native_join_active(False)
-        _set_native_join_resolver(None)
-        _set_native_join_typeinfo_map(None)
-
-    def _collect_type_infos(self) -> list[TypeInfo]:
-        infos = []
-        for name in dir(self.fx):
-            if not name.endswith("i"):
-                continue
-            value = getattr(self.fx, name)
-            if _is_type_info(value):
-                infos.append(value)
-        return infos
-
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
-        from mypy.join import _set_native_join_active
-
-        _set_native_join_active(active)
-        try:
-            return fn()
-        finally:
-            _set_native_join_active(True)
-
-    def _join_str(self, s: Type, t: Type) -> str:
-        from mypy.join import join_types
-
-        return str(join_types(s, t))
-
-    def _assert_par(self, s: Type, t: Type, label: str) -> None:
-        off = self._with_gate(False, lambda: self._join_str(s, t))
-        on = self._with_gate(True, lambda: self._join_str(s, t))
-        assert_equal(on, off, f"diff-args join parity {label}")
-
-    def _engages(self, t: Type, s: Type) -> object:
-        # Direct seam call: non-None proves rust_join_instances decides
-        # for this diff-args pair (it fell through before #867).
-        from mypy.subtypes import _serialize_type
-
-        return _type_kernel.rust_join_instances(
-            _serialize_type(t),
-            _serialize_type(s),
-            True,
-            self.resolver,
-        )
-
-    def test_parity_generic_vs_unrelated(self) -> None:
-        # G[A] join B (B unrelated to G): common ancestor is object.
-        self._assert_par(self.fx.ga, self.fx.b, "G[A] vs B")
-        self._assert_par(self.fx.g2a, self.fx.b, "G2[A] vs B")
-
-    def test_parity_generic_vs_object(self) -> None:
-        # G[A] join object: object on one side -> join is object; the
-        # object fast-path decides natively (proves the seam engages).
-        self._assert_par(self.fx.ga, self.fx.o, "G[A] vs object")
-        self._assert_par(self.fx.o, self.fx.ga, "object vs G[A]")
-        assert self._engages(self.fx.ga, self.fx.o) is not None
-
-    def test_parity_subclass_shared_generic_base(self) -> None:
-        # GS2[A] join G[A]: GS2 <: G so via_supertype maps GS2 back
-        # onto G and the join is G[A]. map_instance_to_supertype may
-        # defer on the typevar base G[s1]; the differential covers both.
-        self._assert_par(self.fx.gs2a, self.fx.ga, "GS2[A] vs G[A]")
-
-    def test_parity_two_generic_unrelated(self) -> None:
-        # G2[A] join G[B]: distinct generic classes -> object (or the
-        # MRO winner the walk finds); both gates must agree.
-        self._assert_par(self.fx.g2a, self.fx.gb, "G2[A] vs G[B]")
-
-    def test_parity_generic_vs_subtype_other_way(self) -> None:
-        # G[B] join GS2[A]: unrelated order must still agree.
-        self._assert_par(self.fx.gb, self.fx.gs2a, "G[B] vs GS2[A]")
-
-
-@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
-class NativeMatchGenericCallablesSuite(Suite):
-    """Parity suite for the Rust `match_generic_callables` id-renumbering
-    port (join.py:1152-1180, freshen.rs).
-
-    With the native join gate on, `match_generic_callables` routes
-    through the kernel: Rust allocates one shared batch of fresh
-    meta-level-0 ids (`TypeVarId.new(meta_level=0)`) passed to BOTH
-    operands, renumbers each operand's variables, and expands the body
-    via `expand_type` (join.py:1171-1173).
-
-    Every test runs a gate-off vs gate-on differential and asserts the
-    results render identically; the Rust seam must also engage (direct
-    kernel call) for the portable cases.
-    """
-
-    def setUp(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        self.fx = TypeFixture(INVARIANT)
-        type_infos = self._collect_type_infos()
-        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
-        typeinfo_map = {info.fullname: info for info in type_infos}
-        _set_native_subtype_active(True)
-        _set_native_subtype_resolver(self.resolver)
-        _set_native_join_active(True)
-        _set_native_join_resolver(self.resolver)
-        _set_native_join_typeinfo_map(typeinfo_map)
-
-    def tearDown(self) -> None:
-        from mypy.join import (
-            _set_native_join_active,
-            _set_native_join_resolver,
-            _set_native_join_typeinfo_map,
-        )
-        from mypy.subtypes import _set_native_subtype_active, _set_native_subtype_resolver
-
-        _set_native_subtype_active(False)
-        _set_native_subtype_resolver(None)
-        _set_native_join_active(False)
-        _set_native_join_resolver(None)
-        _set_native_join_typeinfo_map(None)
-
-    def _collect_type_infos(self) -> list[TypeInfo]:
-        infos = []
-        for name in dir(self.fx):
-            if not name.endswith("i"):
-                continue
-            value = getattr(self.fx, name)
-            if _is_type_info(value):
-                infos.append(value)
-        return infos
-
-    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
-        import mypy.join
-
-        old = mypy.join._native_join_active
-        mypy.join._set_native_join_active(active)
-        try:
-            return fn()
-        finally:
-            mypy.join._set_native_join_active(old)
-
-    def _generic(self, tv: TypeVarType) -> CallableType:
-        """A generic callable: `def f(tv: tv) -> tv`."""
-        return CallableType(
-            [tv], [ARG_POS], [None], tv, self.fx.function, variables=[tv]
-        )
-
-    def test_match_generic_callables_renumbers(self) -> None:
-        # def f(t: T) -> T: join(f, f) must renumber T to a fresh id so
-        # the two operands share one id space.
-        from mypy.join import match_generic_callables
-
-        c = self._generic(self.fx.t)
-        before = TypeVarId.next_raw_id
-        tc, sc = self._with_gate(True, lambda: match_generic_callables(c, c))
-        # Fresh ids were allocated (t and s both get T'raw_id fresh).
-        assert tc.variables[0].id.raw_id >= before
-        assert sc.variables[0].id.raw_id == tc.variables[0].id.raw_id
-        assert tc.variables[0].id.meta_level == 0
-        assert tc.arg_types[0].id == tc.variables[0].id
-        assert sc.arg_types[0].id == sc.variables[0].id
-        assert_equal(str(tc), str(sc))
-
-    def test_match_generic_callables_mixed_arity(self) -> None:
-        # t has 1 var, s has 2: both renumbered into the same id range.
-        from mypy.join import match_generic_callables
-
-        t = self._generic(self.fx.t)
-        s2 = TypeVarType(
-            "U", "U", TypeVarId(3), [], self.fx.o, AnyType(TypeOfAny.special_form)
-        )
-        s2b = TypeVarType(
-            "V", "V", TypeVarId(4), [], self.fx.o, AnyType(TypeOfAny.special_form)
-        )
-        s = CallableType(
-            [s2, s2b], [ARG_POS, ARG_POS], [None, None], s2, self.fx.function, variables=[s2, s2b]
-        )
-        t_out, s_out = match_generic_callables(t, s)
-        # BOTH operands share the same fresh-id batch (join.py:1117-1120
-        # passes one `new_ids` list to both `update_callable_ids` calls):
-        # t's T and s's U both get the first fresh id, s's V the second.
-        assert t_out.variables[0].id.raw_id == s_out.variables[0].id.raw_id
-        assert s_out.variables[1].id.raw_id == s_out.variables[0].id.raw_id + 1
-        assert t_out.arg_types[0].id == t_out.variables[0].id
-        assert s_out.arg_types[0].id == s_out.variables[0].id
-        # str renders names, not ids; assert id equality on the ret types.
+        assert isinstance(t_out.ret_type, TypeVarType)
+        assert isinstance(s_out.ret_type, TypeVarType)
         assert t_out.ret_type.id == s_out.ret_type.id
 
     def test_match_generic_callables_min_len_zero_noop(self) -> None:
@@ -4545,7 +3988,7 @@ class NativeExpandTypeByInstanceSuite(Suite):
         )
         set_wire_typeinfo_map({i.fullname: i for i in self._type_infos})
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -4679,7 +4122,7 @@ class NativeExpandTypeEmptyEnvSuite(Suite):
         self._set_map(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -4898,7 +4341,7 @@ class NativeCheckexprFunctionsDeferralSuite(Suite):
         _set_native_checkexpr_resolver(self.resolver)
         return self.resolver
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checkexpr import _set_native_checkexpr_active
 
         _set_native_checkexpr_active(active)
@@ -5071,7 +4514,7 @@ class NativeClassCallableSuite(Suite):
             init_type, info, None, Instance(self.fx.oi, []), None, is_new, orig_self_type
         )
 
-    def _with_gate(self, active: bool, fn: Callable[[], CallableType]) -> CallableType:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -5196,7 +4639,7 @@ class NativeMapTypeFromSupertypeSuite(Suite):
 
         return map_type_from_supertype(typ, sub_info, super_info)
 
-    def _with_gate(self, active: bool, fn: Callable[[], Type]) -> Type:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -5320,7 +4763,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
 
         return map_instance_to_supertypes(instance, supertype)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.maptype import _set_native_map_active
 
         _set_native_map_active(active)
@@ -5404,7 +4847,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
         # G[A] maps. Flags are [False, True].
         import type_kernel as _tk
 
-        from mypy.maptype import _WriteBuffer
+        from mypy.maptype import _WriteBuffer  # type: ignore[attr-defined]
         from mypy.types import write_type_list
 
         members = [
@@ -5412,7 +4855,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
             Instance(self.fx.gi, [self.fx.a]),
         ]
         buf = _WriteBuffer()
-        write_type_list(buf, members)  # type: ignore[arg-type]
+        write_type_list(buf, members)
         result = _tk.rust_map_instance_to_supertypes(
             self._resolver,
             buf.getvalue(),
@@ -5449,7 +4892,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
         # whole-step loop (returns bytes + flags) rather than deferring.
         import type_kernel as _tk
 
-        from mypy.maptype import _WriteBuffer
+        from mypy.maptype import _WriteBuffer  # type: ignore[attr-defined]
         from mypy.types import write_type_list
 
         members = [
@@ -5457,7 +4900,7 @@ class NativeMapInstanceToSupertypesSuite(Suite):
             Instance(self.fx.gi, [self.fx.b]),
         ]
         buf = _WriteBuffer()
-        write_type_list(buf, members)  # type: ignore[arg-type]
+        write_type_list(buf, members)
         result = _tk.rust_map_instance_to_supertypes(
             self._resolver,
             buf.getvalue(),
@@ -5534,7 +4977,7 @@ class NativeTypeObjectTypeSuite(Suite):
 
         return type_object_type_from_function(sig, info, info, self.fx.type_type, is_new)
 
-    def _with_gate(self, active: bool, fn: Callable[[], FunctionLike]) -> FunctionLike:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -5554,6 +4997,7 @@ class NativeTypeObjectTypeSuite(Suite):
         result = self._with_gate(
             False, lambda: self._type_object(self._init_sig(self.fx.ai, self.fx.ai), self.fx.ai, False)
         )
+        result = cast(CallableType, result)
         assert result.ret_type == Instance(self.fx.ai, [])
         assert list(result.variables) == []
 
@@ -5863,7 +5307,7 @@ class NativeTypeopsDeferralSuite(Suite):
         _set_native_typeops_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -6004,7 +5448,7 @@ class NativeContractLiteralsSuite(Suite):
         _set_native_typeops_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -6133,7 +5577,7 @@ class NativeRemoveRedundantUnionItemsSuite(Suite):
         _set_native_typeops_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -6246,7 +5690,7 @@ class NativeTryGettingLiteralSuite(Suite):
         self._set_active(False)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -6328,14 +5772,14 @@ class NativeRevealImportedSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _make_checker(self, code_enabled: bool = True) -> ExpressionChecker:  # type: ignore[name-defined]
+    def _make_checker(self, code_enabled: bool = True) -> ExpressionChecker:
         from mypy.checker import TypeChecker
         from mypy.checkexpr import ExpressionChecker
         from mypy.errors import Errors
@@ -6365,10 +5809,8 @@ class NativeRevealImportedSuite(Suite):
     ) -> list[tuple[str, str]]:
         ec = self._make_checker(code_enabled)
         captured: list[tuple[str, str]] = []
-        ec.chk.fail = lambda msg, ctx, code=None: captured.append(("fail", msg))  # type: ignore[assignment]
-        ec.chk.note = lambda msg, ctx, offset=0, code=None: captured.append(  # type: ignore[assignment]
-            ("note", msg)
-        )
+        ec.chk.fail = lambda msg, ctx, code=None: captured.append(("fail", msg))  # type: ignore[method-assign, misc, assignment]
+        ec.chk.note = lambda msg, ctx, offset=0, code=None: captured.append(("note", msg))  # type: ignore[method-assign, misc]
         self._with_gate(active, lambda: ec.check_reveal_imported(expr))
         return captured
 
@@ -6471,7 +5913,7 @@ class NativeSuperArgTypesSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -6482,11 +5924,11 @@ class NativeSuperArgTypesSuite(Suite):
         self,
         n_args: int,
         arg_kinds: list[ArgKind],
-        info: TypeInfo | None = None,
+        info: object = None,
     ) -> SuperExpr:
         from mypy.nodes import SuperExpr
 
-        args = [NameExpr(f"a{i}") for i in range(n_args)]
+        args: list[Expression] = [NameExpr(f"a{i}") for i in range(n_args)]
         call = CallExpr(
             callee=NameExpr("super"),
             args=args,
@@ -6494,7 +5936,9 @@ class NativeSuperArgTypesSuite(Suite):
             arg_names=[None] * n_args,
         )
         e = SuperExpr("super", call)
-        e.info = info
+        # Some direct-seam tests pass an opaque object on purpose (the Rust
+        # classifier must tolerate unreadable info facts and defer).
+        e.info = info  # type: ignore[assignment]
         return e
 
     def _make_chk(
@@ -6508,7 +5952,7 @@ class NativeSuperArgTypesSuite(Suite):
             fail=lambda msg, ctx, code=None: captured.append(("fail", str(msg))),
             scope=SimpleNamespace(active_class=lambda: active_class),
         )
-        chk.captured = captured  # type: ignore[attr-defined]
+        chk.captured = captured
         return chk
 
     def _run_super(
@@ -6685,7 +6129,7 @@ class NativeVisitOpExprSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -6697,7 +6141,7 @@ class NativeVisitOpExprSuite(Suite):
 
     def test_seam_analyzed_passthrough(self) -> None:
         e = OpExpr("|", NameExpr("X"), NameExpr("Y"))
-        e.analyzed = NameExpr("Analyzed")
+        e.analyzed = NameExpr("Analyzed")  # type: ignore[assignment]
         assert self._tag(e) == 0
 
     def test_seam_boolean_and(self) -> None:
@@ -6713,7 +6157,7 @@ class NativeVisitOpExprSuite(Suite):
         assert self._tag(e) == 2
 
     def test_seam_str_interp_bytes(self) -> None:
-        e = OpExpr("%", BytesExpr(b"%s"), NameExpr("Y"))
+        e = OpExpr("%", BytesExpr("%s"), NameExpr("Y"))
         assert self._tag(e) == 3
 
     def test_seam_str_interp_str(self) -> None:
@@ -6740,7 +6184,7 @@ class NativeVisitOpExprSuite(Suite):
 
     def test_seam_star_bytes_not_list_multiply(self) -> None:
         # "*" with BytesExpr left goes to check_op, not list multiply.
-        e = OpExpr("*", BytesExpr(b"x"), NameExpr("Y"))
+        e = OpExpr("*", BytesExpr("x"), NameExpr("Y"))
         assert self._tag(e) == 4
 
 
@@ -6964,7 +6408,7 @@ class NativeProtocolImplementationSuite(Suite):
 
     def test_single_method_protocol_engages(self) -> None:
         """A simple `__len__`-style protocol must be decided natively."""
-        self._live_info = {}
+        self._live_info: dict[str, TypeInfo] = {}
         # protocol P: def f(self) -> A
         p = self._protocol("mod.P", ["f"])
         # impl I: def f(self) -> A
@@ -6985,7 +6429,11 @@ class NativeProtocolImplementationSuite(Suite):
         i = self._impl("mod.I", ["f"])
         # f on I returns object; protocol requires A. object is a
         # supertype of A, so the return is not compatible.
-        i.names["f"].node.type = self._method_with_return(i, self.fx.o)
+        fnode = i.names["f"].node
+        assert fnode is not None
+        # runtime node is a FuncDef; Var accepted for the Var-member case
+        assert isinstance(fnode, (Var, FuncDef))
+        fnode.type = self._method_with_return(i, self.fx.o)
         self._build_resolver()
         result = self._seam_call(Instance(i, []), Instance(p, []))
         assert result is False, (
@@ -7110,7 +6558,7 @@ class NativeAliasExpansionSuite(Suite):
 
     def _make_alias(
         self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -7119,10 +6567,10 @@ class NativeAliasExpansionSuite(Suite):
             "mod",
             -1,
             -1,
-            alias_tvars=alias_tvars or [],  # type: ignore[arg-type]
+            alias_tvars=alias_tvars or [],
         )
 
-    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:  # type: ignore[name-defined]
+    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:
         return TypeAliasType(alias, [])
 
     def _with_typeops_gate(
@@ -7148,8 +6596,8 @@ class NativeAliasExpansionSuite(Suite):
             _set_native_checkexpr_active(True)
 
     def _with_checker_gate(
-        self, active: bool, fn: Callable[[], object]
-    ) -> object:
+        self, active: bool, fn: Callable[[], T]
+    ) -> T:
         from mypy.checker import _set_native_checker_stmts_active
 
         _set_native_checker_stmts_active(active)
@@ -7165,7 +6613,7 @@ class NativeAliasExpansionSuite(Suite):
 
         alias = self._make_alias("mod.TA", self.fx.a)
         self._rebuild_resolver([alias])
-        u = UnionType.make_union([self._alias_type(alias), self.fx.a])
+        u = cast(UnionType, UnionType.make_union([self._alias_type(alias), self.fx.a]))
         off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
         on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
         assert_equal(str(on), str(off), "make_simplified_union alias parity")
@@ -7194,7 +6642,7 @@ class NativeAliasExpansionSuite(Suite):
         )
         alias = self._make_alias("mod.TB", Instance(sub, []))
         self._rebuild_resolver([alias], extra_infos=[sub])
-        u = UnionType.make_union([self._alias_type(alias), self.fx.a])
+        u = cast(UnionType, UnionType.make_union([self._alias_type(alias), self.fx.a]))
         off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
         on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
         assert_equal(str(on), str(off), "make_simplified_union subtype parity")
@@ -7219,7 +6667,7 @@ class NativeAliasExpansionSuite(Suite):
         alias_a = self._make_alias("mod.TA", self.fx.a)
         alias_b = self._make_alias("mod.TB", Instance(self.fx.std_listi, [self.fx.a]))
         self._rebuild_resolver([alias_a, alias_b])
-        u = UnionType.make_union([self._alias_type(alias_b), self.fx.a])
+        u = cast(UnionType, UnionType.make_union([self._alias_type(alias_b), self.fx.a]))
         off = self._with_typeops_gate(False, lambda: make_simplified_union(u.items, 0, -1))
         on = self._with_typeops_gate(True, lambda: make_simplified_union(u.items, 0, -1))
         assert_equal(str(on), str(off), "nested-alias make_simplified_union parity")
@@ -7383,7 +6831,7 @@ class NativeFunctionTypeSuite(Suite):
         self._set_active(False)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], FunctionLike]) -> FunctionLike:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -7702,7 +7150,7 @@ class NativeCustomSpecialMethodSuite(Suite):
         # member requires a rebuild for the Rust seam to see it.
         self._rebuild_resolver()
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -7854,7 +7302,7 @@ class NativeCustomSpecialMethodSuite(Suite):
         # to Python (which expands via get_proper_type).
         from mypy.nodes import TypeAlias
 
-        t = TypeAliasType(TypeAlias(None, "mod.Alias", "mod", -1, -1), [])
+        t = TypeAliasType(TypeAlias(cast(Any, None), "mod.Alias", "mod", -1, -1), [])
         self._assert_defers(t)
 
     def _rebuild_resolver_with_aliases(self, aliases: list[Any]) -> None:
@@ -8011,7 +7459,7 @@ class NativeTruthinessSuite(Suite):
             f"{op}(t) str parity strict_optional={strict_optional}",
         )
         if expect_uninhabited:
-            assert isinstance(get_proper_type(on), UninhabitedType), (
+            assert isinstance(on, UninhabitedType), (
                 f"{op}(t) should be UninhabitedType, got {on!r}"
             )
 
@@ -8274,8 +7722,8 @@ class NativeTypeImplTruthinessSuite(Suite):
 
         self._types_mod = _types_mod
         # Bind the seam names the module-level try would have bound.
-        _types_mod._VisitorWriteBuffer = _WB
-        _types_mod._ReadBuffer = _RB
+        _types_mod._VisitorWriteBuffer = _WB  # type: ignore[attr-defined]
+        _types_mod._ReadBuffer = _RB  # type: ignore[attr-defined]
         for n in self._VISITOR_SEAM_NAMES:
             _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
@@ -8416,7 +7864,7 @@ class NativeTypeImplTruthinessSuite(Suite):
         # TypeAliasType: delegates to alias.target.can_be_*.
         alias_node = TypeAliasType(
             None,
-            self.fx.a,
+        [self.fx.a],
         )  # alias.target = self.fx.a (Instance A)
         self._assert_par(alias_node)
 
@@ -8441,10 +7889,6 @@ class NativeTypeImplTruthinessSuite(Suite):
                 is not None
             ), f"rust_can_be_true_default_live did not engage for {t!r}"
 
-
-def _base_infos(fx: TypeFixture) -> list[TypeInfo]:
-    """All fixture TypeInfos for the resolver + object."""
-    return [getattr(fx, n) for n in dir(fx) if n.endswith("i") and _is_type_info(getattr(fx, n))]
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeInstantiateTypeAliasSuite(Suite):
@@ -8471,7 +7915,7 @@ class NativeInstantiateTypeAliasSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -8493,7 +7937,7 @@ class NativeInstantiateTypeAliasSuite(Suite):
             "mod",
             -1,
             -1,
-            alias_tvars=alias_tvars or [],  # type: ignore[arg-type]
+            alias_tvars=alias_tvars or [],
             no_args=no_args,
         )
 
@@ -8541,7 +7985,7 @@ class NativeInstantiateTypeAliasSuite(Suite):
         )
 
     def _assert_engages(self, node: TypeAlias, args: list[Type], no_args: bool) -> None:
-        from mypy.typeanal import _rust_instantiate_type_alias, _serialize_typeanal_type
+        from mypy.typeanal import _rust_instantiate_type_alias, _serialize_typeanal_type  # type: ignore[attr-defined]
 
         result = _rust_instantiate_type_alias(
             node, [_serialize_typeanal_type(a) for a in args], no_args, False
@@ -8638,14 +8082,14 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, *, allow_type_any: bool = False, allow_unbound_tvars: bool = False) -> object:
+    def _analyser(self, *, allow_type_any: bool = False, allow_unbound_tvars: bool = False) -> Any:
         from mypy.tvar_scope import TypeVarLikeScope
         from mypy.typeanal import TypeAnalyser
 
@@ -8654,8 +8098,8 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         ta.allow_type_any = allow_type_any
         ta.allow_unbound_tvars = allow_unbound_tvars
         ta.allow_param_spec_literals = False
-        ta.fail = lambda *a, **k: None
-        ta.note = lambda *a, **k: None
+        ta.fail = lambda *a, **k: None  # type: ignore[method-assign]
+        ta.note = lambda *a, **k: None  # type: ignore[method-assign]
         return ta
 
     def _var_sym(self, info: TypeInfo | None, type: AnyType | Instance | TypeType | None, name: str = "mod.x") -> SymbolTableNode:
@@ -8669,7 +8113,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
     def _tvar_expr_sym(self, name: str = "T") -> SymbolTableNode:
         from mypy.nodes import SymbolTableNode, TypeVarExpr
 
-        tv = TypeVarExpr(name, name, -1, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
+        tv = TypeVarExpr(name, name, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics))
         return SymbolTableNode(MDEF, tv)
 
     def _call(
@@ -8682,7 +8126,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
         allow_unbound_tvars: bool = False,
     ) -> Type:
         ta = self._analyser(allow_type_any=allow_type_any, allow_unbound_tvars=allow_unbound_tvars)
-        return ta.analyze_unbound_type_without_type_info(t, sym, defining_literal)
+        return cast("Type", ta.analyze_unbound_type_without_type_info(t, sym, defining_literal))
 
     def _assert_par(
         self,
@@ -8707,7 +8151,7 @@ class NativeUnboundWithoutTypeInfoSuite(Suite):
                         is_type_instance: bool = False, is_type_type_any: bool = False,
                         unbound_tvar: bool = False, allow_unbound_tvars: bool = False,
                         is_enum_member: bool = False, defining_literal: bool = False) -> None:
-        from mypy.typeanal import _rust_analyze_unbound_without_info
+        from mypy.typeanal import _rust_analyze_unbound_without_info  # type: ignore[attr-defined]
 
         result = _rust_analyze_unbound_without_info(
             is_var_any, allow_type_any, is_type_instance, is_type_type_any,
@@ -8815,14 +8259,14 @@ class NativeUnboundBranchFrontSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, syms: dict[str, SymbolTableNode], **kwargs: object) -> object:
+    def _analyser(self, syms: dict[str, SymbolTableNode], **kwargs: Any) -> Any:
         from mypy.tvar_scope import TypeVarLikeScope
         from mypy.typeanal import TypeAnalyser
 
@@ -8866,11 +8310,11 @@ class NativeUnboundBranchFrontSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.tvar_scope = TypeVarLikeScope()
-        ta.plugin = FakePlugin(kwargs.pop("hook", None))
+        ta.plugin = FakePlugin(kwargs.pop("hook", None))  # type: ignore[assignment]
         ta.options = Options()
         ta.defining_alias = False
         ta.python_3_12_type_alias = False
@@ -8902,7 +8346,7 @@ class NativeUnboundBranchFrontSuite(Suite):
         from mypy.nodes import SymbolTableNode, TypeVarExpr
 
         tv = TypeVarExpr(
-            name, fullname, -1, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
+            name, fullname, [], self.fx.o, AnyType(TypeOfAny.from_omitted_generics)
         )
         return SymbolTableNode(MDEF, tv)
 
@@ -8922,7 +8366,7 @@ class NativeUnboundBranchFrontSuite(Suite):
         )
         return SymbolTableNode(MDEF, te)
 
-    def _bind(self, ta: object, tvar_def: TypeVarLikeType) -> None:
+    def _bind(self, ta: Any, tvar_def: TypeVarLikeType) -> None:
         ta.tvar_scope.bind_existing(tvar_def)
 
     def _bound_tvar(self, name: str = "T", fullname: str = "mod.T") -> TypeVarType:
@@ -8946,13 +8390,13 @@ class NativeUnboundBranchFrontSuite(Suite):
         )
 
     def _visit(
-        self, t: UnboundType, ta: object, defining_literal: bool = False
+        self, t: UnboundType, ta: Any, defining_literal: bool = False
     ) -> tuple[str, list[str], dict[str, int]]:
         result = ta.visit_unbound_type_nonoptional(t, defining_literal)
         messages = [m for m in ta.api.errors if not m.startswith("note: ")]
         return str(result), messages, ta.api.calls
 
-    def _assert_par(self, t: UnboundType, syms: dict[str, SymbolTableNode], **kwargs: object) -> None:
+    def _assert_par(self, t: UnboundType, syms: dict[str, SymbolTableNode], **kwargs: Any) -> None:
         off_ta, _ = self._analyser(syms, **kwargs)
         off = self._with_gate(False, lambda: self._visit(t, off_ta))
         self._set_active(True)
@@ -8971,10 +8415,10 @@ class NativeUnboundBranchFrontSuite(Suite):
             f"visit_unbound_type_nonoptional record parity {t.name}",
         )
 
-    def _assert_engages(self, **facts: object) -> None:
-        from mypy.typeanal import _rust_classify_unbound_front
+    def _assert_engages(self, **facts: Any) -> None:
+        from mypy.typeanal import _rust_classify_unbound_front  # type: ignore[attr-defined]
 
-        defaults: dict[str, object] = {
+        defaults: dict[str, Any] = {
             "node_kind": -1,
             "placeholder_becomes_typeinfo": False,
             "final_iteration": False,
@@ -9356,14 +8800,14 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, **kwargs: object) -> tuple[object, object]:
+    def _analyser(self, **kwargs: Any) -> tuple[Any, Any]:
         from mypy.tvar_scope import TypeVarLikeScope
         from mypy.typeanal import TypeAnalyser
 
@@ -9433,11 +8877,11 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.tvar_scope = TypeVarLikeScope()
-        ta.plugin = FakePlugin()
+        ta.plugin = FakePlugin()  # type: ignore[assignment]
         ta.options = Options()
         ta.defining_alias = False
         ta.python_3_12_type_alias = False
@@ -9461,7 +8905,7 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
         ta.allow_tuple_literal = True
         ta.report_invalid_types = False
         ta.prohibit_self_type = None
-        ta.cur_mod_node = None
+        ta.cur_mod_node = None  # type: ignore[assignment]
         for key, value in kwargs.items():
             setattr(ta, key, value)
         return ta, api
@@ -9469,11 +8913,11 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
     _t_fullname = "typing.Any"
 
     @staticmethod
-    def _t(fullname: str, args: list[Type] | None = None, **kw: object) -> UnboundType:
+    def _t(fullname: str, args: list[Type] | None = None, **kw: Any) -> UnboundType:
         return UnboundType(fullname, args, **kw)
 
     def _call(
-        self, ta: object, t: UnboundType, fullname: str
+        self, ta: Any, t: UnboundType, fullname: str
     ) -> tuple[str, list[str]]:
         result = ta.try_analyze_special_unbound_type(t, fullname)
         messages = list(ta.api.errors)
@@ -9501,10 +8945,10 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
         if expected is not None:
             assert_equal(on[0], expected, f"try_analyze_special_unbound result {fullname}")
 
-    def _assert_engages(self, **facts: object) -> None:
-        from mypy.typeanal import _rust_classify_special_unbound
+    def _assert_engages(self, **facts: Any) -> None:
+        from mypy.typeanal import _rust_classify_special_unbound  # type: ignore[attr-defined]
 
-        defaults: dict[str, object] = {
+        defaults: dict[str, Any] = {
             "fullname": "typing.Any",
             "arg_count": 0,
             "empty_tuple_index": False,
@@ -9971,7 +9415,7 @@ class NativeRawExpressionTypeSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -9979,7 +9423,7 @@ class NativeRawExpressionTypeSuite(Suite):
             self._set_active(True)
 
     def _analyser(self, report_invalid_types: bool = True) -> tuple[object, object]:
-        from mypy.errors import ErrorCode as _ErrorCode
+        from mypy.errorcodes import ErrorCode as _ErrorCode
         from mypy.typeanal import TypeAnalyser
 
         class FakeApi:
@@ -9994,19 +9438,19 @@ class NativeRawExpressionTypeSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.report_invalid_types = report_invalid_types
         return ta, api
 
-    def _call(self, ta: object, t: object) -> tuple[str, list[str]]:
+    def _call(self, ta: Any, t: Any) -> tuple[str, list[str]]:
         result = ta.visit_raw_expression_type(t)
         messages = list(ta.api.errors)
         return str(result), messages
 
     def _make_t(
-        self, base_type_name: str, literal_value: object, note: str | None = None
+        self, base_type_name: str, literal_value: Any, note: str | None = None
     ) -> object:
         from mypy.types import RawExpressionType
 
@@ -10015,7 +9459,7 @@ class NativeRawExpressionTypeSuite(Suite):
     def _assert_par(
         self,
         base_type_name: str,
-        literal_value: object,
+        literal_value: Any,
         *,
         note: str | None = None,
         report_invalid_types: bool = True,
@@ -10031,7 +9475,7 @@ class NativeRawExpressionTypeSuite(Suite):
     def _assert_engages(
         self, base_type_name: str, report_invalid_types: bool = True, note_is_none: bool = True
     ) -> None:
-        from mypy.typeanal import _rust_classify_raw_expression_type
+        from mypy.typeanal import _rust_classify_raw_expression_type  # type: ignore[attr-defined]
 
         tag = _rust_classify_raw_expression_type(
             report_invalid_types, base_type_name, note_is_none
@@ -10039,7 +9483,7 @@ class NativeRawExpressionTypeSuite(Suite):
         assert tag is not None, f"seam did not engage for {base_type_name}"
 
     def _assert_defers(self, base_type_name: str) -> None:
-        from mypy.typeanal import _rust_classify_raw_expression_type
+        from mypy.typeanal import _rust_classify_raw_expression_type  # type: ignore[attr-defined]
 
         tag = _rust_classify_raw_expression_type(False, base_type_name, True)
         assert tag is None, f"seam did not defer for {base_type_name}"
@@ -10127,15 +9571,15 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
         set_wire_typeinfo_map(None)
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, **kwargs: object) -> object:
-        from mypy.errors import ErrorCode as _ErrorCode
+    def _analyser(self, **kwargs: Any) -> Any:
+        from mypy.errorcodes import ErrorCode as _ErrorCode
         from mypy.typeanal import TypeAnalyser
 
         class FakeApi:
@@ -10151,10 +9595,10 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
-        ta.tvar_scope = None  # anal_type must not reach the tvar scope for bound args
+        ta.tvar_scope = None  # type: ignore[assignment]
         ta.options = Options()
         ta.defining_alias = False
         ta.nesting_level = 0
@@ -10208,10 +9652,10 @@ class NativeAnalyzeTypeWithInfoSuite(Suite):
         assert_equal(on[0], off[0], f"analyze_type_with_type_info parity {info.fullname}")
         assert_equal(on[1], off[1], f"analyze_type_with_type_info errors {info.fullname}")
 
-    def _assert_engages(self, expected: int, **facts: object) -> None:
-        from mypy.typeanal import _rust_classify_type_with_info
+    def _assert_engages(self, expected: int, **facts: Any) -> None:
+        from mypy.typeanal import _rust_classify_type_with_info  # type: ignore[attr-defined]
 
-        defaults: dict[str, object] = {
+        defaults: dict[str, Any] = {
             "fullname": "mod.UserClass",
             "args_len": 0,
             "tuple_type_not_none": False,
@@ -10336,7 +9780,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         _set_native_checkexpr_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _stub_checker(self) -> tuple[object, list[str]]:
+    def _stub_checker(self) -> tuple[Any, list[str]]:
         """Minimal `ExpressionChecker` that records its effects.
 
         `check_argument_types` needs `self.chk.named_type` (var-arg
@@ -10392,7 +9836,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         chk.msg = _Msg()  # type: ignore[assignment]
 
         checker = ExpressionChecker.__new__(ExpressionChecker)
-        checker.chk = chk  # type: ignore[attr-defined]
+        checker.chk = chk
         checker._arg_infer_context_cache = ArgumentInferContext(
             named_type("typing.Mapping"), named_type("typing.Iterable")
         )
@@ -10452,7 +9896,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
                     f"{caller_kind}, {callee_type}, actual{n}, formal{m})"
                 )
 
-            ExpressionChecker.check_argument_types(  # type: ignore[call-arg]
+            ExpressionChecker.check_argument_types(
                 checker,
                 arg_types,
                 arg_kinds,
@@ -10480,7 +9924,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         callee: CallableType,
         f2a: list[list[int]],
     ) -> None:
-        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr
+        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr  # type: ignore[attr-defined]
 
         assert _rust_check_argument_types_plan is not None
         result = _rust_check_argument_types_plan(
@@ -10558,7 +10002,7 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]], assert_engages=False)
         # The seam must actively refuse the alias (prove the seal, not a
         # silent pass-through).
-        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr
+        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr  # type: ignore[attr-defined]
 
         result = _rust_check_argument_types_plan(
             self._resolver,
@@ -10616,7 +10060,7 @@ class NativeEqualityValueInfoSuite(Suite):
         _set_native_checker_active(False)
         _set_native_checker_resolver(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checker import _set_native_checker_active
 
         _set_native_checker_active(active)
@@ -10640,7 +10084,6 @@ class NativeEqualityValueInfoSuite(Suite):
                     frozenset(domain_info.enum_type_names),
                 )
                 for domain, domain_info in info.domains.items()
-                if isinstance(domain_info, EqualityDomainInfo)
             ),
         )
 
@@ -10927,7 +10370,7 @@ class NativeGetPropertyTypeSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -11003,7 +10446,7 @@ class NativeDetachCallableSuite(Suite):
         self._set_active(False)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -11020,13 +10463,13 @@ class NativeDetachCallableSuite(Suite):
             variables=variables,
         )
 
-    def _assert_par(self, typ: CallableType, class_type_vars: list[TypeVarType]) -> None:
+    def _assert_par(self, typ: CallableType, class_type_vars: list[TypeVarLikeType]) -> None:
         from mypy.checker import detach_callable
 
         off = self._with_gate(False, lambda: detach_callable(typ, class_type_vars))
-        assert isinstance(off, CallableType)  # type: ignore[misc]
+        assert isinstance(off, CallableType)
         on = self._with_gate(True, lambda: detach_callable(typ, class_type_vars))
-        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert isinstance(on, CallableType)
         assert_equal(str(on), str(off), f"detach_callable str parity {typ}")
         assert_equal(
             len(on.variables),
@@ -11048,7 +10491,7 @@ class NativeDetachCallableSuite(Suite):
         # Fast path: empty class_type_vars returns typ unchanged, no Rust call.
         c = self._callable([])
         result = self._with_gate(True, lambda: detach_callable(c, []))
-        assert isinstance(result, CallableType)  # type: ignore[misc]
+        assert isinstance(result, CallableType)
         assert result is c, "empty class_type_vars must return typ unchanged"
 
     def test_non_generic_class_vars_extended(self) -> None:
@@ -11057,7 +10500,7 @@ class NativeDetachCallableSuite(Suite):
         c = self._callable([])
         self._assert_par(c, [self.fx.t])
         on = self._with_gate(True, lambda: detach_callable(c, [self.fx.t]))
-        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert isinstance(on, CallableType)
         assert_equal(len(on.variables), 1)
         self._assert_engages(c, [self.fx.t])
 
@@ -11067,7 +10510,7 @@ class NativeDetachCallableSuite(Suite):
         c = self._callable([self.fx.t])
         self._assert_par(c, [self.fx.s])
         on = self._with_gate(True, lambda: detach_callable(c, [self.fx.s]))
-        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert isinstance(on, CallableType)
         assert_equal(len(on.variables), 2)
         self._assert_engages(c, [self.fx.s])
 
@@ -11077,7 +10520,7 @@ class NativeDetachCallableSuite(Suite):
         c = self._callable([self.fx.t])
         self._assert_par(c, [self.fx.s, self.fx.u])
         on = self._with_gate(True, lambda: detach_callable(c, [self.fx.s, self.fx.u]))
-        assert isinstance(on, CallableType)  # type: ignore[misc]
+        assert isinstance(on, CallableType)
         assert_equal(len(on.variables), 3)
         self._assert_engages(c, [self.fx.s, self.fx.u])
 
@@ -11123,7 +10566,7 @@ class NativeOverloadNeverSuite(Suite):
         _set_native_checker_active(False)
         _set_native_checker_resolver(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -11244,12 +10687,12 @@ class NativeOverloadNeverSuite(Suite):
         other = self._callable([self.fx.o], [ARG_POS], self.fx.o)
 
         def raw(t: CallableType, s: CallableType) -> bool | None:
-            return _type_kernel.rust_is_same_arg_prefix(
+            return cast("bool | None", _type_kernel.rust_is_same_arg_prefix(
                 _serialize_type_for_checker(t),
                 _serialize_type_for_checker(s),
                 state.strict_optional,
                 self.resolver,
-            )
+            ))
 
         def via_fn(t: CallableType, s: CallableType) -> bool:
             return is_same_arg_prefix(t, s)
@@ -11373,7 +10816,7 @@ class NativeHasAnyTypeSuite(Suite):
         *,
         alias_tvars: list[TypeVarType] | None = None,
         no_args: bool = False,
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -11665,7 +11108,7 @@ class NativeTupleExpandAndJoinSuite(Suite):
         _set_native_checkexpr_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _build_tuple(self, items: list[Type], seen_unpack: int) -> Type | None:
+    def _build_tuple(self, items: Sequence[Type], seen_unpack: int) -> Type | None:
         from mypy.checkexpr import (
             _deserialize_type_from_checkexpr,
             _serialize_type_for_checkexpr,
@@ -11677,7 +11120,7 @@ class NativeTupleExpandAndJoinSuite(Suite):
             return None
         return _deserialize_type_from_checkexpr(bytes(raw))
 
-    def _container(self, tag: str, items: list[Type]) -> Type | None:
+    def _container(self, tag: str, items: Sequence[Type]) -> Type | None:
         from mypy.checkexpr import (
             _deserialize_type_from_checkexpr,
             _serialize_type_for_checkexpr,
@@ -11760,7 +11203,7 @@ class NativeTupleExpandAndJoinSuite(Suite):
         self,
         set_active: Any,
         active: bool,
-        fn: Any,
+        fn: Callable[..., Type | None],
         *args: Any,
     ) -> Type | None:
         set_active(active)
@@ -11878,7 +11321,7 @@ class NativeUninhabitedSuite(Suite):
         *,
         alias_tvars: list[TypeVarType] | None = None,
         no_args: bool = False,
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -12049,7 +11492,7 @@ class NativeHasErasedComponentSuite(Suite):
         *,
         alias_tvars: list[TypeVarType] | None = None,
         no_args: bool = False,
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -13726,7 +13169,7 @@ class NativeMeetDeferralSuite(Suite):
         alias = TypeAliasType(self.union_alias, [])
         r = _type_kernel.rust_get_possible_variants(_serialize_type(alias), self.resolver)
         assert r is not None, "rust_get_possible_variants deferred on a resolvable alias"
-        decoded = read_type_list(mypy.join._ReadBuffer(bytes(r)))
+        decoded = read_type_list(mypy.join._ReadBuffer(bytes(r)))  # type: ignore[attr-defined]
         fixed = [fixup_wire_type(item) for item in decoded]
         assert fixed and all(item is not None for item in fixed), "get_possible_variants fixup"
         variants = [item for item in fixed if item is not None]
@@ -14410,7 +13853,7 @@ class NativeApplyGenericArgumentsAmbiguousSuite(Suite):
         from mypy.applytype import apply_generic_arguments
 
         return apply_generic_arguments(
-            callable, [arg], lambda *a: None, None, skip_unsatisfied=True
+            callable, [arg], lambda *a: None, Context(), skip_unsatisfied=True
         )
 
     def _par(self, tvar: TypeVarType, arg: Type, label: str) -> CallableType:
@@ -14453,8 +13896,9 @@ class NativeApplyGenericArgumentsAmbiguousSuite(Suite):
         # No default: the ambiguous branch is skipped, the Never falls
         # through the bound check, so T maps to the Never itself.
         assert not off.variables
-        assert isinstance(off.ret_type, UninhabitedType)
-        assert off.ret_type.ambiguous is True
+        rt = get_proper_type(off.ret_type)
+        assert isinstance(rt, UninhabitedType)
+        assert rt.ambiguous is True
 
     def test_non_ambiguous_falls_through(self) -> None:
         tvar = self._tvar(self.fx.str_type)
@@ -14463,8 +13907,9 @@ class NativeApplyGenericArgumentsAmbiguousSuite(Suite):
         # Non-ambiguous Never never expands the default; it falls through
         # the bound check and maps T to the Never.
         assert not off.variables
-        assert isinstance(off.ret_type, UninhabitedType)
-        assert off.ret_type.ambiguous is False
+        rt = get_proper_type(off.ret_type)
+        assert isinstance(rt, UninhabitedType)
+        assert rt.ambiguous is False
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -14846,7 +14291,7 @@ class NativeTypeanalAliasQuerySuite(Suite):
 
     def _make_alias(
         self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -14858,7 +14303,7 @@ class NativeTypeanalAliasQuerySuite(Suite):
             alias_tvars=alias_tvars or [],
         )
 
-    def _install_aliases(self, aliases: list[TypeAlias]) -> None:  # type: ignore[name-defined]
+    def _install_aliases(self, aliases: list[TypeAlias]) -> None:
         from mypy.typeanal import _set_native_typeanal_resolver
         from mypy.wirefixup import set_wire_alias_map
 
@@ -16204,7 +15649,7 @@ class NativeMessagesDeferralSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -16347,7 +15792,7 @@ class NativeFindTypeOverlapsSuite(Suite):
         info.bases = []
         return Instance(info, [])
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -16460,7 +15905,7 @@ class NativeCheckPatternSuite(Suite):
                 infos.append(value)
         return infos
 
-    def _build_resolver(self, infos: list[TypeInfo], aliases: list[Any]) -> object:
+    def _build_resolver(self, infos: list[TypeInfo], aliases: list[Any]) -> Any:
         return _type_kernel.build_native_resolver(infos, aliases)
 
     def _bytes_of(self, t: Type) -> bytes:
@@ -16468,7 +15913,7 @@ class NativeCheckPatternSuite(Suite):
         t.write(self._buf)
         return self._buf.getvalue()
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checkpattern import _set_native_checkpattern_active
 
         _set_native_checkpattern_active(active)
@@ -17284,7 +16729,7 @@ class NativeCheckMemberSuite(Suite):
         rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
         assert rust_bytes is not None
         decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
-        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        assert isinstance(decoded, CallableType)
         assert decoded.is_bound is True
         assert len(decoded.arg_types) == 0
 
@@ -17297,7 +16742,7 @@ class NativeCheckMemberSuite(Suite):
         rust_bytes = self._tk.rust_bind_self_fast(self._bytes_of(method))
         assert rust_bytes is not None
         decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
-        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        assert isinstance(decoded, CallableType)
         assert decoded.is_bound is False
         assert len(decoded.arg_types) == 1
 
@@ -17827,7 +17272,7 @@ class NativeCheckMemberSuite(Suite):
             ret_type=self.fx.a,
             fallback=self.fx.function,
         )
-        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        assert isinstance(decoded, CallableType)
         assert decoded.arg_types == expected.arg_types
         assert decoded.arg_kinds == expected.arg_kinds
         assert decoded.arg_names == expected.arg_names
@@ -17865,7 +17310,7 @@ class NativeCheckMemberSuite(Suite):
         )
         assert rust_bytes is not None
         decoded = _deserialize_type_for_checkmember(bytes(rust_bytes))
-        assert isinstance(decoded, CallableType)  # type: ignore[misc]
+        assert isinstance(decoded, CallableType)
         # t binds to A (instance arg of G[A]): arg x: T -> A, ret G[T] -> G[A].
         assert decoded.arg_types == [self.fx.a]
         assert decoded.is_bound
@@ -18016,7 +17461,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
         return (next_raw_id, changed, decoded)
 
-    def _raw_dispatch(self, instance: Instance, name: str) -> tuple[int, bool, list[int]] | None:
+    def _raw_dispatch(self, instance: Instance, name: str) -> tuple[int, bool, bytes] | None:
         return self._tk.rust_analyze_instance_member_dispatch(
             self.resolver,
             self._bytes_of(instance),
@@ -18036,6 +17481,7 @@ class NativeMemberAccessDispatchSuite(Suite):
             self.fx.ai, "m", self._sig([self.fx.o], [ARG_POS], ["x"], self.fx.a), is_static=True
         )
         _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        decoded = get_proper_type(decoded)
         assert changed is False
         assert isinstance(decoded, CallableType)
         assert decoded.ret_type == self.fx.a
@@ -18051,6 +17497,7 @@ class NativeMemberAccessDispatchSuite(Suite):
             is_trivial_self=True,
         )
         _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        decoded = get_proper_type(decoded)
         assert changed is False
         assert isinstance(decoded, CallableType)
         assert decoded.is_bound is True
@@ -18066,6 +17513,7 @@ class NativeMemberAccessDispatchSuite(Suite):
             self._sig([self.fx.o, self.fx.a], [ARG_POS, ARG_POS], ["self", "x"], self.fx.a),
         )
         _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        decoded = get_proper_type(decoded)
         assert changed is False
         assert isinstance(decoded, CallableType)
         assert decoded.is_bound is True
@@ -18079,6 +17527,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         item2 = self._sig([self.fx.a], [ARG_POS], ["x"], self.fx.b)
         self._add_method(self.fx.ai, "m", Overloaded([item1, item2]), is_static=True)
         _next_raw_id, changed, decoded = self._dispatch(self.fx.a, "m", self.fx.a)
+        decoded = get_proper_type(decoded)
         assert changed is False
         assert isinstance(decoded, Overloaded)
         assert len(decoded.items) == 2
@@ -18108,11 +17557,14 @@ class NativeMemberAccessDispatchSuite(Suite):
             next_raw_id, changed, decoded = self._dispatch(
                 self.fx.a, "m", self.fx.a, start_raw_id=old
             )
+            decoded = get_proper_type(decoded)
             assert changed is True
             assert next_raw_id == old + 1
             assert isinstance(decoded, CallableType)
-            assert decoded.ret_type.id.raw_id == old
-            assert decoded.ret_type.id.meta_level == 1
+            rt = get_proper_type(decoded.ret_type)
+            assert isinstance(rt, TypeVarType)
+            assert rt.id.raw_id == old
+            assert rt.id.meta_level == 1
         finally:
             TypeVarId.next_raw_id = old
 
@@ -18311,6 +17763,7 @@ class NativeCheckmemberDeferralSuite(Suite):
         )
         tup = TupleType([self.fx.a], self.fx.a)
         _next_raw_id, changed, decoded = self._general(tup, "m")
+        decoded = get_proper_type(decoded)
         assert changed is False
         assert isinstance(decoded, CallableType)
         assert decoded.is_bound is True
@@ -18686,7 +18139,7 @@ class NativeCombineSignaturesSuite(Suite):
         from mypy.checkexpr import _deserialize_type_from_checkexpr
 
         merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
-        assert isinstance(merged, CallableType), str(merged)  # type: ignore[misc]
+        assert isinstance(merged, CallableType), str(merged)
         for live_field in ("line", "column", "definition", "special_sig", "from_type_type"):
             assert getattr(merged, live_field) == getattr(expected, live_field), live_field
         # `str()` renders arg unions, return union, variables, and
@@ -18714,7 +18167,7 @@ class NativeCombineSignaturesSuite(Suite):
         from mypy.checkexpr import _deserialize_type_from_checkexpr
 
         merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
-        assert isinstance(merged, CallableType)  # type: ignore[misc]
+        assert isinstance(merged, CallableType)
         arg_union = get_proper_type(merged.arg_types[0])
         assert isinstance(arg_union, UnionType) and len(arg_union.items) == 2
         ret_union = get_proper_type(merged.ret_type)
@@ -18862,8 +18315,8 @@ class NativeMergeTypevarsSuite(Suite):
 
         output = [_deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes]
         variables = [_deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes]
-        assert all(isinstance(c, CallableType) for c in output)  # type: ignore[misc]
-        assert all(isinstance(v, TypeVarType) for v in variables)  # type: ignore[misc]
+        assert all(isinstance(c, CallableType) for c in output)
+        assert all(isinstance(v, TypeVarType) for v in variables)
         # str() renders the signature including typevar names, so equality is
         # a full oracle check per callable and per distinct typevar.
         assert len(output) == len(expected_output)
@@ -19684,7 +19137,9 @@ class NativeCheckerHelpersDeferralSuite(Suite):
         from mypy.join import _deserialize_type
 
         self.assert_par(self.fx.a, self.fx.b)
-        assert _deserialize_type(self.seam_result(self.fx.a, self.fx.b)) == self.fx.a
+        seam = self.seam_result(self.fx.a, self.fx.b)
+        assert seam is not None
+        assert _deserialize_type(seam) == self.fx.a
         # And the reverse direction.
         self.assert_par(self.fx.b, self.fx.a)
 
@@ -19697,7 +19152,9 @@ class NativeCheckerHelpersDeferralSuite(Suite):
 
         union = UnionType.make_union([self.fx.a, self.fx.b])
         self.assert_par(union, self.fx.b)
-        actual = _deserialize_type(self.seam_result(union, self.fx.b))
+        seam = self.seam_result(union, self.fx.b)
+        assert seam is not None
+        actual = _deserialize_type(seam)
         assert actual == self.fx.a
 
     def test_generic_supertype_still_defers(self) -> None:
@@ -20034,7 +19491,9 @@ class NativeTypeAnalSuite(Suite):
         from mypy.wirefixup import set_wire_alias_map
 
         A, _ = self.fx.def_alias_1(self.fx.a)
-        set_wire_alias_map({A.alias.fullname: A.alias})
+        alias = A.alias
+        assert alias is not None
+        set_wire_alias_map({alias.fullname: alias})
         result = native_analyze_type(A, allow_unpack=True)
         assert result is not None
         assert isinstance(result, TypeAliasType)
@@ -20049,7 +19508,9 @@ class NativeTypeAnalSuite(Suite):
         from mypy.wirefixup import set_wire_alias_map
 
         NA = self.fx.non_rec_alias(Instance(self.fx.gi, [self.fx.t]), [self.fx.t], [self.fx.a])
-        set_wire_alias_map({NA.alias.fullname: NA.alias})
+        alias = NA.alias
+        assert alias is not None
+        set_wire_alias_map({alias.fullname: alias})
         result = native_analyze_type(NA, allow_unpack=True)
         assert result is not None
         assert isinstance(result, TypeAliasType)
@@ -20296,14 +19757,14 @@ class NativeTypeExpressionClassifySuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self) -> object:
+    def _analyser(self) -> Any:
         from contextlib import nullcontext
 
         from mypy.errors import Errors
@@ -20313,11 +19774,11 @@ class NativeTypeExpressionClassifySuite(Suite):
         sa.type_expression_parse_count = 0
         sa.type_expression_full_parse_success_count = 0
         sa.type_expression_full_parse_failure_count = 0
-        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign]
+        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign, assignment]
         sa.tvar_scope = None  # type: ignore[assignment]
         sa.errors = Errors(Options())
-        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign]
-        sa.expr_to_analyzed_type = lambda expr: self.fx.o  # type: ignore[method-assign]
+        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign, return-value, assignment]
+        sa.expr_to_analyzed_type = lambda expr: self.fx.o  # type: ignore[method-assign, assignment, misc]
         return sa
 
     def _run(
@@ -20325,15 +19786,15 @@ class NativeTypeExpressionClassifySuite(Suite):
     ) -> tuple[str, int, int]:
         sa = self._analyser()
         expr = node_factory()
-        sa.try_parse_as_type_expression(expr)  # type: ignore[attr-defined]
+        sa.try_parse_as_type_expression(expr)
         # NameExpr/MemberExpr never receive `as_type` (the method returns
         # before assigning it); represent that as a fixed sentinel so both
         # gates compare equal.
         as_type = str(expr.as_type) if hasattr(expr, "as_type") else "NO_AS_TYPE_ATTR"
         return (
             as_type,
-            sa.type_expression_full_parse_success_count,  # type: ignore[attr-defined]
-            sa.type_expression_full_parse_failure_count,  # type: ignore[attr-defined]
+            sa.type_expression_full_parse_success_count,
+            sa.type_expression_full_parse_failure_count,
         )
 
     def _assert_par(self, node_factory: Callable[[], Expression]) -> None:
@@ -20537,14 +19998,14 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, typealias_fullname: str | None) -> object:
+    def _analyser(self, typealias_fullname: str | None) -> Any:
         from mypy.semanal import SemanticAnalyzer
 
         sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
@@ -20552,7 +20013,7 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
             from types import SimpleNamespace
 
             sym = SymbolTableNode(
-                MDEF, SimpleNamespace(fullname=typealias_fullname)
+                MDEF, SimpleNamespace(fullname=typealias_fullname)  # type: ignore[arg-type]
             )
         else:
             sym = None
@@ -20568,7 +20029,7 @@ class NativeCanPossiblyBeTypeFormSuite(Suite):
     ) -> None:
         def run() -> bool:
             sa = self._analyser(typealias_fullname)
-            result = sa.can_possibly_be_type_form(node_factory())  # type: ignore[attr-defined]
+            result = sa.can_possibly_be_type_form(node_factory())
             assert isinstance(result, bool)
             return result
 
@@ -22018,14 +21479,14 @@ class NativeClassmethodStaticSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _assert_par(self, node: object) -> None:
+    def _assert_par(self, node: Any) -> None:
         from mypy.checker import is_classmethod_node, is_node_static
 
         off_cm = self._with_gate(False, lambda: is_classmethod_node(node))
@@ -22035,7 +21496,7 @@ class NativeClassmethodStaticSuite(Suite):
         on_st = self._with_gate(True, lambda: is_node_static(node))
         assert_equal(on_st, off_st, f"is_node_static parity {node!r}")
 
-    def _assert_engages(self, node: object) -> None:
+    def _assert_engages(self, node: Any) -> None:
         assert _type_kernel.rust_is_classmethod_node(node) is not None, (
             f"Rust is_classmethod_node did not engage for {node!r}"
         )
@@ -22143,8 +21604,8 @@ class NativeClassmethodStaticSuite(Suite):
         # (real path), so Rust defers and Python runs the pure body.
         e = IntExpr(42)
         self._assert_par(e)
-        assert_equal(self._with_gate(True, lambda: is_classmethod_node(e)), None)
-        assert_equal(self._with_gate(True, lambda: is_node_static(e)), None)
+        assert_equal(self._with_gate(True, lambda: is_classmethod_node(e)), None)  # type: ignore[arg-type]
+        assert_equal(self._with_gate(True, lambda: is_node_static(e)), None)  # type: ignore[arg-type]
 
     def test_none_input_defers(self) -> None:
         from mypy.checker import is_classmethod_node, is_node_static
@@ -22177,7 +21638,7 @@ class NativeGroupComparisonOperandsSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -22189,7 +21650,7 @@ class NativeGroupComparisonOperandsSuite(Suite):
         # names -> the same id (the coalescing signal).
         return {index: ("FakeExpr", name) for index, name in operands.items()}
 
-    def _assert_par(self, pairs, keymap, operators: set[str]) -> None:
+    def _assert_par(self, pairs: Any, keymap: Any, operators: set[str]) -> None:
         from mypy.checker import group_comparison_operands
 
         off = self._with_gate(
@@ -22348,7 +21809,7 @@ class NativeExpandCallableVariantsSuite(Suite):
         self._set_active(False)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -22520,7 +21981,7 @@ class NativeBuiltinItemTypeSuite(Suite):
         _set_native_checker_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checker import _set_native_checker_active
 
         _set_native_checker_active(active)
@@ -22647,7 +22108,7 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
         _set_native_checker_active(False)
         _set_native_checker_resolver(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checker import _set_native_checker_active
 
         _set_native_checker_active(active)
@@ -22669,7 +22130,7 @@ class NativeUnsafeOverlappingOverloadSuite(Suite):
         self,
         sig: CallableType,
         oth: CallableType,
-        class_type_vars: list[TypeVarType],
+        class_type_vars: Any,
         partial_only: bool = True,
     ) -> None:
         from mypy.checker import is_unsafe_overlapping_overload_signatures
@@ -22911,7 +22372,7 @@ class NativeOverloadingOverloadsSuite(Suite):
             self.resolver,
         )
         assert result is not None, "Rust check_overlapping_overloads did not engage"
-        return [tuple(r) for r in result]  # type: ignore[arg-type]
+        return cast("list[tuple[int, int, int, bool]]", [tuple(r) for r in result])
 
     def _reference_decisions(
         self,
@@ -23715,7 +23176,7 @@ class NativeEqualityAmbiguitySuite(Suite):
         _set_native_checker_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checker import _set_native_checker_active
 
         _set_native_checker_active(active)
@@ -23939,25 +23400,25 @@ class NativeDangerousComparisonSuite(Suite):
             }.get(name),
         )
         self.method = ExpressionChecker.__new__(ExpressionChecker)
-        self.method.chk = chk  # type: ignore[attr-defined]
+        self.method.chk = chk  # type: ignore[assignment]
 
     def tearDown(self) -> None:
         self._set_active(False)
         self._set_resolver(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _assert_par(self, left: Type, right: Type, **kw: object) -> None:
+    def _assert_par(self, left: Type, right: Type, **kw: Any) -> None:
         off = self._with_gate(False, lambda: self.method.dangerous_comparison(left, right, **kw))
         on = self._with_gate(True, lambda: self.method.dangerous_comparison(left, right, **kw))
         assert_equal(on, off, f"dangerous_comparison parity {left} / {right}")
 
-    def _assert_engages(self, left: Type, right: Type, original: Type | None = None, **kw: object) -> None:
+    def _assert_engages(self, left: Type, right: Type, original: Type | None = None, **kw: Any) -> None:
         from mypy.checkexpr import _serialize_type_for_checkexpr
         from mypy.typeops import custom_special_method
 
@@ -24170,7 +23631,7 @@ class NativeClassDecoratorCommonSuite(Suite):
         assert self._classify(self._member("mod", "decorator")) == ("none", None)
 
     def test_name_set_mismatch_defers(self) -> None:
-        assert self._tk.rust_classify_class_decorator(self._name("typing.final"), ()) is None
+        assert self._tk.rust_classify_class_decorator(self._name("typing.final"), ()) is None  # type: ignore[arg-type]
 
     def _run_method(
         self,
@@ -24197,10 +23658,10 @@ class NativeClassDecoratorCommonSuite(Suite):
         defn.fullname = "mod.A"
         info = TypeInfo(SymbolTable(), defn, "mod")
         info.is_protocol = is_protocol
-        info.typeddict_type = object() if typeddict else None
+        info.typeddict_type = object() if typeddict else None  # type: ignore[assignment]
         defn.info = info
         analyzer = _Analyzer()
-        semanal.SemanticAnalyzer.analyze_class_decorator_common(analyzer, defn, decorator)
+        semanal.SemanticAnalyzer.analyze_class_decorator_common(analyzer, defn, decorator)  # type: ignore[arg-type]
         return (
             info.is_final,
             info.is_disjoint_base,
@@ -24336,8 +23797,8 @@ class NativeCompatMetaclassHelperSuite(Suite):
     def _run_method(
         self,
         base_expr: CallExpr | None = None,
-        decorators: list[CallExpr] | None = None,
-    ) -> tuple[list[str], str | None, list[str]]:
+        decorators: list[Expression] | None = None,
+    ) -> tuple[list[str | None], str | None, list[str]]:
         from mypy import semanal
         from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
 
@@ -24361,7 +23822,7 @@ class NativeCompatMetaclassHelperSuite(Suite):
         defn.base_type_exprs = [base_expr] if base_expr is not None else []
         defn.decorators = decorators or []
         analyzer = _Analyzer()
-        semanal.SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers(analyzer, defn)
+        semanal.SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers(analyzer, defn)  # type: ignore[arg-type]
         fullnames = [getattr(b, "fullname", None) for b in defn.base_type_exprs]
         metaclass = getattr(defn.metaclass, "fullname", None)
         return (fullnames, metaclass, analyzer.failures)
@@ -24369,7 +23830,7 @@ class NativeCompatMetaclassHelperSuite(Suite):
     def _assert_method_parity(
         self,
         base_expr: CallExpr | None = None,
-        decorators: list[CallExpr] | None = None,
+        decorators: list[Expression] | None = None,
     ) -> None:
         from mypy import semanal
 
@@ -24399,7 +23860,7 @@ class NativeCompatMetaclassHelperSuite(Suite):
         )
         self._assert_method_parity(base_expr)
 
-    def _decorator(self, fullname: str, args: list[Expression], kinds: list[int]) -> CallExpr:
+    def _decorator(self, fullname: str, args: list[Expression], kinds: list[ArgKind]) -> CallExpr:
         return CallExpr(self._name(fullname), args, kinds, [None] * len(args))
 
     def test_method_add_metaclass_parity(self) -> None:
@@ -24580,7 +24041,7 @@ class NativeFinalSuperSuite(Suite):
 
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -24736,7 +24197,7 @@ class NativeAreArgsCompatibleSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -24794,7 +24255,7 @@ class NativeAreArgsCompatibleSuite(Suite):
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(
         self,
@@ -24923,7 +24384,7 @@ class NativeCheckLvalueSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -24968,8 +24429,8 @@ class NativeCheckLvalueSuite(Suite):
 
         def check_one() -> tuple[object, object, object]:
             chk = TypeChecker.__new__(TypeChecker)
-            chk.options = SimpleNamespace(allow_redefinition=allow_redefinition)
-            chk._expr_checker = SimpleNamespace(
+            chk.options = SimpleNamespace(allow_redefinition=allow_redefinition)  # type: ignore[assignment]
+            chk._expr_checker = SimpleNamespace(  # type: ignore[assignment]
                 accept=lambda expr: ("accept", expr),
                 analyze_ordinary_member_access=lambda lv, is_lvalue, rvalue: (
                     "member_access",
@@ -24979,12 +24440,12 @@ class NativeCheckLvalueSuite(Suite):
                 analyze_ref_expr=lambda lv, lvalue: ("ref_expr", lv),
             )
             chk.store_type = lambda lv, t: None  # type: ignore[assignment]
-            chk.named_type = lambda name: self.fx.std_tuple  # type: ignore[assignment]
+            chk.named_type = lambda name: self.fx.std_tuple  # type: ignore[method-assign]
             return chk.check_lvalue(lvalue)
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(
         self, lvalue: Lvalue, *, allow_redefinition: bool = False
@@ -25100,7 +24561,7 @@ class NativeUntypedDecoratorSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25173,7 +24634,7 @@ class NativeUntypedDecoratorSuite(Suite):
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(
         self,
@@ -25267,7 +24728,7 @@ class NativeExplicitOverrideDecoratorSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25312,14 +24773,14 @@ class NativeExplicitOverrideDecoratorSuite(Suite):
         self,
         defn: FuncDef,
         found: list[TypeInfo] | None,
-    ) -> list[tuple[str, str]]:
+    ) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
         from types import SimpleNamespace
 
         from mypy.checker import TypeChecker
 
-        def check_one() -> list[tuple[str, str]]:
+        def check_one() -> list[tuple[Any, ...]]:
             chk = TypeChecker.__new__(TypeChecker)
-            msgs: list[tuple[str, str]] = []
+            msgs: list[tuple[Any, ...]] = []
             chk.msg = SimpleNamespace(  # type: ignore[assignment]
                 explicit_override_decorator_missing=(
                     lambda n, bn, ctx: msgs.append(("missing", n, bn))
@@ -25330,7 +24791,7 @@ class NativeExplicitOverrideDecoratorSuite(Suite):
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(self, defn: FuncDef, found: list[TypeInfo] | None) -> None:
         off, on = self._run(defn, found)
@@ -25433,7 +24894,7 @@ class NativeCompatibilityClassvarSuperSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25466,7 +24927,7 @@ class NativeCompatibilityClassvarSuperSuite(Suite):
         def check_one() -> tuple[bool, list[tuple[str, str]]]:
             chk = TypeChecker.__new__(TypeChecker)
             msgs: list[tuple[str, str]] = []
-            chk.fail = lambda msg, ctx: msgs.append(("fail", str(msg)))  # type: ignore[assignment]
+            chk.fail = lambda msg, ctx: msgs.append(("fail", str(msg)))  # type: ignore[assignment, misc]
             ret = chk.check_compatibility_classvar_super(node, base, base_node)
             return ret, msgs
 
@@ -25551,7 +25012,7 @@ class NativeNewSignatureSuite(Suite):
 
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25590,11 +25051,11 @@ class NativeNewSignatureSuite(Suite):
             fx.function,
         )
 
-        def check_one() -> list[tuple[str, str]]:
+        def check_one() -> list[tuple[Any, ...]]:
             chk = TypeChecker.__new__(TypeChecker)
             chk.options = Options()
             chk.type_type = lambda: fx.type_type  # type: ignore[method-assign]
-            records: list[tuple[str, str]] = []
+            records: list[tuple[Any, ...]] = []
 
             def record_subtype(
                 subtype: Type, supertype: Type, _ctx: Any, msg: Any, l1: Any = None, l2: Any = None
@@ -25605,8 +25066,8 @@ class NativeNewSignatureSuite(Suite):
             def record_fail(msg: Any, _ctx: Any) -> None:
                 records.append(("fail", msg.value if hasattr(msg, "value") else msg))
 
-            chk.check_subtype = record_subtype  # type: ignore[method-assign]
-            chk.fail = record_fail  # type: ignore[method-assign]
+            chk.check_subtype = record_subtype  # type: ignore[method-assign, assignment]
+            chk.fail = record_fail  # type: ignore[method-assign, assignment]
             chk.check___new___signature(fdef, typ)
             return records
 
@@ -25685,7 +25146,7 @@ class NativeFunctionSignatureSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25715,7 +25176,7 @@ class NativeFunctionSignatureSuite(Suite):
         def check_one() -> tuple[object, object]:
             sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
             msgs: list[tuple[str, bool]] = []
-            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: msgs.append(  # type: ignore[method-assign]
+            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: msgs.append(  # type: ignore[method-assign, misc]
                 (str(msg), blocker)
             )
             fdef = self._fdef(n_args, list(sig_arg_types))
@@ -25786,7 +25247,7 @@ class NativeFuncDefOverrideSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -25823,23 +25284,23 @@ class NativeFuncDefOverrideSuite(Suite):
             obs: list[object] = []
             old_type = old_type_fn() if old_type_fn is not None else new_type
             chk.function_type = lambda d: old_type  # type: ignore[assignment]
-            chk.msg = SimpleNamespace(
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
                 incompatible_conditional_function_def=lambda d, ot, nt: obs.append(
                     ("incompatible_cond", d.name)
                 )
             )
-            chk.find_partial_types = lambda var: {var: True}  # type: ignore[assignment]
-            chk.fail = lambda msg, ctx: obs.append(("fail", msg))
-            chk.binder = SimpleNamespace(
+            chk.find_partial_types = lambda var: {var: True}  # type: ignore[method-assign, dict-item]
+            chk.fail = lambda msg, ctx: obs.append(("fail", msg))  # type: ignore[method-assign, misc, assignment]
+            chk.binder = SimpleNamespace(  # type: ignore[assignment]
                 assign_type=lambda expr, nt, ot: obs.append(("assign", expr.name))
             )
-            chk.check_subtype = lambda nt, ot, ctx, msg, d1, d2: obs.append(("subtype",))
+            chk.check_subtype = lambda nt, ot, ctx, msg, d1, d2: obs.append(("subtype",))  # type: ignore[method-assign, assignment]
             chk.check_func_def_override(defn, new_type)
             orig_def = defn.original_def
             if isinstance(orig_def, FuncDef):
                 orig_type_repr = "FuncDef"
             else:
-                orig_type_repr = repr(orig_def.type)
+                orig_type_repr = repr(orig_def.type) if orig_def is not None else "None"
             return (tuple(obs), defn.is_invalid_redefinition, orig_type_repr)
 
         off = self._with_gate(False, check_one)
@@ -25993,7 +25454,7 @@ class NativeEnumNewSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -26109,7 +25570,7 @@ class NativeEnumBasesSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -26220,7 +25681,7 @@ class NativeIsFinalEnumValueSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -26254,12 +25715,12 @@ class NativeIsFinalEnumValueSuite(Suite):
 
         def check_one() -> bool:
             chk = TypeChecker.__new__(TypeChecker)
-            chk.is_stub = is_stub  # type: ignore[attr-defined]
+            chk.is_stub = is_stub
             return chk.is_final_enum_value(self._sym(node))
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(self, node: Any, is_stub: bool) -> None:
         off, on = self._run(node, is_stub)
@@ -26349,25 +25810,25 @@ class NativeFixedArgsSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _call(self, n_args: int, kinds: list[int]) -> CallExpr:
+    def _call(self, n_args: int, kinds: list[ArgKind]) -> CallExpr:
         from mypy.nodes import NameExpr
 
         callee = NameExpr("f")
-        args = [NameExpr(f"a{i}") for i in range(n_args)]
+        args: list[Expression] = [NameExpr(f"a{i}") for i in range(n_args)]
         return CallExpr(callee, args, kinds, [None] * n_args)
 
-    def _seam(self, n_args: int, kinds: list[int], numargs: int) -> int | None:
-        return self._tk.rust_classify_fixed_args(n_args, kinds, numargs)
+    def _seam(self, n_args: int, kinds: list[ArgKind], numargs: int) -> int | None:
+        return self._tk.rust_classify_fixed_args(n_args, [k.value for k in kinds], numargs)
 
     def _run(
-        self, n_args: int, kinds: list[int], numargs: int, name: str = "f"
+        self, n_args: int, kinds: list[ArgKind], numargs: int, name: str = "f"
     ) -> tuple[bool, list[str]]:
         from mypy import semanal
 
@@ -26380,7 +25841,7 @@ class NativeFixedArgsSuite(Suite):
                     failures.append(str(msg))
 
             analyzer = _Analyzer()
-            ret = semanal.SemanticAnalyzer.check_fixed_args(analyzer, call, numargs, name)
+            ret = semanal.SemanticAnalyzer.check_fixed_args(analyzer, call, numargs, name)  # type: ignore[arg-type]
             return ret, failures
 
         off = self._with_gate(False, check_one)
@@ -26388,24 +25849,24 @@ class NativeFixedArgsSuite(Suite):
         return off, on  # type: ignore[return-value]
 
     def _assert_par(
-        self, n_args: int, kinds: list[int], numargs: int, name: str = "f"
+        self, n_args: int, kinds: list[ArgKind], numargs: int, name: str = "f"
     ) -> None:
         off, on = self._run(n_args, kinds, numargs, name)
         assert_equal(on, off, f"check_fixed_args parity n_args={n_args} kinds={kinds}")
 
     def test_seam_ok(self) -> None:
-        assert self._seam(2, [0, 0], 2) == 0
+        assert self._seam(2, [ARG_POS, ARG_POS], 2) == 0
         assert self._seam(0, [], 0) == 0
-        assert self._seam(1, [0], 1) == 0
+        assert self._seam(1, [ARG_POS], 1) == 0
 
     def test_seam_wrong_count(self) -> None:
-        assert self._seam(1, [0], 2) == 1
-        assert self._seam(3, [0, 0, 0], 2) == 1
+        assert self._seam(1, [ARG_POS], 2) == 1
+        assert self._seam(3, [ARG_POS, ARG_POS, ARG_POS], 2) == 1
 
     def test_seam_wrong_kinds(self) -> None:
-        assert self._seam(2, [0, 3], 2) == 2
-        assert self._seam(2, [3, 0], 2) == 2
-        assert self._seam(2, [3, 3], 2) == 2
+        assert self._seam(2, [ARG_POS, ARG_NAMED], 2) == 2
+        assert self._seam(2, [ARG_NAMED, ARG_POS], 2) == 2
+        assert self._seam(2, [ARG_NAMED, ARG_NAMED], 2) == 2
 
     def test_parity_ok(self) -> None:
         self._assert_par(2, [ARG_POS, ARG_POS], 2)
@@ -26460,11 +25921,13 @@ class NativeTypedDictCallSuite(Suite):
             return 3
         return 4
 
-    def _assert_par(self, args: list[Expression], arg_kinds: list[ArgKind]) -> None:
+    def _assert_par(self, args: Sequence[Expression], arg_kinds: list[ArgKind]) -> None:
         from mypy.checkexpr import _try_native_classify_typeddict_call
 
-        expected = self._python_tag(args, arg_kinds)
-        native = _try_native_classify_typeddict_call(args, arg_kinds)
+        expected = self._python_tag(cast("list[Expression]", args), arg_kinds)
+        native = _try_native_classify_typeddict_call(
+            cast("list[Expression]", args), arg_kinds
+        )
         assert native is not None, f"native classifier deferred for tag {expected}"
         assert native == expected, f"native tag {native} != golden {expected}"
 
@@ -26503,7 +25966,7 @@ class NativeTypedDictCallSuite(Suite):
         self._assert_par(args, [ARG_POS])
 
     def test_direct_seam_engages(self) -> None:
-        shapes = [
+        shapes: list[tuple[Any, Any]] = [
             ([StrExpr("x")], [ARG_NAMED]),
             ([DictExpr([(StrExpr("x"), StrExpr("1"))])], [ARG_POS]),
             ([NameExpr("f")], [ARG_STAR2]),
@@ -26558,7 +26021,7 @@ class NativeHasAbstractTypeSuite(Suite):
     def _callee(self, info: TypeInfo) -> TypeType:
         return TypeType(Instance(info, []))
 
-    def _make_checker(self) -> ExpressionChecker:  # type: ignore[name-defined]
+    def _make_checker(self) -> ExpressionChecker:
         from mypy.checker import TypeChecker
         from mypy.checkexpr import ExpressionChecker
         from mypy.errors import Errors
@@ -26576,7 +26039,7 @@ class NativeHasAbstractTypeSuite(Suite):
         msg = MessageBuilder(errors, modules)
         return ExpressionChecker(chk, msg, Plugin(options), {})
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.checkexpr import _set_native_checkexpr_active
 
         _set_native_checkexpr_active(active)
@@ -27142,7 +26605,7 @@ class NativeIsSubtypeAliasSuite(Suite):
 
     def _make_alias(
         self, fullname: str, target: Type, *, alias_tvars: list[TypeVarLikeType] | None = None
-    ) -> TypeAlias:  # type: ignore[name-defined]
+    ) -> TypeAlias:
         from mypy.nodes import TypeAlias
 
         return TypeAlias(
@@ -27154,7 +26617,7 @@ class NativeIsSubtypeAliasSuite(Suite):
             alias_tvars=alias_tvars or [],
         )
 
-    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:  # type: ignore[name-defined]
+    def _alias_type(self, alias: TypeAlias) -> TypeAliasType:
         return TypeAliasType(alias, [])
 
     def _rebuild_resolver(self, aliases: list[Any], extra_infos: list[Any] | None = None) -> None:
@@ -27342,7 +26805,7 @@ class NativeInferVarianceSuite(Suite):
         self._install_gate(info, on)
         try:
             ok = infer_variance(info, 0)
-            return ok, info.defn.type_vars[0].variance
+            return ok, cast(TypeVarType, info.defn.type_vars[0]).variance
         finally:
             self._install_gate(info, False)
 
@@ -27640,7 +27103,7 @@ class NativeObjectFromInstanceSuite(Suite):
         self._set_map(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -27650,12 +27113,12 @@ class NativeObjectFromInstanceSuite(Suite):
     def _native_result(self, instance: Instance) -> Instance:
         from mypy.join import object_from_instance
 
-        return self._with_gate(True, lambda: object_from_instance(instance))  # type: ignore[return-value]
+        return self._with_gate(True, lambda: object_from_instance(instance))
 
     def _reference_result(self, instance: Instance) -> Instance:
         from mypy.join import object_from_instance
 
-        return self._with_gate(False, lambda: object_from_instance(instance))  # type: ignore[return-value]
+        return self._with_gate(False, lambda: object_from_instance(instance))
 
     def _assert_parity(self, instance: Instance) -> None:
         res = self._native_result(instance)
@@ -28121,7 +27584,7 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         self._set_map(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -28132,7 +27595,7 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         from mypy.expandtype import freshen_function_type_vars
 
         result = freshen_function_type_vars(c)
-        assert isinstance(result, CallableType)  # type: ignore[misc]
+        assert isinstance(result, CallableType)
         return result
 
     def _assert_par(self, c: CallableType) -> None:
@@ -28193,7 +27656,9 @@ class NativeFreshenFunctionTypeVarsSuite(Suite):
         fresh_t2 = result.variables[1]
         assert_equal(fresh_t2.default, fresh_t1)
         # Default points at the fresh T1, so its id is the fresh one.
-        assert_equal(fresh_t2.default.id.raw_id, fresh_t1.id.raw_id)
+        d2 = get_proper_type(fresh_t2.default)
+        assert isinstance(d2, TypeVarType)
+        assert_equal(d2.id.raw_id, fresh_t1.id.raw_id)
         self._assert_par(c)
 
     def test_overloaded_generic(self) -> None:
@@ -28278,19 +27743,19 @@ class NativeRemoveTrivialSuite(Suite):
         self._set_map(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _remove(self, types: list[Type]) -> list[Type]:
+    def _remove(self, types: Sequence[Type]) -> list[Type]:
         from mypy.expandtype import remove_trivial
 
         return remove_trivial(types)
 
-    def _remove_so(self, types: list[Type], strict_optional: bool) -> list[Type]:
+    def _remove_so(self, types: Sequence[Type], strict_optional: bool) -> list[Type]:
         import mypy.state
 
         old = mypy.state.state.strict_optional
@@ -28300,7 +27765,7 @@ class NativeRemoveTrivialSuite(Suite):
         finally:
             mypy.state.state.strict_optional = old
 
-    def _assert_par(self, types: list[Type], strict_optional: bool = True) -> None:
+    def _assert_par(self, types: Sequence[Type], strict_optional: bool = True) -> None:
         off = str(self._with_gate(False, lambda: self._remove_so(types, strict_optional)))
         on = str(self._with_gate(True, lambda: self._remove_so(types, strict_optional)))
         assert_equal(on, off, f"remove_trivial parity {types} so={strict_optional}")
@@ -28344,8 +27809,9 @@ class NativeRemoveTrivialSuite(Suite):
         types = [UninhabitedType(), Instance(self.fx.oi, [])]
         result = self._remove_so(types, True)
         assert_equal(len(result), 1)
-        assert isinstance(result[0], Instance), f"expected Instance, got {result[0]!r}"
-        assert result[0].type.fullname == "builtins.object"  # type: ignore[union-attr]
+        first = get_proper_type(result[0])
+        assert isinstance(first, Instance), f"expected Instance, got {result[0]!r}"
+        assert first.type.fullname == "builtins.object"
         self._assert_par(types)
 
     def test_duplicates_dropped(self) -> None:
@@ -28356,8 +27822,12 @@ class NativeRemoveTrivialSuite(Suite):
         ]
         result = self._remove_so(types, True)
         assert_equal(len(result), 2)
-        assert result[0].type.fullname == "A"  # type: ignore[union-attr]
-        assert result[1].type.fullname == "B"  # type: ignore[union-attr]
+        first = get_proper_type(result[0])
+        assert isinstance(first, Instance)
+        second = get_proper_type(result[1])
+        assert isinstance(second, Instance)
+        assert first.type.fullname == "A"
+        assert second.type.fullname == "B"
         self._assert_par(types)
 
     def test_mixed(self) -> None:
@@ -28431,7 +27901,7 @@ class NativeEraseReturnSelfSuite(Suite):
         self._set_active(False)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -28461,8 +27931,9 @@ class NativeEraseReturnSelfSuite(Suite):
         )
         self._assert_par(c, self.fx.a)
         result = self._with_gate(True, lambda: erase_return_self_types(c, self.fx.a))
+        result = get_proper_type(result)
         assert isinstance(result, CallableType)
-        assert isinstance(result.ret_type, AnyType)
+        assert isinstance(get_proper_type(result.ret_type), AnyType)
         assert_equal(str(result), "def (A) -> Any")
         self._assert_engages(c, self.fx.a)
 
@@ -28474,6 +27945,7 @@ class NativeEraseReturnSelfSuite(Suite):
         )
         self._assert_par(c, self.fx.a)
         result = self._with_gate(True, lambda: erase_return_self_types(c, self.fx.a))
+        result = get_proper_type(result)
         assert isinstance(result, CallableType)
         assert_equal(str(result.ret_type), "B")
         self._assert_engages(c, self.fx.a)
@@ -28489,8 +27961,9 @@ class NativeEraseReturnSelfSuite(Suite):
         )
         self._assert_par(c, self_type)
         result = self._with_gate(True, lambda: erase_return_self_types(c, self_type))
+        result = get_proper_type(result)
         assert isinstance(result, CallableType)
-        assert isinstance(result.ret_type, AnyType)
+        assert isinstance(get_proper_type(result.ret_type), AnyType)
         self._assert_engages(c, self_type)
 
     def test_generic_self_args_differ_unchanged(self) -> None:
@@ -28503,6 +27976,7 @@ class NativeEraseReturnSelfSuite(Suite):
         )
         self._assert_par(c, self_type)
         result = self._with_gate(True, lambda: erase_return_self_types(c, self_type))
+        result = get_proper_type(result)
         assert isinstance(result, CallableType)
         assert_equal(str(result.ret_type), "G[B]")
         self._assert_engages(c, self_type)
@@ -28520,8 +27994,9 @@ class NativeEraseReturnSelfSuite(Suite):
         overloaded = Overloaded([c1, c2])
         self._assert_par(overloaded, self.fx.a)
         result = self._with_gate(True, lambda: erase_return_self_types(overloaded, self.fx.a))
+        result = get_proper_type(result)
         assert isinstance(result, Overloaded)
-        assert isinstance(result.items[0].ret_type, AnyType)
+        assert isinstance(get_proper_type(result.items[0].ret_type), AnyType)
         assert_equal(str(result.items[1].ret_type), "B")
         self._assert_engages(overloaded, self.fx.a)
 
@@ -28858,13 +28333,13 @@ class NativeSolveOneSuite(Suite):
         assert_equal(res, ref)
 
     def test_infer_unions_true(self) -> None:
-        from mypy.state import state
+        from mypy.typestate import type_state
 
-        state.infer_unions = True
+        type_state.infer_unions = True
         try:
             self._assert_par([self.fx.a, self.fx.b], [])
         finally:
-            state.infer_unions = False
+            type_state.infer_unions = False
 
     def test_infer_unions_false(self) -> None:
         self._assert_par([self.fx.a, self.fx.b], [])
@@ -28966,7 +28441,7 @@ class NativeSolveDependentNoopSuite(Suite):
     def _assert_par(self, constraints: list[Constraint]) -> None:
         from mypy.solve import solve_with_dependent
 
-        tvars = {tv.id: tv for tv in self._vars}
+        tvars: dict[TypeVarId, TypeVarLikeType] = {tv.id: tv for tv in self._vars}
         tvar_ids = list(tvars)
         self._set_active(False)
         ref = solve_with_dependent(tvar_ids, constraints, tvar_ids, tvars)
@@ -28984,7 +28459,7 @@ class NativeSolveDependentNoopSuite(Suite):
             _serialize_type_list,
         )
 
-        tvars = {tv.id: tv for tv in self._vars}
+        tvars: dict[TypeVarId, TypeVarLikeType] = {tv.id: tv for tv in self._vars}
         tvar_ids = list(tvars)
         result = _type_kernel.rust_solve_dependent(
             _serialize_type_list(list(tvars.values())),
@@ -29036,7 +28511,7 @@ class NativeSolveDependentNoopSuite(Suite):
         c = Constraint(self.fx.t, SUPERTYPE_OF, anyt)
         self._assert_par([c])
         solutions = self._seam_solutions([c])
-        got = solutions[self.fx.t.id]
+        got = get_proper_type(solutions[self.fx.t.id])
         assert isinstance(got, AnyType)
         assert_equal(got.type_of_any, TypeOfAny.from_another_any)
         assert_equal(got.source_any, anyt)
@@ -29050,7 +28525,7 @@ class NativeSolveDependentNoopSuite(Suite):
         c = Constraint(self.fx.t, SUBTYPE_OF, nb)
         self._assert_par([c])
         solutions = self._seam_solutions([c])
-        got = solutions[self.fx.t.id]
+        got = get_proper_type(solutions[self.fx.t.id])
         assert isinstance(got, UninhabitedType)
         assert got.ambiguous
 
@@ -29126,7 +28601,7 @@ class NativeJoinInstancesSuite(Suite):
         self._set_map(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -29138,14 +28613,14 @@ class NativeJoinInstancesSuite(Suite):
 
         return self._with_gate(
             True, lambda: InstanceJoiner().join_instances(t, s)
-        )  # type: ignore[return-value]
+        )
 
     def _reference_result(self, t: Instance, s: Instance) -> ProperType:
         from mypy.join import InstanceJoiner
 
         return self._with_gate(
             False, lambda: InstanceJoiner().join_instances(t, s)
-        )  # type: ignore[return-value]
+        )
 
     def _assert_parity(self, t: Instance, s: Instance) -> None:
         res = self._native_result(t, s)
@@ -29315,7 +28790,7 @@ class NativeTypeRequiresUsageSuite(Suite):
         self._set_active(False)
         self._set_resolver(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -29335,7 +28810,7 @@ class NativeTypeRequiresUsageSuite(Suite):
         self._assert_engages_with(typ, expected_code, self.resolver)
 
     def _assert_engages_with(
-        self, typ: Type, expected_code: int, resolver: object
+        self, typ: Type, expected_code: int, resolver: Any
     ) -> None:
         from mypy.checker import _serialize_type_for_checker
 
@@ -29501,6 +28976,7 @@ class NativeCheckexprJoinAndTupleSuite(Suite):
         if result is None:
             return None
         # The container seam returns `list[joined]`; extract the element.
+        result = get_proper_type(result)
         assert isinstance(result, Instance) and result.args
         return str(result.args[0])
 
@@ -29630,7 +29106,7 @@ class NativeCheckcallSetopsDeferSuite(Suite):
         self._set_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -29831,7 +29307,7 @@ class NativeGeneratorReturnTypeSuite(Suite):
         self._set_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -30093,12 +29569,12 @@ class NativeSemanalVisitorAuditSuite(Suite):
 
         sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
         sa._is_stub_file = False
-        sa.globals = {}
-        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign]
+        sa.globals = SymbolTable()
+        sa.lookup = lambda name, typ, suppress_errors=True: None  # type: ignore[method-assign, assignment]
         sa.is_pep_613 = lambda s: False  # type: ignore[method-assign]
         sa.is_none_alias = lambda node: False  # type: ignore[method-assign]
         sa.errors = Errors(Options())
-        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign]
+        sa.isolated_error_analysis = lambda: nullcontext()  # type: ignore[method-assign, return-value, assignment]
         self.sa = sa
 
     # --- node builders ---
@@ -30159,13 +29635,14 @@ class NativeSemanalVisitorAuditSuite(Suite):
         # A NameExpr whose node is a TypeVarLikeExpr: the seam decides Some(false).
         # Python's true-path also calls `self.fail` (live analyzer state),
         # so this is a seam-engagement assert only, not a differential.
-        from mypy.nodes import TypeVarLikeExpr
+        from mypy.nodes import TypeVarExpr
         from mypy.types import AnyType, TypeOfAny
 
         rv = self._name("m.T")
-        rv.node = TypeVarLikeExpr(
+        rv.node = TypeVarExpr(
             "T",
             "m.T",
+            [],
             AnyType(TypeOfAny.special_form),
             AnyType(TypeOfAny.special_form),
         )
@@ -30177,7 +29654,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
             rv = self._name(fullname)
             rv.node = self._instance(fullname)
             self._par(
-                lambda rv=rv: self.sa.is_type_ref(rv, bare=True),
+                lambda rv=rv: self.sa.is_type_ref(rv, bare=True),  # type: ignore[misc]
                 f"is_type_ref-{fullname}",
             )
 
@@ -30196,7 +29673,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
             rv = self._name(fullname)
             rv.node = self._instance(fullname)
             self._par(
-                lambda rv=rv: self.sa.is_type_ref(rv, bare=False),
+                lambda rv=rv: self.sa.is_type_ref(rv, bare=False),  # type: ignore[misc]
                 f"is_type_ref-{fullname}",
             )
 
@@ -30235,7 +29712,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
 
     def test_type_form_non_assignment_defers(self) -> None:
         # Non-AssignmentStmt input: the seam returns None (defer).
-        assert self._tk.rust_can_possibly_be_type_form(IntExpr(1), False) is None
+        assert self._tk.rust_can_possibly_be_type_form(IntExpr(1), False) is None  # type: ignore[arg-type]
 
     def test_type_form_positive_decided(self) -> None:
         # Lvalue NameExpr, rvalue IndexExpr, no unanalyzed annotation:
@@ -30282,7 +29759,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
         # `call = type(None)`: the seam returns Some(false), which the shim never
         # trusts, so gate-on and gate-off results are identical (both run the
         # true path; is_none_alias is False on the stub -> False).
-        from mypy.semanal import _rust_can_be_type_alias
+        from mypy.semanal import _rust_can_be_type_alias  # type: ignore[attr-defined]
 
         call = self._call(self._name("builtins.type"), [self._name("builtins.None")])
         assert _rust_can_be_type_alias(call, False, False) is False
@@ -30292,7 +29769,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
         # `None | X`: the OpExpr arm needs is_none_alias (deep analyzer), so the
         # seam defers on the union; Python evaluates is_none_alias (False on
         # the stub) and both agree (False) through the recursion.
-        from mypy.semanal import _rust_can_be_type_alias
+        from mypy.semanal import _rust_can_be_type_alias  # type: ignore[attr-defined]
 
         op = OpExpr("|", self._name("builtins.None"), self._name("m.X"))
         r = _rust_can_be_type_alias(op, False, False)
@@ -30302,7 +29779,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
     # --- check_typevarlike_name ---
 
     def test_check_typevarlike_name_valid(self) -> None:
-        from mypy.semanal import _rust_check_typevarlike_name
+        from mypy.semanal import _rust_check_typevarlike_name  # type: ignore[attr-defined]
 
         call = self._call(self._name("typing.TypeVar"), [StrExpr("T")])
         r = _rust_check_typevarlike_name(call, "T")
@@ -30312,7 +29789,7 @@ class NativeSemanalVisitorAuditSuite(Suite):
         assert r is None, f"check_typevarlike_name valid: {r!r}"
 
     def test_check_typevarlike_name_mismatch_defers(self) -> None:
-        from mypy.semanal import _rust_check_typevarlike_name
+        from mypy.semanal import _rust_check_typevarlike_name  # type: ignore[attr-defined]
 
         call = self._call(self._name("typing.TypeVar"), [StrExpr("U")])
         r = _rust_check_typevarlike_name(call, "T")
@@ -30321,9 +29798,9 @@ class NativeSemanalVisitorAuditSuite(Suite):
         assert r is None, f"mismatch: {r!r}"
 
     def test_check_typevarlike_name_not_call_defers(self) -> None:
-        from mypy.semanal import _rust_check_typevarlike_name
+        from mypy.semanal import _rust_check_typevarlike_name  # type: ignore[attr-defined]
 
-        assert _rust_check_typevarlike_name(IntExpr(1), "T") is None
+        assert _rust_check_typevarlike_name(IntExpr(1), "T") is None  # type: ignore[arg-type]
 
     # --- parse_bool ---
 
@@ -30417,7 +29894,7 @@ class NativeLiteralParamSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -30489,11 +29966,11 @@ class NativeLiteralParamSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.tvar_scope = TypeVarLikeScope()
-        ta.plugin = FakePlugin()
+        ta.plugin = FakePlugin()  # type: ignore[assignment]
         ta.options = Options()
         ta.defining_alias = False
         ta.python_3_12_type_alias = False
@@ -30517,11 +29994,11 @@ class NativeLiteralParamSuite(Suite):
         ta.allow_tuple_literal = True
         ta.report_invalid_types = False
         ta.prohibit_self_type = None
-        ta.cur_mod_node = None
+        ta.cur_mod_node = None  # type: ignore[assignment]
         return ta, api
 
     def _call(
-        self, ta: object, arg: Type
+        self, ta: Any, arg: Type
     ) -> tuple[str, list[str]]:
         result = ta.analyze_literal_param(1, arg, self.fx.o)
         messages = list(ta.api.errors)
@@ -30542,10 +30019,10 @@ class NativeLiteralParamSuite(Suite):
         if expected is not None:
             assert_equal(on[0], expected, f"literal_param result {arg!r}")
 
-    def _assert_engages(self, **facts: object) -> None:
-        from mypy.typeanal import _rust_classify_literal_param
+    def _assert_engages(self, **facts: Any) -> None:
+        from mypy.typeanal import _rust_classify_literal_param  # type: ignore[attr-defined]
 
-        defaults: dict[str, object] = {
+        defaults: dict[str, Any] = {
             "is_proper_type": False,
             "is_unbound": False,
             "is_union_pre": False,
@@ -30689,7 +30166,7 @@ class NativeLiteralParamSuite(Suite):
 
     def test_str_beats_any_direct(self) -> None:
         # Direct seam call: branch (a) is checked before (c).
-        from mypy.typeanal import _rust_classify_literal_param
+        from mypy.typeanal import _rust_classify_literal_param  # type: ignore[attr-defined]
 
         tag = _rust_classify_literal_param(
             True, True, False, True,
@@ -30726,7 +30203,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
 
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -30754,8 +30231,8 @@ class NativeMetaclassCompatibilitySuite(Suite):
         info.is_protocol = is_protocol
         info.is_named_tuple = is_named_tuple
         info.is_enum = is_enum
-        info.typeddict_type = typeddict_type
-        info.metaclass_type = metaclass_type
+        info.typeddict_type = typeddict_type  # type: ignore[assignment]
+        info.metaclass_type = metaclass_type  # type: ignore[assignment]
         info.bases = list(bases) if bases is not None else []
         # Give info a minimal MRO so is_metaclass() (which calls has_base)
         # does not crash: [info] alone suffices for the non-metaclass cases.
@@ -30779,7 +30256,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         fake_type = SimpleNamespace(fullname="builtins.type")
-        t.mro = [t, fake_type]
+        t.mro = [t, fake_type]  # type: ignore[list-item]
         assert self._tag(t) == 0
 
     def test_seam_exempt_protocol(self) -> None:
@@ -30805,7 +30282,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         base_type = self._typeinfo(fullname="mod.Meta")
-        base_type.metaclass_type = SimpleNamespace()  # non-None
+        base_type.metaclass_type = SimpleNamespace()  # type: ignore[assignment]
         base = self._base_instance(base_type)
         t = self._typeinfo(bases=[base])
         assert self._tag(t) == 1
@@ -30814,7 +30291,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         base_type = self._typeinfo(fullname="mod.Meta")
-        base_type.metaclass_type = SimpleNamespace()
+        base_type.metaclass_type = SimpleNamespace()  # type: ignore[assignment]
         base = self._base_instance(base_type)
         mc = SimpleNamespace()
         t = self._typeinfo(metaclass_type=mc, bases=[base])
@@ -30830,7 +30307,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         base_type = self._typeinfo(fullname="mod.Meta")
-        base_type.metaclass_type = SimpleNamespace()
+        base_type.metaclass_type = SimpleNamespace()  # type: ignore[assignment]
         base = self._base_instance(base_type)
         # Protocol + conflict-shape: exemption short-circuits.
         t = self._typeinfo(is_protocol=True, bases=[base])
@@ -30843,12 +30320,12 @@ class NativeMetaclassCompatibilitySuite(Suite):
             chk = TypeChecker.__new__(TypeChecker)
             fails: list[str] = []
             notes: list[str] = []
-            chk.fail = lambda msg, ctx, *, code=None: fails.append(msg)  # type: ignore
-            chk.note = lambda msg, ctx, *, code=None: notes.append(msg)  # type: ignore
+            chk.fail = lambda msg, ctx, *, code=None: fails.append(msg)  # type: ignore[arg-type, assignment, method-assign, return-value]
+            chk.note = lambda msg, ctx, *, code=None: notes.append(msg)  # type: ignore[assignment, method-assign, misc]
             chk.check_metaclass_compatibility(typ)
             return fails, notes
 
-        return check_one()  # type: ignore[return-value]
+        return check_one()
 
     def _assert_par(self, typ: TypeInfo) -> None:
         off = self._with_gate(False, lambda: self._run(typ))
@@ -30871,7 +30348,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         base_type = self._typeinfo(fullname="mod.Meta")
-        base_type.metaclass_type = SimpleNamespace()
+        base_type.metaclass_type = SimpleNamespace()  # type: ignore[assignment]
         base = self._base_instance(base_type)
         t = self._typeinfo(bases=[base])
         self._assert_par(t)
@@ -30886,7 +30363,7 @@ class NativeMetaclassCompatibilitySuite(Suite):
         from types import SimpleNamespace
 
         base_type = self._typeinfo(fullname="mod.Meta")
-        base_type.metaclass_type = SimpleNamespace()
+        base_type.metaclass_type = SimpleNamespace()  # type: ignore[assignment]
         base = self._base_instance(base_type)
         mc = SimpleNamespace()
         t = self._typeinfo(metaclass_type=mc, bases=[base])
@@ -30920,7 +30397,7 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -30933,7 +30410,7 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
         ns = SimpleNamespace()
         ns.type = object() if has_type else None
         ns.is_func_scope = lambda: func_scope
-        ns._fail: list[str] = []
+        ns._fail = []
         ns.fail = lambda msg, ctx: ns._fail.append(msg)
         return ns
 
@@ -30949,13 +30426,14 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
         def check_one() -> list[str]:
             ns = self._analyzer(has_type=has_type, func_scope=func_scope)
             SemanticAnalyzer.check_decorated_function_is_method(
-                ns, "abstractmethod", None
+                ns, "abstractmethod", None  # type: ignore[arg-type]
             )
-            return ns._fail
+            fails: list[str] = ns._fail
+            return fails
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(self, *, has_type: bool, func_scope: bool) -> None:
         off, on = self._run(has_type=has_type, func_scope=func_scope)
@@ -31016,7 +30494,7 @@ class NativeLvalueValiditySuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -31040,7 +30518,7 @@ class NativeLvalueValiditySuite(Suite):
         def check_one() -> list[str]:
             sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
             fails: list[str] = []
-            sa.fail = lambda msg, ctx, **kw: fails.append(str(msg))  # type: ignore
+            sa.fail = lambda msg, ctx, **kw: fails.append(str(msg))  # type: ignore[method-assign]
             sa.check_lvalue_validity(node, TempNode(AnyType(TypeOfAny.special_form)))
             return fails
 
@@ -31055,7 +30533,7 @@ class NativeLvalueValiditySuite(Suite):
     def test_seam_typevar_expr(self) -> None:
         from mypy.nodes import TypeVarExpr
 
-        tv = TypeVarExpr("T", "T", -1, [], None, AnyType(TypeOfAny.from_omitted_generics))
+        tv = TypeVarExpr("T", "T", [], AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.from_omitted_generics))
         assert self._tag(tv) == 1
 
     def test_seam_typeinfo(self) -> None:
@@ -31069,7 +30547,7 @@ class NativeLvalueValiditySuite(Suite):
     def test_parity_typevar_expr(self) -> None:
         from mypy.nodes import TypeVarExpr
 
-        tv = TypeVarExpr("T", "T", -1, [], None, AnyType(TypeOfAny.from_omitted_generics))
+        tv = TypeVarExpr("T", "T", [], AnyType(TypeOfAny.special_form), AnyType(TypeOfAny.from_omitted_generics))
         self._assert_par(tv)
 
     def test_parity_typeinfo(self) -> None:
@@ -31110,7 +30588,7 @@ class NativeTypeTypeMemberAccessSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -31184,11 +30662,11 @@ class NativeTypeTypeMemberAccessSuite(Suite):
         assert self._tag(tt) == 10
 
     def test_seam_item_type_type_instance(self) -> None:
-        tt = TypeType(TypeType(self.fx.a))
+        tt = TypeType(cast(Any, TypeType(self.fx.a)))
         assert self._tag(tt) == 11
 
     def test_seam_item_type_type_other(self) -> None:
-        tt = TypeType(TypeType(NoneType()))
+        tt = TypeType(cast(Any, TypeType(NoneType())))
         assert self._tag(tt) == 12
 
     def test_seam_none(self) -> None:
@@ -31224,7 +30702,7 @@ class NativeTypeTypeMemberAccessSuite(Suite):
             is_operator=False,
             original_type=typ,
             context=NameExpr("x"),
-            chk=chk,
+            chk=cast(Any, chk),
         )
 
     def _run_fn(
@@ -31241,24 +30719,24 @@ class NativeTypeTypeMemberAccessSuite(Suite):
 
         orig_ama = cm._analyze_member_access
         orig_aca = cm.analyze_class_attribute_access
-        orig_tf = cm.tuple_fallback
+        orig_tf = cm.tuple_fallback  # type: ignore[attr-defined]
 
-        def mock_ama(name, typ, mx, override_info=None):
+        def mock_ama(name: Any, typ: Any, mx: Any, override_info: Any = None) -> Any:
             fb = str(typ)
             calls.append(f"ama:{fb}")
             return AnyType(TypeOfAny.special_form)
 
-        def mock_aca(item, name, mx, **kw):
+        def mock_aca(item: Any, name: Any, mx: Any, **kw: Any) -> Any:
             calls.append(f"aca:{item}")
             return None
 
-        def mock_tf(typ):
+        def mock_tf(typ: Any) -> Any:
             calls.append(f"tf:{typ}")
             return self.fx.o
 
         cm._analyze_member_access = mock_ama
-        cm.analyze_class_attribute_access = mock_aca
-        cm.tuple_fallback = mock_tf
+        cm.analyze_class_attribute_access = mock_aca  # type: ignore[assignment]
+        cm.tuple_fallback = mock_tf  # type: ignore[attr-defined]
         try:
             mx = self._make_mx(typ)
             result = cm.analyze_type_type_member_access(name, typ, mx, None)
@@ -31266,7 +30744,7 @@ class NativeTypeTypeMemberAccessSuite(Suite):
         finally:
             cm._analyze_member_access = orig_ama
             cm.analyze_class_attribute_access = orig_aca
-            cm.tuple_fallback = orig_tf
+            cm.tuple_fallback = orig_tf  # type: ignore[attr-defined]
 
     def _assert_par(self, typ: TypeType) -> None:
         off = self._with_gate(False, lambda: self._run_fn(typ))
@@ -31316,10 +30794,10 @@ class NativeTypeTypeMemberAccessSuite(Suite):
         self._assert_par(TypeType(sig))
 
     def test_par_item_type_type_instance(self) -> None:
-        self._assert_par(TypeType(TypeType(self.fx.a)))
+        self._assert_par(TypeType(cast(Any, TypeType(self.fx.a))))
 
     def test_par_item_type_type_other(self) -> None:
-        self._assert_par(TypeType(TypeType(NoneType())))
+        self._assert_par(TypeType(cast(Any, TypeType(NoneType()))))
 
     def test_par_none(self) -> None:
         self._assert_par(TypeType(NoneType()))
@@ -31353,7 +30831,7 @@ class NativeMatchArgsSuite(Suite):
 
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -31400,13 +30878,13 @@ class NativeMatchArgsSuite(Suite):
                 def note(self, msg: str, _ctx: Any, **_kw: Any) -> None:
                     notes.append(str(msg))
 
-            chk.msg = _Msg()  # type: ignore[method-assign]
+            chk.msg = _Msg()  # type: ignore[assignment]
             chk.check_match_args(Var("__match_args__"), typ, Var("__match_args__"))
             return notes
 
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(self, scope: Any, typ: Type) -> None:
         off, on = self._run(scope, typ)
@@ -31504,7 +30982,7 @@ class NativeIsValidConstructorSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -31646,7 +31124,7 @@ class NativeIsDescriptorSuite(Suite):
         self._set_resolver(None)
         set_wire_typeinfo_map(None)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         self._set_resolver(self.resolver if active else None)
         try:
@@ -31666,7 +31144,7 @@ class NativeIsDescriptorSuite(Suite):
         from mypy.subtypes import _serialize_type
 
         result = _type_kernel.rust_is_descriptor(
-            self.resolver, _serialize_type(typ), True
+            self.resolver, _serialize_type(cast(Any, typ)), True
         )
         assert result is not None, f"rust_is_descriptor did not engage for {typ}"
         assert result == expected, (
@@ -31789,7 +31267,7 @@ class NativeIsInstanceVarSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -32011,7 +31489,7 @@ class NativeEnumCheckSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -32059,12 +31537,10 @@ class NativeEnumCheckSuite(Suite):
             chk.msg = SimpleNamespace(  # type: ignore[assignment]
                 fail=lambda msg, ctx, code=None: msgs.append((str(msg), code))
             )
-            chk.note = (  # type: ignore[assignment]
-                lambda msg, ctx, code=None: msgs.append(("NOTE: " + str(msg), code))
-            )
+            chk.note = lambda msg, ctx, code=None: msgs.append(("NOTE: " + str(msg), code))  # type: ignore[method-assign, misc]
             chk.options = Options()
             chk.is_stub = is_stub
-            chk.tree = SimpleNamespace(fullname=tree_fullname)
+            chk.tree = SimpleNamespace(fullname=tree_fullname)  # type: ignore[assignment]
             defn = self._sub(info)
             chk.check_enum(defn)
             return msgs
@@ -32264,7 +31740,7 @@ class NativeIsRecursivePairSuite(Suite):
         )
         _set_native_typeops_resolver(self._resolver)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         from mypy.typeops import _set_native_typeops_active
 
         _set_native_typeops_active(active)
@@ -32360,14 +31836,14 @@ class NativeTupleTypeImplicitSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
         finally:
             self._set_active(True)
 
-    def _analyser(self, allow_tuple_literal: bool = False) -> tuple[object, object]:
+    def _analyser(self, allow_tuple_literal: bool = False) -> tuple[Any, Any]:
         from mypy.typeanal import TypeAnalyser
 
         class FakeApi:
@@ -32382,11 +31858,10 @@ class NativeTupleTypeImplicitSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.allow_tuple_literal = allow_tuple_literal
-        ta.allow_param_spec = False
         ta.allow_param_spec_literals = False
         ta.nesting_level = 0
         ta.allow_typed_dict_special_forms = False
@@ -32404,7 +31879,7 @@ class NativeTupleTypeImplicitSuite(Suite):
             implicit=implicit,
         )
 
-    def _call(self, ta: object, t: object) -> tuple[str, list[str]]:
+    def _call(self, ta: Any, t: Any) -> tuple[str, list[str]]:
         result = ta.visit_tuple_type(t)
         return str(result), list(ta.api.messages)
 
@@ -32421,7 +31896,7 @@ class NativeTupleTypeImplicitSuite(Suite):
         assert_equal(on[1], off[1], f"{label} parity messages")
 
     def _seam(self, implicit: bool, allow_tuple_literal: bool, items_len: int) -> int | None:
-        from mypy.typeanal import _rust_classify_tuple_type_implicit
+        from mypy.typeanal import _rust_classify_tuple_type_implicit  # type: ignore[attr-defined]
 
         return _rust_classify_tuple_type_implicit(implicit, allow_tuple_literal, items_len)
 
@@ -32481,7 +31956,7 @@ class NativeClassPatternRangesSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -32522,9 +31997,9 @@ class NativeClassPatternRangesSuite(Suite):
         from mypy.checkpattern import PatternChecker
 
         pc = PatternChecker.__new__(PatternChecker)
-        pc.chk = SimpleNamespace(named_type=lambda name: self.fx.function)  # type: ignore[attr-defined]
-        pc.msg = SimpleNamespace(fail=lambda msg, ctx: records.append(msg))  # type: ignore[attr-defined]
-        pc.options = self.options  # type: ignore[attr-defined]
+        pc.chk = SimpleNamespace(named_type=lambda name: self.fx.function)  # type: ignore[assignment]
+        pc.msg = SimpleNamespace(fail=lambda msg, ctx: records.append(msg))  # type: ignore[assignment]
+        pc.options = self.options
         return pc
 
     def _run(
@@ -32542,7 +32017,7 @@ class NativeClassPatternRangesSuite(Suite):
         on = self._with_gate(True, lambda: one(records_on))
         return off, on, records_off, records_on
 
-    def _assert_par(self, typ: Type, node: Any = None) -> object:
+    def _assert_par(self, typ: Type, node: Any = None) -> Any:
         off, on, off_rec, on_rec = self._run(typ, node)
         assert_equal(
             self._ranges(off), self._ranges(on), f"class pattern parity for {typ!r}"
@@ -32638,8 +32113,9 @@ class NativeClassPatternRangesSuite(Suite):
     def test_parity_callable_var_arm(self) -> None:
         on = self._assert_par(self.fx.a, self._callable_var())
         (rng,) = on
-        assert isinstance(rng.item, CallableType)
-        assert rng.item.fallback.type.fullname == "builtins.function"
+        item: ProperType = get_proper_type(rng.item)
+        assert isinstance(item, CallableType)
+        assert item.fallback.type.fullname == "builtins.function"
         assert rng.is_upper_bound is False
 
     def test_parity_fail_arm(self) -> None:
@@ -32662,11 +32138,6 @@ class NativeClassPatternRangesSuite(Suite):
         # which expands to Instance and reports CLASS_PATTERN_TYPE_REQUIRED.
         on = self._assert_par(typ)
         assert on is None
-
-    def _ranges(self, ranges: Any) -> list[tuple[str, bool]]:
-        if ranges is None:
-            return []
-        return [(str(r.item), r.is_upper_bound) for r in ranges]
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -32692,7 +32163,7 @@ class NativeRefersToTypedDictSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -32750,7 +32221,7 @@ class NativeRefersToTypedDictSuite(Suite):
         result = _type_kernel.rust_refers_to_typeddict(base, target_bytes)
         assert result == expected, f"seam: {result} != {expected}"
 
-    def _make_checker(self) -> object:
+    def _make_checker(self) -> Any:
         from mypy.checker import TypeChecker
         from mypy.errors import Errors
         from mypy.nodes import MypyFile, SymbolTable
@@ -32852,7 +32323,7 @@ class NativeSimpleLiteralTypeSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -32860,7 +32331,7 @@ class NativeSimpleLiteralTypeSuite(Suite):
             self._set_active(True)
 
     def _tag(self, function_stack: bool, kind: int, is_final: bool = False) -> int | None:
-        from mypy.semanal import _rust_classify_simple_literal_type
+        from mypy.semanal import _rust_classify_simple_literal_type  # type: ignore[attr-defined]
 
         return _rust_classify_simple_literal_type(function_stack, kind, "__main__", is_final)
 
@@ -32880,13 +32351,13 @@ class NativeSimpleLiteralTypeSuite(Suite):
             return Instance(info, []) if info is not None else None
 
         sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
-        sa.function_stack = function_stack if function_stack is not None else []
+        sa.function_stack = function_stack if function_stack is not None else []  # type: ignore[assignment]
         sa.cur_mod_id = "__main__"
-        sa.named_type_or_none = named_type_or_none  # type: ignore[method-assign]
+        sa.named_type_or_none = named_type_or_none  # type: ignore[method-assign, assignment]
         return sa
 
-    def _call(self, sa: object, rvalue: Expression, is_final: bool) -> str:
-        result = sa.analyze_simple_literal_type(rvalue, is_final)  # type: ignore[attr-defined]
+    def _call(self, sa: Any, rvalue: Expression, is_final: bool) -> str:
+        result = sa.analyze_simple_literal_type(rvalue, is_final)
         if result is None:
             return "None"
         return str(result)
@@ -33001,7 +32472,7 @@ class NativeAnalyzeCallableTypeSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -33011,7 +32482,7 @@ class NativeAnalyzeCallableTypeSuite(Suite):
     def _analyser(
         self, disallow_any_generics: bool = False
     ) -> tuple[object, object]:
-        from mypy.errors import ErrorCode as _ErrorCode
+        from mypy.errorcodes import ErrorCode as _ErrorCode
         from mypy.typeanal import TypeAnalyser
 
         fx = TypeFixture()
@@ -33049,14 +32520,14 @@ class NativeAnalyzeCallableTypeSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.api = api
-        ta.fail_func = api.fail
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.options = Options()
         ta.options.disallow_any_generics = disallow_any_generics
         return ta, api
 
-    def _call_invalid(self, ta: object, t: UnboundType) -> tuple[str, list[str]]:
+    def _call_invalid(self, ta: Any, t: UnboundType) -> tuple[str, list[str]]:
         result = ta.analyze_callable_type(t)
         messages = list(ta.api.errors)
         return str(result), messages
@@ -33088,7 +32559,7 @@ class NativeAnalyzeCallableTypeSuite(Suite):
         arg0_is_ellipsis: bool,
         disallow_any_generics: bool,
     ) -> None:
-        from mypy.typeanal import _rust_classify_analyze_callable_type
+        from mypy.typeanal import _rust_classify_analyze_callable_type  # type: ignore[attr-defined]
 
         tag = _rust_classify_analyze_callable_type(
             arg_count,
@@ -33163,7 +32634,7 @@ class NativeAnalyzeCallableTypeSuite(Suite):
 
     def test_direct_tags(self) -> None:
         # Verify all 6 tags through the direct seam.
-        from mypy.typeanal import (
+        from mypy.typeanal import (  # type: ignore[attr-defined]
             _CALLABLE_TAG_BARE,
             _CALLABLE_TAG_ELLIPSIS,
             _CALLABLE_TAG_INVALID_ALLOW,
@@ -33219,7 +32690,7 @@ class NativeValidVarArgSuite(Suite):
         self._set_active = _set_native_checkexpr_active
         self._set_active(True)
         self.ec = ExpressionChecker.__new__(ExpressionChecker)
-        self.ec.chk = _ValidVarArgStubChk(
+        self.ec.chk = _ValidVarArgStubChk(  # type: ignore[assignment]
             {
                 "builtins.str": self.fx.str_type_info,
                 "typing.Iterable": self.fx.make_type_info(
@@ -33239,7 +32710,7 @@ class NativeValidVarArgSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -33425,7 +32896,7 @@ class NativeInferredTypeNoteSuite(Suite):
         from mypy.nodes import ReturnStmt
 
         expr = NameExpr("x")
-        expr.node = self.fx.a  # a TypeInfo, not a Var
+        expr.node = self.fx.a  # type: ignore[assignment]
         self._assert_par(ReturnStmt(expr), self.fx.lstb, self.fx.lsta)
 
     def test_different_fullnames(self) -> None:
@@ -33493,7 +32964,7 @@ class NativeRvalueCountSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -33519,15 +32990,15 @@ class NativeRvalueCountSuite(Suite):
         lvalues: list[NameExpr | StarExpr],
         rvalue_count: int,
         rvalue_unpack: int | None,
-    ) -> tuple[object, object]:
+    ) -> tuple[Any, Any]:
         from types import SimpleNamespace
 
         from mypy.checker import TypeChecker
 
-        def check_one() -> tuple[object, object]:
+        def check_one() -> tuple[Any, Any]:
             chk = TypeChecker.__new__(TypeChecker)
             msgs: list[tuple[str, str]] = []
-            chk.fail = lambda msg, ctx, code=None: msgs.append(  # type: ignore[method-assign]
+            chk.fail = lambda msg, ctx, code=None: msgs.append(  # type: ignore[method-assign, assignment, misc]
                 ("fail", str(msg))
             )
             chk.msg = SimpleNamespace(  # type: ignore[assignment]
@@ -33536,7 +33007,7 @@ class NativeRvalueCountSuite(Suite):
                 )
             )
             result = chk.check_rvalue_count_in_assignment(
-                lvalues, rvalue_count, Context(), rvalue_unpack=rvalue_unpack
+                cast("list[Expression]", lvalues), rvalue_count, Context(), rvalue_unpack=rvalue_unpack
             )
             return result, msgs
 
@@ -33557,7 +33028,7 @@ class NativeRvalueCountSuite(Suite):
     # --- direct seam tests ---
 
     def test_seam_non_list_defers(self) -> None:
-        assert self._seam("nope", 1, None) is None  # type: ignore[arg-type]
+        assert self._seam("nope", 1, None) is None
 
     def test_seam_variadic_no_star(self) -> None:
         assert self._seam(self._lv(2), 4, 2) == 1
@@ -33655,7 +33126,7 @@ class NativeIndexWithTypeSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -33748,29 +33219,50 @@ class NativeIndexWithTypeSuite(Suite):
         from mypy.checkexpr import ExpressionChecker
 
         accepts: list[Any] = []
+
+        def _named_type(name: Any) -> Any:
+            obs.append(("named_type", name))
+            return Instance(self.fx.gi, [self.fx.o])
         anyt = AnyType(TypeOfAny.from_error)
         chk = SimpleNamespace(
             in_checked_function=lambda: in_checked,
             fail=lambda msg, ctx, code=None: obs.append(("fail", str(msg))),
             note=lambda msg, ctx: obs.append(("note", str(msg))),
-            named_type=lambda name: obs.append(("named_type", name))
-            or Instance(self.fx.gi, [self.fx.o]),
+            named_type=_named_type,
         )
         ec = ExpressionChecker.__new__(ExpressionChecker)
         ec.chk = chk  # type: ignore[assignment]
-        ec.accept = lambda node, *a: accepts.append(node) or anyt  # type: ignore[method-assign]
-        ec.check_method_call_by_name = (  # type: ignore[method-assign]
-            lambda name, lt, args, kinds, ctx=None, original_type=None, self_type=None: obs.append(
-                ("mcall", name, str(lt))
-            )
-            or (anyt, ("__getitem__",))
-        )
-        ec.visit_typeddict_index_expr = (  # type: ignore[method-assign]
-            lambda td, idx, setitem=False: obs.append(("tdict",)) or (anyt, set())
-        )
-        ec.visit_enum_index_expr = (  # type: ignore[method-assign]
-            lambda info, idx, ctx: obs.append(("enum", info.fullname)) or anyt
-        )
+        def _accept(node: Any, *a: Any) -> Any:
+            accepts.append(node)
+            return anyt
+
+        ec.accept = _accept  # type: ignore[method-assign, assignment]
+
+        def _mcall(
+            name: Any,
+            lt: Any,
+            args: Any,
+            kinds: Any,
+            ctx: Any = None,
+            original_type: Any = None,
+            self_type: Any = None,
+        ) -> Any:
+            obs.append(("mcall", name, str(lt)))
+            return (anyt, ("__getitem__",))
+
+        ec.check_method_call_by_name = _mcall  # type: ignore[method-assign, assignment]
+
+        def _tdict(td: Any, idx: Any, setitem: bool = False) -> Any:
+            obs.append(("tdict",))
+            return (anyt, set())
+
+        ec.visit_typeddict_index_expr = _tdict  # type: ignore[method-assign, assignment]
+
+        def _enum(info: Any, idx: Any, ctx: Any) -> Any:
+            obs.append(("enum", info.fullname))
+            return anyt
+
+        ec.visit_enum_index_expr = _enum  # type: ignore[method-assign, assignment]
         return ec, accepts
 
     def _run_visit(
@@ -33815,7 +33307,7 @@ class NativeIndexWithTypeSuite(Suite):
         self._assert_par(self._tuple(self.fx.a, self.fx.b), SliceExpr(None, None, None))
 
     def test_par_tuple_nonliteral(self) -> None:
-        self._assert_par(self._tuple(self.fx.a, self.fx.b), MemberExpr("x", "y"))
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), MemberExpr(NameExpr("x"), "y"))
 
     def test_par_variadic_tuple_literal(self) -> None:
         self._assert_par(self._variadic_tuple(), IntExpr(0))
@@ -33867,7 +33359,7 @@ class NativeGetattrMethodSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -33899,7 +33391,7 @@ class NativeGetattrMethodSuite(Suite):
 
     def test_seam_module_scope_getattribute(self) -> None:
         from mypy.checker import NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
-        from mypy.checker import _rust_classify_getattr_method
+        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
 
         assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattribute__") == (
             NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
@@ -33907,7 +33399,7 @@ class NativeGetattrMethodSuite(Suite):
 
     def test_seam_module_scope_getattr(self) -> None:
         from mypy.checker import NATIVE_GETATTR_METHOD_MODULE
-        from mypy.checker import _rust_classify_getattr_method
+        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
 
         assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattr__") == (
             NATIVE_GETATTR_METHOD_MODULE
@@ -33915,7 +33407,7 @@ class NativeGetattrMethodSuite(Suite):
 
     def test_seam_class_scope(self) -> None:
         from mypy.checker import NATIVE_GETATTR_METHOD_CLASS
-        from mypy.checker import _rust_classify_getattr_method
+        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
 
         assert _rust_classify_getattr_method(_FakeScope(module=False, cls=True), "__getattr__") == (
             NATIVE_GETATTR_METHOD_CLASS
@@ -33923,7 +33415,7 @@ class NativeGetattrMethodSuite(Suite):
 
     def test_seam_other_scope_pass(self) -> None:
         from mypy.checker import NATIVE_GETATTR_METHOD_PASS
-        from mypy.checker import _rust_classify_getattr_method
+        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
 
         assert _rust_classify_getattr_method(_FakeScope(module=False, cls=False), "__getattr__") == (
             NATIVE_GETATTR_METHOD_PASS
@@ -34011,11 +33503,11 @@ def expect_fail_check(module: bool, name: str, ok: bool, cls: bool) -> bool:
 def _make_getattr_sig(ok: bool, cls: bool = False) -> object:
     """A `__getattr__` signature matching the arity the method expects."""
     from mypy.nodes import ARG_POS
-    from mypy.types import AnyType, CallableType, Instance, TypeOfAny
+    from mypy.types import AnyType, CallableType, Instance, Type, TypeOfAny
     from mypy.test.typefixture import TypeFixture
 
     fx = TypeFixture()
-    args: list[object] = [Instance(fx.make_type_info("builtins.str"), [])]
+    args: list[Type] = [Instance(fx.make_type_info("builtins.str"), [])]
     if cls:
         args = [AnyType(TypeOfAny.special_form), Instance(fx.make_type_info("builtins.str"), [])]
     if not ok:
@@ -34055,7 +33547,7 @@ class NativeTypeParameterSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -34077,7 +33569,7 @@ class NativeTypeParameterSuite(Suite):
 
         off = self._with_gate(False, call)
         on = self._with_gate(True, call)
-        return off, on  # type: ignore[return-value]
+        return off, on
 
     def _assert_par(
         self, left: Type, right: Type, variance: int, proper_subtype: bool
@@ -34160,7 +33652,7 @@ class NativeTypeParameterSuite(Suite):
         # the raise behavior on both sides of the gate.
         from mypy.nodes import INVARIANT
 
-        assert self._tag(TypeAliasType("A", UninhabitedType(), []), INVARIANT, False) is None
+        assert self._tag(TypeAliasType(cast(Any, "A"), cast(Any, UninhabitedType()), cast(Any, [])), INVARIANT, False) is None
 
     def test_par_covariant_types(self) -> None:
         from mypy.nodes import COVARIANT
@@ -34235,7 +33727,7 @@ class NativeCheckUnpacksInListSuite(Suite):
 
         api = FakeApi()
         ta = TypeAnalyser.__new__(TypeAnalyser)
-        ta.fail_func = api.fail
+        ta.fail_func = api.fail  # type: ignore[assignment]
         ta.note_func = api.note
         ta.options = Options()
         return ta, api
@@ -34304,7 +33796,7 @@ class NativeCheckUnpacksInListSuite(Suite):
         self._assert_parity([item, self.fx.a])
 
     def test_direct_seam(self) -> None:
-        from mypy.typeanal import _rust_check_unpacks_in_list
+        from mypy.typeanal import _rust_check_unpacks_in_list  # type: ignore[attr-defined]
 
         va, tb = self._variadic_unpack(), self._tuple_unpack()
         assert _rust_check_unpacks_in_list([self.fx.a]) == ([0], None)
@@ -34322,7 +33814,7 @@ class NativeCheckUnpacksInListSuite(Suite):
     def test_engagement(self) -> None:
         # The gate-on differential must exercise the Rust path, not just
         # agree with Python: the seam returns kept indices directly.
-        from mypy.typeanal import _rust_check_unpacks_in_list
+        from mypy.typeanal import _rust_check_unpacks_in_list  # type: ignore[attr-defined]
 
         result = _rust_check_unpacks_in_list([self._variadic_unpack(), self._variadic_unpack()])
         assert result is not None
@@ -34355,7 +33847,7 @@ class NativeCheckWarnDeprecatedSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
         self._set_active(active)
         try:
             return fn()
@@ -34375,20 +33867,20 @@ class NativeCheckWarnDeprecatedSuite(Suite):
 
         ta = TypeAnalyser.__new__(TypeAnalyser)
         captured: list[tuple[str, str]] = []
-        ta.fail_func = lambda msg, ctx, code=None: captured.append(("fail", msg))
-        ta.note_func = lambda msg, ctx, code=None: captured.append(("note", msg))
+        ta.fail_func = lambda msg, ctx, code=None: captured.append(("fail", msg))  # type: ignore[assignment, misc]
+        ta.note_func = lambda msg, ctx, code=None: captured.append(("note", msg))  # type: ignore[misc]
 
         class FakeApi:
             type = api_type
 
-        ta.api = FakeApi()
+        ta.api = FakeApi()  # type: ignore[assignment]
         ta.is_typeshed_stub = stub
-        ta.options = SimpleNamespace(
+        ta.options = SimpleNamespace(  # type: ignore[assignment]
             deprecated_calls_exclude=list(exclude),
             report_deprecated_as_note=report_note,
         )
-        ta.cur_mod_node = SimpleNamespace(imports=list(imports))
-        ta._captured = captured
+        ta.cur_mod_node = SimpleNamespace(imports=list(imports))  # type: ignore[assignment]
+        ta._captured = captured  # type: ignore[attr-defined]
         return ta, captured
 
     def _deprecated_info(
@@ -34401,7 +33893,7 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         info.deprecated = deprecated
         return info
 
-    def _assert_par(self, **kwargs: object) -> list[tuple[str, str]]:
+    def _assert_par(self, **kwargs: Any) -> list[tuple[str, str]]:
         exclude = kwargs.pop("exclude", ())
         report_note = kwargs.pop("report_note", True)
         api_type = kwargs.pop("api_type", None)
@@ -34421,7 +33913,7 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         assert_equal(on, off, f"deprecated parity {info.fullname}")
         return on
 
-    def _call(self, ta: object, info: TypeInfo) -> list[tuple[str, str]]:
+    def _call(self, ta: Any, info: TypeInfo) -> list[tuple[str, str]]:
         ta.check_and_warn_deprecated(info, Context())
         return list(ta._captured)
 
@@ -34469,8 +33961,8 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         captured = self._assert_par(imports=[ImportFrom("other", 0, [("X", None)])])
         assert_equal(captured, [("note", "use mod.B instead")])
 
-    def _assert_direct(self, tag: int, **kwargs: object) -> None:
-        from mypy.typeanal import _rust_classify_check_warn_deprecated
+    def _assert_direct(self, tag: int, **kwargs: Any) -> None:
+        from mypy.typeanal import _rust_classify_check_warn_deprecated  # type: ignore[attr-defined]
 
         result = _rust_classify_check_warn_deprecated(
             kwargs.get("deprecated", "x"),
@@ -34525,23 +34017,17 @@ class NativeHasNoAttrSuite(Suite):
     def tearDown(self) -> None:
         self._set_active(False)
 
-    def _make_builder(self) -> tuple[object, list[tuple[str, object]]]:
+    def _make_builder(self) -> tuple[Any, list[tuple[str, Any]]]:
         from mypy import errorcodes as codes
         from mypy.errors import Errors
         from mypy.messages import MessageBuilder
 
         errors = Errors(self.options)
         builder = MessageBuilder(errors, {})
-        captured: list[tuple[str, object]] = []
-        builder.fail = (  # type: ignore[assignment]
-            lambda msg, ctx, code=None, **kw: captured.append((msg, code))
-        )
-        builder.note = (  # type: ignore[assignment]
-            lambda msg, ctx, offset=0, code=None, **kw: captured.append((msg, code))
-        )
-        builder.unsupported_left_operand = (  # type: ignore[assignment]
-            lambda op, typ, ctx: captured.append(("__left__:" + op, codes.OPERATOR))
-        )
+        captured: list[tuple[str, Any]] = []
+        builder.fail = lambda msg, ctx, code=None, **kw: captured.append((msg, code))  # type: ignore[method-assign,assignment]
+        builder.note = lambda msg, ctx, offset=0, code=None, **kw: captured.append((msg, code))  # type: ignore[method-assign]
+        builder.unsupported_left_operand = lambda op, typ, ctx: captured.append(("__left__:" + op, codes.OPERATOR))  # type: ignore[method-assign,assignment]
         return builder, captured
 
     def _assert_par(
@@ -34551,7 +34037,7 @@ class NativeHasNoAttrSuite(Suite):
         member: str,
         module_symbol_table: SymbolTable | None = None,
         disable_type_names: bool = False,
-    ) -> list[tuple[str, object]]:
+    ) -> tuple[Any, list[tuple[str, Any]]]:
         results = []
         for active in (False, True):
             self._set_active(active)
@@ -34886,7 +34372,7 @@ class NativeAttributeTriggersSuite(Suite):
         self._set_active(True)
         rs = self.v.attribute_triggers(typ, name)
         assert_equal(rs, py, f"Rust/Python mismatch for {typ!r} (name={name!r})")
-        return rs
+        return cast("list[str]", rs)
 
     def test_instance(self) -> None:
         assert_equal(self._triggers(self.fx.a), [self.make_trigger("A.x")])

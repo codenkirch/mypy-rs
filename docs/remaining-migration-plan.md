@@ -513,6 +513,33 @@ switched to the self-hosted macOS ARM64 runner
 directive. Issue #891 tracks the serialize diagnosis; lever (b)
 (residual wire serialize traffic) remains the next target.
 
+Measured 2026-08-27 (after the final port wave merged: #995
+check_getattr_method, #1013 check_type_parameter variance, #1015
+check_unpacks_in_list, #1018 attribute_triggers, #1019
+check_and_warn_deprecated, #1021 constraint-list helpers, #1022
+has_no_attr message arbitration; self-check restored to 0 errors in
+344 source files, fresh `type_kernel`/`module_resolver`/`ast_serialize`
+`.so`s, cold cache, quiet machine, 3 pairs, median-of-ratios via
+`scripts/measure_work_share.py`):
+
+| phase | python | native | share |
+|-------|--------|--------|-------|
+| parse_time | 8.07s | 8.51s | -5.6% |
+| semanal_time | 4.05s | 5.90s | -43.8% |
+| type_check_time | 14.66s | 28.07s | -87.9% |
+| total | 26.77s | 42.49s | -52.6% |
+
+Against the 08-26 late-3 entry, the total share improved -48.3% ->
+-52.6%, type_check -78.3% -> -87.9%, and semanal -29.9% -> -43.8%.
+Parse flipped from -0.8% to -5.6%; parse shares have swung between
++9.6% and -1.6% across 08-26 entries on little-changed code, so the
+parse delta sits inside the observed run-to-run band rather than
+marking a real regression. The Python baseline itself also moved
+across entries (23.0s late-3, 26.8s here), reflecting the growing
+Python-side dispatch code, so cross-entry comparisons mix code growth
+with seam gains. Lever (b) (residual wire serialize traffic) remains
+the next target.
+
 Measured 2026-08-14 (after Phase C merged, fresh `type_kernel` release
 `.so`, cold cache, `MYPY_NUM_WORKERS=0`, self-check
 `mypy_self_check.ini --no-incremental -p mypy`):

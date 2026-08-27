@@ -230,7 +230,7 @@ def _native_map_step_frontier(
     supported = [members[i] for i in supported_idx]
     try:
         buf = _WriteBuffer()
-        write_type_list(buf, supported)  # type: ignore[arg-type]
+        write_type_list(buf, supported)
         result = _type_kernel.rust_map_instance_to_supertypes(
             _native_map_resolver,
             buf.getvalue(),

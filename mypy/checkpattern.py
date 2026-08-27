@@ -877,6 +877,9 @@ class PatternChecker(PatternVisitor[PatternType]):
                 continue
             p_item = get_proper_type(item)
             if tag == _CLASS_PATTERN_TYPE_OBJ:
+                # Tag TYPE_OBJ is only emitted for class-object callables
+                # (FunctionLike with is_type_obj()).
+                assert isinstance(p_item, FunctionLike)
                 out.append(
                     TypeRange(
                         fill_typevars_with_any(p_item.type_object()),
@@ -895,6 +898,8 @@ class PatternChecker(PatternVisitor[PatternType]):
                     )
                 )
             elif tag == _CLASS_PATTERN_TYPE_TYPE:
+                # Tag TYPE_TYPE is only emitted for TypeType leaves.
+                assert isinstance(p_item, TypeType)
                 out.append(TypeRange(p_item.item, is_upper_bound=True))
             else:
                 out.append(TypeRange(p_item, is_upper_bound=False))

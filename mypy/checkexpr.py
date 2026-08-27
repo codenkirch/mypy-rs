@@ -614,7 +614,7 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
             return _BUILTIN_INSTANCE_BYTES[fn]
     fast = _encode_no_arg_instance(t, _CheckExprWriteBuffer)
     if fast is not None:
-        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[attr-defined]
             if _serialize_stats_on:
                 _serialize_stats["writes"] += 1
                 _serialize_stats["bytes"] += len(fast)
@@ -633,17 +633,21 @@ def _serialize_type_for_checkexpr(t: Type) -> bytes:
     return result
 
 
-def _deserialize_type_from_checkexpr(b: bytes) -> Type | None:
+def _deserialize_type_from_checkexpr(b: bytes) -> ProperType | None:
     """Decode wire bytes, resolving type_ref to live TypeInfo via wirefixup.
 
     Bare read_type leaves Instance.type as NOT_READY with only type_ref
     set; fixup resolves type_refs to live TypeInfo (or returns None so
     the caller defers to Python), matching the other wire seams
-    (erasetype, join, typeops, solve).
+    (erasetype, join, typeops, solve). A non-None result is structurally
+    a proper-type tree: fixup_wire_type defers on any TypeAliasType.
     """
     from mypy.wirefixup import fixup_wire_type
 
-    return fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)))
+    fixed = fixup_wire_type(_checkexpr_read_type(_CheckExprReadBuffer(b)))
+    if fixed is None:
+        return None
+    return cast(ProperType, fixed)
 
 
 def _deserialize_optional_type_list(raw: bytes) -> list[Type | None] | None:
@@ -713,7 +717,8 @@ def _decode_argtypes_plan(
     if cached is not None:
         return cached
     try:
-        from mypy.cache import read_int_bare, read_int_list
+        from librt.internal import read_int as read_int_bare
+        from mypy.cache import read_int_list
         from mypy.nodes import ArgKind
         from mypy.wirefixup import fixup_wire_type
 
@@ -925,7 +930,7 @@ def _try_native_check_callable_call(
         if raw is None:
             return None
         resolved = _deserialize_type_from_checkexpr(bytes(raw))
-        if not isinstance(resolved, CallableType):  # type: ignore[misc]
+        if not isinstance(resolved, CallableType):
             return None
         # The wire format has no line/column/special_sig; restore from
         # the pre-edit callee exactly like the calibration path.
@@ -2891,7 +2896,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                                 # Deserialize may return None when a type_ref
                                 # cannot resolve to a live TypeInfo; defer.
                                 # The isinstance narrows None out of the union.
-                                if isinstance(resolved_callee, CallableType):  # type: ignore[misc]
+                                if isinstance(resolved_callee, CallableType):
                                     callee = resolved_callee
                                     # Native solve succeeded; skip Python's infer pass.
                                     native_solved = True
@@ -3013,7 +3018,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 )
                 if raw is not None:
                     resolved = _deserialize_type_from_checkexpr(bytes(raw))
-                    if isinstance(resolved, CallableType):  # type: ignore[misc]
+                    if isinstance(resolved, CallableType):
                         # The wire format has no line/column/special_sig;
                         # the Rust round-trip defaults them. Restore from
                         # the pre-edit callee to match copy_modified
@@ -4741,7 +4746,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             if res is not None:
                 next_raw_id, merged_bytes = res
                 TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
-                merged = get_proper_type(_deserialize_type_from_checkexpr(bytes(merged_bytes)))
+                merged = _deserialize_type_from_checkexpr(bytes(merged_bytes))
                 if isinstance(merged, CallableType):
                     # The wire format cannot carry line/column/definition/
                     # fallback/special_sig; restore from the pre-merge
@@ -5070,13 +5075,15 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 tag = None
             if tag is not None:
-                if tag == NATIVE_VISIT_OP_EXPR_ANALYZED:
+                if tag == NATIVE_VISIT_OP_EXPR_ANALYZED and e.analyzed is not None:
                     return self.accept(e.analyzed)
                 if tag == NATIVE_VISIT_OP_EXPR_BOOLEAN:
                     return self.check_boolean_op(e)
                 if tag == NATIVE_VISIT_OP_EXPR_LIST_MULTIPLY:
                     return self.check_list_multiply(e)
                 if tag == NATIVE_VISIT_OP_EXPR_STR_INTERP:
+                    # Tag STR_INTERP is only chosen for str/bytes left sides.
+                    assert isinstance(e.left, (StrExpr, BytesExpr))
                     return self.strfrm_checker.check_str_interpolation(e.left, e.right)
                 # tag == NATIVE_VISIT_OP_EXPR_CHECK_OP: fall through.
         if e.analyzed:
@@ -6145,12 +6152,16 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
 
         if tag is not None:
             if native_left is not None:
-                left_type = native_left
+                # expand_type on a proper type yields a proper-type tree;
+                # downstream tuple/typeddict helpers require ProperType.
+                left_type = get_proper_type(native_left)
             # Visit the index, just to make sure we have a type for it
             # available (after classification, so a deferral never runs
             # this accept twice).
             self.accept(index)
             if tag == NATIVE_INDEX_UNION:
+                # Tag UNION is only chosen for union left types.
+                assert isinstance(left_type, UnionType)
                 original_type = original_type or left_type
                 # Don't combine literal types, since we may need them for
                 # type narrowing.
@@ -6162,6 +6173,8 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     contract_literals=False,
                 )
             if tag == NATIVE_INDEX_TUPLE:
+                # Tag TUPLE is only chosen for tuple left types.
+                assert isinstance(left_type, TupleType)
                 # Special case for tuples. They return a more specific type
                 # when indexed by an integer literal.
                 if isinstance(index, SliceExpr):
@@ -6185,12 +6198,18 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                 else:
                     return self.nonliteral_tuple_index_helper(left_type, index)
             if tag == NATIVE_INDEX_TYPEDDICT:
+                # Tag TYPEDDICT is only chosen for TypedDict left types.
+                assert isinstance(left_type, TypedDictType)
                 return self.visit_typeddict_index_expr(left_type, e.index)[0]
             if tag == NATIVE_INDEX_ENUM:
+                # Tag ENUM is only chosen for class-object left types.
+                assert isinstance(left_type, FunctionLike)
                 return self.visit_enum_index_expr(left_type.type_object(), e.index, e)
             if tag == NATIVE_INDEX_GENERIC_ALIAS:
                 return self.named_type("types.GenericAlias")
             if tag == NATIVE_INDEX_TYPEVAR:
+                # Tag TYPEVAR is only chosen for TypeVar left types.
+                assert isinstance(left_type, TypeVarType)
                 return self.visit_index_with_type(
                     left_type.values_or_bound(), e, original_type, left_type
                 )
@@ -7415,7 +7434,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     )
                     if result is not None:
                         decoded = _deserialize_type_from_checkexpr(bytes(result))
-                        if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
+                        if decoded is not None and isinstance(decoded, CallableType):
                             return decoded.copy_modified(
                                 line=e.line, column=e.column, name=e.name, implicit=True
                             )
@@ -7919,8 +7938,7 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
                     if alt_bytes is not None:
                         alternative = _deserialize_type_from_checkexpr(alt_bytes)
                         if alternative is not None:
-                            p_alt = get_proper_type(alternative)
-                            if not isinstance(p_alt, Instance) or p_alt.type.fullname != "builtins.object":
+                            if not isinstance(alternative, Instance) or alternative.type.fullname != "builtins.object":
                                 res = alternative
                                 return res
                 except Exception:
@@ -9058,15 +9076,19 @@ def merge_typevars_in_callables_by_name(
             res = None
         if res is not None:
             next_raw_id, callables_bytes, typevars_bytes = res
-            output = [_deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes]
-            variables = [_deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes]
-            if all(isinstance(c, CallableType) for c in output) and all(
-                isinstance(v, TypeVarType) for v in variables
+            native_output = [
+                _deserialize_type_from_checkexpr(bytes(b)) for b in callables_bytes
+            ]
+            native_variables = [
+                _deserialize_type_from_checkexpr(bytes(b)) for b in typevars_bytes
+            ]
+            if all(isinstance(c, CallableType) for c in native_output) and all(
+                isinstance(v, TypeVarType) for v in native_variables
             ):
                 TypeVarId.next_raw_id = max(TypeVarId.next_raw_id, next_raw_id)
                 return (
-                    cast("list[CallableType]", output),
-                    cast("list[TypeVarType]", variables),
+                    cast("list[CallableType]", native_output),
+                    cast("list[TypeVarType]", native_variables),
                 )
 
     output: list[CallableType] = []
@@ -9105,9 +9127,9 @@ def try_getting_literal(typ: Type) -> ProperType:
                 decoded = _deserialize_type_from_checkexpr(bytes(result))
                 if decoded is not None:
                     # Rust always returns a ProperType here (Instance w/o
-                    # lkv or a LiteralType); fixup never reintroduces an
-                    # alias, so the cast satisfies `-> ProperType`.
-                    return cast(ProperType, decoded)
+                    # lkv or a LiteralType), and the deserializer already
+                    # returns ProperType | None.
+                    return decoded
         except (AssertionError, NotImplementedError, ValueError):
             pass
     typ = get_proper_type(typ)
