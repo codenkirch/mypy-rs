@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from librt.internal import ReadBuffer
 from mypy.nodes import FakeInfo
 from mypy.types import (
     AnyType,
@@ -138,17 +139,18 @@ def fixup_wire_type(typ: Type, *, resolve_aliases: bool = False) -> Type | None:
     return None if fixer.missing else result
 
 
-def decode_source_any(data: ReadBuffer) -> Type | None:
+def decode_source_any(data: ReadBuffer) -> AnyType | None:
     """Read a wire AnyType blob for `solve_one` kind=3 (Any-absorption).
 
     Structurally mirrors `AnyType.read` (types.py:1463-1473) up to and
-    including `END_TAG`, returning just the `source_any` Type (the Rust
+    including `END_TAG`, returning just the `source_any` AnyType (the Rust
     seam emits `AnyType(from_another_any, source_any=...)`, whose own
     `type_of_any`/`missing_import_name` are canonical). Returns None for
     `LITERAL_NONE` so the Python shim skips the `from_another_any`
     construction and falls through to the pure-Python body instead.
     """
-    from mypy.types import ANY_TYPE, LITERAL_NONE, read_tag
+    from mypy.cache import LITERAL_NONE, read_tag
+    from mypy.types import ANY_TYPE
 
     tag = read_tag(data)
     if tag == LITERAL_NONE:

@@ -456,7 +456,7 @@ def read_type_to_str(data: bytes) -> str: ...
 def build_resolver(type_infos: list[TypeInfo]) -> dict[str, object]: ...
 def read_type_to_str_with_resolver(data: bytes, resolver: dict[str, object]) -> str: ...
 def build_native_resolver(
-    type_infos: list[TypeInfo], aliases: list[TypeAlias]
+    type_infos: list[TypeInfo], aliases: list[TypeAlias], modules: Any = None
 ) -> NativeTypeResolver: ...
 def read_type_to_str_with_native_resolver(data: bytes, resolver: NativeTypeResolver) -> str: ...
 def rust_get_type_triggers(typ: Any, use_logical_deps: bool) -> list[str] | None: ...
@@ -668,7 +668,9 @@ def rust_is_literal_type_like(type_bytes: bytes) -> bool | None: ...
 def rust_try_getting_str_literals_from_type(type_bytes: bytes) -> list[str] | None: ...
 def rust_try_getting_int_literals_from_type(type_bytes: bytes) -> list[int] | None: ...
 def rust_try_getting_bool_literals_from_type(type_bytes: bytes) -> list[bool] | None: ...
-def rust_try_getting_instance_fallback(type_bytes: bytes) -> bytes | None: ...
+def rust_try_getting_instance_fallback(
+    t_bytes: bytes, resolver: NativeTypeResolver
+) -> bytes | None: ...
 def rust_true_only(
     type_bytes: bytes, resolver: NativeTypeResolver
 ) -> tuple[int, object] | None: ...
@@ -755,13 +757,17 @@ def rust_has_ambiguous_uninhabited_component(
 def rust_has_erased_component(
     type_bytes: bytes, resolver: NativeTypeResolver
 ) -> bool | None: ...
-def rust_allow_fast_container_literal(type_bytes: bytes) -> bool | None: ...
+def rust_allow_fast_container_literal(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bool | None: ...
 def rust_analyze_cond_branch(
     resolver: NativeTypeResolver,
     branch: bytes | None,
     known_type: bytes | None,
 ) -> bytes | None: ...
-def rust_has_bytes_component(type_bytes: bytes) -> bool | None: ...
+def rust_has_bytes_component(
+    resolver: NativeTypeResolver, type_bytes: bytes
+) -> bool | None: ...
 def rust_has_bool_item(type_bytes: bytes) -> bool | None: ...
 def rust_is_non_empty_tuple(type_bytes: bytes) -> bool | None: ...
 def rust_has_coroutine_decorator(type_bytes: bytes) -> bool | None: ...
@@ -964,7 +970,9 @@ def rust_check_callable_call(
     has_user_plugins: bool,
     plugins: Any,
 ) -> bytes | None: ...
-def rust_real_union(type_bytes: bytes, strict_optional: bool) -> bool | None: ...
+def rust_real_union(
+    resolver: NativeTypeResolver, type_bytes: bytes, strict_optional: bool
+) -> bool | None: ...
 def rust_solve_generic_call(
     resolver: NativeTypeResolver,
     callee_bytes: bytes,
@@ -972,9 +980,12 @@ def rust_solve_generic_call(
     formal_to_actual: list[list[int]],
     strict: bool,
     infer_unions: bool,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_possible_none_type_var_overlap(
-    arg_type_bytes: list[bytes], target_bytes: list[bytes]
+    resolver: NativeTypeResolver,
+    arg_type_bytes: list[bytes],
+    target_bytes: list[bytes],
 ) -> bool | None: ...
 def rust_bind_self_fast(method_bytes: bytes) -> bytes | None: ...
 def rust_classify_member_access(
@@ -1117,8 +1128,10 @@ def rust_find_non_escaped_targets(
 def rust_parse_format_value(
     format_value: str,
 ) -> tuple[int, list[tuple[str, int, str | None, str, str, str, str, str | None, bool, str | None, str | None]]]: ...
-def rust_is_uninhabited(type_bytes: bytes) -> bool | None: ...
-def rust_get_match_arg_names(type_bytes: bytes) -> list[str | None] | None: ...
+def rust_is_uninhabited(t_bytes: bytes, resolver: NativeTypeResolver) -> bool | None: ...
+def rust_get_match_arg_names(
+    t_bytes: bytes, resolver: NativeTypeResolver
+) -> list[str | None] | None: ...
 def rust_get_type_range(type_bytes: bytes) -> bool | None: ...
 def rust_should_self_match(
     type_bytes: bytes,
@@ -1143,6 +1156,7 @@ def rust_expand_starred_pattern_types(
     star_pos: int | None,
     num_types: int,
     original_unpack: bool,
+    resolver: NativeTypeResolver,
 ) -> list[bytes] | None: ...
 def rust_construct_sequence_child(
     outer_bytes: bytes,
@@ -1602,7 +1616,10 @@ def rust_calculate_class_abstract_status(
 def rust_check_protocol_status(info: TypeInfo, errors: Any) -> None: ...
 def rust_calculate_class_vars(info: TypeInfo) -> None: ...
 def rust_add_type_promotion(
-    info: TypeInfo, module_names: SymbolTable, options: Any, builtin_names: SymbolTable
+    info: TypeInfo,
+    module_names: SymbolTable,
+    options: Any,
+    builtin_names: SymbolTable | None,
 ) -> None: ...
 
 # Issue #570: fixup functions (live PyO3 objects)
@@ -1662,11 +1679,27 @@ def rust_check_unpacks_in_list(items: Any) -> tuple[list[int], int | None] | Non
 
 # mypy/checkmember.py — member-access resolution (resolver is first).
 def rust_analyze_member_access(
-    resolver: NativeTypeResolver, typ_bytes: bytes
-) -> bytes | None: ...
+    resolver: NativeTypeResolver,
+    name: str,
+    typ_bytes: bytes,
+    self_type_bytes: bytes,
+    is_lvalue: bool,
+    is_super: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: int,
+    strict_optional: bool,
+) -> tuple[int, bool, bytes] | None: ...
 def rust_analyze_union_member_access(
-    resolver: NativeTypeResolver, union_bytes: bytes, strict_optional: bool
-) -> bytes | None: ...
+    resolver: NativeTypeResolver,
+    union_bytes: bytes,
+    name: str,
+    is_lvalue: bool,
+    is_super: bool,
+    _no_deferral: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: int,
+    strict_optional: bool,
+) -> tuple[int, bool, list[bytes]] | None: ...
 def rust_analyze_none_member_access(
     resolver: NativeTypeResolver, name: str, typ_bytes: bytes, strict_optional: bool
 ) -> bytes | None: ...
@@ -1677,7 +1710,10 @@ def rust_analyze_enum_class_attribute_access(
     resolver: NativeTypeResolver, instance_bytes: bytes, name: str
 ) -> bytes | None: ...
 def rust_analyze_descriptor_access(
-    resolver: NativeTypeResolver, descriptor_bytes: bytes, strict_optional: bool
+    resolver: NativeTypeResolver,
+    descriptor_bytes: bytes,
+    is_lvalue: bool,
+    strict_optional: bool,
 ) -> bytes | None: ...
 def rust_descriptor_has_get_set(
     resolver: NativeTypeResolver, descriptor_bytes: bytes
@@ -1829,6 +1865,12 @@ def rust_callable_max_possible_positional_args(typ_bytes: bytes) -> int | None: 
 def rust_callable_min_args(typ_bytes: bytes) -> int | None: ...
 def rust_can_be_false_default(typ_bytes: bytes) -> bool | None: ...
 def rust_can_be_true_default(typ_bytes: bytes) -> bool | None: ...
+def rust_can_be_false_default_live(
+    typ_bytes: bytes, resolver: NativeTypeResolver
+) -> bool | None: ...
+def rust_can_be_true_default_live(
+    typ_bytes: bytes, resolver: NativeTypeResolver
+) -> bool | None: ...
 def rust_tuple_length(typ_bytes: bytes) -> int | None: ...
 def rust_union_length(typ_bytes: bytes) -> int | None: ...
 def rust_copy_modified(typ_bytes: bytes, field: str, value_bytes: bytes) -> bytes | None: ...
@@ -1868,6 +1910,7 @@ def rust_classify_special_unbound(
     not_in_readonly: bool,
     not_in_literal: bool,
     not_in_unpack: bool,
+    not_in_self: bool,
     allow_unpack: bool,
 ) -> int | None: ...
 def rust_classify_tuple_type_implicit(
@@ -2077,7 +2120,7 @@ def rust_any_causes_overload_ambiguity(
     arg_kinds: Any,
     arg_names: Any,
     strict_optional: bool,
-) -> Any: ...
+) -> bool | None: ...
 def rust_are_related_types(
     left_bytes: bytes,
     right_bytes: bytes,
@@ -2108,11 +2151,12 @@ def rust_builtin_item_type(
     resolver: NativeTypeResolver,
 ) -> Any: ...
 def rust_check_argument_types_plan(
-    arg_type_blobs: Any,
-    arg_kinds: Any,
-    formal_to_actual: Any,
+    resolver: NativeTypeResolver,
+    arg_type_blobs: list[bytes],
+    arg_kinds: list[int],
+    formal_to_actual: list[list[int]],
     callee_bytes: bytes,
-) -> Any: ...
+) -> list[bytes] | None: ...
 def rust_check_arguments(
     resolver: NativeTypeResolver,
     callee_bytes: bytes,
@@ -2141,7 +2185,7 @@ def rust_classify_type_expression(
     index_node_is_var: Any,
     index_var_is_special: Any,
     op_is_pipe: Any,
-) -> Any: ...
+) -> int | None: ...
 def rust_classify_type_with_info(
     fullname: Any,
     args_len: Any,
@@ -2174,7 +2218,7 @@ def rust_clean_up_bases(
     fullname: Any,
     in_protocol_names: Any,
     has_args: bool,
-) -> Any: ...
+) -> int: ...
 def rust_is_magic_base(
     base_expr: Expression,
     namedtuple_names: tuple[str, ...],
@@ -2228,7 +2272,7 @@ def rust_dangerous_comparison(
     abstract_set_ref: Any,
     abstract_map_ref: Any,
     resolver: NativeTypeResolver,
-) -> Any: ...
+) -> bool | None: ...
 def rust_detach_callable(
     typ_bytes: bytes,
     class_type_vars_bytes: bytes,
@@ -2271,7 +2315,7 @@ def rust_instantiate_type_alias(
 ) -> Any: ...
 def rust_is_classmethod_node(
     node: Any,
-) -> Any: ...
+) -> bool | None: ...
 def rust_is_enum_overlapping_union(
     x_bytes: bytes,
     y_bytes: bytes,
@@ -2281,7 +2325,7 @@ def rust_is_equality_ambiguous_for_narrowing(
     left_bytes: bytes,
     right_bytes: bytes,
     resolver: NativeTypeResolver,
-) -> Any: ...
+) -> bool | None: ...
 def rust_is_literal_in_union(
     x_bytes: bytes,
     y_bytes: bytes,
@@ -2291,10 +2335,10 @@ def rust_is_more_general_arg_prefix(
     s_bytes: bytes,
     strict_optional: bool,
     resolver: NativeTypeResolver,
-) -> Any: ...
+) -> bool | None: ...
 def rust_is_node_static(
     node: Any,
-) -> Any: ...
+) -> bool | None: ...
 def rust_is_none_object_overlap(
     t1_bytes: bytes,
     t2_bytes: bytes,
@@ -2325,7 +2369,7 @@ def rust_is_unsafe_overlapping_overload_signatures(
     partial_only: Any,
     strict_optional: bool,
     resolver: NativeTypeResolver,
-) -> Any: ...
+) -> bool | None: ...
 def rust_merge_typevars_in_callables_by_name(
     types_bytes: list[bytes],
     start_raw_id: Any,
@@ -2338,7 +2382,7 @@ def rust_overload_can_never_match(
     other_bytes: bytes,
     strict_optional: bool,
     resolver: NativeTypeResolver,
-) -> Any: ...
+) -> bool | None: ...
 def rust_partial_type_inference() -> Any: ...
 def rust_partition_equality_ambiguous_types(
     current_bytes: bytes,
@@ -2383,7 +2427,7 @@ def rust_supported_self_type(
     resolver: NativeTypeResolver,
     allow_callable: bool,
     allow_instances: bool,
-) -> Any: ...
+) -> bool | None: ...
 def rust_transform_copy(
     node: Any,
 ) -> Any: ...
@@ -2404,3 +2448,86 @@ def rust_yield_nonoverlapping_types(
     nonoverlapping_types: Any,
     unreachable_lines: Any,
 ) -> Any: ...
+
+
+# Entries missing from earlier merges, recovered from the built extension
+# (self-check attr-defined failures, 2026-08-27).
+def rust_analyze_instance_member_dispatch(
+    resolver: NativeTypeResolver,
+    instance_bytes: bytes,
+    name: str,
+    override_info: str | None,
+    self_type_bytes: bytes,
+    _no_deferral: bool,
+    preserve_type_var_ids: bool,
+    start_raw_id: int,
+    strict_optional: bool,
+) -> tuple[int, bool, bytes] | None: ...
+def rust_classify_literal_param(
+    is_proper_type: bool,
+    is_unbound: bool,
+    is_union_pre: bool,
+    original_str_expr_is_not_none: bool,
+    is_any: bool,
+    type_of_any: int,
+    is_raw_expr: bool,
+    literal_value_is_none: bool,
+    simple_name: str,
+    is_none_type: bool,
+    is_literal: bool,
+    is_instance: bool,
+    last_known_value_is_none: bool,
+    is_union_post: bool,
+) -> int: ...
+def rust_classify_metaclass_compat(info: Any) -> int | None: ...
+def rust_covers_at_runtime(
+    item_bytes: bytes, supertype_bytes: bytes, strict_optional: bool, resolver: NativeTypeResolver
+) -> bool | None: ...
+def rust_erase_return_self_types(typ_bytes: bytes, self_type_bytes: bytes) -> bytes | None: ...
+def rust_fill_typevars_with_any(typ: Any) -> bytes | None: ...
+def rust_find_type_overlaps(type_bytes_list: list[bytes]) -> list[str] | None: ...
+def rust_get_member_flags(
+    info: Any,
+    name: str,
+    class_obj: bool,
+    extra_attrs: Any | None,
+    strict_optional: bool,
+    resolver: NativeTypeResolver,
+) -> list[int] | None: ...
+def rust_has_await_in_generator(node_bytes: bytes) -> bool: ...
+def rust_infer_variance_member(
+    member_type_bytes: bytes,
+    self_type_bytes: bytes,
+    object_type_bytes: bytes,
+    raw_id: int,
+    resolver: NativeTypeResolver,
+) -> int | None: ...
+def rust_is_better(t_bytes: bytes, s_bytes: bytes, resolver: NativeTypeResolver) -> bool | None: ...
+def rust_is_descriptor(
+    resolver: NativeTypeResolver, type_bytes: bytes, strict_optional: bool
+) -> bool | None: ...
+def rust_is_disjoint_base(info: Any) -> bool: ...
+def rust_is_recursive_pair(
+    s_bytes: bytes,
+    t_bytes: bytes,
+    s_is_recursive: bool,
+    t_is_recursive: bool,
+    resolver: NativeTypeResolver,
+) -> bool | None: ...
+def rust_is_valid_constructor(n: Any) -> bool: ...
+def rust_is_valid_keyword_var_arg(
+    type_bytes: bytes, dict_str_keys_ok: bool, skag_str_ok: bool, skag_never_ok: bool
+) -> bool | None: ...
+def rust_is_valid_var_arg(type_bytes: bytes, iterable_ok: bool) -> bool | None: ...
+def rust_make_inferred_type_note(
+    subtype_bytes: bytes, supertype_bytes: bytes, arg_results: list[bool], context: Any
+) -> bool: ...
+def rust_map_instance_to_supertypes(
+    resolver: NativeTypeResolver, items_wire: bytes, supertype_ref: str
+) -> tuple[bytes, list[bool]] | None: ...
+def rust_match_generic_callables(
+    num_vars: int, start_raw_id: int, t_bytes: bytes, s_bytes: bytes
+) -> tuple[int, bytes, bytes] | None: ...
+def rust_classify_enum(
+    info: Any, is_stub: bool, tree_fullname: str, enum_bases: list[str]
+) -> tuple[int, list[str]] | None: ...

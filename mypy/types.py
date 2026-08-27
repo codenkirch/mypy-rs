@@ -4627,7 +4627,7 @@ def _serialize_type_for_visitor(t: Type) -> bytes:
             return entry[1]
     fast = _encode_no_arg_instance(t, _VisitorWriteBuffer)
     if fast is not None:
-        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[misc]
+        if _wire_cache_enabled() and t.type_ref is None:  # type: ignore[attr-defined]
             if _serialize_stats_on:
                 _serialize_stats["writes"] += 1
                 _serialize_stats["bytes"] += len(fast)
@@ -4646,7 +4646,7 @@ def _serialize_type_for_visitor(t: Type) -> bytes:
     return result
 
 
-def _encode_no_arg_instance(t: Type, buf_cls) -> bytes | None:
+def _encode_no_arg_instance(t: Type, buf_cls: type[WriteBuffer]) -> bytes | None:
     """Fast-path encode a no-arg Instance, bypassing the taint check.
 
     A no-arg Instance with no last_known_value and no extra_attrs cannot

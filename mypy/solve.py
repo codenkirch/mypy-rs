@@ -574,9 +574,10 @@ def solve_one(lowers: Iterable[Type], uppers: Iterable[Type]) -> Type | None:
                 # None via LITERAL_NONE), so build AnyType only when real.
                 from mypy.wirefixup import decode_source_any
 
-                source_any = decode_source_any(_ReadBuffer(bytes(blob)))
-                if source_any is not None:
-                    return AnyType(TypeOfAny.from_another_any, source_any=source_any)
+                if blob is not None:
+                    source_any = decode_source_any(_ReadBuffer(bytes(blob)))
+                    if source_any is not None:
+                        return AnyType(TypeOfAny.from_another_any, source_any=source_any)
 
     bottom: Type | None = None
     top: Type | None = None

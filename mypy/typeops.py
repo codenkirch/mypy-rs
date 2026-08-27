@@ -181,7 +181,7 @@ def _serialize_type_list(items: Sequence[Type]) -> bytes:
 # bytes -> decoded wire-Type cache for the typeops seam.  Byte-identical
 # blobs repeat heavily (~95% of 128K calls), so memoizing read_type +
 # fixup_wire_type cuts decode cost.
-_typeops_decode_cache: dict[bytes, Type] = {}
+_typeops_decode_cache: dict[bytes, ProperType] = {}
 _typeops_decode_list_cache: dict[bytes, list[Type]] = {}
 
 
@@ -190,11 +190,13 @@ def _clear_typeops_decode_cache() -> None:
     _typeops_decode_list_cache.clear()
 
 
-def _deserialize_type(data: bytes) -> Type | None:
+def _deserialize_type(data: bytes) -> ProperType | None:
     """Deserialize wire bytes to a Type, fixing type_ref strings.
 
     Returns None if any type_ref cannot be resolved to a live TypeInfo
-    (so the caller defers to Python).
+    (so the caller defers to Python). A non-None result is structurally
+    a proper-type tree: this seam only passes fully-resolved Rust-built
+    types, and fixup_wire_type defers on any TypeAliasType.
     """
     cached = _typeops_decode_cache.get(data)
     if cached is not None:
@@ -211,8 +213,10 @@ def _deserialize_type(data: bytes) -> Type | None:
     instance_cache.object_type = None
     instance_cache.function_type = None
     fixed = fixup_wire_type(decoded)
-    if fixed is not None:
-        _typeops_decode_cache[data] = fixed
+    if fixed is None:
+        return None
+    fixed = cast(ProperType, fixed)
+    _typeops_decode_cache[data] = fixed
     return fixed
 
 
@@ -305,7 +309,7 @@ def tuple_fallback(typ: TupleType) -> Instance:
             )
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if decoded is not None and isinstance(decoded, Instance):  # type: ignore[misc]
+                if decoded is not None and isinstance(decoded, Instance):
                     return decoded
         except (AssertionError, NotImplementedError, ValueError):
             pass
@@ -509,16 +513,16 @@ def type_object_type_from_function(
                             special_sig=special_sig_seam,
                             instance_type=default_ret_seam,
                         )
-                    items = []
+                    ov_items = []
                     for item in decoded.items:
                         assert isinstance(item, CallableType)
-                        items.append(
+                        ov_items.append(
                             item.copy_modified(
                                 special_sig=special_sig_seam,
                                 instance_type=default_ret_seam,
                             )
                         )
-                    return Overloaded(items)
+                    return Overloaded(ov_items)
         except (AssertionError, NotImplementedError, ValueError):
             pass
 
@@ -873,7 +877,7 @@ def bind_self(
             result = _type_kernel.rust_bind_self(_serialize_type(func))
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
+                if decoded is not None and isinstance(decoded, CallableType):
                     return cast(
                         F,
                         func.copy_modified(
@@ -1011,8 +1015,8 @@ def simple_literal_type(t: ProperType | None) -> Instance | None:
             result = _type_kernel.rust_simple_literal_type(_serialize_type(t))
             if result is not None:
                 decoded = _deserialize_type(bytes(result))
-                if isinstance(get_proper_type(decoded), Instance):
-                    return decoded  # type: ignore[return-value]
+                if isinstance(decoded, Instance):
+                    return decoded
         except (AssertionError, NotImplementedError):
             pass
     if isinstance(t, Instance) and t.last_known_value is not None:
@@ -1095,7 +1099,7 @@ def make_simplified_union(
                 # crashes semanal's check_type_arguments on .accept().
                 if decoded is None:
                     raise NotImplementedError("unresolvable type_ref in simplified union")
-                return get_proper_type(decoded)
+                return decoded
         except (AssertionError, NotImplementedError):
             pass
     # Step 1: expand all nested unions
@@ -1305,13 +1309,13 @@ def _interpret_truthiness_result(disc: tuple[int, object], t: ProperType) -> Pro
         return new_t
     elif tag == 6:
         fallback = _deserialize_type(bytes(disc[1]))  # type: ignore[call-overload]
-        if isinstance(get_proper_type(fallback), Instance):
-            return LiteralType("", fallback=fallback)  # type: ignore[arg-type]
+        if isinstance(fallback, Instance):
+            return LiteralType("", fallback=fallback)
         return None
     elif tag == 7:
         fallback = _deserialize_type(bytes(disc[1]))  # type: ignore[call-overload]
-        if isinstance(get_proper_type(fallback), Instance):
-            return LiteralType(0, fallback=fallback)  # type: ignore[arg-type]
+        if isinstance(fallback, Instance):
+            return LiteralType(0, fallback=fallback)
         return None
     elif tag == 8:
         item_discs: list[tuple[int, object]] = disc[1]  # type: ignore[assignment]
@@ -1483,7 +1487,7 @@ def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
                     assert isinstance(func.type, FunctionLike)
                     return func.type
                 decoded = _deserialize_type(bytes(wire_bytes))
-                if decoded is not None and isinstance(decoded, CallableType):  # type: ignore[misc]
+                if decoded is not None and isinstance(decoded, CallableType):
                     # callable_type arm: Python passes fdef.line/column and
                     # definition=fdef for FuncDef (error-message naming).
                     definition: SymbolNode | None = (
@@ -1496,7 +1500,7 @@ def function_type(func: FuncBase, fallback: Instance) -> FunctionLike:
                         implicit=True,
                         definition=definition,
                     )
-                elif isinstance(decoded, Overloaded):  # type: ignore[misc]
+                elif isinstance(decoded, Overloaded):
                     # Broken overload: rebuild the inner dummy with the
                     # overload's line; Python builds it with no name, so do
                     # not copy func.name here.
@@ -2048,9 +2052,9 @@ def _rust_separate_union_literals(
         literal_items: list[LiteralType] = []
         for blob in literal_blobs:
             decoded = _deserialize_type(bytes(blob))
-            if not isinstance(get_proper_type(decoded), LiteralType):
+            if not isinstance(decoded, LiteralType):
                 return None
-            literal_items.append(decoded)  # type: ignore[arg-type]
+            literal_items.append(decoded)
         union_items: list[Type] = []
         for blob in union_blobs:
             if (decoded := _deserialize_type(bytes(blob))) is None:
@@ -2093,8 +2097,8 @@ def try_getting_instance_fallback(typ: Type) -> Instance | None:
                 # deferred (missing alias snapshot, unresolved type_ref, or
                 # no fallback): fall back to the Python walk below.
                 decoded = _deserialize_type(bytes(result))
-                if isinstance(get_proper_type(decoded), Instance):
-                    return decoded  # type: ignore[return-value]
+                if isinstance(decoded, Instance):
+                    return decoded
         except (AssertionError, NotImplementedError, ValueError):
             pass
     typ = get_proper_type(typ)

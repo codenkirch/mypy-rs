@@ -1198,18 +1198,24 @@ def has_await_in_generator(gen: GeneratorExpr) -> bool:
     for parity tests. The first sequence and the indices are NOT
     checked, matching checkexpr.py:7417-7422.
     """
+    # Read `found` through a fresh local each time: mypy narrows the
+    # `seeker.found` member after the first check and accept() does not
+    # invalidate that narrowing, so the direct reads look unreachable.
     seeker = AwaitSeeker()
     gen.left_expr.accept(seeker)
-    if seeker.found:
+    found = seeker.found
+    if found:
         return True
     for sequence in gen.sequences[1:]:
         sequence.accept(seeker)
-        if seeker.found:
+        found = seeker.found
+        if found:
             return True
     for condlist in gen.condlists:
         for cond in condlist:
             cond.accept(seeker)
-            if seeker.found:
+            found = seeker.found
+            if found:
                 return True
     return False
 

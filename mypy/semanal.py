@@ -7133,7 +7133,7 @@ class SemanticAnalyzer(
             try:
                 tag = _rust_classify_fixed_args(
                     len(expr.args),
-                    [int(k) for k in expr.arg_kinds],
+                    [k.value for k in expr.arg_kinds],
                     numargs,
                 )
             except (AssertionError, NotImplementedError, ValueError, TypeError):
@@ -9521,8 +9521,12 @@ class SemanticAnalyzer(
                 index_base_kind = 0
                 leftmost_is_name = True
                 node = base.node
-                node_is_var = isinstance(node, Var)
-                var_special = node_is_var and self.var_is_typing_special_form(node)
+                if isinstance(node, Var):
+                    node_is_var = True
+                    var_special = self.var_is_typing_special_form(node)
+                else:
+                    node_is_var = False
+                    var_special = False
             elif isinstance(base, MemberExpr):
                 index_base_kind = 1
                 next_leftmost = base
@@ -9532,10 +9536,14 @@ class SemanticAnalyzer(
                         break
                     next_leftmost = leftmost
                 leftmost_is_name = isinstance(leftmost, NameExpr)
-                if leftmost_is_name:
+                if isinstance(leftmost, NameExpr):
                     node = leftmost.node
-                    node_is_var = isinstance(node, Var)
-                    var_special = node_is_var and self.var_is_typing_special_form(node)
+                    if isinstance(node, Var):
+                        node_is_var = True
+                        var_special = self.var_is_typing_special_form(node)
+                    else:
+                        node_is_var = False
+                        var_special = False
                 else:
                     node_is_var = False
                     var_special = False

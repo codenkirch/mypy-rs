@@ -641,7 +641,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
 
             # for non-placeholder, non-None nodes. Match that so a node-None
             # symbol (fullname is None) cannot trip the get_binding assert.
-            if node is not None and not isinstance(node, PlaceholderNode):
+            if sym is not None and node is not None and not isinstance(node, PlaceholderNode):
                 tvar_def = self.tvar_scope.get_binding(sym)
                 # Mirrors the pre-check at typeanal.py:361-369. Re-applied by
                 # the shim below only when Rust decides a front branch, since
@@ -1316,7 +1316,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         if tag == _UNBOUND_SPECIAL_TAG_TYPE_BARE_NONE:
             # To prevent assignment of 'builtins.type' inferred as
             # 'builtins.object'. See https://github.com/python/mypy/issues/9476
-            return None  # type: ignore[return-value]
+            return None
         if tag in (_UNBOUND_SPECIAL_TAG_TYPE_ONE_ARG, _UNBOUND_SPECIAL_TAG_TYPE_ARG_ERR):
             type_str = "Type[...]" if fullname == "typing.Type" else "type[...]"
             if len(t.args) != 1:
@@ -1467,7 +1467,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         """Similar logic to `TypeChecker.check_deprecated` and `TypeChecker.warn_deprecated."""
 
         tag = self._native_deprecated_warn_tag(info)
-        if tag is not None:
+        if tag is not None and info.deprecated is not None:
             if tag == _DEPRECATED_TAG_NOTE:
                 self.note(info.deprecated, ctx, code=codes.DEPRECATED)
             elif tag == _DEPRECATED_TAG_FAIL:
@@ -1709,10 +1709,10 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                     and node.name in node.info.enum_members,
                     defining_literal,
                 )
-                if result == 1 and var_typ is not None:
+                if result == 1 and isinstance(var_typ, AnyType):
                     return AnyType(
                         TypeOfAny.from_unimported_type,
-                        missing_import_name=var_typ.missing_import_name,  # type: ignore[union-attr]
+                        missing_import_name=var_typ.missing_import_name,
                     )
                 if result == 2:
                     return AnyType(TypeOfAny.special_form)
@@ -2504,6 +2504,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             ret = callable_with_ellipsis(any_type, any_type, fallback)
         elif tag == _CALLABLE_TAG_TYPE_LIST:
             # Callable[[ARG, ...], RET] (ordinary callable type).
+            assert isinstance(t.args[0], TypeList)
             analyzed_args = self.analyze_callable_args(t.args[0])
             if analyzed_args is None:
                 return AnyType(TypeOfAny.from_error)
@@ -2668,23 +2669,30 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # Phase 1: branch (a) — string-Literal from original_str_expr,
         # checked on the original arg before visit_unbound_type recursion.
         is_proper = isinstance(arg, ProperType)
-        is_unbound_pre = isinstance(arg, UnboundType)
-        is_union_pre = isinstance(arg, UnionType)
-        if is_proper and (is_unbound_pre or is_union_pre):
-            orig_str_not_none = arg.original_str_expr is not None
-        else:
-            orig_str_not_none = False
+        is_unbound_pre = False
+        is_union_pre = False
+        orig_str: str | None = None
+        orig_fb: str | None = None
+        orig_str_not_none = False
+        if isinstance(arg, ProperType):
+            is_unbound_pre = isinstance(arg, UnboundType)
+            is_union_pre = isinstance(arg, UnionType)
+            if isinstance(arg, (UnboundType, UnionType)):
+                orig_str_not_none = arg.original_str_expr is not None
+                if orig_str_not_none:
+                    orig_str = arg.original_str_expr
+                    orig_fb = arg.original_str_fallback
         if orig_str_not_none:
             tag = _rust_classify_literal_param(
                 is_proper, is_unbound_pre, is_union_pre, True,
                 False, 0, False, True, "", False, False, False, True, False,
             )
             if tag == _LITERAL_PARAM_TAG_STR:
-                assert arg.original_str_fallback is not None
+                assert orig_str is not None and orig_fb is not None
                 return [
                     LiteralType(
-                        value=arg.original_str_expr,
-                        fallback=self.named_type(arg.original_str_fallback),
+                        value=orig_str,
+                        fallback=self.named_type(orig_fb),
                         line=arg.line,
                         column=arg.column,
                     )
@@ -2698,21 +2706,23 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 self.nesting_level -= 1
         arg = get_proper_type(arg)
         # Extract post-chain facts and classify branches (c)-(i).
+        type_of_any = arg.type_of_any if isinstance(arg, AnyType) else 0
         is_any = isinstance(arg, AnyType)
-        type_of_any = arg.type_of_any if is_any else 0
-        is_raw_expr = isinstance(arg, RawExpressionType)
-        if is_raw_expr:
+        if isinstance(arg, RawExpressionType):
+            is_raw_expr = True
             literal_value_is_none = arg.literal_value is None
             simple_name = arg.simple_name() if literal_value_is_none else ""
         else:
+            is_raw_expr = False
             literal_value_is_none = True
             simple_name = ""
         is_none_type = isinstance(arg, NoneType)
         is_literal = isinstance(arg, LiteralType)
         is_instance = isinstance(arg, Instance)
-        last_known_value_is_none = (
-            not is_instance or arg.last_known_value is None
-        )
+        if isinstance(arg, Instance):
+            last_known_value_is_none = arg.last_known_value is None
+        else:
+            last_known_value_is_none = True
         is_union_post = isinstance(arg, UnionType)
         tag = _rust_classify_literal_param(
             False, False, False, False,
@@ -2723,7 +2733,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         return self._apply_literal_param_tag(tag, idx, arg, ctx)
 
     def _apply_literal_param_tag(
-        self, tag: int, idx: int, arg: Type, ctx: Context
+        self, tag: int, idx: int, arg: ProperType, ctx: Context
     ) -> list[Type] | None:
         if tag == _LITERAL_PARAM_TAG_ANY_FAIL:
             self.fail(
@@ -2734,6 +2744,7 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         if tag == _LITERAL_PARAM_TAG_ANY_SILENT:
             return None
         if tag == _LITERAL_PARAM_TAG_RAW_FLOAT_COMPLEX:
+            assert isinstance(arg, RawExpressionType)
             name = arg.simple_name()
             self.fail(
                 f'Parameter {idx} of Literal[...] cannot be of type "{name}"',
@@ -2747,19 +2758,24 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
             )
             return None
         if tag == _LITERAL_PARAM_TAG_RAW_VALUE:
+            assert isinstance(arg, RawExpressionType)
             fallback = self.named_type(arg.base_type_name)
             assert isinstance(fallback, Instance)
+            literal_value = arg.literal_value
+            assert literal_value is not None
             return [
                 LiteralType(
-                    arg.literal_value, fallback,
+                    literal_value, fallback,
                     line=arg.line, column=arg.column,
                 )
             ]
         if tag == _LITERAL_PARAM_TAG_NONE_OR_LITERAL:
             return [arg]
         if tag == _LITERAL_PARAM_TAG_INSTANCE_LKV:
+            assert isinstance(arg, Instance) and arg.last_known_value is not None
             return [arg.last_known_value]
         if tag == _LITERAL_PARAM_TAG_UNION_RECURSE:
+            assert isinstance(arg, UnionType)
             out = []
             for union_arg in arg.items:
                 union_result = self.analyze_literal_param(idx, union_arg, ctx)
@@ -3297,6 +3313,7 @@ def instantiate_type_alias(
                 )
             if result == 1:
                 # non-generic alias with args targeting a bare generic.
+                assert isinstance(node.target, Instance)  # type: ignore[misc]
                 tp = Instance(node.target.type, args)
                 tp.line = ctx.line
                 tp.column = ctx.column
@@ -3308,7 +3325,8 @@ def instantiate_type_alias(
                 # including the FlexibleAlias[T, typ] -> typ unwrap.
                 typ = TypeAliasType(node, args, ctx.line, ctx.column)
                 if (
-                    isinstance(typ.alias.target, Instance)  # type: ignore[misc]
+                    typ.alias is not None
+                    and isinstance(typ.alias.target, Instance)  # type: ignore[misc]
                     and typ.alias.target.type.fullname == "mypy_extensions.FlexibleAlias"
                 ):
                     exp = get_proper_type(typ)
