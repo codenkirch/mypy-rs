@@ -24600,6 +24600,182 @@ class NativeAreArgsCompatibleSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckLvalueSuite(Suite):
+    """Parity for the Rust `check_lvalue` dispatch port.
+
+    `TypeChecker.check_lvalue` (checker.py:5568) computes `skip_definition`
+    then dispatches on the lvalue node kind. The Rust classifier
+    (`checker_functions.rs`) turns the node-kind tags and the `Var` node facts
+    into a branch tag; the Python shim runs each branch body and keeps the
+    pure-Python body as the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off vs
+    gate-on differential drives the real TypeChecker method through stub
+    expression-checker / store-type helpers and asserts identical
+    `(lvalue_type, index_lvalue, inferred)` results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _is_def(self, s: Lvalue) -> bool:
+        from mypy.checker import TypeChecker
+
+        return TypeChecker.is_definition(TypeChecker.__new__(TypeChecker), s)
+
+    def _tag(
+        self, lvalue: Lvalue, *, allow_redefinition: bool = False
+    ) -> int | None:
+        return _type_kernel.rust_classify_check_lvalue(
+            lvalue, allow_redefinition, self._is_def(lvalue)
+        )
+
+    def _name_def(self, name: str = "x") -> NameExpr:
+        ne = NameExpr(name)
+        ne.node = Var(name)
+        ne.is_inferred_def = True
+        return ne
+
+    def _name_expr(self, name: str = "x") -> NameExpr:
+        ne = NameExpr(name)
+        ne.node = Var(name, self.fx.a)
+        return ne
+
+    def _member_def(self, name: str = "attr") -> MemberExpr:
+        me = MemberExpr(NameExpr("base"), name)
+        me.is_inferred_def = True
+        me.def_var = Var(name)
+        return me
+
+    def _run(
+        self, lvalue: Lvalue, *, allow_redefinition: bool = False
+    ) -> tuple[tuple[object, object, object], tuple[object, object, object]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[object, object, object]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = SimpleNamespace(allow_redefinition=allow_redefinition)
+            chk._expr_checker = SimpleNamespace(
+                accept=lambda expr: ("accept", expr),
+                analyze_ordinary_member_access=lambda lv, is_lvalue, rvalue: (
+                    "member_access",
+                    lv,
+                    rvalue,
+                ),
+                analyze_ref_expr=lambda lv, lvalue: ("ref_expr", lv),
+            )
+            chk.store_type = lambda lv, t: None  # type: ignore[assignment]
+            chk.named_type = lambda name: self.fx.std_tuple  # type: ignore[assignment]
+            return chk.check_lvalue(lvalue)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(
+        self, lvalue: Lvalue, *, allow_redefinition: bool = False
+    ) -> None:
+        off, on = self._run(lvalue, allow_redefinition=allow_redefinition)
+        assert_equal(
+            on,
+            off,
+            f"check_lvalue parity for allow_redefinition={allow_redefinition} "
+            f"lvalue={lvalue!r}",
+        )
+
+    def test_seam_name_def(self) -> None:
+        assert self._tag(self._name_def()) == 0
+
+    def test_seam_member_def(self) -> None:
+        assert self._tag(self._member_def()) == 1
+
+    def test_seam_index(self) -> None:
+        assert self._tag(IndexExpr(NameExpr("a"), NameExpr("b"))) == 2
+
+    def test_seam_member(self) -> None:
+        assert self._tag(MemberExpr(NameExpr("base"), "attr")) == 3
+
+    def test_seam_name(self) -> None:
+        assert self._tag(self._name_expr()) == 4
+
+    def test_seam_tuple_list(self) -> None:
+        assert self._tag(TupleExpr([IntExpr(1)])) == 5
+        assert self._tag(ListExpr([IntExpr(1)])) == 5
+
+    def test_seam_star(self) -> None:
+        assert self._tag(StarExpr(IntExpr(1))) == 6
+
+    def test_seam_else(self) -> None:
+        assert self._tag(IntExpr(1)) == 7
+
+    def test_seam_skip_definition(self) -> None:
+        # skip_definition forces the definition path to fall through to the
+        # plain NameExpr branch.
+        ne = self._name_def()
+        assert isinstance(ne.node, Var)
+        ne.node.type = self.fx.a
+        ne.node.is_inferred = True
+        assert self._tag(ne, allow_redefinition=True) == 4
+
+    def test_parity_name_def(self) -> None:
+        self._assert_par(self._name_def())
+
+    def test_parity_member_def(self) -> None:
+        self._assert_par(self._member_def())
+
+    def test_parity_index(self) -> None:
+        self._assert_par(IndexExpr(NameExpr("a"), NameExpr("b")))
+
+    def test_parity_member(self) -> None:
+        self._assert_par(MemberExpr(NameExpr("base"), "attr"))
+
+    def test_parity_name(self) -> None:
+        self._assert_par(self._name_expr())
+
+    def test_parity_name_argument_redefinition(self) -> None:
+        ne = self._name_expr()
+        assert isinstance(ne.node, Var)
+        ne.node.is_argument = True
+        self._assert_par(ne, allow_redefinition=True)
+
+    def test_parity_skip_definition(self) -> None:
+        ne = self._name_def()
+        assert isinstance(ne.node, Var)
+        ne.node.type = self.fx.a
+        ne.node.is_inferred = True
+        self._assert_par(ne, allow_redefinition=True)
+
+    def test_parity_tuple(self) -> None:
+        self._assert_par(TupleExpr([IntExpr(1)]))
+
+    def test_parity_list(self) -> None:
+        self._assert_par(ListExpr([IntExpr(1)]))
+
+    def test_parity_star(self) -> None:
+        self._assert_par(StarExpr(IntExpr(1)))
+
+    def test_parity_else(self) -> None:
+        self._assert_par(IntExpr(1))
+
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeUntypedDecoratorSuite(Suite):
     """Parity for the Rust `check_for_untyped_decorator` conjunction port.
 

@@ -336,6 +336,7 @@ try:
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_classvar_super as _rust_classify_classvar_super,
+        rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_func_def_override as _rust_classify_func_def_override,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
@@ -409,6 +410,7 @@ except ImportError:
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_classvar_super = None  # type: ignore[assignment]
+    _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
@@ -503,6 +505,17 @@ NATIVE_METACLASS_COMPAT_CONFLICT = 1
 NATIVE_ENUM_NEW_SKIP = 0
 NATIVE_ENUM_NEW_ADVANCE = 1
 NATIVE_ENUM_NEW_CONFLICT = 2
+
+# Decision tags returned by `_rust_classify_check_lvalue`; must match
+# `KIND_LVALUE_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_LVALUE_NAME_DEF = 0
+NATIVE_LVALUE_MEMBER_DEF = 1
+NATIVE_LVALUE_INDEX = 2
+NATIVE_LVALUE_MEMBER = 3
+NATIVE_LVALUE_NAME = 4
+NATIVE_LVALUE_TUPLE_LIST = 5
+NATIVE_LVALUE_STAR = 6
+NATIVE_LVALUE_ELSE = 7
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -5594,6 +5607,65 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         lvalue_type = None
         index_lvalue = None
         inferred = None
+
+        # Native type_kernel seam: classify the lvalue node kind into a
+        # branch tag in Rust (checker_functions.rs); branch bodies stay
+        # here. None falls through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_check_lvalue is not None
+        ):
+            try:
+                tag = _rust_classify_check_lvalue(
+                    lvalue,
+                    self.options.allow_redefinition,
+                    self.is_definition(lvalue),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_LVALUE_NAME_DEF:
+                    assert isinstance(lvalue.node, Var)
+                    inferred = lvalue.node
+                elif tag == NATIVE_LVALUE_MEMBER_DEF:
+                    assert isinstance(lvalue, MemberExpr)
+                    self.expr_checker.accept(lvalue.expr)
+                    inferred = lvalue.def_var
+                elif tag == NATIVE_LVALUE_INDEX:
+                    index_lvalue = lvalue
+                elif tag == NATIVE_LVALUE_MEMBER:
+                    lvalue_type = self.expr_checker.analyze_ordinary_member_access(
+                        lvalue, True, rvalue
+                    )
+                    self.store_type(lvalue, lvalue_type)
+                elif tag == NATIVE_LVALUE_NAME:
+                    lvalue_type = self.expr_checker.analyze_ref_expr(lvalue, lvalue=True)
+                    if (
+                        self.options.allow_redefinition
+                        and isinstance(lvalue.node, Var)
+                        # We allow redefinition for function arguments inside function body.
+                        # Although we normally do this for variables without annotation, users
+                        # don't have a choice to leave a function argument without annotation.
+                        and (lvalue.node.is_inferred or lvalue.node.is_argument)
+                    ):
+                        inferred = lvalue.node
+                    self.store_type(lvalue, lvalue_type)
+                elif tag == NATIVE_LVALUE_TUPLE_LIST:
+                    types = [
+                        self.check_lvalue(sub_expr)[0]
+                        or
+                        # This type will be used as a context for further inference of rvalue,
+                        # we put Uninhabited if there is no information available from lvalue.
+                        UninhabitedType(ambiguous=True)
+                        for sub_expr in lvalue.items
+                    ]
+                    lvalue_type = TupleType(types, self.named_type("builtins.tuple"))
+                elif tag == NATIVE_LVALUE_STAR:
+                    lvalue_type, _, _ = self.check_lvalue(lvalue.expr)
+                else:
+                    lvalue_type = self.expr_checker.accept(lvalue)
+                return lvalue_type, index_lvalue, inferred
 
         # When revisiting the initial assignment (for example in a loop),
         # treat is as regular if redefinitions are allowed.

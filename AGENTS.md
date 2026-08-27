@@ -523,6 +523,23 @@ including:
   in `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
   captured message records plus direct seam calls proving engagement),
   and pure decision unit tests in `checker_functions.rs`.
+- `rust_classify_check_lvalue` (issue #955) — mirrors the dispatch head of
+  `TypeChecker.check_lvalue` (checker.py:5568-5632): computes
+  `skip_definition` (the `allow_redefinition` + `NameExpr`-node-`Var` +
+  `is_inferred` + `type is not None` + not `PartialType` + not
+  `is_index_var` conjunction) then a 6-way dispatch on lvalue node kind
+  (NameExpr-definition, MemberExpr-definition, IndexExpr, MemberExpr,
+  NameExpr, TupleExpr/ListExpr, StarExpr, else). Rust reads the live
+  lvalue node-kind tags (isinstance via PyO3) and the `Var` node facts
+  needed for `skip_definition` and returns a branch tag; the Python shim
+  runs each branch body (`accept` / `analyze_ordinary_member_access` /
+  `analyze_ref_expr` / `store_type` / recursion) and returns
+  `(lvalue_type, index_lvalue, inferred)`. Defers (`None`) only on an
+  unreadable node fact. Gated by `_native_checker_active` (wired from
+  `mypy/build.py`) and covered by `NativeCheckLvalueSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential across all 8
+  branches plus direct seam calls), plus pure decision unit tests in
+  `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub
