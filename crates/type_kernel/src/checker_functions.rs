@@ -20,7 +20,7 @@
 //! classified, including the implicit trailing `return True`.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyType};
+use pyo3::types::{PyAny, PyList, PyType};
 use std::collections::HashSet;
 
 /// Decision tags; values must match `NATIVE_FINAL_SUPER_*` in
@@ -231,6 +231,109 @@ pub(crate) fn rust_classify_func_def_override(
     )
 }
 
+// ---------------------------------------------------------------------------
+// check_enum_new base-fold decision port (issue #923)
+// ---------------------------------------------------------------------------
+
+/// Per-base decision tags for `check_enum_new`; values must match
+/// `NATIVE_ENUM_NEW_*` in mypy/checker.py.
+const KIND_ENUM_NEW_SKIP: i64 = 0;
+const KIND_ENUM_NEW_ADVANCE: i64 = 1;
+const KIND_ENUM_NEW_CONFLICT: i64 = 2;
+
+/// Resolved facts for a single base in the `check_enum_new` fold
+/// (checker.py:3748-3765).
+struct BaseFacts {
+    is_enum: bool,
+    /// `has_new_method(base.type)`; only read when `is_enum` is false.
+    base_has_new: bool,
+    /// `(b.is_enum, has_new_method(b))` for each `b` in
+    /// `base.type.mro[1:-1]`; only read when `is_enum` is true.
+    mro_middle: Vec<(bool, bool)>,
+}
+
+/// Pure fold mirroring `check_enum_new` (checker.py:3748-3765) over the
+/// resolved per-base facts. Returns one tag per base.
+fn classify_enum_new(bases: &[BaseFacts]) -> Vec<i64> {
+    let mut tags = Vec::with_capacity(bases.len());
+    let mut has_new = false;
+    for f in bases {
+        let candidate = if f.is_enum {
+            f.mro_middle
+                .iter()
+                .any(|&(b_is_enum, b_has_new)| !b_is_enum && b_has_new)
+        } else {
+            f.base_has_new
+        };
+        if candidate && has_new {
+            tags.push(KIND_ENUM_NEW_CONFLICT);
+        } else if candidate {
+            has_new = true;
+            tags.push(KIND_ENUM_NEW_ADVANCE);
+        } else {
+            tags.push(KIND_ENUM_NEW_SKIP);
+        }
+    }
+    tags
+}
+
+/// `has_new_method` (checker.py:3740-3746) on a live `TypeInfo`: the
+/// `__new__` lookup returns a symbol whose node fullname is not
+/// `builtins.object.__new__`.
+fn has_new_method_live(info: &PyAny) -> PyResult<bool> {
+    let new_method = info.call_method1("get", ("__new__",))?;
+    if new_method.is_none() {
+        return Ok(false);
+    }
+    let node = new_method.getattr("node")?;
+    if node.is_none() {
+        return Ok(false);
+    }
+    let fullname: String = node.getattr("fullname")?.extract()?;
+    Ok(fullname != "builtins.object.__new__")
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_enum_new`
+/// (mypy/checker.py:3739-3766). Reads the live `defn.info.bases` (a
+/// list of `Instance`) via PyO3, resolves each base's facts, and runs
+/// the fold natively. Returns one tag per base; the Python shim applies
+/// the `self.fail` side effect and keeps its own `has_new` bookkeeping.
+/// Returns `None` when `bases` is not a list (deferral).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_enum_new(bases: &PyAny) -> PyResult<Option<Vec<i64>>> {
+    let list = match bases.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let mut facts = Vec::with_capacity(list.len());
+    for base in list.iter() {
+        let base_type = base.getattr("type")?;
+        let is_enum: bool = base_type.getattr("is_enum")?.extract()?;
+        let base_has_new = if is_enum {
+            false
+        } else {
+            has_new_method_live(base_type)?
+        };
+        let mut mro_middle = Vec::new();
+        if is_enum {
+            let mro = base_type.getattr("mro")?.downcast::<PyList>()?;
+            let n = mro.len().saturating_sub(2);
+            for b in mro.iter().skip(1).take(n) {
+                let b_is_enum: bool = b.getattr("is_enum")?.extract()?;
+                let b_has_new = has_new_method_live(b)?;
+                mro_middle.push((b_is_enum, b_has_new));
+            }
+        }
+        facts.push(BaseFacts {
+            is_enum,
+            base_has_new,
+            mro_middle,
+        });
+    }
+    Ok(Some(classify_enum_new(&facts)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -420,6 +523,88 @@ mod tests {
         assert_eq!(
             classify_func_def_override(false, false, false, false, true),
             KIND_NO_OP
+        );
+    }
+    // --- check_enum_new fold tests (issue #923) ---
+
+    #[test]
+    fn test_classify_enum_new_non_enum_advance() {
+        // Non-enum base with __new__: advance (set has_new).
+        let facts = [BaseFacts {
+            is_enum: false,
+            base_has_new: true,
+            mro_middle: vec![],
+        }];
+        assert_eq!(classify_enum_new(&facts), vec![KIND_ENUM_NEW_ADVANCE]);
+    }
+
+    #[test]
+    fn test_classify_enum_new_non_enum_skip() {
+        // Non-enum base without __new__: skip.
+        let facts = [BaseFacts {
+            is_enum: false,
+            base_has_new: false,
+            mro_middle: vec![],
+        }];
+        assert_eq!(classify_enum_new(&facts), vec![KIND_ENUM_NEW_SKIP]);
+    }
+
+    #[test]
+    fn test_classify_enum_new_enum_mro_fold() {
+        // Enum base whose mro[1:-1] has a non-enum mixin with __new__.
+        let facts = [BaseFacts {
+            is_enum: true,
+            base_has_new: false,
+            mro_middle: vec![(true, false), (false, true)],
+        }];
+        assert_eq!(classify_enum_new(&facts), vec![KIND_ENUM_NEW_ADVANCE]);
+    }
+
+    #[test]
+    fn test_classify_enum_new_enum_mro_all_enum_skip() {
+        // Enum base whose mro[1:-1] items are all enums or lack __new__.
+        let facts = [BaseFacts {
+            is_enum: true,
+            base_has_new: false,
+            mro_middle: vec![(true, true), (false, false)],
+        }];
+        assert_eq!(classify_enum_new(&facts), vec![KIND_ENUM_NEW_SKIP]);
+    }
+
+    #[test]
+    fn test_classify_enum_new_conflict_vs_advance() {
+        // Two mixin candidates: second is a conflict, third is skip,
+        // fourth is a conflict (has_new still set from first).
+        let facts = [
+            BaseFacts {
+                is_enum: false,
+                base_has_new: true,
+                mro_middle: vec![],
+            },
+            BaseFacts {
+                is_enum: false,
+                base_has_new: true,
+                mro_middle: vec![],
+            },
+            BaseFacts {
+                is_enum: false,
+                base_has_new: false,
+                mro_middle: vec![],
+            },
+            BaseFacts {
+                is_enum: false,
+                base_has_new: true,
+                mro_middle: vec![],
+            },
+        ];
+        assert_eq!(
+            classify_enum_new(&facts),
+            vec![
+                KIND_ENUM_NEW_ADVANCE,
+                KIND_ENUM_NEW_CONFLICT,
+                KIND_ENUM_NEW_SKIP,
+                KIND_ENUM_NEW_CONFLICT,
+            ]
         );
     }
 }

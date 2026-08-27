@@ -2827,6 +2827,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #923: check_enum_new per-base fold. Rust classifies each
+    // base into SKIP/ADVANCE/CONFLICT; self.fail and has_new stay Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_enum_new,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

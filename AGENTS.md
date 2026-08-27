@@ -426,6 +426,15 @@ including:
   `NativeMetaclassCompatibilitySuite` in `mypy/test/testtypes.py` (direct
   seam tag tests + gate-off vs gate-on differential on fail/note pairs),
   plus pure decision unit tests in `checker_functions.rs`.
+- `rust_classify_enum_new` (issue #923): the Rust fold in
+  `checker_functions.rs` mirrors `TypeChecker.check_enum_new`
+  (checker.py:3739-3766): an enum base scans `mro[1:-1]` for a non-enum
+  mixin exposing `__new__`; a non-enum base tests `__new__` directly; a
+  second mixin returns the CONFLICT tag. Rust reads the live
+  `defn.info.bases` and returns one SKIP/ADVANCE/CONFLICT tag per base;
+  the Python shim applies `self.fail` and tracks `has_new`, keeping the
+  pure-Python body as the fallback. Gated by `_native_checker_active` and
+  covered by `NativeEnumNewSuite` in `mypy/test/testtypes.py`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

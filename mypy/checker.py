@@ -330,6 +330,7 @@ try:
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
+        rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
@@ -404,6 +405,7 @@ except ImportError:
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
+    _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -461,6 +463,7 @@ NATIVE_FINAL_SUPER_CANT_OVERRIDE_FINAL = 2
 NATIVE_FINAL_SUPER_PASS_ENUM = 3
 NATIVE_FINAL_SUPER_CHECK_WRITABLE = 4
 NATIVE_FINAL_SUPER_PASS_TAIL = 5
+
 # Decision tags returned by `_rust_classify_new_signature`; must match
 # `NEW_SIGNATURE_*` in crates/type_kernel/src/checker_functions.rs.
 NATIVE_NEW_SIGNATURE_METACLASS = 0
@@ -477,6 +480,13 @@ NATIVE_FUNC_DEF_OVERRIDE_BINDER_ASSIGN = 4
 NATIVE_FUNC_DEF_OVERRIDE_NO_OP = 5
 NATIVE_METACLASS_COMPAT_PASS = 0
 NATIVE_METACLASS_COMPAT_CONFLICT = 1
+
+# Decision tags returned by `_rust_classify_enum_new`; must match
+# `KIND_ENUM_NEW_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_ENUM_NEW_SKIP = 0
+NATIVE_ENUM_NEW_ADVANCE = 1
+NATIVE_ENUM_NEW_CONFLICT = 2
+
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -3873,6 +3883,32 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 and new_method.node
                 and new_method.node.fullname != "builtins.object.__new__"
             )
+
+        # Native type_kernel seam: classify each base's fold decision in
+        # Rust (checker_functions.rs); self.fail and has_new bookkeeping
+        # stay here. None or a tag-count mismatch falls through.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_enum_new is not None
+        ):
+            bases = defn.info.bases
+            try:
+                tags = _rust_classify_enum_new(bases)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tags = None
+            if tags is not None and len(tags) == len(bases):
+                has_new = False
+                for base, tag in zip(bases, tags):
+                    if tag == NATIVE_ENUM_NEW_CONFLICT:
+                        self.fail(
+                            "Only a single data type mixin is allowed for Enum subtypes, "
+                            'found extra "{}"'.format(base.str_with_options(self.options)),
+                            defn,
+                        )
+                    elif tag == NATIVE_ENUM_NEW_ADVANCE:
+                        has_new = True
+                return
 
         has_new = False
         for base in defn.info.bases:

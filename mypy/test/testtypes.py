@@ -24754,6 +24754,122 @@ class NativeFuncDefOverrideSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeEnumNewSuite(Suite):
+    """Parity for the Rust `check_enum_new` base-fold decision port.
+
+    `TypeChecker.check_enum_new` (checker.py:3739-3766) folds over
+    `defn.info.bases`. An enum base scans `mro[1:-1]` for a non-enum
+    mixin exposing `__new__`; a non-enum base checks `__new__` directly;
+    a second mixin raises the single-data-type-mixin error. The Rust
+    classifier (`checker_functions.rs`) returns one SKIP/ADVANCE/CONFLICT
+    tag per base and the shim applies `self.fail` while tracking
+    `has_new`. Direct seam calls assert exact tags; the gate-off vs
+    gate-on differential compares recorded message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _node(self, fullname: str) -> SymbolTableNode:
+        fn = FuncDef("__new__")
+        fn._fullname = fullname
+        return SymbolTableNode(MDEF, fn)
+
+    def _info(self, name: str, *, is_enum: bool, has_new: bool = False) -> TypeInfo:
+        info = self.fx.make_type_info(name)
+        info.is_enum = is_enum
+        if has_new:
+            info.names["__new__"] = self._node(f"{name}.__new__")
+        return info
+
+    def _seam(self, bases: list[Instance]) -> list[int] | None:
+        return _type_kernel.rust_classify_enum_new(bases)
+
+    def _sub(self, bases: list[Instance]) -> Any:
+        sub = self.fx.make_type_info("mod.Sub")
+        sub.bases = bases
+        sub.defn.info = sub
+        return sub.defn
+
+    def _run(self, bases: list[Instance]) -> tuple[Any, Any]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[tuple[str, object]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, object]] = []
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                fail=lambda msg, ctx, code=None: msgs.append((str(msg), code))
+            )
+            chk.options = Options()
+            chk.check_enum_new(self._sub(bases))
+            return msgs
+
+        return self._with_gate(False, check_one), self._with_gate(True, check_one)
+
+    def test_seam_non_list_defers(self) -> None:
+        assert self._seam("nope") is None  # type: ignore[arg-type]
+
+    def test_seam_non_enum_no_new(self) -> None:
+        base = self._info("mod.Plain", is_enum=False)
+        assert self._seam([Instance(base, [])]) == [0]
+
+    def test_seam_non_enum_has_new(self) -> None:
+        base = self._info("mod.Mixin", is_enum=False, has_new=True)
+        assert self._seam([Instance(base, [])]) == [1]
+
+    def test_seam_enum_mro_has_new(self) -> None:
+        enum = self._info("enum.Enum", is_enum=True)
+        mixin = self._info("mod.Mixin", is_enum=False, has_new=True)
+        enum.mro = [enum, mixin, self.fx.oi]
+        assert self._seam([Instance(enum, [])]) == [1]
+
+    def test_seam_enum_mro_all_enum(self) -> None:
+        enum = self._info("enum.Enum", is_enum=True)
+        enum2 = self._info("enum.Parent", is_enum=True)
+        enum.mro = [enum, enum2, self.fx.oi]
+        assert self._seam([Instance(enum, [])]) == [0]
+
+    def test_seam_conflict(self) -> None:
+        a = self._info("mod.A", is_enum=False, has_new=True)
+        b = self._info("mod.B", is_enum=False, has_new=True)
+        assert self._seam([Instance(a, []), Instance(b, [])]) == [1, 2]
+
+    def test_parity_single_mixin(self) -> None:
+        a = self._info("mod.A", is_enum=False, has_new=True)
+        off, on = self._run([Instance(a, [])])
+        assert_equal(on, off, "single non-enum mixin")
+
+    def test_parity_two_mixins(self) -> None:
+        a = self._info("mod.A", is_enum=False, has_new=True)
+        b = self._info("mod.B", is_enum=False, has_new=True)
+        off, on = self._run([Instance(a, []), Instance(b, [])])
+        assert_equal(on, off, "two non-enum mixins")
+
+    def test_parity_enum_plus_mixin(self) -> None:
+        enum = self._info("enum.Enum", is_enum=True)
+        mixin = self._info("mod.Mixin", is_enum=False, has_new=True)
+        enum.mro = [enum, mixin, self.fx.oi]
+        off, on = self._run([Instance(enum, [])])
+        assert_equal(on, off, "enum base with mixin in mro")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
 
