@@ -2849,6 +2849,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #936: is_final_enum_value pure bool predicate. Rust reads the
+    // live SymbolTableNode via PyO3 and returns the bool directly.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_is_final_enum_value,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

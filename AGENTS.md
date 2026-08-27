@@ -461,6 +461,20 @@ including:
   offending enum base's `str_with_options`, keeping the pure-Python body
   as the fallback. Gated by `_native_checker_active` and covered by
   `NativeEnumBasesSuite` in `mypy/test/testtypes.py`.
+- `rust_is_final_enum_value` (issue #936) — mirrors
+  `TypeChecker.is_final_enum_value` (checker.py:3825-3848): a pure bool
+  predicate over a `SymbolTableNode`. FuncBase/Decorator -> False (a
+  method is fine); non-Var -> True (class or anything else); for a Var,
+  a private/dunder/sunder name or a `FunctionLike` proper type -> False,
+  else `is_stub or has_explicit_value`. Rust reads the live node via PyO3
+  (isinstance against FuncBase/Decorator/Var, the `name` string,
+  `get_proper_type(node.type)` is `FunctionLike`, `has_explicit_value`)
+  and returns the bool directly, mirroring `rust_is_magic_base` (never
+  defers). Gated by `_native_checker_active` (wired from `mypy/build.py`)
+  and covered by `NativeIsFinalEnumValueSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls), plus Rust unit tests for the name predicates in
+  `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

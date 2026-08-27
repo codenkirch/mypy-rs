@@ -356,6 +356,7 @@ try:
         rust_is_empty_generator_function as _rust_is_empty_generator_function,
         rust_is_equality_ambiguous_for_narrowing as _rust_is_equality_ambiguous_for_narrowing,
         rust_is_false_literal as _rust_is_false_literal,
+        rust_is_final_enum_value as _rust_is_final_enum_value,
         rust_is_generator_return_type as _rust_is_generator_return_type,
         rust_is_literal_none as _rust_is_literal_none,
         rust_is_literal_not_implemented as _rust_is_literal_not_implemented,
@@ -428,6 +429,7 @@ except ImportError:
     _rust_try_handler_union = None  # type: ignore[assignment]
     _rust_is_true_literal = None  # type: ignore[assignment]
     _rust_is_false_literal = None  # type: ignore[assignment]
+    _rust_is_final_enum_value = None  # type: ignore[assignment]
     _rust_is_literal_none = None  # type: ignore[assignment]
     _rust_is_literal_not_implemented = None  # type: ignore[assignment]
     _rust_is_empty_generator_function = None  # type: ignore[assignment]
@@ -3834,6 +3836,17 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             self.fail(f'Cannot extend enum with existing members: "{base.name}"', defn)
 
     def is_final_enum_value(self, sym: SymbolTableNode) -> bool:
+        # Native type_kernel seam: the whole predicate is a pure bool over
+        # the SymbolTableNode; Rust reads it via PyO3 and returns the bool.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_is_final_enum_value is not None
+        ):
+            try:
+                return _rust_is_final_enum_value(sym, self.is_stub)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         if isinstance(sym.node, (FuncBase, Decorator)):
             return False  # A method is fine
         if not isinstance(sym.node, Var):
