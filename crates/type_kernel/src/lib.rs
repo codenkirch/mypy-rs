@@ -935,6 +935,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         messages::rust_append_numbers_notes,
         module
     )?)?;
+    // Issue #982: make_inferred_type_note decision (messages.py:3770-3800).
+    module.add_function(wrap_pyfunction!(
+        messages::rust_make_inferred_type_note,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(messages::rust_append_union_note, module)?)?;
     module.add_function(wrap_pyfunction!(messages::rust_pretty_callable, module)?)?;
     // Callable name helpers — ports callable_name and for_function.
