@@ -30265,6 +30265,13 @@ class NativeLvalueValiditySuite(Suite):
     def _tag(self, node: Any) -> int:
         return _type_kernel.rust_classify_lvalue_validity(node)
 
+    def _typeinfo(self) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        class_def = ClassDef("C", Block([]), None, [])
+        class_def.fullname = "mod.C"
+        return TypeInfo(SymbolTable(), class_def, "mod")
+
     def _run(self, node: Any) -> list[str]:
         from mypy.nodes import TempNode
         from mypy.semanal import SemanticAnalyzer
@@ -30291,8 +30298,7 @@ class NativeLvalueValiditySuite(Suite):
         assert self._tag(tv) == 1
 
     def test_seam_typeinfo(self) -> None:
-        ti = TypeInfo(SymbolTable(), FuncDef("C"), "")
-        assert self._tag(ti) == 2
+        assert self._tag(self._typeinfo()) == 2
 
     def test_seam_pass(self) -> None:
         v = Var("x")
@@ -30306,8 +30312,7 @@ class NativeLvalueValiditySuite(Suite):
         self._assert_par(tv)
 
     def test_parity_typeinfo(self) -> None:
-        ti = TypeInfo(SymbolTable(), FuncDef("C"), "")
-        self._assert_par(ti)
+        self._assert_par(self._typeinfo())
 
     def test_parity_var(self) -> None:
         self._assert_par(Var("x"))

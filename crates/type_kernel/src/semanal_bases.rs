@@ -20,6 +20,15 @@ use std::collections::HashSet;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple, PyType};
 
+/// Fetch a class from `mypy.nodes`. Mirrors the private helper in
+/// `checker_functions.rs` / `checker_visitor.rs`.
+fn nodes_class<'py>(py: Python<'py>, name: &str) -> PyResult<&'py PyType> {
+    py.import("mypy.nodes")?
+        .getattr(name)?
+        .downcast::<PyType>()
+        .map_err(Into::into)
+}
+
 /// Action tags handed to the Python shim, index-aligned with the base list:
 /// - `KEEP`: not a Generic/Protocol declaration; nothing to remove.
 /// - `GENERIC`: `typing.Generic` (with or without args); removed, its type
