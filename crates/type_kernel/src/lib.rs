@@ -118,6 +118,7 @@ mod refs;
 mod remove_redundant;
 mod semanal_algebra;
 mod semanal_bases;
+mod semanal_checks;
 mod semanal_classprop;
 mod semanal_lookup;
 mod semanal_shared;
@@ -1405,6 +1406,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_bases::rust_classify_add_metaclass,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_classify_function_signature,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;

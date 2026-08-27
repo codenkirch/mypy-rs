@@ -430,6 +430,7 @@ try:
         rust_classify_add_metaclass as _rust_classify_add_metaclass,
         rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_decorators as _rust_classify_decorators,
+        rust_classify_function_signature as _rust_classify_function_signature,
         rust_classify_imports as _rust_classify_imports,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
@@ -540,6 +541,7 @@ except ImportError:
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_class_decorator = None  # type: ignore[assignment]
+    _rust_classify_function_signature = None  # type: ignore[assignment]
     _rust_classify_with_metaclass = None  # type: ignore[assignment]
     _rust_classify_add_metaclass = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
@@ -662,6 +664,13 @@ _ACTION_WITH_METACLASS = 1
 # Python captures args[0] and breaks.
 _ACTION_NOT_ADD_METACLASS = 0
 _ACTION_ADD_METACLASS = 1
+
+# check_function_signature count-arbitration tags (see semanal_checks.rs).
+# OK: sig.arg_types and fdef.arguments match; TOO_FEW: shorter sig, Python
+# extends arg_types with dummy Any arguments; TOO_MANY: longer sig.
+_NATIVE_FUNC_SIG_OK = 0
+_NATIVE_FUNC_SIG_TOO_FEW = 1
+_NATIVE_FUNC_SIG_TOO_MANY = 2
 
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
@@ -2072,6 +2081,31 @@ class SemanticAnalyzer(
     def check_function_signature(self, fdef: FuncItem) -> None:
         sig = fdef.type
         assert isinstance(sig, CallableType)
+        # Native type_kernel seam: classify the count arbitration in Rust
+        # (semanal_checks.rs); side effects (extend arg_types, fail) stay
+        # here. None falls through to the pure-Python body below.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_function_signature is not None
+        ):
+            try:
+                tag = _rust_classify_function_signature(
+                    len(sig.arg_types), len(fdef.arguments)
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == _NATIVE_FUNC_SIG_TOO_FEW:
+                    self.fail("Type signature has too few arguments", fdef)
+                    # Add dummy Any arguments to prevent crashes later.
+                    num_extra_anys = len(fdef.arguments) - len(sig.arg_types)
+                    extra_anys = [AnyType(TypeOfAny.from_error)] * num_extra_anys
+                    sig.arg_types.extend(extra_anys)
+                    return
+                if tag == _NATIVE_FUNC_SIG_TOO_MANY:
+                    self.fail("Type signature has too many arguments", fdef, blocker=True)
+                return
         if len(sig.arg_types) < len(fdef.arguments):
             self.fail("Type signature has too few arguments", fdef)
             # Add dummy Any arguments to prevent crashes later.
