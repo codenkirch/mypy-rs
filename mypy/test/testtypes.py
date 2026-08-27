@@ -6,6 +6,7 @@ import os
 import re
 import sys
 from collections.abc import Callable, Sequence
+from types import SimpleNamespace
 from typing import Any, TypeVar
 from unittest import TestCase, skipIf, skipUnless
 
@@ -6443,6 +6444,221 @@ class NativeRevealImportedSuite(Suite):
         off = self._run_and_capture(expr, False)
         on = self._run_and_capture(expr, True)
         assert off == on == [], f"imported reveal_type must emit nothing: {off}/{on}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSuperArgTypesSuite(Suite):
+    """Parity for `rust_classify_super_arg_types` (issue #956).
+
+    `_super_arg_types` (checkexpr.py:7440) dispatches a stage-1 arity +
+    scope gate chain producing 7 early-error returns and 2 fall-through
+    bodies. The Rust seam classifies the whole dispatch head from live
+    checker/super-expr facts and returns a branch tag; Python applies
+    the `self.fail` / `fill_typevars` / `accept` side effects and stage 2
+    (proper-type dispatch). The direct seam call must match the expected
+    tag for all 9 branches, and toggling the checkexpr gate off vs on
+    must produce identical results + captured messages for the 7
+    early-exit branches.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_super_expr(
+        self,
+        n_args: int,
+        arg_kinds: list[ArgKind],
+        info: TypeInfo | None = None,
+    ) -> SuperExpr:
+        from mypy.nodes import SuperExpr
+
+        args = [NameExpr(f"a{i}") for i in range(n_args)]
+        call = CallExpr(
+            callee=NameExpr("super"),
+            args=args,
+            arg_kinds=list(arg_kinds),
+            arg_names=[None] * n_args,
+        )
+        e = SuperExpr("super", call)
+        e.info = info
+        return e
+
+    def _make_chk(
+        self,
+        in_checked: bool = True,
+        active_class: object = None,
+    ) -> SimpleNamespace:
+        captured: list[tuple[str, str]] = []
+        chk = SimpleNamespace(
+            in_checked_function=lambda: in_checked,
+            fail=lambda msg, ctx, code=None: captured.append(("fail", str(msg))),
+            scope=SimpleNamespace(active_class=lambda: active_class),
+        )
+        chk.captured = captured  # type: ignore[attr-defined]
+        return chk
+
+    def _run_super(
+        self, e: SuperExpr, chk: SimpleNamespace, active: bool
+    ) -> tuple[str, list[str]]:
+        from mypy.checkexpr import ExpressionChecker
+
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        try:
+            result = self._with_gate(active, lambda: ec._super_arg_types(e))
+            return (str(result), [m for _, m in chk.captured])
+        except Exception as exc:
+            return ("EXC:" + str(exc), [m for _, m in chk.captured])
+
+    # -- direct seam tests (all 9 tags) --
+
+    def test_seam_not_checked(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_NOT_CHECKED
+
+        e = self._make_super_expr(2, [ARG_POS, ARG_POS], info=object())
+        chk = self._make_chk(in_checked=False, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_NOT_CHECKED, f"{tag} != {NATIVE_SUPER_ARG_NOT_CHECKED}"
+
+    def test_seam_zero_arg_no_info(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_ZERO_ARG_NO_INFO
+
+        e = self._make_super_expr(0, [], info=None)
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_ZERO_ARG_NO_INFO, f"{tag}"
+
+    def test_seam_zero_arg_outside_method(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD
+
+        e = self._make_super_expr(0, [], info=object())
+        chk = self._make_chk(in_checked=True, active_class=object())
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_ZERO_ARG_OUTSIDE_METHOD, f"{tag}"
+
+    def test_seam_zero_arg_ok(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_ZERO_ARG_OK
+
+        e = self._make_super_expr(0, [], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_ZERO_ARG_OK, f"{tag}"
+
+    def test_seam_varargs(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_VARARGS
+
+        e = self._make_super_expr(1, [ARG_STAR], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_VARARGS, f"{tag}"
+
+    def test_seam_non_positional(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_NON_POSITIONAL
+
+        e = self._make_super_expr(1, [ARG_NAMED], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_NON_POSITIONAL, f"{tag}"
+
+    def test_seam_single_arg(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_SINGLE_ARG
+
+        e = self._make_super_expr(1, [ARG_POS], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_SINGLE_ARG, f"{tag}"
+
+    def test_seam_two_arg_ok(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_TWO_ARG_OK
+
+        e = self._make_super_expr(2, [ARG_POS, ARG_POS], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_TWO_ARG_OK, f"{tag}"
+
+    def test_seam_too_many(self) -> None:
+        from mypy.checkexpr import NATIVE_SUPER_ARG_TOO_MANY
+
+        e = self._make_super_expr(3, [ARG_POS, ARG_POS, ARG_POS], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        tag = _type_kernel.rust_classify_super_arg_types(chk, e)
+        assert tag == NATIVE_SUPER_ARG_TOO_MANY, f"{tag}"
+
+    # -- gate off/on differential tests (7 early-exit branches) --
+
+    def test_par_not_checked(self) -> None:
+        e = self._make_super_expr(2, [ARG_POS, ARG_POS], info=object())
+        chk = self._make_chk(in_checked=False, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=False, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"not_checked: off={off} on={on}"
+
+    def test_par_zero_arg_no_info(self) -> None:
+        e = self._make_super_expr(0, [], info=None)
+        chk = self._make_chk(in_checked=True, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"zero_arg_no_info: off={off} on={on}"
+
+    def test_par_zero_arg_outside_method(self) -> None:
+        e = self._make_super_expr(0, [], info=object())
+        chk = self._make_chk(in_checked=True, active_class=object())
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=object())
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"outside_method: off={off} on={on}"
+        assert off[1], f"expected fail: {off}"
+
+    def test_par_varargs(self) -> None:
+        e = self._make_super_expr(1, [ARG_STAR], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"varargs: off={off} on={on}"
+        assert off[1], f"expected fail: {off}"
+
+    def test_par_non_positional(self) -> None:
+        e = self._make_super_expr(1, [ARG_NAMED], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"non_positional: off={off} on={on}"
+        assert off[1], f"expected fail: {off}"
+
+    def test_par_single_arg(self) -> None:
+        e = self._make_super_expr(1, [ARG_POS], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"single_arg: off={off} on={on}"
+        assert off[1], f"expected fail: {off}"
+
+    def test_par_too_many(self) -> None:
+        e = self._make_super_expr(3, [ARG_POS, ARG_POS, ARG_POS], info=object())
+        chk = self._make_chk(in_checked=True, active_class=None)
+        off = self._run_super(e, chk, False)
+        chk2 = self._make_chk(in_checked=True, active_class=None)
+        on = self._run_super(e, chk2, True)
+        assert off == on, f"too_many: off={off} on={on}"
+        assert off[1], f"expected fail: {off}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

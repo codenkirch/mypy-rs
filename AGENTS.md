@@ -708,6 +708,23 @@ including:
   and covered by `NativeRevealImportedSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls).
+- `rust_classify_super_arg_types` (issue #956) — mirrors the stage-1
+  arity + scope gate chain of `ExpressionChecker._super_arg_types`
+  (checkexpr.py:7440-7483): `not in_checked_function` -> early
+  Any(unannotated), zero-arg with no info -> Any(from_error), zero-arg
+  outside a method -> fail + Any, zero-arg OK -> fall-through with
+  `fill_typevars`, varargs -> fail, non-positional -> fail, single
+  arg -> fail, two-arg -> fall-through with `accept`, too many ->
+  fail. Rust reads live `chk`/`super_expr` facts (`in_checked_function`,
+  `call.args`, `arg_kinds[].value`, `info.is_none`, `scope.active_class`)
+  via PyO3 and returns a branch tag; Python applies the `self.fail` /
+  `fill_typevars` / `accept` side effects and stage 2 (proper-type
+  dispatch). Defers (`None`) on any unreadable fact. Gated by
+  `_native_checkexpr_active` (wired from `mypy/build.py`) and covered
+  by `NativeSuperArgTypesSuite` in `mypy/test/testtypes.py` (direct seam
+  calls for all 9 tags plus gate-off vs gate-on differential on the 7
+  early-exit branches), plus 9 pure decision unit tests in
+  `checkexpr_functions.rs`.
 - `rust_classify_raw_expression_type` (issue #924) — mirrors the 3-way
   message-selection head of
   `TypeAnalyser.visit_raw_expression_type` (typeanal.py:2135-2150):
