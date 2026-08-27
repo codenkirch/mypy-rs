@@ -136,6 +136,7 @@ mod traverser;
 mod treetransform;
 mod typealias_instantiate;
 mod typeanal_callable;
+mod typeanal_deprec;
 mod typeanal_info;
 mod typeanal_literal;
 mod typeanal_queries;
@@ -1709,6 +1710,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // returns a tag; Python formats the message. None defers to Python.
     module.add_function(wrap_pyfunction!(
         typeanal_rawexpr::rust_classify_raw_expression_type,
+        module
+    )?)?;
+    // check_and_warn_deprecated: deprecation-warn arbitration head. Rust
+    // decides silent/note/fail from scalar facts; Python emits the message
+    // via the live info.deprecated string. Never defers.
+    module.add_function(wrap_pyfunction!(
+        typeanal_deprec::rust_classify_check_warn_deprecated,
         module
     )?)?;
     // visit_tuple_type: implicit-tuple message arbitration (OK / EMPTY /
