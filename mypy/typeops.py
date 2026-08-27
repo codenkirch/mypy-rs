@@ -448,6 +448,13 @@ def is_valid_constructor(n: SymbolNode | None) -> bool:
     This includes normal functions, overloaded functions, and decorators
     that return a callable type.
     """
+    if _HAS_TYPE_KERNEL and _native_typeops_active:
+        try:
+            result = _type_kernel.rust_is_valid_constructor(n)
+            if result is not None:
+                return result
+        except (AssertionError, NotImplementedError, ValueError):
+            pass
     if isinstance(n, SYMBOL_FUNCBASE_TYPES):
         return True
     if isinstance(n, Decorator):

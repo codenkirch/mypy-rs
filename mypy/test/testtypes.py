@@ -31468,3 +31468,113 @@ class NativeMatchArgsSuite(Suite):
         # literal by is_string_literal.
         tup = TupleType([fx.lit_str1_inst], fx.std_tuple)
         self._assert_par(self._class_scope(), tup)
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsValidConstructorSuite(Suite):
+    """Parity for the Rust `is_valid_constructor` port (mypy.typeops, #967).
+
+    `is_valid_constructor` (typeops.py:445-455) is a pure bool predicate:
+    True for `OverloadedFuncDef`/`FuncDef` (SYMBOL_FUNCBASE_TYPES), True for a
+    `Decorator` whose `get_proper_type(var.type)` is a `FunctionLike`, False
+    otherwise (incl. `None` and other SymbolNodes). The Rust seam reads the
+    live node via PyO3 isinstance and checks the wire tag for the Decorator
+    arm; it always returns a bool (never defers). Gate-off vs gate-on runs
+    must agree and the direct seam call must match.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeops_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, n: Any, expected: bool) -> None:
+        from mypy.typeops import is_valid_constructor
+
+        off = self._with_gate(False, lambda: is_valid_constructor(n))
+        on = self._with_gate(True, lambda: is_valid_constructor(n))
+        assert off == expected, f"gate-off {n!r}: {off} != {expected}"
+        assert on == expected, f"gate-on {n!r}: {on} != {expected}"
+
+    def _assert_seam(self, n: Any, expected: bool) -> None:
+        result = _type_kernel.rust_is_valid_constructor(n)
+        assert result is not None, f"Rust deferred on {n!r}"
+        assert result == expected, f"Rust seam {n!r}: {result} != {expected}"
+
+    def _func_def(self, name: str = "f") -> FuncDef:
+        from mypy.nodes import Block
+
+        return FuncDef(name, [], Block([]))
+
+    def _decorator(self, typ: Type | None) -> Decorator:
+        v = Var("m")
+        v.type = typ
+        return Decorator(self._func_def("m"), [], v)
+
+    def test_seam_none(self) -> None:
+        assert _type_kernel.rust_is_valid_constructor(None) is False
+
+    def test_seam_func_def(self) -> None:
+        self._assert_seam(self._func_def(), True)
+
+    def test_seam_overloaded_func_def(self) -> None:
+        from mypy.nodes import OverloadedFuncDef
+
+        self._assert_seam(OverloadedFuncDef([self._func_def("g")]), True)
+
+    def test_seam_decorator_callable(self) -> None:
+        ct = CallableType([], [], [], self.fx.a, self.fx.function, name="m")
+        self._assert_seam(self._decorator(ct), True)
+
+    def test_seam_decorator_overloaded(self) -> None:
+        ct = CallableType([], [], [], self.fx.a, self.fx.function, name="m")
+        self._assert_seam(self._decorator(Overloaded([ct])), True)
+
+    def test_seam_decorator_non_callable(self) -> None:
+        self._assert_seam(self._decorator(self.fx.a), False)
+
+    def test_seam_decorator_none_type(self) -> None:
+        self._assert_seam(self._decorator(None), False)
+
+    def test_seam_other_node(self) -> None:
+        self._assert_seam(Var("x"), False)
+
+    def test_parity_none(self) -> None:
+        self._assert_par(None, False)
+
+    def test_parity_func_def(self) -> None:
+        self._assert_par(self._func_def(), True)
+
+    def test_parity_overloaded_func_def(self) -> None:
+        from mypy.nodes import OverloadedFuncDef
+
+        self._assert_par(OverloadedFuncDef([self._func_def("g")]), True)
+
+    def test_parity_decorator_callable(self) -> None:
+        ct = CallableType([], [], [], self.fx.a, self.fx.function, name="m")
+        self._assert_par(self._decorator(ct), True)
+
+    def test_parity_decorator_overloaded(self) -> None:
+        ct = CallableType([], [], [], self.fx.a, self.fx.function, name="m")
+        self._assert_par(self._decorator(Overloaded([ct])), True)
+
+    def test_parity_decorator_non_callable(self) -> None:
+        self._assert_par(self._decorator(self.fx.a), False)
+
+    def test_parity_decorator_none_type(self) -> None:
+        self._assert_par(self._decorator(None), False)
+
+    def test_parity_var(self) -> None:
+        self._assert_par(Var("x"), False)
+

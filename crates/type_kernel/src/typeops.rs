@@ -21,7 +21,7 @@
 use std::collections::HashSet;
 
 use pyo3::prelude::*;
-use pyo3::types::PyList;
+use pyo3::types::{PyList, PyType};
 use pyo3::IntoPy;
 
 use crate::typeinfo::{
@@ -2539,6 +2539,58 @@ pub(crate) fn rust_callable_type(
     };
     let t = callable_type_inner(py, fdef, &fallback, ret_type.as_ref())?;
     encode_type(&t)
+}
+
+// ---------------------------------------------------------------------------
+// is_valid_constructor
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeops.is_valid_constructor` (typeops.py:445-455): pure bool
+/// predicate. True for `OverloadedFuncDef`/`FuncDef` (SYMBOL_FUNCBASE_TYPES),
+/// or for a `Decorator` whose `get_proper_type(var.type)` is a `FunctionLike`.
+///
+/// Reads the live node via PyO3 isinstance (mirrors `rust_is_magic_base`).
+/// The Decorator arm calls `mypy.types.get_proper_type(n.type)` then
+/// serializes the proper type to the wire format and checks the tag is
+/// `CallableType` or `Overloaded` (the wire form of `FunctionLike`). A
+/// ProperType is never a `TypeAliasType`, so encode/decode always succeeds;
+/// a `None` type (unanalyzed decorator) yields `False`. Always returns a
+/// bool, never defers: no resolver / inference / checker callbacks.
+#[pyfunction]
+pub(crate) fn rust_is_valid_constructor(py: Python<'_>, n: &PyAny) -> PyResult<bool> {
+    if n.is_none() {
+        return Ok(false);
+    }
+    let nodes_mod = py.import("mypy.nodes")?;
+    let ofd_cls: &PyType = nodes_mod.getattr("OverloadedFuncDef")?.downcast()?;
+    let fd_cls: &PyType = nodes_mod.getattr("FuncDef")?.downcast()?;
+    if n.is_instance(ofd_cls)? || n.is_instance(fd_cls)? {
+        return Ok(true);
+    }
+    let decorator_cls: &PyType = nodes_mod.getattr("Decorator")?.downcast()?;
+    if !n.is_instance(decorator_cls)? {
+        return Ok(false);
+    }
+    let n_type = n.getattr("type")?;
+    if n_type.is_none() {
+        return Ok(false);
+    }
+    let types_mod = py.import("mypy.types")?;
+    let get_proper_type = types_mod.getattr("get_proper_type")?;
+    let proper = get_proper_type.call1((n_type,))?;
+    if proper.is_none() {
+        return Ok(false);
+    }
+    if let Some(bytes) = serialize_type_to_bytes(py, proper) {
+        if let Some(t) = decode_type(&bytes) {
+            return Ok(matches!(
+                t,
+                Type::CallableType { .. } | Type::Overloaded { .. }
+            ));
+        }
+    }
+    let fl_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
+    proper.is_instance(fl_cls)
 }
 
 // ---------------------------------------------------------------------------
