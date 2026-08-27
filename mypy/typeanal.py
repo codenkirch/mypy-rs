@@ -2038,33 +2038,61 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def visit_tuple_type(self, t: TupleType) -> Type:
         # Types such as (t1, t2, ...) only allowed in assignment statements. They'll
         # generate errors elsewhere, and Tuple[t1, t2, ...] must be used instead.
-        if t.implicit and not self.allow_tuple_literal:
-            self.fail("Syntax error in type annotation", t, code=codes.SYNTAX)
-            if len(t.items) == 0:
-                self.note(
-                    "Suggestion: Use Tuple[()] instead of () for an empty tuple, or "
-                    "None for a function without a return value",
-                    t,
-                    code=codes.SYNTAX,
-                )
+        tag = self._native_tuple_type_implicit_tag(t)
+        if tag is None:
+            if not (t.implicit and not self.allow_tuple_literal):
+                tag = _TUPLE_TAG_OK
+            elif len(t.items) == 0:
+                tag = _TUPLE_TAG_EMPTY
             elif len(t.items) == 1:
-                self.note("Suggestion: Is there a spurious trailing comma?", t, code=codes.SYNTAX)
+                tag = _TUPLE_TAG_SINGLE
             else:
-                self.note(
-                    "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)",
-                    t,
-                    code=codes.SYNTAX,
-                )
-            return AnyType(TypeOfAny.from_error)
+                tag = _TUPLE_TAG_MULTI
+        if tag == _TUPLE_TAG_OK:
+            any_type = AnyType(TypeOfAny.special_form)
+            # If the fallback isn't filled in yet, its type will be the falsey FakeInfo
+            fallback = (
+                t.partial_fallback
+                if t.partial_fallback.type
+                else self.named_type("builtins.tuple", [any_type])
+            )
+            return TupleType(self.anal_array(t.items, allow_unpack=True), fallback, t.line)
+        self.fail("Syntax error in type annotation", t, code=codes.SYNTAX)
+        if tag == _TUPLE_TAG_EMPTY:
+            self.note(
+                "Suggestion: Use Tuple[()] instead of () for an empty tuple, or "
+                "None for a function without a return value",
+                t,
+                code=codes.SYNTAX,
+            )
+        elif tag == _TUPLE_TAG_SINGLE:
+            self.note("Suggestion: Is there a spurious trailing comma?", t, code=codes.SYNTAX)
+        else:
+            self.note(
+                "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)",
+                t,
+                code=codes.SYNTAX,
+            )
+        return AnyType(TypeOfAny.from_error)
 
-        any_type = AnyType(TypeOfAny.special_form)
-        # If the fallback isn't filled in yet, its type will be the falsey FakeInfo
-        fallback = (
-            t.partial_fallback
-            if t.partial_fallback.type
-            else self.named_type("builtins.tuple", [any_type])
-        )
-        return TupleType(self.anal_array(t.items, allow_unpack=True), fallback, t.line)
+    def _native_tuple_type_implicit_tag(self, t: TupleType) -> int | None:
+        """Classify the `visit_tuple_type` implicit-tuple head in Rust.
+
+        Returns the branch tag (OK/EMPTY/SINGLE/MULTI), or `None` to run
+        the pure-Python arbitration. Rust owns the three-scalar decision
+        (`t.implicit`, `allow_tuple_literal`, `len(t.items)`); the
+        `self.fail` / `self.note` side effects and the named_type +
+        anal_array reconstruction stay Python-side. See
+        crates/type_kernel/src/typeanal_special.rs for the tag table.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        try:
+            return _rust_classify_tuple_type_implicit(
+                t.implicit, self.allow_tuple_literal, len(t.items)
+            )
+        except (AssertionError, NotImplementedError):
+            return None
 
     def visit_typeddict_type(self, t: TypedDictType) -> Type:
         req_keys = set()
@@ -3576,6 +3604,7 @@ try:
         rust_classify_literal_param as _rust_classify_literal_param,
         rust_classify_raw_expression_type as _rust_classify_raw_expression_type,
         rust_classify_special_unbound as _rust_classify_special_unbound,
+        rust_classify_tuple_type_implicit as _rust_classify_tuple_type_implicit,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
@@ -3625,6 +3654,7 @@ except ImportError:
     _rust_classify_literal_param = None  # type: ignore[assignment]
     _rust_classify_raw_expression_type = None  # type: ignore[assignment]
     _rust_classify_analyze_callable_type = None  # type: ignore[assignment]
+    _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -3766,11 +3796,17 @@ _CALLABLE_TAG_ELLIPSIS = 2
 _CALLABLE_TAG_PARAMSPEC = 3
 _CALLABLE_TAG_INVALID_DISALLOW = 4
 _CALLABLE_TAG_INVALID_ALLOW = 5
+# Message tags for `visit_tuple_type` (issue #983). Mirrored in
+# crates/type_kernel/src/typeanal_special.rs; Python applies the
+# self.fail + one-of-three note and, on OK, the reconstruction.
+_TUPLE_TAG_OK = 0
+_TUPLE_TAG_EMPTY = 1
+_TUPLE_TAG_SINGLE = 2
+_TUPLE_TAG_MULTI = 3
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
 # side effect + result construction for the two inline tags, the rest
-
 # re-run the original body.
 _TYPE_WITH_INFO_TAG_TUPLE = 1
 _TYPE_WITH_INFO_TAG_VEC = 2
