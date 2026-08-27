@@ -75,6 +75,7 @@ pub(crate) const RECALC_ENUM_GENERIC_FAIL: i64 = 3;
 /// (whether the Var symbol's proper type is `AnyType`; None when the wire
 /// bytes are undecodable), and the three metaclass-info facts (None when
 /// unreadable). Branch order mirrors Python exactly.
+#[allow(clippy::too_many_arguments)]
 fn classify_declared_metaclass_inner(
     mc_name: Option<&str>,
     sym_missing: bool,
@@ -145,17 +146,11 @@ pub(crate) fn rust_classify_declared_metaclass(
 
     let sym_missing = sym_node.is_none();
     let sym_is_var = match sym_node {
-        Some(node) => match node.is_instance(var_cls) {
-            Ok(b) => Some(b),
-            Err(_) => None,
-        },
+        Some(node) => node.is_instance(var_cls).ok(),
         None => Some(false),
     };
     let sym_is_placeholder = match sym_node {
-        Some(node) => match node.is_instance(placeholder_cls) {
-            Ok(b) => Some(b),
-            Err(_) => None,
-        },
+        Some(node) => node.is_instance(placeholder_cls).ok(),
         None => Some(false),
     };
     // The shim passes None wire bytes when the Var has no type at all
@@ -291,10 +286,7 @@ pub(crate) fn rust_classify_recalculate_metaclass(defn: &PyAny) -> PyResult<Opti
             .getattr("type")
             .and_then(|t| t.call_method1("has_base", ("enum.EnumMeta",)))
         {
-            Ok(b) => match b.is_true() {
-                Ok(v) => Some(v),
-                Err(_) => None,
-            },
+            Ok(b) => b.is_true().ok(),
             Err(_) => None,
         }
     } else {
