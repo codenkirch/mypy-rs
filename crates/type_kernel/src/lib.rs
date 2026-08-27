@@ -1397,6 +1397,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_bases::rust_classify_with_metaclass,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_bases::rust_classify_add_metaclass,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,

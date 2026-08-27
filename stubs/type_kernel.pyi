@@ -2049,6 +2049,11 @@ def rust_classify_with_metaclass(
     args_len: int,
     all_positional: bool,
 ) -> int: ...
+def rust_classify_add_metaclass(
+    fullname: str | None,
+    args_len: int,
+    arg_kind_0_positional: bool,
+) -> int: ...
 def rust_create_errors(
     error_tuples: Any,
 ) -> Any: ...

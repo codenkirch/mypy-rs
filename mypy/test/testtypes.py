@@ -7826,9 +7826,9 @@ class NativeTypeImplTruthinessSuite(Suite):
     _VISITOR_SEAM_RESOLVER_NAMES = ("can_be_true_default_live", "can_be_false_default_live")
 
     def setUp(self) -> None:
-        import mypy.types as _types_mod
-
         from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+
+        import mypy.types as _types_mod
 
         self._types_mod = _types_mod
         # Bind the seam names the module-level try would have bound.
@@ -7838,7 +7838,7 @@ class NativeTypeImplTruthinessSuite(Suite):
             _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
 
-        from mypy.types import _set_native_truthiness_resolver, _set_native_visitor_active
+        from mypy.types import _set_native_truthiness_resolver
 
         self.fx = TypeFixture()
         self.type_infos = _base_infos(self.fx)
@@ -7848,7 +7848,7 @@ class NativeTypeImplTruthinessSuite(Suite):
         self._set_gate(True)
 
     def tearDown(self) -> None:
-        from mypy.types import _set_native_visitor_active, _set_native_truthiness_resolver
+        from mypy.types import _set_native_truthiness_resolver
 
         # Restore the pre-suite state: visitor gate off and no resolver.
         self._set_gate(False)
@@ -13102,7 +13102,6 @@ class NativeMeetDeferralSuite(Suite):
 
     def test_narrow_alias_parity(self) -> None:
         import mypy.join
-
         from mypy.meet import narrow_declared_type
 
         # Python expands the alias via get_proper_type before the seam, so
@@ -13121,7 +13120,7 @@ class NativeMeetDeferralSuite(Suite):
         self.assertEqual(results[1], results[0])
 
     def test_narrow_alias_seam_engages(self) -> None:
-        from mypy.join import _serialize_type, _deserialize_type
+        from mypy.join import _deserialize_type, _serialize_type
 
         alias = TypeAliasType(self.inst_alias, [])
         r = _type_kernel.rust_narrow_declared_type(
@@ -13137,7 +13136,6 @@ class NativeMeetDeferralSuite(Suite):
 
     def test_get_possible_variants_alias_seam_engages(self) -> None:
         import mypy.join
-
         from mypy.join import _serialize_type
         from mypy.types import read_type_list
         from mypy.wirefixup import fixup_wire_type
@@ -15600,10 +15598,9 @@ class NativeMessagesDeferralSuite(Suite):
     """
 
     def setUp(self) -> None:
+        from mypy.messages import _set_native_messages_active, _set_native_messages_resolver
         from mypy.options import Options
         from mypy.test.typefixture import TypeFixture as _TypeFixture
-
-        from mypy.messages import _set_native_messages_active, _set_native_messages_resolver
 
         self.fx = _TypeFixture()
         self.options = Options()
@@ -15870,7 +15867,6 @@ class NativeCheckPatternSuite(Suite):
         self._resolver = self._build_resolver(self._type_infos(), [])
 
     def _type_infos(self) -> list[TypeInfo]:
-        from mypy.nodes import TypeInfo
 
         infos = []
         for name in dir(self.fx):
@@ -17541,7 +17537,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         assert self._raw_dispatch(self.fx.a, "zzz") is None
 
     def test_dispatch_defers_decorator(self) -> None:
-        from mypy.nodes import Decorator, FuncDef, MDEF, SymbolTableNode, Var
+        from mypy.nodes import MDEF, Decorator, FuncDef, SymbolTableNode, Var
 
         fn = FuncDef("m", [], None, None)
         fn.type = self._sig([], [], [], self.fx.a)
@@ -17656,12 +17652,11 @@ class NativeCheckmemberDeferralSuite(Suite):
         _set_native_checkmember_active(True)
 
     def tearDown(self) -> None:
-        from mypy.wirefixup import set_wire_typeinfo_map
-
         from mypy.checkmember import (
             _set_native_checkmember_active,
             _set_native_checkmember_resolver,
         )
+        from mypy.wirefixup import set_wire_typeinfo_map
 
         self.resolver.set_live_typeinfo_map(None)
         set_wire_typeinfo_map(None)
@@ -23669,13 +23664,14 @@ class NativeClassDecoratorCommonSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCompatMetaclassHelperSuite(Suite):
-    """Parity for the Rust six.with_metaclass base-class classifier (#914).
+    """Parity for the Rust compat-helper classifiers (#914, #917).
 
-    Exercises `type_kernel.rust_classify_with_metaclass` directly on the
-    scalar facts and asserts a gate-on/off differential on
-    `infer_metaclass_and_bases_from_compat_helpers` (semanal.py:3321-3338):
-    the base-side `six.with_metaclass(M, B1, ...)` head decides in Rust and
-    Python applies the two side effects.
+    Exercises `type_kernel.rust_classify_with_metaclass` and
+    `rust_classify_add_metaclass` directly on the scalar facts and asserts a
+    gate-on/off differential on `infer_metaclass_and_bases_from_compat_helpers`
+    (semanal.py): both the base-side `six.with_metaclass(M, B1, ...)` head
+    and the decorator-side `@six.add_metaclass(M)` loop decide in Rust while
+    Python applies the side effects.
     """
 
     def setUp(self) -> None:
@@ -23715,6 +23711,18 @@ class NativeCompatMetaclassHelperSuite(Suite):
         assert self._tk.rust_classify_with_metaclass("mod.NotWithMeta", 2, True) == 0
         assert self._tk.rust_classify_with_metaclass(None, 2, True) == 0
 
+    def test_add_metaclass_seam_engages(self) -> None:
+        assert self._tk.rust_classify_add_metaclass("six.add_metaclass", 1, True) == 1
+
+    def test_add_metaclass_decision_table(self) -> None:
+        assert self._tk.rust_classify_add_metaclass("six.add_metaclass", 1, True) == 1
+        assert self._tk.rust_classify_add_metaclass("six.add_metaclass", 0, True) == 0
+        assert self._tk.rust_classify_add_metaclass("six.add_metaclass", 2, True) == 0
+        assert self._tk.rust_classify_add_metaclass("six.add_metaclass", 1, False) == 0
+        assert self._tk.rust_classify_add_metaclass("six.with_metaclass", 1, True) == 0
+        assert self._tk.rust_classify_add_metaclass("mod.Other", 1, True) == 0
+        assert self._tk.rust_classify_add_metaclass(None, 1, True) == 0
+
     def test_gate_off_defers(self) -> None:
         from mypy import semanal
 
@@ -23730,7 +23738,23 @@ class NativeCompatMetaclassHelperSuite(Suite):
         finally:
             semanal._native_semanal_visitor_active = old
 
-    def _run_method(self, base_expr: CallExpr) -> tuple[list[str], str | None, list[str]]:
+    def test_add_metaclass_gate_off_defers(self) -> None:
+        from mypy import semanal
+
+        callee = self._name("six.add_metaclass")
+        call_expr = self._call(callee, [self._name("mod.M")])
+        old = semanal._native_semanal_visitor_active
+        try:
+            semanal._native_semanal_visitor_active = False
+            assert semanal._native_add_metaclass_classification(call_expr) is None
+        finally:
+            semanal._native_semanal_visitor_active = old
+
+    def _run_method(
+        self,
+        base_expr: CallExpr | None = None,
+        decorators: list[CallExpr] | None = None,
+    ) -> tuple[list[str], str | None, list[str]]:
         from mypy import semanal
         from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
 
@@ -23744,27 +23768,34 @@ class NativeCompatMetaclassHelperSuite(Suite):
             def analyze_type_expr(self, expr: Expression) -> None:
                 pass
 
+            def visit_name_expr(self, expr: NameExpr) -> None:
+                pass
+
         defn = ClassDef("A", Block([]), None, [])
         defn.fullname = "mod.A"
         info = TypeInfo(SymbolTable(), defn, "mod")
         defn.info = info
-        defn.base_type_exprs = [base_expr]
-        defn.decorators = []
+        defn.base_type_exprs = [base_expr] if base_expr is not None else []
+        defn.decorators = decorators or []
         analyzer = _Analyzer()
         semanal.SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers(analyzer, defn)
         fullnames = [getattr(b, "fullname", None) for b in defn.base_type_exprs]
         metaclass = getattr(defn.metaclass, "fullname", None)
         return (fullnames, metaclass, analyzer.failures)
 
-    def _assert_method_parity(self, base_expr: CallExpr) -> None:
+    def _assert_method_parity(
+        self,
+        base_expr: CallExpr | None = None,
+        decorators: list[CallExpr] | None = None,
+    ) -> None:
         from mypy import semanal
 
         old = semanal._native_semanal_visitor_active
         try:
             semanal._native_semanal_visitor_active = False
-            off = self._run_method(base_expr)
+            off = self._run_method(base_expr, decorators)
             semanal._native_semanal_visitor_active = True
-            on = self._run_method(base_expr)
+            on = self._run_method(base_expr, decorators)
         finally:
             semanal._native_semanal_visitor_active = old
         assert_equal(on, off, "infer_metaclass_and_bases_from_compat_helpers parity")
@@ -23784,6 +23815,29 @@ class NativeCompatMetaclassHelperSuite(Suite):
             [self._name("mod.M"), self._name("mod.B1"), self._name("mod.B2")],
         )
         self._assert_method_parity(base_expr)
+
+    def _decorator(self, fullname: str, args: list[Expression], kinds: list[int]) -> CallExpr:
+        return CallExpr(self._name(fullname), args, kinds, [None] * len(args))
+
+    def test_method_add_metaclass_parity(self) -> None:
+        decorator = self._decorator("six.add_metaclass", [self._name("mod.M")], [ARG_POS])
+        self._assert_method_parity(decorators=[decorator])
+
+    def test_method_add_metaclass_not_matched_parity(self) -> None:
+        decorator = self._decorator("mod.Other", [self._name("mod.M")], [ARG_POS])
+        self._assert_method_parity(decorators=[decorator])
+
+    def test_method_add_metaclass_wrong_arity_parity(self) -> None:
+        decorator = self._decorator(
+            "six.add_metaclass",
+            [self._name("mod.M"), self._name("mod.B")],
+            [ARG_POS, ARG_POS],
+        )
+        self._assert_method_parity(decorators=[decorator])
+
+    def test_method_add_metaclass_non_positional_parity(self) -> None:
+        decorator = self._decorator("six.add_metaclass", [self._name("mod.M")], [ARG_NAMED])
+        self._assert_method_parity(decorators=[decorator])
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -23940,7 +23994,6 @@ class NativeFinalSuperSuite(Suite):
         self._set_active(True)
 
     def tearDown(self) -> None:
-        from mypy.checker import _set_native_checker_active
 
         self._set_active(False)
 

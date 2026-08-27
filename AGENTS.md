@@ -259,6 +259,27 @@ including:
   applies the side effects (AST mutation, error reporting, scope checks).
   Parity-gated behind the semanal_visitor gate and unit-tested by
   `NativeDecoratorClassifySuite` in `mypy/test/testtypes.py`.
+- `rust_classify_with_metaclass` (issue #914) — mirrors the
+  `six.with_metaclass` base-side classifier head of
+  `SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers`
+  (semanal.py:3327-3336). Rust decides from three scalar facts (callee
+  fullname, args_len, all-positional) whether the base is a
+  `six.with_metaclass` / `future.utils.with_metaclass` /
+  `past.utils.with_metaclass` call; Python runs `analyze_type_expr`
+  first and applies the two side effects (`with_meta_expr = args[0]`,
+  `defn.base_type_exprs = args[1:]`). Gated by the semanal_visitor gate
+  and covered by `NativeCompatMetaclassHelperSuite` in
+  `mypy/test/testtypes.py`.
+- `rust_classify_add_metaclass` (issue #917) — mirrors the
+  `@six.add_metaclass(M)` decorator-side classifier head of
+  `SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers`
+  (semanal.py:3373-3377). Rust decides from three scalar facts
+  (callee fullname `== "six.add_metaclass"`, args_len `== 1`,
+  first arg positional) whether the decorator is an add-metaclass call;
+  Python runs `dec_expr.callee.accept(self)` first and applies the
+  side effect (`add_meta_expr = args[0]`, break). Gated by the
+  semanal_visitor gate and covered by `NativeCompatMetaclassHelperSuite`
+  in `mypy/test/testtypes.py`.
 - `rust_bind_self` (issue #492) — mirrors `mypy.typeops.bind_self`'s
   non-generic fast path (typeops.py:540-641): strips the first parameter
   and sets `is_bound=True` for non-variable-carrying `CallableType`s. Rust
