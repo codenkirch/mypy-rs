@@ -218,6 +218,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(subtypes::rust_is_more_precise, module)?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_equivalent, module)?)?;
     module.add_function(wrap_pyfunction!(subtypes::rust_is_same_type, module)?)?;
+    module.add_function(wrap_pyfunction!(subtypes::rust_is_descriptor, module)?)?;
     module.add_function(wrap_pyfunction!(
         callable_compat::rust_callables_compatible,
         module

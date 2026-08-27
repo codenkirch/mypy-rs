@@ -839,6 +839,19 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on
   (return, is_compat call count) plus direct seam calls proving
   engagement), and 12 pure decision unit tests in `subtypes.rs`.
+- `rust_is_descriptor` (issue #968) — mirrors `mypy.subtypes.is_descriptor`
+  (subtypes.py:2177-2183), a recursive bool predicate. Rust walks the wire
+  `Type`: an `Instance` is a descriptor when its class (via MRO) has a
+  `__get__` member (reusing `has_readable_member_by_ref` from checkmember);
+  a `UnionType` is a descriptor when all relevant items are descriptors
+  (`NoneType` items filtered when `strict_optional` is off, matching
+  `UnionType.relevant_items`). All other types return `Some(false)`. Defers
+  (`None`) on `TypeAliasType` (no alias target on the wire) and on missing
+  resolver snapshots for any MRO class consulted. Gated by
+  `_native_subtype_active` + `_native_subtype_resolver` (wired from
+  `mypy/build.py`) and covered by `NativeIsDescriptorSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls for Instance/Union/None/Any/Callable paths).
 - `rust_classify_fixed_args` (issue #935) — mirrors the two gap checks of
   `SemanticAnalyzer.check_fixed_args` (semanal.py:6962-6976):
   `len(expr.args) != numargs` (wrong count) and

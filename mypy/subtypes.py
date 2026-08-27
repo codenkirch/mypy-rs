@@ -2175,6 +2175,20 @@ def get_member_flags(name: str, itype: Instance, class_obj: bool = False) -> set
 
 
 def is_descriptor(typ: Type | None) -> bool:
+    if _HAS_TYPE_KERNEL and _native_subtype_active and _native_subtype_resolver is not None:
+        try:
+            type_bytes = _serialize_type(typ)
+        except Exception:
+            type_bytes = None
+        if type_bytes is not None:
+            try:
+                result = _type_kernel.rust_is_descriptor(
+                    _native_subtype_resolver, type_bytes, state.strict_optional
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                return result
     typ = get_proper_type(typ)
     if isinstance(typ, Instance):
         return typ.type.get("__get__") is not None

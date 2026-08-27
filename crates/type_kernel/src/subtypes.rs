@@ -3106,6 +3106,73 @@ pub(crate) fn rust_are_args_compatible(
     )))
 }
 
+// =====================================================================
+// Issue #968: is_descriptor (subtypes.py:2177-2183)
+// =====================================================================
+
+/// `is_descriptor` (subtypes.py:2177-2183): recursive bool predicate.
+/// An Instance is a descriptor when its class (via MRO) has a `__get__`
+/// member. A UnionType is a descriptor when all relevant items are
+/// descriptors (`NoneType` items are filtered when `strict_optional` is
+/// off, matching `UnionType.relevant_items`). All other types are not
+/// descriptors. Defers (None) on `TypeAliasType` (can't expand without
+/// the alias target) and when the resolver snapshot is missing for any
+/// MRO class consulted.
+#[pyfunction]
+pub(crate) fn rust_is_descriptor(
+    resolver: &NativeTypeResolver,
+    type_bytes: &[u8],
+    strict_optional: bool,
+) -> Option<bool> {
+    let typ = decode_type(type_bytes)?;
+    is_descriptor_inner(&typ, resolver.resolver(), strict_optional)
+}
+
+/// Pure recursion core of `is_descriptor`, operating on decoded wire
+/// `Type` values. Defers (None) on `TypeAliasType` and missing resolver
+/// snapshots; returns `Some(bool)` for all decidable cases.
+fn is_descriptor_inner(typ: &Type, resolver: &TypeResolver, strict_optional: bool) -> Option<bool> {
+    // get_proper_type: TypeAliasType can't be expanded from wire alone.
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return None;
+    }
+    match typ {
+        Type::Instance { type_ref, .. } => {
+            crate::checkmember::has_readable_member_by_ref(resolver, type_ref, "__get__")
+        }
+        Type::UnionType { items, .. } => {
+            // Mirror UnionType.relevant_items(): when strict_optional is
+            // off, NoneType items are filtered out. TypeAliasType items
+            // can't be expanded to check if they're NoneType, so defer.
+            let mut relevant: Vec<&Type> = Vec::with_capacity(items.len());
+            for item in items {
+                if !strict_optional {
+                    if matches!(item, Type::TypeAliasType { .. }) {
+                        return None;
+                    }
+                    if matches!(item, Type::NoneType) {
+                        continue;
+                    }
+                }
+                relevant.push(item);
+            }
+            // all([]) is True in Python.
+            if relevant.is_empty() {
+                return Some(true);
+            }
+            for item in &relevant {
+                match is_descriptor_inner(item, resolver, strict_optional) {
+                    Some(true) => continue,
+                    Some(false) => return Some(false),
+                    None => return None,
+                }
+            }
+            Some(true)
+        }
+        _ => Some(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
