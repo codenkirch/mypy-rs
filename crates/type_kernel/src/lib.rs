@@ -1735,6 +1735,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkmember::rust_classify_type_type_member_access,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkoperator::rust_check_operator,
         module
     )?)?;

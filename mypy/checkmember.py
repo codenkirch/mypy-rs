@@ -126,6 +126,7 @@ try:
         rust_analyze_typeddict_access as _rust_analyze_typeddict_access,
         rust_analyze_union_member_access as _rust_analyze_union_member_access,
         rust_bind_self_fast as _rust_bind_self_fast,
+        rust_classify_type_type_member_access as _rust_classify_type_type_member_access,
         rust_defined_in_superclass as _rust_defined_in_superclass,
         rust_has_operator as _rust_has_operator,
         rust_instance_fallback as _rust_instance_fallback,
@@ -141,6 +142,7 @@ except ImportError:
     _rust_has_operator = None  # type: ignore[assignment]
     _rust_meta_has_operator = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
+    _rust_classify_type_type_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_method = None  # type: ignore[assignment]
     _rust_analyze_instance_member_access = None  # type: ignore[assignment]
@@ -199,6 +201,23 @@ def _set_native_checkmember_resolver(resolver: Any) -> None:
     """Install/clear the NativeTypeResolver shared with the checkmember kernel."""
     global _native_checkmember_resolver
     _native_checkmember_resolver = resolver
+
+
+# Decision tags from `rust_classify_type_type_member_access`; must match
+# `TT_*` constants in crates/type_kernel/src/checkmember.rs.
+NATIVE_TT_NONE = 0
+NATIVE_TT_ITEM_INSTANCE = 1
+NATIVE_TT_ITEM_ANY = 2
+NATIVE_TT_TV_UB_INSTANCE = 3
+NATIVE_TT_TV_UB_UNION = 4
+NATIVE_TT_TV_UB_TUPLE = 5
+NATIVE_TT_TV_UB_ANY = 6
+NATIVE_TT_TV_UB_OTHER = 7
+NATIVE_TT_ITEM_TUPLE = 8
+NATIVE_TT_ITEM_FUNC_TYPEOBJ = 9
+NATIVE_TT_ITEM_FUNC_NOT_TYPEOBJ = 10
+NATIVE_TT_ITEM_TYPE_TYPE_INSTANCE = 11
+NATIVE_TT_ITEM_TYPE_TYPE_OTHER = 12
 
 
 _BUILTIN_INSTANCE_BYTES: Final[dict[str, bytes]] = {
@@ -968,35 +987,82 @@ def analyze_type_type_member_access(
     # Similar to analyze_type_callable_attribute_access.
     item = None
     fallback = mx.named_type("builtins.type")
-    if isinstance(typ.item, Instance):
-        item = typ.item
-    elif isinstance(typ.item, AnyType):
-        with mx.msg.filter_errors():
-            return _analyze_member_access(name, fallback, mx, override_info)
-    elif isinstance(typ.item, TypeVarType):
-        upper_bound = get_proper_type(typ.item.upper_bound)
-        if isinstance(upper_bound, Instance):
-            item = upper_bound
-        elif isinstance(upper_bound, UnionType):
-            return _analyze_member_access(
-                name,
-                TypeType.make_normalized(upper_bound, line=typ.line, column=typ.column),
-                mx,
-                override_info,
-            )
-        elif isinstance(upper_bound, TupleType):
-            item = tuple_fallback(upper_bound)
-        elif isinstance(upper_bound, AnyType):
+    # Issue-#957: classify the 9-way dispatch head in Rust
+    # (checkmember.rs); terminal branches stay here. None falls
+    # through to the pure-Python body below.
+    tag = None
+    if (
+        _HAS_TYPE_KERNEL
+        and _native_checkmember_active
+        and _rust_classify_type_type_member_access is not None
+    ):
+        try:
+            tag = _rust_classify_type_type_member_access(typ)
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            tag = None
+        if tag is not None:
+            if tag == NATIVE_TT_ITEM_INSTANCE:
+                item = typ.item
+            elif tag == NATIVE_TT_ITEM_ANY:
+                with mx.msg.filter_errors():
+                    return _analyze_member_access(name, fallback, mx, override_info)
+            elif tag == NATIVE_TT_TV_UB_INSTANCE:
+                item = get_proper_type(typ.item.upper_bound)
+            elif tag == NATIVE_TT_TV_UB_UNION:
+                upper_bound = get_proper_type(typ.item.upper_bound)
+                return _analyze_member_access(
+                    name,
+                    TypeType.make_normalized(
+                        upper_bound, line=typ.line, column=typ.column
+                    ),
+                    mx,
+                    override_info,
+                )
+            elif tag == NATIVE_TT_TV_UB_TUPLE:
+                item = tuple_fallback(get_proper_type(typ.item.upper_bound))
+            elif tag == NATIVE_TT_TV_UB_ANY:
+                with mx.msg.filter_errors():
+                    return _analyze_member_access(name, fallback, mx, override_info)
+            elif tag == NATIVE_TT_ITEM_TUPLE:
+                item = tuple_fallback(typ.item)
+            elif tag == NATIVE_TT_ITEM_FUNC_TYPEOBJ:
+                item = typ.item.fallback
+            elif tag == NATIVE_TT_ITEM_TYPE_TYPE_INSTANCE:
+                item = typ.item.item.type.metaclass_type
+            # tags NONE / TV_UB_OTHER / FUNC_NOT_TYPEOBJ /
+            # TYPE_TYPE_OTHER: item stays None, fall through to tail.
+    if item is None and tag is None:
+        if isinstance(typ.item, Instance):
+            item = typ.item
+        elif isinstance(typ.item, AnyType):
             with mx.msg.filter_errors():
                 return _analyze_member_access(name, fallback, mx, override_info)
-    elif isinstance(typ.item, TupleType):
-        item = tuple_fallback(typ.item)
-    elif isinstance(typ.item, FunctionLike) and typ.item.is_type_obj():
-        item = typ.item.fallback
-    elif isinstance(typ.item, TypeType):
-        # Access member on metaclass object via Type[Type[C]]
-        if isinstance(typ.item.item, Instance):
-            item = typ.item.item.type.metaclass_type
+        elif isinstance(typ.item, TypeVarType):
+            upper_bound = get_proper_type(typ.item.upper_bound)
+            if isinstance(upper_bound, Instance):
+                item = upper_bound
+            elif isinstance(upper_bound, UnionType):
+                return _analyze_member_access(
+                    name,
+                    TypeType.make_normalized(
+                        upper_bound, line=typ.line, column=typ.column
+                    ),
+                    mx,
+                    override_info,
+                )
+            elif isinstance(upper_bound, TupleType):
+                item = tuple_fallback(upper_bound)
+            elif isinstance(upper_bound, AnyType):
+                with mx.msg.filter_errors():
+                    return _analyze_member_access(name, fallback, mx, override_info)
+        elif isinstance(typ.item, TupleType):
+            item = tuple_fallback(typ.item)
+        elif isinstance(typ.item, FunctionLike) and typ.item.is_type_obj():
+            item = typ.item.fallback
+        elif isinstance(typ.item, TypeType):
+            # Access member on metaclass object via Type[Type[C]]
+            if isinstance(typ.item.item, Instance):
+                item = typ.item.item.type.metaclass_type
     ignore_messages = False
 
     if item is not None:

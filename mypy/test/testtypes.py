@@ -31080,3 +31080,246 @@ class NativeLvalueValiditySuite(Suite):
 
     def test_parity_none(self) -> None:
         self._assert_par(None)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeTypeMemberAccessSuite(Suite):
+    """Parity for the Rust `analyze_type_type_member_access` dispatch port.
+
+    `rust_classify_type_type_member_access` classifies the 9-way dispatch
+    head of `mypy.checkmember.analyze_type_type_member_access`
+    (checkmember.py:965) plus a nested 4-way sub-dispatch on
+    `get_proper_type(typ.item.upper_bound)` for the TypeVarType arm. Rust
+    returns a branch tag; the Python shim applies the terminal branches
+    (`_analyze_member_access`, `filter_errors`, `tuple_fallback`,
+    `TypeType.make_normalized`, `metaclass_type`).
+
+    Direct seam calls assert the exact tag for every branch; the
+    gate-off vs gate-on differential drives the real
+    `analyze_type_type_member_access` through a mock MemberContext and
+    asserts identical (result, path) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkmember import _set_native_checkmember_active
+
+        self._set_active = _set_native_checkmember_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, typ: TypeType) -> int | None:
+        return _type_kernel.rust_classify_type_type_member_access(typ)
+
+    def _typevar(self, upper_bound: Type) -> TypeVarType:
+        return TypeVarType(
+            "T",
+            "T",
+            TypeVarId(1),
+            [],
+            upper_bound,
+            AnyType(TypeOfAny.from_omitted_generics),
+            COVARIANT,
+        )
+
+    def test_seam_item_instance(self) -> None:
+        tt = TypeType(self.fx.a)
+        assert self._tag(tt) == 1
+
+    def test_seam_item_any(self) -> None:
+        tt = TypeType(AnyType(TypeOfAny.special_form))
+        assert self._tag(tt) == 2
+
+    def test_seam_tv_ub_instance(self) -> None:
+        tt = TypeType(self._typevar(self.fx.a))
+        assert self._tag(tt) == 3
+
+    def test_seam_tv_ub_union(self) -> None:
+        tt = TypeType(self._typevar(UnionType([self.fx.a, self.fx.b])))
+        assert self._tag(tt) == 4
+
+    def test_seam_tv_ub_tuple(self) -> None:
+        tt = TypeType(self._typevar(
+            TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        ))
+        assert self._tag(tt) == 5
+
+    def test_seam_tv_ub_any(self) -> None:
+        tt = TypeType(self._typevar(AnyType(TypeOfAny.special_form)))
+        assert self._tag(tt) == 6
+
+    def test_seam_tv_ub_other(self) -> None:
+        tt = TypeType(self._typevar(NoneType()))
+        assert self._tag(tt) == 7
+
+    def test_seam_item_tuple(self) -> None:
+        tt = TypeType(TupleType([self.fx.a, self.fx.b], self.fx.std_tuple))
+        assert self._tag(tt) == 8
+
+    def test_seam_item_func_typeobj(self) -> None:
+        from mypy.types import CallableType
+
+        sig = CallableType(
+            [], [], [], self.fx.a, self.fx.type_type
+        )
+        tt = TypeType(sig)
+        assert self._tag(tt) == 9
+
+    def test_seam_item_func_not_typeobj(self) -> None:
+        from mypy.types import CallableType
+
+        sig = CallableType(
+            [], [], [], self.fx.a, self.fx.function
+        )
+        tt = TypeType(sig)
+        assert self._tag(tt) == 10
+
+    def test_seam_item_type_type_instance(self) -> None:
+        tt = TypeType(TypeType(self.fx.a))
+        assert self._tag(tt) == 11
+
+    def test_seam_item_type_type_other(self) -> None:
+        tt = TypeType(TypeType(NoneType()))
+        assert self._tag(tt) == 12
+
+    def test_seam_none(self) -> None:
+        tt = TypeType(NoneType())
+        assert self._tag(tt) == 0
+
+    def _make_mx(self, typ: TypeType) -> Any:
+        """Build a minimal MemberContext for the tail path."""
+        from types import SimpleNamespace
+
+        from mypy.checkmember import MemberContext
+
+        class _FilterErrorsCtx:
+            def __enter__(self) -> None:
+                pass
+
+            def __exit__(self, *a: object) -> None:
+                pass
+
+        msg = SimpleNamespace(
+            filter_errors=lambda *a, **kw: _FilterErrorsCtx(),
+            disable_type_names=lambda: _FilterErrorsCtx(),
+            fail=lambda *a, **kw: None,
+        )
+        chk = SimpleNamespace(
+            named_type=lambda n: self.fx.type_type,
+            msg=msg,
+            handle_cannot_determine_type=lambda *a, **kw: None,
+        )
+        return MemberContext(
+            is_lvalue=False,
+            is_super=False,
+            is_operator=False,
+            original_type=typ,
+            context=NameExpr("x"),
+            chk=chk,
+        )
+
+    def _run_fn(
+        self, typ: TypeType, name: str = "foo"
+    ) -> tuple[str, list[str]]:
+        """Run analyze_type_type_member_access with mocked tail calls.
+
+        Returns (result_str, call_log) where call_log records which
+        tail functions were invoked.
+        """
+        import mypy.checkmember as cm
+
+        calls: list[str] = []
+
+        orig_ama = cm._analyze_member_access
+        orig_aca = cm.analyze_class_attribute_access
+        orig_tf = cm.tuple_fallback
+
+        def mock_ama(name, typ, mx, override_info=None):
+            fb = str(typ)
+            calls.append(f"ama:{fb}")
+            return AnyType(TypeOfAny.special_form)
+
+        def mock_aca(item, name, mx, **kw):
+            calls.append(f"aca:{item}")
+            return None
+
+        def mock_tf(typ):
+            calls.append(f"tf:{typ}")
+            return self.fx.o
+
+        cm._analyze_member_access = mock_ama
+        cm.analyze_class_attribute_access = mock_aca
+        cm.tuple_fallback = mock_tf
+        try:
+            mx = self._make_mx(typ)
+            result = cm.analyze_type_type_member_access(name, typ, mx, None)
+            return str(result), sorted(calls)
+        finally:
+            cm._analyze_member_access = orig_ama
+            cm.analyze_class_attribute_access = orig_aca
+            cm.tuple_fallback = orig_tf
+
+    def _assert_par(self, typ: TypeType) -> None:
+        off = self._with_gate(False, lambda: self._run_fn(typ))
+        on = self._with_gate(True, lambda: self._run_fn(typ))
+        assert_equal(on, off, f"analyze_type_type_member_access parity for {typ}")
+
+    def test_par_item_instance(self) -> None:
+        self._assert_par(TypeType(self.fx.a))
+
+    def test_par_item_any(self) -> None:
+        self._assert_par(TypeType(AnyType(TypeOfAny.special_form)))
+
+    def test_par_tv_ub_instance(self) -> None:
+        self._assert_par(TypeType(self._typevar(self.fx.a)))
+
+    def test_par_tv_ub_union(self) -> None:
+        self._assert_par(TypeType(self._typevar(
+            UnionType([self.fx.a, self.fx.b])
+        )))
+
+    def test_par_tv_ub_tuple(self) -> None:
+        self._assert_par(TypeType(self._typevar(
+            TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        )))
+
+    def test_par_tv_ub_any(self) -> None:
+        self._assert_par(TypeType(self._typevar(AnyType(TypeOfAny.special_form))))
+
+    def test_par_tv_ub_other(self) -> None:
+        self._assert_par(TypeType(self._typevar(NoneType())))
+
+    def test_par_item_tuple(self) -> None:
+        self._assert_par(TypeType(
+            TupleType([self.fx.a, self.fx.b], self.fx.std_tuple)
+        ))
+
+    def test_par_item_func_typeobj(self) -> None:
+        from mypy.types import CallableType
+
+        sig = CallableType([], [], [], self.fx.a, self.fx.type_type)
+        self._assert_par(TypeType(sig))
+
+    def test_par_item_func_not_typeobj(self) -> None:
+        from mypy.types import CallableType
+
+        sig = CallableType([], [], [], self.fx.a, self.fx.function)
+        self._assert_par(TypeType(sig))
+
+    def test_par_item_type_type_instance(self) -> None:
+        self._assert_par(TypeType(TypeType(self.fx.a)))
+
+    def test_par_item_type_type_other(self) -> None:
+        self._assert_par(TypeType(TypeType(NoneType())))
+
+    def test_par_none(self) -> None:
+        self._assert_par(TypeType(NoneType()))

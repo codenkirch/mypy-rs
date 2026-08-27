@@ -865,6 +865,26 @@ including:
   `NativeVisitOpExprSuite` in `mypy/test/testtypes.py` (direct seam calls
   for all 5 branches plus edge cases), and 11 pure decision unit tests in
   `checkexpr_functions.rs`.
+- `rust_classify_type_type_member_access` (issue #957) — mirrors the
+  9-way dispatch head of
+  `mypy.checkmember.analyze_type_type_member_access`
+  (checkmember.py:965-1018) plus a nested 4-way sub-dispatch on
+  `get_proper_type(typ.item.upper_bound)` for the TypeVarType arm.
+  Rust reads the live `TypeType` via PyO3 (isinstance tags against
+  `mypy.types` classes: Instance / AnyType / TypeVarType / TupleType /
+  FunctionLike / TypeType, plus `is_type_obj()` bool and
+  `isinstance(typ.item.item, Instance)` for the TypeType arm) and
+  returns a branch tag (0-12); the Python shim applies the terminal
+  branches (`_analyze_member_access`, `filter_errors`,
+  `tuple_fallback`, `TypeType.make_normalized`, `metaclass_type`).
+  Tags NONE / TV_UB_OTHER / FUNC_NOT_TYPEOBJ / TYPE_TYPE_OTHER leave
+  `item` as None and fall through to the shared tail; `None` is the
+  exception-only deferral (unreadable PyO3 facts). Gated by
+  `_native_checkmember_active` (wired from `mypy/build.py`) and covered
+  by `NativeTypeTypeMemberAccessSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests for all 13 branches plus gate-off vs gate-on
+  differential on the result / call-log through a mock
+  MemberContext), and 13 pure decision unit tests in `checkmember.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
