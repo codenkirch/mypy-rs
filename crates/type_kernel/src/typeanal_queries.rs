@@ -1267,6 +1267,87 @@ fn check_vec_union(
 }
 
 // ---------------------------------------------------------------------------
+// check_unpacks_in_list (filter variadic Unpack items in a type list)
+// ---------------------------------------------------------------------------
+
+/// `mypy.typeanal.TypeAnalyser.check_unpacks_in_list` — filter a type-arg
+/// list that must carry at most one non-tuple `Unpack` item.
+///
+/// Mirrors typeanal.py:2991-3006: an item is a variadic unpack when it is
+/// an `UnpackType` whose proper type is not a `TupleType`; the first such
+/// item is kept and later ones are dropped. The inner type is resolved via
+/// Python's `get_proper_type` (alias expansion must consult the live
+/// resolver), matching the erase.rs pattern.
+///
+/// Returns `(kept_indices, final_unpack_index)` where `final_unpack_index`
+/// is `Some` only when more than one variadic unpack was seen; Python
+/// applies the "More than one variadic Unpack" fail with the final unpack's
+/// inner type as context and rebuilds the item list from the indices.
+/// `None` (defer) on unreadable facts (non-sequence input, missing `type`
+/// attr, `get_proper_type` failure).
+#[pyfunction]
+pub(crate) fn rust_check_unpacks_in_list(
+    py: Python<'_>,
+    items: &PyAny,
+) -> PyResult<Option<(Vec<usize>, Option<usize>)>> {
+    let refs = match TypeRefs::try_new(py) {
+        Ok(r) => r,
+        Err(_) => return Ok(None),
+    };
+    match check_unpacks_in_list_inner(py, items, &refs) {
+        Ok(r) => Ok(Some(r)),
+        Err(DeferError) => Ok(None),
+    }
+}
+
+fn check_unpacks_in_list_inner(
+    py: Python<'_>,
+    items: &PyAny,
+    refs: &TypeRefs<'_>,
+) -> Result<(Vec<usize>, Option<usize>), DeferError> {
+    let list = iter_seq(items)?;
+    let get_proper_type = py
+        .import("mypy.types")
+        .and_then(|m| m.getattr("get_proper_type"))
+        .map_err(|_| DeferError)?;
+    let mut variadic: Vec<bool> = Vec::with_capacity(list.len());
+    for item in list.iter() {
+        let mut is_variadic = false;
+        if is_instance(item, refs.unpack_type) {
+            let inner = item.getattr("type").map_err(|_| DeferError)?;
+            let proper = get_proper_type.call1((inner,)).map_err(|_| DeferError)?;
+            if !is_instance(proper, refs.tuple_type) {
+                is_variadic = true;
+            }
+        }
+        variadic.push(is_variadic);
+    }
+    Ok(filter_variadic_unpacks(&variadic))
+}
+
+/// Pure index fold over per-item "is a variadic unpack" flags: the first
+/// variadic unpack is kept, later ones are dropped, and the returned
+/// `final_unpack_index` is set only when more than one was seen.
+fn filter_variadic_unpacks(variadic: &[bool]) -> (Vec<usize>, Option<usize>) {
+    let mut kept: Vec<usize> = Vec::with_capacity(variadic.len());
+    let mut num_unpacks = 0usize;
+    let mut final_unpack: Option<usize> = None;
+    for (i, &is_variadic) in variadic.iter().enumerate() {
+        if is_variadic {
+            if num_unpacks == 0 {
+                kept.push(i);
+            }
+            num_unpacks += 1;
+            final_unpack = Some(i);
+        } else {
+            kept.push(i);
+        }
+    }
+    let final_out = if num_unpacks > 1 { final_unpack } else { None };
+    (kept, final_out)
+}
+
+// ---------------------------------------------------------------------------
 // is_typevar_default_recursive (BFS over default_depends graph)
 // ---------------------------------------------------------------------------
 
@@ -2748,4 +2829,47 @@ fn analyze_type_var_likes(
         )?);
     }
     Some(out)
+}
+
+// ---------------------------------------------------------------------------
+// check_unpacks_in_list pure decision tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod check_unpacks_tests {
+    use super::filter_variadic_unpacks;
+
+    #[test]
+    fn test_no_unpacks() {
+        assert_eq!(
+            filter_variadic_unpacks(&[false, false, false]),
+            (vec![0, 1, 2], None)
+        );
+    }
+
+    #[test]
+    fn test_first_variadic_unpack_kept() {
+        assert_eq!(filter_variadic_unpacks(&[true, false]), (vec![0, 1], None));
+    }
+
+    #[test]
+    fn test_second_variadic_unpack_dropped() {
+        assert_eq!(
+            filter_variadic_unpacks(&[true, false, true]),
+            (vec![0, 1], Some(2))
+        );
+    }
+
+    #[test]
+    fn test_three_variadic_unpacks_keep_first_only() {
+        assert_eq!(
+            filter_variadic_unpacks(&[true, true, true]),
+            (vec![0], Some(2))
+        );
+    }
+
+    #[test]
+    fn test_tuple_unpack_is_ordinary() {
+        assert_eq!(filter_variadic_unpacks(&[false, false]), (vec![0, 1], None));
+    }
 }

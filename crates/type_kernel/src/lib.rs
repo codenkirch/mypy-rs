@@ -580,6 +580,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_refers_to_typeddict,
         module
     )?)?;
+    // check_unpacks_in_list: filters non-tuple Unpack items from a type-arg
+    // list and reports the final unpack index. Python applies the fail and
+    // rebuilds the item list from the kept indices. None defers.
+    module.add_function(wrap_pyfunction!(
+        typeanal_queries::rust_check_unpacks_in_list,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_classify_reveal_imported,
         module
