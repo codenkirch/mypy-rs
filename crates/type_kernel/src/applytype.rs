@@ -154,7 +154,14 @@ fn apply_generic_arguments_inner(
             None => continue,
             Some(t) => t,
         };
-        let target_type = get_target_type(tvar, target, skip_unsatisfied, resolver)?;
+        let target_type = get_target_type(
+            tvar,
+            target,
+            skip_unsatisfied,
+            resolver,
+            &id_to_type,
+            strict_optional,
+        )?;
         if let Some(tt) = target_type {
             let key = typevar_id_key(tvar)?;
             id_to_type.insert(key, tt);
@@ -272,15 +279,24 @@ fn get_target_type(
     type_arg: &Type,
     skip_unsatisfied: bool,
     resolver: &NativeTypeResolver,
+    id_to_type: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
 ) -> Option<Option<Type>> {
     // applytype.py:42: p_type = get_proper_type(type)
     // Defer on TypeAliasType (wire format has no alias target).
     let p_type = get_proper_type(type_arg)?;
 
-    // Gradual default expansion for ambiguous UninhabitedType.
-    // Wire format lacks `ambiguous` field; defer this case to Python.
-    if matches!(p_type, Type::UninhabitedType { .. }) {
-        return None;
+    // applytype.py:254-256: an ambiguous UninhabitedType with a real
+    // tvar default expands the default gradually through id_to_type.
+    // A no-default tvar or non-ambiguous Never falls through below.
+    if let Type::UninhabitedType { ambiguous: true } = p_type {
+        if let Some(default) = default_of(tvar) {
+            return Some(Some(crate::expandtype::expand_type_inner(
+                default,
+                id_to_type,
+                strict_optional,
+            )?));
+        }
     }
 
     match tvar {
@@ -467,6 +483,22 @@ fn has_default(tvar: &Type) -> bool {
             ..
         } if type_of_any == TYPE_OF_ANY_FROM_OMITTED_GENERICS
     )
+}
+
+/// Borrow the raw `tvar.default` when the tvar has a real default
+/// (`has_default`). Used by `get_target_type`'s ambiguous-UninhabitedType
+/// branch to expand the default gradually (applytype.py:256). Returns
+/// `None` for non-TypeVarLike types or the no-default sentinel.
+fn default_of(tvar: &Type) -> Option<&Type> {
+    if !has_default(tvar) {
+        return None;
+    }
+    match tvar {
+        Type::TypeVarType { default, .. }
+        | Type::ParamSpecType { default, .. }
+        | Type::TypeVarTupleType { default, .. } => Some(default.as_ref()),
+        _ => None,
+    }
 }
 
 /// Default SubtypeContext for constraint/bound checks in applytype.
@@ -782,5 +814,70 @@ mod tests {
             }
             _ => panic!("expected Instance"),
         }
+    }
+
+    // --- get_target_type ambiguous-UninhabitedType (issue #913) ---
+
+    fn make_resolver() -> NativeTypeResolver {
+        crate::typeinfo::NativeTypeResolver::from_resolver(crate::typeinfo::TypeResolver::new())
+    }
+
+    fn make_amb_uninhabited() -> Type {
+        Type::UninhabitedType { ambiguous: true }
+    }
+
+    fn make_plain_uninhabited() -> Type {
+        Type::UninhabitedType { ambiguous: false }
+    }
+
+    #[test]
+    fn test_get_target_type_ambiguous_with_default_expands() {
+        // applytype.py:254-256: ambiguous UninhabitedType + a real tvar
+        // default expands via the partial env. T2 defaults to T1, which
+        // is already mapped to builtins.int, so the result must be int.
+        let resolver = make_resolver();
+        let t1 = make_typevar(1, "ns");
+        let t2 = make_typevar_with_default(2, "ns", t1.clone());
+        let mut env: HashMap<EnvKey, Type> = HashMap::new();
+        env.insert(
+            (1, 0, "ns".to_string()),
+            make_instance("builtins.int", vec![]),
+        );
+        let result = get_target_type(&t2, &make_amb_uninhabited(), true, &resolver, &env, true);
+        let got = result.expect("should decide").expect("should not skip");
+        assert_eq!(got, make_instance("builtins.int", vec![]));
+    }
+
+    #[test]
+    fn test_get_target_type_ambiguous_no_default_falls_through() {
+        // No default: ambiguous branch is skipped; the UninhabitedType
+        // falls through to the bound check. UninhabitedType <: object is
+        // Some(true), so the type_arg (the UninhabitedType) is returned.
+        let resolver = make_resolver();
+        let tvar = make_typevar_with_default(1, "ns", make_omitted_any());
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let result = get_target_type(&tvar, &make_amb_uninhabited(), true, &resolver, &env, true);
+        let got = result.expect("should decide").expect("should not skip");
+        assert!(matches!(got, Type::UninhabitedType { ambiguous: true }));
+    }
+
+    #[test]
+    fn test_get_target_type_non_ambiguous_falls_through() {
+        // non-ambiguous UninhabitedType: the ambiguous branch does not
+        // fire even though the tvar has a real default; it falls through
+        // to the bound check and returns the type_arg (not the default).
+        let resolver = make_resolver();
+        let tvar = make_typevar_with_default(1, "ns", make_instance("builtins.int", vec![]));
+        let env: HashMap<EnvKey, Type> = HashMap::new();
+        let result = get_target_type(
+            &tvar,
+            &make_plain_uninhabited(),
+            true,
+            &resolver,
+            &env,
+            true,
+        );
+        let got = result.expect("should decide").expect("should not skip");
+        assert!(matches!(got, Type::UninhabitedType { ambiguous: false }));
     }
 }
