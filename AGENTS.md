@@ -402,6 +402,32 @@ including:
   (gate-off vs gate-on differential on the result string and captured
   fail/note messages, plus a direct seam call proving engagement from the
   scalar facts), and pure decision unit tests in `typeanal_special.rs`.
+- `rust_classify_literal_param` (issue #919) — mirrors the 9-way
+  dispatch head of `mypy.typeanal.TypeAnalyser.analyze_literal_param`
+  (typeanal.py:2474-2557): string-Literal from `original_str_expr`
+  (branch a, checked pre-`get_proper_type` on the original arg), Any
+  fail/silent (branch c, splits on `type_of_any` ∈ {from_error,
+  special_form}), `RawExpressionType` float/complex/arbitrary/
+  with-value (branch d, splits on `literal_value is None` +
+  `simple_name`), `NoneType`/`LiteralType` pass-through (branch e),
+  Instance `last_known_value` extraction (branch f), `UnionType`
+  recursion (branch g), and the invalid tail (branch h). Rust returns
+  a branch tag (i64, 1-10) from scalar isinstance facts; the Python
+  shim (`_native_analyze_literal_param`) applies all side effects
+  (LiteralType construction via `named_type`, error emission,
+  `visit_unbound_type` recursion, union merge). The shim is two-phase:
+  phase 1 checks branch (a) on the original arg (pre-ProperType);
+  phase 2 runs the unbound recursion + `get_proper_type` in Python,
+  extracts post-chain facts, and classifies branches (c)-(h). No
+  `None` deferral: every path maps to a tag (unlike the special-unbound
+  and unbound-front classifiers which defer on recursion / plugin
+  hooks). Gated by `_set_native_typeanal_active` (wired from
+  `mypy/build.py`) and covered by `NativeLiteralParamSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on
+  `str(result)` and captured fail messages across all 9 branches,
+  plus a direct seam call proving engagement and a str-beats-Any
+  ordering test), and 18 pure decision unit tests in
+  `typeanal_literal.rs`.
 - `rust_join_instances` — mirrors
   `InstanceJoiner.join_instances` (join.py:208-303): same-type
   args-less (fresh Instance when LKV present), same-type with args
