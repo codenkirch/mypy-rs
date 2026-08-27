@@ -1666,6 +1666,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_rawexpr::rust_classify_raw_expression_type,
         module
     )?)?;
+    // visit_tuple_type: implicit-tuple message arbitration (OK / EMPTY /
+    // SINGLE / MULTI). Rust owns the three-scalar branch; Python applies
+    // the fail + one-of-three note and the reconstruction on OK.
+    module.add_function(wrap_pyfunction!(
+        typeanal_special::rust_classify_tuple_type_implicit,
+        module
+    )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
     // (Instance, Callable, TypeVar, Tuple, etc.). Returns None for types
     // needing semantic context, matching Python's deferral semantics.

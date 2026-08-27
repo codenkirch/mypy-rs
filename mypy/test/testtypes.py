@@ -32324,3 +32324,123 @@ class NativeIsRecursivePairSuite(Suite):
         t = NoneType()
         assert self._seam(s, t) is None
         self._assert_par(s, t)
+
+
+class NativeTupleTypeImplicitSuite(Suite):
+    """Parity for the Rust `visit_tuple_type` implicit-tuple classifier.
+
+    The message-arbitration head (implicit tuple + allow_tuple_literal off
+    -> fail + one-of-three suggestion note by len(t.items)) is decided in
+    Rust from three scalars; the Python shim applies the fail/note and,
+    on OK, the named_type + anal_array reconstruction. Toggling the
+    typeanal gate off (pure Python) and on (Rust seam) must produce
+    identical (str(result), captured fail/note messages), and direct seam
+    calls prove the tag table (OK/EMPTY/SINGLE/MULTI).
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, allow_tuple_literal: bool = False) -> tuple[object, object]:
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            def fail(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.messages.append(f"fail: {msg}")
+
+            def note(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.messages.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.allow_tuple_literal = allow_tuple_literal
+        ta.allow_param_spec = False
+        ta.allow_param_spec_literals = False
+        ta.nesting_level = 0
+        ta.allow_typed_dict_special_forms = False
+        ta.allow_final = False
+        ta.allow_ellipsis = False
+        ta.allow_unpack = False
+        return ta, api
+
+    def _make_t(self, n_items: int, *, implicit: bool) -> object:
+        return TupleType(
+            [AnyType(TypeOfAny.special_form)] * n_items,
+            self.fx.std_tuple,
+            line=-1,
+            column=-1,
+            implicit=implicit,
+        )
+
+    def _call(self, ta: object, t: object) -> tuple[str, list[str]]:
+        result = ta.visit_tuple_type(t)
+        return str(result), list(ta.api.messages)
+
+    def _assert_par(
+        self, n_items: int, *, implicit: bool, allow_tuple_literal: bool = False
+    ) -> None:
+        t = self._make_t(n_items, implicit=implicit)
+        off_ta, _ = self._analyser(allow_tuple_literal=allow_tuple_literal)
+        off = self._with_gate(False, lambda: self._call(off_ta, t))
+        on_ta, _ = self._analyser(allow_tuple_literal=allow_tuple_literal)
+        on = self._with_gate(True, lambda: self._call(on_ta, t))
+        label = f"tuple_implicit {n_items} implicit={implicit} allow={allow_tuple_literal}"
+        assert_equal(on[0], off[0], f"{label} parity result")
+        assert_equal(on[1], off[1], f"{label} parity messages")
+
+    def _seam(self, implicit: bool, allow_tuple_literal: bool, items_len: int) -> int | None:
+        from mypy.typeanal import _rust_classify_tuple_type_implicit
+
+        return _rust_classify_tuple_type_implicit(implicit, allow_tuple_literal, items_len)
+
+    def test_implicit_empty_tuple(self) -> None:
+        self._assert_par(0, implicit=True)
+        assert self._seam(True, False, 0) == 1
+
+    def test_implicit_single_item(self) -> None:
+        self._assert_par(1, implicit=True)
+        assert self._seam(True, False, 1) == 2
+
+    def test_implicit_many_items(self) -> None:
+        self._assert_par(3, implicit=True)
+        assert self._seam(True, False, 3) == 3
+
+    def test_not_implicit_ok_path(self) -> None:
+        self._assert_par(2, implicit=False)
+        assert self._seam(False, False, 2) == 0
+
+    def test_implicit_with_allowed_literal_ok_path(self) -> None:
+        self._assert_par(2, implicit=True, allow_tuple_literal=True)
+        assert self._seam(True, True, 2) == 0
+
+    def test_gate_off_defers_to_python(self) -> None:
+        # Gate off is handled in the shim, not the seam; verify the shim
+        # returns None (pure-Python arbitration) while the seam itself is
+        # a total function.
+        ta, _ = self._analyser()
+        t = self._make_t(1, implicit=True)
+        self._set_active(False)
+        try:
+            assert ta._native_tuple_type_implicit_tag(t) is None
+        finally:
+            self._set_active(True)
