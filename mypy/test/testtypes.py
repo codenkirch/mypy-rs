@@ -36837,6 +36837,359 @@ class NativeConfigureBasesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDeclaredMetaclassSuite(Suite):
+    """Parity for the Rust metaclass resolution decision heads (issue #1037).
+
+    `SemanticAnalyzer.get_declared_metaclass` (semanal.py:3767) runs a
+    strictly sequential gate chain (dynamic / name-error / Any-Var /
+    placeholder / alias-unwrap / invalid / not-a-metaclass / ok); Rust owns
+    the classification and Python applies the four fails plus the
+    fill_typevars construction. `SemanticAnalyzer.recalculate_metaclass`
+    (semanal.py:3863) folds the protocol-MRO scan and the enum scan into one
+    exclusive 4-way tag; Python keeps named_type_or_none, is_enum, and the
+    generic-enum fail. Direct seam calls assert the exact tags; the gate-off
+    vs gate-on differential drives the real SemanticAnalyzer methods through
+    stub recorders and asserts identical observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _bare_info(self, fullname: str) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        name = fullname.rsplit(".", 1)[-1]
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        return info
+
+    def _metaclass_info(self, name: str = "M") -> TypeInfo:
+        # A minimal TypeInfo that passes is_metaclass(): its mro carries a
+        # fake "builtins.type" class.
+        type_info = self._bare_info("builtins.type")
+        info = self._bare_info(f"mod.{name}")
+        info.mro = [info, type_info]
+        return info
+
+    # Movement (a): direct seam tag tests.
+
+    def test_seam_declared_engages_ok(self) -> None:
+        from mypy.semanal import _META_OK
+
+        meta = self._metaclass_info()
+        result = _type_kernel.rust_classify_declared_metaclass("M", meta, None, meta)
+        assert result == _META_OK
+
+    def test_seam_declared_dynamic_and_name_error(self) -> None:
+        from mypy.semanal import _META_DYNAMIC, _META_NAME_ERROR
+
+        assert (
+            _type_kernel.rust_classify_declared_metaclass(None, None, None, None) == _META_DYNAMIC
+        )
+        assert (
+            _type_kernel.rust_classify_declared_metaclass("M", None, None, None)
+            == _META_NAME_ERROR
+        )
+
+    def test_seam_declared_any_var(self) -> None:
+        from mypy.nodes import Var
+        from mypy.semanal import _META_ANY, _META_INVALID, _serialize_semanal_type
+
+        fx = self.fx
+        v = Var("M")
+        v.type = fx.anyt
+        result = _type_kernel.rust_classify_declared_metaclass(
+            "M", v, _serialize_semanal_type(fx.anyt), v
+        )
+        assert result == _META_ANY
+        # A Var symbol whose type is not Any falls into the invalid arm.
+        v.type = fx.str_type
+        result = _type_kernel.rust_classify_declared_metaclass(
+            "M", v, _serialize_semanal_type(fx.str_type), v
+        )
+        assert result == _META_INVALID
+
+    def test_seam_declared_placeholder_and_invalid(self) -> None:
+        from mypy.nodes import NameExpr, PlaceholderNode
+        from mypy.semanal import _META_DEFER, _META_INVALID, _META_NOT_METACLASS
+
+        p = PlaceholderNode("mod.M", NameExpr("M"), 1)
+        assert _type_kernel.rust_classify_declared_metaclass("M", p, None, p) == _META_DEFER
+        plain = self._bare_info("mod.NotMeta")
+        result = _type_kernel.rust_classify_declared_metaclass("M", plain, None, plain)
+        assert result == _META_NOT_METACLASS
+        tuple_named = self._metaclass_info()
+        tuple_named.tuple_type = TupleType([self.fx.a], self.fx.o)
+        result = _type_kernel.rust_classify_declared_metaclass("M", tuple_named, None, tuple_named)
+        assert result == _META_INVALID
+
+    def test_seam_declared_defers(self) -> None:
+        from mypy.nodes import Var
+
+        # Undecodable wire bytes for a Var symbol defer the whole seam.
+        v = Var("M")
+        v.type = self.fx.a
+        assert _type_kernel.rust_classify_declared_metaclass("M", v, b"\x63garbage", v) is None
+        # Unreadable sym/meta objects defer too.
+        assert _type_kernel.rust_classify_declared_metaclass("M", v, None, None) is None
+
+    def test_seam_recalculate_direct_tags(self) -> None:
+        from mypy.semanal import (
+            _RECALC_ABCMETA,
+            _RECALC_ENUM_GENERIC_FAIL,
+            _RECALC_IS_ENUM,
+            _RECALC_OK,
+        )
+
+        info = self._bare_info("mod.A")
+        info.mro.append(info)
+        assert _type_kernel.rust_classify_recalculate_metaclass(info.defn) == _RECALC_OK
+        # A protocol in the mro with no/default metaclass -> ABCMeta tag.
+        proto = self._bare_info("mod.P")
+        proto.is_protocol = True
+        info.mro = [info, proto]
+        assert _type_kernel.rust_classify_recalculate_metaclass(info.defn) == _RECALC_ABCMETA
+        # An enum-metaclass tag, split on defn.type_vars.
+        enum_meta = self._bare_info("mod.EnumMeta2")
+        fake_enum_base = self._bare_info("enum.EnumMeta")
+        enum_meta.mro = [enum_meta, fake_enum_base]
+        info.mro = [info]
+        info.metaclass_type = Instance(enum_meta, [])
+        assert _type_kernel.rust_classify_recalculate_metaclass(info.defn) == _RECALC_IS_ENUM
+        info.defn.type_vars = [self.fx.a]  # type: ignore[list-item]
+        result = _type_kernel.rust_classify_recalculate_metaclass(info.defn)
+        assert result == _RECALC_ENUM_GENERIC_FAIL
+
+    def test_seam_recalculate_defers(self) -> None:
+        from types import SimpleNamespace
+
+        assert _type_kernel.rust_classify_recalculate_metaclass(SimpleNamespace()) is None
+        assert _type_kernel.rust_classify_recalculate_metaclass(self._bare_info("mod.A")) is None
+
+    # Movement (b)/(c): gate-off vs gate-on differential via the shims.
+
+    def _run_declared(
+        self,
+        metaclass_expr: Any,
+        sym_node: Any,
+        gate: bool,
+        disallow_subclassing_any: bool = False,
+    ) -> tuple[object, object, object, object]:
+        from mypy.nodes import SymbolTableNode
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> tuple[object, object, object, object]:
+            records: list[object] = []
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            sa.options = Options()
+            sa.options.disallow_subclassing_any = disallow_subclassing_any
+            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: records.append(  # type: ignore[method-assign, misc]
+                ("fail", str(msg))
+            )
+            sym = SymbolTableNode(0, sym_node) if sym_node is not None else None
+
+            def lookup(name: str, ctx: Any) -> SymbolTableNode | None:
+                return sym
+
+            sa.lookup_qualified = lookup  # type: ignore[method-assign, assignment]
+            result = sa.get_declared_metaclass("C", metaclass_expr)
+            inst = result[0]
+            return (
+                str(inst) if inst is not None else None,
+                result[1],
+                result[2],
+                list(records),
+            )
+
+        return self._with_gate(gate, check_one)
+
+    def _assert_par_declared(
+        self,
+        metaclass_expr: Any,
+        sym_node: Any,
+        disallow_subclassing_any: bool = False,
+    ) -> None:
+        off = self._run_declared(
+            metaclass_expr, sym_node, gate=False, disallow_subclassing_any=disallow_subclassing_any
+        )
+        on = self._run_declared(
+            metaclass_expr, sym_node, gate=True, disallow_subclassing_any=disallow_subclassing_any
+        )
+        assert_equal(on, off, f"get_declared_metaclass parity expr={metaclass_expr}")
+
+    def test_parity_declared_none_expr(self) -> None:
+        self._assert_par_declared(None, None)
+
+    def test_parity_declared_valid_class(self) -> None:
+        meta = self._metaclass_info()
+        self._assert_par_declared(NameExpr("M"), meta)
+        self._assert_par_declared(MemberExpr(NameExpr("m"), "Meta"), meta)
+
+    def test_parity_declared_dynamic(self) -> None:
+        self._assert_par_declared(IntExpr(1), None)
+
+    def test_parity_declared_lookup_miss(self) -> None:
+        self._assert_par_declared(NameExpr("M"), None)
+
+    def test_parity_declared_any_var(self) -> None:
+        v = Var("M")
+        v.type = self.fx.a
+        self._assert_par_declared(NameExpr("M"), v)
+        self._assert_par_declared(NameExpr("M"), v, disallow_subclassing_any=True)
+
+    def test_parity_declared_placeholder(self) -> None:
+        p = PlaceholderNode("mod.M", NameExpr("M"), 1)
+        self._assert_par_declared(NameExpr("M"), p)
+
+    def test_parity_declared_alias_unwrap(self) -> None:
+        meta = self._metaclass_info()
+        ta = TypeAlias(Instance(meta, []), "mod.meta_alias", "mod", 1, 0)
+        self._assert_par_declared(NameExpr("meta_alias"), ta)
+        # A PEP 695 style alias does not unwrap -> invalid metaclass.
+        ta_312 = TypeAlias(
+            Instance(meta, []), "mod.meta_p312", "mod", 1, 0, python_3_12_type_alias=True
+        )
+        self._assert_par_declared(NameExpr("meta_p312"), ta_312)
+
+    def test_parity_declared_non_class_var(self) -> None:
+        v = Var("M")
+        v.type = self.fx.str_type
+        self._assert_par_declared(NameExpr("M"), v)
+
+    def test_parity_declared_not_metaclass(self) -> None:
+        plain = self._bare_info("mod.NotMeta")
+        self._assert_par_declared(NameExpr("M"), plain)
+
+    def _run_recalculate(
+        self,
+        mro_protocols: bool,
+        declared: Instance | None,
+        enum_meta: TypeInfo | None,
+        type_vars: list[Any] | None,
+        gate: bool,
+    ) -> tuple[object, object, object, object]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> tuple[object, object, object, object]:
+            records: list[object] = []
+            info = self._bare_info("mod.A")
+            if mro_protocols:
+                proto = self._bare_info("mod.P")
+                proto.is_protocol = True
+                info.mro = [info, proto]
+            else:
+                info.mro = [info]
+            enum_base = None
+            if enum_meta is not None:
+                enum_base = self._bare_info("enum.EnumMeta")
+                enum_meta.mro = [enum_meta, enum_base]
+            abc_meta = self._bare_info("abc.ABCMeta")
+            defn = info.defn
+            if type_vars is not None:
+                defn.type_vars = type_vars
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: records.append(  # type: ignore[method-assign, misc]
+                ("fail", str(msg))
+            )
+
+            def named_type_or_none(fullname: str, args: Any = None) -> Instance | None:
+                return Instance(abc_meta, [])
+
+            sa.named_type_or_none = named_type_or_none  # type: ignore[method-assign]
+            sa.recalculate_metaclass(defn, declared)
+            meta_t = info.metaclass_type
+            return (
+                str(meta_t) if meta_t is not None else None,
+                info.is_enum,
+                info.declared_metaclass is declared,
+                list(records),
+            )
+
+        return self._with_gate(gate, check_one)
+
+    def _assert_par_recalculate(
+        self,
+        mro_protocols: bool = False,
+        declared: Instance | None = None,
+        enum_meta: TypeInfo | None = None,
+        type_vars: list[Any] | None = None,
+    ) -> None:
+        off = self._run_recalculate(mro_protocols, declared, enum_meta, type_vars, gate=False)
+        on = self._run_recalculate(mro_protocols, declared, enum_meta, type_vars, gate=True)
+        assert_equal(on, off, "recalculate_metaclass parity")
+
+    def test_parity_recalculate_plain(self) -> None:
+        self._assert_par_recalculate()
+
+    def test_parity_recalculate_protocol_abcmeta(self) -> None:
+        self._assert_par_recalculate(mro_protocols=True)
+
+    def test_parity_recalculate_enum(self) -> None:
+        self._assert_par_recalculate(enum_meta=self._bare_info("mod.EM"))
+
+    def test_parity_recalculate_enum_generic_fail(self) -> None:
+        self._assert_par_recalculate(enum_meta=self._bare_info("mod.EM"), type_vars=[self.fx.a])
+
+    def test_parity_recalculate_declared_instance(self) -> None:
+        self._assert_par_recalculate(declared=Instance(self._bare_info("mod.M"), []))
+
+    # Movement (d)-adjacent: deferral audits through the gated shims.
+
+    def test_shim_falls_back_when_seam_missing(self) -> None:
+        import mypy.semanal as semanal_mod
+
+        meta = self._metaclass_info()
+        saved_d = semanal_mod._rust_classify_declared_metaclass  # type: ignore[attr-defined]
+        saved_r = semanal_mod._rust_classify_recalculate_metaclass  # type: ignore[attr-defined]
+        semanal_mod._rust_classify_declared_metaclass = None  # type: ignore[assignment, attr-defined]
+        semanal_mod._rust_classify_recalculate_metaclass = None  # type: ignore[assignment, attr-defined]
+        try:
+            off = self._run_declared(NameExpr("M"), meta, gate=False)
+            on = self._run_declared(NameExpr("M"), meta, gate=True)
+            assert_equal(on, off)
+            roff = self._run_recalculate(
+                mro_protocols=True, declared=None, enum_meta=None, type_vars=None, gate=False
+            )
+            ron = self._run_recalculate(
+                mro_protocols=True, declared=None, enum_meta=None, type_vars=None, gate=True
+            )
+            assert_equal(ron, roff)
+        finally:
+            semanal_mod._rust_classify_declared_metaclass = saved_d  # type: ignore[attr-defined]
+            semanal_mod._rust_classify_recalculate_metaclass = saved_r  # type: ignore[attr-defined]
+
+    def test_shim_declared_falls_back_on_garbage_wire(self) -> None:
+        import mypy.semanal as semanal_mod
+
+        v = Var("M")
+        v.type = self.fx.a
+        saved = semanal_mod._serialize_semanal_type
+        semanal_mod._serialize_semanal_type = lambda t: b"\x63garbage"
+        try:
+            off = self._run_declared(NameExpr("M"), v, gate=False)
+            on = self._run_declared(NameExpr("M"), v, gate=True)
+        finally:
+            semanal_mod._serialize_semanal_type = saved
+        assert_equal(on, off)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativePrepareMethodSignatureSuite(Suite):
     """Parity for the Rust `prepare_method_signature` dispatch-head port.
 

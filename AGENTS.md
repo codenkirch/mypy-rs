@@ -312,6 +312,34 @@ including:
   and covered by `NativeConfigureBasesSuite` in `mypy/test/testtypes.py`
   (direct seam tag tests + gate-off vs gate-on differential), plus pure
   decision unit tests in `semanal_bases.rs`.
+- `rust_classify_declared_metaclass` (issue #1037) — mirrors the gate
+  chain of `SemanticAnalyzer.get_declared_metaclass` (semanal.py:3767):
+  Rust classifies the declared-metaclass expression from the name, the
+  looked-up symbol node, the wire-serialized Var type, and the resolved
+  symbol (tags OK / DYNAMIC / NAME_ERROR / ANY / DEFER / INVALID /
+  NOT_METACLASS). Python performs the `lookup_qualified` and the pure
+  alias unwrap feeding the classifier, then applies the four fails and
+  the `fill_typevars` construction. Rust short-circuits like Python:
+  `tuple_type`/`is_metaclass` are only read when the symbol is a
+  `TypeInfo`, so non-TypeInfo nodes (Var/Placeholder) never trigger a
+  getattr defer. Gated by the semanal_visitor gate and covered by
+  `NativeDeclaredMetaclassSuite` in `mypy/test/testtypes.py` (direct
+  seam tag tests + gate-off vs gate-on differential), plus pure decision
+  unit tests in `semanal_metaclass.rs`.
+- `rust_classify_recalculate_metaclass` (issue #1037) — mirrors the
+  branch selection of `SemanticAnalyzer.recalculate_metaclass`
+  (semanal.py:3837): Rust reads the live `defn.info` via PyO3 (the MRO
+  scan for a protocol base, `metaclass_type` presence + `builtins.type`
+  fullname + `enum.EnumMeta` base, and the non-empty `defn.type_vars`)
+  and returns a 4-way tag (OK / ABCMETA / IS_ENUM / ENUM_GENERIC_FAIL);
+  the Python shim applies the two idempotent prelude writes
+  (`declared_metaclass`, `metaclass_type` via the live
+  `calculate_metaclass_type`), the `named_type_or_none("abc.ABCMeta")`
+  install, the `is_enum = True` write, and the "Enum class cannot be
+  generic" fail, keeping the pure-Python body as the fallback. Gated by
+  the semanal_visitor gate and covered by `NativeDeclaredMetaclassSuite`
+  in `mypy/test/testtypes.py`, plus pure decision unit tests in
+  `semanal_metaclass.rs`.
 - `rust_bind_self` (issue #492) — mirrors `mypy.typeops.bind_self`'s
   non-generic fast path (typeops.py:540-641): strips the first parameter
   and sets `is_bound=True` for non-variable-carrying `CallableType`s. Rust

@@ -121,6 +121,7 @@ mod semanal_bases;
 mod semanal_checks;
 mod semanal_classprop;
 mod semanal_lookup;
+mod semanal_metaclass;
 mod semanal_shared;
 mod semanal_typeddict;
 mod semanal_typeexpr;
@@ -1525,6 +1526,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_bases::rust_classify_configure_mro,
+        module
+    )?)?;
+    // semanal_metaclass: get_declared_metaclass gate chain +
+    // recalculate_metaclass decision heads (issue #1037). Rust owns the
+    // tags; fails, fill_typevars, and metaclass writes stay in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_metaclass::rust_classify_declared_metaclass,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_metaclass::rust_classify_recalculate_metaclass,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

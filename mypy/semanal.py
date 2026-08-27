@@ -432,6 +432,7 @@ try:
         rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_configure_bases as _rust_classify_configure_bases,
         rust_classify_configure_mro as _rust_classify_configure_mro,
+        rust_classify_declared_metaclass as _rust_classify_declared_metaclass,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_fixed_args as _rust_classify_fixed_args,
         rust_classify_function_signature as _rust_classify_function_signature,
@@ -439,6 +440,7 @@ try:
         rust_classify_lvalue_validity as _rust_classify_lvalue_validity,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_method_signature as _rust_classify_method_signature,
+        rust_classify_recalculate_metaclass as _rust_classify_recalculate_metaclass,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_simple_literal_type as _rust_classify_simple_literal_type,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -560,6 +562,8 @@ except ImportError:
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
     _rust_classify_method_signature = None  # type: ignore[assignment]
+    _rust_classify_declared_metaclass = None  # type: ignore[assignment]
+    _rust_classify_recalculate_metaclass = None  # type: ignore[assignment]
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
@@ -749,6 +753,25 @@ _CONFIGURE_INVALID_BASE = 7
 _CONFIGURE_MRO_DUMMY = 1
 _CONFIGURE_MRO_ANY = 2
 _CONFIGURE_MRO_PROCEED = 3
+
+# get_declared_metaclass gate-chain tags (semanal.py:3767-3835): OK returns
+# the fill_typevars instance; DYNAMIC / NAME_ERROR / ANY / INVALID /
+# NOT_METACLASS fail (ANY only under disallow_subclassing_any); DEFER defers.
+_META_OK = 1
+_META_DYNAMIC = 2
+_META_NAME_ERROR = 3
+_META_ANY = 4
+_META_DEFER = 5
+_META_INVALID = 6
+_META_NOT_METACLASS = 7
+
+# recalculate_metaclass tags (semanal.py:3837-3856): ABCMETA installs
+# abc.ABCMeta for protocol-MRO classes, IS_ENUM sets is_enum, and
+# ENUM_GENERIC_FAIL additionally fails "Enum class cannot be generic".
+_RECALC_OK = 0
+_RECALC_ABCMETA = 1
+_RECALC_IS_ENUM = 2
+_RECALC_ENUM_GENERIC_FAIL = 3
 
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
@@ -3777,6 +3800,85 @@ class SemanticAnalyzer(
 
         The two boolean flags can only be True if instance is None.
         """
+        # Native decision head (issue #1037): Rust owns the gate chain
+        # (dynamic / name-error / Any-Var / placeholder / invalid /
+        # not-a-metaclass / ok); Python keeps the lookup, unwrap, fails, fill.
+        if (
+            metaclass_expr
+            and _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_declared_metaclass is not None
+        ):
+            try:
+                metaclass_name = None
+                if isinstance(metaclass_expr, NameExpr):
+                    metaclass_name = metaclass_expr.name
+                elif isinstance(metaclass_expr, MemberExpr):
+                    metaclass_name = get_member_expr_fullname(metaclass_expr)
+                sym_node = None
+                metaclass_info: Node | None = None
+                var_type_wire = None
+                if metaclass_name is not None:
+                    sym = self.lookup_qualified(metaclass_name, metaclass_expr)
+                    if sym is not None:
+                        sym_node = sym.node
+                        metaclass_info = sym_node
+                        # Support type aliases, like `_Meta: TypeAlias = type`
+                        if (
+                            isinstance(sym_node, TypeAlias)
+                            and not sym_node.python_3_12_type_alias
+                            and not sym_node.alias_tvars
+                        ):
+                            target = get_proper_type(sym_node.target)
+                            if isinstance(target, Instance):
+                                metaclass_info = target.type
+                    if isinstance(sym_node, Var) and sym_node.type is not None:
+                        var_type_wire = _serialize_semanal_type(get_proper_type(sym_node.type))
+                tag = _rust_classify_declared_metaclass(
+                    metaclass_name, sym_node, var_type_wire, metaclass_info
+                )
+                if tag == _META_OK:
+                    assert isinstance(metaclass_info, TypeInfo)
+                    inst = fill_typevars(metaclass_info)
+                    assert isinstance(inst, Instance)
+                    return inst, False, False
+                if tag == _META_DYNAMIC:
+                    self.fail(
+                        f'Dynamic metaclass not supported for "{name}"',
+                        metaclass_expr,
+                        code=codes.METACLASS,
+                    )
+                    return None, False, True
+                if tag == _META_NAME_ERROR:
+                    # Probably a name error - it is already handled elsewhere
+                    return None, False, True
+                if tag == _META_ANY:
+                    assert isinstance(sym_node, Var)
+                    if self.options.disallow_subclassing_any:
+                        self.fail(
+                            f'Class cannot use "{sym_node.name}" as a metaclass (has type "Any")',
+                            metaclass_expr,
+                            code=codes.METACLASS,
+                        )
+                    return None, False, True
+                if tag == _META_DEFER:
+                    return None, True, False  # defer later in the caller
+                if tag == _META_INVALID:
+                    self.fail(
+                        f'Invalid metaclass "{metaclass_name}"',
+                        metaclass_expr,
+                        code=codes.METACLASS,
+                    )
+                    return None, False, False
+                if tag == _META_NOT_METACLASS:
+                    self.fail(
+                        'Metaclasses not inheriting from "type" are not supported',
+                        metaclass_expr,
+                        code=codes.METACLASS,
+                    )
+                    return None, False, False
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                pass
         declared_metaclass = None
         if metaclass_expr:
             metaclass_name = None
@@ -3807,7 +3909,7 @@ class SemanticAnalyzer(
                 return None, True, False  # defer later in the caller
 
             # Support type aliases, like `_Meta: TypeAlias = type`
-            metaclass_info: Node | None = sym.node
+            metaclass_info = sym.node
             if (
                 isinstance(sym.node, TypeAlias)
                 and not sym.node.python_3_12_type_alias
@@ -3835,6 +3937,32 @@ class SemanticAnalyzer(
         return declared_metaclass, False, False
 
     def recalculate_metaclass(self, defn: ClassDef, declared_metaclass: Instance | None) -> None:
+        # Native decision head (issue #1037): Rust owns the protocol-MRO
+        # scan and the enum scan as one exclusive 4-way tag; Python keeps
+        # the two unconditional writes, the ABCMeta lookup, is_enum, the fail.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_recalculate_metaclass is not None
+        ):
+            defn.info.declared_metaclass = declared_metaclass
+            defn.info.metaclass_type = defn.info.calculate_metaclass_type()
+            try:
+                tag = _rust_classify_recalculate_metaclass(defn)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == _RECALC_ABCMETA:
+                    # All protocols and their subclasses have ABCMeta metaclass by default.
+                    # TODO: add a metaclass conflict check if there is another metaclass.
+                    abc_meta = self.named_type_or_none("abc.ABCMeta", [])
+                    if abc_meta is not None:  # May be None in tests with incomplete lib-stub.
+                        defn.info.metaclass_type = abc_meta
+                elif tag in (_RECALC_IS_ENUM, _RECALC_ENUM_GENERIC_FAIL):
+                    defn.info.is_enum = True
+                    if tag == _RECALC_ENUM_GENERIC_FAIL and defn.type_vars:
+                        self.fail("Enum class cannot be generic", defn)
+                return
         defn.info.declared_metaclass = declared_metaclass
         defn.info.metaclass_type = defn.info.calculate_metaclass_type()
         if any(info.is_protocol for info in defn.info.mro):
