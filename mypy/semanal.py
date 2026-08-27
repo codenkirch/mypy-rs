@@ -438,6 +438,7 @@ try:
         rust_classify_imports as _rust_classify_imports,
         rust_classify_lvalue_validity as _rust_classify_lvalue_validity,
         rust_classify_member_resolution as _rust_classify_member_resolution,
+        rust_classify_method_signature as _rust_classify_method_signature,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
         rust_classify_simple_literal_type as _rust_classify_simple_literal_type,
         rust_classify_type_expression as _rust_classify_type_expression,
@@ -558,6 +559,7 @@ except ImportError:
     _rust_classify_lvalue_validity = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
+    _rust_classify_method_signature = None  # type: ignore[assignment]
     _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
@@ -685,6 +687,16 @@ _ACTION_ADD_METACLASS = 1
 _NATIVE_FUNC_SIG_OK = 0
 _NATIVE_FUNC_SIG_TOO_FEW = 1
 _NATIVE_FUNC_SIG_TOO_MANY = 2
+
+# prepare_method_signature dispatch tags (see semanal_checks.rs). The
+# unconditional write arms return METH_SIG_OK plus set_is_static /
+# set_is_class write flags in the returned tuple.
+_NATIVE_METH_SIG_ANY_SELF_REPLACE = 0
+_NATIVE_METH_SIG_ANY_SELF_TRIVIAL = 1
+_NATIVE_METH_SIG_REDUNDANT_SELF = 2
+_NATIVE_METH_SIG_EXPLICIT_SELF_CONFLICT = 3
+_NATIVE_METH_SIG_STATIC_SELF_FAIL = 4
+_NATIVE_METH_SIG_OK = 5
 
 # analyze_simple_literal_type dispatch tags (see semanal_visitor.rs).
 # Value kinds classify the constant_fold_expr result; type-name tags select
@@ -1564,8 +1576,56 @@ class SemanticAnalyzer(
 
     def prepare_method_signature(self, func: FuncDef, info: TypeInfo, has_self_type: bool) -> None:
         """Check basic signature validity and tweak annotation of self/cls argument."""
-        # Only non-static methods are special, as well as __new__.
+        # Issue #1036: native method-signature dispatch (strangler-fig). Rust
+        # classifies the branch from live FuncDef facts plus the wire self
+        # type; writes, side effects, and fails stay here. None -> Python body.
         functype = func.type
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_method_signature is not None
+        ):
+            try:
+                decided = self._native_prepare_method_signature(
+                    func, info, has_self_type, functype
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                decided = None
+            if decided is not None:
+                set_is_static, set_is_class, tag = decided
+                if set_is_static:
+                    func.is_static = True
+                if set_is_class:
+                    func.is_class = True
+                if tag in (
+                    _NATIVE_METH_SIG_ANY_SELF_REPLACE,
+                    _NATIVE_METH_SIG_ANY_SELF_TRIVIAL,
+                ):
+                    if tag == _NATIVE_METH_SIG_ANY_SELF_REPLACE:
+                        assert self.type is not None and self.type.self_type is not None
+                        leading_type: Type = self.type.self_type
+                    else:
+                        func.is_trivial_self = True
+                        leading_type = fill_typevars(info)
+                    if func.is_class or func.name == "__new__":
+                        leading_type = self.class_type(leading_type)
+                    assert isinstance(functype, CallableType)
+                    if not has_placeholder(leading_type):
+                        func.type = replace_implicit_first_type(functype, leading_type)
+                elif tag == _NATIVE_METH_SIG_REDUNDANT_SELF:
+                    # This error is off by default, since it is explicitly allowed
+                    # by the PEP 673.
+                    self.fail(
+                        'Redundant "Self" annotation for the first method argument',
+                        func,
+                        code=codes.REDUNDANT_SELF_TYPE,
+                    )
+                elif tag == _NATIVE_METH_SIG_EXPLICIT_SELF_CONFLICT:
+                    self.fail("Method cannot have explicit self annotation and Self type", func)
+                elif tag == _NATIVE_METH_SIG_STATIC_SELF_FAIL:
+                    self.fail("Static methods cannot use Self type", func)
+                return
+        # Only non-static methods are special, as well as __new__.
         if func.name == "__new__":
             func.is_static = True
         if func.has_self_or_cls_argument:
@@ -1576,7 +1636,7 @@ class SemanticAnalyzer(
                 if isinstance(self_type, AnyType):
                     if has_self_type:
                         assert self.type is not None and self.type.self_type is not None
-                        leading_type: Type = self.type.self_type
+                        leading_type = self.type.self_type
                     else:
                         func.is_trivial_self = True
                         leading_type = fill_typevars(info)
@@ -1602,6 +1662,44 @@ class SemanticAnalyzer(
                             )
         elif has_self_type:
             self.fail("Static methods cannot use Self type", func)
+
+    def _native_prepare_method_signature(
+        self, func: FuncDef, info: TypeInfo, has_self_type: bool, functype: ProperType | None
+    ) -> tuple[bool, bool, int] | None:
+        """Gather the scalar facts for rust_classify_method_signature.
+
+        Returns (set_is_static, set_is_class, tag) when Rust decided, or
+        None to defer to the pure-Python body. `is_expected_self_type`
+        needs lookup_qualified, so its result is precomputed here and
+        passed in as a bool (the rust_class_callable pattern); a failure
+        to compute it defers the whole seam.
+        """
+        self_type_wire: bytes | None = None
+        # Unanalyzed-arg kind: 0 = the unanalyzed elif did not apply (not
+        # gathered / unanalyzed_type not callable), 1 = unanalyzed arg0 is
+        # AnyType, 2 = unanalyzed arg0 is not AnyType.
+        unanalyzed_kind = 0
+        expected_self: bool | None = None
+        if func.has_self_or_cls_argument and func.arguments and isinstance(functype, CallableType):
+            self_type = get_proper_type(functype.arg_types[0])
+            self_type_wire = _serialize_semanal_type(self_type)
+            if has_self_type and not isinstance(self_type, AnyType):
+                if isinstance(func.unanalyzed_type, CallableType):
+                    unanalyzed_arg0 = get_proper_type(func.unanalyzed_type.arg_types[0])
+                    unanalyzed_kind = 1 if isinstance(unanalyzed_arg0, AnyType) else 2
+                if unanalyzed_kind == 2:
+                    # Mirrors the pure body's `func.is_class or
+                    # func.name == "__new__"`: the is_class write (1551) has
+                    # fired by this point since has_self_or_cls is true.
+                    effective_is_class = (
+                        bool(func.is_class)
+                        or func.name in ("__init_subclass__", "__class_getitem__")
+                        or func.name == "__new__"
+                    )
+                    expected_self = self.is_expected_self_type(self_type, effective_is_class)
+        return _rust_classify_method_signature(
+            func, self_type_wire, unanalyzed_kind, expected_self, has_self_type
+        )
 
     def is_expected_self_type(self, typ: Type, is_classmethod: bool) -> bool:
         """Does this (analyzed or not) type represent the expected Self type for a method?"""
@@ -2156,9 +2254,7 @@ class SemanticAnalyzer(
             and _rust_classify_function_signature is not None
         ):
             try:
-                tag = _rust_classify_function_signature(
-                    len(sig.arg_types), len(fdef.arguments)
-                )
+                tag = _rust_classify_function_signature(len(sig.arg_types), len(fdef.arguments))
             except (AssertionError, NotImplementedError, ValueError, TypeError):
                 tag = None
             if tag is not None:
@@ -2804,9 +2900,7 @@ class SemanticAnalyzer(
                 # when the registry proves no DefaultPlugin hook matches.
                 from mypy.checkexpr import plugin_hook_known_absent
 
-                if not plugin_hook_known_absent(
-                    "get_class_decorator_hook", decorator_name
-                ):
+                if not plugin_hook_known_absent("get_class_decorator_hook", decorator_name):
                     hook = self.plugin.get_class_decorator_hook(decorator_name)
                 else:
                     hook = None
@@ -2933,7 +3027,9 @@ class SemanticAnalyzer(
                     tag, deprecated_msg = result
             except (AssertionError, NotImplementedError):
                 pass
-        if tag == "final" or (tag is None and refers_to_fullname(decorator, FINAL_DECORATOR_NAMES)):
+        if tag == "final" or (
+            tag is None and refers_to_fullname(decorator, FINAL_DECORATOR_NAMES)
+        ):
             info.is_final = True
         elif tag == "disjoint_base" or (
             tag is None and refers_to_fullname(decorator, DISJOINT_BASE_DECORATOR_NAMES)
@@ -3124,9 +3220,7 @@ class SemanticAnalyzer(
             return None
         try:
             in_protocol_names = sym.node.fullname in PROTOCOL_NAMES
-            return _rust_clean_up_bases(
-                sym.node.fullname, in_protocol_names, bool(base.args)
-            )
+            return _rust_clean_up_bases(sym.node.fullname, in_protocol_names, bool(base.args))
         except (AssertionError, NotImplementedError, ValueError):
             return None
 
@@ -3311,9 +3405,7 @@ class SemanticAnalyzer(
             is_magic: bool | None = None
             if _SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active:
                 try:
-                    is_magic = _rust_is_magic_base(
-                        base_expr, TYPED_NAMEDTUPLE_NAMES, TPDICT_NAMES
-                    )
+                    is_magic = _rust_is_magic_base(base_expr, TYPED_NAMEDTUPLE_NAMES, TPDICT_NAMES)
                 except (AssertionError, NotImplementedError):
                     pass
             if (is_magic is True) or (
