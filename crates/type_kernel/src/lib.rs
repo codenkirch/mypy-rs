@@ -522,6 +522,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_is_typeddict_type_context,
         module
     )?)?;
+    // Issue #980: RefExpr -> TypedDict target predicate; unregistered on
+    // main, which disabled the whole checkexpr kernel block on import.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_refers_to_typeddict,
+        module
+    )?)?;
     // Issue #486: tuple-index / tuple-slice helpers.
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_try_getting_int_literals,
@@ -754,6 +760,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkcall::rust_check_callable_call,
+        module
+    )?)?;
+    // Issue #1000: two-pass argument-inference classifier. Rust decides
+    // pass 1 vs pass 2 per actual; Python applies the results.
+    module.add_function(wrap_pyfunction!(
+        checkcall::rust_get_arg_infer_passes,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
@@ -1226,6 +1238,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_classify_setup_type_vars,
+        module
+    )?)?;
+    // Issue #980 follow-up: Literal classification head; likewise missing
+    // from the registration list, so semanal.py fell back on import.
+    module.add_function(wrap_pyfunction!(
+        semanal_visitor::rust_classify_simple_literal_type,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(

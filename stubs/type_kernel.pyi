@@ -982,6 +982,14 @@ def rust_solve_generic_call(
     infer_unions: bool,
     strict_optional: bool,
 ) -> bytes | None: ...
+def rust_get_arg_infer_passes(
+    resolver: NativeTypeResolver,
+    formal_bytes: list[bytes],
+    actual_bytes: list[bytes],
+    lambda_flags: list[bool],
+    formal_to_actual: list[list[int]],
+    num_actuals: int,
+) -> list[int] | None: ...
 def rust_possible_none_type_var_overlap(
     resolver: NativeTypeResolver,
     arg_type_bytes: list[bytes],
