@@ -2007,7 +2007,15 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         return None
 
     def anal_type_guard_arg(self, t: UnboundType, fullname: str) -> Type | None:
-        if fullname in ("typing_extensions.TypeGuard", "typing.TypeGuard"):
+        tag = self._native_type_guard_arg_tag(fullname, len(t.args), is_typeis=False)
+        if tag == _TYPE_GUARD_TAG_FAIL:
+            self.fail(
+                "TypeGuard must have exactly one type argument", t, code=codes.VALID_TYPE
+            )
+            return AnyType(TypeOfAny.from_error)
+        if tag == _TYPE_GUARD_TAG_RECURSE:
+            return self.anal_type(t.args[0])
+        if tag is None and fullname in ("typing_extensions.TypeGuard", "typing.TypeGuard"):
             if len(t.args) != 1:
                 self.fail(
                     "TypeGuard must have exactly one type argument", t, code=codes.VALID_TYPE
@@ -2025,12 +2033,39 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         return None
 
     def anal_type_is_arg(self, t: UnboundType, fullname: str) -> Type | None:
-        if fullname in ("typing_extensions.TypeIs", "typing.TypeIs"):
+        tag = self._native_type_guard_arg_tag(fullname, len(t.args), is_typeis=True)
+        if tag == _TYPE_GUARD_TAG_FAIL:
+            self.fail("TypeIs must have exactly one type argument", t, code=codes.VALID_TYPE)
+            return AnyType(TypeOfAny.from_error)
+        if tag == _TYPE_GUARD_TAG_RECURSE:
+            return self.anal_type(t.args[0])
+        if tag is None and fullname in ("typing_extensions.TypeIs", "typing.TypeIs"):
             if len(t.args) != 1:
                 self.fail("TypeIs must have exactly one type argument", t, code=codes.VALID_TYPE)
                 return AnyType(TypeOfAny.from_error)
             return self.anal_type(t.args[0])
         return None
+
+    def _native_type_guard_arg_tag(
+        self, fullname: str, args_len: int, *, is_typeis: bool
+    ) -> int | None:
+        """Classify the `anal_type_guard_arg`/`anal_type_is_arg` head in Rust.
+
+        Returns NOT_GUARD (fullname outside the family -> the wrapper
+        returns None), FAIL (arity != 1 -> the shim emits the VALID_TYPE
+        fail + AnyType(from_error)), or RECURSE (the shim runs
+        `anal_type(t.args[0])`). The `isinstance(t, UnboundType)` check and
+        `lookup_qualified` stay Python-side (the shim precomputes the
+        fullname), so all Rust facts are scalars and the classifier never
+        defers; `None` only means the gate is off. See
+        crates/type_kernel/src/typeanal_special.rs for the tag table.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        try:
+            return _rust_classify_type_guard_arg(fullname, args_len, is_typeis)
+        except (AssertionError, NotImplementedError):
+            return None
 
     def anal_star_arg_type(self, t: Type, kind: ArgKind, nested: bool) -> tuple[str | None, Type]:
         """Analyze signature argument type for *args and **kwargs argument."""
@@ -3682,6 +3717,7 @@ try:
         rust_classify_raw_expression_type as _rust_classify_raw_expression_type,
         rust_classify_special_unbound as _rust_classify_special_unbound,
         rust_classify_tuple_type_implicit as _rust_classify_tuple_type_implicit,
+        rust_classify_type_guard_arg as _rust_classify_type_guard_arg,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
@@ -3734,6 +3770,7 @@ except ImportError:
     _rust_classify_raw_expression_type = None  # type: ignore[assignment]
     _rust_classify_check_warn_deprecated = None  # type: ignore[assignment]
     _rust_classify_analyze_callable_type = None  # type: ignore[assignment]
+    _rust_classify_type_guard_arg = None  # type: ignore[assignment]
     _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
@@ -3881,6 +3918,13 @@ _TUPLE_TAG_OK = 0
 _TUPLE_TAG_EMPTY = 1
 _TUPLE_TAG_SINGLE = 2
 _TUPLE_TAG_MULTI = 3
+
+# Branch tags for `anal_type_guard_arg` / `anal_type_is_arg` (issue #1043).
+# Mirrored in crates/type_kernel/src/typeanal_special.rs; Python applies
+# the VALID_TYPE fail + AnyType(from_error) or the anal_type recursion.
+_TYPE_GUARD_TAG_NOT_GUARD = 0
+_TYPE_GUARD_TAG_FAIL = 1
+_TYPE_GUARD_TAG_RECURSE = 2
 
 # Branch tags for `analyze_callable_type` (issue #958), mirrored in
 # crates/type_kernel/src/typeanal_callable.rs; Python builds the live

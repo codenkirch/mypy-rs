@@ -2009,6 +2009,11 @@ def rust_classify_analyze_callable_type(
     arg0_is_ellipsis: bool,
     disallow_any_generics: bool,
 ) -> int | None: ...
+def rust_classify_type_guard_arg(
+    fullname: str,
+    args_len: int,
+    is_typeis: bool,
+) -> int | None: ...
 
 # mypy/semanal.py — decorator/semanal-visitor helpers.
 def rust_erase_func_annotations(func: Any) -> None: ...

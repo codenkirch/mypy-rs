@@ -314,6 +314,41 @@ pub(crate) fn rust_classify_tuple_type_implicit(
     Ok(Some(tag))
 }
 
+// TypeGuard/TypeIs argument tags for the Python shim (anal_type_guard_arg /
+// anal_type_is_arg, typeanal.py:2009-2033). NOT_GUARD lets the Python
+// wrapper return None; FAIL/RECURSE select the shim's side effects.
+const TAG_GUARD_NOT_GUARD: i64 = 0; // fullname not in the family -> Python returns None
+const TAG_GUARD_FAIL: i64 = 1; // arity != 1 -> fail(VALID_TYPE) + Any(from_error)
+const TAG_GUARD_RECURSE: i64 = 2; // arity == 1 -> anal_type(t.args[0])
+
+/// `anal_type_guard_arg` / `anal_type_is_arg` classifier (typeanal.py
+/// 2009-2033). Mirrors the two-step decision: family membership by the
+/// `is_typeis` flag (TypeGuard vs TypeIs name-sets), then the arity gate.
+/// All facts are scalars (the shim precomputes the fullname via
+/// `lookup_qualified`; the `isinstance(t, UnboundType)` check stays
+/// Python-side), so the classifier never defers: every (fullname,
+/// args_len, is_typeis) triple maps to exactly one tag, and `None` is
+/// unreachable (kept as the exception-only deferral shape).
+#[pyfunction]
+pub(crate) fn rust_classify_type_guard_arg(
+    fullname: String,
+    args_len: usize,
+    is_typeis: bool,
+) -> PyResult<Option<i64>> {
+    let in_family = if is_typeis {
+        fullname == "typing.TypeIs" || fullname == "typing_extensions.TypeIs"
+    } else {
+        fullname == "typing.TypeGuard" || fullname == "typing_extensions.TypeGuard"
+    };
+    if !in_family {
+        return Ok(Some(TAG_GUARD_NOT_GUARD));
+    }
+    if args_len != 1 {
+        return Ok(Some(TAG_GUARD_FAIL));
+    }
+    Ok(Some(TAG_GUARD_RECURSE))
+}
+
 /// Classify the tail of `try_analyze_special_unbound_type`
 /// (typeanal.py:1168-1202): the TypeGuard/TypeIs is-check families, the
 /// Unpack and Self special forms, and the non-special tail.
@@ -905,5 +940,100 @@ mod tuple_implicit_tests {
     #[test]
     fn implicit_many_items() {
         assert_eq!(classify(true, false, 3), Some(TAG_TUPLE_MULTI));
+    }
+}
+
+#[cfg(test)]
+mod type_guard_arg_tests {
+    use super::*;
+
+    fn classify(fullname: &str, args_len: usize, is_typeis: bool) -> Option<i64> {
+        rust_classify_type_guard_arg(fullname.to_string(), args_len, is_typeis).unwrap()
+    }
+
+    #[test]
+    fn guard_one_arg_recurses() {
+        assert_eq!(
+            classify("typing.TypeGuard", 1, false),
+            Some(TAG_GUARD_RECURSE)
+        );
+    }
+
+    #[test]
+    fn guard_ext_one_arg_recurses() {
+        assert_eq!(
+            classify("typing_extensions.TypeGuard", 1, false),
+            Some(TAG_GUARD_RECURSE)
+        );
+    }
+
+    #[test]
+    fn guard_zero_args_fails() {
+        assert_eq!(classify("typing.TypeGuard", 0, false), Some(TAG_GUARD_FAIL));
+    }
+
+    #[test]
+    fn guard_two_args_fails() {
+        assert_eq!(
+            classify("typing_extensions.TypeGuard", 2, false),
+            Some(TAG_GUARD_FAIL)
+        );
+    }
+
+    #[test]
+    fn typeis_one_arg_recurses() {
+        assert_eq!(classify("typing.TypeIs", 1, true), Some(TAG_GUARD_RECURSE));
+    }
+
+    #[test]
+    fn typeis_ext_one_arg_recurses() {
+        assert_eq!(
+            classify("typing_extensions.TypeIs", 1, true),
+            Some(TAG_GUARD_RECURSE)
+        );
+    }
+
+    #[test]
+    fn typeis_zero_args_fails() {
+        assert_eq!(classify("typing.TypeIs", 0, true), Some(TAG_GUARD_FAIL));
+    }
+
+    #[test]
+    fn typeis_two_args_fails() {
+        assert_eq!(classify("typing.TypeIs", 3, true), Some(TAG_GUARD_FAIL));
+    }
+
+    #[test]
+    fn non_guard_fullname_is_not_guard() {
+        assert_eq!(
+            classify("mod.NotAGuard", 1, false),
+            Some(TAG_GUARD_NOT_GUARD)
+        );
+        assert_eq!(
+            classify("mod.NotAGuard", 0, true),
+            Some(TAG_GUARD_NOT_GUARD)
+        );
+    }
+
+    #[test]
+    fn guard_fullname_with_typeis_flag_is_not_guard() {
+        // The name-sets are disjoint: a TypeGuard fullname with the TypeIs
+        // flag is outside the TypeIs family (and vice versa).
+        assert_eq!(
+            classify("typing.TypeGuard", 1, true),
+            Some(TAG_GUARD_NOT_GUARD)
+        );
+        assert_eq!(
+            classify("typing.TypeIs", 1, false),
+            Some(TAG_GUARD_NOT_GUARD)
+        );
+    }
+
+    #[test]
+    fn other_special_form_is_not_guard() {
+        assert_eq!(
+            classify("typing.Optional", 1, false),
+            Some(TAG_GUARD_NOT_GUARD)
+        );
     }
 }
