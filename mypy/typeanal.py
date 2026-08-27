@@ -2133,27 +2133,46 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         # instead.
 
         if self.report_invalid_types:
-            if t.base_type_name in ("builtins.int", "builtins.bool"):
-                # The only time it makes sense to use an int or bool is inside of
-                # a literal type.
-                msg = f"Invalid type: try using Literal[{repr(t.literal_value)}] instead?"
-            elif t.base_type_name in ("builtins.float", "builtins.complex"):
-                # We special-case warnings for floats and complex numbers.
-                msg = f"Invalid type: {t.simple_name()} literals cannot be used as a type"
-            else:
-                # And in all other cases, we default to a generic error message.
-                # Note: the reason why we use a generic error message for strings
-                # but not ints or bools is because whenever we see an out-of-place
-
-                # string, it's unclear if the user meant to construct a literal type
-                # or just misspelled a regular type. So we avoid guessing.
-                msg = "Invalid type comment or annotation"
-
+            msg = self._native_raw_expression_message(t)
+            if msg is None:
+                if t.base_type_name in ("builtins.int", "builtins.bool"):
+                    msg = f"Invalid type: try using Literal[{repr(t.literal_value)}] instead?"
+                elif t.base_type_name in ("builtins.float", "builtins.complex"):
+                    msg = f"Invalid type: {t.simple_name()} literals cannot be used as a type"
+                else:
+                    msg = "Invalid type comment or annotation"
             self.fail(msg, t, code=codes.VALID_TYPE)
             if t.note is not None:
                 self.note(t.note, t, code=codes.VALID_TYPE)
 
         return AnyType(TypeOfAny.from_error, line=t.line, column=t.column)
+
+    def _native_raw_expression_message(self, t: RawExpressionType) -> str | None:
+        """Classify the `visit_raw_expression_type` message head in Rust.
+
+        Returns the formatted fail message, or `None` to run the pure-Python
+        `if`/`elif` chain. Rust owns only the 3-way set-membership branch
+        (int/bool, float/complex, else); `self.fail` / `self.note` side
+        effects and the trailing `AnyType` stay Python-side. See
+        crates/type_kernel/src/typeanal_rawexpr.rs for the tag table.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        try:
+            tag = _rust_classify_raw_expression_type(
+                self.report_invalid_types,
+                t.base_type_name,
+                t.note is None,
+            )
+        except (AssertionError, NotImplementedError):
+            return None
+        if tag is None:
+            return None
+        if tag == _RAW_EXPR_TAG_LITERAL:
+            return f"Invalid type: try using Literal[{repr(t.literal_value)}] instead?"
+        if tag == _RAW_EXPR_TAG_NUMERIC_LITERALS:
+            return f"Invalid type: {t.simple_name()} literals cannot be used as a type"
+        return "Invalid type comment or annotation"
 
     def visit_literal_type(self, t: LiteralType) -> Type:
         return t
@@ -3456,8 +3475,9 @@ try:
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
         rust_check_vec_type_args as _rust_check_vec_type_args,
-rust_classify_literal_param as _rust_classify_literal_param,
-rust_classify_special_unbound as _rust_classify_special_unbound,
+        rust_classify_literal_param as _rust_classify_literal_param,
+        rust_classify_special_unbound as _rust_classify_special_unbound,
+        rust_classify_raw_expression_type as _rust_classify_raw_expression_type,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
@@ -3505,6 +3525,7 @@ except ImportError:
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
     _rust_classify_literal_param = None  # type: ignore[assignment]
+    _rust_classify_raw_expression_type = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -3629,6 +3650,13 @@ _LITERAL_PARAM_TAG_NONE_OR_LITERAL = 7
 _LITERAL_PARAM_TAG_INSTANCE_LKV = 8
 _LITERAL_PARAM_TAG_UNION_RECURSE = 9
 _LITERAL_PARAM_TAG_INVALID = 10
+
+# Message tags for `visit_raw_expression_type` (issue #924).
+# Mirrored in crates/type_kernel/src/typeanal_rawexpr.rs; Python formats the
+# message and applies self.fail / self.note for the tag Rust returns.
+_RAW_EXPR_TAG_LITERAL = 0
+_RAW_EXPR_TAG_NUMERIC_LITERALS = 1
+_RAW_EXPR_TAG_GENERIC = 2
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the

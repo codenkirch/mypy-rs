@@ -9646,6 +9646,147 @@ class NativeTryAnalyzeSpecialUnboundSuite(Suite):
         self._assert_par("typing_extensions.Self")
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRawExpressionTypeSuite(Suite):
+    """Parity for the Rust `visit_raw_expression_type` message classifier.
+
+    The 3-way dispatch (int/bool -> Literal hint, float/complex -> "literals
+    cannot be used", else -> generic "Invalid type comment or annotation") is
+    decided in Rust from scalar facts (`report_invalid_types`,
+    `base_type_name`); the Python shim formats the message and applies
+    `self.fail` / `self.note` for the tag Rust returns. When
+    `report_invalid_types` is false the head is skipped entirely and Rust
+    defers (`None`), so no message is emitted and the trailing `AnyType`
+    is returned unchanged.
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical (str(result), captured fail/note messages), and a
+    direct seam call proves the classifier engages on each branch.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self, report_invalid_types: bool = True) -> tuple[object, object]:
+        from mypy.errors import ErrorCode as _ErrorCode
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.errors: list[str] = []
+
+            def fail(self, msg: str, ctx: Context, code: _ErrorCode | None = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: _ErrorCode | None = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.report_invalid_types = report_invalid_types
+        return ta, api
+
+    def _call(self, ta: object, t: object) -> tuple[str, list[str]]:
+        result = ta.visit_raw_expression_type(t)
+        messages = list(ta.api.errors)
+        return str(result), messages
+
+    def _make_t(
+        self, base_type_name: str, literal_value: object, note: str | None = None
+    ) -> object:
+        from mypy.types import RawExpressionType
+
+        return RawExpressionType(literal_value, base_type_name, line=-1, column=-1, note=note)
+
+    def _assert_par(
+        self,
+        base_type_name: str,
+        literal_value: object,
+        *,
+        note: str | None = None,
+        report_invalid_types: bool = True,
+    ) -> None:
+        t = self._make_t(base_type_name, literal_value, note)
+        off_ta, _ = self._analyser(report_invalid_types=report_invalid_types)
+        off = self._with_gate(False, lambda: self._call(off_ta, t))
+        on_ta, _ = self._analyser(report_invalid_types=report_invalid_types)
+        on = self._with_gate(True, lambda: self._call(on_ta, t))
+        assert_equal(on[0], off[0], f"raw_expr parity result {base_type_name}")
+        assert_equal(on[1], off[1], f"raw_expr parity messages {base_type_name}")
+
+    def _assert_engages(
+        self, base_type_name: str, report_invalid_types: bool = True, note_is_none: bool = True
+    ) -> None:
+        from mypy.typeanal import _rust_classify_raw_expression_type
+
+        tag = _rust_classify_raw_expression_type(
+            report_invalid_types, base_type_name, note_is_none
+        )
+        assert tag is not None, f"seam did not engage for {base_type_name}"
+
+    def _assert_defers(self, base_type_name: str) -> None:
+        from mypy.typeanal import _rust_classify_raw_expression_type
+
+        tag = _rust_classify_raw_expression_type(False, base_type_name, True)
+        assert tag is None, f"seam did not defer for {base_type_name}"
+
+    def test_int_literal(self) -> None:
+        self._assert_par("builtins.int", 1)
+        self._assert_engages("builtins.int")
+
+    def test_bool_literal(self) -> None:
+        self._assert_par("builtins.bool", True)
+        self._assert_engages("builtins.bool")
+
+    def test_float_literal(self) -> None:
+        self._assert_par("builtins.float", 1.0)
+        self._assert_engages("builtins.float")
+
+    def test_complex_literal(self) -> None:
+        self._assert_par("builtins.complex", 1j)
+        self._assert_engages("builtins.complex")
+
+    def test_generic(self) -> None:
+        self._assert_par("builtins.str", "x")
+        self._assert_engages("builtins.str")
+
+    def test_report_off_defers(self) -> None:
+        # report_invalid_types False skips the whole head; no message is
+        # emitted and the trailing AnyType is returned unchanged.
+        self._assert_par("builtins.int", 1, report_invalid_types=False)
+        self._assert_defers("builtins.int")
+
+    def test_note_present(self) -> None:
+        self._assert_par("builtins.int", 1, note="see PEP 586")
+
+    def test_note_present_generic(self) -> None:
+        self._assert_par("builtins.str", "x", note="custom note")
+
+    def test_engages_all_branches(self) -> None:
+        # Direct seam calls prove the classifier decides each bucket.
+        self._assert_engages("builtins.int")
+        self._assert_engages("builtins.bool")
+        self._assert_engages("builtins.float")
+        self._assert_engages("builtins.complex")
+        self._assert_engages("builtins.str")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeAnalyzeTypeWithInfoSuite(Suite):
     """Parity for the Rust `analyze_type_with_type_info` decision front.
 

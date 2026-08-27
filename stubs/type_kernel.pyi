@@ -1767,6 +1767,11 @@ def rust_classify_special_unbound(
     not_in_unpack: bool,
     allow_unpack: bool,
 ) -> int | None: ...
+def rust_classify_raw_expression_type(
+    report_invalid_types: bool,
+    base_type_name: str,
+    note_is_none: bool,
+) -> int | None: ...
 
 # mypy/semanal.py — decorator/semanal-visitor helpers.
 def rust_erase_func_annotations(func: Any) -> None: ...
