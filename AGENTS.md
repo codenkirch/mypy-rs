@@ -752,6 +752,23 @@ including:
   Measured (self-check): 18623 calls, 13049 decided (70% native).
   Covered by `NativeProtocolImplementationSuite` in
   `mypy/test/testtypes.py`.
+- `rust_refers_to_typeddict` (issue #980, mypy.checkexpr) — mirrors the
+  pure bool predicate `ExpressionChecker.refers_to_typeddict`
+  (checkexpr.py:1385-1393), which runs for every call expression. Rust
+  reads the live callee via PyO3 `is_instance` (mirroring
+  `rust_classify_lvalue_validity`): `RefExpr` gate, then `node` as
+  `TypeInfo` with `typeddict_type is not None` (direct reference), then
+  `node` as `TypeAlias` whose target proper-type — serialized to wire
+  bytes by the Python shim — decodes to `Type::TypedDictType`. Returns
+  a plain bool; the only raise is a TypeAlias node without decodable
+  target bytes (unreachable through the shim), which the Python shim
+  treats as a fallback to the pure-Python body. Python keeps the
+  consumer branch (`accept` + `check_typeddict_call`) unchanged.
+  Gated by `_native_checkexpr_active` (existing wiring, no build.py
+  change) and covered by `NativeRefersToTypedDictSuite` in
+  `mypy/test/testtypes.py` (direct seam calls plus gate-off vs gate-on
+  differential over all branches), plus wire round-trip unit tests in
+  `checkexpr_functions.rs`.
 - `rust_has_abstract_type` (mypy.checkexpr) — mirrors
   `TypeChecker.has_abstract_type` (checkexpr.py:8134-8143): a pure
   boolean conjunction over live types. The seam reads live Python

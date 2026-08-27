@@ -563,6 +563,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_refers_to_typeddict,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_classify_reveal_imported,
         module
     )?)?;

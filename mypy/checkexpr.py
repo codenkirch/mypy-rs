@@ -253,6 +253,7 @@ try:
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
+        rust_refers_to_typeddict as _rust_refers_to_typeddict,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
         rust_container_type as _rust_container_type,
@@ -328,6 +329,7 @@ except ImportError:
     _rust_classify_super_arg_types = None  # type: ignore[assignment]
     _rust_classify_visit_op_expr = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
+    _rust_refers_to_typeddict = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
     _rust_real_union = None  # type: ignore[assignment]
@@ -1383,6 +1385,20 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         return self.visit_call_expr_inner(e, allow_none_return=allow_none_return)
 
     def refers_to_typeddict(self, base: Expression) -> bool:
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                # The TypeAlias arm is decided in Rust from the wire bytes
+                # of the target's proper type; serialize it here so the
+                # seam never needs the resolver.
+                target_bytes: bytes | None = None
+                node = getattr(base, "node", None)
+                if isinstance(node, TypeAlias):
+                    target_bytes = _serialize_type_for_checkexpr(
+                        get_proper_type(node.target)
+                    )
+                return _rust_refers_to_typeddict(base, target_bytes)
+            except (AssertionError, NotImplementedError, ValueError):
+                pass
         if not isinstance(base, RefExpr):
             return False
         if isinstance(base.node, TypeInfo) and base.node.typeddict_type is not None:
