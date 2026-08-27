@@ -280,6 +280,40 @@ pub(crate) fn rust_classify_special_unbound(
     Ok(Some(tag))
 }
 
+// Implicit-tuple message tags for the Python shim (visit_tuple_type,
+// typeanal.py:2041-2058). OK takes the normal reconstruction path;
+// EMPTY/SINGLE/MULTI select the one-of-three suggestion note.
+const TAG_TUPLE_OK: i64 = 0; // normal path: named_type + anal_array
+const TAG_TUPLE_EMPTY: i64 = 1; // len(items) == 0 -> Tuple[()] suggestion
+const TAG_TUPLE_SINGLE: i64 = 2; // len(items) == 1 -> spurious comma
+const TAG_TUPLE_MULTI: i64 = 3; // len(items) > 1 -> Tuple[T1, ..., Tn]
+
+/// `visit_tuple_type` implicit-tuple message-arbitration classifier.
+/// Mirrors the branch order of typeanal.py:2041-2058: the error head fires
+/// only when `t.implicit` is set and `allow_tuple_literal` is off; inside
+/// the head the note is chosen by `len(t.items)`. All three facts are
+/// scalars, so the classifier never defers: every (implicit,
+/// allow_tuple_literal, items_len) triple maps to exactly one tag, and
+/// `None` is unreachable (kept as the exception-only deferral shape).
+#[pyfunction]
+pub(crate) fn rust_classify_tuple_type_implicit(
+    implicit: bool,
+    allow_tuple_literal: bool,
+    items_len: usize,
+) -> PyResult<Option<i64>> {
+    if !(implicit && !allow_tuple_literal) {
+        return Ok(Some(TAG_TUPLE_OK));
+    }
+    let tag = if items_len == 0 {
+        TAG_TUPLE_EMPTY
+    } else if items_len == 1 {
+        TAG_TUPLE_SINGLE
+    } else {
+        TAG_TUPLE_MULTI
+    };
+    Ok(Some(tag))
+}
+
 /// Classify the tail of `try_analyze_special_unbound_type`
 /// (typeanal.py:1168-1202): the TypeGuard/TypeIs is-check families, the
 /// Unpack and Self special forms, and the non-special tail.
@@ -837,5 +871,39 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(classify(&f), None);
+    }
+}
+
+#[cfg(test)]
+mod tuple_implicit_tests {
+    use super::*;
+
+    fn classify(implicit: bool, allow_tuple_literal: bool, items_len: usize) -> Option<i64> {
+        rust_classify_tuple_type_implicit(implicit, allow_tuple_literal, items_len).unwrap()
+    }
+
+    #[test]
+    fn not_implicit_is_ok() {
+        assert_eq!(classify(false, false, 2), Some(TAG_TUPLE_OK));
+    }
+
+    #[test]
+    fn implicit_with_allowed_literal_is_ok() {
+        assert_eq!(classify(true, true, 0), Some(TAG_TUPLE_OK));
+    }
+
+    #[test]
+    fn implicit_empty_items() {
+        assert_eq!(classify(true, false, 0), Some(TAG_TUPLE_EMPTY));
+    }
+
+    #[test]
+    fn implicit_single_item() {
+        assert_eq!(classify(true, false, 1), Some(TAG_TUPLE_SINGLE));
+    }
+
+    #[test]
+    fn implicit_many_items() {
+        assert_eq!(classify(true, false, 3), Some(TAG_TUPLE_MULTI));
     }
 }

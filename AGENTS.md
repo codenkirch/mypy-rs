@@ -807,6 +807,22 @@ including:
   covered by `NativeRawExpressionTypeSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), and pure
   decision unit tests in `typeanal_rawexpr.rs`.
+- `rust_classify_tuple_type_implicit` (issue #983) — mirrors the
+  implicit-tuple message-arbitration head of
+  `TypeAnalyser.visit_tuple_type` (typeanal.py:2038-2058): Rust reads
+  three scalars (`t.implicit`, `allow_tuple_literal`, `len(t.items)`)
+  and returns a tag OK (0, normal named_type + anal_array
+  reconstruction), EMPTY (1, `Tuple[()]` suggestion), SINGLE (2,
+  spurious-trailing-comma suggestion), or MULTI (3, `Tuple[T1, ..., Tn]`
+  suggestion). The Python shim applies the
+  "Syntax error in type annotation" fail + one-of-three note and, on OK,
+  the reconstruction; the pure-Python arbitration is the fallback when
+  the gate is off. Never defers: all three facts are scalars, so every
+  triple maps to exactly one tag. Lives in `typeanal_special.rs`,
+  gated by `_set_native_typeanal_active` (wired from `mypy/build.py`)
+  and covered by `NativeTupleTypeImplicitSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `typeanal_special.rs`.
 - `rust_classify_function_signature` (issue #940) — mirrors the count
   arbitration of `SemanticAnalyzer.check_function_signature`
   (semanal.py:2072): compares `len(sig.arg_types)` against
