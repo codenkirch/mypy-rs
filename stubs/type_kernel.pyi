@@ -220,6 +220,9 @@ __all__ = [
     "rust_classify_rvalue_count",
     "rust_classify_truthy_type",
     "rust_classify_missing_annotations",
+    "rust_classify_return_stmt_variant",
+    "rust_classify_return_stmt_pre",
+    "rust_classify_return_stmt_post",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_conditional_types",
@@ -873,6 +876,24 @@ def rust_classify_missing_annotations(
     strict_optional: bool,
     resolver: NativeTypeResolver,
 ) -> tuple[int, bool] | None: ...
+def rust_classify_return_stmt_variant(is_generator: bool, is_coroutine: bool) -> int: ...
+def rust_classify_return_stmt_pre(
+    return_type_bytes: bytes, is_lambda: bool
+) -> bool | None: ...
+def rust_classify_return_stmt_post(
+    typ_bytes: bytes | None,
+    return_type_bytes: bytes,
+    is_async_generator: bool,
+    is_generator: bool,
+    is_coroutine: bool,
+    declared_none_return: bool,
+    warn_return_any: bool,
+    current_node_deferred: bool,
+    name_in_binary_magic: bool,
+    expr_is_literal_not_implemented: bool,
+    is_lambda: bool,
+    in_checked_function: bool,
+) -> int | None: ...
 def rust_classify_lvalue_validity(node: Any) -> int: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes

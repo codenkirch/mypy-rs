@@ -3095,6 +3095,20 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checker_functions::rust_classify_truthy_type,
         module
     )?)?;
+    // Issue #1004: check_return_stmt two-phase decision port; the accept()
+    // call and the fail/note emissions stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_return_stmt_variant,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_return_stmt_pre,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_return_stmt_post,
+        module
+    )?)?;
 
     // Issue #1009: check_for_missing_annotations decision-head port. Rust
     // arbitrates the annotation-completeness gates; the fail/note emission

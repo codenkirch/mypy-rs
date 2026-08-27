@@ -3117,6 +3117,218 @@ pub(crate) fn rust_classify_truthy_type(py: Python<'_>, t: &PyAny) -> PyResult<O
         is_iterable_instance,
     )))
 }
+// ---------------------------------------------------------------------------
+// check_return_stmt two-phase decision port (issue #1004)
+// ---------------------------------------------------------------------------
+
+/// Decision tags for the `check_return_stmt` seam; must match
+/// `NATIVE_RETURN_*` in mypy/checker.py. Phase 1's NO_RETURN_EXPECTED arm
+/// returns a bool from `rust_classify_return_stmt_pre`, so it has no tag
+/// here; the shim applies the fail directly.
+const RETURN_VARIANT_GENERATOR: i64 = 1;
+const RETURN_VARIANT_COROUTINE: i64 = 2;
+const RETURN_VARIANT_PLAIN: i64 = 3;
+
+const RETURN_TAG_ASYNC_GEN_FAIL: i64 = 2;
+const RETURN_TAG_WARN_ANY: i64 = 3;
+const RETURN_TAG_ANY_RETURN: i64 = 4;
+const RETURN_TAG_NONE_OK: i64 = 5;
+const RETURN_TAG_NONE_FAIL: i64 = 6;
+const RETURN_TAG_CHECK_SUBTYPE: i64 = 7;
+const RETURN_TAG_EMPTY_OK: i64 = 8;
+const RETURN_TAG_EMPTY_FAIL: i64 = 9;
+
+/// Pure phase-1 decision mirroring the return-type variant dispatch of
+/// `TypeChecker.check_return_stmt` (checker.py:6441-6452). The variant
+/// selection itself (get_generator_return_type / get_coroutine_return_type)
+/// stays Python-side: those helpers are separately native-accelerated and
+/// the shim dispatches on this tag.
+#[pyfunction]
+pub(crate) fn rust_classify_return_stmt_variant(
+    is_generator: bool,
+    is_coroutine: bool,
+) -> PyResult<i64> {
+    if is_generator {
+        Ok(RETURN_VARIANT_GENERATOR)
+    } else if is_coroutine {
+        Ok(RETURN_VARIANT_COROUTINE)
+    } else {
+        Ok(RETURN_VARIANT_PLAIN)
+    }
+}
+
+/// Pure phase-1b decision (checker.py:6453-6459): fire NO_RETURN_EXPECTED
+/// on a non-ambiguous `UninhabitedType` return type, except in lambdas
+/// (which suppress the extra message for failed inference). Returns
+/// `Some(true)` when the shim must emit the fail and return; `Some(false)`
+/// to proceed.
+fn classify_return_stmt_pre(ret: &Type, is_lambda: bool) -> bool {
+    match ret {
+        Type::UninhabitedType { ambiguous } => !is_lambda && !ambiguous,
+        _ => false,
+    }
+}
+
+/// `#[pyfunction]` entry for the phase-1 NO_RETURN_EXPECTED arm. Reads the
+/// proper `return_type` from the wire. Defers (`None`) on an undecodable
+/// blob so the shim re-derives the decision in Python.
+#[pyfunction]
+pub(crate) fn rust_classify_return_stmt_pre(
+    return_type_bytes: &[u8],
+    is_lambda: bool,
+) -> PyResult<Option<bool>> {
+    let ret = match crate::checkmember::decode_type(return_type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(Some(classify_return_stmt_pre(&ret, is_lambda)))
+}
+
+/// `is_proper_subtype(AnyType(TypeOfAny.special_form), ret)` decided
+/// structurally: proper subtyping of an `AnyType` left operand holds iff the
+/// right side is `AnyType` too (subtypes.py, `visit_any` with
+/// `proper_subtype=True`), or is a union one of whose items is (subtypes.py
+/// decomposes a non-union left against union right items before reaching the
+/// visitor). `return_type` is always a proper type here (the shim ran
+/// `get_proper_type` before serializing), so `TypeAliasType` and non-union
+/// nesting are not reachable.
+fn any_is_proper_subtype_of(ret: &Type) -> bool {
+    match ret {
+        Type::AnyType { .. } => true,
+        Type::UnionType { items, .. } => items.iter().any(any_is_proper_subtype_of),
+        _ => false,
+    }
+}
+
+/// Pure phase-2 decision mirroring the post-accept arms
+/// (checker.py:6576-6627, `typ` present) and the empty-return arms
+/// (checker.py:6613-6626, `typ` absent).
+///
+/// `typ is None` selects the empty-return arms; the warn_return_any gate's
+/// `not is_proper_subtype(AnyType(TypeOfAny.special_form), return_type)`
+/// clause is decided structurally by `any_is_proper_subtype_of` (AnyType +
+/// union-item decomposition).
+#[allow(clippy::too_many_arguments)]
+fn classify_return_stmt_post(
+    typ: Option<&Type>,
+    ret: &Type,
+    is_async_generator: bool,
+    is_generator: bool,
+    is_coroutine: bool,
+    declared_none_return: bool,
+    warn_return_any: bool,
+    current_node_deferred: bool,
+    name_in_binary_magic: bool,
+    expr_is_literal_not_implemented: bool,
+    is_lambda: bool,
+    in_checked_function: bool,
+) -> i64 {
+    let typ = match typ {
+        None => {
+            // Empty returns are valid in generators with Any typed returns,
+            // but not in coroutines (checker.py:6614-6626).
+            if is_generator && !is_coroutine && matches!(ret, Type::AnyType { .. }) {
+                return RETURN_TAG_EMPTY_OK;
+            }
+            if matches!(ret, Type::NoneType | Type::AnyType { .. }) {
+                return RETURN_TAG_EMPTY_OK;
+            }
+            if in_checked_function {
+                return RETURN_TAG_EMPTY_FAIL;
+            }
+            return RETURN_TAG_EMPTY_OK;
+        }
+        Some(t) => t,
+    };
+    if is_async_generator {
+        return RETURN_TAG_ASYNC_GEN_FAIL;
+    }
+    // Returning a value of type Any is always fine (checker.py:6581-6602).
+    if matches!(typ, Type::AnyType { .. }) {
+        let ret_is_object =
+            matches!(ret, Type::Instance { type_ref, .. } if type_ref == "builtins.object");
+        if warn_return_any
+            && !current_node_deferred
+            && !any_is_proper_subtype_of(ret)
+            && !(name_in_binary_magic && expr_is_literal_not_implemented)
+            && !ret_is_object
+            && !is_lambda
+        {
+            return RETURN_TAG_WARN_ANY;
+        }
+        return RETURN_TAG_ANY_RETURN;
+    }
+    // Disallow return expressions in functions declared to return None,
+    // subject to the lambda / None-value exemptions (checker.py:6605-6612).
+    if declared_none_return {
+        if is_lambda || matches!(typ, Type::NoneType) {
+            return RETURN_TAG_NONE_OK;
+        }
+        return RETURN_TAG_NONE_FAIL;
+    }
+    RETURN_TAG_CHECK_SUBTYPE
+}
+
+/// `#[pyfunction]` entry for the phase-2 classification. `typ_bytes` is
+/// `None` for an empty return; otherwise the serialized accepted expression
+/// type. Defers (`None`) on an undecodable blob so the Python shim falls
+/// back to the pure-Python tail.
+#[pyfunction]
+#[pyo3(signature = (
+    typ_bytes,
+    return_type_bytes,
+    is_async_generator,
+    is_generator,
+    is_coroutine,
+    declared_none_return,
+    warn_return_any,
+    current_node_deferred,
+    name_in_binary_magic,
+    expr_is_literal_not_implemented,
+    is_lambda,
+    in_checked_function
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_classify_return_stmt_post(
+    typ_bytes: Option<&[u8]>,
+    return_type_bytes: &[u8],
+    is_async_generator: bool,
+    is_generator: bool,
+    is_coroutine: bool,
+    declared_none_return: bool,
+    warn_return_any: bool,
+    current_node_deferred: bool,
+    name_in_binary_magic: bool,
+    expr_is_literal_not_implemented: bool,
+    is_lambda: bool,
+    in_checked_function: bool,
+) -> PyResult<Option<i64>> {
+    let ret = match crate::checkmember::decode_type(return_type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let typ = match typ_bytes {
+        None => None,
+        Some(bytes) => match crate::checkmember::decode_type(bytes) {
+            Some(t) => Some(t),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(classify_return_stmt_post(
+        typ.as_ref(),
+        &ret,
+        is_async_generator,
+        is_generator,
+        is_coroutine,
+        declared_none_return,
+        warn_return_any,
+        current_node_deferred,
+        name_in_binary_magic,
+        expr_is_literal_not_implemented,
+        is_lambda,
+        in_checked_function,
+    )))
+}
 
 #[cfg(test)]
 mod truthy_type_tests {
@@ -3396,5 +3608,645 @@ mod check_final_tests {
     #[test]
     fn test_without_value_named_tuple() {
         assert!(!final_without_value(true, false, false, true, false, true));
+    }
+}
+
+#[cfg(test)]
+mod return_stmt_tests {
+    use super::{
+        classify_return_stmt_post, classify_return_stmt_pre, RETURN_TAG_ANY_RETURN,
+        RETURN_TAG_ASYNC_GEN_FAIL, RETURN_TAG_CHECK_SUBTYPE, RETURN_TAG_EMPTY_FAIL,
+        RETURN_TAG_EMPTY_OK, RETURN_TAG_NONE_FAIL, RETURN_TAG_NONE_OK, RETURN_TAG_WARN_ANY,
+        RETURN_VARIANT_COROUTINE, RETURN_VARIANT_GENERATOR, RETURN_VARIANT_PLAIN,
+    };
+    use crate::wire::Type;
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn ret_variant(is_generator: bool, is_coroutine: bool) -> i64 {
+        crate::checker_functions::rust_classify_return_stmt_variant(is_generator, is_coroutine)
+            .unwrap()
+    }
+
+    #[test]
+    fn test_variant_plain() {
+        assert_eq!(ret_variant(false, false), RETURN_VARIANT_PLAIN);
+    }
+
+    #[test]
+    fn test_variant_generator() {
+        assert_eq!(ret_variant(true, false), RETURN_VARIANT_GENERATOR);
+    }
+
+    #[test]
+    fn test_variant_coroutine() {
+        assert_eq!(ret_variant(false, true), RETURN_VARIANT_COROUTINE);
+    }
+
+    #[test]
+    fn test_variant_generator_beats_coroutine() {
+        // is_generator is checked first in the original if/elif.
+        assert_eq!(ret_variant(true, true), RETURN_VARIANT_GENERATOR);
+    }
+
+    #[test]
+    fn test_pre_uninhabited_not_ambiguous() {
+        assert!(classify_return_stmt_pre(
+            &Type::UninhabitedType { ambiguous: false },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_pre_uninhabited_ambiguous() {
+        assert!(!classify_return_stmt_pre(
+            &Type::UninhabitedType { ambiguous: true },
+            false
+        ));
+    }
+
+    #[test]
+    fn test_pre_lambda_suppresses() {
+        assert!(!classify_return_stmt_pre(
+            &Type::UninhabitedType { ambiguous: false },
+            true
+        ));
+    }
+
+    #[test]
+    fn test_pre_non_uninhabited_proceeds() {
+        assert!(!classify_return_stmt_pre(&instance("builtins.str"), false));
+        assert!(!classify_return_stmt_pre(&Type::NoneType, false));
+        assert!(!classify_return_stmt_pre(
+            &Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None
+            },
+            false
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn post(
+        typ: Option<&Type>,
+        ret: &Type,
+        is_async_generator: bool,
+        is_generator: bool,
+        is_coroutine: bool,
+        declared_none_return: bool,
+        warn_return_any: bool,
+        current_node_deferred: bool,
+        name_in_binary_magic: bool,
+        expr_is_literal_not_implemented: bool,
+        is_lambda: bool,
+        in_checked_function: bool,
+    ) -> i64 {
+        classify_return_stmt_post(
+            typ,
+            ret,
+            is_async_generator,
+            is_generator,
+            is_coroutine,
+            declared_none_return,
+            warn_return_any,
+            current_node_deferred,
+            name_in_binary_magic,
+            expr_is_literal_not_implemented,
+            is_lambda,
+            in_checked_function,
+        )
+    }
+
+    #[test]
+    fn test_post_empty_any_generator() {
+        let ret = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(None, &ret, false, true, false, false, false, false, false, false, false, true),
+            RETURN_TAG_EMPTY_OK
+        );
+    }
+
+    #[test]
+    fn test_post_empty_any_coroutine_still_ok() {
+        // Arm 2 (NoneType/AnyType) fires regardless of is_coroutine.
+        let ret = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(None, &ret, false, false, true, false, false, false, false, false, false, true),
+            RETURN_TAG_EMPTY_OK
+        );
+    }
+
+    #[test]
+    fn test_post_empty_none_type_ok() {
+        assert_eq!(
+            post(
+                None,
+                &Type::NoneType,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_EMPTY_OK
+        );
+    }
+
+    #[test]
+    fn test_post_empty_checked_fail() {
+        assert_eq!(
+            post(
+                None,
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_EMPTY_FAIL
+        );
+    }
+
+    #[test]
+    fn test_post_empty_unchecked_ok() {
+        assert_eq!(
+            post(
+                None,
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            RETURN_TAG_EMPTY_OK
+        );
+    }
+
+    #[test]
+    fn test_post_empty_uninhabited_checked_fail() {
+        // UninhabitedType is neither NoneType nor AnyType: hits the
+        // in_checked_function arm.
+        let ret = Type::UninhabitedType { ambiguous: false };
+        assert_eq!(
+            post(None, &ret, false, false, false, false, false, false, false, false, false, true),
+            RETURN_TAG_EMPTY_FAIL
+        );
+    }
+
+    #[test]
+    fn test_post_async_generator_fail_beats_any() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                true,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ASYNC_GEN_FAIL
+        );
+    }
+
+    #[test]
+    fn test_post_any_plain_return() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_WARN_ANY
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_ret_any() {
+        // is_proper_subtype(AnyType(special_form), AnyType) is True: silent.
+        let typ = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let ret = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &ret,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_ret_optional_any() {
+        // Optional[Any]: the union-item decomposition of
+        // is_proper_subtype(AnyType(special_form), Union[Any, None]) makes
+        // the warn gate silent (testOKReturnAnyIfProperSubtype).
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let ret = Type::UnionType {
+            items: vec![any_type(), Type::NoneType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &ret,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_fires_ret_optional_str() {
+        // A union without an Any item does not satisfy the proper-subtype
+        // clause: the warn fires.
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        let ret = Type::UnionType {
+            items: vec![instance("builtins.str"), Type::NoneType],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &ret,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_WARN_ANY
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_object() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.object"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_lambda() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_deferred() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_any_warn_silent_binary_magic_not_implemented() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                true,
+                false,
+                true
+            ),
+            RETURN_TAG_ANY_RETURN
+        );
+    }
+
+    #[test]
+    fn test_post_binary_magic_without_literal_still_warns() {
+        let typ = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            post(
+                Some(&typ),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_WARN_ANY
+        );
+    }
+
+    #[test]
+    fn test_post_none_declared_none_value_ok() {
+        assert_eq!(
+            post(
+                Some(&Type::NoneType),
+                &Type::NoneType,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_NONE_OK
+        );
+    }
+
+    #[test]
+    fn test_post_none_declared_lambda_ok() {
+        assert_eq!(
+            post(
+                Some(&instance("builtins.str")),
+                &Type::NoneType,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true
+            ),
+            RETURN_TAG_NONE_OK
+        );
+    }
+
+    #[test]
+    fn test_post_none_declared_fail() {
+        assert_eq!(
+            post(
+                Some(&instance("builtins.int")),
+                &Type::NoneType,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_NONE_FAIL
+        );
+    }
+
+    #[test]
+    fn test_post_check_subtype() {
+        assert_eq!(
+            post(
+                Some(&instance("builtins.int")),
+                &instance("builtins.str"),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_CHECK_SUBTYPE
+        );
+    }
+
+    #[test]
+    fn test_post_async_gen_empty_defers_nothing() {
+        // The async-generator check is post-accept only; an empty return
+        // in an async generator goes through the empty-return arms.
+        assert_eq!(
+            post(
+                None,
+                &instance("builtins.str"),
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            RETURN_TAG_EMPTY_FAIL
+        );
     }
 }

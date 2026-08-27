@@ -1415,3 +1415,27 @@ directly to `main`.
   `NativeMissingAnnotationsSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus 12 pure decision
   unit tests in `checker_functions.rs`.
+- `rust_classify_return_stmt` (issue #1004) — two-phase port of
+  `TypeChecker.check_return_stmt` (checker.py:6546). Rust owns the pure
+  decisions: `rust_classify_return_stmt_variant` picks the variant tag
+  (generator / coroutine / plain, never defers), `rust_classify_return_stmt_pre`
+  fires NO_RETURN_EXPECTED (non-ambiguous `UninhabitedType`, suppressed for
+  lambdas), and `rust_classify_return_stmt_post` classifies the post-accept
+  arms (async-generator fail, warn_return_any gate, declared-None exemptions,
+  the `check_subtype` call, and the empty-return arms). Python keeps
+  `get_proper_type`, the `accept()` call and its binder side effects, the
+  `check_subtype` body, and all fail/note emission: the shim applies the four
+  distinct fail messages plus the `incorrectly_returning_any` note from the
+  Rust tags and falls back to the verbatim pure-Python tail on a deferral
+  (undecodable wire bytes, a `TypeAliasType`, or an unreadable warn-gate
+  shape); `accept()` is never re-run on the fallback path. The warn gate's
+  `is_proper_subtype(AnyType(special_form), ret)` check is decided
+  structurally by `any_is_proper_subtype_of`: bare `AnyType` or a union with
+  an `AnyType` item (verified against `subtypes.py` `visit_any` with
+  `proper_subtype=True` plus the union-item decomposition), and the object
+  clause is an Instance with type_ref `builtins.object`. Gated by
+  `_native_checker_active` (wired from `mypy/build.py`) and covered by
+  `NativeReturnStmtSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on the captured
+  message lists plus direct seam calls for the variant / pre / post tags and
+  the None deferrals), plus pure decision unit tests in `checker_functions.rs`.

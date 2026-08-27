@@ -345,6 +345,9 @@ try:
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_missing_annotations as _rust_classify_missing_annotations,
         rust_classify_new_signature as _rust_classify_new_signature,
+        rust_classify_return_stmt_post as _rust_classify_return_stmt_post,
+        rust_classify_return_stmt_pre as _rust_classify_return_stmt_pre,
+        rust_classify_return_stmt_variant as _rust_classify_return_stmt_variant,
         rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
         rust_classify_truthy_type as _rust_classify_truthy_type,
@@ -420,6 +423,9 @@ except ImportError:
     _rust_classify_check_final = None  # type: ignore[assignment]
     _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
+    _rust_classify_return_stmt_post = None  # type: ignore[assignment]
+    _rust_classify_return_stmt_pre = None  # type: ignore[assignment]
+    _rust_classify_return_stmt_variant = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_check_match_args = None  # type: ignore[assignment]
@@ -552,6 +558,19 @@ NATIVE_TRUTHY_FUNCTION = 1
 NATIVE_TRUTHY_UNION = 2
 NATIVE_TRUTHY_ITERABLE = 3
 NATIVE_TRUTHY_OTHER = 4
+# Decision tags returned by the `check_return_stmt` seam; must match
+# `RETURN_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_RETURN_VARIANT_GENERATOR = 1
+NATIVE_RETURN_VARIANT_COROUTINE = 2
+NATIVE_RETURN_VARIANT_PLAIN = 3
+NATIVE_RETURN_TAG_ASYNC_GEN_FAIL = 2
+NATIVE_RETURN_TAG_WARN_ANY = 3
+NATIVE_RETURN_TAG_ANY_RETURN = 4
+NATIVE_RETURN_TAG_NONE_OK = 5
+NATIVE_RETURN_TAG_NONE_FAIL = 6
+NATIVE_RETURN_TAG_CHECK_SUBTYPE = 7
+NATIVE_RETURN_TAG_EMPTY_OK = 8
+NATIVE_RETURN_TAG_EMPTY_FAIL = 9
 
 # Decision tags returned by `_rust_classify_missing_annotations`; must match
 # `KIND_MISSING_ANN_*` in crates/type_kernel/src/checker_functions.rs.
@@ -6636,7 +6655,31 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check_return_stmt(self, s: ReturnStmt) -> None:
         defn = self.scope.current_function()
         if defn is not None:
-            if defn.is_generator:
+            is_lambda = isinstance(defn, LambdaExpr)
+            # Native type_kernel seam (issue #1004): phase 1 picks the
+            # return-type variant and fires NO_RETURN_EXPECTED; phase 2
+            # classifies the post-accept / empty-return arms.
+            vtag: int | None = None
+            if (
+                _CHECKER_HAS_TYPE_KERNEL
+                and _native_checker_active
+                and _rust_classify_return_stmt_variant is not None
+            ):
+                try:
+                    vtag = _rust_classify_return_stmt_variant(
+                        defn.is_generator, defn.is_coroutine
+                    )
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    vtag = None
+            if vtag == NATIVE_RETURN_VARIANT_GENERATOR:
+                return_type = self.get_generator_return_type(
+                    self.return_types[-1], defn.is_coroutine
+                )
+            elif vtag == NATIVE_RETURN_VARIANT_COROUTINE:
+                return_type = self.get_coroutine_return_type(self.return_types[-1])
+            elif vtag == NATIVE_RETURN_VARIANT_PLAIN:
+                return_type = self.return_types[-1]
+            elif defn.is_generator:
                 return_type = self.get_generator_return_type(
                     self.return_types[-1], defn.is_coroutine
                 )
@@ -6646,12 +6689,28 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 return_type = self.return_types[-1]
             return_type = get_proper_type(return_type)
 
-            is_lambda = isinstance(defn, LambdaExpr)
-            if isinstance(return_type, UninhabitedType):
+            no_return_expected: bool | None = None
+            if (
+                _CHECKER_HAS_TYPE_KERNEL
+                and _native_checker_active
+                and _rust_classify_return_stmt_pre is not None
+            ):
+                try:
+                    no_return_expected = _rust_classify_return_stmt_pre(
+                        _serialize_type_for_checker(return_type), is_lambda
+                    )
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    no_return_expected = None
+            if no_return_expected is None:
+                # Pure-Python phase 1 (gate off or deferral).
+                if isinstance(return_type, UninhabitedType):
+                    no_return_expected = not is_lambda and not return_type.ambiguous
+                else:
+                    no_return_expected = False
+            if no_return_expected:
                 # Avoid extra error messages for failed inference in lambdas
-                if not is_lambda and not return_type.ambiguous:
-                    self.fail(message_registry.NO_RETURN_EXPECTED, s)
-                    return
+                self.fail(message_registry.NO_RETURN_EXPECTED, s)
+                return
 
             if s.expr:
                 declared_none_return = isinstance(return_type, NoneType)
@@ -6687,40 +6746,62 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 # definition in typeshed prior to python/typeshed#4222.
                 if isinstance(typ, Instance) and typ.type.fullname in NOT_IMPLEMENTED_TYPE_NAMES:
                     typ = AnyType(TypeOfAny.special_form)
+            else:
+                typ = None
+            self._classify_return_stmt_tail(
+                s, defn, typ, return_type, declared_none_return if s.expr else False, is_lambda
+            )
 
-                if defn.is_async_generator:
+    def _classify_return_stmt_tail(
+        self,
+        s: ReturnStmt,
+        defn: FuncItem,
+        typ: ProperType | None,
+        return_type: ProperType,
+        declared_none_return: bool,
+        is_lambda: bool,
+    ) -> None:
+        """Post-accept classification for check_return_stmt.
+
+        Native phase 2 classifies the post-accept and empty-return arms;
+        the fail / note side effects stay here. `typ is None` selects the
+        empty-return arms. Any deferral falls back to the pure-Python
+        classification in _python_return_stmt_tail.
+        """
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_return_stmt_post is not None
+        ):
+            try:
+                tag = _rust_classify_return_stmt_post(
+                    _serialize_type_for_checker(typ) if typ is not None else None,
+                    _serialize_type_for_checker(return_type),
+                    defn.is_async_generator,
+                    defn.is_generator,
+                    defn.is_coroutine,
+                    declared_none_return,
+                    self.options.warn_return_any,
+                    self.current_node_deferred,
+                    defn.name in BINARY_MAGIC_METHODS,
+                    is_literal_not_implemented(s.expr) if s.expr else False,
+                    is_lambda,
+                    self.in_checked_function(),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_RETURN_TAG_ASYNC_GEN_FAIL:
                     self.fail(message_registry.RETURN_IN_ASYNC_GENERATOR, s)
                     return
-                # Returning a value of type Any is always fine.
-                if isinstance(typ, AnyType):
-                    # (Unless you asked to be warned in that case, and the
-                    # function is not declared to return Any)
-                    if (
-                        self.options.warn_return_any
-                        and not self.current_node_deferred
-                        and not is_proper_subtype(AnyType(TypeOfAny.special_form), return_type)
-                        and not (
-                            defn.name in BINARY_MAGIC_METHODS
-                            and is_literal_not_implemented(s.expr)
-                        )
-                        and not (
-                            isinstance(return_type, Instance)
-                            and return_type.type.fullname == "builtins.object"
-                        )
-                        and not is_lambda
-                    ):
-                        self.msg.incorrectly_returning_any(return_type, s)
+                if tag == NATIVE_RETURN_TAG_WARN_ANY:
+                    self.msg.incorrectly_returning_any(return_type, s)
                     return
-
-                # Disallow return expressions in functions declared to return
-                # None, subject to two exceptions below.
-                if declared_none_return:
-                    # Lambdas are allowed to have None returns.
-                    # Functions returning a value of type None are allowed to have a None return.
-                    if is_lambda or isinstance(typ, NoneType):
-                        return
+                if tag == NATIVE_RETURN_TAG_NONE_FAIL:
                     self.fail(message_registry.NO_RETURN_VALUE_EXPECTED, s)
-                else:
+                    return
+                if tag == NATIVE_RETURN_TAG_CHECK_SUBTYPE:
+                    assert typ is not None and s.expr is not None
                     self.check_subtype(
                         subtype_label="got",
                         subtype=typ,
@@ -6730,21 +6811,89 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                         outer_context=s,
                         msg=message_registry.INCOMPATIBLE_RETURN_VALUE_TYPE,
                     )
-            else:
-                # Empty returns are valid in Generators with Any typed returns, but not in
-                # coroutines.
-                if (
-                    defn.is_generator
-                    and not defn.is_coroutine
-                    and isinstance(return_type, AnyType)
-                ):
                     return
-
-                if isinstance(return_type, (NoneType, AnyType)):
-                    return
-
-                if self.in_checked_function():
+                if tag == NATIVE_RETURN_TAG_EMPTY_FAIL:
                     self.fail(message_registry.RETURN_VALUE_EXPECTED, s)
+                    return
+                # NATIVE_RETURN_TAG_ANY_RETURN / NONE_OK / EMPTY_OK: plain
+                # return, and NO_RETURN_EXPECTED is phase-1 only.
+                return
+        self._python_return_stmt_tail(s, defn, typ, return_type, declared_none_return, is_lambda)
+
+    def _python_return_stmt_tail(
+        self,
+        s: ReturnStmt,
+        defn: FuncItem,
+        typ: ProperType | None,
+        return_type: ProperType,
+        declared_none_return: bool,
+        is_lambda: bool,
+    ) -> None:
+        """Pure-Python classification tail of check_return_stmt.
+
+        `typ is None` means an empty return (the empty-return arms);
+        otherwise the post-accept arms. Kept as the fallback for the native
+        two-phase seam and for the gate-off path.
+        """
+        if typ is not None:
+            if defn.is_async_generator:
+                self.fail(message_registry.RETURN_IN_ASYNC_GENERATOR, s)
+                return
+            # Returning a value of type Any is always fine.
+            if isinstance(typ, AnyType):
+                # (Unless you asked to be warned in that case, and the
+                # function is not declared to return Any)
+                if (
+                    self.options.warn_return_any
+                    and not self.current_node_deferred
+                    and not is_proper_subtype(AnyType(TypeOfAny.special_form), return_type)
+                    and not (
+                        defn.name in BINARY_MAGIC_METHODS
+                        and is_literal_not_implemented(s.expr)
+                    )
+                    and not (
+                        isinstance(return_type, Instance)
+                        and return_type.type.fullname == "builtins.object"
+                    )
+                    and not is_lambda
+                ):
+                    self.msg.incorrectly_returning_any(return_type, s)
+                return
+
+            # Disallow return expressions in functions declared to return
+            # None, subject to two exceptions below.
+            if declared_none_return:
+                # Lambdas are allowed to have None returns.
+                # Functions returning a value of type None are allowed to have a None return.
+                if is_lambda or isinstance(typ, NoneType):
+                    return
+                self.fail(message_registry.NO_RETURN_VALUE_EXPECTED, s)
+            else:
+                assert s.expr is not None
+                self.check_subtype(
+                    subtype_label="got",
+                    subtype=typ,
+                    supertype_label="expected",
+                    supertype=return_type,
+                    context=s.expr,
+                    outer_context=s,
+                    msg=message_registry.INCOMPATIBLE_RETURN_VALUE_TYPE,
+                )
+        else:
+            # Empty returns are valid in Generators with Any typed returns, but not in
+            # coroutines.
+            if (
+                defn.is_generator
+                and not defn.is_coroutine
+                and isinstance(return_type, AnyType)
+            ):
+                return
+
+            if isinstance(return_type, (NoneType, AnyType)):
+                return
+
+            if self.in_checked_function():
+                self.fail(message_registry.RETURN_VALUE_EXPECTED, s)
 
     def visit_if_stmt(self, s: IfStmt) -> None:
         """Type check an if statement."""
