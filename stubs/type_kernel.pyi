@@ -207,6 +207,7 @@ __all__ = [
     "rust_check_for_untyped_decorator",
     "rust_check_explicit_override_decorator",
     "rust_classify_lvalue_validity",
+    "rust_classify_fixed_args",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -2115,6 +2116,11 @@ def rust_classify_function_signature(
     sig_arg_types_len: int,
     arguments_len: int,
 ) -> int: ...
+def rust_classify_fixed_args(
+    args_len: int,
+    arg_kinds: list[int],
+    numargs: int,
+) -> int | None: ...
 def rust_create_errors(
     error_tuples: Any,
 ) -> Any: ...

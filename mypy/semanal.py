@@ -429,6 +429,7 @@ try:
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_check_decorated_function_is_method as _rust_check_decorated_function_is_method,
         rust_classify_add_metaclass as _rust_classify_add_metaclass,
+        rust_classify_fixed_args as _rust_classify_fixed_args,
         rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_function_signature as _rust_classify_function_signature,
@@ -546,6 +547,7 @@ except ImportError:
     _rust_classify_function_signature = None  # type: ignore[assignment]
     _rust_classify_with_metaclass = None  # type: ignore[assignment]
     _rust_classify_add_metaclass = None  # type: ignore[assignment]
+    _rust_classify_fixed_args = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_classify_lvalue_validity = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
@@ -682,6 +684,12 @@ _NATIVE_FUNC_SIG_TOO_MANY = 2
 _LVALUE_KIND_PASS = 0
 _LVALUE_KIND_TYPEVAR = 1
 _LVALUE_KIND_TYPEINFO = 2
+
+# check_fixed_args arbitration tags (see semanal_checks.rs). OK: args
+# are valid; WRONG_COUNT: len mismatch; WRONG_KINDS: not all positional.
+NATIVE_FIXED_ARGS_OK = 0
+NATIVE_FIXED_ARGS_WRONG_COUNT = 1
+NATIVE_FIXED_ARGS_WRONG_KINDS = 2
 
 
 def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
@@ -7046,6 +7054,34 @@ class SemanticAnalyzer(
         s = "s"
         if numargs == 1:
             s = ""
+        # Native type_kernel seam: classify the two gap checks in Rust
+        # (semanal_checks.rs); message emission stays here. None falls
+        # through to the pure-Python body below.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_fixed_args is not None
+        ):
+            try:
+                tag = _rust_classify_fixed_args(
+                    len(expr.args),
+                    [int(k) for k in expr.arg_kinds],
+                    numargs,
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_FIXED_ARGS_OK:
+                    return True
+                if tag == NATIVE_FIXED_ARGS_WRONG_COUNT:
+                    self.fail('"%s" expects %d argument%s' % (name, numargs, s), expr)
+                    return False
+                if tag == NATIVE_FIXED_ARGS_WRONG_KINDS:
+                    self.fail(
+                        f'"{name}" must be called with {numargs} positional argument{s}',
+                        expr,
+                    )
+                    return False
         if len(expr.args) != numargs:
             self.fail('"%s" expects %d argument%s' % (name, numargs, s), expr)
             return False

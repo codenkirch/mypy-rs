@@ -1427,6 +1427,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_bases::rust_classify_lvalue_validity,
         module
     )?)?;
+    // semanal_checks: check_fixed_args arg-count + arg-kinds arbitration.
+    // Rust classifies the two gap checks into a tag; the self.fail
+    // message emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_classify_fixed_args,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,
