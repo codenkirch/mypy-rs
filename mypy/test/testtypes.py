@@ -28240,3 +28240,309 @@ class _FakeTypeInfo:
     def __init__(self, fullname: str, is_enum: bool = False) -> None:
         self.fullname = fullname
         self.is_enum = is_enum
+
+
+class NativeLiteralParamSuite(Suite):
+    """Parity for the Rust `analyze_literal_param` dispatch classifier.
+
+    The 9-way Literal-param dispatch head (string-Literal, Any fail/silent,
+    RawExpression float/complex/arbitrary/with-value, NoneType/LiteralType,
+    Instance LKV, Union recursion, invalid) is decided in Rust from scalar
+    type-kind facts; the Python shim applies the branch bodies (LiteralType
+    construction, error emission, visit_unbound_type recursion, union merge).
+
+    Toggling the typeanal gate off (pure Python) and on (Rust seam) must
+    produce identical (str(result), captured fail messages), and a direct
+    seam call proves the Rust classifier engages on each branch.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self) -> tuple[object, object]:
+        from mypy.tvar_scope import TypeVarLikeScope
+        from mypy.typeanal import TypeAnalyser
+
+        fx = self.fx
+        str_info: TypeInfo = fx.str_type_info
+        int_info: TypeInfo = fx.make_type_info("builtins.int")
+        bool_info: TypeInfo = fx.bool_type_info
+        float_info: TypeInfo = fx.make_type_info("builtins.float")
+        complex_info: TypeInfo = fx.make_type_info("builtins.complex")
+
+        class FakePlugin:
+            def get_type_analyze_hook(self, fullname: str) -> object:
+                return None
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.final_iteration = False
+                self.errors: list[str] = []
+                self.syms: dict[str, SymbolTableNode] = {
+                    "builtins.str": SymbolTableNode(MDEF, str_info),
+                    "builtins.int": SymbolTableNode(MDEF, int_info),
+                    "builtins.bool": SymbolTableNode(MDEF, bool_info),
+                    "builtins.float": SymbolTableNode(MDEF, float_info),
+                    "builtins.complex": SymbolTableNode(MDEF, complex_info),
+                    "str": SymbolTableNode(MDEF, str_info),
+                    "int": SymbolTableNode(MDEF, int_info),
+                }
+
+            def lookup_qualified(
+                self, name: str, ctx: Context, suppress_errors: bool = False
+            ) -> SymbolTableNode | None:
+                return self.syms.get(name)
+
+            def lookup_fully_qualified(self, fullname: str) -> SymbolTableNode:
+                return self.syms[fullname]
+
+            def lookup_fully_qualified_or_none(
+                self, fullname: str
+            ) -> SymbolTableNode | None:
+                return self.syms.get(fullname)
+
+            def is_incomplete_namespace(self, fullname: str) -> bool:
+                return False
+
+            def record_incomplete_ref(self) -> None:
+                pass
+
+            def fail(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(msg)
+
+            def note(self, msg: str, ctx: Context, code: ErrorCode | None = None) -> None:
+                self.errors.append(f"note: {msg}")
+
+            def is_func_scope(self) -> bool:
+                return False
+
+            def record_fixed_type(self, typ: Type) -> None:
+                pass
+
+            def defer(self) -> None:
+                pass
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.tvar_scope = TypeVarLikeScope()
+        ta.plugin = FakePlugin()
+        ta.options = Options()
+        ta.defining_alias = False
+        ta.python_3_12_type_alias = False
+        ta.alias_type_params_names = None
+        ta.allowed_alias_tvars = []
+        ta.erase_tvar_defs = []
+        ta.allow_unbound_tvars = False
+        ta.allow_placeholder = False
+        ta.allow_param_spec_literals = False
+        ta.allow_type_any = False
+        ta.allow_type_var_tuple = -1
+        ta.nesting_level = 0
+        ta.is_typeshed_stub = False
+        ta.analyzing_tvar_def = False
+        ta.aliases_used = set()
+        ta.prohibit_special_class_field_types = None
+        ta.allow_typed_dict_special_forms = False
+        ta.allow_final = True
+        ta.allow_unpack = False
+        ta.allow_ellipsis = False
+        ta.allow_tuple_literal = True
+        ta.report_invalid_types = False
+        ta.prohibit_self_type = None
+        ta.cur_mod_node = None
+        return ta, api
+
+    def _call(
+        self, ta: object, arg: Type
+    ) -> tuple[str, list[str]]:
+        result = ta.analyze_literal_param(1, arg, self.fx.o)
+        messages = list(ta.api.errors)
+        if result is None:
+            return "None", messages
+        return str(result), messages
+
+    def _assert_par(
+        self, arg: Type, *, expected: str | None = None
+    ) -> None:
+        off_ta, _ = self._analyser()
+        off = self._with_gate(False, lambda: self._call(off_ta, arg))
+        self._set_active(True)
+        on_ta, _ = self._analyser()
+        on = self._with_gate(True, lambda: self._call(on_ta, arg))
+        assert_equal(on[0], off[0], f"literal_param parity result {arg!r}")
+        assert_equal(on[1], off[1], f"literal_param parity messages {arg!r}")
+        if expected is not None:
+            assert_equal(on[0], expected, f"literal_param result {arg!r}")
+
+    def _assert_engages(self, **facts: object) -> None:
+        from mypy.typeanal import _rust_classify_literal_param
+
+        defaults: dict[str, object] = {
+            "is_proper_type": False,
+            "is_unbound": False,
+            "is_union_pre": False,
+            "original_str_expr_is_not_none": False,
+            "is_any": False,
+            "type_of_any": 0,
+            "is_raw_expr": False,
+            "literal_value_is_none": True,
+            "simple_name": "",
+            "is_none_type": False,
+            "is_literal": False,
+            "is_instance": False,
+            "last_known_value_is_none": True,
+            "is_union_post": False,
+        }
+        defaults.update(facts)
+        result = _rust_classify_literal_param(
+            defaults["is_proper_type"],
+            defaults["is_unbound"],
+            defaults["is_union_pre"],
+            defaults["original_str_expr_is_not_none"],
+            defaults["is_any"],
+            defaults["type_of_any"],
+            defaults["is_raw_expr"],
+            defaults["literal_value_is_none"],
+            defaults["simple_name"],
+            defaults["is_none_type"],
+            defaults["is_literal"],
+            defaults["is_instance"],
+            defaults["last_known_value_is_none"],
+            defaults["is_union_post"],
+        )
+        assert result is not None, "Rust literal_param did not engage"
+
+    def test_str_literal_unbound(self) -> None:
+        arg = UnboundType("foo", original_str_expr="hello",
+                          original_str_fallback="builtins.str")
+        self._assert_par(arg, expected="[Literal['hello']]")
+        self._assert_engages(
+            is_proper_type=True, is_unbound=True,
+            original_str_expr_is_not_none=True,
+        )
+
+    def test_str_literal_union(self) -> None:
+        union = UnionType([UnboundType("a"), UnboundType("b")])
+        union.original_str_expr = "hello"
+        union.original_str_fallback = "builtins.str"
+        self._assert_par(union, expected="[Literal['hello']]")
+        self._assert_engages(
+            is_proper_type=True, is_union_pre=True,
+            original_str_expr_is_not_none=True,
+        )
+
+    def test_none_type(self) -> None:
+        self._assert_par(NoneType(), expected="[None]")
+        self._assert_engages(is_none_type=True)
+
+    def test_literal_type(self) -> None:
+        lit = LiteralType(42, Instance(self.fx.make_type_info("builtins.int"), []))
+        self._assert_par(lit, expected="[Literal[42]]")
+        self._assert_engages(is_literal=True)
+
+    def test_any_fail(self) -> None:
+        self._assert_par(
+            AnyType(TypeOfAny.explicit), expected="None"
+        )
+        self._assert_engages(is_any=True, type_of_any=2)
+
+    def test_any_silent_from_error(self) -> None:
+        self._assert_par(
+            AnyType(TypeOfAny.from_error), expected="None"
+        )
+        self._assert_engages(is_any=True, type_of_any=5)
+
+    def test_any_silent_special_form(self) -> None:
+        self._assert_par(
+            AnyType(TypeOfAny.special_form), expected="None"
+        )
+        self._assert_engages(is_any=True, type_of_any=6)
+
+    def test_raw_no_value_float(self) -> None:
+        from mypy.types import RawExpressionType
+
+        arg = RawExpressionType(None, "builtins.float")
+        self._assert_par(arg, expected="None")
+        self._assert_engages(
+            is_raw_expr=True, literal_value_is_none=True,
+            simple_name="float",
+        )
+
+    def test_raw_no_value_complex(self) -> None:
+        from mypy.types import RawExpressionType
+
+        arg = RawExpressionType(None, "builtins.complex")
+        self._assert_par(arg, expected="None")
+        self._assert_engages(
+            is_raw_expr=True, literal_value_is_none=True,
+            simple_name="complex",
+        )
+
+    def test_raw_no_value_arbitrary(self) -> None:
+        from mypy.types import RawExpressionType
+
+        arg = RawExpressionType(None, "builtins.list")
+        self._assert_par(arg, expected="None")
+        self._assert_engages(
+            is_raw_expr=True, literal_value_is_none=True,
+            simple_name="list",
+        )
+
+    def test_raw_with_value(self) -> None:
+        from mypy.types import RawExpressionType
+
+        arg = RawExpressionType(42, "builtins.int")
+        self._assert_par(arg)
+        self._assert_engages(
+            is_raw_expr=True, literal_value_is_none=False,
+        )
+
+    def test_instance_lkv(self) -> None:
+        int_info = self.fx.make_type_info("builtins.int")
+        lkv = LiteralType(42, Instance(int_info, []))
+        inst = Instance(int_info, [], last_known_value=lkv)
+        self._assert_par(inst, expected="[Literal[42]]")
+        self._assert_engages(
+            is_instance=True, last_known_value_is_none=False,
+        )
+
+    def test_union_recurse(self) -> None:
+        union = UnionType(
+            [LiteralType(1, Instance(self.fx.make_type_info("builtins.int"), [])), NoneType()]
+        )
+        self._assert_par(union, expected="[Literal[1], None]")
+        self._assert_engages(is_union_post=True)
+
+    def test_invalid(self) -> None:
+        # CallableType is not any of the recognized branches.
+        arg = CallableType([], [], [], NoneType(), self.fx.function)
+        self._assert_par(arg, expected="None")
+        self._assert_engages()
+
+    def test_str_beats_any_direct(self) -> None:
+        # Direct seam call: branch (a) is checked before (c).
+        from mypy.typeanal import _rust_classify_literal_param
+
+        tag = _rust_classify_literal_param(
+            True, True, False, True,
+            True, 2, False, True, "",
+            False, False, False, True, False,
+        )
+        assert tag == 1, f"expected TAG_STR_LITERAL, got {tag}"

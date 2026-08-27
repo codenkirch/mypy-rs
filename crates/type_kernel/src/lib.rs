@@ -135,6 +135,7 @@ mod traverser;
 mod treetransform;
 mod typealias_instantiate;
 mod typeanal_info;
+mod typeanal_literal;
 mod typeanal_queries;
 mod typeanal_special;
 mod typeanal_unbound;
@@ -1603,6 +1604,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // defers to pure Python for the branches needing recursive analysis.
     module.add_function(wrap_pyfunction!(
         typeanal_special::rust_classify_special_unbound,
+        module
+    )?)?;
+    // analyze_literal_param: 9-way Literal-param dispatch head. Rust
+    // returns a branch tag from scalar facts; Python applies the side
+    // effects (LiteralType build, errors, recursion, union merge).
+    module.add_function(wrap_pyfunction!(
+        typeanal_literal::rust_classify_literal_param,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types

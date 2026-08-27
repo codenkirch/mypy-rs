@@ -2472,6 +2472,125 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         return UnionType.make_union(output, line=t.line)
 
     def analyze_literal_param(self, idx: int, arg: Type, ctx: Context) -> list[Type] | None:
+        if _TYPEANAL_HAS_KERNEL and _native_typeanal_active:
+            return self._native_analyze_literal_param(idx, arg, ctx)
+        return self._python_analyze_literal_param(idx, arg, ctx)
+
+    def _native_analyze_literal_param(
+        self, idx: int, arg: Type, ctx: Context
+    ) -> list[Type] | None:
+        # Phase 1: branch (a) — string-Literal from original_str_expr,
+        # checked on the original arg before visit_unbound_type recursion.
+        is_proper = isinstance(arg, ProperType)
+        is_unbound_pre = isinstance(arg, UnboundType)
+        is_union_pre = isinstance(arg, UnionType)
+        if is_proper and (is_unbound_pre or is_union_pre):
+            orig_str_not_none = arg.original_str_expr is not None
+        else:
+            orig_str_not_none = False
+        if orig_str_not_none:
+            tag = _rust_classify_literal_param(
+                is_proper, is_unbound_pre, is_union_pre, True,
+                False, 0, False, True, "", False, False, False, True, False,
+            )
+            if tag == _LITERAL_PARAM_TAG_STR:
+                assert arg.original_str_fallback is not None
+                return [
+                    LiteralType(
+                        value=arg.original_str_expr,
+                        fallback=self.named_type(arg.original_str_fallback),
+                        line=arg.line,
+                        column=arg.column,
+                    )
+                ]
+        # Phase 2: branch (b) — unbound recursion, then get_proper_type.
+        if isinstance(arg, UnboundType):
+            self.nesting_level += 1
+            try:
+                arg = self.visit_unbound_type(arg, defining_literal=True)
+            finally:
+                self.nesting_level -= 1
+        arg = get_proper_type(arg)
+        # Extract post-chain facts and classify branches (c)-(i).
+        is_any = isinstance(arg, AnyType)
+        type_of_any = arg.type_of_any if is_any else 0
+        is_raw_expr = isinstance(arg, RawExpressionType)
+        if is_raw_expr:
+            literal_value_is_none = arg.literal_value is None
+            simple_name = arg.simple_name() if literal_value_is_none else ""
+        else:
+            literal_value_is_none = True
+            simple_name = ""
+        is_none_type = isinstance(arg, NoneType)
+        is_literal = isinstance(arg, LiteralType)
+        is_instance = isinstance(arg, Instance)
+        last_known_value_is_none = (
+            not is_instance or arg.last_known_value is None
+        )
+        is_union_post = isinstance(arg, UnionType)
+        tag = _rust_classify_literal_param(
+            False, False, False, False,
+            is_any, type_of_any, is_raw_expr, literal_value_is_none,
+            simple_name, is_none_type, is_literal, is_instance,
+            last_known_value_is_none, is_union_post,
+        )
+        return self._apply_literal_param_tag(tag, idx, arg, ctx)
+
+    def _apply_literal_param_tag(
+        self, tag: int, idx: int, arg: Type, ctx: Context
+    ) -> list[Type] | None:
+        if tag == _LITERAL_PARAM_TAG_ANY_FAIL:
+            self.fail(
+                f'Parameter {idx} of Literal[...] cannot be of type "Any"',
+                ctx, code=codes.VALID_TYPE,
+            )
+            return None
+        if tag == _LITERAL_PARAM_TAG_ANY_SILENT:
+            return None
+        if tag == _LITERAL_PARAM_TAG_RAW_FLOAT_COMPLEX:
+            name = arg.simple_name()
+            self.fail(
+                f'Parameter {idx} of Literal[...] cannot be of type "{name}"',
+                ctx, code=codes.VALID_TYPE,
+            )
+            return None
+        if tag == _LITERAL_PARAM_TAG_RAW_ARBITRARY:
+            self.fail(
+                "Invalid type: Literal[...] cannot contain arbitrary expressions",
+                ctx, code=codes.VALID_TYPE,
+            )
+            return None
+        if tag == _LITERAL_PARAM_TAG_RAW_VALUE:
+            fallback = self.named_type(arg.base_type_name)
+            assert isinstance(fallback, Instance)
+            return [
+                LiteralType(
+                    arg.literal_value, fallback,
+                    line=arg.line, column=arg.column,
+                )
+            ]
+        if tag == _LITERAL_PARAM_TAG_NONE_OR_LITERAL:
+            return [arg]
+        if tag == _LITERAL_PARAM_TAG_INSTANCE_LKV:
+            return [arg.last_known_value]
+        if tag == _LITERAL_PARAM_TAG_UNION_RECURSE:
+            out = []
+            for union_arg in arg.items:
+                union_result = self.analyze_literal_param(idx, union_arg, ctx)
+                if union_result is None:
+                    return None
+                out.extend(union_result)
+            return out
+        # _LITERAL_PARAM_TAG_INVALID
+        self.fail(
+            f"Parameter {idx} of Literal[...] is invalid",
+            ctx, code=codes.VALID_TYPE,
+        )
+        return None
+
+    def _python_analyze_literal_param(
+        self, idx: int, arg: Type, ctx: Context
+    ) -> list[Type] | None:
         # This UnboundType was originally defined as a string.
         if (
             isinstance(arg, ProperType)
@@ -3337,6 +3456,7 @@ try:
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
         rust_check_vec_type_args as _rust_check_vec_type_args,
+rust_classify_literal_param as _rust_classify_literal_param,
 rust_classify_special_unbound as _rust_classify_special_unbound,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
@@ -3384,6 +3504,7 @@ except ImportError:
     _rust_classify_type_with_info = None  # type: ignore[assignment]
     _rust_classify_unbound_front = None  # type: ignore[assignment]
     _rust_classify_special_unbound = None  # type: ignore[assignment]
+    _rust_classify_literal_param = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -3494,6 +3615,20 @@ _UNBOUND_SPECIAL_TAG_UNPACK_ARG_ERR = 37
 _UNBOUND_SPECIAL_TAG_UNPACK_POS_ERR = 38
 _UNBOUND_SPECIAL_TAG_UNPACK_DEFER = 39
 _UNBOUND_SPECIAL_TAG_NOT_SPECIAL = 40
+
+# Branch tags for `analyze_literal_param` (issue #919), mirrored in
+# typeanal_literal.rs; the Python shim applies the side effects
+# (LiteralType build, errors, recursion, union merge) for each tag.
+_LITERAL_PARAM_TAG_STR = 1
+_LITERAL_PARAM_TAG_ANY_FAIL = 2
+_LITERAL_PARAM_TAG_ANY_SILENT = 3
+_LITERAL_PARAM_TAG_RAW_FLOAT_COMPLEX = 4
+_LITERAL_PARAM_TAG_RAW_ARBITRARY = 5
+_LITERAL_PARAM_TAG_RAW_VALUE = 6
+_LITERAL_PARAM_TAG_NONE_OR_LITERAL = 7
+_LITERAL_PARAM_TAG_INSTANCE_LKV = 8
+_LITERAL_PARAM_TAG_UNION_RECURSE = 9
+_LITERAL_PARAM_TAG_INVALID = 10
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
