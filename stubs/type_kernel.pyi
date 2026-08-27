@@ -172,6 +172,7 @@ __all__ = [
     "rust_repack_callable_args",
     "rust_classify_call",
     "rust_classify_typeddict_call",
+    "rust_classify_reveal_imported",
     "rust_calibrate_type_obj_return",
     "rust_normalize_callable",
     "rust_check_callable_call",
@@ -875,6 +876,9 @@ def rust_classify_call(callee_bytes: bytes) -> int | None: ...
 def rust_classify_typeddict_call(
     args: list[Expression], arg_kinds: list[int]
 ) -> int | None: ...
+def rust_classify_reveal_imported(
+    kind: int, is_imported: bool, unimported_reveal_enabled: bool
+) -> str | None: ...
 def rust_calibrate_type_obj_return(callee_bytes: bytes, arg_type_bytes: bytes) -> bytes | None: ...
 def rust_normalize_callable(callee_bytes: bytes) -> bytes | None: ...
 def rust_check_callable_call(

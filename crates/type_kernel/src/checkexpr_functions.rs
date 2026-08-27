@@ -5567,3 +5567,114 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_reveal_imported
+// ---------------------------------------------------------------------------
+
+/// `mypy.checkexpr.check_reveal_imported` dispatch head (issue #918).
+///
+/// Mirrors checkexpr.py:6483-6497. The Python dispatch:
+///   1. early return when `UNIMPORTED_REVEAL` is not an enabled error code;
+///   2. `name = "reveal_locals"` when `kind == REVEAL_LOCALS`;
+///   3. `name = "reveal_type"` when `kind == REVEAL_TYPE and not is_imported`;
+///   4. else early return (no name).
+///
+/// `REVEAL_LOCALS` / `REVEAL_TYPE` are `mypy.semanal` module constants,
+/// read via PyO3 the same way `rust_visit_reveal_expr` does. Returns
+/// `Ok(None)` for both the disabled case (arm 1) and the else-arm (arm 4):
+/// in both, Python does nothing. Returns `Ok(Some(name))` when the
+/// fail+note body should run in Python with that name.
+#[pyfunction]
+#[pyo3(signature = (kind, is_imported, unimported_reveal_enabled))]
+pub(crate) fn rust_classify_reveal_imported(
+    py: Python<'_>,
+    kind: i64,
+    is_imported: bool,
+    unimported_reveal_enabled: bool,
+) -> PyResult<Option<String>> {
+    if !unimported_reveal_enabled {
+        return Ok(None);
+    }
+    let semanal_mod = py.import("mypy.semanal")?;
+    let reveal_locals: i64 = semanal_mod.getattr("REVEAL_LOCALS")?.extract()?;
+    let reveal_type: i64 = semanal_mod.getattr("REVEAL_TYPE")?.extract()?;
+    if kind == reveal_locals {
+        Ok(Some("reveal_locals".to_string()))
+    } else if kind == reveal_type && !is_imported {
+        Ok(Some("reveal_type".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod classify_reveal_imported_tests {
+    fn consts() -> (i64, i64) {
+        // REVEAL_LOCALS == 1, REVEAL_TYPE == 0 (mypy.nodes, re-exported
+        // by mypy.semanal). The unit tests run without a Python
+        // interpreter, so use the literal ints.
+        (1, 0)
+    }
+
+    #[test]
+    fn test_classify_reveal_imported_disabled() {
+        let (rl, rt) = consts();
+        // No Python interpreter in `cargo test`; inline the logic.
+        let r = classify_reveal_imported_pure(rl, false, false);
+        assert_eq!(r, None);
+        let r = classify_reveal_imported_pure(rt, true, false);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn test_classify_reveal_imported_reveal_locals() {
+        let (rl, _) = consts();
+        let r = classify_reveal_imported_pure(rl, false, true);
+        assert_eq!(r.as_deref(), Some("reveal_locals"));
+        // is_imported is irrelevant for reveal_locals.
+        let r = classify_reveal_imported_pure(rl, true, true);
+        assert_eq!(r.as_deref(), Some("reveal_locals"));
+    }
+
+    #[test]
+    fn test_classify_reveal_imported_reveal_type_not_imported() {
+        let (_, rt) = consts();
+        let r = classify_reveal_imported_pure(rt, false, true);
+        assert_eq!(r.as_deref(), Some("reveal_type"));
+    }
+
+    #[test]
+    fn test_classify_reveal_imported_reveal_type_imported() {
+        let (_, rt) = consts();
+        let r = classify_reveal_imported_pure(rt, true, true);
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn test_classify_reveal_imported_unknown_kind() {
+        let r = classify_reveal_imported_pure(999, false, true);
+        assert_eq!(r, None);
+    }
+
+    /// Pure-logic twin of `rust_classify_reveal_imported` for unit tests
+    /// that run without a Python interpreter (constants inlined).
+    fn classify_reveal_imported_pure(
+        kind: i64,
+        is_imported: bool,
+        unimported_reveal_enabled: bool,
+    ) -> Option<String> {
+        if !unimported_reveal_enabled {
+            return None;
+        }
+        let reveal_locals: i64 = 1;
+        let reveal_type: i64 = 0;
+        if kind == reveal_locals {
+            Some("reveal_locals".to_string())
+        } else if kind == reveal_type && !is_imported {
+            Some("reveal_type".to_string())
+        } else {
+            None
+        }
+    }
+}

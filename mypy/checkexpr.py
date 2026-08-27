@@ -249,6 +249,7 @@ try:
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
+        rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_combine_function_signatures as _rust_combine_function_signatures,
         rust_conditional_expr_join as _rust_conditional_expr_join,
@@ -321,6 +322,7 @@ except ImportError:
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
+    _rust_classify_reveal_imported = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
     _rust_normalize_callable = None  # type: ignore[assignment]
@@ -6481,16 +6483,26 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
             return NoneType()
 
     def check_reveal_imported(self, expr: RevealExpr) -> None:
-        if codes.UNIMPORTED_REVEAL not in self.chk.options.enabled_error_codes:
-            return
+        name: str | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                name = _rust_classify_reveal_imported(
+                    int(expr.kind),
+                    expr.is_imported,
+                    codes.UNIMPORTED_REVEAL in self.chk.options.enabled_error_codes,
+                )
+            except (AssertionError, NotImplementedError):
+                name = None
 
-        name = ""
-        if expr.kind == REVEAL_LOCALS:
-            name = "reveal_locals"
-        elif expr.kind == REVEAL_TYPE and not expr.is_imported:
-            name = "reveal_type"
-        else:
-            return
+        if name is None:
+            if codes.UNIMPORTED_REVEAL not in self.chk.options.enabled_error_codes:
+                return
+            if expr.kind == REVEAL_LOCALS:
+                name = "reveal_locals"
+            elif expr.kind == REVEAL_TYPE and not expr.is_imported:
+                name = "reveal_type"
+            else:
+                return
 
         self.chk.fail(f'Name "{name}" is not defined', expr, code=codes.UNIMPORTED_REVEAL)
         if name == "reveal_type":
