@@ -1168,6 +1168,22 @@ including:
   bool/complex/fold-failure/final-var-ref/inside-function), plus pure
   decision unit tests in `semanal_visitor.rs`.
 
+- `rust_classify_class_decorator` (issue #897, Phase E1 slice of #624) —
+  mirrors the name-set dispatch of
+  `SemanticAnalyzer.analyze_class_decorator_common` (semanal.py:2889):
+  Rust checks the decorator against the final / disjoint_base /
+  type_check_only name sets (via `refers_to_fullname`, short-circuit in
+  branch order) and, when none matched, extracts the
+  `@warnings.deprecated("msg")` message from the `CallExpr`'s first
+  `StrExpr` arg. Returns a `(tag, deprecated_msg)` pair; `None` defers on
+  a name-set arity mismatch. The Python shim applies the flag writes
+  (`is_final` / `is_disjoint_base` / `is_type_check_only` / `deprecated`)
+  and the two `@disjoint_base` `fail`s (protocol / TypedDict). Gated by
+  `_native_semanal_visitor_active` and covered by
+  `NativeClassDecoratorCommonSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests + gate-off vs gate-on method differential +
+  deferral audit), plus pure decision unit tests in `semanal_visitor.rs`.
+
 - `rust_refers_to_typeddict` (issue #980, mypy.checkexpr) — mirrors the
   pure bool predicate `ExpressionChecker.refers_to_typeddict`
   (checkexpr.py:1385-1393), which runs for every call expression. Rust
