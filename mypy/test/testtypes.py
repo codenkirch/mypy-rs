@@ -31860,3 +31860,115 @@ class NativeIsInstanceVarSuite(Suite):
         var = Var("x")
         result = _type_kernel.rust_is_instance_var(var)
         assert result is None, f"expected defer, got {result}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsDisjointBaseSuite(Suite):
+    """Parity tests for `rust_is_disjoint_base` (mypy.typeops._is_disjoint_base).
+
+    The Rust seam reads `info.is_disjoint_base`, `info.slots`, and
+    `info.bases[*].type.slots` via PyO3 and computes the own-vs-base
+    slot set difference. Each test compares the direct seam call and
+    the gated Python shim against the pure-Python fallback.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeops import _set_native_typeops_active
+
+        self._set_active = _set_native_typeops_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _typeinfo(
+        self,
+        *,
+        fullname: str = "mod.A",
+        is_disjoint_base: bool = False,
+        slots: set[str] | None = None,
+        bases: list[Any] | None = None,
+    ) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.is_disjoint_base = is_disjoint_base
+        info.slots = slots
+        info.bases = list(bases) if bases is not None else []
+        info.mro = [info]
+        return info
+
+    def _base_entry(self, base_type: TypeInfo) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(type=base_type)
+
+    def _pure_python(self, info: TypeInfo) -> bool:
+        self._set_active(False)
+        try:
+            from mypy.typeops import _is_disjoint_base
+
+            return _is_disjoint_base(info)
+        finally:
+            self._set_active(True)
+
+    def _assert_par(self, info: TypeInfo) -> None:
+        from mypy.typeops import _is_disjoint_base
+
+        expected = self._pure_python(info)
+        assert _type_kernel.rust_is_disjoint_base(info) == expected
+        assert _is_disjoint_base(info) == expected
+
+    def test_decorator_true(self) -> None:
+        info = self._typeinfo(is_disjoint_base=True)
+        self._assert_par(info)
+
+    def test_no_slots(self) -> None:
+        info = self._typeinfo(slots=None)
+        self._assert_par(info)
+
+    def test_empty_slots(self) -> None:
+        info = self._typeinfo(slots=set())
+        self._assert_par(info)
+
+    def test_own_slots_no_bases(self) -> None:
+        info = self._typeinfo(slots={"x", "y"})
+        self._assert_par(info)
+
+    def test_all_slots_inherited_from_base(self) -> None:
+        base = self._typeinfo(fullname="mod.Base", slots={"x"})
+        info = self._typeinfo(slots={"x"}, bases=[self._base_entry(base)])
+        self._assert_par(info)
+
+    def test_mixed_own_and_inherited(self) -> None:
+        base = self._typeinfo(fullname="mod.Base", slots={"x"})
+        info = self._typeinfo(slots={"x", "y"}, bases=[self._base_entry(base)])
+        self._assert_par(info)
+
+    def test_base_slots_none(self) -> None:
+        base = self._typeinfo(fullname="mod.Base", slots=None)
+        info = self._typeinfo(slots={"x"}, bases=[self._base_entry(base)])
+        self._assert_par(info)
+
+    def test_multiple_bases(self) -> None:
+        b1 = self._typeinfo(fullname="mod.B1", slots={"x"})
+        b2 = self._typeinfo(fullname="mod.B2", slots={"y"})
+        info = self._typeinfo(
+            slots={"x", "y", "z"},
+            bases=[self._base_entry(b1), self._base_entry(b2)],
+        )
+        self._assert_par(info)
+
+    def test_gate_off_vs_on(self) -> None:
+        base = self._typeinfo(fullname="mod.Base", slots={"x"})
+        info = self._typeinfo(slots={"x", "y"}, bases=[self._base_entry(base)])
+        self._set_active(False)
+        from mypy.typeops import _is_disjoint_base
+
+        off = _is_disjoint_base(info)
+        self._set_active(True)
+        on = _is_disjoint_base(info)
+        assert off == on

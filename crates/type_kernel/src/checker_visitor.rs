@@ -519,50 +519,11 @@ fn disjoint_base_of(instance: &PyAny) -> PyResult<Option<PyObject>> {
     Ok(None)
 }
 
-/// `mypy.typeops._is_disjoint_base` — does the type have the
-/// `@disjoint_base` decorator or define non-empty `__slots__`?
-///
-/// Mirrors typeops.py:1661-1675. A slot is "own" when no base class
-/// (directly) declares it. Bases whose `slots` is `None` declare nothing.
+/// `mypy.typeops._is_disjoint_base` — delegates to the shared
+/// `typeops::is_disjoint_base_inner` to avoid duplicating the slot
+/// set-difference logic.
 fn is_disjoint_base(info: &PyAny) -> PyResult<bool> {
-    if info.getattr("is_disjoint_base")?.is_true()? {
-        return Ok(true);
-    }
-    let slots = info.getattr("slots")?;
-    if slots.is_none() {
-        return Ok(false);
-    }
-    let bases_list = info.getattr("bases")?.downcast::<PyList>()?;
-
-    // `TypeInfo.slots` is `set[str] | None`, so iterate it generically rather
-    // than downcasting to a list. Mirrors typeops.py:1667-1675: a slot is
-    // "own" when no base (directly) declares it.
-    let mut own_slot_found = false;
-    for slot_result in slots.iter()? {
-        let slot_str: String = slot_result?.extract()?;
-        let mut owned = true;
-        for base in bases_list.iter() {
-            let base_slots = base.getattr("type")?.getattr("slots")?;
-            if base_slots.is_none() {
-                continue;
-            }
-            for base_slot_result in base_slots.iter()? {
-                let base_slot_str: String = base_slot_result?.extract()?;
-                if base_slot_str == slot_str {
-                    owned = false;
-                    break;
-                }
-            }
-            if !owned {
-                break;
-            }
-        }
-        if owned {
-            own_slot_found = true;
-            break;
-        }
-    }
-    Ok(own_slot_found)
+    crate::typeops::is_disjoint_base_inner(info)
 }
 
 // ---------------------------------------------------------------------------

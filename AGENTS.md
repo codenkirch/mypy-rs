@@ -943,6 +943,21 @@ including:
   by `NativeIsInstanceVarSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus a Rust unit test
   proving the deferral path in `checkmember.rs`.
+- `rust_is_disjoint_base` (issue #969) — mirrors the pure bool predicate
+  `_is_disjoint_base` (typeops.py:2110-2124): returns `True` when
+  `info.is_disjoint_base` is set, or when `info.slots` is non-empty and at
+  least one slot is "own" (not declared by any direct base's `slots`).
+  Rust reads `info.is_disjoint_base`, `info.slots`, and
+  `info.bases[*].type.slots` via PyO3 and computes the own-vs-base slot
+  set difference, mirroring `rust_is_magic_base` (live-object, no wire
+  decode). Never defers: every well-formed `TypeInfo` yields a plain
+  bool. The shared `is_disjoint_base_inner` in `typeops.rs` replaces the
+  duplicate in `checker_visitor.rs`, so `rust_can_have_shared_disjoint_base`
+  uses the same code path. Gated by `_native_typeops_active` (wired from
+  `mypy/build.py`) and covered by `NativeIsDisjointBaseSuite` in
+  `mypy/test/testtypes.py` (direct seam calls, gate-off vs gate-on
+  differential across decorator, no-slots, empty-slots, own-slots,
+  all-inherited, mixed, base-slots-None, and multiple-bases cases).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
