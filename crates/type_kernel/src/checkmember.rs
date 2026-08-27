@@ -2551,6 +2551,173 @@ pub(crate) fn rust_descriptor_has_get_set(
 }
 
 // ---------------------------------------------------------------------------
+// classify_type_type_member_access (issue #957)
+// ---------------------------------------------------------------------------
+
+/// Dispatch tags for `analyze_type_type_member_access`
+/// (checkmember.py:965). Values must match `NATIVE_TT_*` in
+/// mypy/checkmember.py.
+const TT_NONE: i64 = 0;
+const TT_ITEM_INSTANCE: i64 = 1;
+const TT_ITEM_ANY: i64 = 2;
+const TT_TV_UB_INSTANCE: i64 = 3;
+const TT_TV_UB_UNION: i64 = 4;
+const TT_TV_UB_TUPLE: i64 = 5;
+const TT_TV_UB_ANY: i64 = 6;
+const TT_TV_UB_OTHER: i64 = 7;
+const TT_ITEM_TUPLE: i64 = 8;
+const TT_ITEM_FUNC_TYPEOBJ: i64 = 9;
+const TT_ITEM_FUNC_NOT_TYPEOBJ: i64 = 10;
+const TT_ITEM_TYPE_TYPE_INSTANCE: i64 = 11;
+const TT_ITEM_TYPE_TYPE_OTHER: i64 = 12;
+
+/// The `typ.item` kind in the top-level isinstance dispatch.
+#[derive(Clone, Copy, PartialEq)]
+enum TtItemKind {
+    Instance,
+    AnyType,
+    TypeVarType,
+    TupleType,
+    FunctionLike,
+    TypeType,
+    Other,
+}
+
+/// The `get_proper_type(typ.item.upper_bound)` kind in the
+/// TypeVarType sub-dispatch.
+#[derive(Clone, Copy, PartialEq)]
+enum TtUbKind {
+    Instance,
+    UnionType,
+    TupleType,
+    AnyType,
+    Other,
+}
+
+/// Pure decision mirroring `analyze_type_type_member_access` dispatch
+/// head (checkmember.py:971-999). Returns a branch tag; Python applies
+/// the terminal branches (`_analyze_member_access`, `filter_errors`,
+/// `tuple_fallback`, `TypeType.make_normalized`, `metaclass_type`).
+fn classify_type_type_member_access(
+    item_kind: TtItemKind,
+    is_type_obj: bool,
+    inner_item_is_instance: bool,
+    ub_kind: TtUbKind,
+) -> i64 {
+    match item_kind {
+        TtItemKind::Instance => TT_ITEM_INSTANCE,
+        TtItemKind::AnyType => TT_ITEM_ANY,
+        TtItemKind::TypeVarType => match ub_kind {
+            TtUbKind::Instance => TT_TV_UB_INSTANCE,
+            TtUbKind::UnionType => TT_TV_UB_UNION,
+            TtUbKind::TupleType => TT_TV_UB_TUPLE,
+            TtUbKind::AnyType => TT_TV_UB_ANY,
+            TtUbKind::Other => TT_TV_UB_OTHER,
+        },
+        TtItemKind::TupleType => TT_ITEM_TUPLE,
+        TtItemKind::FunctionLike => {
+            if is_type_obj {
+                TT_ITEM_FUNC_TYPEOBJ
+            } else {
+                TT_ITEM_FUNC_NOT_TYPEOBJ
+            }
+        }
+        TtItemKind::TypeType => {
+            if inner_item_is_instance {
+                TT_ITEM_TYPE_TYPE_INSTANCE
+            } else {
+                TT_ITEM_TYPE_TYPE_OTHER
+            }
+        }
+        TtItemKind::Other => TT_NONE,
+    }
+}
+
+/// `#[pyfunction]` entry for
+/// `mypy.checkmember.analyze_type_type_member_access`
+/// (checkmember.py:965-1018). Reads the live `TypeType` via PyO3,
+/// classifies the 9-way dispatch head (plus a nested 4-way
+/// sub-dispatch on `get_proper_type(typ.item.upper_bound)` for the
+/// TypeVarType arm), and returns a branch tag. Python applies the
+/// terminal branches. Returns `None` on any read failure.
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_type_type_member_access(
+    py: Python<'_>,
+    typ: &PyAny,
+) -> PyResult<Option<i64>> {
+    match classify_type_type_member_access_inner(py, typ) {
+        Ok(tag) => Ok(Some(tag)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn classify_type_type_member_access_inner(py: Python<'_>, typ: &PyAny) -> PyResult<i64> {
+    let types_mod = py.import("mypy.types")?;
+    let item = typ.getattr("item")?;
+    let instance_cls = types_mod.getattr("Instance")?;
+    let any_cls = types_mod.getattr("AnyType")?;
+    let typevar_cls = types_mod.getattr("TypeVarType")?;
+    let tuple_cls = types_mod.getattr("TupleType")?;
+    let funclike_cls = types_mod.getattr("FunctionLike")?;
+    let typetype_cls = types_mod.getattr("TypeType")?;
+    let union_cls = types_mod.getattr("UnionType")?;
+
+    let item_kind = if item.is_instance(instance_cls)? {
+        TtItemKind::Instance
+    } else if item.is_instance(any_cls)? {
+        TtItemKind::AnyType
+    } else if item.is_instance(typevar_cls)? {
+        TtItemKind::TypeVarType
+    } else if item.is_instance(tuple_cls)? {
+        TtItemKind::TupleType
+    } else if item.is_instance(funclike_cls)? {
+        TtItemKind::FunctionLike
+    } else if item.is_instance(typetype_cls)? {
+        TtItemKind::TypeType
+    } else {
+        TtItemKind::Other
+    };
+
+    let mut is_type_obj = false;
+    let mut inner_item_is_instance = false;
+    let mut ub_kind = TtUbKind::Other;
+    match item_kind {
+        TtItemKind::FunctionLike => {
+            is_type_obj = item.call_method0("is_type_obj")?.extract()?;
+        }
+        TtItemKind::TypeType => {
+            let inner = item.getattr("item")?;
+            inner_item_is_instance = inner.is_instance(instance_cls)?;
+        }
+        TtItemKind::TypeVarType => {
+            let upper_bound = item.getattr("upper_bound")?;
+            let proper = types_mod
+                .getattr("get_proper_type")?
+                .call1((upper_bound,))?;
+            ub_kind = if proper.is_instance(instance_cls)? {
+                TtUbKind::Instance
+            } else if proper.is_instance(union_cls)? {
+                TtUbKind::UnionType
+            } else if proper.is_instance(tuple_cls)? {
+                TtUbKind::TupleType
+            } else if proper.is_instance(any_cls)? {
+                TtUbKind::AnyType
+            } else {
+                TtUbKind::Other
+            };
+        }
+        _ => {}
+    }
+    Ok(classify_type_type_member_access(
+        item_kind,
+        is_type_obj,
+        inner_item_is_instance,
+        ub_kind,
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -3824,5 +3991,146 @@ mod tests {
             true, // is_class
         );
         assert!(result.is_none(), "classmethod must defer");
+    }
+
+    // --- classify_type_type_member_access (issue #957) ---
+
+    #[test]
+    fn test_tt_item_instance() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::Instance, false, false, TtUbKind::Other),
+            TT_ITEM_INSTANCE
+        );
+    }
+
+    #[test]
+    fn test_tt_item_any() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::AnyType, false, false, TtUbKind::Other),
+            TT_ITEM_ANY
+        );
+    }
+
+    #[test]
+    fn test_tt_tv_ub_instance() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::TypeVarType,
+                false,
+                false,
+                TtUbKind::Instance
+            ),
+            TT_TV_UB_INSTANCE
+        );
+    }
+
+    #[test]
+    fn test_tt_tv_ub_union() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::TypeVarType,
+                false,
+                false,
+                TtUbKind::UnionType
+            ),
+            TT_TV_UB_UNION
+        );
+    }
+
+    #[test]
+    fn test_tt_tv_ub_tuple() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::TypeVarType,
+                false,
+                false,
+                TtUbKind::TupleType
+            ),
+            TT_TV_UB_TUPLE
+        );
+    }
+
+    #[test]
+    fn test_tt_tv_ub_any() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::TypeVarType,
+                false,
+                false,
+                TtUbKind::AnyType
+            ),
+            TT_TV_UB_ANY
+        );
+    }
+
+    #[test]
+    fn test_tt_tv_ub_other() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::TypeVarType,
+                false,
+                false,
+                TtUbKind::Other
+            ),
+            TT_TV_UB_OTHER
+        );
+    }
+
+    #[test]
+    fn test_tt_item_tuple() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::TupleType, false, false, TtUbKind::Other),
+            TT_ITEM_TUPLE
+        );
+    }
+
+    #[test]
+    fn test_tt_item_func_typeobj() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::FunctionLike,
+                true,
+                false,
+                TtUbKind::Other
+            ),
+            TT_ITEM_FUNC_TYPEOBJ
+        );
+    }
+
+    #[test]
+    fn test_tt_item_func_not_typeobj() {
+        assert_eq!(
+            classify_type_type_member_access(
+                TtItemKind::FunctionLike,
+                false,
+                false,
+                TtUbKind::Other
+            ),
+            TT_ITEM_FUNC_NOT_TYPEOBJ
+        );
+    }
+
+    #[test]
+    fn test_tt_item_type_type_instance() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::TypeType, false, true, TtUbKind::Other),
+            TT_ITEM_TYPE_TYPE_INSTANCE
+        );
+    }
+
+    #[test]
+    fn test_tt_item_type_type_other() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::TypeType, false, false, TtUbKind::Other),
+            TT_ITEM_TYPE_TYPE_OTHER
+        );
+    }
+
+    #[test]
+    fn test_tt_none() {
+        assert_eq!(
+            classify_type_type_member_access(TtItemKind::Other, false, false, TtUbKind::Other),
+            TT_NONE
+        );
     }
 }

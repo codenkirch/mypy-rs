@@ -1634,6 +1634,7 @@ def rust_analyze_descriptor_access(
 def rust_descriptor_has_get_set(
     resolver: NativeTypeResolver, descriptor_bytes: bytes
 ) -> tuple[bool, bool] | None: ...
+def rust_classify_type_type_member_access(typ: Any) -> int | None: ...
 def rust_check_self_arg(
     resolver: NativeTypeResolver,
     functype_bytes: bytes,
