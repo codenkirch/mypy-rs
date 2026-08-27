@@ -752,23 +752,6 @@ including:
   Measured (self-check): 18623 calls, 13049 decided (70% native).
   Covered by `NativeProtocolImplementationSuite` in
   `mypy/test/testtypes.py`.
-- `rust_refers_to_typeddict` (issue #980, mypy.checkexpr) — mirrors the
-  pure bool predicate `ExpressionChecker.refers_to_typeddict`
-  (checkexpr.py:1385-1393), which runs for every call expression. Rust
-  reads the live callee via PyO3 `is_instance` (mirroring
-  `rust_classify_lvalue_validity`): `RefExpr` gate, then `node` as
-  `TypeInfo` with `typeddict_type is not None` (direct reference), then
-  `node` as `TypeAlias` whose target proper-type — serialized to wire
-  bytes by the Python shim — decodes to `Type::TypedDictType`. Returns
-  a plain bool; the only raise is a TypeAlias node without decodable
-  target bytes (unreachable through the shim), which the Python shim
-  treats as a fallback to the pure-Python body. Python keeps the
-  consumer branch (`accept` + `check_typeddict_call`) unchanged.
-  Gated by `_native_checkexpr_active` (existing wiring, no build.py
-  change) and covered by `NativeRefersToTypedDictSuite` in
-  `mypy/test/testtypes.py` (direct seam calls plus gate-off vs gate-on
-  differential over all branches), plus wire round-trip unit tests in
-  `checkexpr_functions.rs`.
 - `rust_has_abstract_type` (mypy.checkexpr) — mirrors
   `TypeChecker.has_abstract_type` (checkexpr.py:8134-8143): a pure
   boolean conjunction over live types. The seam reads live Python
@@ -824,22 +807,24 @@ including:
   covered by `NativeRawExpressionTypeSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), and pure
   decision unit tests in `typeanal_rawexpr.rs`.
-- `rust_classify_tuple_type_implicit` (issue #983) — mirrors the
-  implicit-tuple message-arbitration head of
-  `TypeAnalyser.visit_tuple_type` (typeanal.py:2038-2058): Rust reads
-  three scalars (`t.implicit`, `allow_tuple_literal`, `len(t.items)`)
-  and returns a tag OK (0, normal named_type + anal_array
-  reconstruction), EMPTY (1, `Tuple[()]` suggestion), SINGLE (2,
-  spurious-trailing-comma suggestion), or MULTI (3, `Tuple[T1, ..., Tn]`
-  suggestion). The Python shim applies the
-  "Syntax error in type annotation" fail + one-of-three note and, on OK,
-  the reconstruction; the pure-Python arbitration is the fallback when
-  the gate is off. Never defers: all three facts are scalars, so every
-  triple maps to exactly one tag. Lives in `typeanal_special.rs`,
-  gated by `_set_native_typeanal_active` (wired from `mypy/build.py`)
-  and covered by `NativeTupleTypeImplicitSuite` in `mypy/test/testtypes.py`
-  (gate-off vs gate-on differential plus direct seam calls), plus pure
-  decision unit tests in `typeanal_special.rs`.
+- `rust_classify_analyze_callable_type` (issue #958) — mirrors the
+  two-level dispatch head of `TypeAnalyser.analyze_callable_type`
+  (typeanal.py:2330-2394): arity 0 = bare `Callable[..., Any]`, arity 2
+  with `arg0` a `TypeList` = `Callable[[ARG, ...], RET]`, arity 2 with
+  `arg0` an `EllipsisType` = `Callable[..., RET]`, arity 2 otherwise =
+  the ParamSpec `Callable[P, RET]` form, any other arity = the
+  invalid-arity message (branching on `options.disallow_any_generics`).
+  Rust owns the whole decision table from four scalar facts
+  (`arg_count`, `arg0_is_type_list`, `arg0_is_ellipsis`,
+  `disallow_any_generics`) and returns a branch tag; the Python shim
+  (`_native_callable_type_tag` + `_apply_callable_type_tag`) builds the
+  live `CallableType`, enters `tvar_scope`, and emits `fail`/`note` for
+  the tag Rust returns. Every branch is decided; `None` is the
+  exception-only deferral. Gated by `_set_native_typeanal_active` (wired
+  from `mypy/build.py`) and covered by
+  `NativeAnalyzeCallableTypeSuite` in `mypy/test/testtypes.py` (gate-off
+  vs gate-on differential plus direct seam calls), and pure decision unit
+  tests in `typeanal_callable.rs`.
 - `rust_classify_function_signature` (issue #940) — mirrors the count
   arbitration of `SemanticAnalyzer.check_function_signature`
   (semanal.py:2072): compares `len(sig.arg_types)` against
@@ -949,22 +934,20 @@ including:
   (direct seam tag tests for all 13 branches plus gate-off vs gate-on
   differential on the result / call-log through a mock
   MemberContext), and 13 pure decision unit tests in `checkmember.rs`.
-- `rust_check_match_args` (issue #986, rework of the #970 tag-classifier
-  seam into the `rust_is_final_enum_value` pure-bool shape) — mirrors the
-  type predicate of `TypeChecker.check_match_args`
-  (checker.py:3128-3141): Rust reads one wire `typ`, resolves the proper
-  type (defers on an unresolved `TypeAliasType`), and returns
-  `isinstance(TupleType) and all(is_string_literal(item))` as a bool,
-  reusing `is_string_literal_inner` per item. The
-  `scope.active_class()` gate and the `LITERAL_REQ` note emission stay in
-  Python; the shim returns early on a decided bool and falls through to
-  the pure-Python body on `None`. Defers (`None`) on decode failure or an
-  item the string-literal kernel cannot decide (Python's
-  `try_getting_str_literals_from_type` fallback may still answer). Gated
+- `rust_classify_match_args` (issue #970) — mirrors the predicate head of
+  `TypeChecker.check_match_args` (checker.py:3128-3141): `not
+  self.scope.active_class()` -> skip (tag 0); `get_proper_type(typ)` not a
+  `TupleType` or any non-string-literal item -> fail (tag 2, emit the
+  `LITERAL_REQ` note); all items string literals -> ok (tag 1). Rust
+  decodes the wire `typ`, resolves the proper type (defers on an
+  unresolved `TypeAliasType`), checks the `TupleType` kind, and reuses
+  `is_string_literal_inner` per item. Defers (`None`) on decode failure
+  or an item the string-literal kernel cannot decide; the Python shim
+  emits the note and keeps the pure-Python body as the fallback. Gated
   by `_native_checker_active` (wired from `mypy/build.py`) and covered by
   `NativeMatchArgsSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
-  differential plus direct seam and alias-deferral calls), and 6 pure
-  unit tests in `checker_functions.rs`.
+  differential plus direct seam calls), and 5 pure decision unit tests in
+  `checker_functions.rs`.
 - `rust_is_valid_constructor` (issue #967) — mirrors
   `mypy.typeops.is_valid_constructor` (typeops.py:445-455): a pure bool
   predicate, True for `OverloadedFuncDef`/`FuncDef`
@@ -1026,45 +1009,6 @@ including:
   `mypy/build.py`) and covered by `NativeIsRecursivePairSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus 6 pure decision unit tests in `typeops.rs`.
-- `rust_classify_class_pattern_ranges` (issue #987) — mirrors the dispatch
-  of `PatternChecker.get_class_pattern_type_ranges`
-  (checkpattern.py:794-832): Rust decodes the wire `typ` and recurses over
-  `UnionType` items Rust-side, returning one branch tag per leaf in union
-  pre-order (FAIL / TYPE_OBJ / CALLABLE_VAR / TYPE_TYPE / ANY). The three
-  class-ref scalars (`isinstance(o.class_ref.node, Var)`, `node.type is
-  not None`, `node.fullname == "typing.Callable"`) are read via PyO3.
-  Python keeps all TypeRange construction from live nodes
-  (`fill_typevars_with_any` / `callable_with_ellipsis` / `named_type`) and
-  the `self.msg.fail` with `typ.str_with_options`. Defers (`None`) on any
-  `TypeAliasType` in the union (Python's `get_proper_type` would expand it
-  from live symbols), an undecodable wire blob, an unreadable class-ref
-  attribute, and any `CallableType`/`Overloaded` whose fallback is not
-  provably `builtins.type` (`is_type_obj` needs the live
-  `fallback.type.is_metaclass()`); an alias ret_type also defers. An
-  `UninhabitedType` ret_type decides `is_type_obj == False` so the scalar
-  class-ref arm still engages. Gated by `_native_checkpattern_active`
-  (already wired from `mypy/build.py`) and covered by
-  `NativeClassPatternRangesSuite` in `mypy/test/testtypes.py` (gate-off vs
-  gate-on differential plus direct seam calls), plus pure decision unit
-  tests in `checkpattern.rs`.
-- `rust_classify_simple_literal_type` (issue #984) — mirrors the 5-way
-  dispatch head of `SemanticAnalyzer.analyze_simple_literal_type`
-  (semanal.py:4720-4749): function_stack truthiness (skip inside a
-  function) and the folded constant kind (None / complex / bool / int /
-  str / float) decide the type-name tag (builtins.bool/int/str/float or
-  None). The Python shim folds the rvalue via the already-native
-  `constant_fold_expr`, applies `named_type_or_none(type_name)`, and
-  when `is_final` wraps the result via
-  `copy_modified(last_known_value=LiteralType(...))`. `cur_mod_id` and
-  `is_final` are carried for signature fidelity but do not affect the
-  decision. Never defers in production: the shim only produces the six
-  known value kinds; an unknown kind (direct seam calls only) defers
-  (`None`) to the pure-Python body. Gated by
-  `_native_semanal_visitor_active` and covered by
-  `NativeSimpleLiteralTypeSuite` in `mypy/test/testtypes.py` (direct
-  seam tag tests + gate-off vs gate-on differential over int/str/float/
-  bool/complex/fold-failure/final-var-ref/inside-function), plus pure
-  decision unit tests in `semanal_visitor.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

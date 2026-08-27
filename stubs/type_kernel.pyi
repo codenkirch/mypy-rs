@@ -1833,6 +1833,12 @@ def rust_classify_raw_expression_type(
     base_type_name: str,
     note_is_none: bool,
 ) -> int | None: ...
+def rust_classify_analyze_callable_type(
+    arg_count: int,
+    arg0_is_type_list: bool,
+    arg0_is_ellipsis: bool,
+    disallow_any_generics: bool,
+) -> int | None: ...
 
 # mypy/semanal.py — decorator/semanal-visitor helpers.
 def rust_erase_func_annotations(func: Any) -> None: ...

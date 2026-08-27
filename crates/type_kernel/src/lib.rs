@@ -135,6 +135,7 @@ mod supported_self_type;
 mod traverser;
 mod treetransform;
 mod typealias_instantiate;
+mod typeanal_callable;
 mod typeanal_info;
 mod typeanal_literal;
 mod typeanal_queries;
@@ -560,10 +561,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_classify_typeddict_call,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        checkexpr_functions::rust_refers_to_typeddict,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
@@ -1012,10 +1009,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
-        checkpattern::rust_classify_class_pattern_ranges,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
         checkstrformat::rust_parse_conversion_specifiers,
         module
     )?)?;
@@ -1158,10 +1151,6 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_visitor::rust_remove_imported_names_from_symtable,
-        module
-    )?)?;
-    module.add_function(wrap_pyfunction!(
-        semanal_visitor::rust_classify_simple_literal_type,
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
@@ -1678,11 +1667,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_rawexpr::rust_classify_raw_expression_type,
         module
     )?)?;
-    // visit_tuple_type: implicit-tuple message arbitration (OK / EMPTY /
-    // SINGLE / MULTI). Rust owns the three-scalar branch; Python applies
-    // the fail + one-of-three note and the reconstruction on OK.
+    // analyze_callable_type: two-level dispatch (arity + arg0 kind). Rust
+    // returns a branch tag from scalar facts; Python builds the live
+    // CallableType / enters tvar_scope / emits fail/note.
     module.add_function(wrap_pyfunction!(
-        typeanal_special::rust_classify_tuple_type_implicit,
+        typeanal_callable::rust_classify_analyze_callable_type,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types
@@ -2955,11 +2944,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
-    // Issue #986: check_match_args predicate port. Rust reads one wire
-    // Type and returns the TupleType + string-literal bool; the
-    // active_class gate and note emission stay in Python.
+    // Issue #970: check_match_args predicate-head port. Rust classifies
+    // active_class / TupleType / per-item string-literal into a branch
+    // tag; the note emission stays in Python.
     module.add_function(wrap_pyfunction!(
-        checker_functions::rust_check_match_args,
+        checker_functions::rust_classify_match_args,
         module
     )?)?;
 
