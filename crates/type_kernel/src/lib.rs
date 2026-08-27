@@ -2920,6 +2920,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #970: check_match_args predicate-head port. Rust classifies
+    // active_class / TupleType / per-item string-literal into a branch
+    // tag; the note emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_match_args,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,
