@@ -131,6 +131,7 @@ try:
         rust_has_operator as _rust_has_operator,
         rust_instance_fallback as _rust_instance_fallback,
         rust_meta_has_operator as _rust_meta_has_operator,
+        rust_is_instance_var as _rust_is_instance_var,
     )
 
     from mypy.types import read_type as _checkmember_read_type
@@ -141,6 +142,7 @@ except ImportError:
     _rust_instance_fallback = None  # type: ignore[assignment]
     _rust_has_operator = None  # type: ignore[assignment]
     _rust_meta_has_operator = None  # type: ignore[assignment]
+    _rust_is_instance_var = None  # type: ignore[assignment]
     _rust_defined_in_superclass = None  # type: ignore[assignment]
     _rust_classify_type_type_member_access = None  # type: ignore[assignment]
     _rust_analyze_member_access = None  # type: ignore[assignment]
@@ -1567,6 +1569,10 @@ def analyze_descriptor_assign(descriptor_type: Instance, mx: MemberContext) -> T
 
 def is_instance_var(var: Var) -> bool:
     """Return if var is an instance variable according to PEP 526."""
+    if _HAS_TYPE_KERNEL and _native_checkmember_active and _rust_is_instance_var is not None:
+        result = _rust_is_instance_var(var)
+        if result is not None:
+            return result
     return (
         # check the type_info node is the var (not a decorated function, etc.)
         var.name in var.info.names
