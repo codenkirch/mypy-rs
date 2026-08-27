@@ -475,6 +475,22 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus Rust unit tests for the name predicates in
   `checker_functions.rs`.
+- `rust_check_for_untyped_decorator` (issue #942) — mirrors
+  `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964): the
+  bool gate `disallow_untyped_decorators and is_typed_callable(func.type)
+  and is_untyped_decorator(dec_type) and not current_node_deferred`. Rust
+  folds the two wire-format type sub-predicates (reusing the existing
+  `is_typed_callable` / `is_untyped_decorator` ports in
+  `checkexpr_functions.rs`) with the two scalar flags, short-circuiting in
+  Python order; the Python shim emits `typed_function_untyped_decorator`
+  when the result is True and keeps the pure-Python body as the fallback.
+  Defers (`None`) on an undecodable blob or a deferred sub-predicate (an
+  Instance decorator whose `__call__` needs live TypeInfo). Gated by
+  `_native_checker_active` (wired from `mypy/build.py`; the Python shim
+  mirrors `rust_classify_final_super` gating) and covered by
+  `NativeUntypedDecoratorSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls), plus pure decision unit
+  tests in `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub

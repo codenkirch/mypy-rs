@@ -945,6 +945,73 @@ pub(crate) fn rust_is_final_enum_value(
     Ok(is_stub || has_explicit_value)
 }
 
+/// `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964): the
+/// bool conjunction `disallow_untyped_decorators and is_typed_callable(func.type)
+/// and is_untyped_decorator(dec_type) and not current_node_deferred`, reduced to
+/// a pure decision over resolved facts. `func_is_typed` / `dec_is_untyped` are
+/// `Option<bool>` where `None` means the sub-predicate deferred (e.g. an
+/// instance decorator whose `__call__` needs live TypeInfo, or an alias).
+/// Short-circuit order mirrors the Python body, so a `false` disallow flag or
+/// an untruthy sub-predicate answers `Some(false)` without touching the rest.
+fn check_untyped_decorator(
+    disallow: bool,
+    func_is_typed: Option<bool>,
+    dec_is_untyped: Option<bool>,
+    deferred: bool,
+) -> Option<bool> {
+    if !disallow {
+        return Some(false);
+    }
+    let func_typed = func_is_typed?;
+    if !func_typed {
+        return Some(false);
+    }
+    let dec_untyped = dec_is_untyped?;
+    if !dec_untyped {
+        return Some(false);
+    }
+    Some(!deferred)
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_for_untyped_decorator`
+/// (mypy/checker.py:6955-6964). The two type sub-predicates are computed on
+/// the wire format via the existing `is_typed_callable` /
+/// `is_untyped_decorator` ports; the scalar flags (`disallow_untyped_decorators`
+/// and `current_node_deferred`) arrive as plain bools. Returns `Some(bool)` for
+/// every decidable conjunction, or `None` to defer (an undecodable type blob or
+/// a deferred sub-predicate, which mirrors the Python `try/except` shim).
+#[pyfunction]
+#[pyo3(signature = (disallow_untyped_decorators, func_type_bytes, dec_type_bytes, current_node_deferred))]
+pub(crate) fn rust_check_for_untyped_decorator(
+    disallow_untyped_decorators: bool,
+    func_type_bytes: Option<&[u8]>,
+    dec_type_bytes: Option<&[u8]>,
+    current_node_deferred: bool,
+) -> PyResult<Option<bool>> {
+    let func_is_typed = match func_type_bytes {
+        // `is_typed_callable(None)` is False (get_proper_type(None) is falsy).
+        None => Some(false),
+        Some(bytes) => match crate::checkmember::decode_type(bytes) {
+            Some(t) => crate::checkexpr_functions::is_typed_callable_inner(&t),
+            None => return Ok(None),
+        },
+    };
+    let dec_is_untyped = match dec_type_bytes {
+        // `is_untyped_decorator(None)` is True (get_proper_type(None) is falsy).
+        None => Some(true),
+        Some(bytes) => match crate::checkmember::decode_type(bytes) {
+            Some(t) => crate::checkexpr_functions::is_untyped_decorator_inner(&t),
+            None => return Ok(None),
+        },
+    };
+    Ok(check_untyped_decorator(
+        disallow_untyped_decorators,
+        func_is_typed,
+        dec_is_untyped,
+        current_node_deferred,
+    ))
+}
+
 #[cfg(test)]
 mod metaclass_compat_tests {
     use super::*;
@@ -1121,5 +1188,58 @@ mod final_enum_value_tests {
         // `__prop` is private but not sunder (no trailing underscore).
         assert!(is_private("__prop"));
         assert!(!is_sunder("__prop"));
+    }
+}
+
+#[cfg(test)]
+mod check_untyped_decorator_tests {
+    use super::*;
+
+    fn decide(
+        disallow: bool,
+        func_is_typed: Option<bool>,
+        dec_is_untyped: Option<bool>,
+        deferred: bool,
+    ) -> Option<bool> {
+        check_untyped_decorator(disallow, func_is_typed, dec_is_untyped, deferred)
+    }
+
+    #[test]
+    fn test_disallow_false_short_circuits() {
+        // disallow off: False regardless of the sub-predicates.
+        assert_eq!(decide(false, None, None, true), Some(false));
+        assert_eq!(decide(false, Some(true), Some(true), false), Some(false));
+    }
+
+    #[test]
+    fn test_func_not_typed_short_circuits() {
+        assert_eq!(decide(true, Some(false), None, true), Some(false));
+        assert_eq!(decide(true, Some(false), Some(true), false), Some(false));
+    }
+
+    #[test]
+    fn test_func_typed_defer_propagates() {
+        assert_eq!(decide(true, None, Some(true), false), None);
+    }
+
+    #[test]
+    fn test_dec_not_untyped_short_circuits() {
+        assert_eq!(decide(true, Some(true), Some(false), true), Some(false));
+        assert_eq!(decide(true, Some(true), Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn test_dec_untyped_defer_propagates() {
+        assert_eq!(decide(true, Some(true), None, false), None);
+    }
+
+    #[test]
+    fn test_all_true_not_deferred() {
+        assert_eq!(decide(true, Some(true), Some(true), false), Some(true));
+    }
+
+    #[test]
+    fn test_all_true_but_deferred() {
+        assert_eq!(decide(true, Some(true), Some(true), true), Some(false));
     }
 }

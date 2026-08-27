@@ -204,6 +204,7 @@ __all__ = [
     "rust_classify_enum_new",
     "rust_classify_enum_bases",
     "rust_is_final_enum_value",
+    "rust_check_for_untyped_decorator",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -801,6 +802,12 @@ def rust_classify_func_def_override(
 def rust_classify_enum_new(bases: Any) -> list[int] | None: ...
 def rust_classify_enum_bases(bases: Any) -> tuple[int, int] | None: ...
 def rust_is_final_enum_value(sym: SymbolTableNode, is_stub: bool) -> bool: ...
+def rust_check_for_untyped_decorator(
+    disallow_untyped_decorators: bool,
+    func_type_bytes: bytes | None,
+    dec_type_bytes: bytes | None,
+    current_node_deferred: bool,
+) -> bool | None: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes
 ) -> bool | None: ...

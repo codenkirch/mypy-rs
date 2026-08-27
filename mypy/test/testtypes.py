@@ -24412,6 +24412,173 @@ class NativeFinalSuperSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeUntypedDecoratorSuite(Suite):
+    """Parity for the Rust `check_for_untyped_decorator` conjunction port.
+
+    `TypeChecker.check_for_untyped_decorator` (checker.py:6955-6964) is the
+    bool gate `disallow_untyped_decorators and is_typed_callable(func.type)
+    and is_untyped_decorator(dec_type) and not current_node_deferred`. The
+    Rust fold (checker_functions.rs) computes the two type sub-predicates on
+    the wire format and combines them with the two scalar flags; the Python
+    shim emits `typed_function_untyped_decorator` when it returns True and
+    keeps the pure-Python body as the fallback.
+
+    Direct seam calls prove engagement and short-circuit ordering; the
+    gate-off vs gate-on differential drives the real TypeChecker method and
+    asserts identical message output.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typed_callable(self) -> CallableType:
+        return CallableType(
+            [self.fx.a],
+            [ARG_POS],
+            [None],
+            self.fx.a,
+            self.fx.function,
+        )
+
+    def _untyped_callable(self) -> CallableType:
+        any_unannotated = AnyType(TypeOfAny.unannotated)
+        return CallableType(
+            [any_unannotated],
+            [ARG_POS],
+            [None],
+            any_unannotated,
+            self.fx.function,
+        )
+
+    def _serialize(self, typ: Type | None) -> bytes | None:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(typ) if typ is not None else None
+
+    def _seam(
+        self,
+        disallow: bool,
+        func_type: Type | None,
+        dec_type: Type | None,
+        deferred: bool,
+    ) -> bool | None:
+        return _type_kernel.rust_check_for_untyped_decorator(
+            disallow,
+            self._serialize(func_type),
+            self._serialize(dec_type),
+            deferred,
+        )
+
+    def _run(
+        self,
+        disallow: bool,
+        func_type: Type | None,
+        dec_type: Type | None,
+        deferred: bool,
+    ) -> tuple[list[str], list[str]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> list[str]:
+            chk = TypeChecker.__new__(TypeChecker)
+            names: list[str] = []
+            chk.options = SimpleNamespace(
+                disallow_untyped_decorators=disallow
+            )  # type: ignore[assignment]
+            chk.current_node_deferred = deferred
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                typed_function_untyped_decorator=lambda n, ctx: names.append(n)
+            )
+            func = FuncDef("func")
+            func.type = func_type  # type: ignore[assignment]
+            chk.check_for_untyped_decorator(func, dec_type, None)  # type: ignore[arg-type]
+            return names
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(
+        self,
+        disallow: bool,
+        func_type: Type | None,
+        dec_type: Type | None,
+        deferred: bool,
+    ) -> None:
+        off, on = self._run(disallow, func_type, dec_type, deferred)
+        assert_equal(
+            on,
+            off,
+            "check_for_untyped_decorator parity (disallow={}, deferred={})".format(
+                disallow, deferred
+            ),
+        )
+
+    def test_seam_disallow_false(self) -> None:
+        assert self._seam(False, None, None, True) is False
+
+    def test_seam_typed_func_untyped_decorator(self) -> None:
+        assert self._seam(True, self._typed_callable(), self._untyped_callable(), False) is True
+
+    def test_seam_typed_func_untyped_decorator_deferred(self) -> None:
+        assert (
+            self._seam(True, self._typed_callable(), self._untyped_callable(), True) is False
+        )
+
+    def test_seam_untyped_func(self) -> None:
+        assert self._seam(True, self._untyped_callable(), self._untyped_callable(), False) is False
+
+    def test_seam_typed_decorator(self) -> None:
+        assert self._seam(True, self._typed_callable(), self._typed_callable(), False) is False
+
+    def test_seam_none_types(self) -> None:
+        # is_typed_callable(None) is False; is_untyped_decorator(None) is True.
+        assert self._seam(True, None, None, False) is False
+        assert self._seam(True, self._typed_callable(), None, False) is True
+
+    def test_seam_instance_decorator_defers(self) -> None:
+        # is_untyped_decorator on an Instance needs the live `__call__` lookup,
+        # so the Rust seam must defer (None); the Python shim falls back.
+        assert self._seam(True, self._typed_callable(), self.fx.a, False) is None
+
+    def test_parity_all_false(self) -> None:
+        self._assert_par(False, None, None, False)
+
+    def test_parity_typed_func_untyped_decorator(self) -> None:
+        self._assert_par(True, self._typed_callable(), self._untyped_callable(), False)
+
+    def test_parity_typed_func_untyped_decorator_deferred(self) -> None:
+        self._assert_par(True, self._typed_callable(), self._untyped_callable(), True)
+
+    def test_parity_untyped_func(self) -> None:
+        self._assert_par(True, self._untyped_callable(), self._untyped_callable(), False)
+
+    def test_parity_typed_decorator(self) -> None:
+        self._assert_par(True, self._typed_callable(), self._typed_callable(), False)
+
+    def test_parity_instance_decorator(self) -> None:
+        self._assert_par(True, self._typed_callable(), self.fx.a, False)
+
+    def test_parity_none_decorator(self) -> None:
+        self._assert_par(True, self._typed_callable(), None, False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeCompatibilityClassvarSuperSuite(Suite):
     """Parity for the Rust `check_compatibility_classvar_super` 2x2 predicate port.
 
