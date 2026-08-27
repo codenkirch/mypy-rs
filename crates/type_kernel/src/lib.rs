@@ -2861,6 +2861,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #942: check_for_untyped_decorator conjunction port. Rust folds
+    // the disallow/typed-callback/untyped-decorator/not-deferred bool gate on
+    // the wire format; the message emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_check_for_untyped_decorator,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

@@ -329,6 +329,7 @@ try:
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
+        rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_enum_new as _rust_classify_enum_new,
         rust_classify_enum_bases as _rust_classify_enum_bases,
@@ -402,6 +403,7 @@ except ImportError:
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
     _rust_builtin_item_type = None  # type: ignore[assignment]
+    _rust_check_for_untyped_decorator = None  # type: ignore[assignment]
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
@@ -6955,6 +6957,33 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check_for_untyped_decorator(
         self, func: FuncDef, dec_type: Type, dec_expr: Expression
     ) -> None:
+        # Native type_kernel seam: fold the bool conjunction in Rust
+        # (checker_functions.rs); message emission stays here. None falls
+        # through to the pure-Python body below.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_check_for_untyped_decorator is not None
+        ):
+            try:
+                func_type_bytes = (
+                    _serialize_type_for_checker(func.type) if func.type is not None else None
+                )
+                dec_type_bytes = (
+                    _serialize_type_for_checker(dec_type) if dec_type is not None else None
+                )
+                res = _rust_check_for_untyped_decorator(
+                    self.options.disallow_untyped_decorators,
+                    func_type_bytes,
+                    dec_type_bytes,
+                    bool(self.current_node_deferred),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                res = None
+            if res is not None:
+                if res:
+                    self.msg.typed_function_untyped_decorator(func.name, dec_expr)
+                return
         if (
             self.options.disallow_untyped_decorators
             and is_typed_callable(func.type)
