@@ -91,6 +91,7 @@ try:
     from mypy.types import read_type as _read_type
 
     _rust_infer_variance_member = _type_kernel.rust_infer_variance_member
+    _rust_are_args_compatible = _type_kernel.rust_are_args_compatible
     _HAS_TYPE_KERNEL = True
 except ImportError:
     _type_kernel = None  # type: ignore[assignment]
@@ -98,6 +99,7 @@ except ImportError:
     _WriteBuffer = None  # type: ignore[assignment,misc]
     _read_type = None  # type: ignore[assignment]
     _rust_infer_variance_member = None  # type: ignore[assignment]
+    _rust_are_args_compatible = None  # type: ignore[assignment]
     _HAS_TYPE_KERNEL = False
 
 # Module-level flag + resolver, set by the build manager from
@@ -146,6 +148,22 @@ def _native_variance_member_active() -> bool:
 def _native_erase_return_self_types_active() -> bool:
     """Guard for the `erase_return_self_types` seam."""
     return _HAS_TYPE_KERNEL and _native_subtype_active
+
+
+# Decision tags returned by `_rust_are_args_compatible`; must match the
+# `KIND_ARE_ARGS_*` constants in crates/type_kernel/src/subtypes.rs.
+NATIVE_ARE_ARGS_FALSE = 0
+NATIVE_ARE_ARGS_TRUE = 1
+NATIVE_ARE_ARGS_CALL_IS_COMPAT = 2
+
+
+def _native_are_args_compatible_active() -> bool:
+    """Guard for the `are_args_compatible` dispatch seam."""
+    return (
+        _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _rust_are_args_compatible is not None
+    )
 
 
 def _native_infer_variance_member(
@@ -2633,6 +2651,26 @@ def are_args_compatible(
     allow_partial_overlap: bool,
     allow_imprecise_kinds: bool = False,
 ) -> bool:
+    # Native type_kernel seam: classify the pure decision in Rust
+    # (subtypes.rs); the trailing is_compat call stays here. None falls
+    # through to the pure-Python body below.
+    if _native_are_args_compatible_active():
+        try:
+            tag = _rust_are_args_compatible(
+                left,
+                right,
+                bool(ignore_pos_arg_names),
+                bool(allow_partial_overlap),
+                bool(allow_imprecise_kinds),
+            )
+        except (AssertionError, NotImplementedError, ValueError, TypeError):
+            tag = None
+        if tag == NATIVE_ARE_ARGS_FALSE:
+            return False
+        if tag == NATIVE_ARE_ARGS_TRUE:
+            return True
+        # NATIVE_ARE_ARGS_CALL_IS_COMPAT falls through to the tail.
+
     if left.required and right.required:
         # If both arguments are required allow_partial_overlap has no effect.
         allow_partial_overlap = False

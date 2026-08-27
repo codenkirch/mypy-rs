@@ -229,6 +229,7 @@ __all__ = [
     "rust_replace_implicit_first_type",
     "rust_infer_function_type_arguments",
     "rust_callables_compatible",
+    "rust_are_args_compatible",
     "rust_are_parameters_compatible",
     "rust_is_overlapping_types",
     "rust_refers_to_fullname",
@@ -1208,6 +1209,13 @@ def rust_are_parameters_compatible(
     nested_proper_subtype: bool,
     resolver: NativeTypeResolver,
 ) -> bool | None: ...
+def rust_are_args_compatible(
+    left: Any,
+    right: Any,
+    ignore_pos_arg_names: bool,
+    allow_partial_overlap: bool,
+    allow_imprecise_kinds: bool,
+) -> int | None: ...
 def rust_is_overlapping_types(
     left_bytes: bytes,
     right_bytes: bytes,

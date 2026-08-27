@@ -134,6 +134,7 @@ from mypy.types import (
     DeletedType,
     EllipsisType,
     ErasedType,
+    FormalArgument,
     FunctionLike,
     Instance,
     LiteralType,
@@ -24409,6 +24410,193 @@ class NativeFinalSuperSuite(Suite):
         self._assert_par(node_final, base, self._var("base_attr", False))
         # Non-final override of non-final base var: trailing pass, no message.
         self._assert_par(node_plain, base, self._var("base_attr", False))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAreArgsCompatibleSuite(Suite):
+    """Parity for the Rust `are_args_compatible` dispatch-head port.
+
+    `mypy.subtypes.are_args_compatible` (subtypes.py:2627-2681) classifies
+    the name gate, position gate, required-arity gate, and partial-overlap
+    shortcut head over two `FormalArgument` scalars, then falls through to
+    `is_compat(right.typ, left.typ)` for the tail. The Rust classifier
+    (`subtypes.rs`) turns those facts into a tag (FALSE / TRUE /
+    CALL_IS_COMPAT); the Python shim keeps the trailing is_compat call and
+    the pure-Python body.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real function with a stub is_compat
+    and asserts identical (return, call count) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.subtypes import _set_native_subtype_active
+
+        self._set_active = _set_native_subtype_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _arg(self, name: str | None, pos: int | None, required: bool) -> FormalArgument:
+        return FormalArgument(name, pos, NoneType(), required)
+
+    def _tag(
+        self,
+        left: FormalArgument,
+        right: FormalArgument,
+        *,
+        ignore_pos_arg_names: bool = False,
+        allow_partial_overlap: bool = False,
+        allow_imprecise_kinds: bool = False,
+    ) -> int | None:
+        return _type_kernel.rust_are_args_compatible(
+            left,
+            right,
+            ignore_pos_arg_names,
+            allow_partial_overlap,
+            allow_imprecise_kinds,
+        )
+
+    def _run(
+        self,
+        left: FormalArgument,
+        right: FormalArgument,
+        *,
+        ignore_pos_arg_names: bool = False,
+        allow_partial_overlap: bool = False,
+        allow_imprecise_kinds: bool = False,
+    ) -> tuple[tuple[bool, int], tuple[bool, int]]:
+        from mypy.subtypes import are_args_compatible
+
+        def check_one() -> tuple[bool, int]:
+            calls = 0
+
+            def is_compat(l: Any, r: Any) -> bool:
+                nonlocal calls
+                calls += 1
+                return True
+
+            ret = are_args_compatible(
+                left,
+                right,
+                is_compat,
+                ignore_pos_arg_names=ignore_pos_arg_names,
+                allow_partial_overlap=allow_partial_overlap,
+                allow_imprecise_kinds=allow_imprecise_kinds,
+            )
+            return ret, calls
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(
+        self,
+        left: FormalArgument,
+        right: FormalArgument,
+        *,
+        ignore_pos_arg_names: bool = False,
+        allow_partial_overlap: bool = False,
+        allow_imprecise_kinds: bool = False,
+    ) -> None:
+        off, on = self._run(
+            left,
+            right,
+            ignore_pos_arg_names=ignore_pos_arg_names,
+            allow_partial_overlap=allow_partial_overlap,
+            allow_imprecise_kinds=allow_imprecise_kinds,
+        )
+        assert_equal(
+            on,
+            off,
+            f"are_args_compatible parity for left={left!r} right={right!r}",
+        )
+
+    def test_seam_name_mismatch_false(self) -> None:
+        left = self._arg("x", None, False)
+        right = self._arg("y", None, False)
+        assert self._tag(left, right) == 0
+
+    def test_seam_name_mismatch_ignored_with_pos_calls_compat(self) -> None:
+        left = self._arg("x", 0, False)
+        right = self._arg("y", 0, False)
+        assert self._tag(left, right, ignore_pos_arg_names=True) == 2
+
+    def test_seam_name_mismatch_ignored_no_right_pos_false(self) -> None:
+        left = self._arg("x", None, False)
+        right = self._arg("y", None, False)
+        assert self._tag(left, right, ignore_pos_arg_names=True) == 0
+
+    def test_seam_right_name_none_calls_compat(self) -> None:
+        left = self._arg("x", 0, False)
+        right = self._arg(None, 0, False)
+        assert self._tag(left, right) == 2
+
+    def test_seam_pos_mismatch_false(self) -> None:
+        left = self._arg(None, 0, False)
+        right = self._arg(None, 1, False)
+        assert self._tag(left, right) == 0
+
+    def test_seam_pos_mismatch_imprecise_calls_compat(self) -> None:
+        left = self._arg(None, 0, False)
+        right = self._arg(None, 1, False)
+        assert self._tag(left, right, allow_imprecise_kinds=True) == 2
+
+    def test_seam_right_pos_none_calls_compat(self) -> None:
+        left = self._arg(None, 0, False)
+        right = self._arg(None, None, False)
+        assert self._tag(left, right) == 2
+
+    def test_seam_required_left_optional_right_false(self) -> None:
+        left = self._arg(None, 0, True)
+        right = self._arg(None, 0, False)
+        assert self._tag(left, right) == 0
+
+    def test_seam_overlap_both_optional_true(self) -> None:
+        left = self._arg(None, 0, False)
+        right = self._arg(None, 0, False)
+        assert self._tag(left, right, allow_partial_overlap=True) == 1
+
+    def test_seam_overlap_one_required_calls_compat(self) -> None:
+        left = self._arg(None, 0, True)
+        right = self._arg(None, 0, False)
+        assert self._tag(left, right, allow_partial_overlap=True) == 2
+
+    def test_seam_both_required_disables_overlap_calls_compat(self) -> None:
+        left = self._arg(None, 0, True)
+        right = self._arg(None, 0, True)
+        assert self._tag(left, right, allow_partial_overlap=True) == 2
+
+    def test_seam_overlap_left_name_none_true(self) -> None:
+        left = self._arg(None, 0, False)
+        right = self._arg("y", 0, False)
+        assert self._tag(left, right, allow_partial_overlap=True) == 1
+
+    def test_parity_every_branch(self) -> None:
+        cases: list[tuple[FormalArgument, FormalArgument, dict[str, bool]]] = [
+            (self._arg("x", None, False), self._arg("y", None, False), {}),
+            (self._arg("x", 0, False), self._arg("y", 0, False), {"ignore_pos_arg_names": True}),
+            (self._arg("x", None, False), self._arg("y", None, False), {"ignore_pos_arg_names": True}),
+            (self._arg("x", 0, False), self._arg(None, 0, False), {}),
+            (self._arg(None, 0, False), self._arg(None, 1, False), {}),
+            (self._arg(None, 0, False), self._arg(None, 1, False), {"allow_imprecise_kinds": True}),
+            (self._arg(None, 0, False), self._arg(None, None, False), {}),
+            (self._arg(None, 0, True), self._arg(None, 0, False), {}),
+            (self._arg(None, 0, False), self._arg(None, 0, False), {"allow_partial_overlap": True}),
+            (self._arg(None, 0, True), self._arg(None, 0, False), {"allow_partial_overlap": True}),
+            (self._arg(None, 0, True), self._arg(None, 0, True), {"allow_partial_overlap": True}),
+            (self._arg(None, 0, False), self._arg("y", 0, False), {"allow_partial_overlap": True}),
+        ]
+        for left, right, flags in cases:
+            self._assert_par(left, right, **flags)
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

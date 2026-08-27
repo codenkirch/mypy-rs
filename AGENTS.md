@@ -784,6 +784,27 @@ including:
   `NativeDecoratedFunctionIsMethodSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential on the fail list plus direct seam
   calls), and 4 pure decision unit tests in `semanal_checks.rs`.
+- `rust_are_args_compatible` (issue #954) — mirrors the dispatch head of
+  `mypy.subtypes.are_args_compatible` (subtypes.py:2627-2681): the
+  name-mismatch gate (`is_different(left.name, right.name, ...)`,
+  modulated by `ignore_pos_arg_names` / `right.pos`), the position gate
+  (`is_different(left.pos, right.pos, allow_overlap=False)` gated by
+  `allow_imprecise_kinds`), the required-arity gate (`not
+  allow_partial_overlap and not right.required and left.required`), and
+  the partial-overlap shortcut (`allow_partial_overlap and not
+  left.required and not right.required`), with the "both required ->
+  allow_partial_overlap=False" pre-adjustment applied. Rust reads the
+  `left`/`right` `FormalArgument` scalar fields (`name`, `pos`,
+  `required`) via PyO3 plus the three bool flag args and returns a tag:
+  FALSE (0) / TRUE (1) / CALL_IS_COMPAT (2). The Python shim keeps the
+  trailing `is_compat(right.typ, left.typ)` tail (already native via the
+  subtype resolver) and the pure-Python body as the fallback. `None`
+  defers only on an unreadable attribute or comparison failure. Gated by
+  `_native_are_args_compatible_active` (`_native_subtype_active`, wired
+  from `mypy/build.py`) and covered by `NativeAreArgsCompatibleSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on
+  (return, is_compat call count) plus direct seam calls proving
+  engagement), and 12 pure decision unit tests in `subtypes.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

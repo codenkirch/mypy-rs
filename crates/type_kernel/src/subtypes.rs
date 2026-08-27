@@ -16,6 +16,7 @@
 //! `Options.native_type_kernel` is on AND `mypy/subtypes.py` dispatches
 //! to it (the shim is added in this same milestone).
 
+use pyo3::basic::CompareOp;
 use pyo3::prelude::*;
 use std::collections::HashSet;
 
@@ -2936,6 +2937,175 @@ pub(crate) fn rust_subtype_tvar_tuple_right(
     visit_instance_variadic_right(&left, &right, &ctx, resolver.resolver(), type_ref.as_str())
 }
 
+/// Decision tags; values must match `NATIVE_ARE_ARGS_*` in mypy/subtypes.py.
+const KIND_ARE_ARGS_FALSE: i64 = 0;
+const KIND_ARE_ARGS_TRUE: i64 = 1;
+const KIND_ARE_ARGS_CALL_IS_COMPAT: i64 = 2;
+
+/// `are_args_compatible.is_different` (subtypes.py:2640-2654): true when the
+/// left/right items differ, defaulting to False when the right is unspecified
+/// (None) or, under partial overlap, when the left is also unspecified.
+fn is_different(left_is_none: bool, right_is_none: bool, equal: bool, allow_overlap: bool) -> bool {
+    if right_is_none {
+        return false;
+    }
+    if allow_overlap && left_is_none {
+        return false;
+    }
+    !equal
+}
+
+/// Pure decision core of `mypy.subtypes.are_args_compatible`
+/// (subtypes.py:2627-2681), over resolved scalar facts. Mirrors the
+/// Python branch order: the name gate, the position gate, the
+/// required-arity gate, the partial-overlap shortcut, then the tail.
+/// Returns FALSE / TRUE / CALL_IS_COMPAT.
+#[allow(clippy::too_many_arguments)]
+fn classify_are_args_compatible(
+    left_name_is_none: bool,
+    right_name_is_none: bool,
+    names_equal: bool,
+    right_pos_is_none: bool,
+    pos_equal: bool,
+    left_required: bool,
+    right_required: bool,
+    ignore_pos_arg_names: bool,
+    allow_partial_overlap: bool,
+    allow_imprecise_kinds: bool,
+) -> i64 {
+    // subtypes.py:2636-2638: when both args are required, overlap is off.
+    let partial = allow_partial_overlap && !(left_required && right_required);
+
+    // subtypes.py:2658-2661: name gate.
+    if is_different(left_name_is_none, right_name_is_none, names_equal, partial)
+        && (!ignore_pos_arg_names || right_pos_is_none)
+    {
+        return KIND_ARE_ARGS_FALSE;
+    }
+
+    // subtypes.py:2666-2667: position gate (overlap disabled for pos).
+    if is_different(false, right_pos_is_none, pos_equal, false) && !allow_imprecise_kinds {
+        return KIND_ARE_ARGS_FALSE;
+    }
+
+    // subtypes.py:2672-2673: optional right, required left, no overlap.
+    if !partial && !right_required && left_required {
+        return KIND_ARE_ARGS_FALSE;
+    }
+
+    // subtypes.py:2677-2678: overlap shortcut for two optional args.
+    if partial && !left_required && !right_required {
+        return KIND_ARE_ARGS_TRUE;
+    }
+
+    // subtypes.py:2681: tail `return is_compat(right.typ, left.typ)`.
+    KIND_ARE_ARGS_CALL_IS_COMPAT
+}
+
+/// Read a bool flag attribute off a live Python object; return `None` to
+/// defer on any read/truthiness failure (strangler-fig fallback).
+fn read_bool_attr(obj: &PyAny, name: &str) -> PyResult<Option<bool>> {
+    match obj.getattr(name) {
+        Ok(v) => match v.is_true() {
+            Ok(b) => Ok(Some(b)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// Read an attribute as a borrowed reference; return `None` (defer) when
+/// the attribute cannot be read.
+fn read_attr_opt<'py>(obj: &'py PyAny, name: &str) -> PyResult<Option<&'py PyAny>> {
+    match obj.getattr(name) {
+        Ok(v) => Ok(Some(v)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Python `a == b` under rich comparison; return `None` (defer) on any
+/// comparison or truthiness failure.
+fn py_eq(a: &PyAny, b: &PyAny) -> PyResult<Option<bool>> {
+    match a.rich_compare(b, CompareOp::Eq) {
+        Ok(r) => match r.is_true() {
+            Ok(b) => Ok(Some(b)),
+            Err(_) => Ok(None),
+        },
+        Err(_) => Ok(None),
+    }
+}
+
+/// `#[pyfunction]` entry for `mypy.subtypes.are_args_compatible`
+/// (subtypes.py:2627-2681).
+///
+/// Reads the `left`/`right` `FormalArgument` scalar fields (`name`,
+/// `pos`, `required`) plus the three bool flag args via PyO3, and
+/// returns a tag: FALSE (0), TRUE (1), or CALL_IS_COMPAT (2). The Python
+/// shim keeps the trailing `is_compat(right.typ, left.typ)` call and the
+/// pure-Python body as the fallback. `None` defers on any unreadable
+/// attribute (strangler-fig contract).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_are_args_compatible(
+    left: &PyAny,
+    right: &PyAny,
+    ignore_pos_arg_names: bool,
+    allow_partial_overlap: bool,
+    allow_imprecise_kinds: bool,
+) -> PyResult<Option<i64>> {
+    let left_required = match read_bool_attr(left, "required")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let right_required = match read_bool_attr(right, "required")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    let left_name = match read_attr_opt(left, "name")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let right_name = match read_attr_opt(right, "name")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let left_pos = match read_attr_opt(left, "pos")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let right_pos = match read_attr_opt(right, "pos")? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    let left_name_is_none = left_name.is_none();
+    let right_name_is_none = right_name.is_none();
+    let right_pos_is_none = right_pos.is_none();
+
+    let names_equal = match py_eq(left_name, right_name)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let pos_equal = match py_eq(left_pos, right_pos)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+
+    Ok(Some(classify_are_args_compatible(
+        left_name_is_none,
+        right_name_is_none,
+        names_equal,
+        right_pos_is_none,
+        pos_equal,
+        left_required,
+        right_required,
+        ignore_pos_arg_names,
+        allow_partial_overlap,
+        allow_imprecise_kinds,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5001,6 +5171,239 @@ mod tests {
         assert_eq!(
             rust_all_same_types(vec![&a, &s], false, true, &mut native),
             None
+        );
+    }
+
+    // `are_args_compatible` pure-decision tests. Tag values must match
+    // KIND_ARE_ARGS_* in this file and NATIVE_ARE_ARGS_* in subtypes.py.
+    fn are_args(
+        left_name: Option<&str>,
+        right_name: Option<&str>,
+        left_pos: Option<i64>,
+        right_pos: Option<i64>,
+        left_required: bool,
+        right_required: bool,
+        ignore_pos_arg_names: bool,
+        allow_partial_overlap: bool,
+        allow_imprecise_kinds: bool,
+    ) -> i64 {
+        classify_are_args_compatible(
+            left_name.is_none(),
+            right_name.is_none(),
+            left_name == right_name,
+            right_pos.is_none(),
+            left_pos == right_pos,
+            left_required,
+            right_required,
+            ignore_pos_arg_names,
+            allow_partial_overlap,
+            allow_imprecise_kinds,
+        )
+    }
+
+    #[test]
+    fn test_are_args_name_mismatch_returns_false() {
+        // Names differ and names matter (not ignoring pos-arg names).
+        assert_eq!(
+            are_args(
+                Some("x"),
+                Some("y"),
+                None,
+                None,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_are_args_name_mismatch_ignored_with_pos_falls_through() {
+        // Names differ but ignore_pos_arg_names and right has a position,
+        // so the name gate does not return False; falls through to compat.
+        assert_eq!(
+            are_args(
+                Some("x"),
+                Some("y"),
+                Some(0),
+                Some(0),
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_name_mismatch_ignored_no_right_pos_returns_false() {
+        // ignore_pos_arg_names but right.pos is None -> still False.
+        assert_eq!(
+            are_args(
+                Some("x"),
+                Some("y"),
+                None,
+                None,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_are_args_right_name_none_passes_name_gate() {
+        // Right does not care about name: is_different returns False.
+        assert_eq!(
+            are_args(
+                Some("x"),
+                None,
+                Some(0),
+                Some(0),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_pos_mismatch_returns_false() {
+        assert_eq!(
+            are_args(
+                None,
+                None,
+                Some(0),
+                Some(1),
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_are_args_pos_mismatch_imprecise_falls_through() {
+        assert_eq!(
+            are_args(
+                None,
+                None,
+                Some(0),
+                Some(1),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_right_pos_none_passes_pos_gate() {
+        assert_eq!(
+            are_args(None, None, Some(0), None, false, false, false, false, false),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_required_left_optional_right_returns_false() {
+        assert_eq!(
+            are_args(
+                None,
+                None,
+                Some(0),
+                Some(0),
+                true,
+                false,
+                false,
+                false,
+                false
+            ),
+            KIND_ARE_ARGS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_are_args_overlap_both_optional_returns_true() {
+        assert_eq!(
+            are_args(
+                None,
+                None,
+                Some(0),
+                Some(0),
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
+            KIND_ARE_ARGS_TRUE
+        );
+    }
+
+    #[test]
+    fn test_are_args_overlap_one_required_falls_through() {
+        // partial overlap but left required -> no shortcut.
+        assert_eq!(
+            are_args(
+                None,
+                None,
+                Some(0),
+                Some(0),
+                true,
+                false,
+                false,
+                true,
+                false
+            ),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_both_required_disables_overlap() {
+        // Both required: partial overlap has no effect, so the shortcut
+        // (which needs both optional) does not fire.
+        assert_eq!(
+            are_args(None, None, Some(0), Some(0), true, true, false, true, false),
+            KIND_ARE_ARGS_CALL_IS_COMPAT
+        );
+    }
+
+    #[test]
+    fn test_are_args_name_left_none_under_overlap_passes_name_gate() {
+        // Under partial overlap, a left name of None short-circuits the
+        // name is_different to False, so the name gate is skipped.
+        assert_eq!(
+            are_args(
+                None,
+                Some("y"),
+                Some(0),
+                Some(0),
+                false,
+                false,
+                false,
+                true,
+                false
+            ),
+            KIND_ARE_ARGS_TRUE
         );
     }
 }
