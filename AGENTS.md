@@ -413,7 +413,9 @@ including:
   and `object_from_instance` fallback on a hit. Defers (None) for
   ParamSpec type vars, TypeVarTuple multi-arg / prefix/suffix splits,
   `type_var.values` non-empty, `fallback_to_any`, different-type with
-  args, and any pair already on the Python `seen_instances` stack
+  args, `VARIANCE_NOT_READY` (PEP695 snapshot froze before
+  `infer_class_variances` ran; mirrors `subtypes.rs:1980`), and any pair
+  already on the Python `seen_instances` stack
   (checked before the shim call so the Python guard still wins).
   Gated by `_native_join_active` (per-call inline gate in
   `InstanceJoiner.join_instances`) and covered by

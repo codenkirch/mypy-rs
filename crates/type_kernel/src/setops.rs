@@ -4257,13 +4257,18 @@ fn visit_instance_with_args(
             _ => return None,
         }
 
+        // VARIANCE_NOT_READY: PEP695 snapshot froze before inference ran;
+        // defer to Python for the live variance (mirrors subtypes.rs:1980).
+        if *variance == VARIANCE_NOT_READY {
+            return None;
+        }
         // Push a joined arg. `disc` keeps the SameTypeWithArgs path
         // intact for pure-0/1/4 arg lists; `needs_encode` flips once a
         // real join (Ancestor/Object/Any/Bottom) appears, and the
 
         // function then emits the full Instance encoded.
         match *variance {
-            v if v == COVARIANT || v == VARIANCE_NOT_READY => {
+            v if v == COVARIANT => {
                 // join.py:136-148: covariant. new_type = join_types(ta,
                 // sa). If type_var.values non-empty, defer (needs
                 // values check, join.py:140-143; snapshot has no
@@ -7796,6 +7801,23 @@ mod tests {
         g.type_var_upper_bounds = vec![Vec::new()]; // empty blob
         let a = snap("a.A", "A");
         let r = make_resolver(vec![g, a]);
+        let s = instance("g.G", vec![instance("a.A", vec![])]);
+        let t = instance("g.G", vec![instance("a.A", vec![])]);
+        assert_eq!(join_types(&s, &t, &ctx(true), &r), None);
+    }
+
+    #[test]
+    fn join_instance_variance_not_ready_defers() {
+        // PEP695 `class C[T]`: snapshot froze T.variance at
+        // VARIANCE_NOT_READY; defer (mirrors subtypes.rs:1980, #860).
+        let mut g = snap("g.G", "G");
+        g.type_vars_with_variance = vec![("T".to_string(), VARIANCE_NOT_READY, 0)];
+        g.type_var_upper_bounds = vec![crate::wire::encode_instance_simple_for_test(
+            "builtins.object",
+        )];
+        let a = snap("a.A", "A");
+        let o = snap("builtins.object", "object");
+        let r = make_resolver(vec![g, a, o]);
         let s = instance("g.G", vec![instance("a.A", vec![])]);
         let t = instance("g.G", vec![instance("a.A", vec![])]);
         assert_eq!(join_types(&s, &t, &ctx(true), &r), None);

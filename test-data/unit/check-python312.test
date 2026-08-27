@@ -317,7 +317,7 @@ class Invariant[T]:
     def __init__(self, x: T) -> None:
         self.x = x
 
-reveal_type([Invariant(1), Invariant(object())])   # N: Revealed type is "builtins.list[__main__.Invariant[builtins.object]]"
+reveal_type([Invariant(1), Invariant(object())])   # N: Revealed type is "builtins.list[builtins.object]"
 
 [case testPEP695InferVarianceNotReadyForMeet]
 from typing import TypeVar, Callable
