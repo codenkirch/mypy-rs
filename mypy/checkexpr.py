@@ -254,6 +254,7 @@ try:
         rust_classify_index_with_type as _rust_classify_index_with_type,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
+        rust_classify_check_boolean_op as _rust_classify_check_boolean_op,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
         rust_refers_to_typeddict as _rust_refers_to_typeddict,
         rust_combine_function_signatures as _rust_combine_function_signatures,
@@ -338,6 +339,7 @@ except ImportError:
     _rust_classify_index_with_type = None  # type: ignore[assignment]
     _rust_classify_super_arg_types = None  # type: ignore[assignment]
     _rust_classify_visit_op_expr = None  # type: ignore[assignment]
+    _rust_classify_check_boolean_op = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
     _rust_refers_to_typeddict = None  # type: ignore[assignment]
     _rust_calibrate_type_obj_return = None  # type: ignore[assignment]
@@ -404,6 +406,20 @@ NATIVE_INDEX_GENERIC_ALIAS = 5
 NATIVE_INDEX_TYPEVAR = 6
 NATIVE_INDEX_SPECIAL_FORM = 7
 NATIVE_INDEX_GETITEM = 8
+
+# Decision tags returned by `_rust_classify_check_boolean_op`; must match
+# the `CHECK_BOOLEAN_OP_*` constants in checkexpr_functions.rs.
+NATIVE_CHECK_BOOLEAN_OP_RETURN_LEFT = 0
+NATIVE_CHECK_BOOLEAN_OP_RETURN_RIGHT = 1
+NATIVE_CHECK_BOOLEAN_OP_UNION = 2
+NATIVE_CHECK_BOOLEAN_OP_UNINHABITED = 3
+
+# Map-selection tags returned by `_rust_classify_check_boolean_op`; must
+# match the `CHECK_BOOLEAN_OP_MAP_*` constants in checkexpr_functions.rs.
+NATIVE_CHECK_BOOLEAN_OP_MAP_RIGHT_ALWAYS = 0
+NATIVE_CHECK_BOOLEAN_OP_MAP_RIGHT_UNREACHABLE = 1
+NATIVE_CHECK_BOOLEAN_OP_MAP_AND = 2
+NATIVE_CHECK_BOOLEAN_OP_MAP_OR = 3
 
 # Stage 9 checkcall gate: when active, generic callable solving
 # (normalize + map + infer + solve + apply) routes through the Rust kernel.
@@ -836,6 +852,44 @@ def _try_native_visit_newtype_expr() -> bytes | None:
         return _rust_visit_newtype_expr()
     except (AssertionError, NotImplementedError, ValueError):
         return None
+
+
+def _try_native_check_boolean_op(
+    e: OpExpr,
+    left_map: mypy.checker.TypeMap,
+    right_map: mypy.checker.TypeMap,
+    expanded_left_type: Type,
+) -> tuple[int, bool, bool, int] | None:
+    """Rust decision seam for `check_boolean_op` (issue #1049).
+
+    Rust selects the unreachable-map branch, applies both reachability
+    gates' raw booleans, and arbitrates the result tail (return left /
+    return right / Uninhabited / union) from one wire serialization of
+    the expanded left operand plus its live can_be_true/can_be_false
+    flags. `find_isinstance_check`, `analyze_cond_branch`, the two
+    self.msg.*_operand emissions and `make_simplified_union` stay in
+    Python. None defers to the pure-Python body.
+    """
+    if _native_checkexpr_resolver is None:
+        return None
+    try:
+        left_values = [_serialize_type_for_checkexpr(v) for v in left_map.values()]
+        right_values = [_serialize_type_for_checkexpr(v) for v in right_map.values()]
+        result = _rust_classify_check_boolean_op(
+            e.op == "and",
+            e.right_always,
+            e.right_unreachable,
+            left_values,
+            right_values,
+            _serialize_type_for_checkexpr(expanded_left_type),
+            expanded_left_type.can_be_true,
+            expanded_left_type.can_be_false,
+            state.strict_optional,
+            _native_checkexpr_resolver,
+        )
+    except (AssertionError, NotImplementedError, ValueError, TypeError):
+        return None
+    return result
 
 
 def _try_native_conditional_expr_join(
@@ -6079,9 +6133,21 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         elif e.op == "or":
             left_map, right_map = self.chk.find_isinstance_check(e.left)
 
+        # Native type_kernel seam (issue #1049): Rust classifies the
+        # unreachable-map branch and arbitrates the result tail. None
+        # defers to the pure-Python reachability + tail logic below.
+        native: tuple[int, bool, bool, int] | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            native = _try_native_check_boolean_op(e, left_map, right_map, expanded_left_type)
+
         # If left_map is unreachable then we know mypy considers the left expression
         # to be redundant.
-        left_unreachable = mypy.checker.is_unreachable_map(left_map)
+        if native is not None:
+            _, left_unreachable, right_unreachable, result_tag = native
+        else:
+            left_unreachable = mypy.checker.is_unreachable_map(left_map)
+            right_unreachable = mypy.checker.is_unreachable_map(right_map)
+
         if (
             codes.REDUNDANT_EXPR in self.chk.options.enabled_error_codes
             and left_unreachable
@@ -6090,7 +6156,6 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         ):
             self.msg.redundant_left_operand(e.op, e.left)
 
-        right_unreachable = mypy.checker.is_unreachable_map(right_map)
         if (
             self.chk.should_report_unreachable_issues()
             and right_unreachable
@@ -6102,6 +6167,22 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         right_type = self.analyze_cond_branch(
             right_map, e.right, self._combined_context(expanded_left_type)
         )
+
+        if native is not None:
+            if result_tag == NATIVE_CHECK_BOOLEAN_OP_UNINHABITED:
+                return UninhabitedType()
+            if result_tag == NATIVE_CHECK_BOOLEAN_OP_RETURN_LEFT:
+                # The boolean expression is statically known to be the left value
+                return left_type
+            if result_tag == NATIVE_CHECK_BOOLEAN_OP_RETURN_RIGHT:
+                # The boolean expression is statically known to be the right value
+                return right_type
+            # NATIVE_CHECK_BOOLEAN_OP_UNION
+            if e.op == "and":
+                restricted_left_type = false_only(expanded_left_type)
+            else:
+                restricted_left_type = true_only(expanded_left_type)
+            return make_simplified_union([restricted_left_type, right_type])
 
         if left_unreachable and right_unreachable:
             return UninhabitedType()

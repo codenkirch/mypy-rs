@@ -622,6 +622,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_check_arg,
         module
     )?)?;
+    // Issue #1049: check_boolean_op decision head. Rust classifies the
+    // unreachable-map branch and the result tail; find_isinstance_check,
+    // analyze_cond_branch, the msg emissions, make_simplified_union stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_check_boolean_op,
+        module
+    )?)?;
     // Issue #999: visit_index_with_type dispatch head. Rust classifies the
     // left_type branch from PyO3 facts; the fail/note tails and branch
     // bodies (incl. the tuple sub-dispatch) stay in Python.

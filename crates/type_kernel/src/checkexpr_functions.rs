@@ -7037,3 +7037,560 @@ mod classify_check_arg_tests {
         );
     }
 }
+// classify_check_boolean_op
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `check_boolean_op`; must match
+/// `NATIVE_CHECK_BOOLEAN_OP_*` in mypy/checkexpr.py.
+const CHECK_BOOLEAN_OP_RETURN_LEFT: i64 = 0;
+const CHECK_BOOLEAN_OP_RETURN_RIGHT: i64 = 1;
+const CHECK_BOOLEAN_OP_UNION: i64 = 2;
+const CHECK_BOOLEAN_OP_UNINHABITED: i64 = 3;
+
+/// Map-selection tags (which branch built `left_map`/`right_map`);
+/// must match `NATIVE_CHECK_BOOLEAN_OP_MAP_*` in mypy/checkexpr.py.
+const CHECK_BOOLEAN_OP_MAP_RIGHT_ALWAYS: i64 = 0;
+const CHECK_BOOLEAN_OP_MAP_RIGHT_UNREACHABLE: i64 = 1;
+const CHECK_BOOLEAN_OP_MAP_AND: i64 = 2;
+const CHECK_BOOLEAN_OP_MAP_OR: i64 = 3;
+
+/// Decision core of `ExpressionChecker.check_boolean_op`
+/// (checkexpr.py:6002-6077), pure over the decoded map values plus live
+/// scalar flags. Returns `(map_tag, left_unreachable, right_unreachable,
+/// result_tag)`; `None` defers to the pure-Python body.
+///
+/// * Map tag: 4-way from `e.op` x `e.right_always` x `e.right_unreachable`
+///   (the `if e.right_always / elif e.right_unreachable / elif e.op`
+///   arrangement in the Python body).
+/// * Reachability: `mypy.checker.is_unreachable_map` — the shim already
+///   filtered `None` values (never `UninhabitedType`). A `TypeAliasType`
+///   value may unwrap to `UninhabitedType` under `get_proper_type`,
+///   which the wire cannot resolve -> defer.
+/// * Result tail: `restricted_left_type = false_only/true_only(
+///   expanded_left)` from the live `can_be_true`/`can_be_false` flags
+///   (steps 1-2) plus the typeops leaf kernels (dunder lookup +
+///   final/enum via the live resolver). Union recursion reads live
+///   per-item flags the wire does not carry -> defer.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn classify_check_boolean_op(
+    py: Python<'_>,
+    op_is_and: bool,
+    right_always: bool,
+    right_unreachable: bool,
+    left_map_values: &[Type],
+    right_map_values: &[Type],
+    expanded_left: &Type,
+    can_be_true: bool,
+    can_be_false: bool,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<(i64, bool, bool, i64)> {
+    let map_tag = if right_always {
+        CHECK_BOOLEAN_OP_MAP_RIGHT_ALWAYS
+    } else if right_unreachable {
+        CHECK_BOOLEAN_OP_MAP_RIGHT_UNREACHABLE
+    } else if op_is_and {
+        CHECK_BOOLEAN_OP_MAP_AND
+    } else {
+        CHECK_BOOLEAN_OP_MAP_OR
+    };
+
+    let any_unreachable = |values: &[Type]| -> Option<bool> {
+        let mut unreachable = false;
+        for v in values {
+            match v {
+                Type::TypeAliasType { .. } => return None,
+                Type::UninhabitedType { .. } => unreachable = true,
+                _ => {}
+            }
+        }
+        Some(unreachable)
+    };
+    let left_unreachable = any_unreachable(left_map_values)?;
+    let right_unreachable = any_unreachable(right_map_values)?;
+
+    if left_unreachable && right_unreachable {
+        return Some((
+            map_tag,
+            left_unreachable,
+            right_unreachable,
+            CHECK_BOOLEAN_OP_UNINHABITED,
+        ));
+    }
+    if right_unreachable {
+        return Some((
+            map_tag,
+            left_unreachable,
+            right_unreachable,
+            CHECK_BOOLEAN_OP_RETURN_LEFT,
+        ));
+    }
+    if left_unreachable {
+        return Some((
+            map_tag,
+            left_unreachable,
+            right_unreachable,
+            CHECK_BOOLEAN_OP_RETURN_RIGHT,
+        ));
+    }
+
+    // Tail: restricted_left_type = false_only/true_only(expanded_left);
+    // result_is_left = not expanded.can_be_true (and) / not can_be_false (or).
+    // Mirrors Python's flag-decidable steps 1-2; union recursion defers.
+    let restricted_uninhabited: bool = if op_is_and {
+        if !can_be_false {
+            // false_only: UninhabitedType under strict_optional, else NoneType.
+            strict_optional
+        } else if !can_be_true {
+            matches!(expanded_left, Type::UninhabitedType { .. })
+        } else {
+            match expanded_left {
+                Type::TypeAliasType { .. } | Type::UnionType { .. } => return None,
+                _ => matches!(
+                    crate::typeops::false_only(py, expanded_left, strict_optional, resolver)?,
+                    crate::typeops::TruthinessResult::Uninhabited
+                ),
+            }
+        }
+    } else {
+        // true_only: step 1 is always UninhabitedType.
+        if !can_be_true {
+            true
+        } else if !can_be_false {
+            matches!(expanded_left, Type::UninhabitedType { .. })
+        } else {
+            match expanded_left {
+                Type::TypeAliasType { .. } | Type::UnionType { .. } => return None,
+                _ => matches!(
+                    crate::typeops::true_only(py, expanded_left, resolver)?,
+                    crate::typeops::TruthinessResult::Uninhabited
+                ),
+            }
+        }
+    };
+
+    let result_tag = if restricted_uninhabited {
+        CHECK_BOOLEAN_OP_RETURN_RIGHT
+    } else {
+        let result_is_left = if op_is_and {
+            !can_be_true
+        } else {
+            !can_be_false
+        };
+        if result_is_left {
+            CHECK_BOOLEAN_OP_RETURN_LEFT
+        } else {
+            CHECK_BOOLEAN_OP_UNION
+        }
+    };
+    Some((map_tag, left_unreachable, right_unreachable, result_tag))
+}
+
+/// `#[pyfunction]` entry for the `check_boolean_op` decision head
+/// (issue #1049). `left_map_values`/`right_map_values` are the
+/// wire-serialized map values; `expanded_left_bytes` is one
+/// serialization of the expanded left operand type. Defers (`None`)
+/// on any decode failure.
+#[pyfunction]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+#[pyo3(signature = (
+    op_is_and,
+    right_always,
+    right_unreachable,
+    left_map_values,
+    right_map_values,
+    expanded_left_bytes,
+    can_be_true,
+    can_be_false,
+    strict_optional,
+    resolver,
+))]
+pub(crate) fn rust_classify_check_boolean_op(
+    py: Python<'_>,
+    op_is_and: bool,
+    right_always: bool,
+    right_unreachable: bool,
+    left_map_values: Vec<Vec<u8>>,
+    right_map_values: Vec<Vec<u8>>,
+    expanded_left_bytes: &[u8],
+    can_be_true: bool,
+    can_be_false: bool,
+    strict_optional: bool,
+    resolver: &NativeTypeResolver,
+) -> Option<(i64, bool, bool, i64)> {
+    let expanded_left = decode_type(expanded_left_bytes)?;
+    let mut left_values: Vec<Type> = Vec::with_capacity(left_map_values.len());
+    for v in &left_map_values {
+        left_values.push(decode_type(v)?);
+    }
+    let mut right_values: Vec<Type> = Vec::with_capacity(right_map_values.len());
+    for v in &right_map_values {
+        right_values.push(decode_type(v)?);
+    }
+    classify_check_boolean_op(
+        py,
+        op_is_and,
+        right_always,
+        right_unreachable,
+        &left_values,
+        &right_values,
+        &expanded_left,
+        can_be_true,
+        can_be_false,
+        strict_optional,
+        resolver,
+    )
+}
+
+#[cfg(test)]
+mod classify_check_boolean_op_tests {
+    use super::*;
+    use crate::typeinfo::NativeTypeResolver;
+
+    /// Initialize the embedded interpreter, then run with the GIL.
+    fn with_py<T>(f: impl FnOnce(Python<'_>) -> T) -> T {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(f)
+    }
+
+    fn empty_resolver() -> NativeTypeResolver {
+        NativeTypeResolver::new(Default::default(), Default::default())
+    }
+
+    fn uninhabited() -> Type {
+        Type::UninhabitedType { ambiguous: false }
+    }
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn int_instance() -> Type {
+        Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    #[test]
+    fn map_right_always_left_unreachable() {
+        // e.right_always: left_map = {left: Uninhabited}, right_map = {}.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                true,
+                false,
+                &[uninhabited()],
+                &[],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_RIGHT_ALWAYS);
+        assert!(r.1 && !r.2);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn map_right_unreachable_returns_left() {
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                true,
+                &[],
+                &[uninhabited()],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_RIGHT_UNREACHABLE);
+        assert!(!r.1 && r.2);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_LEFT);
+    }
+
+    #[test]
+    fn map_and_non_unreachable_unions() {
+        // and: ordinary find_isinstance_check maps, expanded int (leaf ->
+        // LiteralType(0), never Uninhabited), can_be_true -> UNION.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[int_instance()],
+                &[],
+                &int_instance(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_AND);
+        assert!(!r.1 && !r.2);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_UNION);
+    }
+
+    #[test]
+    fn map_or_tag() {
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.0, CHECK_BOOLEAN_OP_MAP_OR);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_UNION);
+    }
+
+    #[test]
+    fn both_unreachable_returns_uninhabited() {
+        // Both find_isinstance_check maps carry an UninhabitedType value.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[uninhabited()],
+                &[uninhabited()],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert!(r.1 && r.2);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_UNINHABITED);
+    }
+
+    #[test]
+    fn left_unreachable_only_returns_right() {
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[uninhabited()],
+                &[any_type()],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert!(r.1 && !r.2);
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn restricted_uninhabited_strict_returns_right() {
+        // and: can_be_false=False under strict_optional -> false_only
+        // yields UninhabitedType -> return right_type.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[any_type()],
+                &[],
+                &any_type(),
+                true,
+                false,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn restricted_none_type_non_strict_returns_left() {
+        // Same flags but --no-strict-optional: false_only yields NoneType,
+        // not UninhabitedType; result_is_left = not can_be_true -> left.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[any_type()],
+                &[],
+                &any_type(),
+                false,
+                false,
+                false,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_LEFT);
+    }
+
+    #[test]
+    fn result_is_left_or_never_false() {
+        // or: can_be_false=False -> true_only keeps t (not Uninhabited);
+        // result_is_left = not can_be_false -> return left_type.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[any_type()],
+                &[],
+                &any_type(),
+                true,
+                false,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_LEFT);
+    }
+
+    #[test]
+    fn true_only_flag_step_returns_uninhabited_tail() {
+        // or with can_be_true=False and expanded not UninhabitedType on
+        // the wire: true_only step 1 is unconditionally UninhabitedType
+        // -> RETURN_RIGHT.
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &int_instance(),
+                false,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        })
+        .unwrap();
+        assert_eq!(r.3, CHECK_BOOLEAN_OP_RETURN_RIGHT);
+    }
+
+    #[test]
+    fn union_expanded_defers() {
+        // Union recursion reads live per-item flags the wire does not
+        // carry -> the whole call defers.
+        let union = Type::UnionType {
+            items: vec![int_instance(), any_type()],
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        };
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &union,
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        });
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn literal_expanded_defers() {
+        // Literals need the live TypeInfo unwrap in the leaf -> defer.
+        let lit = Type::LiteralType {
+            fallback: Box::new(Type::Instance {
+                type_ref: "builtins.bool".to_string(),
+                args: vec![],
+                last_known_value: None,
+                extra_attrs: None,
+            }),
+            value: LiteralValue::Bool(true),
+        };
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[],
+                &[],
+                &lit,
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        });
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn alias_map_value_defers() {
+        // A TypeAliasType map value may unwrap to UninhabitedType under
+        // get_proper_type; the wire cannot resolve it -> defer.
+        let alias = Type::TypeAliasType {
+            type_ref: "mod.TA".to_string(),
+            args: vec![],
+        };
+        let r = with_py(|py| {
+            classify_check_boolean_op(
+                py,
+                true,
+                false,
+                false,
+                &[alias],
+                &[],
+                &any_type(),
+                true,
+                true,
+                true,
+                &empty_resolver(),
+            )
+        });
+        assert!(r.is_none());
+    }
+}

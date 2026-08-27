@@ -38243,3 +38243,265 @@ class NativeTypeCheckRaiseSuite(Suite):
         on = self._run(fx.str_type, True, e=e)
         assert off == on, f"callee: off={off} on={on}"
         assert len([r for r in off if r[0] == "fail"]) == 1, f"expected fail: {off}"
+class NativeCheckBooleanOpSuite(Suite):
+    """Parity for `rust_classify_check_boolean_op` (issue #1049).
+
+    `ExpressionChecker.check_boolean_op` (checkexpr.py:6062) arranges the
+    and/or maps, then decides the reachability gates and the result tail
+    (return left / return right / Uninhabited / union). The Rust seam
+    classifies the branch + tail from the wire-serialized map values and
+    the expanded left operand's live can_be_true/can_be_false flags;
+    Python keeps `find_isinstance_check`, `analyze_cond_branch`, the two
+    self.msg emissions, and `make_simplified_union`. Direct seam calls
+    assert the 4-way map table and the 4 result tails; toggling the
+    checkexpr gate off vs on must produce identical (str(result),
+    captured messages).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active, _set_native_checkexpr_resolver
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self.fx = TypeFixture()
+        self.int_info = self.fx.make_type_info("builtins.int", mro=[self.fx.oi])
+        self.int_inst: Instance = Instance(self.int_info, [])
+        self.str_inst: Instance = Instance(self.fx.str_type_info, [])
+        self.resolver = _type_kernel.build_native_resolver(
+            [
+                self.fx.oi,
+                self.fx.ai,
+                self.fx.bi,
+                self.int_info,
+                self.fx.str_type_info,
+                self.fx.type_typei,
+                self.fx.std_tuplei,
+                self.fx.std_listi,
+            ],
+            [],
+        )
+        self._set_resolver(self.resolver)
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+        self._set_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_ec(
+        self,
+        fic: tuple[TypeMap, TypeMap],
+        left_type: Type,
+        right_type: Type,
+        report_unreachable: bool = False,
+        enabled_error_codes: set[ErrorCode] | None = None,
+    ) -> tuple[ExpressionChecker, list[tuple[str, str]]]:
+        captured: list[tuple[str, str]] = []
+        chk = SimpleNamespace(
+            options=SimpleNamespace(
+                enabled_error_codes=enabled_error_codes if enabled_error_codes else set()
+            ),
+            should_report_unreachable_issues=lambda: report_unreachable,
+        )
+
+        def find_isinstance_check(node: object) -> tuple[TypeMap, TypeMap]:
+            return fic
+
+        chk.find_isinstance_check = find_isinstance_check
+        chk.captured = captured
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        ec.msg = SimpleNamespace(  # type: ignore[assignment]
+            redundant_left_operand=lambda op, ctx: captured.append(("redundant", op)),
+            unreachable_right_operand=lambda op, ctx: captured.append(("unreachable", op)),
+        )
+        ec.type_context = [None]
+
+        def accept(
+            node: Expression,
+            type_context: Type | None = None,
+            allow_none_return: bool = False,
+            always_allow_any: bool = False,
+            is_callee: bool = False,
+        ) -> Type:
+            return left_type
+
+        def combined_context(ty: Type | None) -> Type | None:
+            return ty
+
+        def analyze_cond_branch(
+            map: TypeMap,
+            node: Expression,
+            context: Type | None = None,
+            allow_none_return: bool = False,
+            suppress_unreachable_errors: bool = True,
+        ) -> Type:
+            return right_type
+
+        ec.accept = accept  # type: ignore[method-assign]
+        ec._combined_context = combined_context  # type: ignore[method-assign]
+        ec.analyze_cond_branch = analyze_cond_branch  # type: ignore[method-assign]
+        return ec, captured
+
+    def _make_op(
+        self, op: str, right_always: bool = False, right_unreachable: bool = False
+    ) -> OpExpr:
+        e = OpExpr(op, NameExpr("L"), NameExpr("R"))
+        e.right_always = right_always
+        e.right_unreachable = right_unreachable
+        return e
+
+    def _run(
+        self,
+        active: bool,
+        e: OpExpr,
+        make_ec: Callable[[], tuple[ExpressionChecker, list[tuple[str, str]]]],
+    ) -> tuple[str, list[tuple[str, str]]]:
+        # A fresh checker per run: the captured-message list must not leak
+        # across the gate-off and gate-on passes.
+        ec, captured = make_ec()
+        result = self._with_gate(active, lambda: ec.check_boolean_op(e))
+        return str(result), captured
+
+    def _try_native(
+        self, e: OpExpr, left_map: TypeMap, right_map: TypeMap, left: Type
+    ) -> tuple[int, bool, bool, int] | None:
+        from mypy.checkexpr import _try_native_check_boolean_op
+
+        return _try_native_check_boolean_op(e, left_map, right_map, left)
+
+    def test_seam_map_tags(self) -> None:
+        # 4-way map table from e.op x e.right_always x e.right_unreachable.
+        e = self._make_op("or", right_always=True)
+        r = self._try_native(e, {e.left: UninhabitedType()}, {}, self.int_inst)
+        assert r == (0, True, False, 1)  # RIGHT_ALWAYS, RETURN_RIGHT
+        e = self._make_op("and", right_unreachable=True)
+        r = self._try_native(e, {}, {e.right: UninhabitedType()}, self.int_inst)
+        assert r == (1, False, True, 0)  # RIGHT_UNREACHABLE, RETURN_LEFT
+        e = self._make_op("and")
+        r = self._try_native(e, {}, {e.left: self.int_inst}, self.int_inst)
+        assert r is not None and r[0] == 2  # MAP_AND
+        e = self._make_op("or")
+        # A decided tag needs a reachability hit: a plain or-tail with an int
+        # Instance defers (true_only needs a live __bool__ lookup).
+        r = self._try_native(
+            e, {e.left: self.int_inst}, {e.right: UninhabitedType()}, self.int_inst
+        )
+        assert r == (3, False, True, 0)  # MAP_OR, RETURN_LEFT
+
+    def test_seam_result_tags_raw(self) -> None:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        b = _serialize_type_for_checkexpr
+        int_b = b(self.int_inst)
+        unin_b = b(UninhabitedType())
+        resolver = self.resolver
+        seam = _type_kernel.rust_classify_check_boolean_op
+        # Both maps unreachable -> UNINHABITED (3).
+        r = seam(True, False, False, [unin_b], [unin_b], int_b, True, True, True, resolver)
+        assert r == (2, True, True, 3)
+        # Right unreachable -> RETURN_LEFT (result tag 0).
+        r = seam(True, False, False, [], [unin_b], int_b, True, True, True, resolver)
+        assert r == (2, False, True, 0)
+        # Left unreachable -> RETURN_RIGHT (result tag 1).
+        r = seam(True, False, False, [unin_b], [], int_b, True, True, True, resolver)
+        assert r == (2, True, False, 1)
+        # Live tail: false_only(int) -> LiteralType(0), result_is_left False -> UNION (2).
+        r = seam(True, False, False, [], [], int_b, True, True, True, resolver)
+        assert r == (2, False, False, 2)
+        # Union expanded_left defers the tail.
+        union_b = b(UnionType([self.int_inst, self.str_inst]))
+        assert seam(True, False, False, [], [], union_b, True, True, True, resolver) is None
+
+    def test_par_right_always(self) -> None:
+        e = self._make_op("or", right_always=True)
+        make = lambda: self._make_ec(
+            ({}, {}), self.int_inst, self.str_inst, report_unreachable=True
+        )
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"right_always: off={off} on={on}"
+        assert off == ("builtins.str", []), off
+
+    def test_par_right_unreachable_flag(self) -> None:
+        # e.right_unreachable=True: intentional, no emission even when
+        # should_report_unreachable_issues() is True.
+        e = self._make_op("and", right_unreachable=True)
+        make = lambda: self._make_ec(
+            ({}, {}), self.int_inst, self.str_inst, report_unreachable=True
+        )
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"right_unreachable flag: off={off} on={on}"
+        assert off == ("builtins.int", []), off
+
+    def test_par_and_union_int_left(self) -> None:
+        # Both maps reachable, int left: UNION tail, false_only(int) ->
+        # LiteralType(0, fallback=int) simplifies against the int right.
+        e = self._make_op("and")
+        fic: tuple[TypeMap, TypeMap] = ({NameExpr("L"): self.int_inst}, {})
+        make = lambda: self._make_ec(fic, self.int_inst, self.int_inst)
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"and-union: off={off} on={on}"
+        assert off[0] == "builtins.int", off
+
+    def test_par_or_left_unreachable(self) -> None:
+        e = self._make_op("or")
+        fic: tuple[TypeMap, TypeMap] = ({e.left: UninhabitedType()}, {})
+        make = lambda: self._make_ec(fic, self.int_inst, self.str_inst)
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"or-left-unreachable: off={off} on={on}"
+        assert off == ("builtins.str", []), off
+
+    def test_par_or_unreachable_right_emits(self) -> None:
+        e = self._make_op("or")
+        fic: tuple[TypeMap, TypeMap] = ({}, {e.right: UninhabitedType()})
+        make = lambda: self._make_ec(fic, self.int_inst, self.str_inst, report_unreachable=True)
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"or-unreachable-right: off={off} on={on}"
+        assert off == ("builtins.int", [("unreachable", "or")]), off
+
+    def test_par_redundant_left_emitted(self) -> None:
+        from mypy import errorcodes as codes
+
+        e = self._make_op("and")
+        # "and" swaps: right_map, left_map = find_isinstance_check(e.left).
+        fic: tuple[TypeMap, TypeMap] = ({}, {e.left: UninhabitedType()})
+        make = lambda: self._make_ec(
+            fic, self.int_inst, self.str_inst, enabled_error_codes={codes.REDUNDANT_EXPR}
+        )
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"redundant: off={off} on={on}"
+        assert off == ("builtins.str", [("redundant", "and")]), off
+
+    def test_par_both_unreachable(self) -> None:
+        e = self._make_op("and")
+        fic: tuple[TypeMap, TypeMap] = ({e.left: UninhabitedType()}, {e.left: UninhabitedType()})
+        make = lambda: self._make_ec(fic, self.int_inst, self.str_inst)
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"both-unreachable: off={off} on={on}"
+        assert off[0] == "Never", off
+
+    def test_par_defer_union_left(self) -> None:
+        # expanded_left is a UnionType: the Rust tail defers (None) and the
+        # whole body falls back to the pure-Python tail. Gate-on must equal
+        # gate-off, and the shim must actually defer.
+        e = self._make_op("and")
+        fic: tuple[TypeMap, TypeMap] = ({}, {e.left: self.int_inst})
+        left = UnionType([self.int_inst, self.str_inst])
+        assert self._try_native(e, fic[1], fic[0], left) is None
+        make = lambda: self._make_ec(fic, left, self.str_inst)
+        off = self._run(False, e, make)
+        on = self._run(True, e, make)
+        assert off == on, f"defer-union: off={off} on={on}"
