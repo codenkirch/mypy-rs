@@ -137,6 +137,7 @@ mod typealias_instantiate;
 mod typeanal_info;
 mod typeanal_literal;
 mod typeanal_queries;
+mod typeanal_rawexpr;
 mod typeanal_special;
 mod typeanal_unbound;
 mod typeanal_unbound2;
@@ -1611,6 +1612,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // effects (LiteralType build, errors, recursion, union merge).
     module.add_function(wrap_pyfunction!(
         typeanal_literal::rust_classify_literal_param,
+        module
+    )?)?;
+    // visit_raw_expression_type: 3-way message head (int/bool, float/
+    // complex, else generic). Rust owns the set-membership branch and
+    // returns a tag; Python formats the message. None defers to Python.
+    module.add_function(wrap_pyfunction!(
+        typeanal_rawexpr::rust_classify_raw_expression_type,
         module
     )?)?;
     // Hot path: mirrors TypeAnalyser.anal_type for already-bound types

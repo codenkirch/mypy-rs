@@ -612,6 +612,21 @@ including:
   and covered by `NativeRevealImportedSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls).
+- `rust_classify_raw_expression_type` (issue #924) — mirrors the 3-way
+  message-selection head of
+  `TypeAnalyser.visit_raw_expression_type` (typeanal.py:2135-2150):
+  `builtins.int`/`builtins.bool` -> "try using Literal[...]",
+  `builtins.float`/`builtins.complex` -> "literals cannot be used as a
+  type", else -> "Invalid type comment or annotation". Rust owns only
+  the set-membership branch and returns a message tag; the Python shim
+  formats the message (needs the live `t` for `literal_value` /
+  `simple_name()`) and applies `self.fail` / `self.note` when
+  `t.note is not None`. Defers (`None`) when `report_invalid_types` is
+  false (the whole head is skipped). Gated by
+  `_set_native_typeanal_active` (wired from `mypy/build.py`) and
+  covered by `NativeRawExpressionTypeSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), and pure
+  decision unit tests in `typeanal_rawexpr.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
