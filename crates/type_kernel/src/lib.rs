@@ -3073,6 +3073,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1010: check_for_truthy_type decision-head port. Rust
+    // classifies the strict-optional truthiness arbitration into a
+    // branch tag; the format_type messages and fail emission stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_truthy_type,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

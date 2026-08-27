@@ -345,6 +345,7 @@ try:
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
+        rust_classify_truthy_type as _rust_classify_truthy_type,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -420,6 +421,7 @@ except ImportError:
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_rvalue_count = None  # type: ignore[assignment]
+    _rust_classify_truthy_type = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
@@ -538,6 +540,14 @@ NATIVE_RVALUE_COUNT_FAIL_TOO_MANY = 2
 NATIVE_RVALUE_COUNT_WARN_TOO_MANY = 3
 NATIVE_RVALUE_COUNT_FAIL_WRONG_STAR = 4
 NATIVE_RVALUE_COUNT_FAIL_WRONG = 5
+
+# Decision tags returned by `_rust_classify_truthy_type`; must match
+# `TRUTHY_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_TRUTHY_SKIP = 0
+NATIVE_TRUTHY_FUNCTION = 1
+NATIVE_TRUTHY_UNION = 2
+NATIVE_TRUTHY_ITERABLE = 3
+NATIVE_TRUTHY_OTHER = 4
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -7909,7 +7919,32 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             return  # if everything can be None, all bets are off
 
         t = get_proper_type(t)
-        if not self._is_truthy_type(t):
+
+        # Native type_kernel seam (issue #1010): Rust classifies the
+        # truthiness arbitration into a branch tag; the format_type
+        # messages and fail emission stay here. None defers to the body below.
+        tag: int | None = None
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_truthy_type is not None
+        ):
+            try:
+                tag = _rust_classify_truthy_type(t)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+        if tag is None:
+            if not self._is_truthy_type(t):
+                return
+            if isinstance(t, FunctionLike):
+                tag = NATIVE_TRUTHY_FUNCTION
+            elif isinstance(t, UnionType):
+                tag = NATIVE_TRUTHY_UNION
+            elif isinstance(t, Instance) and t.type.fullname == "typing.Iterable":
+                tag = NATIVE_TRUTHY_ITERABLE
+            else:
+                tag = NATIVE_TRUTHY_OTHER
+        elif tag == NATIVE_TRUTHY_SKIP:
             return
 
         def format_expr_type() -> str:

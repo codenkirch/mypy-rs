@@ -35048,3 +35048,176 @@ class NativeArgInferPassesSuite(Suite):
             1,
         )
         assert result == [1], f"expected skip result [1], got {result}"
+class NativeTruthyTypeSuite(Suite):
+    """Gate-off vs gate-on parity for check_for_truthy_type (issue #1010).
+
+    Runs TypeChecker.check_for_truthy_type on a stub checker with a fail
+    recorder and asserts identical message lists with the native
+    classifier off and on, plus direct seam calls on the live types.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], list[str]]) -> list[str]:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _run(self, t: Type, expr: Any = None) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+        from mypy.nodes import NameExpr
+        from mypy.options import Options
+        from mypy.state import state
+
+        if expr is None:
+            expr = NameExpr("x")
+
+        def check_one() -> list[str]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            fails: list[str] = []
+
+            class _Msg:
+                def fail(self, msg: str, _ctx: Any, **_kw: Any) -> None:
+                    fails.append(str(msg))
+
+            chk.msg = _Msg()  # type: ignore[assignment]
+            chk.check_for_truthy_type(t, expr)
+            return fails
+
+        old = state.strict_optional
+        state.strict_optional = True
+        try:
+            off = self._with_gate(False, check_one)
+            on = self._with_gate(True, check_one)
+        finally:
+            state.strict_optional = old
+        return off, on
+
+    def _assert_par(self, t: Type, expr: Any = None) -> None:
+        off, on = self._run(t, expr)
+        assert_equal(on, off, f"check_for_truthy_type parity for typ={t!r}")
+
+    def _tag(self, t: Type) -> int:
+        proper = get_proper_type(t)
+        result = _type_kernel.rust_classify_truthy_type(proper)
+        assert result is not None
+        return result
+
+    def _bool_member_instance(self) -> Instance:
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        info = self.fx.make_type_info("WithBool")
+        assert info is not None
+        info.names["__bool__"] = SymbolTableNode(MDEF, Var("__bool__"))
+        return Instance(info, [])
+
+    def _len_member_instance(self) -> Instance:
+        from mypy.nodes import MDEF, SymbolTableNode, Var
+
+        info = self.fx.make_type_info("WithLen")
+        assert info is not None
+        info.names["__len__"] = SymbolTableNode(MDEF, Var("__len__"))
+        return Instance(info, [])
+
+    def _iterable_instance(self) -> Instance:
+        info = self.fx.make_type_info("typing.Iterable")
+        assert info is not None
+        return Instance(info, [self.fx.o])
+
+    # Direct seam calls: the five branch tags.
+
+    def test_seam_other_instance(self) -> None:
+        # fx.a has a fixture-added __bool__; class D does not.
+        assert self._tag(self.fx.d) == 4
+
+    def test_seam_skip_object(self) -> None:
+        assert self._tag(self.fx.o) == 0
+
+    def test_seam_skip_none(self) -> None:
+        assert self._tag(self.fx.nonet) == 0
+
+    def test_seam_skip_any(self) -> None:
+        assert self._tag(self.fx.anyt) == 0
+
+    def test_seam_lkv_instance_is_other(self) -> None:
+        # The fixture's builtins.str TypeInfo has no __bool__ member, so
+        # an Instance with last_known_value is still a truthy Instance.
+        assert self._tag(self.fx.lit_str1_inst) == 4
+
+    def test_seam_skip_bool_member(self) -> None:
+        assert self._tag(self._bool_member_instance()) == 0
+
+    def test_seam_skip_len_member(self) -> None:
+        assert self._tag(self._len_member_instance()) == 0
+
+    def test_seam_function(self) -> None:
+        assert self._tag(self.fx.callable(self.fx.o, self.fx.nonet)) == 1
+
+    def test_seam_union_of_callables(self) -> None:
+        c = self.fx.callable(self.fx.o, self.fx.nonet)
+        assert self._tag(UnionType([c, c])) == 2
+
+    def test_seam_iterable(self) -> None:
+        assert self._tag(self._iterable_instance()) == 3
+
+    # Gate-off vs gate-on differentials on the captured fail messages.
+
+    def test_parity_other_instance(self) -> None:
+        # fx.a has a fixture-added __bool__; class D does not.
+        self._assert_par(self.fx.d)
+
+    def test_parity_skip_object(self) -> None:
+        self._assert_par(self.fx.o)
+
+    def test_parity_skip_none(self) -> None:
+        self._assert_par(self.fx.nonet)
+
+    def test_parity_skip_any(self) -> None:
+        self._assert_par(self.fx.anyt)
+
+    def test_parity_lkv_instance(self) -> None:
+        self._assert_par(self.fx.lit_str1_inst)
+
+    def test_parity_skip_bool_member(self) -> None:
+        self._assert_par(self._bool_member_instance())
+
+    def test_parity_skip_len_member(self) -> None:
+        self._assert_par(self._len_member_instance())
+
+    def test_parity_function(self) -> None:
+        self._assert_par(self.fx.callable(self.fx.o, self.fx.nonet))
+
+    def test_parity_union_of_callables(self) -> None:
+        c = self.fx.callable(self.fx.o, self.fx.nonet)
+        self._assert_par(UnionType([c, c]))
+
+    def test_parity_union_with_non_truthy_item(self) -> None:
+        c = self.fx.callable(self.fx.o, self.fx.nonet)
+        self._assert_par(UnionType([c, self.fx.o]))
+
+    def test_parity_iterable(self) -> None:
+        self._assert_par(self._iterable_instance())
+
+    def test_parity_member_expr_message(self) -> None:
+        from mypy.nodes import MemberExpr, NameExpr
+
+        member = MemberExpr(NameExpr("x"), "f")
+        self._assert_par(self.fx.callable(self.fx.o, self.fx.nonet), member)
+
+    def test_parity_call_expr_message(self) -> None:
+        from mypy.nodes import ARG_POS, CallExpr, NameExpr
+
+        call = CallExpr(NameExpr("f"), [], [ARG_POS], [None])
+        self._assert_par(self.fx.callable(self.fx.o, self.fx.nonet), call)
