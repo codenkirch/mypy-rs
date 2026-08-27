@@ -247,6 +247,48 @@ def _try_native_is_similar_constraints(x: list[Constraint], y: list[Constraint])
     return _type_kernel.rust_is_similar_constraints(x_buf.getvalue(), y_buf.getvalue())
 
 
+def _try_native_merge_with_any(constraint: Constraint) -> bool | None:
+    """Route the merge_with_any decision through the Rust kernel.
+
+    Rust only decides whether the target needs a union with Any
+    (`True` = merge); Python applies the decision so the live target and
+    origin type var keep their identity. `None` defers to Python.
+    """
+    buf = _WriteBuffer()
+    _write_constraint(buf, constraint)
+    return _type_kernel.rust_merge_with_any(buf.getvalue())
+
+
+def _try_native_filter_satisfiable(option: list[Constraint]) -> list[Constraint] | None:
+    """Route filter_satisfiable through the Rust kernel, deferring on unsupported input.
+
+    Returns the kept live constraints (empty result means every
+    constraint was filtered and Python returns None).
+    """
+    if _native_constraints_resolver is None:
+        return None
+    buf = _WriteBuffer()
+    _write_option(buf, option)
+    raw = _type_kernel.rust_filter_satisfiable(buf.getvalue(), _native_constraints_resolver)
+    if raw is None:
+        raise NotImplementedError("kernel deferred filter_satisfiable")
+    kept = [option[i] for i in _read_index_list(bytes(raw))]
+    return kept or None
+
+
+def _try_native_is_same_constraints(x: list[Constraint], y: list[Constraint]) -> bool | None:
+    """Route is_same_constraints through the Rust kernel, deferring on unsupported input."""
+    if _native_constraints_resolver is None:
+        return None
+    x_buf = _WriteBuffer()
+    _write_option(x_buf, x)
+    y_buf = _WriteBuffer()
+    _write_option(y_buf, y)
+    return _type_kernel.rust_is_same_constraints(
+        x_buf.getvalue(), y_buf.getvalue(), _native_constraints_resolver
+    )
+
+
 def _try_native_any_constraints(
     options: Sequence[list[Constraint] | None], *, eager: bool
 ) -> list[Constraint] | None:
@@ -923,6 +965,22 @@ def select_trivial(options: Sequence[list[Constraint] | None]) -> list[list[Cons
 
 def merge_with_any(constraint: Constraint) -> Constraint:
     """Transform a constraint target into a union with given Any type."""
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            merge = _try_native_merge_with_any(constraint)
+            if merge is False:
+                # Target already contains Any; keep the constraint intact.
+                return constraint
+            if merge is True:
+                target = constraint.target
+                any_type = AnyType(TypeOfAny.implementation_artifact)
+                return Constraint(
+                    constraint.origin_type_var,
+                    constraint.op,
+                    UnionType.make_union([target, any_type], target.line, target.column),
+                )
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     target = constraint.target
     if is_union_with_any(target):
         # Do not produce redundant unions.
@@ -1027,6 +1085,14 @@ def filter_satisfiable(option: list[Constraint] | None) -> list[Constraint] | No
     if not option:
         return option
 
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            kept = _try_native_filter_satisfiable(option)
+            if kept is not None:
+                return kept
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
+
     satisfiable = []
     for c in option:
         if isinstance(c.origin_type_var, TypeVarType) and c.origin_type_var.values:
@@ -1058,6 +1124,13 @@ def exclude_non_meta_vars(option: list[Constraint] | None) -> list[Constraint] |
 
 
 def is_same_constraints(x: list[Constraint], y: list[Constraint]) -> bool:
+    if _native_constraints_active and _HAS_TYPE_KERNEL:
+        try:
+            same = _try_native_is_same_constraints(x, y)
+            if same is not None:
+                return same
+        except (AssertionError, NotImplementedError, ValueError, AttributeError):
+            pass
     for c1 in x:
         if not any(is_same_constraint(c1, c2) for c2 in y):
             return False

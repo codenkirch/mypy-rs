@@ -34966,3 +34966,316 @@ class NativeAttributeTriggersSuite(Suite):
         triggers = self.v.attribute_triggers(self.fx.a, "x")
         self._set_active(True)
         self.assertEqual(triggers, [self.make_trigger("A.x")])
+
+
+class NativeConstraintHelpersSuite(Suite):
+    """Parity tests for the standalone constraint-list helper seams.
+
+    Ports `merge_with_any`, `filter_satisfiable`, and
+    `is_same_constraints` (issue #1001). Differential harness: runs each
+    Python helper with the native gate on (resolver installed) and off
+    (pure Python) and asserts identical results. Direct seam calls prove
+    engagement and the deferral set (alias targets, ParamSpec origins,
+    missing resolver).
+    """
+
+    def setUp(self) -> None:
+        from mypy.constraints import Constraint, _set_native_constraints_active
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        self.Constraint = Constraint
+        self._set_active = _set_native_constraints_active
+        type_infos = [
+            value
+            for name in dir(self.fx)
+            if name.endswith("i")
+            for value in [getattr(self.fx, name)]
+            if isinstance(value, TypeInfo)
+        ]
+        set_wire_typeinfo_map({info.fullname: info for info in type_infos})
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        from mypy.constraints import _set_native_constraints_resolver
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        _set_native_constraints_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _tvar(
+        self,
+        name: str,
+        raw_id: int,
+        upper_bound: Type,
+        *,
+        meta_level: int = 0,
+        values: list[Type] | None = None,
+    ) -> TypeVarType:
+        return TypeVarType(
+            name,
+            name,
+            TypeVarId(raw_id, meta_level=meta_level),
+            values if values is not None else [],
+            upper_bound,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _pspec(self) -> ParamSpecType:
+        return ParamSpecType(
+            "P",
+            "P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    # --- merge_with_any ---
+
+    def _merge_result(self, constraint: Constraint, native: bool) -> Constraint:
+        from mypy.constraints import merge_with_any
+
+        self._set_active(native)
+        return merge_with_any(constraint)
+
+    def _assert_merge_par(self, constraint: Constraint) -> None:
+        native = self._merge_result(constraint, native=True)
+        python = self._merge_result(constraint, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_merge_plain_target(self) -> None:
+        # Plain Instance target: a union with Any is built; the seam
+        # engages natively.
+        self._assert_merge_par(self.Constraint(self.fx.t, 0, self.fx.a))
+        merged = self._merge_result(self.Constraint(self.fx.t, 0, self.fx.a), native=True)
+        assert isinstance(get_proper_type(merged.target), UnionType)
+
+    def test_merge_union_with_any_untouched(self) -> None:
+        # Target already contains Any: the constraint is returned as-is
+        # (same object, no redundant union).
+        target = UnionType([self.fx.a, AnyType(TypeOfAny.special_form)])
+        constraint = self.Constraint(self.fx.t, 0, target)
+        self._assert_merge_par(constraint)
+        assert self._merge_result(constraint, native=True) is constraint
+        assert self._merge_result(constraint, native=False) is constraint
+
+    def test_merge_plain_any_target(self) -> None:
+        # Any target itself counts as a union with Any.
+        constraint = self.Constraint(self.fx.t, 0, AnyType(TypeOfAny.special_form))
+        self._assert_merge_par(constraint)
+        assert self._merge_result(constraint, native=True) is constraint
+
+    def test_merge_alias_target_defers(self) -> None:
+        # TypeAliasType targets defer (get_proper_type cannot expand on
+        # the wire); the Python fallback merges the same way.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        self._assert_merge_par(self.Constraint(self.fx.t, 0, TypeAliasType(alias, [])))
+
+    # --- filter_satisfiable ---
+
+    def _filter_result(
+        self, option: list[Constraint] | None, native: bool
+    ) -> list[Constraint] | None:
+        from mypy.constraints import _set_native_constraints_resolver, filter_satisfiable
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return filter_satisfiable(option)
+
+    def _assert_filter_par(
+        self, option: list[Constraint] | None
+    ) -> None:
+        native = self._filter_result(option, native=True)
+        python = self._filter_result(option, native=False)
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_filter_upper_bound_keeps(self) -> None:
+        # Target is a subtype of the upper bound: kept.
+        self._assert_filter_par([self.Constraint(self.fx.t, 0, self.fx.a)])
+
+    def test_filter_upper_bound_drops(self) -> None:
+        # b is not a subtype of a: the only constraint is dropped -> None.
+        t = self._tvar("t", 11, self.fx.a)
+        t2 = self._tvar("t2", 12, self.fx.b)
+        self._assert_filter_par([self.Constraint(t2, 0, self.fx.a)])
+        self._assert_filter_par([self.Constraint(t, 0, self.fx.a)])
+
+    def test_filter_mixed(self) -> None:
+        # B <: A in the fixture, so both constraints survive the A bound.
+        t = self._tvar("t", 11, self.fx.a)
+        self._assert_filter_par(
+            [self.Constraint(t, 0, self.fx.a), self.Constraint(t, 0, self.fx.b)]
+        )
+
+    def test_filter_values_branch(self) -> None:
+        # Values-carrying origin: keep when the target is a subtype of
+        # one of the values.
+        t1 = self._tvar("t1", 12, self.fx.o, values=[self.fx.a, self.fx.b])
+        self._assert_filter_par(
+            [self.Constraint(t1, 0, self.fx.a), self.Constraint(t1, 0, self.fx.b)]
+        )
+        t2 = self._tvar("t2", 13, self.fx.o, values=[self.fx.b])
+        self._assert_filter_par([self.Constraint(t2, 0, self.fx.a)])
+
+    def test_filter_empty_and_none(self) -> None:
+        # `if not option: return option` runs before the seam: an empty
+        # list is returned intact, None passes through.
+        assert self._filter_result([], native=True) == []
+        assert self._filter_result(None, native=True) is None
+        self._assert_filter_par([])
+        self._assert_filter_par(None)
+
+    def test_filter_paramspec_defers(self) -> None:
+        # ParamSpec origins defer to the pure-Python body; parity holds.
+        self._assert_filter_par([self.Constraint(self._pspec(), 0, self.fx.o)])
+
+    # --- is_same_constraints ---
+
+    def _same_result(self, x: list[Constraint], y: list[Constraint], native: bool) -> bool:
+        from mypy.constraints import _set_native_constraints_resolver, is_same_constraints
+
+        self._set_active(native)
+        if native:
+            _set_native_constraints_resolver(self.resolver)
+        else:
+            _set_native_constraints_resolver(None)
+        return is_same_constraints(x, y)
+
+    def _assert_same_par(self, x: list[Constraint], y: list[Constraint]) -> None:
+        native = self._same_result(x, y, native=True)
+        python = self._same_result(x, y, native=False)
+        assert native == python, f"native={native!r} python={python!r}"
+
+    def test_same_identical_lists(self) -> None:
+        option = [self.Constraint(self.fx.t, 0, self.fx.a)]
+        self._assert_same_par(option, list(option))
+        assert self._same_result(option, list(option), native=True) is True
+
+    def test_same_both_any_skips_op(self) -> None:
+        # Both targets Any: op mismatch is ignored.
+        x = [self.Constraint(self.fx.t, 0, AnyType(TypeOfAny.special_form))]
+        y = [self.Constraint(self.fx.t, 1, AnyType(TypeOfAny.special_form))]
+        self._assert_same_par(x, y)
+        assert self._same_result(x, y, native=True) is True
+
+    def test_same_op_mismatch(self) -> None:
+        x = [self.Constraint(self.fx.t, 0, self.fx.a)]
+        y = [self.Constraint(self.fx.t, 1, self.fx.a)]
+        self._assert_same_par(x, y)
+        assert self._same_result(x, y, native=True) is False
+
+    def test_same_target_mismatch(self) -> None:
+        x = [self.Constraint(self.fx.t, 0, self.fx.a)]
+        y = [self.Constraint(self.fx.t, 0, self.fx.b)]
+        self._assert_same_par(x, y)
+        assert self._same_result(x, y, native=True) is False
+
+    def test_same_var_mismatch(self) -> None:
+        x = [self.Constraint(self.fx.t, 0, self.fx.a)]
+        y = [self.Constraint(self.fx.s, 0, self.fx.a)]
+        self._assert_same_par(x, y)
+        assert self._same_result(x, y, native=True) is False
+
+    def test_same_empty_lists(self) -> None:
+        self._assert_same_par([], [])
+        assert self._same_result([], [], native=True) is True
+
+    def test_same_alias_target_defers(self) -> None:
+        # Alias targets make the pairwise check undecidable in Rust; the
+        # Python fallback decides and parity holds.
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        target = TypeAliasType(alias, [])
+        self._assert_same_par(
+            [self.Constraint(self.fx.t, 0, target)], [self.Constraint(self.fx.t, 0, self.fx.a)]
+        )
+
+    # --- direct seam calls ---
+
+    def _wire_constraint(self, constraint: Constraint) -> bytes:
+        from mypy.constraints import _write_constraint
+
+        buf = _WriteBuffer()
+        _write_constraint(buf, constraint)
+        return buf.getvalue()
+
+    def _wire_option(self, option: list[Constraint]) -> bytes:
+        from mypy.constraints import _write_option
+
+        buf = _WriteBuffer()
+        _write_option(buf, option)
+        return buf.getvalue()
+
+    def test_direct_merge_engages(self) -> None:
+        assert _type_kernel.rust_merge_with_any(
+            self._wire_constraint(self.Constraint(self.fx.t, 0, self.fx.a))
+        ) is True
+        assert _type_kernel.rust_merge_with_any(
+            self._wire_constraint(self.Constraint(self.fx.t, 0, AnyType(TypeOfAny.special_form)))
+        ) is False
+
+    def test_direct_merge_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        blob = self._wire_constraint(self.Constraint(self.fx.t, 0, TypeAliasType(alias, [])))
+        assert _type_kernel.rust_merge_with_any(blob) is None
+
+    def test_direct_filter_engages(self) -> None:
+        from mypy.constraints import _read_index_list
+
+        # B <: A in the fixture: both targets satisfy the A upper bound.
+        t = self._tvar("t", 11, self.fx.a)
+        option = [self.Constraint(t, 0, self.fx.a), self.Constraint(t, 0, self.fx.b)]
+        raw = _type_kernel.rust_filter_satisfiable(self._wire_option(option), self.resolver)
+        assert raw is not None
+        assert _read_index_list(bytes(raw)) == [0, 1]
+        # All filtered: A is not a subtype of the B upper bound.
+        t2 = self._tvar("t2", 12, self.fx.b)
+        raw = _type_kernel.rust_filter_satisfiable(
+            self._wire_option([self.Constraint(t2, 0, self.fx.a)]), self.resolver
+        )
+        assert raw is not None
+        assert _read_index_list(bytes(raw)) == []
+
+    def test_direct_filter_paramspec_defers(self) -> None:
+        raw = _type_kernel.rust_filter_satisfiable(
+            self._wire_option([self.Constraint(self._pspec(), 0, self.fx.o)]), self.resolver
+        )
+        assert raw is None
+
+    def test_direct_is_same_engages(self) -> None:
+        option = [self.Constraint(self.fx.t, 0, self.fx.a)]
+        assert (
+            _type_kernel.rust_is_same_constraints(
+                self._wire_option(option), self._wire_option(option), self.resolver
+            )
+            is True
+        )
+        other = [self.Constraint(self.fx.t, 1, self.fx.a)]
+        assert (
+            _type_kernel.rust_is_same_constraints(
+                self._wire_option(option), self._wire_option(other), self.resolver
+            )
+            is False
+        )
+
+    def test_direct_filter_requires_resolver(self) -> None:
+        # The shim defers to Python when no resolver snapshot is installed.
+        from mypy.constraints import _try_native_filter_satisfiable
+
+        t = self._tvar("t", 11, self.fx.a)
+        self._set_active(True)
+        try:
+            assert _try_native_filter_satisfiable([self.Constraint(t, 0, self.fx.a)]) is None
+        finally:
+            self._set_active(False)
