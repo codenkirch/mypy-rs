@@ -3610,6 +3610,8 @@ mod check_final_tests {
         assert!(!final_without_value(true, false, false, true, false, true));
     }
 }
+
+#[cfg(test)]
 mod return_stmt_tests {
     use super::{
         classify_return_stmt_post, classify_return_stmt_pre, RETURN_TAG_ANY_RETURN,
