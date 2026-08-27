@@ -1010,6 +1010,22 @@ def rust_invalid_index_type(index_str: str, expected_str: str, base_str: str) ->
 def rust_missing_named_argument(name: str, for_func: str) -> str: ...
 def rust_signatures_incompatible(method: str, other_method: str) -> str: ...
 def rust_signature_incompatible_with_supertype(name: str, target: str) -> str: ...
+def rust_classify_has_no_attr(
+    member: str,
+    is_instance: bool,
+    is_function_like: bool,
+    is_type_obj: bool,
+    is_union: bool,
+    is_typevar: bool,
+    typevar_bound_is_union: bool,
+    has_readable_member: bool,
+    instance_fullname: str,
+    are_type_names_disabled: bool,
+    instance_has_names: bool,
+    module_private: bool,
+    instance_names: list[str],
+    module_public_names: list[str],
+) -> tuple[int, str, list[str]]: ...
 def rust_too_few_arguments(
     prefer_simple: bool,
     argument_names: list[str | None] | None,

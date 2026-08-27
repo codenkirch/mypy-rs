@@ -30,6 +30,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyType;
 
 use crate::subtypes::{is_subtype, SubtypeContext};
+use crate::suggestions::rust_best_matches;
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
 use crate::visitor::flatten_nested_unions_inner;
 use crate::wire::{self, LiteralValue, ReadBuffer, Type};
@@ -2232,9 +2233,474 @@ pub fn rust_signature_incompatible_with_supertype(name: String, target: String) 
     format!("Signature of \"{name}\" incompatible with {target}")
 }
 
+/// `op_methods` from `mypy/operators.py` — binary operator id to dunder.
+/// Order matters: `has_no_attr` scans it to name the operator for tag 2.
+const OP_METHODS: &[(&str, &str)] = &[
+    ("+", "__add__"),
+    ("-", "__sub__"),
+    ("*", "__mul__"),
+    ("/", "__truediv__"),
+    ("%", "__mod__"),
+    ("divmod", "__divmod__"),
+    ("//", "__floordiv__"),
+    ("**", "__pow__"),
+    ("@", "__matmul__"),
+    ("&", "__and__"),
+    ("|", "__or__"),
+    ("^", "__xor__"),
+    ("<<", "__lshift__"),
+    (">>", "__rshift__"),
+    ("==", "__eq__"),
+    ("!=", "__ne__"),
+    ("<", "__lt__"),
+    (">=", "__ge__"),
+    (">", "__gt__"),
+    ("<=", "__le__"),
+    ("in", "__contains__"),
+];
+
+/// `COMMON_MISTAKES` from `mypy/messages.py:3608`.
+const COMMON_MISTAKES: &[(&str, &[&str])] = &[("add", &["append", "extend"])];
+
+/// `mypy/messages.py:has_no_attr` — member-access message arbitration.
+///
+/// Python keeps all side effects (fail/note emission,
+/// `unsupported_left_operand`, formatting); Rust only picks the branch.
+/// Returns `(tag, op, matches)`: branch tag, the operator id for tag 2, and
+/// the did-you-mean matches for tag 12. Never defers: the scalar facts
+/// cover every reachable branch.
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+pub fn rust_classify_has_no_attr(
+    member: String,
+    is_instance: bool,
+    is_function_like: bool,
+    is_type_obj: bool,
+    is_union: bool,
+    is_typevar: bool,
+    typevar_bound_is_union: bool,
+    has_readable_member: bool,
+    instance_fullname: String,
+    are_type_names_disabled: bool,
+    instance_has_names: bool,
+    module_private: bool,
+    instance_names: Vec<String>,
+    module_public_names: Vec<String>,
+) -> (i64, String, Vec<String>) {
+    // Tags 0-10: the special-case front of has_no_attr (messages.py:391-471).
+    if is_instance && has_readable_member {
+        return (0, String::new(), vec![]);
+    }
+    if member == "__contains__" {
+        return (1, String::new(), vec![]);
+    }
+    if let Some((op, _)) = OP_METHODS.iter().find(|(_, m)| *m == member) {
+        return (2, (*op).to_string(), vec![]);
+    }
+    match member.as_str() {
+        "__neg__" => return (3, String::new(), vec![]),
+        "__pos__" => return (4, String::new(), vec![]),
+        "__invert__" => return (5, String::new(), vec![]),
+        "__getitem__" => {
+            // messages.py:429-446: type objects report without a code.
+            if is_function_like && is_type_obj {
+                return (6, String::new(), vec![]);
+            }
+            return (7, String::new(), vec![]);
+        }
+        "__setitem__" => return (8, String::new(), vec![]),
+        "__call__" => {
+            // messages.py:457-471: 'builtins.function' gets a clearer message.
+            if is_instance && instance_fullname == "builtins.function" {
+                return (9, String::new(), vec![]);
+            }
+            return (10, String::new(), vec![]);
+        }
+        _ => {}
+    }
+    // The non-special tail (messages.py:504-601). The Union/TypeVar/else
+    // chain hangs off `if not are_type_names_disabled()`; with type names
+    // enabled everything lands in the plain or Instance sub-block.
+    if !are_type_names_disabled {
+        if is_instance && instance_has_names {
+            if module_private {
+                return (11, String::new(), vec![]);
+            }
+            let mut alternatives: HashSet<String> = instance_names.iter().cloned().collect();
+            alternatives.extend(module_public_names.iter().cloned());
+            alternatives.remove(&member);
+            let common: &[&str] = COMMON_MISTAKES
+                .iter()
+                .find(|(m, _)| **m == member)
+                .map(|(_, fixes)| *fixes)
+                .unwrap_or(&[]);
+            let mut matches: Vec<String> = common
+                .iter()
+                .filter(|f| alternatives.contains(**f))
+                .map(|f| f.to_string())
+                .collect();
+            matches.extend(rust_best_matches(
+                &member,
+                alternatives.into_iter().collect(),
+                3,
+            ));
+            if member == "__aiter__" && matches == ["__iter__".to_string()] {
+                matches.clear(); // Avoid misleading suggestion
+            }
+            if !matches.is_empty() {
+                return (12, String::new(), matches);
+            }
+            return (13, String::new(), vec![]);
+        }
+        return (16, String::new(), vec![]);
+    }
+    if is_union {
+        return (14, String::new(), vec![]);
+    }
+    if is_typevar {
+        // A TypeVarType whose upper bound is not a union produces no
+        // message at all (messages.py:578-591 falls out of the whole
+        // block); that is the only silent tail.
+        if typevar_bound_is_union {
+            return (15, String::new(), vec![]);
+        }
+        return (17, String::new(), vec![]);
+    }
+    (16, String::new(), vec![])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::suggestions::rust_best_matches;
+
+    #[test]
+    fn test_classify_has_no_attr_not_assignable() {
+        let (tag, op, matches) = rust_classify_has_no_attr(
+            "x".to_string(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            "mod.C".to_string(),
+            false,
+            true,
+            false,
+            vec!["x".to_string()],
+            vec![],
+        );
+        assert_eq!((tag, op, matches), (0, String::new(), vec![]));
+    }
+
+    #[test]
+    fn test_classify_has_no_attr_operators() {
+        let mk = |member: &str| {
+            rust_classify_has_no_attr(
+                member.to_string(),
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                String::new(),
+                false,
+                false,
+                false,
+                vec![],
+                vec![],
+            )
+        };
+        assert_eq!(mk("__contains__").0, 1);
+        let (tag, op, _) = mk("__add__");
+        assert_eq!((tag, op.as_str()), (2, "+"));
+        let (tag, op, _) = mk("__mod__");
+        assert_eq!((tag, op.as_str()), (2, "%"));
+        assert_eq!(mk("__neg__").0, 3);
+        assert_eq!(mk("__pos__").0, 4);
+        assert_eq!(mk("__invert__").0, 5);
+    }
+
+    #[test]
+    fn test_classify_has_no_attr_indexing_and_call() {
+        let mk = |member: &str, is_fn: bool, is_type_obj: bool, fullname: &str| {
+            rust_classify_has_no_attr(
+                member.to_string(),
+                fullname == "builtins.function",
+                is_fn,
+                is_type_obj,
+                false,
+                false,
+                false,
+                false,
+                fullname.to_string(),
+                false,
+                false,
+                false,
+                vec![],
+                vec![],
+            )
+        };
+        assert_eq!(mk("__getitem__", true, true, "type[T]").0, 6);
+        assert_eq!(mk("__getitem__", true, false, "f").0, 7);
+        assert_eq!(mk("__getitem__", false, false, "i").0, 7);
+        assert_eq!(mk("__setitem__", false, false, "i").0, 8);
+        assert_eq!(mk("__call__", false, false, "builtins.function").0, 9);
+        assert_eq!(mk("__call__", false, false, "i").0, 10);
+    }
+
+    #[test]
+    fn test_classify_has_no_attr_ordinary_tail() {
+        let mk = |member: &str,
+                  is_instance: bool,
+                  has_names: bool,
+                  disabled: bool,
+                  private: bool,
+                  is_union: bool,
+                  is_typevar: bool,
+                  tv_union_bound: bool,
+                  names: Vec<String>,
+                  mod_names: Vec<String>| {
+            rust_classify_has_no_attr(
+                member.to_string(),
+                is_instance,
+                false,
+                false,
+                is_union,
+                is_typevar,
+                tv_union_bound,
+                false,
+                String::new(),
+                disabled,
+                has_names,
+                private,
+                names,
+                mod_names,
+            )
+        };
+        // Module-private member: tag 11.
+        let (tag, _, _) = mk(
+            "x",
+            true,
+            true,
+            false,
+            true,
+            false,
+            false,
+            false,
+            vec!["a".to_string()],
+            vec!["x".to_string()],
+        );
+        assert_eq!(tag, 11);
+        // Suggestion: member "add" with "append" among the names.
+        let (tag, _, matches) = mk(
+            "add",
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            vec!["append".to_string()],
+            vec![],
+        );
+        assert_eq!(tag, 12);
+        assert_eq!(matches, vec!["append".to_string()]);
+        // The __aiter__ -> __iter__ suggestion is suppressed.
+        let (tag, _, matches) = mk(
+            "__aiter__",
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            vec!["__iter__".to_string()],
+            vec![],
+        );
+        assert_eq!((tag, matches), (13, Vec::<String>::new()));
+        // Plain Instance attribute miss: tag 13.
+        let (tag, _, _) = mk(
+            "zz",
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            vec!["append".to_string()],
+            vec![],
+        );
+        assert_eq!(tag, 13);
+        // Instance with empty names falls to the plain else-branch: tag 16.
+        assert_eq!(
+            mk(
+                "zz",
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                vec![],
+                vec![]
+            )
+            .0,
+            16
+        );
+        // With type names enabled, union and typevar shapes land in the
+        // plain else-branch: tag 16.
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                vec![],
+                vec![]
+            )
+            .0,
+            16
+        );
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                vec![],
+                vec![]
+            )
+            .0,
+            16
+        );
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                vec![],
+                vec![]
+            )
+            .0,
+            16
+        );
+        // Type names disabled: the Instance suggestion sub-block is
+        // suppressed, but the tail still dispatches to the plain message.
+        assert_eq!(
+            mk(
+                "x",
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                vec!["append".to_string()],
+                vec![]
+            )
+            .0,
+            16
+        );
+        // Disabled: union and typevar arms get their own tags.
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                vec![],
+                vec![]
+            )
+            .0,
+            14
+        );
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                true,
+                vec![],
+                vec![]
+            )
+            .0,
+            15
+        );
+        // Disabled typevar with a non-union bound is silent: tag 17.
+        assert_eq!(
+            mk(
+                "x",
+                false,
+                false,
+                true,
+                false,
+                false,
+                true,
+                false,
+                vec![],
+                vec![]
+            )
+            .0,
+            17
+        );
+    }
+
+    #[test]
+    fn test_classify_has_no_attr_matches_exclude_member_and_private_filter() {
+        // Public module names join the alternatives; the member itself is
+        // always removed from the candidate set.
+        let (tag, _, matches) = rust_classify_has_no_attr(
+            "appnd".to_string(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            String::new(),
+            false,
+            true,
+            false,
+            vec!["apend".to_string()],
+            vec!["append".to_string()],
+        );
+        assert_eq!(tag, 12);
+        assert!(matches.contains(&"append".to_string()));
+        assert!(matches.contains(&"apend".to_string()));
+        assert!(!matches.contains(&"appnd".to_string()));
+    }
 
     #[test]
     fn test_format_key_list() {

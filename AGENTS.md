@@ -1278,3 +1278,22 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus 6 pure decision unit tests in `typeops.rs`.
 - `rust_make_inferred_type_note` (issue #982) — mirrors the pure bool
+- `rust_classify_has_no_attr` (issue #1006) — mirrors the dispatch of
+  `Messages.has_no_attr` (messages.py:364-601): the 11-arm special-case
+  front (not-assignable member, `in`, binary-op methods via `op_methods`,
+  unary ops, getitem/setitem/call with the type-obj and
+  `builtins.function` special cases) plus the non-special tail. The tail
+  hangs off `are_type_names_disabled()`: with type names enabled
+  everything lands in the Instance suggestion sub-block (module-private
+  export, did-you-mean via `COMMON_MISTAKES` + `best_matches`, or plain
+  ATTR_DEFINED); the union-item / typevar-upper-bound / silent tags only
+  fire when names are disabled. Rust reads 14 scalar facts (isinstance
+  tags, name lists, the module symbol table's public/private split) and
+  returns a 17-tag arbitration plus the op id and did-you-mean matches
+  (via the difflib `best_matches` port); Python applies all fail/note
+  side effects and every format call (format_type, format_type_distinctly,
+  pretty_seq). Never defers: the scalar facts cover every reachable
+  branch. Gated by `_native_messages_active` (wired from `mypy/build.py`)
+  and covered by `NativeHasNoAttrSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `messages.rs`.
