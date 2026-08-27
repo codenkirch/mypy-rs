@@ -351,6 +351,7 @@ __all__ = [
     "rust_can_be_type_alias",
     "rust_check_typevarlike_name",
     "rust_check_decorated_function_is_method",
+    "rust_classify_method_signature",
     "rust_extract_typevarlike_name",
     "rust_special_function_elide_names",
     "rust_argument_elide_name",
@@ -1555,6 +1556,13 @@ def rust_check_typevarlike_name(
 def rust_check_decorated_function_is_method(
     semanal: Any,
 ) -> bool | None: ...
+def rust_classify_method_signature(
+    func: Any,
+    self_type_wire: bytes | None,
+    unanalyzed_kind: int,
+    expected_self: bool | None,
+    has_self_type: bool,
+) -> tuple[bool, bool, int] | None: ...
 def rust_extract_typevarlike_name(
     s: AssignmentStmt,
     call: CallExpr,

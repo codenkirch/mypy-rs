@@ -1556,6 +1556,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_classify_fixed_args,
         module
     )?)?;
+    // semanal_checks: prepare_method_signature method-signature dispatch
+    // head. Rust classifies the branch from live FuncDef facts plus the
+    // wire self type; writes, side effects, and fails stay in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_classify_method_signature,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,

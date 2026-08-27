@@ -950,6 +950,30 @@ including:
   and covered by `NativeFixedArgsSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), and pure
   decision unit tests in `semanal_checks.rs`.
+- `rust_classify_method_signature` (issue #1036) — mirrors the dispatch
+  head of `SemanticAnalyzer.prepare_method_signature`
+  (semanal.py:1543-1582): the `__new__` is_static write (NEW_STATIC),
+  the `__init_subclass__`/`__class_getitem__` is_class write
+  (CLASS_SPECIAL), the Any-self trivial/replace arms, the
+  redundant-Self / explicit-self-conflict fails, the
+  static-method-with-Self fail, and the OK tail. Rust returns
+  `(set_is_static, set_is_class, tag)` from live FuncDef facts read via
+  PyO3 (name, has_self_or_cls_argument, arguments non-empty,
+  functype-is-CallableType) plus the analyzed arg_types[0] proper type
+  serialized once to wire (the AnyType check), the unanalyzed-arg kind,
+  and the shim-precomputed `is_expected_self_type` bool (needs
+  lookup_qualified; the rust_class_callable pattern). The `func.is_class`
+  read at 1561 is decidable without the write because the shim applies
+  the is_class write before its tag handler re-reads it. Python applies
+  the is_static/is_class/is_trivial_self writes, the
+  replace_implicit_first_type + func.type assignment, and the three
+  self.fail emissions. Defers (`None`) on an unreadable fact, an
+  undecodable self-type blob, or an uncomputable
+  `is_expected_self_type`. Gated by `_native_semanal_visitor_active`
+  (wired from `mypy/build.py`) and covered by
+  `NativePrepareMethodSignatureSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests, gate-off vs gate-on differential, deferral
+  audit), plus pure decision unit tests in `semanal_checks.rs`.
 - `rust_classify_visit_op_expr` (issue #959) — mirrors the 5-way dispatch
   head of `ExpressionChecker.visit_op_expr` (checkexpr.py:5014-5044):
   `e.analyzed` passthrough (tag 0), `and`/`or` boolean op (tag 1),

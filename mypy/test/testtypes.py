@@ -36834,3 +36834,304 @@ class NativeConfigureBasesSuite(Suite):
         finally:
             semanal_mod._serialize_semanal_type = saved
         assert_equal(on, off)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativePrepareMethodSignatureSuite(Suite):
+    """Parity for the Rust `prepare_method_signature` dispatch-head port.
+
+    `SemanticAnalyzer.prepare_method_signature` (semanal.py:1543) walks a
+    branch chain over the method signature: the `__new__` is_static write,
+    the `__init_subclass__`/`__class_getitem__` is_class write, the
+    Any-self trivial/replace arms, the Self-vs-explicit-annotation
+    redundant/conflict fails, and the static-method-with-Self fail. The
+    Rust classifier (`semanal_checks.rs`) returns
+    (set_is_static, set_is_class, tag) from live FuncDef facts plus the
+    wire-serialized first argument and the shim-precomputed
+    `is_expected_self_type` bool; the Python shim applies every write and
+    error emission and keeps the pure-Python body as the fallback.
+
+    Direct seam calls assert the exact (flags, tag) tuple for every branch;
+    the gate-off vs gate-on differential drives the real
+    `prepare_method_signature` through a stub fail recorder and asserts
+    identical (fail records, flags, str(func.type)) observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _wire(self, t: Type) -> bytes:
+        from mypy.subtypes import _serialize_type
+
+        return _serialize_type(t)
+
+    def _info(self) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef("C", Block([]), None, [])
+        defn.fullname = "mod.C"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro.append(info)
+
+        info.self_type = Instance(info, [])  # type: ignore[assignment]
+        return info
+
+    def _fdef(
+        self,
+        name: str,
+        arg_types: list[Type],
+        unanalyzed_arg0: Type | None = None,
+        is_static: bool = False,
+    ) -> FuncDef:
+        fx = TypeFixture()
+        sig = CallableType(
+            list(arg_types),
+            [ARG_POS] * len(arg_types),
+            [None] * len(arg_types),
+            AnyType(TypeOfAny.special_form),
+            fx.function,
+        )
+        args = [Argument(Var(f"a{i}"), None, None, ARG_POS) for i in range(len(arg_types))]
+        fdef = FuncDef(name, args, None, sig)
+        if is_static:
+            fdef.is_static = True
+        if unanalyzed_arg0 is not None:
+            fdef.unanalyzed_type = CallableType(
+                [unanalyzed_arg0] + list(arg_types[1:]),
+                [ARG_POS] * len(arg_types),
+                [None] * len(arg_types),
+                AnyType(TypeOfAny.special_form),
+                fx.function,
+            )
+        return fdef
+
+    def _tag(
+        self,
+        fdef: FuncDef,
+        self_type_wire: bytes | None,
+        unanalyzed_kind: int,
+        expected_self: bool | None,
+        has_self_type: bool,
+    ) -> tuple[bool, bool, int] | None:
+        assert _type_kernel is not None
+        return _type_kernel.rust_classify_method_signature(
+            fdef, self_type_wire, unanalyzed_kind, expected_self, has_self_type
+        )
+
+    def _run(
+        self,
+        name: str,
+        arg0: Type,
+        has_self_type: bool,
+        unanalyzed_arg0: Type | None = None,
+        is_static: bool = False,
+        expected: bool = False,
+    ) -> tuple[object, object]:
+        from types import SimpleNamespace
+
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> tuple[object, ...]:
+            msgs = []
+            info = self._info()
+            sa = SimpleNamespace(
+                type=info,
+                fail=lambda msg, ctx, serious=False, blocker=None, code=None: msgs.append(
+                    (str(msg), code)
+                ),
+                is_expected_self_type=lambda typ, is_classmethod: expected,
+                class_type=lambda t: TypeType.make_normalized(t),
+            )
+            sa._native_prepare_method_signature = lambda func, i, hst, ft: (
+                SemanticAnalyzer._native_prepare_method_signature(
+                    sa,  # type: ignore[arg-type]
+                    func,
+                    i,
+                    hst,
+                    ft,
+                )
+            )
+            fdef = self._fdef(name, [arg0], unanalyzed_arg0, is_static)
+            SemanticAnalyzer.prepare_method_signature(sa, fdef, info, has_self_type)  # type: ignore[arg-type]
+            return (
+                list(msgs),
+                fdef.is_static,
+                fdef.is_class,
+                fdef.is_trivial_self,
+                str(fdef.type),
+            )
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        name: str,
+        arg0: Type,
+        has_self_type: bool,
+        unanalyzed_arg0: Type | None = None,
+        is_static: bool = False,
+        expected: bool = False,
+    ) -> None:
+        off, on = self._run(name, arg0, has_self_type, unanalyzed_arg0, is_static, expected)
+        assert_equal(on, off, f"prepare_method_signature parity name={name} arg0={arg0}")
+
+    def test_seam_any_self_trivial(self) -> None:
+        fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
+
+        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, False) == (
+            False,
+            False,
+            1,
+        )
+
+    def test_seam_any_self_replace(self) -> None:
+        fdef = self._fdef("m", [AnyType(TypeOfAny.unannotated)])
+
+        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, True) == (
+            False,
+            False,
+            0,
+        )
+
+    def test_seam_new_static(self) -> None:
+        static_fdef = self._fdef("__new__", [])
+        static_fdef.is_static = True
+        assert self._tag(static_fdef, None, 0, None, False) == (True, False, 5)
+
+    def test_seam_new_with_any_self(self) -> None:
+        fdef = self._fdef("__new__", [AnyType(TypeOfAny.unannotated)])
+
+        assert self._tag(fdef, self._wire(AnyType(TypeOfAny.unannotated)), 0, None, False) == (
+            True,
+            False,
+            1,
+        )
+
+    def test_seam_class_special_write(self) -> None:
+        fx = TypeFixture()
+        fdef = self._fdef("__init_subclass__", [fx.a])
+        assert self._tag(fdef, self._wire(fx.a), 0, None, False) == (False, True, 5)
+
+    def test_seam_static_self_fail(self) -> None:
+        fx = TypeFixture()
+        fdef = self._fdef("m", [fx.a], is_static=True)
+        assert self._tag(fdef, None, 0, None, True) == (False, False, 4)
+
+    def test_seam_redundant_and_conflict(self) -> None:
+        fx = TypeFixture()
+        fdef = self._fdef("m", [fx.str_type], unanalyzed_arg0=fx.str_type)
+
+        assert self._tag(fdef, self._wire(fx.str_type), 2, True, True) == (False, False, 2)
+        assert self._tag(fdef, self._wire(fx.str_type), 2, False, True) == (False, False, 3)
+
+    def test_seam_ok_tails(self) -> None:
+        fx = TypeFixture()
+        fdef = self._fdef("m", [fx.a])
+
+        assert self._tag(fdef, self._wire(fx.a), 0, None, False) == (False, False, 5)
+        assert self._tag(fdef, self._wire(fx.a), 1, None, True) == (False, False, 5)
+        assert self._tag(fdef, self._wire(fx.a), 0, None, True) == (False, False, 5)
+
+    def test_seam_defers(self) -> None:
+        fx = TypeFixture()
+        fdef = self._fdef("m", [fx.a])
+
+        assert self._tag(fdef, None, 0, None, False) is None
+        assert self._tag(fdef, self._wire(fx.a), 2, None, True) is None
+
+    def test_parity_trivial_self(self) -> None:
+        self._assert_par("m", AnyType(TypeOfAny.unannotated), False)
+
+    def test_parity_any_self_replace(self) -> None:
+        self._assert_par("m", AnyType(TypeOfAny.unannotated), True)
+
+    def test_parity_new_static_and_replace(self) -> None:
+        self._assert_par("__new__", AnyType(TypeOfAny.unannotated), False)
+        self._assert_par("__new__", AnyType(TypeOfAny.unannotated), True)
+
+    def test_parity_class_special(self) -> None:
+        self._assert_par("__init_subclass__", AnyType(TypeOfAny.unannotated), False)
+        self._assert_par("__class_getitem__", AnyType(TypeOfAny.unannotated), True)
+
+    def test_parity_static_self_fail(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.a, True, is_static=True)
+
+    def test_parity_redundant_self(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.str_type, True, unanalyzed_arg0=fx.str_type, expected=True)
+        off, on = self._run("m", fx.str_type, True, unanalyzed_arg0=fx.str_type, expected=True)
+        on_msgs = on[0]  # type: ignore[index]
+        assert isinstance(on_msgs, list) and len(on_msgs) == 1
+        assert on_msgs[0][0] == 'Redundant "Self" annotation for the first method argument'
+        assert on_msgs[0][1] is not None
+
+    def test_parity_explicit_self_conflict(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.str_type, True, unanalyzed_arg0=fx.str_type, expected=False)
+
+    def test_parity_plain_method_ok(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.a, False)
+
+    def test_parity_unanalyzed_arg0_any_ok(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.a, True, unanalyzed_arg0=AnyType(TypeOfAny.unannotated))
+
+    def test_parity_unanalyzed_not_callable_ok(self) -> None:
+        fx = TypeFixture()
+        self._assert_par("m", fx.str_type, True, unanalyzed_arg0=None)
+
+    def test_fallback_when_expected_self_raises(self) -> None:
+        from mypy.semanal import SemanticAnalyzer
+
+        fx = TypeFixture()
+
+        def check_one() -> tuple[object, ...]:
+            info = self._info()
+
+            def boom(typ: Type, is_classmethod: bool) -> bool:
+                raise RuntimeError("boom")
+
+            sa = SimpleNamespace(
+                type=info,
+                fail=lambda msg, ctx, serious=False, blocker=None, code=None: None,
+                is_expected_self_type=boom,
+                class_type=lambda t: TypeType.make_normalized(t),
+            )
+            sa._native_prepare_method_signature = lambda func, i, hst, ft: (
+                SemanticAnalyzer._native_prepare_method_signature(
+                    sa,  # type: ignore[arg-type]
+                    func,
+                    i,
+                    hst,
+                    ft,
+                )
+            )
+            fdef = self._fdef("m", [fx.str_type], unanalyzed_arg0=fx.str_type)
+
+            try:
+                SemanticAnalyzer.prepare_method_signature(sa, fdef, info, True)  # type: ignore[arg-type]
+            except RuntimeError as exc:
+                return ("raised", str(exc))
+            return (fdef.is_static, fdef.is_class, fdef.is_trivial_self, str(fdef.type))
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        assert_equal(on, off, "prepare_method_signature deferral parity")

@@ -6,6 +6,7 @@
 //! - `check_decorated_function_is_method` (semanal.py:2256) predicate
 //! - `check_fixed_args` (semanal.py:6962) arg-count + arg-kinds arbitration
 //! - `should_wait_rhs` (semanal.py:4179) assignment-rvalue wait predicate
+//! - `prepare_method_signature` (semanal.py:1543) method-signature dispatch
 
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyString, PyType};
@@ -401,6 +402,180 @@ pub(crate) fn rust_should_wait_rhs(semanal: &PyAny, rv: &PyAny) -> PyResult<Opti
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// prepare_method_signature dispatch head (issue #1036)
+// ---------------------------------------------------------------------------
+
+/// Terminal branch tags for the method-signature dispatch; must match
+/// `_NATIVE_METH_SIG_*` in mypy/semanal.py. NEW_STATIC and CLASS_SPECIAL
+/// (the two unconditional write arms of the branch chain) are represented
+/// as METH_SIG_OK combined with the `set_is_static` / `set_is_class` write
+/// flags in the returned tuple.
+pub(crate) const METH_SIG_ANY_SELF_REPLACE: i64 = 0;
+pub(crate) const METH_SIG_ANY_SELF_TRIVIAL: i64 = 1;
+pub(crate) const METH_SIG_REDUNDANT_SELF: i64 = 2;
+pub(crate) const METH_SIG_EXPLICIT_SELF_CONFLICT: i64 = 3;
+pub(crate) const METH_SIG_STATIC_SELF_FAIL: i64 = 4;
+pub(crate) const METH_SIG_OK: i64 = 5;
+
+/// Sentinel kinds for the unanalyzed first-argument fact (the inner
+/// `elif has_self_type and isinstance(func.unanalyzed_type, CallableType)`
+/// chain). `0` = the elif did not apply (unanalyzed not callable or not
+/// gathered), `1` = unanalyzed arg0 IS AnyType (inner guard false), `2` =
+/// unanalyzed arg0 is not AnyType (the expected-self checks run).
+const UNANALYZED_NOT_CALLABLE: i64 = 0;
+const UNANALYZED_ARG0_IS_ANY: i64 = 1;
+const UNANALYZED_ARG0_NOT_ANY: i64 = 2;
+
+/// Pure decision core of `SemanticAnalyzer.prepare_method_signature`
+/// (semanal.py:1543-1582), kept separate from the PyO3 entry so the branch
+/// chain is unit-testable without a Python runtime.
+///
+/// `self_type_is_any` mirrors `isinstance(get_proper_type(arg_types[0]),
+/// AnyType)`; `None` means the wire blob was undecodable (defer).
+/// `expected_self` is the shim-precomputed `is_expected_self_type` result
+/// (it needs `lookup_qualified`, so Rust cannot compute it); `None` there
+/// defers when the branch needs it.
+///
+/// Returns `(set_is_static, set_is_class, tag)`: the two write flags mirror
+/// the unconditional arms (func.is_static at semanal.py:1548, func.is_class
+/// at :1551), `tag` the terminal branch. The `func.is_class` read at :1561
+/// is decidable without the write because Python's shim applies the
+/// `set_is_class` write before its tag handler re-reads `func.is_class`.
+#[allow(clippy::too_many_arguments)]
+fn classify_method_signature(
+    name: &str,
+    has_self_or_cls: bool,
+    has_arguments: bool,
+    functype_is_callable: bool,
+    self_type_is_any: Option<bool>,
+    has_self_type: bool,
+    unanalyzed_kind: i64,
+    expected_self: Option<bool>,
+) -> Option<(bool, bool, i64)> {
+    let set_is_static = name == "__new__";
+    let set_is_class =
+        has_self_or_cls && (name == "__init_subclass__" || name == "__class_getitem__");
+    let tag = if !has_self_or_cls {
+        if has_self_type {
+            METH_SIG_STATIC_SELF_FAIL
+        } else {
+            METH_SIG_OK
+        }
+    } else if has_arguments && functype_is_callable {
+        let self_is_any = self_type_is_any?;
+        if self_is_any {
+            if has_self_type {
+                METH_SIG_ANY_SELF_REPLACE
+            } else {
+                METH_SIG_ANY_SELF_TRIVIAL
+            }
+        } else if has_self_type {
+            match unanalyzed_kind {
+                UNANALYZED_ARG0_NOT_ANY => match expected_self {
+                    Some(true) => METH_SIG_REDUNDANT_SELF,
+                    Some(false) => METH_SIG_EXPLICIT_SELF_CONFLICT,
+                    // Shim could not compute is_expected_self_type: defer.
+                    None => return None,
+                },
+                UNANALYZED_NOT_CALLABLE | UNANALYZED_ARG0_IS_ANY => METH_SIG_OK,
+                _ => METH_SIG_OK,
+            }
+        } else {
+            METH_SIG_OK
+        }
+    } else if has_self_type {
+        METH_SIG_STATIC_SELF_FAIL
+    } else {
+        METH_SIG_OK
+    };
+    Some((set_is_static, set_is_class, tag))
+}
+
+/// `#[pyfunction]` entry for `SemanticAnalyzer.prepare_method_signature`
+/// (semanal.py:1543-1582).
+///
+/// `func` is the live `FuncDef`; Rust reads `name`,
+/// `has_self_or_cls_argument`, `arguments` (non-empty), and the
+/// `CallableType` isinstance of `func.type` via PyO3. The shim passes the
+/// analyzed first-argument proper type serialized once to the wire format
+/// (the AnyType check), the unanalyzed-arg kind, the precomputed
+/// `is_expected_self_type` bool, and `has_self_type`. Returns
+/// `Some((set_is_static, set_is_class, tag))` for every decided case and
+/// `None` to defer when a fact is unreadable or undecodable; the Python
+/// shim applies all writes and error emissions.
+#[pyfunction]
+#[pyo3(signature = (func, self_type_wire, unanalyzed_kind, expected_self, has_self_type))]
+pub(crate) fn rust_classify_method_signature(
+    func: &PyAny,
+    self_type_wire: Option<&[u8]>,
+    unanalyzed_kind: i64,
+    expected_self: Option<bool>,
+    has_self_type: bool,
+) -> Option<(bool, bool, i64)> {
+    let name = match func.getattr("name") {
+        Ok(v) => match v.downcast::<PyString>() {
+            Ok(s) => match s.to_str() {
+                Ok(s) => s,
+                Err(_) => return None,
+            },
+            Err(_) => return None,
+        },
+        Err(_) => return None,
+    };
+    let has_self_or_cls = match func.getattr("has_self_or_cls_argument") {
+        Ok(v) => match v.is_true() {
+            Ok(b) => b,
+            Err(_) => return None,
+        },
+        Err(_) => return None,
+    };
+    let has_arguments = match func.getattr("arguments") {
+        Ok(v) => match v.len() {
+            Ok(n) => n > 0,
+            Err(_) => return None,
+        },
+        Err(_) => return None,
+    };
+    let functype_is_callable = match func.getattr("type") {
+        Ok(t) => {
+            let types_mod = match func.py().import("mypy.types") {
+                Ok(m) => m,
+                Err(_) => return None,
+            };
+            let callable_cls: &PyType = match types_mod.getattr("CallableType") {
+                Ok(c) => match c.downcast() {
+                    Ok(c) => c,
+                    Err(_) => return None,
+                },
+                Err(_) => return None,
+            };
+            match t.is_instance(callable_cls) {
+                Ok(b) => b,
+                Err(_) => return None,
+            }
+        }
+        Err(_) => return None,
+    };
+    let self_type_is_any = match self_type_wire {
+        Some(bytes) => {
+            let t = crate::checkmember::decode_type(bytes)?;
+            Some(matches!(t, crate::wire::Type::AnyType { .. }))
+        }
+        None => None,
+    };
+    classify_method_signature(
+        name,
+        has_self_or_cls,
+        has_arguments,
+        functype_is_callable,
+        self_type_is_any,
+        has_self_type,
+        unanalyzed_kind,
+        expected_self,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,5 +742,176 @@ mod tests {
         );
         assert_eq!(member_fullname_join(None, "b"), None);
         assert_eq!(member_fullname_join(None, ""), None);
+    }
+
+    // prepare_method_signature (issue #1036)
+
+    #[test]
+    fn test_method_sig_new_static_no_self() {
+        // __new__ without a self-or-cls argument: is_static write, OK tail.
+        assert_eq!(
+            classify_method_signature("__new__", false, false, false, None, false, 0, None),
+            Some((true, false, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_new_with_any_self_trivial() {
+        // __new__ with an Any self and no Self type: is_static write +
+        // trivial-self replace.
+        assert_eq!(
+            classify_method_signature("__new__", true, true, true, Some(true), false, 0, None),
+            Some((true, false, METH_SIG_ANY_SELF_TRIVIAL))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_class_special_write() {
+        assert_eq!(
+            classify_method_signature(
+                "__init_subclass__",
+                true,
+                true,
+                true,
+                Some(false),
+                false,
+                0,
+                None
+            ),
+            Some((false, true, METH_SIG_OK))
+        );
+        assert_eq!(
+            classify_method_signature(
+                "__class_getitem__",
+                true,
+                true,
+                true,
+                Some(false),
+                false,
+                0,
+                None
+            ),
+            Some((false, true, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_class_special_no_self_arg() {
+        // The is_class write is gated on has_self_or_cls_argument.
+        assert_eq!(
+            classify_method_signature(
+                "__init_subclass__",
+                false,
+                false,
+                false,
+                None,
+                false,
+                0,
+                None
+            ),
+            Some((false, false, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_static_self_fail() {
+        // No self-or-cls argument but Self type used.
+        assert_eq!(
+            classify_method_signature("m", false, false, false, None, true, 0, None),
+            Some((false, false, METH_SIG_STATIC_SELF_FAIL))
+        );
+        // Self-or-cls argument but no arguments / non-callable type.
+        assert_eq!(
+            classify_method_signature("m", true, false, false, None, true, 0, None),
+            Some((false, false, METH_SIG_STATIC_SELF_FAIL))
+        );
+        assert_eq!(
+            classify_method_signature("m", true, true, false, None, true, 0, None),
+            Some((false, false, METH_SIG_STATIC_SELF_FAIL))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_any_self_replace() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(true), true, 0, None),
+            Some((false, false, METH_SIG_ANY_SELF_REPLACE))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_any_self_trivial() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(true), false, 0, None),
+            Some((false, false, METH_SIG_ANY_SELF_TRIVIAL))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_redundant_self() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), true, 2, Some(true)),
+            Some((false, false, METH_SIG_REDUNDANT_SELF))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_explicit_self_conflict() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), true, 2, Some(false)),
+            Some((false, false, METH_SIG_EXPLICIT_SELF_CONFLICT))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_ok_unanalyzed_not_callable() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), true, 0, None),
+            Some((false, false, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_ok_unanalyzed_arg0_any() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), true, 1, None),
+            Some((false, false, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_ok_plain_method_no_self_type() {
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), false, 0, None),
+            Some((false, false, METH_SIG_OK))
+        );
+    }
+
+    #[test]
+    fn test_method_sig_defers_on_expected_none() {
+        // The shim could not compute is_expected_self_type: defer.
+        assert_eq!(
+            classify_method_signature("m", true, true, true, Some(false), true, 2, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_method_sig_defers_on_undecodable_self_wire() {
+        // Body applies but the self-type wire blob is missing: defer
+        // rather than misclassify the AnyType check.
+        assert_eq!(
+            classify_method_signature("m", true, true, true, None, false, 0, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_method_sig_new_with_self_type_replace() {
+        // __new__ with Any self and a Self type: is_static write + replace.
+        assert_eq!(
+            classify_method_signature("__new__", true, true, true, Some(true), true, 0, None),
+            Some((true, false, METH_SIG_ANY_SELF_REPLACE))
+        );
     }
 }
