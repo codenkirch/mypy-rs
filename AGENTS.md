@@ -1455,3 +1455,11 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on the captured
   message lists plus direct seam calls for the variant / pre / post tags and
   the None deferrals), plus pure decision unit tests in `checker_functions.rs`.
+- `rust_has_return_statement` (mypy.traverser, `traverser.rs`) — mirrors
+  `ReturnSeeker` for `has_return_statement` (traverser.py:946-963). The
+  Python shim serializes the `FuncBase` via `mypy/astwire.py` and defers
+  to the pure-Python `ReturnSeeker` when Rust returns `None`: the
+  serializer emits a bare `LITERAL_NONE` for any node kind without a wire
+  tag (e.g. a bare `FuncItem`, issue #1030), and the undecodable root
+  defers instead of silently answering `False`. Covered by
+  `NativeTraverserSuite` in `mypy/test/testtypes.py`.

@@ -1056,7 +1056,12 @@ def has_return_statement(fdef: FuncBase) -> bool:
     """
     if _TRAVERSER_HAS_KERNEL:
         try:
-            return _rust_has_return_statement(_serialize_ast_node(fdef))
+            # None = defer: the node kind has no wire tag (e.g. a bare
+            # FuncItem serializes to LITERAL_NONE), so Rust cannot answer
+            # and we fall back to the pure-Python seeker (#1030).
+            native = _rust_has_return_statement(_serialize_ast_node(fdef))
+            if native is not None:
+                return native
         except (AssertionError, NotImplementedError, RecursionError):
             pass
     seeker = ReturnSeeker()
