@@ -250,6 +250,7 @@ try:
         rust_classify_call as _rust_classify_call,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
+        rust_classify_index_with_type as _rust_classify_index_with_type,
         rust_classify_super_arg_types as _rust_classify_super_arg_types,
         rust_classify_visit_op_expr as _rust_classify_visit_op_expr,
         rust_classify_typeddict_call as _rust_classify_typeddict_call,
@@ -330,6 +331,7 @@ except ImportError:
     _rust_classify_call = None  # type: ignore[assignment]
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_classify_reveal_imported = None  # type: ignore[assignment]
+    _rust_classify_index_with_type = None  # type: ignore[assignment]
     _rust_classify_super_arg_types = None  # type: ignore[assignment]
     _rust_classify_visit_op_expr = None  # type: ignore[assignment]
     _rust_classify_typeddict_call = None  # type: ignore[assignment]
@@ -379,6 +381,18 @@ NATIVE_VISIT_OP_EXPR_BOOLEAN = 1
 NATIVE_VISIT_OP_EXPR_LIST_MULTIPLY = 2
 NATIVE_VISIT_OP_EXPR_STR_INTERP = 3
 NATIVE_VISIT_OP_EXPR_CHECK_OP = 4
+
+# Decision tags returned by `_rust_classify_index_with_type`; must match
+# the `INDEX_*` constants in crates/type_kernel/src/checkexpr_functions.rs.
+NATIVE_INDEX_NORMALIZE = 0
+NATIVE_INDEX_UNION = 1
+NATIVE_INDEX_TUPLE = 2
+NATIVE_INDEX_TYPEDDICT = 3
+NATIVE_INDEX_ENUM = 4
+NATIVE_INDEX_GENERIC_ALIAS = 5
+NATIVE_INDEX_TYPEVAR = 6
+NATIVE_INDEX_SPECIAL_FORM = 7
+NATIVE_INDEX_GETITEM = 8
 
 # Stage 9 checkcall gate: when active, generic callable solving
 # (normalize + map + infer + solve + apply) routes through the Rust kernel.
@@ -6111,6 +6125,91 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         index = e.index
         self_type = self_type or left_type
         left_type = get_proper_type(left_type)
+
+        # Native type_kernel seam (issue #999): Rust classifies the left_type
+        # dispatch; None defers to the Python body. The tuple sub-dispatch
+        # stays Python: try_getting_int_literals re-accepts the index.
+        tag: int | None = None
+        native_left: Type | None = None
+        if _CHECKEXPR_HAS_TYPE_KERNEL and _native_checkexpr_active:
+            try:
+                tag = _rust_classify_index_with_type(left_type, self.chk, True)
+                if tag == NATIVE_INDEX_NORMALIZE:
+                    native_left = expand_type(left_type, {})
+                    tag = _rust_classify_index_with_type(native_left, self.chk, False)
+                    if tag == NATIVE_INDEX_NORMALIZE:
+                        # Unreachable in practice; defer rather than loop.
+                        tag = None
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+
+        if tag is not None:
+            if native_left is not None:
+                left_type = native_left
+            # Visit the index, just to make sure we have a type for it
+            # available (after classification, so a deferral never runs
+            # this accept twice).
+            self.accept(index)
+            if tag == NATIVE_INDEX_UNION:
+                original_type = original_type or left_type
+                # Don't combine literal types, since we may need them for
+                # type narrowing.
+                return make_simplified_union(
+                    [
+                        self.visit_index_with_type(typ, e, original_type)
+                        for typ in left_type.relevant_items()
+                    ],
+                    contract_literals=False,
+                )
+            if tag == NATIVE_INDEX_TUPLE:
+                # Special case for tuples. They return a more specific type
+                # when indexed by an integer literal.
+                if isinstance(index, SliceExpr):
+                    return self.visit_tuple_slice_helper(left_type, index)
+                ns = self.try_getting_int_literals(index)
+                if ns is not None:
+                    out = []
+                    for n in ns:
+                        item = self.visit_tuple_index_helper(left_type, n)
+                        if item is not None:
+                            out.append(item)
+                        else:
+                            self.chk.fail(message_registry.TUPLE_INDEX_OUT_OF_RANGE, e)
+                            if any(isinstance(t, UnpackType) for t in left_type.items):
+                                min_len = self.min_tuple_length(left_type)
+                                self.chk.note(
+                                    f"Variadic tuple can have length {min_len}", e
+                                )
+                            return AnyType(TypeOfAny.from_error)
+                    return make_simplified_union(out)
+                else:
+                    return self.nonliteral_tuple_index_helper(left_type, index)
+            if tag == NATIVE_INDEX_TYPEDDICT:
+                return self.visit_typeddict_index_expr(left_type, e.index)[0]
+            if tag == NATIVE_INDEX_ENUM:
+                return self.visit_enum_index_expr(left_type.type_object(), e.index, e)
+            if tag == NATIVE_INDEX_GENERIC_ALIAS:
+                return self.named_type("types.GenericAlias")
+            if tag == NATIVE_INDEX_TYPEVAR:
+                return self.visit_index_with_type(
+                    left_type.values_or_bound(), e, original_type, left_type
+                )
+            if tag == NATIVE_INDEX_SPECIAL_FORM:
+                # Allow special forms to be indexed and used to create
+                # union types
+                return self.named_type("typing._SpecialForm")
+            # tag == NATIVE_INDEX_GETITEM: the __getitem__ tail.
+            result, method_type = self.check_method_call_by_name(
+                "__getitem__",
+                left_type,
+                [e.index],
+                [ARG_POS],
+                e,
+                original_type=original_type,
+                self_type=self_type,
+            )
+            e.method_type = method_type
+            return result
 
         # Visit the index, just to make sure we have a type for it available
         self.accept(index)

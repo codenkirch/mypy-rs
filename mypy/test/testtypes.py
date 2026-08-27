@@ -33620,3 +33620,226 @@ class NativeRvalueCountSuite(Suite):
         off, on = self._run(self._lv(3), 2, None)
         assert_equal(on, off, "exact count message")
         assert on[1] == [("wrong_number", "2:3")]
+
+
+def _chk(in_checked: bool) -> SimpleNamespace:
+    return SimpleNamespace(in_checked_function=lambda: in_checked)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIndexWithTypeSuite(Suite):
+    """Parity for `rust_classify_index_with_type` (issue #999).
+
+    `ExpressionChecker.visit_index_with_type` (checkexpr.py:6095) dispatches
+    every subscript expression on the proper left type: variadic-tuple
+    normalization, union fan-out, the `in_checked_function()`-gated tuple
+    arm, TypedDict, enum / generic-alias type objects, TypeVar,
+    special-form Instance, and the trailing `__getitem__` tail. The Rust
+    seam classifies the branch from PyO3 facts and returns a tag; Python
+    applies the branch bodies (the tuple slice vs int-literal vs nonliteral
+    sub-dispatch stays in Python because the literal body needs the ns
+    values from `try_getting_int_literals`, which re-accepts the index).
+    Direct seam calls assert the exact tag per branch; the gate-off vs
+    gate-on differential drives the real `visit_index_with_type` through a
+    bare `ExpressionChecker` and asserts identical results and captured
+    side effects.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, left: Type, in_checked: bool = True, expand: bool = True) -> int | None:
+        chk = SimpleNamespace(in_checked_function=lambda: in_checked)
+        return _type_kernel.rust_classify_index_with_type(left, chk, expand)
+
+    def _tuple(self, *items: Type) -> TupleType:
+        return TupleType(list(items), self.fx.std_tuple)
+
+    def _variadic_tuple(self) -> TupleType:
+        unpacked = Instance(self.fx.std_tuplei, [self.fx.o])
+        return TupleType([self.fx.a, UnpackType(unpacked)], self.fx.std_tuple)
+
+    def _enum_callable(self) -> CallableType:
+        enum_info = self.fx.make_type_info("Color")
+        enum_info.is_enum = True
+        return CallableType([], [], [], Instance(enum_info, []), self.fx.type_type)
+
+    # -- direct seam tests (all 9 tags + deferrals) --
+
+    def _seam(self, left: Type, in_checked: bool = True, expand: bool = True) -> int | None:
+        return _type_kernel.rust_classify_index_with_type(left, _chk(in_checked), expand)
+
+    def test_seam_variadic_normalizes(self) -> None:
+        assert self._seam(self._variadic_tuple()) == 0
+
+    def test_seam_variadic_no_expand(self) -> None:
+        assert self._seam(self._variadic_tuple(), expand=False) == 2
+
+    def test_seam_union(self) -> None:
+        u = UnionType([self.fx.a, self.fx.b])
+        assert self._seam(u) == 1
+
+    def test_seam_tuple_checked(self) -> None:
+        t = self._tuple(self.fx.a, self.fx.b)
+        assert self._seam(t) == 2
+
+    def test_seam_tuple_unchecked(self) -> None:
+        t = self._tuple(self.fx.a, self.fx.b)
+        assert self._seam(t, in_checked=False) == 8
+
+    def test_seam_typeddict(self) -> None:
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.a, -1, -1)
+        assert self._seam(td) == 3
+
+    def test_seam_enum(self) -> None:
+        assert self._seam(self._enum_callable()) == 4
+
+    def test_seam_generic_alias_builtin_type(self) -> None:
+        c = self.fx.callable_type(Instance(self.fx.type_typei, []))
+        assert self._seam(c) == 5
+
+    def test_seam_generic_alias_type_vars(self) -> None:
+        c = CallableType([], [], [], Instance(self.fx.gi, [self.fx.o]), self.fx.type_type)
+        assert self._seam(c) == 5
+
+    def test_seam_typevar(self) -> None:
+        assert self._seam(self.fx.t) == 6
+
+    def test_seam_special_form(self) -> None:
+        sf_info = self.fx.make_type_info("typing._SpecialForm", module_name="typing")
+        assert self._seam(Instance(sf_info, [])) == 7
+
+    def test_seam_getitem_instance(self) -> None:
+        assert self._seam(self.fx.a) == 8
+
+    def test_seam_getitem_callable_not_type_obj(self) -> None:
+        c = self.fx.callable(self.fx.o)
+        assert self._seam(c) == 8
+
+    def test_seam_type_obj_fallthrough(self) -> None:
+        # A type object that is neither an enum nor a generic alias falls
+        # through to the __getitem__ tail.
+        c = self.fx.callable_type(self.fx.a)
+        assert self._seam(c) == 8
+
+    def test_seam_defers_on_broken_chk(self) -> None:
+        # A tuple left type needs in_checked_function(); an unreadable
+        # checker defers (None).
+        t = self._tuple(self.fx.a, self.fx.b)
+        assert _type_kernel.rust_classify_index_with_type(t, SimpleNamespace(), True) is None
+
+    # -- gate off/on differential tests through the real method --
+
+    def _make_ec(self, in_checked: bool, obs: list[Any]) -> tuple[Any, list[Any]]:
+        from mypy.checkexpr import ExpressionChecker
+
+        accepts: list[Any] = []
+        anyt = AnyType(TypeOfAny.from_error)
+        chk = SimpleNamespace(
+            in_checked_function=lambda: in_checked,
+            fail=lambda msg, ctx, code=None: obs.append(("fail", str(msg))),
+            note=lambda msg, ctx: obs.append(("note", str(msg))),
+            named_type=lambda name: obs.append(("named_type", name))
+            or Instance(self.fx.gi, [self.fx.o]),
+        )
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        ec.accept = lambda node, *a: accepts.append(node) or anyt  # type: ignore[method-assign]
+        ec.check_method_call_by_name = (  # type: ignore[method-assign]
+            lambda name, lt, args, kinds, ctx=None, original_type=None, self_type=None: obs.append(
+                ("mcall", name, str(lt))
+            )
+            or (anyt, ("__getitem__",))
+        )
+        ec.visit_typeddict_index_expr = (  # type: ignore[method-assign]
+            lambda td, idx, setitem=False: obs.append(("tdict",)) or (anyt, set())
+        )
+        ec.visit_enum_index_expr = (  # type: ignore[method-assign]
+            lambda info, idx, ctx: obs.append(("enum", info.fullname)) or anyt
+        )
+        return ec, accepts
+
+    def _run_visit(
+        self, left: Type, index: Expression, in_checked: bool = True
+    ) -> tuple[object, ...]:
+        def run_one() -> tuple[object, ...]:
+            obs: list[Any] = []
+            ec, accepts = self._make_ec(in_checked, obs)
+            e = IndexExpr(NameExpr("base"), index)
+            try:
+                result = ec.visit_index_with_type(left, e)
+            except Exception as exc:  # noqa: BLE001
+                result = "EXC:" + type(exc).__name__
+            return (str(result), e.method_type, tuple(obs), len(accepts))
+
+        off = self._with_gate(False, run_one)
+        on = self._with_gate(True, run_one)
+        return off, on
+
+    def _assert_par(self, left: Type, index: Any, in_checked: bool = True) -> None:
+        off, on = self._run_visit(left, index, in_checked)
+        assert_equal(on, off, "visit_index_with_type parity")
+
+    def test_par_instance_getitem(self) -> None:
+        self._assert_par(self.fx.a, NameExpr("k"))
+
+    def test_par_union_of_instances(self) -> None:
+        self._assert_par(UnionType([self.fx.a, self.fx.b]), NameExpr("k"))
+
+    def test_par_union_with_tuple(self) -> None:
+        self._assert_par(
+            UnionType([self._tuple(self.fx.a, self.fx.b), self.fx.b]), IntExpr(1)
+        )
+
+    def test_par_tuple_literal_in_range(self) -> None:
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), IntExpr(0))
+
+    def test_par_tuple_literal_out_of_range(self) -> None:
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), IntExpr(3))
+
+    def test_par_tuple_slice(self) -> None:
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), SliceExpr(None, None, None))
+
+    def test_par_tuple_nonliteral(self) -> None:
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), MemberExpr("x", "y"))
+
+    def test_par_variadic_tuple_literal(self) -> None:
+        self._assert_par(self._variadic_tuple(), IntExpr(0))
+
+    def test_par_tuple_unchecked(self) -> None:
+        self._assert_par(self._tuple(self.fx.a, self.fx.b), NameExpr("k"), in_checked=False)
+
+    def test_par_typeddict(self) -> None:
+        td = TypedDictType({"x": self.fx.o}, {"x"}, set(), self.fx.a, -1, -1)
+        self._assert_par(td, StrExpr("x"))
+
+    def test_par_enum(self) -> None:
+        self._assert_par(self._enum_callable(), NameExpr("k"))
+
+    def test_par_generic_alias(self) -> None:
+        c = self.fx.callable_type(Instance(self.fx.type_typei, []))
+        self._assert_par(c, NameExpr("k"))
+
+    def test_par_typevar(self) -> None:
+        self._assert_par(self.fx.t, NameExpr("k"))
+
+    def test_par_special_form(self) -> None:
+        sf_info = self.fx.make_type_info("typing._SpecialForm", module_name="typing")
+        self._assert_par(Instance(sf_info, []), NameExpr("k"))
+
+    def test_par_type_obj_fallthrough(self) -> None:
+        self._assert_par(self.fx.callable_type(self.fx.a), NameExpr("k"))
