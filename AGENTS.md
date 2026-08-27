@@ -1543,3 +1543,21 @@ directly to `main`.
   tag (e.g. a bare `FuncItem`, issue #1030), and the undecodable root
   defers instead of silently answering `False`. Covered by
   `NativeTraverserSuite` in `mypy/test/testtypes.py`.
+- `rust_classify_type_guard_arg` (issue #1043) — mirrors the decision head of
+  `TypeAnalyser.anal_type_guard_arg` / `anal_type_is_arg` (typeanal.py:2009-2033)
+  plus their outer wrappers `anal_type_guard`/`anal_type_is` (:2001-2025). Rust
+  classifies from three scalars (the shim-precomputed `fullname`, `args_len`,
+  and an `is_typeis` family flag): NOT_GUARD (fullname outside the
+  {"typing.TypeGuard","typing_extensions.TypeGuard"} or
+  {"typing.TypeIs","typing_extensions.TypeIs"} name-set -> wrapper returns
+  None), FAIL (arity != 1 -> Python emits the existing VALID_TYPE fail +
+  AnyType(TypeOfAny.from_error)), or RECURSE (Python runs
+  `anal_type(t.args[0])`). The `isinstance(t, UnboundType)` wrapper check and
+  `lookup_qualified` stay Python-side; all Rust facts are scalars, never
+  defers. Serves all three call sites: the `or`-chain at :1214-1215 (bool
+  alias), the native special-unbound tag-applier at :1443-1445, and the
+  `visit_callable_type` ret_type wrappers at :1928-1929. Gated by
+  `_set_native_typeanal_active` (wired from `mypy/build.py`) and covered by
+  `NativeTypeGuardArgSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
+  differential plus direct seam calls), plus pure decision unit tests in
+  `typeanal_special.rs`.

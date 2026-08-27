@@ -1810,6 +1810,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         typeanal_callable::rust_classify_analyze_callable_type,
         module
     )?)?;
+    // anal_type_guard_arg / anal_type_is_arg (issue #1043): TypeGuard/
+    // TypeIs argument-family + arity classifier. Rust decides from scalar
+    // facts; Python applies the fail + Any or the anal_type recursion.
+    module.add_function(wrap_pyfunction!(
+        typeanal_special::rust_classify_type_guard_arg,
+        module
+    )?)?;
     // visit_tuple_type: implicit-tuple message arbitration (OK / EMPTY /
     // SINGLE / MULTI). Rust owns the three-scalar branch; Python applies
     // the fail + one-of-three note and the reconstruction on OK.

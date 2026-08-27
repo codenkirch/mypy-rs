@@ -37487,3 +37487,151 @@ class NativePrepareMethodSignatureSuite(Suite):
         off = self._with_gate(False, check_one)
         on = self._with_gate(True, check_one)
         assert_equal(on, off, "prepare_method_signature deferral parity")
+
+class NativeTypeGuardArgSuite(Suite):
+    """Parity for the Rust TypeGuard/TypeIs argument classifier (issue #1043).
+
+    `anal_type_guard_arg` / `anal_type_is_arg` (typeanal.py) decide family
+    membership (TypeGuard vs TypeIs name-sets) and the arity gate in Rust
+    from scalars (fullname, args_len, is_typeis); the Python shim applies
+    the VALID_TYPE fail + AnyType(from_error) or the anal_type recursion,
+    and NOT_GUARD returns None. Toggling the typeanal gate off (pure
+    Python) and on (Rust seam) must produce identical
+    (str(result), captured fail messages), and direct seam calls prove the
+    tag table.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(self) -> Any:
+        from mypy.typeanal import TypeAnalyser
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.messages: list[str] = []
+
+            def fail(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.messages.append(f"fail: {msg}")
+
+            def note(self, msg: str, ctx: Context, code: Any = None) -> None:
+                self.messages.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api  # type: ignore[assignment]
+        ta.fail_func = api.fail  # type: ignore[assignment]
+        ta.note_func = api.note
+        # anal_type recursion stub: the RECURSE branch returns its argument.
+        ta.anal_type = lambda t, **kw: t  # type: ignore[method-assign]
+        # lookup_qualified stub: resolve the unbound name to a node whose
+        # fullname is the name itself (the wrappers precompute it Python-
+        # side; only the _arg methods hit the seam).
+        ta.lookup_qualified = lambda name, ctx, suppress_errors=False: SimpleNamespace(
+            node=SimpleNamespace(fullname=name)
+        )
+        return ta
+
+    def _make_t(self, fullname: str, n_args: int) -> UnboundType:
+        return UnboundType(fullname, [self.fx.str_type] * n_args)
+
+    def _call(
+        self, ta: Any, t: UnboundType, fullname: str, typeis: bool
+    ) -> tuple[str, list[str]]:
+        if typeis:
+            result = ta.anal_type_is(t)
+        else:
+            result = ta.anal_type_guard(t)
+        return str(result), list(ta.api.messages)
+
+    def _assert_par(self, fullname: str, n_args: int, typeis: bool = False) -> None:
+        t = self._make_t(fullname, n_args)
+        off = self._with_gate(False, lambda: self._call(self._analyser(), t, fullname, typeis))
+        on = self._with_gate(True, lambda: self._call(self._analyser(), t, fullname, typeis))
+        label = f"type_guard_arg {fullname} n={n_args} typeis={typeis}"
+        assert_equal(on[0], off[0], f"{label} parity result")
+        assert_equal(on[1], off[1], f"{label} parity messages")
+
+    def _seam(self, fullname: str, args_len: int, typeis: bool) -> int | None:
+        from mypy.typeanal import _rust_classify_type_guard_arg  # type: ignore[attr-defined]
+
+        return _rust_classify_type_guard_arg(fullname, args_len, typeis)
+
+    def test_guard_one_arg_recurses(self) -> None:
+        self._assert_par("typing.TypeGuard", 1)
+        assert self._seam("typing.TypeGuard", 1, False) == 2
+
+    def test_guard_zero_args_fails(self) -> None:
+        self._assert_par("typing.TypeGuard", 0)
+        assert self._seam("typing.TypeGuard", 0, False) == 1
+
+    def test_guard_two_args_fails(self) -> None:
+        self._assert_par("typing.TypeGuard", 2)
+        assert self._seam("typing.TypeGuard", 2, False) == 1
+
+    def test_typeis_one_arg_recurses(self) -> None:
+        self._assert_par("typing.TypeIs", 1, typeis=True)
+        assert self._seam("typing.TypeIs", 1, True) == 2
+
+    def test_typeis_zero_args_fails(self) -> None:
+        self._assert_par("typing.TypeIs", 0, typeis=True)
+        assert self._seam("typing.TypeIs", 0, True) == 1
+
+    def test_typeis_two_args_fails(self) -> None:
+        self._assert_par("typing.TypeIs", 2, typeis=True)
+        assert self._seam("typing.TypeIs", 2, True) == 1
+
+    def test_non_guard_fullname_returns_none(self) -> None:
+        self._assert_par("typing.Optional", 1)
+        self._assert_par("mod.NotAGuard", 0, typeis=True)
+        assert self._seam("mod.NotAGuard", 1, False) == 0
+
+    def test_extension_fullnames(self) -> None:
+        self._assert_par("typing_extensions.TypeGuard", 1)
+        self._assert_par("typing_extensions.TypeIs", 0, typeis=True)
+        assert self._seam("typing_extensions.TypeGuard", 1, False) == 2
+        assert self._seam("typing_extensions.TypeIs", 2, True) == 1
+
+    def test_gate_off_defers_to_python(self) -> None:
+        # Gate off is handled in the shim, not the seam; verify the shim
+        # returns None (pure-Python arbitration) while the seam itself is
+        # a total function.
+        ta = self._analyser()
+        self._set_active(False)
+        try:
+            assert ta._native_type_guard_arg_tag("typing.TypeGuard", 1, is_typeis=False) is None
+        finally:
+            self._set_active(True)
+
+    def test_recurse_result_and_fail_messages_parity(self) -> None:
+        # Explicit parity on the three payload shapes: the RECURSE result
+        # carries the analyzed arg, the FAIL branches carry the family-
+        # specific message, and NOT_GUARD is a silent None.
+        t = self._make_t("typing.TypeGuard", 1)
+        off = self._with_gate(False, lambda: self._call(self._analyser(), t, "typing.TypeGuard", False))
+        on = self._with_gate(True, lambda: self._call(self._analyser(), t, "typing.TypeGuard", False))
+        assert_equal(on, ("builtins.str", []), "guard recurse payload")
+        assert_equal(off, on, "guard recurse parity")
+        t0 = self._make_t("typing.TypeIs", 0)
+        off = self._with_gate(False, lambda: self._call(self._analyser(), t0, "typing.TypeIs", True))
+        on = self._with_gate(True, lambda: self._call(self._analyser(), t0, "typing.TypeIs", True))
+        assert_equal(
+            on,
+            ("Any", ["fail: TypeIs must have exactly one type argument"]),
+            "typeis fail payload",
+        )
+        assert_equal(off, on, "typeis fail parity")
