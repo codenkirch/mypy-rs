@@ -32973,3 +32973,209 @@ class NativeSimpleLiteralTypeSuite(Suite):
         on = self._with_gate(True, lambda: self._call(on_sa, IntExpr(42), False))
         assert_equal(on, off, "simple_literal_type parity inside function")
         assert_equal(on, "None", "simple_literal_type inside function")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAnalyzeCallableTypeSuite(Suite):
+    """Parity for the Rust `analyze_callable_type` dispatch classifier.
+
+    The 6-way dispatch head of `analyze_callable_type` (bare Callable, TypeList
+    args, Ellipsis, ParamSpec, invalid arity with/without disallow_any_generics)
+    is decided in Rust from four scalar facts (`arg_count`, `arg0` is TypeList,
+    `arg0` is Ellipsis, `disallow_any_generics`); the Python shim applies the
+    branch bodies (object construction, tvar_scope entry, fail/note emission).
+
+    The invalid-arity branches (tags 4 and 5) only call `self.fail` and return
+    AnyType, so they are exercised end-to-end with a minimal FakeApi. The
+    remaining branches need `named_type`, `get_omitted_any`, `tvar_scope`, and
+    `visit_callable_type` which require a fully wired TypeAnalyser; those paths
+    are covered by testcheck.py parity and by direct seam tag tests.
+    """
+
+    def setUp(self) -> None:
+        from mypy.typeanal import _set_native_typeanal_active
+
+        self._set_active = _set_native_typeanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _analyser(
+        self, disallow_any_generics: bool = False
+    ) -> tuple[object, object]:
+        from mypy.errors import ErrorCode as _ErrorCode
+        from mypy.typeanal import TypeAnalyser
+
+        fx = TypeFixture()
+        function_info: TypeInfo = fx.functioni
+
+        class FakeApi:
+            def __init__(self) -> None:
+                self.errors: list[str] = []
+                self.syms: dict[str, SymbolTableNode] = {
+                    "builtins.function": SymbolTableNode(MDEF, function_info),
+                }
+
+            def lookup_qualified(
+                self, name: str, ctx: Context, suppress_errors: bool = False
+            ) -> SymbolTableNode | None:
+                return self.syms.get(name)
+
+            def lookup_fully_qualified(self, fullname: str) -> SymbolTableNode:
+                return self.syms[fullname]
+
+            def lookup_fully_qualified_or_none(
+                self, fullname: str
+            ) -> SymbolTableNode | None:
+                return self.syms.get(fullname)
+
+            def fail(
+                self, msg: str, ctx: Context, code: _ErrorCode | None = None
+            ) -> None:
+                self.errors.append(msg)
+
+            def note(
+                self, msg: str, ctx: Context, code: _ErrorCode | None = None
+            ) -> None:
+                self.errors.append(f"note: {msg}")
+
+        api = FakeApi()
+        ta = TypeAnalyser.__new__(TypeAnalyser)
+        ta.api = api
+        ta.fail_func = api.fail
+        ta.note_func = api.note
+        ta.options = Options()
+        ta.options.disallow_any_generics = disallow_any_generics
+        return ta, api
+
+    def _call_invalid(self, ta: object, t: UnboundType) -> tuple[str, list[str]]:
+        result = ta.analyze_callable_type(t)
+        messages = list(ta.api.errors)
+        return str(result), messages
+
+    def _assert_invalid_par(
+        self, args: list[Type], *, disallow_any_generics: bool = False
+    ) -> None:
+        t = UnboundType("typing.Callable", args)
+        off_ta, _ = self._analyser(disallow_any_generics=disallow_any_generics)
+        off = self._with_gate(
+            False, lambda: self._call_invalid(off_ta, t)
+        )
+        self._set_active(True)
+        on_ta, _ = self._analyser(disallow_any_generics=disallow_any_generics)
+        on = self._with_gate(
+            True, lambda: self._call_invalid(on_ta, t)
+        )
+        assert_equal(
+            on[0], off[0], f"callable_type parity result {args!r}"
+        )
+        assert_equal(
+            on[1], off[1], f"callable_type parity messages {args!r}"
+        )
+
+    def _assert_engages(
+        self,
+        arg_count: int,
+        arg0_is_type_list: bool,
+        arg0_is_ellipsis: bool,
+        disallow_any_generics: bool,
+    ) -> None:
+        from mypy.typeanal import _rust_classify_analyze_callable_type
+
+        tag = _rust_classify_analyze_callable_type(
+            arg_count,
+            arg0_is_type_list,
+            arg0_is_ellipsis,
+            disallow_any_generics,
+        )
+        assert tag is not None, "Rust analyze_callable_type did not engage"
+
+    def test_invalid_arity_allow(self) -> None:
+        # 1 or 3 args without disallow_any_generics -> tag 5.
+        self._assert_invalid_par([UnboundType("int")])
+        self._assert_invalid_par(
+            [UnboundType("int"), UnboundType("str"), UnboundType("bool")]
+        )
+        self._assert_engages(1, False, False, False)
+        self._assert_engages(3, False, False, False)
+
+    def test_invalid_arity_disallow(self) -> None:
+        # 1 or 3 args with disallow_any_generics -> tag 4.
+        self._assert_invalid_par(
+            [UnboundType("int")], disallow_any_generics=True
+        )
+        self._assert_invalid_par(
+            [UnboundType("int"), UnboundType("str"), UnboundType("bool")],
+            disallow_any_generics=True,
+        )
+        self._assert_engages(1, False, False, True)
+        self._assert_engages(3, False, False, True)
+
+    def test_invalid_disallow_message(self) -> None:
+        # Tag 4 emits the shorter message (no "or Callable" suffix).
+        t = UnboundType("typing.Callable", [UnboundType("int")])
+        on_ta, on_api = self._analyser(disallow_any_generics=True)
+        on = self._with_gate(True, lambda: self._call_invalid(on_ta, t))
+        assert_equal(
+            on[1],
+            ['Please use "Callable[[<parameters>], <return type>]"'],
+            "disallow_any_generics message",
+        )
+
+    def test_invalid_allow_message(self) -> None:
+        # Tag 5 emits the longer message (with "or Callable" suffix).
+        t = UnboundType("typing.Callable", [UnboundType("int")])
+        on_ta, on_api = self._analyser(disallow_any_generics=False)
+        on = self._with_gate(True, lambda: self._call_invalid(on_ta, t))
+        assert_equal(
+            on[1],
+            [
+                'Please use "Callable[[<parameters>], <return type>]"'
+                ' or "Callable"'
+            ],
+            "allow_any_generics message",
+        )
+
+    def test_bare(self) -> None:
+        # arg_count == 0 -> tag 0 (bare Callable).
+        self._assert_engages(0, False, False, False)
+        self._assert_engages(0, False, False, True)
+
+    def test_type_list(self) -> None:
+        # arg_count == 2, arg0 is TypeList -> tag 1.
+        self._assert_engages(2, True, False, False)
+
+    def test_ellipsis(self) -> None:
+        # arg_count == 2, arg0 is Ellipsis -> tag 2.
+        self._assert_engages(2, False, True, False)
+
+    def test_paramspec(self) -> None:
+        # arg_count == 2, arg0 is neither TypeList nor Ellipsis -> tag 3.
+        self._assert_engages(2, False, False, False)
+
+    def test_direct_tags(self) -> None:
+        # Verify all 6 tags through the direct seam.
+        from mypy.typeanal import (
+            _CALLABLE_TAG_BARE,
+            _CALLABLE_TAG_ELLIPSIS,
+            _CALLABLE_TAG_INVALID_ALLOW,
+            _CALLABLE_TAG_INVALID_DISALLOW,
+            _CALLABLE_TAG_PARAMSPEC,
+            _CALLABLE_TAG_TYPE_LIST,
+            _rust_classify_analyze_callable_type,
+        )
+
+        assert _rust_classify_analyze_callable_type(0, False, False, False) == _CALLABLE_TAG_BARE
+        assert _rust_classify_analyze_callable_type(2, True, False, False) == _CALLABLE_TAG_TYPE_LIST
+        assert _rust_classify_analyze_callable_type(2, False, True, False) == _CALLABLE_TAG_ELLIPSIS
+        assert _rust_classify_analyze_callable_type(2, False, False, False) == _CALLABLE_TAG_PARAMSPEC
+        assert _rust_classify_analyze_callable_type(1, False, False, True) == _CALLABLE_TAG_INVALID_DISALLOW
+        assert _rust_classify_analyze_callable_type(1, False, False, False) == _CALLABLE_TAG_INVALID_ALLOW

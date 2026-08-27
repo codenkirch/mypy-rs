@@ -2038,61 +2038,33 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
     def visit_tuple_type(self, t: TupleType) -> Type:
         # Types such as (t1, t2, ...) only allowed in assignment statements. They'll
         # generate errors elsewhere, and Tuple[t1, t2, ...] must be used instead.
-        tag = self._native_tuple_type_implicit_tag(t)
-        if tag is None:
-            if not (t.implicit and not self.allow_tuple_literal):
-                tag = _TUPLE_TAG_OK
-            elif len(t.items) == 0:
-                tag = _TUPLE_TAG_EMPTY
+        if t.implicit and not self.allow_tuple_literal:
+            self.fail("Syntax error in type annotation", t, code=codes.SYNTAX)
+            if len(t.items) == 0:
+                self.note(
+                    "Suggestion: Use Tuple[()] instead of () for an empty tuple, or "
+                    "None for a function without a return value",
+                    t,
+                    code=codes.SYNTAX,
+                )
             elif len(t.items) == 1:
-                tag = _TUPLE_TAG_SINGLE
+                self.note("Suggestion: Is there a spurious trailing comma?", t, code=codes.SYNTAX)
             else:
-                tag = _TUPLE_TAG_MULTI
-        if tag == _TUPLE_TAG_OK:
-            any_type = AnyType(TypeOfAny.special_form)
-            # If the fallback isn't filled in yet, its type will be the falsey FakeInfo
-            fallback = (
-                t.partial_fallback
-                if t.partial_fallback.type
-                else self.named_type("builtins.tuple", [any_type])
-            )
-            return TupleType(self.anal_array(t.items, allow_unpack=True), fallback, t.line)
-        self.fail("Syntax error in type annotation", t, code=codes.SYNTAX)
-        if tag == _TUPLE_TAG_EMPTY:
-            self.note(
-                "Suggestion: Use Tuple[()] instead of () for an empty tuple, or "
-                "None for a function without a return value",
-                t,
-                code=codes.SYNTAX,
-            )
-        elif tag == _TUPLE_TAG_SINGLE:
-            self.note("Suggestion: Is there a spurious trailing comma?", t, code=codes.SYNTAX)
-        else:
-            self.note(
-                "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)",
-                t,
-                code=codes.SYNTAX,
-            )
-        return AnyType(TypeOfAny.from_error)
+                self.note(
+                    "Suggestion: Use Tuple[T1, ..., Tn] instead of (T1, ..., Tn)",
+                    t,
+                    code=codes.SYNTAX,
+                )
+            return AnyType(TypeOfAny.from_error)
 
-    def _native_tuple_type_implicit_tag(self, t: TupleType) -> int | None:
-        """Classify the `visit_tuple_type` implicit-tuple head in Rust.
-
-        Returns the branch tag (OK/EMPTY/SINGLE/MULTI), or `None` to run
-        the pure-Python arbitration. Rust owns the three-scalar decision
-        (`t.implicit`, `allow_tuple_literal`, `len(t.items)`); the
-        `self.fail` / `self.note` side effects and the named_type +
-        anal_array reconstruction stay Python-side. See
-        crates/type_kernel/src/typeanal_special.rs for the tag table.
-        """
-        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
-            return None
-        try:
-            return _rust_classify_tuple_type_implicit(
-                t.implicit, self.allow_tuple_literal, len(t.items)
-            )
-        except (AssertionError, NotImplementedError):
-            return None
+        any_type = AnyType(TypeOfAny.special_form)
+        # If the fallback isn't filled in yet, its type will be the falsey FakeInfo
+        fallback = (
+            t.partial_fallback
+            if t.partial_fallback.type
+            else self.named_type("builtins.tuple", [any_type])
+        )
+        return TupleType(self.anal_array(t.items, allow_unpack=True), fallback, t.line)
 
     def visit_typeddict_type(self, t: TypedDictType) -> Type:
         req_keys = set()
@@ -2356,6 +2328,9 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
         )
 
     def analyze_callable_type(self, t: UnboundType) -> Type:
+        tag = self._native_callable_type_tag(t)
+        if tag is not None:
+            return self._apply_callable_type_tag(tag, t)
         fallback = self.named_type("builtins.function")
         if len(t.args) == 0:
             # Callable (bare). Treat as Callable[..., Any].
@@ -2417,6 +2392,100 @@ class TypeAnalyser(SyntheticTypeVisitor[Type], TypeAnalyzerPluginInterface):
                 self.fail('Please use "Callable[[<parameters>], <return type>]"', t)
             else:
                 self.fail('Please use "Callable[[<parameters>], <return type>]" or "Callable"', t)
+            return AnyType(TypeOfAny.from_error)
+        assert isinstance(ret, CallableType)
+        return ret.accept(self)
+
+    def _native_callable_type_tag(self, t: UnboundType) -> int | None:
+        """Classify the two-level dispatch head of `analyze_callable_type`.
+
+        Returns a branch tag matching typeanal_callable.rs, or `None` to run
+        the pure-Python body. Rust owns the whole decision table from four
+        scalar facts (`len(t.args)`, `arg0` is `TypeList`, `arg0` is
+        `EllipsisType`, `options.disallow_any_generics`); no live objects
+        cross the seam.
+        """
+        if not (_TYPEANAL_HAS_KERNEL and _native_typeanal_active):
+            return None
+        arg_count = len(t.args)
+        arg0_is_type_list = arg_count == 2 and isinstance(t.args[0], TypeList)
+        arg0_is_ellipsis = arg_count == 2 and isinstance(t.args[0], EllipsisType)
+        try:
+            return _rust_classify_analyze_callable_type(
+                arg_count,
+                arg0_is_type_list,
+                arg0_is_ellipsis,
+                self.options.disallow_any_generics,
+            )
+        except (AssertionError, NotImplementedError):
+            return None
+
+    def _apply_callable_type_tag(self, tag: int, t: UnboundType) -> Type:
+        """Apply the side effects for the branch `tag` Rust returned.
+
+        Mirrors typeanal_callable.rs: each tag maps to one terminal branch of
+        `analyze_callable_type`; the object construction, `tvar_scope` entry,
+        and error emission stay Python-side.
+        """
+        fallback = self.named_type("builtins.function")
+        if tag == _CALLABLE_TAG_BARE:
+            # Callable (bare). Treat as Callable[..., Any].
+            any_type = self.get_omitted_any(t)
+            ret = callable_with_ellipsis(any_type, any_type, fallback)
+        elif tag == _CALLABLE_TAG_TYPE_LIST:
+            # Callable[[ARG, ...], RET] (ordinary callable type).
+            analyzed_args = self.analyze_callable_args(t.args[0])
+            if analyzed_args is None:
+                return AnyType(TypeOfAny.from_error)
+            args, kinds, names = analyzed_args
+            ret = CallableType(args, kinds, names, ret_type=t.args[1], fallback=fallback)
+        elif tag == _CALLABLE_TAG_ELLIPSIS:
+            # Callable[..., RET] (with literal ellipsis; accept arbitrary arguments).
+            ret = callable_with_ellipsis(
+                AnyType(TypeOfAny.explicit), ret_type=t.args[1], fallback=fallback
+            )
+        elif tag == _CALLABLE_TAG_PARAMSPEC:
+            callable_args = t.args[0]
+            ret_type = t.args[1]
+            # Callable[P, RET] (where P is ParamSpec).
+            with self.tvar_scope_frame(namespace=""):
+                # Temporarily bind ParamSpecs to allow code like this:
+                #     my_fun: Callable[Q, Foo[Q]]
+                # We usually do this in visit_callable_type(), but this is early.
+                variables = []
+                for name, tvar_expr in self.find_type_var_likes(callable_args):
+                    variables.append(
+                        self.tvar_scope.bind_new(name, tvar_expr, self.fail_func, t)
+                    )
+                maybe_ret = self.analyze_callable_args_for_paramspec(
+                    callable_args, ret_type, fallback
+                ) or self.analyze_callable_args_for_concatenate(
+                    callable_args, ret_type, fallback
+                )
+                if isinstance(maybe_ret, CallableType):
+                    maybe_ret = maybe_ret.copy_modified(variables=variables)
+            if maybe_ret is None:
+                # Callable[?, RET] (where ? is something invalid).
+                self.fail(
+                    "The first argument to Callable must be a "
+                    'list of types, parameter specification, or "..."',
+                    t,
+                    code=codes.VALID_TYPE,
+                )
+                self.note(
+                    "See https://mypy.readthedocs.io/en/stable/kinds_of_types.html#callable-types-and-lambdas",
+                    t,
+                )
+                return AnyType(TypeOfAny.from_error)
+            elif isinstance(maybe_ret, AnyType):
+                return maybe_ret
+            ret = maybe_ret
+        elif tag == _CALLABLE_TAG_INVALID_DISALLOW:
+            self.fail('Please use "Callable[[<parameters>], <return type>]"', t)
+            return AnyType(TypeOfAny.from_error)
+        else:
+            assert tag == _CALLABLE_TAG_INVALID_ALLOW
+            self.fail('Please use "Callable[[<parameters>], <return type>]" or "Callable"', t)
             return AnyType(TypeOfAny.from_error)
         assert isinstance(ret, CallableType)
         return ret.accept(self)
@@ -3503,10 +3572,10 @@ try:
     from type_kernel import (
         rust_analyze_unbound_without_info as _rust_analyze_unbound_without_info,
         rust_check_vec_type_args as _rust_check_vec_type_args,
+        rust_classify_analyze_callable_type as _rust_classify_analyze_callable_type,
         rust_classify_literal_param as _rust_classify_literal_param,
         rust_classify_raw_expression_type as _rust_classify_raw_expression_type,
         rust_classify_special_unbound as _rust_classify_special_unbound,
-        rust_classify_tuple_type_implicit as _rust_classify_tuple_type_implicit,
         rust_classify_type_with_info as _rust_classify_type_with_info,
         rust_classify_unbound_front as _rust_classify_unbound_front,
         rust_collect_all_inner_types as _rust_collect_all_inner_types,
@@ -3555,7 +3624,7 @@ except ImportError:
     _rust_classify_special_unbound = None  # type: ignore[assignment]
     _rust_classify_literal_param = None  # type: ignore[assignment]
     _rust_classify_raw_expression_type = None  # type: ignore[assignment]
-    _rust_classify_tuple_type_implicit = None  # type: ignore[assignment]
+    _rust_classify_analyze_callable_type = None  # type: ignore[assignment]
     _TypeanalWriteBuffer = None  # type: ignore[assignment,misc]
     _TypeanalReadBuffer = None  # type: ignore[assignment,misc]
     _typeanal_read_type = None  # type: ignore[assignment]
@@ -3688,13 +3757,15 @@ _RAW_EXPR_TAG_LITERAL = 0
 _RAW_EXPR_TAG_NUMERIC_LITERALS = 1
 _RAW_EXPR_TAG_GENERIC = 2
 
-# Message tags for `visit_tuple_type` (issue #983). Mirrored in
-# crates/type_kernel/src/typeanal_special.rs; Python applies the
-# self.fail + one-of-three note and, on OK, the reconstruction.
-_TUPLE_TAG_OK = 0
-_TUPLE_TAG_EMPTY = 1
-_TUPLE_TAG_SINGLE = 2
-_TUPLE_TAG_MULTI = 3
+# Branch tags for `analyze_callable_type` (issue #958), mirrored in
+# crates/type_kernel/src/typeanal_callable.rs; Python builds the live
+# CallableType / enters tvar_scope / emits fail/note for each tag.
+_CALLABLE_TAG_BARE = 0
+_CALLABLE_TAG_TYPE_LIST = 1
+_CALLABLE_TAG_ELLIPSIS = 2
+_CALLABLE_TAG_PARAMSPEC = 3
+_CALLABLE_TAG_INVALID_DISALLOW = 4
+_CALLABLE_TAG_INVALID_ALLOW = 5
 
 # Branch tags for `analyze_type_with_type_info` (issue #721).
 # Mirrored in crates/type_kernel/src/typeanal_info.rs; Python applies the
