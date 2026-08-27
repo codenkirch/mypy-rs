@@ -13774,6 +13774,119 @@ class NativePluginHookSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeApplyGenericArgumentsAmbiguousSuite(Suite):
+    """Parity suite for the Rust apply_generic_arguments ambiguous-
+    UninhabitedType branch (issue #913).
+
+    Python's get_target_type (applytype.py:254-256) expands a typevar
+    default when the applied arg is an ambiguous UninhabitedType and the
+    typevar has a real default; a non-ambiguous Never or a typevar with
+    no default falls through to the bound check. The Rust path previously
+    deferred the whole call on any UninhabitedType; it now mirrors that
+    branch. Each test compares gate-off (pure Python) to gate-on (Rust
+    seam) on str(), plus a direct seam call proving the kernel engages.
+    """
+
+    def setUp(self) -> None:
+        from mypy.applytype import (
+            _set_native_applytype_active,
+            _set_native_applytype_resolver,
+            _set_native_applytype_typeinfo_map,
+        )
+
+        self.fx = TypeFixture()
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        typeinfo_map = {info.fullname: info for info in type_infos}
+        _set_native_applytype_active(True)
+        _set_native_applytype_resolver(self.resolver)
+        _set_native_applytype_typeinfo_map(typeinfo_map)
+
+    def tearDown(self) -> None:
+        from mypy.applytype import (
+            _set_native_applytype_active,
+            _set_native_applytype_resolver,
+            _set_native_applytype_typeinfo_map,
+        )
+
+        _set_native_applytype_active(False)
+        _set_native_applytype_resolver(None)
+        _set_native_applytype_typeinfo_map(None)
+
+    def _tvar(self, default: Type) -> TypeVarType:
+        return TypeVarType("T", "T", TypeVarId(1), [], self.fx.o, default)
+
+    def _callable(self, tvar: TypeVarType) -> CallableType:
+        return self.fx.callable(tvar, tvar).copy_modified(variables=[tvar])
+
+    def _apply(self, callable: CallableType, arg: Type) -> CallableType:
+        from mypy.applytype import apply_generic_arguments
+
+        return apply_generic_arguments(
+            callable, [arg], lambda *a: None, None, skip_unsatisfied=True
+        )
+
+    def _par(self, tvar: TypeVarType, arg: Type, label: str) -> CallableType:
+        from mypy.applytype import _set_native_applytype_active
+
+        callable = self._callable(tvar)
+        _set_native_applytype_active(False)
+        off = self._apply(callable, arg)
+        _set_native_applytype_active(True)
+        on = self._apply(callable, arg)
+        assert_equal(str(on), str(off), f"{label}: str parity")
+        return off
+
+    def _assert_engages(self, tvar: TypeVarType, arg: Type, label: str) -> None:
+        from mypy.applytype import _serialize_optional_type_list, _serialize_type
+
+        callable = self._callable(tvar)
+        result = _type_kernel.rust_apply_generic_arguments(
+            self.resolver,
+            _serialize_type(callable),
+            _serialize_optional_type_list([arg]),
+            True,
+            state.strict_optional,
+        )
+        assert result is not None, f"{label}: Rust seam did not engage"
+
+    def test_ambiguous_with_default_expands(self) -> None:
+        tvar = self._tvar(self.fx.str_type)
+        off = self._par(tvar, self.fx.a_uninhabited, "ambiguous+default")
+        self._assert_engages(tvar, self.fx.a_uninhabited, "ambiguous+default")
+        # The ambiguous Never with a real default expands to the default;
+        # T (the only variable) is fully substituted.
+        assert not off.variables
+        assert off.ret_type == self.fx.str_type
+
+    def test_ambiguous_no_default_falls_through(self) -> None:
+        tvar = self._tvar(AnyType(TypeOfAny.from_omitted_generics))
+        off = self._par(tvar, self.fx.a_uninhabited, "ambiguous+no-default")
+        self._assert_engages(tvar, self.fx.a_uninhabited, "ambiguous+no-default")
+        # No default: the ambiguous branch is skipped, the Never falls
+        # through the bound check, so T maps to the Never itself.
+        assert not off.variables
+        assert isinstance(off.ret_type, UninhabitedType)
+        assert off.ret_type.ambiguous is True
+
+    def test_non_ambiguous_falls_through(self) -> None:
+        tvar = self._tvar(self.fx.str_type)
+        off = self._par(tvar, self.fx.uninhabited, "non-ambiguous")
+        self._assert_engages(tvar, self.fx.uninhabited, "non-ambiguous")
+        # Non-ambiguous Never never expands the default; it falls through
+        # the bound check and maps T to the Never.
+        assert not off.variables
+        assert isinstance(off.ret_type, UninhabitedType)
+        assert off.ret_type.ambiguous is False
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeWireFixupSuite(Suite):
     """Parity suite for the wire round-trip fixup (#156).
 
