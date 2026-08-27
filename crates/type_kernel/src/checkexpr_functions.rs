@@ -6403,3 +6403,509 @@ mod is_valid_var_arg_tests {
         assert_eq!(kwarg(&alias(), false, true, true), None);
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_index_with_type
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `visit_index_with_type`; must match
+/// `NATIVE_INDEX_*` in mypy/checkexpr.py.
+const INDEX_NORMALIZE: i64 = 0;
+const INDEX_UNION: i64 = 1;
+const INDEX_TUPLE: i64 = 2;
+const INDEX_TYPEDDICT: i64 = 3;
+const INDEX_ENUM: i64 = 4;
+const INDEX_GENERIC_ALIAS: i64 = 5;
+const INDEX_TYPEVAR: i64 = 6;
+const INDEX_SPECIAL_FORM: i64 = 7;
+const INDEX_GETITEM: i64 = 8;
+
+/// Pure dispatch of `ExpressionChecker.visit_index_with_type`
+/// (checkexpr.py:6109-6166). Mirrors the Python branch order exactly:
+/// variadic-tuple normalization gate (only when `expand_variadic`, since
+/// Python normalizes once, never in a loop), union fan-out, tuple arm
+/// gated by `in_checked_function()`, TypedDict, enum / generic-alias
+/// type-object arms, then the second if-chain (TypeVar, special-form
+/// Instance) and the trailing `__getitem__` tail. `left_type` is the
+/// already-proper type; the tuple slice vs int-literal vs nonliteral
+/// sub-dispatch stays in Python (the literal body needs the `ns` values
+/// from `try_getting_int_literals`, which re-accepts the index).
+#[allow(clippy::too_many_arguments)]
+fn classify_index_with_type(
+    is_tuple: bool,
+    is_variadic: bool,
+    expand_variadic: bool,
+    is_union: bool,
+    in_checked: bool,
+    is_typeddict: bool,
+    is_function_like: bool,
+    is_type_obj: bool,
+    is_enum: bool,
+    to_has_type_vars: bool,
+    to_is_builtin_type: bool,
+    is_typevar: bool,
+    is_instance: bool,
+    left_fullname: Option<&str>,
+) -> i64 {
+    if is_tuple && is_variadic && expand_variadic {
+        return INDEX_NORMALIZE;
+    }
+    if is_union {
+        return INDEX_UNION;
+    }
+    if is_tuple && in_checked {
+        return INDEX_TUPLE;
+    }
+    if is_typeddict {
+        return INDEX_TYPEDDICT;
+    }
+    if is_function_like && is_type_obj {
+        if is_enum {
+            return INDEX_ENUM;
+        }
+        if to_has_type_vars || to_is_builtin_type {
+            return INDEX_GENERIC_ALIAS;
+        }
+        // Not enum / generic-alias: falls through to the second if-chain.
+    }
+    if is_typevar {
+        return INDEX_TYPEVAR;
+    }
+    if is_instance && left_fullname == Some("typing._SpecialForm") {
+        return INDEX_SPECIAL_FORM;
+    }
+    INDEX_GETITEM
+}
+
+/// `#[pyfunction]` entry for `ExpressionChecker.visit_index_with_type`
+/// (checkexpr.py:6095). Reads the live proper `left_type` isinstance tags
+/// (variadic walk over `TupleType.items`, `FunctionLike.is_type_obj()` /
+/// `type_object()` facts, `Instance.type.fullname`) and
+/// `chk.in_checked_function()` via PyO3, then classifies. Returns a
+/// branch tag; `None` defers on any unreadable fact.
+#[pyfunction]
+#[pyo3(signature = (left_type, chk, expand_variadic))]
+pub(crate) fn rust_classify_index_with_type(
+    py: Python<'_>,
+    left_type: &PyAny,
+    chk: &PyAny,
+    expand_variadic: bool,
+) -> PyResult<Option<i64>> {
+    let types_mod = match py.import("mypy.types") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let tuple_cls: &PyType = match types_mod.getattr("TupleType") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let union_cls: &PyType = match types_mod.getattr("UnionType") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let tdict_cls: &PyType = match types_mod.getattr("TypedDictType") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let func_like_cls: &PyType = match types_mod.getattr("FunctionLike") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let typevar_cls: &PyType = match types_mod.getattr("TypeVarType") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let instance_cls: &PyType = match types_mod.getattr("Instance") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let unpack_cls: &PyType = match types_mod.getattr("UnpackType") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+
+    // Read facts lazily in Python branch order so a deferred read never
+    // fires for a branch that short-circuits before it.
+    let is_tuple = match left_type.is_instance(tuple_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let mut is_variadic = false;
+    if is_tuple && expand_variadic {
+        let items = match left_type.getattr("items") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let seq = match items.downcast::<PyList>() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        for item in seq.iter() {
+            match item.is_instance(unpack_cls) {
+                Ok(true) => {
+                    is_variadic = true;
+                    break;
+                }
+                Ok(false) => {}
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+    let is_union = match left_type.is_instance(union_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    let mut in_checked = false;
+    if is_tuple {
+        in_checked = match chk.call_method0("in_checked_function") {
+            Ok(v) => match v.extract() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+    }
+
+    let is_typeddict = match left_type.is_instance(tdict_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    let mut is_type_obj = false;
+    let mut is_enum = false;
+    let mut to_has_type_vars = false;
+    let mut to_is_builtin_type = false;
+    let is_function_like = match left_type.is_instance(func_like_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    if is_function_like {
+        is_type_obj = match left_type.call_method0("is_type_obj") {
+            Ok(v) => match v.extract() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        if is_type_obj {
+            let type_object = match left_type.call_method0("type_object") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+            is_enum = match type_object.getattr("is_enum") {
+                Ok(v) => match v.is_true() {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if !is_enum {
+                to_has_type_vars = match type_object.getattr("type_vars") {
+                    Ok(v) => match v.is_true() {
+                        Ok(b) => b,
+                        Err(_) => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                };
+                let to_fullname: String = match type_object.getattr("fullname") {
+                    Ok(v) => match v.extract() {
+                        Ok(s) => s,
+                        Err(_) => return Ok(None),
+                    },
+                    Err(_) => return Ok(None),
+                };
+                to_is_builtin_type = to_fullname == "builtins.type";
+            }
+        }
+    }
+
+    let is_typevar = match left_type.is_instance(typevar_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+
+    let mut left_fullname: Option<String> = None;
+    let is_instance = match left_type.is_instance(instance_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    if is_instance {
+        let tinfo = match left_type.getattr("type") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        left_fullname = Some(match tinfo.getattr("fullname") {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        });
+    }
+
+    Ok(Some(classify_index_with_type(
+        is_tuple,
+        is_variadic,
+        expand_variadic,
+        is_union,
+        in_checked,
+        is_typeddict,
+        is_function_like,
+        is_type_obj,
+        is_enum,
+        to_has_type_vars,
+        to_is_builtin_type,
+        is_typevar,
+        is_instance,
+        left_fullname.as_deref(),
+    )))
+}
+
+#[cfg(test)]
+mod classify_index_with_type_tests {
+    use super::*;
+
+    #[allow(clippy::too_many_arguments)]
+    fn classify(
+        is_tuple: bool,
+        is_variadic: bool,
+        expand_variadic: bool,
+        is_union: bool,
+        in_checked: bool,
+        is_typeddict: bool,
+        is_function_like: bool,
+        is_type_obj: bool,
+        is_enum: bool,
+        to_has_type_vars: bool,
+        to_is_builtin_type: bool,
+        is_typevar: bool,
+        is_instance: bool,
+        left_fullname: Option<&str>,
+    ) -> i64 {
+        super::classify_index_with_type(
+            is_tuple,
+            is_variadic,
+            expand_variadic,
+            is_union,
+            in_checked,
+            is_typeddict,
+            is_function_like,
+            is_type_obj,
+            is_enum,
+            to_has_type_vars,
+            to_is_builtin_type,
+            is_typevar,
+            is_instance,
+            left_fullname,
+        )
+    }
+
+    #[test]
+    fn test_variadic_tuple_normalize() {
+        assert_eq!(
+            classify(
+                true, true, true, false, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            0
+        );
+        // Second pass (expand_variadic=false) does not re-normalize.
+        assert_eq!(
+            classify(
+                true, true, false, false, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn test_union_first() {
+        assert_eq!(
+            classify(
+                false, false, true, true, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn test_union_beats_variadic_tuple_when_not_expanding() {
+        // A non-variadic flag with expand disabled still hits union only
+        // when is_union is set; tuple wins otherwise.
+        assert_eq!(
+            classify(
+                true, false, true, false, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn test_tuple_requires_checked_function() {
+        assert_eq!(
+            classify(
+                true, false, true, false, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            2
+        );
+        // Not in a checked function: falls to the second if-chain tail.
+        assert_eq!(
+            classify(
+                true, false, true, false, false, false, false, false, false, false, false, false,
+                false, None
+            ),
+            8
+        );
+    }
+
+    #[test]
+    fn test_typeddict() {
+        assert_eq!(
+            classify(
+                false, false, true, false, true, true, false, false, false, false, false, false,
+                false, None
+            ),
+            3
+        );
+    }
+
+    #[test]
+    fn test_enum_type_obj() {
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, true, true, true, false, false, false,
+                false, None
+            ),
+            4
+        );
+    }
+
+    #[test]
+    fn test_generic_alias_type_vars() {
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, true, true, false, true, false, false,
+                false, None
+            ),
+            5
+        );
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, true, true, false, false, true, false,
+                false, None
+            ),
+            5
+        );
+    }
+
+    #[test]
+    fn test_type_obj_falls_through() {
+        // A type object that is neither enum nor generic-alias reaches the
+        // second if-chain (and lands on __getitem__ for a FunctionLike).
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, true, true, false, false, false, false,
+                false, None
+            ),
+            8
+        );
+        // Non-type-object FunctionLike also falls through.
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, true, false, false, false, false, false,
+                false, None
+            ),
+            8
+        );
+    }
+
+    #[test]
+    fn test_typevar() {
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, false, false, false, false, false, true,
+                false, None
+            ),
+            6
+        );
+    }
+
+    #[test]
+    fn test_special_form_instance() {
+        assert_eq!(
+            classify(
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                Some("typing._SpecialForm")
+            ),
+            7
+        );
+    }
+
+    #[test]
+    fn test_getitem_tail() {
+        assert_eq!(
+            classify(
+                false, false, true, false, true, false, false, false, false, false, false, false,
+                false, None
+            ),
+            8
+        );
+        assert_eq!(
+            classify(
+                false,
+                false,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                Some("builtins.list")
+            ),
+            8
+        );
+    }
+}

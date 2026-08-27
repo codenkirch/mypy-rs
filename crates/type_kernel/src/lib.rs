@@ -590,6 +590,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_visit_op_expr,
         module
     )?)?;
+    // Issue #999: visit_index_with_type dispatch head. Rust classifies the
+    // left_type branch from PyO3 facts; the fail/note tails and branch
+    // bodies (incl. the tuple sub-dispatch) stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_index_with_type,
+        module
+    )?)?;
     // Issue #489: overload-result family (combine_function_signatures body).
     module.add_function(wrap_pyfunction!(
         checkexpr_overload::rust_combine_function_signatures,
