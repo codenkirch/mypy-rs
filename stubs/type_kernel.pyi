@@ -206,6 +206,7 @@ __all__ = [
     "rust_check_overlapping_overloads",
     "rust_classify_except_handler_tests",
     "rust_classify_final_super",
+    "rust_classify_check_final",
     "rust_classify_classvar_super",
     "rust_classify_check_lvalue",
     "rust_classify_new_signature",
@@ -813,6 +814,14 @@ def rust_classify_final_super(
     enum_bases: list[str],
     enum_special_props: list[str],
 ) -> int | None: ...
+def rust_classify_check_final(
+    lvalues: Any,
+    is_final_decl: bool,
+    cls: Any,
+    is_stub: bool,
+    s_type_is_none: bool,
+    is_assignment_stmt: bool,
+) -> tuple[bool, list[tuple[str, bool]]] | None: ...
 def rust_classify_classvar_super(
     base_node: Any,
     node_is_classvar: bool,
