@@ -3130,6 +3130,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1050: type_check_raise decision-head port. Rust classifies
+    // the deleted / not-implemented arbitration into a branch tag; the
+    // fail emissions and the check_call recursion stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_type_check_raise,
+        module
+    )?)?;
+
     // Issue #1003: check_rvalue_count_in_assignment dispatch port. Rust
     // classifies the arity/star decision into a branch tag; the fail and
     // wrong-number messages stay in Python.

@@ -1588,3 +1588,19 @@ directly to `main`.
   `NativeCheckArgSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
   differential plus direct seam calls), plus pure decision unit tests in
   `checkexpr_functions.rs`.
+- `rust_classify_type_check_raise` (issue #1050) — mirrors the decision
+  head of `TypeChecker.type_check_raise` (checker.py:6979-7010): Rust
+  decodes the wire proper type of the raised expression and returns a
+  3-way tag (DELETED / PLAIN / NOT_IMPLEMENTED). The DeletedType arm
+  short-circuits ahead of the not-implemented guard, mirroring the
+  Python order; NOT_IMPLEMENTED comes from the wire `Instance.type_ref`
+  membership in `NOT_IMPLEMENTED_TYPE_NAMES` or the shim-supplied
+  callee fullname fact (`CallExpr` + `RefExpr` with fullname
+  `builtins.NotImplemented`). Python applies `deleted_as_rvalue`, the
+  `check_subtype` against the BaseException union (already native, with
+  the `NoneType` item when `optional`), the zero-arg FunctionLike
+  `check_call`, and the "did you mean NotImplementedError" fail. Defers
+  (None) on undecodable wire bytes. Gated by `_native_checker_active`
+  and covered by `NativeTypeCheckRaiseSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `checker_functions.rs`.

@@ -38013,3 +38013,233 @@ class NativeCheckArgSuite(Suite):
         on = self._run_check_arg(fx.a, fx.a, ARG_POS, True)
         assert off == on, f"pass: off={off} on={on}"
         assert off == [], f"expected no messages: {off}"
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeTypeCheckRaiseSuite(Suite):
+    """Parity for the Rust `type_check_raise` decision-head port (#1050).
+
+    `TypeChecker.type_check_raise` (checker.py:6979) classifies the raised
+    expression's proper type: DeletedType -> deleted_as_rvalue early
+    return, else the BaseException subtype check (already native) plus a
+    zero-arg `check_call` for FunctionLike types, plus the
+    "did you mean NotImplementedError" fail when the type is a
+    _NotImplementedType instance or the raised expression is a call of
+    `builtins.NotImplemented`. The Rust seam decides only the tag from the
+    wire type plus the callee fullname fact; Python applies every side
+    effect. Direct seam calls assert the exact tag for every branch;
+    toggling the checker gate off vs on must produce identical captured
+    message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _wire(self, t: Type) -> bytes:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(t)
+
+    def _notimpl_info(self, name: str, module: str) -> Any:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        class_def = ClassDef(name, Block([]), None, [])
+        class_def.fullname = f"{module}.{name}"
+        return TypeInfo(SymbolTable(), class_def, module)
+
+    def _notimpl_instance(self) -> Instance:
+        return Instance(self._notimpl_info("_NotImplementedType", "builtins"), [])
+
+    def _call_of_notimpl(self) -> Any:
+        from mypy.nodes import CallExpr, NameExpr
+
+        callee = NameExpr("NotImplemented")
+        callee.fullname = "builtins.NotImplemented"
+        return CallExpr(callee, [], [], [])
+
+    def _run(
+        self,
+        typ: Type,
+        active: bool,
+        e: Any | None = None,
+        optional: bool = False,
+    ) -> list[tuple[str, str]]:
+        from mypy.checker import TypeChecker
+        from mypy.options import Options
+
+        fx = TypeFixture()
+        from mypy.nodes import NameExpr, RaiseStmt
+
+        if e is None:
+            e = NameExpr("ctx")
+
+        def run_one() -> list[tuple[str, str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            records: list[tuple[str, str]] = []
+
+            class _Msg:
+                def deleted_as_rvalue(self, t: Any, _ctx: Any) -> None:
+                    records.append(("deleted_as_rvalue", str(t.source)))
+
+            chk.msg = _Msg()  # type: ignore[assignment]
+            chk.fail = lambda msg, _ctx, **_kw: records.append(  # type: ignore[assignment]
+                ("fail", str(msg.value))
+            )
+            chk.named_type = lambda _name: fx.o  # type: ignore[assignment]
+            chk.check_subtype = (  # type: ignore[method-assign]
+                lambda _typ, _exp, _ctx, _msg, **_kw: records.append(  # type: ignore[assignment]
+                    ("check_subtype", "call")
+                )
+            )
+            chk._expr_checker = SimpleNamespace(  # type: ignore[assignment]
+                accept=lambda _e: typ,
+                check_call=lambda t, _args, _kinds, _ctx: records.append(
+                    ("check_call", str(t))
+                ),
+            )
+            s = RaiseStmt(None, None)
+            chk.type_check_raise(e, s, optional)
+            return records
+
+        return self._with_gate(active, run_one)
+
+    def _assert_par(
+        self, typ: Type, e: Any | None = None, optional: bool = False
+    ) -> None:
+        off = self._run(typ, False, e, optional)
+        on = self._run(typ, True, e, optional)
+        assert_equal(on, off, f"type_check_raise parity for typ={typ!r}")
+
+    # -- direct seam tests (all 3 tags + deferral) --
+
+    def test_seam_deleted(self) -> None:
+        from mypy.checker import NATIVE_RAISE_DELETED
+
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(DeletedType("x")), None
+        )
+        assert tag == NATIVE_RAISE_DELETED, f"{tag}"
+
+    def test_seam_deleted_beats_callee(self) -> None:
+        from mypy.checker import NATIVE_RAISE_DELETED
+
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(DeletedType("x")), "builtins.NotImplemented"
+        )
+        assert tag == NATIVE_RAISE_DELETED, f"{tag}"
+
+    def test_seam_plain(self) -> None:
+        from mypy.checker import NATIVE_RAISE_PLAIN
+
+        fx = TypeFixture()
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(fx.str_type), None
+        )
+        assert tag == NATIVE_RAISE_PLAIN, f"{tag}"
+
+    def test_seam_plain_any(self) -> None:
+        from mypy.checker import NATIVE_RAISE_PLAIN
+
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(AnyType(TypeOfAny.special_form)), None
+        )
+        assert tag == NATIVE_RAISE_PLAIN, f"{tag}"
+
+    def test_seam_notimpl_instance(self) -> None:
+        from mypy.checker import NATIVE_RAISE_NOT_IMPLEMENTED
+
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(self._notimpl_instance()), None
+        )
+        assert tag == NATIVE_RAISE_NOT_IMPLEMENTED, f"{tag}"
+
+    def test_seam_notimpl_types_module_name(self) -> None:
+        from mypy.checker import NATIVE_RAISE_NOT_IMPLEMENTED
+
+        info = self._notimpl_info("NotImplementedType", "types")
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(Instance(info, [])), None
+        )
+        assert tag == NATIVE_RAISE_NOT_IMPLEMENTED, f"{tag}"
+
+    def test_seam_notimpl_callee_fact(self) -> None:
+        from mypy.checker import NATIVE_RAISE_NOT_IMPLEMENTED
+
+        fx = TypeFixture()
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(fx.str_type), "builtins.NotImplemented"
+        )
+        assert tag == NATIVE_RAISE_NOT_IMPLEMENTED, f"{tag}"
+
+    def test_seam_notimpl_error_subclass_is_plain(self) -> None:
+        from mypy.checker import NATIVE_RAISE_PLAIN
+
+        tag = _type_kernel.rust_classify_type_check_raise(
+            self._wire(AnyType(TypeOfAny.special_form)),
+            "builtins.NotImplementedError",
+        )
+        assert tag == NATIVE_RAISE_PLAIN, f"{tag}"
+
+    def test_seam_defers_on_bad_wire(self) -> None:
+        assert _type_kernel.rust_classify_type_check_raise(b"\xff\xff\xff", None) is None
+
+    # -- gate off/on differential tests (all branches) --
+
+    def test_par_deleted(self) -> None:
+        off = self._run(DeletedType("x"), False)
+        on = self._run(DeletedType("x"), True)
+        assert off == on, f"deleted: off={off} on={on}"
+        assert ("deleted_as_rvalue", "x") in off, f"expected delete: {off}"
+
+    def test_par_valid_exception(self) -> None:
+        fx = TypeFixture()
+        off = self._run(fx.str_type, False)
+        on = self._run(fx.str_type, True)
+        assert off == on, f"valid: off={off} on={on}"
+        assert ("check_subtype", "call") in off, f"expected subtype: {off}"
+
+    def test_par_valid_exception_optional(self) -> None:
+        # `raise e from None` path: optional=True adds NoneType to the
+        # expected union; the tail behavior is unchanged.
+        fx = TypeFixture()
+        off = self._run(fx.str_type, False, optional=True)
+        on = self._run(fx.str_type, True, optional=True)
+        assert off == on, f"optional: off={off} on={on}"
+        assert ("check_subtype", "call") in off, f"expected subtype: {off}"
+
+    def test_par_function_like(self) -> None:
+        fx = TypeFixture()
+        call = fx.callable_type(fx.anyt)
+        off = self._run(call, False)
+        on = self._run(call, True)
+        assert off == on, f"callable: off={off} on={on}"
+        assert ("check_call", str(call)) in off, f"expected check_call: {off}"
+
+    def test_par_notimpl_instance(self) -> None:
+        typ = self._notimpl_instance()
+        off = self._run(typ, False)
+        on = self._run(typ, True)
+        assert off == on, f"notimpl: off={off} on={on}"
+        assert ("check_subtype", "call") in off
+        assert len([r for r in off if r[0] == "fail"]) == 1, f"expected fail: {off}"
+
+    def test_par_notimpl_callee(self) -> None:
+        fx = TypeFixture()
+        e = self._call_of_notimpl()
+        off = self._run(fx.str_type, False, e=e)
+        on = self._run(fx.str_type, True, e=e)
+        assert off == on, f"callee: off={off} on={on}"
+        assert len([r for r in off if r[0] == "fail"]) == 1, f"expected fail: {off}"

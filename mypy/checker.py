@@ -342,15 +342,16 @@ try:
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
         rust_classify_func_def_override as _rust_classify_func_def_override,
+        rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_missing_annotations as _rust_classify_missing_annotations,
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_classify_return_stmt_post as _rust_classify_return_stmt_post,
         rust_classify_return_stmt_pre as _rust_classify_return_stmt_pre,
         rust_classify_return_stmt_variant as _rust_classify_return_stmt_variant,
-        rust_classify_getattr_method as _rust_classify_getattr_method,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
         rust_classify_truthy_type as _rust_classify_truthy_type,
+        rust_classify_type_check_raise as _rust_classify_type_check_raise,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -431,6 +432,7 @@ except ImportError:
     _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_rvalue_count = None  # type: ignore[assignment]
     _rust_classify_truthy_type = None  # type: ignore[assignment]
+    _rust_classify_type_check_raise = None  # type: ignore[assignment]
     _rust_classify_missing_annotations = None  # type: ignore[assignment]
     _rust_classify_getattr_method = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
@@ -558,6 +560,12 @@ NATIVE_TRUTHY_FUNCTION = 1
 NATIVE_TRUTHY_UNION = 2
 NATIVE_TRUTHY_ITERABLE = 3
 NATIVE_TRUTHY_OTHER = 4
+
+# Decision tags returned by `_rust_classify_type_check_raise`; must match
+# `RAISE_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_RAISE_DELETED = 0
+NATIVE_RAISE_PLAIN = 1
+NATIVE_RAISE_NOT_IMPLEMENTED = 2
 # Decision tags returned by the `check_return_stmt` seam; must match
 # `RETURN_*` in crates/type_kernel/src/checker_functions.rs.
 NATIVE_RETURN_VARIANT_GENERATOR = 1
@@ -6970,6 +6978,50 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def type_check_raise(self, e: Expression, s: RaiseStmt, optional: bool = False) -> None:
         typ = get_proper_type(self.expr_checker.accept(e))
+        # Native type_kernel seam: classify the deleted / not-implemented
+        # arbitration in Rust (checker_functions.rs); the fail emissions
+        # and the check_subtype + check_call tail stay here.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_type_check_raise is not None
+        ):
+            try:
+                callee_fullname = (
+                    e.callee.fullname
+                    if isinstance(e, CallExpr) and isinstance(e.callee, RefExpr)
+                    else None
+                )
+                tag = _rust_classify_type_check_raise(
+                    _serialize_type_for_checker(typ), callee_fullname
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_RAISE_DELETED:
+                    self.msg.deleted_as_rvalue(cast(DeletedType, typ), e)
+                    return
+                exc_type = self.named_type("builtins.BaseException")
+                expected_type_items = [exc_type, TypeType(exc_type)]
+                if optional:
+                    expected_type_items.append(NoneType())
+                self.check_subtype(
+                    typ,
+                    UnionType.make_union(expected_type_items),
+                    s,
+                    message_registry.INVALID_EXCEPTION,
+                )
+                if isinstance(typ, FunctionLike):
+                    self.expr_checker.check_call(typ, [], [], e)
+                if tag == NATIVE_RAISE_NOT_IMPLEMENTED:
+                    self.fail(
+                        message_registry.INVALID_EXCEPTION.with_additional_msg(
+                            '; did you mean "NotImplementedError"?'
+                        ),
+                        s,
+                    )
+                return
+
         if isinstance(typ, DeletedType):
             self.msg.deleted_as_rvalue(typ, e)
             return
