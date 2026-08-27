@@ -976,6 +976,21 @@ including:
   `mypy/test/testtypes.py` (direct seam calls, gate-off vs gate-on
   differential across decorator, no-slots, empty-slots, own-slots,
   all-inherited, mixed, base-slots-None, and multiple-bases cases).
+- `rust_is_recursive_pair` (issue #966) — mirrors
+  `mypy.typeops.is_recursive_pair` (typeops.py:249-274), the pure bool
+  predicate gating `join_types` / `meet_types` / `is_subtype` against
+  infinite recursion. Rust classifies two wire Type bytes plus the live
+  `is_recursive` flags (the wire `TypeAliasType` has no `is_recursive`
+  field; it needs the live `TypeAlias` node). The alias-chain expansion
+  (`get_proper_type`) runs through the snapshot alias resolver
+  (`expand_alias_shape`); a missing snapshot or an alias cycle defers
+  (`None`) and the Python caller falls back. `or`-chain short-circuit is
+  preserved by checking the resolver-free branch (`t_rec`/`s_rec`) first;
+  a later resolver-dependent branch defers only when no earlier branch
+  already returned `True`. Gated by `_native_typeops_active` (wired from
+  `mypy/build.py`) and covered by `NativeIsRecursivePairSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls), plus 6 pure decision unit tests in `typeops.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

@@ -380,6 +380,7 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(typeops::rust_is_disjoint_base, module)?)?;
+    module.add_function(wrap_pyfunction!(typeops::rust_is_recursive_pair, module)?)?;
     module.add_function(wrap_pyfunction!(operators::rust_operator_tables, module)?)?;
     module.add_function(wrap_pyfunction!(
         erase_typevars::rust_erase_typevars,
