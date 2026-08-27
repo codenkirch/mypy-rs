@@ -23555,6 +23555,125 @@ class NativeClassDecoratorCommonSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCompatMetaclassHelperSuite(Suite):
+    """Parity for the Rust six.with_metaclass base-class classifier (#914).
+
+    Exercises `type_kernel.rust_classify_with_metaclass` directly on the
+    scalar facts and asserts a gate-on/off differential on
+    `infer_metaclass_and_bases_from_compat_helpers` (semanal.py:3321-3338):
+    the base-side `six.with_metaclass(M, B1, ...)` head decides in Rust and
+    Python applies the two side effects.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _name(self, fullname: str) -> NameExpr:
+        node = NameExpr(fullname.rsplit(".", 1)[-1])
+        node.fullname = fullname
+        return node
+
+    def _call(self, callee: Expression, args: list[Expression]) -> CallExpr:
+        kinds = [ARG_POS] * len(args)
+        return CallExpr(callee, args, kinds, [None] * len(args))
+
+    def test_seam_engages(self) -> None:
+        assert self._tk.rust_classify_with_metaclass("six.with_metaclass", 2, True) == 1
+
+    def test_decision_table(self) -> None:
+        for name in (
+            "six.with_metaclass",
+            "future.utils.with_metaclass",
+            "past.utils.with_metaclass",
+        ):
+            assert self._tk.rust_classify_with_metaclass(name, 2, True) == 1
+        assert self._tk.rust_classify_with_metaclass("six.with_metaclass", 0, True) == 0
+        assert self._tk.rust_classify_with_metaclass("six.with_metaclass", 2, False) == 0
+        assert self._tk.rust_classify_with_metaclass("six.add_metaclass", 1, True) == 0
+        assert self._tk.rust_classify_with_metaclass("mod.NotWithMeta", 2, True) == 0
+        assert self._tk.rust_classify_with_metaclass(None, 2, True) == 0
+
+    def test_gate_off_defers(self) -> None:
+        from mypy import semanal
+
+        callee = self._name("six.with_metaclass")
+        call_expr = self._call(
+            callee,
+            [self._name("mod.M"), self._name("mod.B1"), self._name("mod.B2")],
+        )
+        old = semanal._native_semanal_visitor_active
+        try:
+            semanal._native_semanal_visitor_active = False
+            assert semanal._native_with_metaclass_classification(call_expr) is None
+        finally:
+            semanal._native_semanal_visitor_active = old
+
+    def _run_method(self, base_expr: CallExpr) -> tuple[list[str], str | None, list[str]]:
+        from mypy import semanal
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        class _Analyzer:
+            def __init__(self) -> None:
+                self.failures: list[str] = []
+
+            def fail(self, msg: str, _ctx: object, *, code: object = None) -> None:
+                self.failures.append(msg)
+
+            def analyze_type_expr(self, expr: Expression) -> None:
+                pass
+
+        defn = ClassDef("A", Block([]), None, [])
+        defn.fullname = "mod.A"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        defn.base_type_exprs = [base_expr]
+        defn.decorators = []
+        analyzer = _Analyzer()
+        semanal.SemanticAnalyzer.infer_metaclass_and_bases_from_compat_helpers(analyzer, defn)
+        fullnames = [getattr(b, "fullname", None) for b in defn.base_type_exprs]
+        metaclass = getattr(defn.metaclass, "fullname", None)
+        return (fullnames, metaclass, analyzer.failures)
+
+    def _assert_method_parity(self, base_expr: CallExpr) -> None:
+        from mypy import semanal
+
+        old = semanal._native_semanal_visitor_active
+        try:
+            semanal._native_semanal_visitor_active = False
+            off = self._run_method(base_expr)
+            semanal._native_semanal_visitor_active = True
+            on = self._run_method(base_expr)
+        finally:
+            semanal._native_semanal_visitor_active = old
+        assert_equal(on, off, "infer_metaclass_and_bases_from_compat_helpers parity")
+
+    def test_method_with_metaclass_parity(self) -> None:
+        callee = self._name("six.with_metaclass")
+        base_expr = self._call(
+            callee,
+            [self._name("mod.M"), self._name("mod.B1"), self._name("mod.B2")],
+        )
+        self._assert_method_parity(base_expr)
+
+    def test_method_not_with_metaclass_parity(self) -> None:
+        callee = self._name("mod.Other")
+        base_expr = self._call(
+            callee,
+            [self._name("mod.M"), self._name("mod.B1"), self._name("mod.B2")],
+        )
+        self._assert_method_parity(base_expr)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMagicBaseSuite(Suite):
     """Parity for the magic-base skip and core-builtin gate classifiers
     (semanal_bases.rs). Direct seam calls only; the Python shim keeps the
