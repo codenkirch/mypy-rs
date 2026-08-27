@@ -248,6 +248,7 @@ try:
         rust_check_operator as _rust_check_operator,
         rust_check_overload_call as _rust_check_overload_call,
         rust_classify_call as _rust_classify_call,
+        rust_classify_check_arg as _rust_classify_check_arg,
         rust_classify_protocol_test_callee as _rust_classify_protocol_test_callee,
         rust_classify_reveal_imported as _rust_classify_reveal_imported,
         rust_classify_index_with_type as _rust_classify_index_with_type,
@@ -331,6 +332,7 @@ except ImportError:
     _rust_method_fullname = None  # type: ignore[assignment]
     _rust_try_getting_literal = None  # type: ignore[assignment]
     _rust_classify_call = None  # type: ignore[assignment]
+    _rust_classify_check_arg = None  # type: ignore[assignment]
     _rust_classify_protocol_test_callee = None  # type: ignore[assignment]
     _rust_classify_reveal_imported = None  # type: ignore[assignment]
     _rust_classify_index_with_type = None  # type: ignore[assignment]
@@ -383,6 +385,13 @@ NATIVE_VISIT_OP_EXPR_BOOLEAN = 1
 NATIVE_VISIT_OP_EXPR_LIST_MULTIPLY = 2
 NATIVE_VISIT_OP_EXPR_STR_INTERP = 3
 NATIVE_VISIT_OP_EXPR_CHECK_OP = 4
+
+# Decision tags returned by `_rust_classify_check_arg`; must match
+# `CHECK_ARG_*` in crates/type_kernel/src/checkexpr_functions.rs.
+NATIVE_CHECK_ARG_DELETED = 0
+NATIVE_CHECK_ARG_ABSTRACT_ONLY = 1
+NATIVE_CHECK_ARG_INCOMPATIBLE = 2
+NATIVE_CHECK_ARG_PASS = 3
 
 # Decision tags returned by `_rust_classify_index_with_type`; must match
 # the `INDEX_*` constants in crates/type_kernel/src/checkexpr_functions.rs.
@@ -4175,6 +4184,50 @@ class ExpressionChecker(ExpressionVisitor[Type], ExpressionCheckerSharedApi):
         caller_type = get_proper_type(caller_type)
         original_caller_type = get_proper_type(original_caller_type)
         callee_type = get_proper_type(callee_type)
+
+        # Native type_kernel seam: classify the 4-way dispatch in Rust
+        # (checkexpr_functions.rs); message emission stays here. The two
+        # booleans are pure, so eager evaluation is value-preserving.
+        if (
+            _CHECKEXPR_HAS_TYPE_KERNEL
+            and _native_checkexpr_active
+            and _rust_classify_check_arg is not None
+        ):
+            try:
+                tag = _rust_classify_check_arg(
+                    _serialize_type_for_checkexpr(caller_type),
+                    is_subtype(caller_type, callee_type, options=self.chk.options),
+                    self.has_abstract_type_part(caller_type, callee_type),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_CHECK_ARG_DELETED:
+                    self.msg.deleted_as_rvalue(cast(DeletedType, caller_type), context)
+                elif tag == NATIVE_CHECK_ARG_ABSTRACT_ONLY:
+                    self.msg.concrete_only_call(callee_type, context)
+                elif tag == NATIVE_CHECK_ARG_INCOMPATIBLE:
+                    error = self.msg.incompatible_argument(
+                        n,
+                        m,
+                        callee,
+                        original_caller_type,
+                        caller_kind,
+                        object_type=object_type,
+                        context=context,
+                        outer_context=outer_context,
+                    )
+                    if not caller_kind.is_star():
+                        # For *args / **kwargs this note would be incorrect: we compare
+                        # iterable/mapping type with union of relevant arg types.
+                        self.msg.incompatible_argument_note(
+                            original_caller_type, callee_type, context, parent_error=error
+                        )
+                    if not self.msg.prefer_simple_messages():
+                        self.chk.check_possible_missing_await(
+                            caller_type, callee_type, context, error.code
+                        )
+                return
 
         if isinstance(caller_type, DeletedType):
             self.msg.deleted_as_rvalue(caller_type, context)

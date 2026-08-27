@@ -1575,3 +1575,16 @@ directly to `main`.
   target (`get_proper_type` needs the live alias). Gated by
   `_native_semanal_visitor_active` and covered by
   `NativeRemoveUnpackKwargsSuite` in `mypy/test/testtypes.py`.
+- `rust_classify_check_arg` (issue #1048) — mirrors the 4-way elif-chain
+  head of `ExpressionChecker.check_arg` (checkexpr.py:4161-4204). Rust
+  reads the wire caller type (DeletedType tag) plus two Python-computed
+  booleans (`is_subtype` via the subtype resolver, `has_abstract_type_part`
+  via `rust_has_abstract_type`, Tuple-x-Tuple fold Python-side) and
+  returns a branch tag (DELETED / ABSTRACT_ONLY / INCOMPATIBLE / PASS).
+  Python applies `deleted_as_rvalue` / `concrete_only_call` /
+  `incompatible_argument` + the `is_star()` note gate +
+  `check_possible_missing_await`. Defers (None) on undecodable wire
+  bytes. Gated by `_native_checkexpr_active` and covered by
+  `NativeCheckArgSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
+  differential plus direct seam calls), plus pure decision unit tests in
+  `checkexpr_functions.rs`.

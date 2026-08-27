@@ -615,6 +615,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_visit_op_expr,
         module
     )?)?;
+    // Issue #1048: check_arg decision head. Rust classifies the 4-way
+    // dispatch (DeletedType / abstract-only / incompatible / pass) from
+    // the wire caller type; message emission stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_check_arg,
+        module
+    )?)?;
     // Issue #999: visit_index_with_type dispatch head. Rust classifies the
     // left_type branch from PyO3 facts; the fail/note tails and branch
     // bodies (incl. the tuple sub-dispatch) stay in Python.

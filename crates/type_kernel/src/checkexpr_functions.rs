@@ -6909,3 +6909,131 @@ mod classify_index_with_type_tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_check_arg
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `check_arg`; must match `NATIVE_CHECK_ARG_*`
+/// in mypy/checkexpr.py.
+const CHECK_ARG_DELETED: i64 = 0;
+const CHECK_ARG_ABSTRACT_ONLY: i64 = 1;
+const CHECK_ARG_INCOMPATIBLE: i64 = 2;
+const CHECK_ARG_PASS: i64 = 3;
+
+/// Pure 4-way dispatch of `ExpressionChecker.check_arg`
+/// (checkexpr.py:4161-4204). `caller` is the decoded wire form of the
+/// proper caller type; `is_subtype` and `has_abstract_type_part` are
+/// precomputed by the Python shim from the already-native subtype
+/// resolver and `rust_has_abstract_type` (the Tuple-x-Tuple fold stays
+/// Python-side). Branch order mirrors the Python body exactly:
+/// DeletedType first, then the abstract-part gate, then the subtype
+/// check, then the implicit pass. Python's body short-circuits -- it
+/// never evaluates `is_subtype` / `has_abstract_type_part` on a
+/// DeletedType caller -- but both inputs are pure functions of the
+/// types, so eager evaluation is value-preserving; the shim documents
+/// this and still falls back if the eager computation raises.
+fn classify_check_arg(caller: &Type, is_subtype: bool, has_abstract_type_part: bool) -> i64 {
+    if matches!(caller, Type::DeletedType { .. }) {
+        return CHECK_ARG_DELETED;
+    }
+    if has_abstract_type_part {
+        return CHECK_ARG_ABSTRACT_ONLY;
+    }
+    if !is_subtype {
+        return CHECK_ARG_INCOMPATIBLE;
+    }
+    CHECK_ARG_PASS
+}
+
+/// `#[pyfunction]` entry for `ExpressionChecker.check_arg`
+/// (checkexpr.py:4161-4204). Rust decides ONLY the tag from the wire
+/// caller type plus the two Python-computed booleans; the shim applies
+/// all side effects (deleted_as_rvalue / concrete_only_call /
+/// incompatible_argument + note + check_possible_missing_await).
+/// Defers (`None`) on undecodable wire bytes; never otherwise.
+#[pyfunction]
+#[pyo3(signature = (caller_type_bytes, is_subtype, has_abstract_type_part))]
+pub(crate) fn rust_classify_check_arg(
+    caller_type_bytes: &[u8],
+    is_subtype: bool,
+    has_abstract_type_part: bool,
+) -> PyResult<Option<i64>> {
+    let caller = match crate::checkmember::decode_type(caller_type_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    Ok(Some(classify_check_arg(
+        &caller,
+        is_subtype,
+        has_abstract_type_part,
+    )))
+}
+
+#[cfg(test)]
+mod classify_check_arg_tests {
+    use super::*;
+
+    #[test]
+    fn test_deleted_type_wins() {
+        // DeletedType is checked first: the two booleans are irrelevant.
+        let deleted = Type::DeletedType { source: None };
+        assert_eq!(
+            classify_check_arg(&deleted, false, false),
+            CHECK_ARG_DELETED
+        );
+        assert_eq!(classify_check_arg(&deleted, false, true), CHECK_ARG_DELETED);
+        assert_eq!(classify_check_arg(&deleted, true, true), CHECK_ARG_DELETED);
+    }
+
+    #[test]
+    fn test_abstract_only() {
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            classify_check_arg(&any, true, true),
+            CHECK_ARG_ABSTRACT_ONLY
+        );
+    }
+
+    #[test]
+    fn test_incompatible() {
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            classify_check_arg(&any, false, false),
+            CHECK_ARG_INCOMPATIBLE
+        );
+    }
+
+    #[test]
+    fn test_pass() {
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(classify_check_arg(&any, true, false), CHECK_ARG_PASS);
+    }
+
+    #[test]
+    fn test_abstract_beats_incompatible() {
+        // The Python elif-chain never reaches is_subtype when the
+        // abstract part fires.
+        let any = Type::AnyType {
+            type_of_any: 1,
+            source_any: None,
+            missing_import_name: None,
+        };
+        assert_eq!(
+            classify_check_arg(&any, false, true),
+            CHECK_ARG_ABSTRACT_ONLY
+        );
+    }
+}

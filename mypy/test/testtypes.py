@@ -37806,3 +37806,210 @@ class NativeRemoveUnpackKwargsSuite(Suite):
         )
         assert ret.unpack_kwargs
         assert isinstance(get_proper_type(ret.arg_types[-1]), TypedDictType)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckArgSuite(Suite):
+    """Parity for `rust_classify_check_arg` (issue #1048).
+
+    `ExpressionChecker.check_arg` (checkexpr.py:4161-4204) dispatches a
+    4-way branch: DeletedType -> deleted_as_rvalue,
+    has_abstract_type_part -> concrete_only_call, not is_subtype ->
+    incompatible_argument (+ optional note + check_possible_missing_await),
+    else pass. The Rust seam decides only the tag from the wire caller
+    type plus two Python-computed booleans (is_subtype via the subtype
+    resolver; has_abstract_type_part via rust_has_abstract_type with the
+    Tuple-x-Tuple fold kept Python-side); Python applies every side
+    effect. Direct seam calls assert the exact tag for every branch;
+    toggling the checkexpr gate off vs on must produce identical
+    captured message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_ec(self) -> tuple[ExpressionChecker, list[tuple[str, str]]]:
+        captured: list[tuple[str, str]] = []
+        error = SimpleNamespace(code=None)
+
+        def incompatible_argument(n: int, m: int, *a: Any, **kw: Any) -> Any:
+            captured.append(("incompatible_argument", f"{n}:{m}"))
+            return error
+
+        msg = SimpleNamespace(
+            deleted_as_rvalue=lambda t, ctx: captured.append(
+                ("deleted_as_rvalue", str(t.source))
+            ),
+            concrete_only_call=lambda t, ctx: captured.append(
+                ("concrete_only_call", str(t))
+            ),
+            incompatible_argument=incompatible_argument,
+            incompatible_argument_note=lambda ot, ct, ctx, *, parent_error: captured.append(
+                ("incompatible_argument_note", "note")
+            ),
+            prefer_simple_messages=lambda: False,
+        )
+        chk = SimpleNamespace(
+            options=Options(),
+            allow_abstract_call=False,
+            check_possible_missing_await=lambda ct, ct2, ctx, code: captured.append(
+                ("await", str(code))
+            ),
+        )
+        ec = ExpressionChecker.__new__(ExpressionChecker)
+        ec.chk = chk  # type: ignore[assignment]
+        ec.msg = msg  # type: ignore[assignment]
+        return ec, captured
+
+    def _run_check_arg(
+        self,
+        caller_type: Type,
+        callee_type: Type,
+        kind: ArgKind,
+        active: bool,
+    ) -> list[tuple[str, str]]:
+        fx = TypeFixture()
+        ec, captured = self._make_ec()
+        callee = fx.callable_type(fx.anyt)
+        ctx = NameExpr("ctx")
+
+        def run() -> None:
+            self._with_gate(
+                active,
+                lambda: ec.check_arg(
+                    caller_type,
+                    caller_type,
+                    kind,
+                    callee_type,
+                    1,
+                    1,
+                    callee,
+                    None,
+                    ctx,
+                    ctx,
+                ),
+            )
+
+        try:
+            run()
+        except Exception as exc:
+            captured.append(("EXC", str(exc)))
+        return captured
+
+    # -- direct seam tests (all 4 tags) --
+
+    def _wire(self, t: Type) -> bytes:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        return _serialize_type_for_checkexpr(t)
+
+    def test_seam_deleted(self) -> None:
+        from mypy.checkexpr import NATIVE_CHECK_ARG_DELETED
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(DeletedType("x")), False, False
+        )
+        assert tag == NATIVE_CHECK_ARG_DELETED, f"{tag}"
+
+    def test_seam_deleted_beats_all(self) -> None:
+        # Python checks DeletedType first; the booleans are irrelevant.
+        from mypy.checkexpr import NATIVE_CHECK_ARG_DELETED
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(DeletedType("x")), False, True
+        )
+        assert tag == NATIVE_CHECK_ARG_DELETED, f"{tag}"
+
+    def test_seam_abstract_only(self) -> None:
+        from mypy.checkexpr import NATIVE_CHECK_ARG_ABSTRACT_ONLY
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(AnyType(TypeOfAny.special_form)), True, True
+        )
+        assert tag == NATIVE_CHECK_ARG_ABSTRACT_ONLY, f"{tag}"
+
+    def test_seam_incompatible(self) -> None:
+        from mypy.checkexpr import NATIVE_CHECK_ARG_INCOMPATIBLE
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(AnyType(TypeOfAny.special_form)), False, False
+        )
+        assert tag == NATIVE_CHECK_ARG_INCOMPATIBLE, f"{tag}"
+
+    def test_seam_pass(self) -> None:
+        from mypy.checkexpr import NATIVE_CHECK_ARG_PASS
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(AnyType(TypeOfAny.special_form)), True, False
+        )
+        assert tag == NATIVE_CHECK_ARG_PASS, f"{tag}"
+
+    def test_seam_abstract_beats_incompatible(self) -> None:
+        from mypy.checkexpr import NATIVE_CHECK_ARG_ABSTRACT_ONLY
+
+        tag = _type_kernel.rust_classify_check_arg(
+            self._wire(AnyType(TypeOfAny.special_form)), False, True
+        )
+        assert tag == NATIVE_CHECK_ARG_ABSTRACT_ONLY, f"{tag}"
+
+    def test_seam_defers_on_bad_wire(self) -> None:
+        assert _type_kernel.rust_classify_check_arg(b"\xff\xff\xff", True, True) is None
+
+    # -- gate off/on differential tests (all 4 branches) --
+
+    def test_par_deleted(self) -> None:
+        fx = TypeFixture()
+        off = self._run_check_arg(DeletedType("x"), fx.anyt, ARG_POS, False)
+        on = self._run_check_arg(DeletedType("x"), fx.anyt, ARG_POS, True)
+        assert off == on, f"deleted: off={off} on={on}"
+        assert ("deleted_as_rvalue", "x") in off, f"expected delete: {off}"
+
+    def test_par_abstract_only(self) -> None:
+        fx = TypeFixture()
+        # The fixture leaves is_abstract unset; set it so the
+        # FunctionLike-caller x TypeType-callee abstract fold fires.
+        fx.fi.is_abstract = True
+        caller = fx.callable_type(Instance(fx.fi, []))
+        callee = TypeType.make_normalized(Instance(fx.fi, []))
+        off = self._run_check_arg(caller, callee, ARG_POS, False)
+        on = self._run_check_arg(caller, callee, ARG_POS, True)
+        assert off == on, f"abstract: off={off} on={on}"
+        assert ("concrete_only_call", str(callee)) in off, f"expected abstract: {off}"
+
+    def test_par_incompatible(self) -> None:
+        fx = TypeFixture()
+        off = self._run_check_arg(fx.a, fx.d, ARG_POS, False)
+        on = self._run_check_arg(fx.a, fx.d, ARG_POS, True)
+        assert off == on, f"incompatible: off={off} on={on}"
+        assert ("incompatible_argument", "1:1") in off
+        assert ("incompatible_argument_note", "note") in off
+        assert ("await", "None") in off, f"expected await check: {off}"
+
+    def test_par_incompatible_star_no_note(self) -> None:
+        # For *args / **kwargs the note would be incorrect: suppressed.
+        fx = TypeFixture()
+        off = self._run_check_arg(fx.a, fx.d, ARG_STAR, False)
+        on = self._run_check_arg(fx.a, fx.d, ARG_STAR, True)
+        assert off == on, f"star: off={off} on={on}"
+        assert ("incompatible_argument", "1:1") in off
+        assert ("incompatible_argument_note", "note") not in off
+
+    def test_par_pass(self) -> None:
+        fx = TypeFixture()
+        off = self._run_check_arg(fx.a, fx.a, ARG_POS, False)
+        on = self._run_check_arg(fx.a, fx.a, ARG_POS, True)
+        assert off == on, f"pass: off={off} on={on}"
+        assert off == [], f"expected no messages: {off}"
