@@ -457,6 +457,7 @@ def build_native_resolver(
 ) -> NativeTypeResolver: ...
 def read_type_to_str_with_native_resolver(data: bytes, resolver: NativeTypeResolver) -> str: ...
 def rust_get_type_triggers(typ: Any, use_logical_deps: bool) -> list[str] | None: ...
+def rust_attribute_triggers(typ: Any, name: str) -> list[str] | None: ...
 def rust_is_subtype(
     left: bytes,
     right: bytes,
@@ -1859,6 +1860,15 @@ def rust_classify_special_unbound(
     not_in_unpack: bool,
     allow_unpack: bool,
 ) -> int | None: ...
+def rust_classify_tuple_type_implicit(
+    implicit: bool,
+    allow_tuple_literal: bool,
+    items_len: int,
+) -> int | None: ...
+def rust_classify_class_pattern_ranges(
+    typ_bytes: bytes,
+    class_ref_node: Any,
+) -> list[int] | None: ...
 def rust_classify_raw_expression_type(
     report_invalid_types: bool,
     base_type_name: str,

@@ -94,6 +94,7 @@ try:
         rust_compute_wildcard_triggers as _rust_compute_wildcard_triggers,
     )
     from type_kernel import rust_get_type_triggers as _rust_get_type_triggers
+    from type_kernel import rust_attribute_triggers as _rust_attribute_triggers
     from type_kernel import rust_merge_dependencies as _rust_merge_dependencies
     from type_kernel import rust_non_trivial_bases as _rust_non_trivial_bases
     from type_kernel import rust_has_user_bases as _rust_has_user_bases
@@ -103,6 +104,7 @@ except ImportError:
     _rust_compute_target_modules = None  # type: ignore[assignment]
     _rust_compute_wildcard_triggers = None  # type: ignore[assignment]
     _rust_get_type_triggers = None  # type: ignore[assignment]
+    _rust_attribute_triggers = None  # type: ignore[assignment]
     _rust_merge_dependencies = None  # type: ignore[assignment]
     _rust_non_trivial_bases = None  # type: ignore[assignment]
     _rust_has_user_bases = None  # type: ignore[assignment]
@@ -1023,6 +1025,11 @@ class DependencyVisitor(TraverserVisitor):
 
     def attribute_triggers(self, typ: Type, name: str) -> list[str]:
         """Return all triggers associated with the attribute of a type."""
+        if _HAS_TYPE_KERNEL and _native_server_deps_active:
+            result = _rust_attribute_triggers(typ, name)
+            if result is not None:
+                return result
+            # Rust returned None (unsupported case) — fall through to Python.
         typ = get_proper_type(typ)
         if isinstance(typ, TypeVarType):
             typ = get_proper_type(typ.upper_bound)

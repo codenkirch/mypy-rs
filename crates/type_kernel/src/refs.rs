@@ -14,6 +14,8 @@ use pyo3::types::PyType;
 
 /// Cache of Python constructors and class objects, looked up once per call.
 pub(crate) struct TypeRefs<'py> {
+    /// mypy.types.FunctionLike (abstract base of CallableType/Overloaded)
+    pub(crate) function_like: &'py PyType,
     /// mypy.types.AnyType
     pub(crate) any_type: &'py PyType,
     /// mypy.types.NoneType
@@ -61,6 +63,7 @@ impl<'py> TypeRefs<'py> {
             }};
         }
         Ok(TypeRefs {
+            function_like: class!("FunctionLike"),
             any_type: class!("AnyType"),
             none_type: class!("NoneType"),
             uninhabited_type: class!("UninhabitedType"),
