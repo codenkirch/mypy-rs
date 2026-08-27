@@ -17,8 +17,12 @@
 
 use std::collections::HashSet;
 
+use pyo3::class::basic::CompareOp;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple, PyType};
+
+use crate::typeanal_queries::{has_explicit_any_inner, EXPLICIT, FROM_UNIMPORTED_TYPE};
+use crate::wire::{read_type, ReadBuffer, Type};
 
 /// Fetch a class from `mypy.nodes`. Mirrors the private helper in
 /// `checker_functions.rs` / `checker_visitor.rs`.
@@ -298,6 +302,295 @@ pub(crate) fn rust_classify_lvalue_validity(py: Python<'_>, node: &PyAny) -> PyR
     Ok(LVALUE_KIND_PASS)
 }
 
+/// Kind tags for the `configure_base_classes` per-base classifier, decoded
+/// from the top-level wire `Type` variant (mirrors the ProperType isinstance
+/// chain at semanal.py:3349-3372):
+/// - `KIND_TUPLE`: `TupleType` -> Python runs `configure_tuple_base_class`.
+/// - `KIND_INSTANCE`: `Instance` (splits on `is_newtype`).
+/// - `KIND_ANY`: `AnyType` (splits on `disallow_subclassing_any`).
+/// - `KIND_TYPEDDICT`: `TypedDictType` -> Python appends `base.fallback`.
+/// - `KIND_OTHER`: anything else -> invalid base, Python fails + fallback_to_any.
+pub(crate) const KIND_TUPLE: i64 = 0;
+pub(crate) const KIND_INSTANCE: i64 = 1;
+pub(crate) const KIND_ANY: i64 = 2;
+pub(crate) const KIND_TYPEDDICT: i64 = 3;
+pub(crate) const KIND_OTHER: i64 = 4;
+
+/// Result tags handed to the Python shim for `configure_base_classes`,
+/// one per base, index-aligned with the input list:
+/// - `CONFIGURE_TUPLE`: Python calls `configure_tuple_base_class(defn, base)`
+///   and appends its result (the TupleType arm defers per-base: the tuple
+///   base-class surgery stays in Python).
+/// - `CONFIGURE_INSTANCE`: plain instance base; Python appends it.
+/// - `CONFIGURE_INSTANCE_NEWTYPE_FAIL`: Python fails 'Cannot subclass
+///   "NewType"' and still appends the base.
+/// - `CONFIGURE_ANY_OK`: `Any` base with `disallow_subclassing_any` off;
+///   Python only sets `info.fallback_to_any = True`.
+/// - `CONFIGURE_ANY_FAIL`: same plus the "Class cannot subclass" fail.
+/// - `CONFIGURE_TYPEDDICT_FALLBACK`: Python appends `base.fallback`.
+/// - `CONFIGURE_INVALID_BASE`: Python fails "Invalid base class ..." and
+///   sets `fallback_to_any`.
+pub(crate) const CONFIGURE_TUPLE: i64 = 1;
+pub(crate) const CONFIGURE_INSTANCE: i64 = 2;
+pub(crate) const CONFIGURE_INSTANCE_NEWTYPE_FAIL: i64 = 3;
+pub(crate) const CONFIGURE_ANY_OK: i64 = 4;
+pub(crate) const CONFIGURE_ANY_FAIL: i64 = 5;
+pub(crate) const CONFIGURE_TYPEDDICT_FALLBACK: i64 = 6;
+pub(crate) const CONFIGURE_INVALID_BASE: i64 = 7;
+
+/// MRO-tail tags decided by `verify_base_classes` +
+/// `verify_duplicate_base_classes` (semanal.py:3512-3526):
+/// - `MRO_DUMMY`: a cyclic base -> Python fails "Cycle in inheritance
+///   hierarchy" per cyclic base (indices returned alongside) and calls
+///   `set_dummy_mro`.
+/// - `MRO_ANY`: a duplicate direct base (name returned alongside) -> Python
+///   fails 'Duplicate base class "..."' and calls `set_any_mro`, then
+///   `calculate_class_mro`.
+/// - `MRO_PROCEED`: clean hierarchy -> Python just calls `calculate_class_mro`.
+pub(crate) const MRO_DUMMY: i64 = 1;
+pub(crate) const MRO_ANY: i64 = 2;
+pub(crate) const MRO_PROCEED: i64 = 3;
+
+/// Pure decision core of the `configure_base_classes` per-base classifier
+/// (semanal.py:3349-3381). PyO3-free so the decision table is unit-tested
+/// directly. `kind` is the wire top-level kind tag, `unimported_any` /
+/// `explicit_any` are the `has_any_from_unimported_type` /
+/// `has_explicit_any` walk results (Python gates them on
+/// `disallow_any_unimported` / `disallow_any_explicit` +
+/// `is_typeshed_stub_file` before calling). Returns
+/// `(tag, unimported_emit, explicit_emit)` or `None` when a walk deferred.
+fn classify_configure_base_inner(
+    kind: i64,
+    is_newtype: bool,
+    disallow_subclassing_any: bool,
+    unimported_any: Option<bool>,
+    explicit_any: Option<bool>,
+) -> Option<(i64, bool, bool)> {
+    let unimported_emit = unimported_any?;
+    let explicit_emit = explicit_any?;
+    let tag = match kind {
+        KIND_TUPLE => CONFIGURE_TUPLE,
+        KIND_INSTANCE => {
+            if is_newtype {
+                CONFIGURE_INSTANCE_NEWTYPE_FAIL
+            } else {
+                CONFIGURE_INSTANCE
+            }
+        }
+        KIND_ANY => {
+            if disallow_subclassing_any {
+                CONFIGURE_ANY_FAIL
+            } else {
+                CONFIGURE_ANY_OK
+            }
+        }
+        KIND_TYPEDDICT => CONFIGURE_TYPEDDICT_FALLBACK,
+        _ => CONFIGURE_INVALID_BASE,
+    };
+    Some((tag, unimported_emit, explicit_emit))
+}
+
+/// Wire top-level kind of a decoded base `ProperType`. The bases list holds
+/// ProperTypes (Python ran `get_proper_type` before calling), so the
+/// top-level variant decides the isinstance chain 1:1; every other variant
+/// falls into Python's `else` arm (INVALID_BASE).
+fn wire_base_kind(t: &Type) -> i64 {
+    match t {
+        Type::TupleType { .. } => KIND_TUPLE,
+        Type::Instance { .. } => KIND_INSTANCE,
+        Type::AnyType { .. } => KIND_ANY,
+        Type::TypedDictType { .. } => KIND_TYPEDDICT,
+        _ => KIND_OTHER,
+    }
+}
+
+/// `SemanticAnalyzer.configure_base_classes` per-base classifier
+/// (semanal.py:3348-3381). One call classifies every base: the ProperType
+/// isinstance chain (from the wire bytes) plus the
+/// `disallow_any_unimported` / `check_for_explicit_any` predicates (walked
+/// by the same kernel `has_explicit_any_inner` backs
+/// `rust_has_explicit_any` / `rust_has_any_from_unimported_type`). Python
+/// keeps every side effect: `configure_tuple_base_class`, the fail
+/// emissions, `info.fallback_to_any`, the `base_types`/`info.bases` writes,
+/// and `configure_tuple_base_class`'s tuple surgery. Defers (`None`) on an
+/// undecodable blob or any any-walk that cannot conclude from the wire
+/// (nested `TypeAliasType`), falling back to the pure-Python body.
+#[pyfunction]
+#[pyo3(signature = (bases_wire, is_newtypes, disallow_subclassing_any, disallow_any_unimported, disallow_any_explicit, is_typeshed_stub_file))]
+pub(crate) fn rust_classify_configure_bases(
+    bases_wire: &PyList,
+    is_newtypes: &PyList,
+    disallow_subclassing_any: bool,
+    disallow_any_unimported: bool,
+    disallow_any_explicit: bool,
+    is_typeshed_stub_file: bool,
+) -> PyResult<Option<Vec<(i64, bool, bool)>>> {
+    if bases_wire.len() != is_newtypes.len() {
+        return Ok(None);
+    }
+    let mut out = Vec::with_capacity(bases_wire.len());
+    for (item, flag) in bases_wire.iter().zip(is_newtypes.iter()) {
+        let bytes: &[u8] = match item.extract() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let is_newtype: bool = match flag.extract() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let t = match decode_type(bytes) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let kind = wire_base_kind(&t);
+        // The unimported/explicit walks mirror the Python short-circuits:
+        // `has_any_from_unimported_type(base)` only runs when the option is
+        // on; `check_for_explicit_any` only when not a typeshed stub file.
+        let unimported_any = if disallow_any_unimported {
+            has_any_from_unimported_inner(&t)
+        } else {
+            Some(false)
+        };
+        let explicit_any = if disallow_any_explicit && !is_typeshed_stub_file {
+            has_explicit_any_inner(&t, EXPLICIT)
+        } else {
+            Some(false)
+        };
+        match classify_configure_base_inner(
+            kind,
+            is_newtype,
+            disallow_subclassing_any,
+            unimported_any,
+            explicit_any,
+        ) {
+            Some(row) => out.push(row),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(out))
+}
+
+/// `has_any_from_unimported_type` walk over an already-decoded wire type
+/// (typeanal_queries keeps the byte-level wrapper).
+fn has_any_from_unimported_inner(t: &Type) -> Option<bool> {
+    has_explicit_any_inner(t, FROM_UNIMPORTED_TYPE)
+}
+
+fn decode_type(bytes: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(bytes);
+    read_type(&mut buf, None).ok()
+}
+
+/// Pure decision core of the MRO tail (semanal.py:3390-3397):
+/// `verify_base_classes` + `verify_duplicate_base_classes` folded into one
+/// 3-way tag. Cyclic bases win (dummy MRO, early return in Python), then a
+/// duplicate direct base (Any MRO), else proceed.
+fn configure_mro_tail_inner(cyclic: &[usize], dup: Option<&str>) -> (i64, Vec<usize>, Option<String>) {
+    if !cyclic.is_empty() {
+        (MRO_DUMMY, cyclic.to_vec(), None)
+    } else if let Some(d) = dup {
+        (MRO_ANY, Vec::new(), Some(d.to_string()))
+    } else {
+        (MRO_PROCEED, Vec::new(), None)
+    }
+}
+
+/// `SemanticAnalyzer.is_base_class` (semanal.py:3528-3542) over live
+/// TypeInfos: search the base-class graph of `s` for `t`, without the mro.
+/// Python compares TypeInfos with `==` (identity for mypy TypeInfo); the
+/// walk mirrors that with PyO3 identity. Returns `None` when an attribute
+/// is unreadable so the caller defers to pure Python.
+fn is_base_class_walk(t: &PyAny, s: &PyAny) -> Option<bool> {
+    let mut worklist: Vec<&PyAny> = vec![s];
+    let mut visited: Vec<&PyAny> = vec![s];
+    while let Some(nxt) = worklist.pop() {
+        if nxt.is(t) {
+            return Some(true);
+        }
+        let bases = nxt.getattr("bases").ok()?;
+        let bases = bases.downcast::<PyList>().ok()?;
+        for base in bases.iter() {
+            let baseinfo = base.getattr("type").ok()?;
+            if !visited.iter().any(|v| v.is(baseinfo)) {
+                visited.push(baseinfo);
+                worklist.push(baseinfo);
+            }
+        }
+    }
+    Some(false)
+}
+
+/// `configure_base_classes` MRO tail (semanal.py:3390-3397 + 3512-3526).
+/// Rust walks the live `TypeInfo` (`info.bases`, each `base.type`) via PyO3,
+/// runs the `is_base_class` cycle walk per base and the
+/// `find_duplicate(direct_base_classes())` scan, and returns one 3-way tag
+/// plus the facts Python needs for its `fail` emissions: the indices of the
+/// cyclic bases (one "Cycle in inheritance hierarchy" fail each, in
+/// `info.bases` order) and the duplicate base's name. Python keeps
+/// `set_dummy_mro` / `set_any_mro` / `calculate_class_mro` (plugins stay
+/// live). Defers (`None`) on any unreadable attribute, mirroring the
+/// exception-only deferral of the sibling classifiers.
+#[pyfunction]
+pub(crate) fn rust_classify_configure_mro(
+    info: &PyAny,
+) -> PyResult<Option<(i64, Vec<i64>, Option<String>)>> {
+    let bases = match info.getattr("bases") {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let bases = match bases.downcast::<PyList>() {
+        Ok(l) => l,
+        Err(_) => return Ok(None),
+    };
+    let mut baseinfos: Vec<&PyAny> = Vec::with_capacity(bases.len());
+    let mut cyclic: Vec<usize> = Vec::new();
+    for (i, base) in bases.iter().enumerate() {
+        let baseinfo = match base.getattr("type") {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        match is_base_class_walk(info, baseinfo) {
+            Some(true) => cyclic.push(i),
+            Some(false) => {}
+            None => return Ok(None),
+        }
+        baseinfos.push(baseinfo);
+    }
+    let mut dup: Option<&PyAny> = None;
+    'outer: for i in 1..baseinfos.len() {
+        for j in 0..i {
+            let is_eq = match baseinfos[i].rich_compare(baseinfos[j], CompareOp::Eq) {
+                Ok(e) => e,
+                Err(_) => return Ok(None),
+            };
+            match is_eq.is_true() {
+                Ok(true) => {
+                    dup = Some(baseinfos[i]);
+                    break 'outer;
+                }
+                Ok(false) => {}
+                Err(_) => return Ok(None),
+            }
+        }
+    }
+    let dup_name = match dup {
+        Some(d) => match d.getattr("name") {
+            Ok(n) => match n.extract::<String>() {
+                Ok(s) => Some(s),
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        },
+        None => None,
+    };
+    let (tag, cyclic_idx, dup_name) = configure_mro_tail_inner(&cyclic, dup_name.as_deref());
+    Ok(Some((
+        tag,
+        cyclic_idx.into_iter().map(|i| i as i64).collect(),
+        dup_name,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +773,124 @@ mod tests {
         assert_ne!(LVALUE_KIND_PASS, LVALUE_KIND_TYPEVAR);
         assert_ne!(LVALUE_KIND_PASS, LVALUE_KIND_TYPEINFO);
         assert_ne!(LVALUE_KIND_TYPEVAR, LVALUE_KIND_TYPEINFO);
+    }
+
+    // configure_base_classes per-base classifier (pure core).
+
+    fn classify_base(
+        kind: i64,
+        is_newtype: bool,
+        disallow_subclassing_any: bool,
+        unimported_any: Option<bool>,
+        explicit_any: Option<bool>,
+    ) -> Option<(i64, bool, bool)> {
+        classify_configure_base_inner(
+            kind,
+            is_newtype,
+            disallow_subclassing_any,
+            unimported_any,
+            explicit_any,
+        )
+    }
+
+    #[test]
+    fn tuple_base_tag() {
+        assert_eq!(
+            classify_base(KIND_TUPLE, false, false, Some(false), Some(false)),
+            Some((CONFIGURE_TUPLE, false, false))
+        );
+    }
+
+    #[test]
+    fn instance_base_split_on_newtype() {
+        assert_eq!(
+            classify_base(KIND_INSTANCE, false, false, Some(false), Some(false)),
+            Some((CONFIGURE_INSTANCE, false, false))
+        );
+        assert_eq!(
+            classify_base(KIND_INSTANCE, true, false, Some(false), Some(false)),
+            Some((CONFIGURE_INSTANCE_NEWTYPE_FAIL, false, false))
+        );
+    }
+
+    #[test]
+    fn any_base_split_on_disallow_subclassing() {
+        assert_eq!(
+            classify_base(KIND_ANY, false, false, Some(false), Some(false)),
+            Some((CONFIGURE_ANY_OK, false, false))
+        );
+        assert_eq!(
+            classify_base(KIND_ANY, false, true, Some(false), Some(false)),
+            Some((CONFIGURE_ANY_FAIL, false, false))
+        );
+    }
+
+    #[test]
+    fn typeddict_fallback_tag() {
+        assert_eq!(
+            classify_base(KIND_TYPEDDICT, false, false, Some(false), Some(false)),
+            Some((CONFIGURE_TYPEDDICT_FALLBACK, false, false))
+        );
+    }
+
+    #[test]
+    fn other_kinds_are_invalid_base() {
+        for kind in [KIND_OTHER, 99, -1] {
+            assert_eq!(
+                classify_base(kind, false, false, Some(false), Some(false)),
+                Some((CONFIGURE_INVALID_BASE, false, false))
+            );
+        }
+    }
+
+    #[test]
+    fn unimported_and_explicit_flags_pass_through() {
+        assert_eq!(
+            classify_base(KIND_INSTANCE, false, false, Some(true), Some(true)),
+            Some((CONFIGURE_INSTANCE, true, true))
+        );
+        assert_eq!(
+            classify_base(KIND_ANY, false, true, Some(true), Some(false)),
+            Some((CONFIGURE_ANY_FAIL, true, false))
+        );
+    }
+
+    #[test]
+    fn deferred_any_walk_defers_whole_base() {
+        // A nested TypeAliasType makes the any-walks defer (None); the
+        // classifier must defer the whole base.
+        assert!(classify_base(KIND_INSTANCE, false, false, None, Some(false)).is_none());
+        assert!(classify_base(KIND_INSTANCE, false, false, Some(false), None).is_none());
+    }
+
+    #[test]
+    fn mro_tail_dummy_wins_over_any() {
+        let (tag, cyclic, dup) = configure_mro_tail_inner(&[0, 2], Some("B"));
+        assert_eq!(tag, MRO_DUMMY);
+        assert_eq!(cyclic, vec![0, 2]);
+        assert_eq!(dup, None);
+    }
+
+    #[test]
+    fn mro_tail_any_on_duplicate_only() {
+        let (tag, cyclic, dup) = configure_mro_tail_inner(&[], Some("B"));
+        assert_eq!(tag, MRO_ANY);
+        assert!(cyclic.is_empty());
+        assert_eq!(dup, Some("B".to_string()));
+    }
+
+    #[test]
+    fn mro_tail_proceed_when_clean() {
+        let (tag, cyclic, dup) = configure_mro_tail_inner(&[], None);
+        assert_eq!(tag, MRO_PROCEED);
+        assert!(cyclic.is_empty());
+        assert_eq!(dup, None);
+    }
+
+    #[test]
+    fn mro_tail_constants_are_distinct() {
+        assert_ne!(MRO_DUMMY, MRO_ANY);
+        assert_ne!(MRO_DUMMY, MRO_PROCEED);
+        assert_ne!(MRO_ANY, MRO_PROCEED);
     }
 }

@@ -1516,6 +1516,17 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_bases::rust_classify_add_metaclass,
         module
     )?)?;
+    // semanal_bases: configure_base_classes per-base classifier + MRO tail.
+    // Rust owns the wire classification and MRO tag; fails, fallback_to_any,
+    // info.bases, configure_tuple_base_class, and the mro writes stay in Python.
+    module.add_function(wrap_pyfunction!(
+        semanal_bases::rust_classify_configure_bases,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_bases::rust_classify_configure_mro,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_checks::rust_classify_function_signature,
         module

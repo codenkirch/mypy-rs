@@ -168,14 +168,14 @@ from mypy.types import (
 
 # Solving the import cycle:
 import mypy.expandtype  # ruff: isort: skip
-from mypy.checker_shared import TypeRange
 from mypy.checker import TypeChecker, TypeMap
+from mypy.checker_shared import TypeRange
 from mypy.checkexpr import ExpressionChecker
+from mypy.checkstrformat import ConversionSpecifier
 from mypy.constraints import Constraint
 from mypy.errorcodes import ErrorCode
 from mypy.nodes import Lvalue, SuperExpr, TypeAlias
 from mypy.patterns import ClassPattern
-from mypy.checkstrformat import ConversionSpecifier
 
 
 class TypesSuite(Suite):
@@ -3089,7 +3089,7 @@ class NativeJoinTypesSuite(Suite):
     def test_join_uninhabited_uninhabited_returns_uninhabited(self) -> None:
         # s=Uninhabited, t=Uninhabited: no swap, visit_uninhabited
         # returns s (UninhabitedType).
-        from mypy.join import join_types
+        pass
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -7987,7 +7987,10 @@ class NativeInstantiateTypeAliasSuite(Suite):
         )
 
     def _assert_engages(self, node: TypeAlias, args: list[Type], no_args: bool) -> None:
-        from mypy.typeanal import _rust_instantiate_type_alias, _serialize_typeanal_type  # type: ignore[attr-defined]
+        from mypy.typeanal import (  # type: ignore[attr-defined]
+            _rust_instantiate_type_alias,
+            _serialize_typeanal_type,
+        )
 
         result = _rust_instantiate_type_alias(
             node, [_serialize_typeanal_type(a) for a in args], no_args, False
@@ -9926,7 +9929,10 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         callee: CallableType,
         f2a: list[list[int]],
     ) -> None:
-        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr  # type: ignore[attr-defined]
+        from mypy.checkexpr import (  # type: ignore[attr-defined]
+            _rust_check_argument_types_plan,
+            _serialize_type_for_checkexpr,
+        )
 
         assert _rust_check_argument_types_plan is not None
         result = _rust_check_argument_types_plan(
@@ -10004,7 +10010,10 @@ class NativeCheckArgumentTypesPlanSuite(Suite):
         self._run([fx.a, fx.b], [ARG_POS, ARG_POS], callee, [[0], [1]], assert_engages=False)
         # The seam must actively refuse the alias (prove the seal, not a
         # silent pass-through).
-        from mypy.checkexpr import _rust_check_argument_types_plan, _serialize_type_for_checkexpr  # type: ignore[attr-defined]
+        from mypy.checkexpr import (  # type: ignore[attr-defined]
+            _rust_check_argument_types_plan,
+            _serialize_type_for_checkexpr,
+        )
 
         result = _rust_check_argument_types_plan(
             self._resolver,
@@ -10074,7 +10083,7 @@ class NativeEqualityValueInfoSuite(Suite):
     def _normalize(
         self, info: object
     ) -> tuple[bool, frozenset[tuple[str, frozenset[str], frozenset[str]]]]:
-        from mypy.checker import EqualityDomainInfo, EqualityValueInfo
+        from mypy.checker import EqualityValueInfo
 
         assert isinstance(info, EqualityValueInfo)
         return (
@@ -22633,7 +22642,6 @@ class NativeAndOrConditionalMapsSuite(Suite):
         into one). Reusing the cached key across maps mirrors production,
         where the same narrowed expression object appears in both TypeMaps.
         """
-        from mypy.checker import TypeMap
 
         m: TypeMap = {}
         for name, t in pairs:
@@ -24945,7 +24953,6 @@ class NativeCompatibilityClassvarSuperSuite(Suite):
     def _run(
         self, node: Any, base: Any, base_node: Any
     ) -> tuple[bool, list[tuple[str, str]]]:
-        from types import SimpleNamespace
 
         from mypy.checker import TypeChecker
 
@@ -25033,7 +25040,6 @@ class NativeNewSignatureSuite(Suite):
         self._set_active(True)
 
     def tearDown(self) -> None:
-        from mypy.checker import _set_native_checker_active
 
         self._set_active(False)
 
@@ -25734,7 +25740,6 @@ class NativeIsFinalEnumValueSuite(Suite):
         return _type_kernel.rust_is_final_enum_value(self._sym(node), is_stub)
 
     def _run(self, node: Any, is_stub: bool) -> tuple[bool, bool]:
-        from types import SimpleNamespace
 
         from mypy.checker import TypeChecker
 
@@ -30852,7 +30857,6 @@ class NativeMatchArgsSuite(Suite):
         self._set_active(True)
 
     def tearDown(self) -> None:
-        from mypy.checker import _set_native_checker_active
 
         self._set_active(False)
 
@@ -30872,8 +30876,8 @@ class NativeMatchArgsSuite(Suite):
         return _serialize_type_for_checker(t)
 
     def _class_scope(self) -> Any:
-        from mypy.nodes import Block, ClassDef, SymbolTable
         from mypy.checker_shared import CheckerScope
+        from mypy.nodes import Block, ClassDef, SymbolTable
 
         info = TypeInfo(SymbolTable(), ClassDef("C", Block([]), None, []), "mod")
         scope = CheckerScope.__new__(CheckerScope)
@@ -30881,8 +30885,8 @@ class NativeMatchArgsSuite(Suite):
         return scope
 
     def _module_scope(self) -> Any:
-        from mypy.nodes import MypyFile
         from mypy.checker_shared import CheckerScope
+        from mypy.nodes import MypyFile
 
         mod = MypyFile([], [], False, {})
         scope = CheckerScope.__new__(CheckerScope)
@@ -32584,7 +32588,9 @@ class NativeAnalyzeCallableTypeSuite(Suite):
         arg0_is_ellipsis: bool,
         disallow_any_generics: bool,
     ) -> None:
-        from mypy.typeanal import _rust_classify_analyze_callable_type  # type: ignore[attr-defined]
+        from mypy.typeanal import (  # type: ignore[attr-defined]
+            _rust_classify_analyze_callable_type,
+        )
 
         tag = _rust_classify_analyze_callable_type(
             arg_count,
@@ -33299,7 +33305,7 @@ class NativeIndexWithTypeSuite(Suite):
             e = IndexExpr(NameExpr("base"), index)
             try:
                 result = ec.visit_index_with_type(left, e)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 result = "EXC:" + type(exc).__name__
             return (str(result), e.method_type, tuple(obs), len(accepts))
 
@@ -33415,32 +33421,40 @@ class NativeGetattrMethodSuite(Suite):
     # -- direct seam calls -------------------------------------------------
 
     def test_seam_module_scope_getattribute(self) -> None:
-        from mypy.checker import NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
-        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
+        from mypy.checker import (  # type: ignore[attr-defined]
+            NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE,
+            _rust_classify_getattr_method,
+        )
 
         assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattribute__") == (
             NATIVE_GETATTR_METHOD_MODULE_GETATTRIBUTE
         )
 
     def test_seam_module_scope_getattr(self) -> None:
-        from mypy.checker import NATIVE_GETATTR_METHOD_MODULE
-        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
+        from mypy.checker import (  # type: ignore[attr-defined]
+            NATIVE_GETATTR_METHOD_MODULE,
+            _rust_classify_getattr_method,
+        )
 
         assert _rust_classify_getattr_method(_FakeScope(module=True), "__getattr__") == (
             NATIVE_GETATTR_METHOD_MODULE
         )
 
     def test_seam_class_scope(self) -> None:
-        from mypy.checker import NATIVE_GETATTR_METHOD_CLASS
-        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
+        from mypy.checker import (  # type: ignore[attr-defined]
+            NATIVE_GETATTR_METHOD_CLASS,
+            _rust_classify_getattr_method,
+        )
 
         assert _rust_classify_getattr_method(_FakeScope(module=False, cls=True), "__getattr__") == (
             NATIVE_GETATTR_METHOD_CLASS
         )
 
     def test_seam_other_scope_pass(self) -> None:
-        from mypy.checker import NATIVE_GETATTR_METHOD_PASS
-        from mypy.checker import _rust_classify_getattr_method  # type: ignore[attr-defined]
+        from mypy.checker import (  # type: ignore[attr-defined]
+            NATIVE_GETATTR_METHOD_PASS,
+            _rust_classify_getattr_method,
+        )
 
         assert _rust_classify_getattr_method(_FakeScope(module=False, cls=False), "__getattr__") == (
             NATIVE_GETATTR_METHOD_PASS
@@ -33528,8 +33542,8 @@ def expect_fail_check(module: bool, name: str, ok: bool, cls: bool) -> bool:
 def _make_getattr_sig(ok: bool, cls: bool = False) -> object:
     """A `__getattr__` signature matching the arity the method expects."""
     from mypy.nodes import ARG_POS
-    from mypy.types import AnyType, CallableType, Instance, Type, TypeOfAny
     from mypy.test.typefixture import TypeFixture
+    from mypy.types import AnyType, CallableType, Instance, TypeOfAny
 
     fx = TypeFixture()
     args: list[Type] = [Instance(fx.make_type_info("builtins.str"), [])]
@@ -33987,7 +34001,9 @@ class NativeCheckWarnDeprecatedSuite(Suite):
         assert_equal(captured, [("note", "use mod.B instead")])
 
     def _assert_direct(self, tag: int, **kwargs: Any) -> None:
-        from mypy.typeanal import _rust_classify_check_warn_deprecated  # type: ignore[attr-defined]
+        from mypy.typeanal import (  # type: ignore[attr-defined]
+            _rust_classify_check_warn_deprecated,
+        )
 
         result = _rust_classify_check_warn_deprecated(
             kwargs.get("deprecated", "x"),
@@ -34470,7 +34486,7 @@ class NativeAttributeTriggersSuite(Suite):
         )
 
     def test_gate_off_matches_python(self) -> None:
-        from mypy.server.deps import _HAS_TYPE_KERNEL, DependencyVisitor
+        from mypy.server.deps import _HAS_TYPE_KERNEL
 
         assert _HAS_TYPE_KERNEL
         self._set_active(False)
@@ -36486,3 +36502,335 @@ class NativeReturnStmtSuite(Suite):
     def test_parity_check_subtype(self) -> None:
         msgs = self._run(self._defn(), self.fx.str_type, expr_type=self.fx.a)
         assert len(msgs) == 1 and msgs[0][0] == "subtype"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeConfigureBasesSuite(Suite):
+    """Parity for the Rust `configure_base_classes` classifier + MRO tail port.
+
+    `SemanticAnalyzer.configure_base_classes` (semanal.py:3348-3397) runs one
+    ProperType isinstance chain per base (tuple / instance / Any / TypedDict
+    / else) plus the disallow_any_unimported and check_for_explicit_any
+    predicates, then folds verify_base_classes +
+    verify_duplicate_base_classes into a 3-way MRO tail (dummy / any /
+    proceed). Rust (`semanal_bases.rs`) owns both decisions; Python keeps
+    configure_tuple_base_class, every fail, info.fallback_to_any, info.bases,
+    the implicit-object append, and the mro writes. Direct seam calls assert
+    the exact tags and flag fold; the gate-off vs gate-on differential drives
+    the real SemanticAnalyzer method through stub recorders and asserts
+    identical observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _ser(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    # Movement (a): direct seam tag tests.
+
+    def _classify(
+        self,
+        bases: list[Type],
+        is_newtypes: list[bool],
+        disallow_subclassing_any: bool = False,
+        disallow_any_unimported: bool = False,
+        disallow_any_explicit: bool = False,
+        is_typeshed_stub_file: bool = False,
+    ) -> list[tuple[int, bool, bool]] | None:
+        return _type_kernel.rust_classify_configure_bases(
+            [self._ser(b) for b in bases],
+            is_newtypes,
+            disallow_subclassing_any,
+            disallow_any_unimported,
+            disallow_any_explicit,
+            is_typeshed_stub_file,
+        )
+
+    def test_seam_engages_instance(self) -> None:
+        from mypy.semanal import _CONFIGURE_INSTANCE, _CONFIGURE_INSTANCE_NEWTYPE_FAIL
+
+        fx = TypeFixture()
+        result = self._classify([fx.str_type], [False])
+        assert result == [(_CONFIGURE_INSTANCE, False, False)]
+        result = self._classify([Instance(fx.oi, [])], [True])
+        assert result == [(_CONFIGURE_INSTANCE_NEWTYPE_FAIL, False, False)]
+
+    def test_seam_tuple_and_typeddict_and_invalid(self) -> None:
+        from mypy.semanal import (
+            _CONFIGURE_INVALID_BASE,
+            _CONFIGURE_TUPLE,
+            _CONFIGURE_TYPEDDICT_FALLBACK,
+        )
+
+        fx = TypeFixture()
+        result = self._classify([TupleType([fx.a], fx.o)], [False])
+        assert result == [(_CONFIGURE_TUPLE, False, False)]
+        result = self._classify([TypedDictType({}, set(), set(), fx.str_type)], [False])
+        assert result == [(_CONFIGURE_TYPEDDICT_FALLBACK, False, False)]
+        result = self._classify([NoneType()], [False])
+        assert result == [(_CONFIGURE_INVALID_BASE, False, False)]
+
+    def test_seam_any_ok_and_fail(self) -> None:
+        from mypy.semanal import _CONFIGURE_ANY_FAIL, _CONFIGURE_ANY_OK
+
+        fx = TypeFixture()
+        result = self._classify([fx.anyt], [False])
+        assert result == [(_CONFIGURE_ANY_OK, False, False)]
+        result = self._classify([fx.anyt], [False], disallow_subclassing_any=True)
+        assert result == [(_CONFIGURE_ANY_FAIL, False, False)]
+
+    def test_seam_unimported_and_explicit_flag_fold(self) -> None:
+        fx = TypeFixture()
+        unimported = AnyType(TypeOfAny.from_unimported_type)
+        # Instance arg carries the unimported Any; option gates the flag.
+        plain = Instance(fx.oi, [fx.a])
+        carrying = Instance(fx.oi, [unimported])
+        result = self._classify([carrying], [False], disallow_any_unimported=True)
+        assert result is not None and result[0][1] is True
+        result = self._classify([carrying], [False])
+        assert result == [(2, False, False)]
+        result = self._classify([plain], [False], disallow_any_unimported=True)
+        assert result == [(2, False, False)]
+        # check_for_explicit_any: disallow_any_explicit and not typeshed stub.
+        # A bare explicit Any base is the ANY_OK (4) arm.
+        explicit = AnyType(TypeOfAny.explicit)
+        result = self._classify([explicit], [False], disallow_any_explicit=True)
+        assert result == [(4, False, True)]
+        result = self._classify(
+            [explicit], [False], disallow_any_explicit=True, is_typeshed_stub_file=True
+        )
+        assert result == [(4, False, False)]
+        # The unimported walk descends into tuples too.
+        result = self._classify(
+            [TupleType([unimported], fx.o)], [False], disallow_any_unimported=True
+        )
+        assert result is not None and result[0][0] == 1 and result[0][1] is True
+
+    def test_seam_defers_on_garbage(self) -> None:
+        result = _type_kernel.rust_classify_configure_bases(
+            [b"\x63not-a-type"], [False], False, False, False, False
+        )
+        assert result is None
+
+    # Movement (b)/(c): gate-off vs gate-on differential via the shim.
+
+    def _info(self, name: str = "A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = f"mod.{name}"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro.append(info)
+        return info
+
+    def _run_case(
+        self,
+        make_bases: Callable[[TypeInfo], list[tuple[Any, Expression]]],
+        gate: bool,
+        options: Options | None = None,
+    ) -> tuple[object, object, object, object]:
+        from types import SimpleNamespace
+
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> tuple[object, object, object, object]:
+            fx = self.fx
+            info = self._info()
+            defn = info.defn
+            records: list[object] = []
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            sa.options = options if options is not None else Options()
+            sa._is_typeshed_stub_file = False
+            sa.fail = lambda msg, ctx, serious=False, blocker=False, code=None: records.append(  # type: ignore[method-assign, misc]
+                ("fail", str(msg), blocker)
+            )
+            sa.msg = SimpleNamespace(  # type: ignore[assignment]
+                unimported_type_becomes_any=lambda prefix, t, ctx: records.append(
+                    ("unimported", prefix, str(t))
+                ),
+                explicit_any=lambda ctx: records.append(("explicit",)),
+            )
+            sa.object_type = lambda: fx.o  # type: ignore[method-assign]
+            sa.get_name_repr_of_expr = lambda e: getattr(e, "name", None)  # type: ignore[method-assign, assignment]
+            sa.configure_tuple_base_class = lambda defn, base: base.partial_fallback  # type: ignore[method-assign]
+            sa.set_dummy_mro = lambda info: records.append(("dummy_mro",))  # type: ignore[method-assign]
+            sa.set_any_mro = lambda info: records.append(("any_mro",))  # type: ignore[method-assign]
+            sa.calculate_class_mro = lambda defn, obj: records.append(("mro",))  # type: ignore[method-assign, assignment, misc]
+            sa.configure_base_classes(defn, make_bases(info))
+            return (
+                list(records),
+                info.fallback_to_any,
+                info.bad_mro,
+                [str(b) for b in info.bases],
+            )
+
+        return self._with_gate(gate, check_one)
+
+    def _assert_par(
+        self,
+        make_bases: Callable[[TypeInfo], list[tuple[Any, Expression]]],
+        options: Options | None = None,
+    ) -> None:
+        off = self._run_case(make_bases, gate=False, options=options)
+        on = self._run_case(make_bases, gate=True, options=options)
+        assert_equal(on, off, f"configure_base_classes parity bases={make_bases}")
+
+    def test_parity_plain_instance(self) -> None:
+        fx = self.fx
+        self._assert_par(lambda info: [(fx.str_type, NameExpr("B"))])
+
+    def test_parity_implicit_object(self) -> None:
+        self._assert_par(lambda info: [])
+
+    def test_parity_newtype_fail(self) -> None:
+        nt = TypeInfo(SymbolTable(), self._info("NT").defn, "mod")
+        nt.is_newtype = True
+        self._assert_par(lambda info: [(Instance(nt, []), NameExpr("NT"))])
+
+    def test_parity_any_ok(self) -> None:
+        fx = self.fx
+        self._assert_par(lambda info: [(fx.a, NameExpr("Whatevs"))])
+
+    def test_parity_any_fail_named(self) -> None:
+        fx = self.fx
+        options = Options()
+        options.disallow_subclassing_any = True
+        self._assert_par(lambda info: [(fx.a, NameExpr("Whatevs"))], options)
+
+    def test_parity_any_fail_member_expr(self) -> None:
+        fx = self.fx
+        options = Options()
+        options.disallow_subclassing_any = True
+        expr = MemberExpr(NameExpr("m"), "attr")
+        self._assert_par(lambda info: [(fx.a, expr)], options)
+
+    def test_parity_typeddict_fallback(self) -> None:
+        fx = self.fx
+        self._assert_par(
+            lambda info: [(TypedDictType({}, set(), set(), fx.str_type), NameExpr("TD"))]
+        )
+
+    def test_parity_tuple_base(self) -> None:
+        fx = self.fx
+        self._assert_par(lambda info: [(TupleType([fx.a], fx.o), NameExpr("tup"))])
+
+    def test_parity_invalid_base_named_and_anon(self) -> None:
+        self._assert_par(lambda info: [(NoneType(), NameExpr("Bad"))])
+        self._assert_par(lambda info: [(NoneType(), IntExpr(1))])
+
+    def test_parity_unimported_any_flag(self) -> None:
+        fx = self.fx
+        options = Options()
+        options.disallow_any_unimported = True
+        carrying = Instance(fx.oi, [AnyType(TypeOfAny.from_unimported_type)])
+        self._assert_par(lambda info: [(carrying, NameExpr("B"))], options)
+
+    def test_parity_explicit_any_flag(self) -> None:
+        fx = self.fx
+        options = Options()
+        options.disallow_any_explicit = True
+        self._assert_par(lambda info: [(fx.a, NameExpr("B"))], options)
+
+    def test_parity_cycle_dummy_mro(self) -> None:
+        self._assert_par(lambda info: [(Instance(info, []), NameExpr("A"))])
+
+    def test_parity_duplicate_base_any_mro(self) -> None:
+        def make(info: TypeInfo) -> list[tuple[ProperType, Expression]]:
+            b = self._info("B")
+            return [(Instance(b, []), NameExpr("B")), (Instance(b, []), NameExpr("B"))]
+
+        self._assert_par(make)
+
+    def test_parity_clean_mro_proceed(self) -> None:
+        def make(info: TypeInfo) -> list[tuple[ProperType, Expression]]:
+            b = self._info("B")
+            return [(Instance(b, []), NameExpr("B"))]
+
+        self._assert_par(make)
+
+    # Movement (c): deferral audit — the gated shim falls back to Python.
+
+    def test_seam_mro_defers_on_non_typeinfo(self) -> None:
+        from types import SimpleNamespace
+
+        from mypy.semanal import _CONFIGURE_MRO_PROCEED
+
+        # A well-formed clean TypeInfo decides PROCEED...
+        info = self._info()
+        b = self._info("B")
+        info.bases = [Instance(b, [])]
+        result = _type_kernel.rust_classify_configure_mro(info)
+        assert result == (_CONFIGURE_MRO_PROCEED, [], None)
+        # ...while an unreadable object defers (None) to the Python verify.
+        assert _type_kernel.rust_classify_configure_mro(SimpleNamespace()) is None  # type: ignore[arg-type]
+        assert _type_kernel.rust_classify_configure_mro(info.defn) is None  # type: ignore[arg-type]
+
+    def test_seam_mro_direct_tags(self) -> None:
+        from mypy.semanal import (
+            _CONFIGURE_MRO_ANY,
+            _CONFIGURE_MRO_DUMMY,
+            _CONFIGURE_MRO_PROCEED,
+        )
+
+        # Self-cycle: info lists itself as a base -> DUMMY with the cyclic index.
+        info = self._info()
+        info.bases = [Instance(info, [])]
+        result = _type_kernel.rust_classify_configure_mro(info)
+        assert result == (_CONFIGURE_MRO_DUMMY, [0], None)
+        # No bases at all -> proceed (implicit object is a Python-side append).
+        result = _type_kernel.rust_classify_configure_mro(self._info())
+        assert result == (_CONFIGURE_MRO_PROCEED, [], None)
+        info2 = self._info("C")
+        b = self._info("B")
+        info2.bases = [Instance(b, []), Instance(b, [])]
+        result = _type_kernel.rust_classify_configure_mro(info2)
+        assert result == (_CONFIGURE_MRO_ANY, [], "B")
+
+    def test_shim_falls_back_when_kernel_symbol_missing(self) -> None:
+        import mypy.semanal as semanal_mod
+
+        fx = self.fx
+        make: Callable[[TypeInfo], list[tuple[Any, Expression]]] = (
+            lambda info: [(fx.str_type, NameExpr("B"))]
+        )
+        saved = semanal_mod._rust_classify_configure_bases  # type: ignore[attr-defined]
+        semanal_mod._rust_classify_configure_bases = None  # type: ignore[attr-defined, assignment]
+        try:
+            off = self._run_case(make, gate=False)
+            on = self._run_case(make, gate=True)
+        finally:
+            semanal_mod._rust_classify_configure_bases = saved  # type: ignore[attr-defined]
+        assert_equal(on, off)
+
+    def test_shim_falls_back_when_garbage_blob(self) -> None:
+        # An undecodable wire blob must defer the whole seam: the Rust
+        # classifier returns None and the shim re-runs the pure body.
+        import mypy.semanal as semanal_mod
+
+        fx = self.fx
+        saved = semanal_mod._serialize_semanal_type
+        semanal_mod._serialize_semanal_type = lambda t: b"\x63garbage"
+        try:
+            off = self._run_case(lambda info: [(fx.str_type, NameExpr("B"))], gate=False)
+            on = self._run_case(lambda info: [(fx.str_type, NameExpr("B"))], gate=True)
+        finally:
+            semanal_mod._serialize_semanal_type = saved
+        assert_equal(on, off)

@@ -43,8 +43,8 @@ use crate::typeinfo::NativeTypeResolver;
 use crate::wire::{read_type, write_type, ExtraAttrs, Parameters, ReadBuffer, Type, WriteBuffer};
 
 // TypeOfAny constants (mirror mypy/types.py:213-239).
-const EXPLICIT: i64 = 2;
-const FROM_UNIMPORTED_TYPE: i64 = 3;
+pub(crate) const EXPLICIT: i64 = 2;
+pub(crate) const FROM_UNIMPORTED_TYPE: i64 = 3;
 const SPECIAL_FORM: i64 = 6;
 
 fn decode_type(bytes: &[u8]) -> Option<Type> {
@@ -90,7 +90,7 @@ pub(crate) fn rust_has_any_from_unimported_type(type_bytes: &[u8]) -> PyResult<O
 /// ANY_STRATEGY (default False) bool query over the wire type, comparing
 /// `AnyType.type_of_any` against `wanted`. Any child deferring (alias) makes
 /// the whole result defer (`None`) to match the Python fallback.
-fn has_explicit_any_inner(t: &Type, wanted: i64) -> Option<bool> {
+pub(crate) fn has_explicit_any_inner(t: &Type, wanted: i64) -> Option<bool> {
     // TypeAliasType needs the live target to expand (mirrors
     // rust_has_recursive_types); can't conclude from the wire.
     if matches!(t, Type::TypeAliasType { .. }) {
