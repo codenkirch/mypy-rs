@@ -5,9 +5,10 @@
 //! - `check_function_signature` (semanal.py:2072) count arbitration
 //! - `check_decorated_function_is_method` (semanal.py:2256) predicate
 //! - `check_fixed_args` (semanal.py:6962) arg-count + arg-kinds arbitration
+//! - `should_wait_rhs` (semanal.py:4179) assignment-rvalue wait predicate
 
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyString, PyType};
 
 // ---------------------------------------------------------------------------
 // check_function_signature count arbitration (issue #940)
@@ -136,6 +137,270 @@ pub(crate) fn rust_classify_fixed_args(
     Ok(Some(classify_fixed_args(args_len, &arg_kinds, numargs)))
 }
 
+// ---------------------------------------------------------------------------
+// should_wait_rhs predicate (issue #1008)
+// ---------------------------------------------------------------------------
+
+/// Step tags for the rvalue dispatch; must match `NATIVE_WAIT_RHS_*` in
+/// mypy/semanal.py.
+pub(crate) const WAIT_RHS_FALSE: u8 = 0;
+pub(crate) const WAIT_RHS_LOOKUP_NAME: u8 = 1;
+pub(crate) const WAIT_RHS_LOOKUP_QUALIFIED: u8 = 2;
+pub(crate) const WAIT_RHS_DESCEND: u8 = 3;
+
+/// Node-kind tags for the rvalue dispatch.
+const KIND_NAME: u8 = 0;
+const KIND_MEMBER: u8 = 1;
+const KIND_INDEX: u8 = 2;
+const KIND_CALL: u8 = 3;
+const KIND_OTHER: u8 = 4;
+
+/// Bound on the IndexExpr.base / CallExpr.callee descent. The Python
+/// recursion is unbounded, but every descent step requires the child to be
+/// a `RefExpr`, and the next iteration dispatches on the child's kind, so
+/// real chains are a few links long. Past the bound the seam defers and
+/// the pure-Python body runs unchanged.
+const WAIT_RHS_MAX_DEPTH: usize = 512;
+
+/// Pure decision core of the rvalue step dispatch, kept separate from the
+/// PyO3 entry so the table is unit-testable without a Python runtime.
+///
+/// `kind` is one of the KIND_* tags; `has_fullname` mirrors
+/// `get_member_expr_fullname(rv) is not None` for MemberExpr; `child_is_ref`
+/// mirrors `isinstance(child, RefExpr)` for IndexExpr.base / CallExpr.callee.
+fn classify_should_wait_rhs_step(kind: u8, has_fullname: bool, child_is_ref: bool) -> u8 {
+    match kind {
+        KIND_NAME => WAIT_RHS_LOOKUP_NAME,
+        KIND_MEMBER => {
+            if has_fullname {
+                WAIT_RHS_LOOKUP_QUALIFIED
+            } else {
+                WAIT_RHS_FALSE
+            }
+        }
+        KIND_INDEX | KIND_CALL => {
+            if child_is_ref {
+                WAIT_RHS_DESCEND
+            } else {
+                WAIT_RHS_FALSE
+            }
+        }
+        _ => WAIT_RHS_FALSE,
+    }
+}
+
+/// Pure decision core of the lookup-result classification
+/// (`n and isinstance(n.node, PlaceholderNode) and not
+/// n.node.becomes_typeinfo`).
+fn placeholder_waits(is_placeholder: bool, becomes_typeinfo: bool) -> bool {
+    is_placeholder && !becomes_typeinfo
+}
+
+/// Pure core of the `f"{initial}.{expr.name}"` tail of
+/// `get_member_expr_fullname` (nodes.py:5475). `initial` is `None` when the
+/// chain cannot be represented; the join then yields `None` too.
+fn member_fullname_join(initial: Option<&str>, member: &str) -> Option<String> {
+    initial.map(|i| format!("{}.{}", i, member))
+}
+
+/// Port of `get_member_expr_fullname` (nodes.py:5475-5486) as a bounded
+/// recursive walk over `expr.expr` chains of NameExpr/MemberExpr.
+///
+/// Returns `Ok(None)` to defer when an attribute is unreadable (the Python
+/// caller falls back to the pure-Python body), `Some(None)` when the chain
+/// is not representable as `a.b.c` (Python returns `None`), and
+/// `Some(Some(name))` with the dotted chain.
+fn member_expr_fullname_rust(
+    expr: &PyAny,
+    name_cls: &PyType,
+    member_cls: &PyType,
+    depth: usize,
+) -> PyResult<Option<Option<String>>> {
+    if depth > WAIT_RHS_MAX_DEPTH {
+        return Ok(None);
+    }
+    let inner = match expr.getattr("expr") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let initial: Option<String> = if inner.is_instance(name_cls)? {
+        match inner.getattr("name") {
+            Ok(v) => match v.downcast::<PyString>() {
+                Ok(s) => Some(s.to_str()?.to_string()),
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        }
+    } else if inner.is_instance(member_cls)? {
+        match member_expr_fullname_rust(inner, name_cls, member_cls, depth + 1)? {
+            Some(v) => v,
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    if initial.is_none() {
+        return Ok(Some(None));
+    }
+    let name = match expr.getattr("name") {
+        Ok(v) => match v.downcast::<PyString>() {
+            Ok(s) => s.to_str()?.to_string(),
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(member_fullname_join(initial.as_deref(), &name)))
+}
+
+/// Classify the lookup result `n` (a `SymbolTableNode | None`):
+/// `Some(true)` when the symbol is a `PlaceholderNode` that does not
+/// become typeinfo (wait), `Some(false)` otherwise, `None` to defer when
+/// an attribute is unreadable. Truthiness of `n` is mirrored via `is_true`
+/// so a falsy symbol node behaves exactly like Python's `if n and ...`.
+fn should_wait_for_symbol(n: &PyAny, placeholder_cls: &PyType) -> PyResult<Option<bool>> {
+    let truthy = match n.is_true() {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    if !truthy {
+        return Ok(Some(false));
+    }
+    let node = match n.getattr("node") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    if !node.is_instance(placeholder_cls)? {
+        return Ok(Some(false));
+    }
+    let becomes_typeinfo = match node.getattr("becomes_typeinfo") {
+        Ok(v) => match v.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(placeholder_waits(true, becomes_typeinfo)))
+}
+
+/// `#[pyfunction]` entry for `SemanticAnalyzer.should_wait_rhs`
+/// (semanal.py:4179-4206).
+///
+/// `semanal` is the live `SemanticAnalyzer` (`self`) and `rv` the rvalue
+/// expression. Rust reads `self.final_iteration`, dispatches on the rvalue
+/// node kind (NameExpr / MemberExpr / IndexExpr / CallExpr / other) with a
+/// bounded descent through `IndexExpr.base` and `CallExpr.callee`, and
+/// classifies the lookup results. The symbol lookups ride the real
+/// `self.lookup` / `self.lookup_qualified` methods (called via PyO3), so
+/// all their side effects (error emission, module_refs recording) stay in
+/// Python. Returns `Some(bool)` for every decided case and `None` to defer
+/// when a fact is unreadable or the descent bound is exceeded.
+#[pyfunction]
+pub(crate) fn rust_should_wait_rhs(semanal: &PyAny, rv: &PyAny) -> PyResult<Option<bool>> {
+    let nodes_mod = semanal.py().import("mypy.nodes")?;
+    let name_cls: &PyType = nodes_mod.getattr("NameExpr")?.downcast()?;
+    let member_cls: &PyType = nodes_mod.getattr("MemberExpr")?.downcast()?;
+    let index_cls: &PyType = nodes_mod.getattr("IndexExpr")?.downcast()?;
+    let call_cls: &PyType = nodes_mod.getattr("CallExpr")?.downcast()?;
+    let ref_cls: &PyType = nodes_mod.getattr("RefExpr")?.downcast()?;
+    let placeholder_cls: &PyType = nodes_mod.getattr("PlaceholderNode")?.downcast()?;
+
+    let mut node = rv;
+    for depth in 0..=WAIT_RHS_MAX_DEPTH {
+        // The Python port re-enters should_wait_rhs per descent level,
+        // which re-reads self.final_iteration; mirror that here.
+        let final_iteration = match semanal.getattr("final_iteration") {
+            Ok(v) => match v.is_true() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        if final_iteration {
+            // No chance, nothing has changed.
+            return Ok(Some(false));
+        }
+
+        let kind = if node.is_instance(name_cls)? {
+            KIND_NAME
+        } else if node.is_instance(member_cls)? {
+            KIND_MEMBER
+        } else if node.is_instance(index_cls)? {
+            KIND_INDEX
+        } else if node.is_instance(call_cls)? {
+            KIND_CALL
+        } else {
+            KIND_OTHER
+        };
+
+        // Gather the per-kind scalar facts for the dispatch table.
+        let mut has_fullname = false;
+        let mut fname: Option<String> = None;
+        let mut child_is_ref = false;
+        let mut child: Option<&PyAny> = None;
+        match kind {
+            KIND_MEMBER => match member_expr_fullname_rust(node, name_cls, member_cls, depth)? {
+                Some(v) => {
+                    has_fullname = v.is_some();
+                    fname = v;
+                }
+                None => return Ok(None),
+            },
+            KIND_INDEX => {
+                let base = match node.getattr("base") {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                child_is_ref = base.is_instance(ref_cls)?;
+                child = Some(base);
+            }
+            KIND_CALL => {
+                let callee = match node.getattr("callee") {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                child_is_ref = callee.is_instance(ref_cls)?;
+                child = Some(callee);
+            }
+            _ => {}
+        }
+
+        match classify_should_wait_rhs_step(kind, has_fullname, child_is_ref) {
+            WAIT_RHS_FALSE => return Ok(Some(false)),
+            WAIT_RHS_LOOKUP_NAME => {
+                let name = match node.getattr("name") {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                let n = match semanal.call_method1("lookup", (name, node)) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                return should_wait_for_symbol(n, placeholder_cls);
+            }
+            WAIT_RHS_LOOKUP_QUALIFIED => {
+                let n = match semanal.call_method1(
+                    "lookup_qualified",
+                    (fname.as_deref().unwrap_or(""), node, true),
+                ) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(None),
+                };
+                return should_wait_for_symbol(n, placeholder_cls);
+            }
+            WAIT_RHS_DESCEND => {
+                node = match child {
+                    Some(c) => c,
+                    // Unreachable: DESCEND implies a gathered child.
+                    None => return Ok(None),
+                };
+            }
+            _ => return Ok(Some(false)),
+        }
+    }
+    // Descent bound exceeded: defer to the pure-Python recursion.
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +488,84 @@ mod tests {
     #[test]
     fn test_fixed_args_arg_kinds_length_mismatch() {
         assert_eq!(classify_fixed_args(2, &[0], 2), FIXED_ARGS_WRONG_KINDS);
+    }
+
+    // should_wait_rhs (issue #1008)
+
+    #[test]
+    fn test_wait_rhs_step_name_looks_up() {
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_NAME, false, false),
+            WAIT_RHS_LOOKUP_NAME
+        );
+    }
+
+    #[test]
+    fn test_wait_rhs_step_member_with_fullname_looks_up_qualified() {
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_MEMBER, true, false),
+            WAIT_RHS_LOOKUP_QUALIFIED
+        );
+    }
+
+    #[test]
+    fn test_wait_rhs_step_member_without_fullname_is_false() {
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_MEMBER, false, false),
+            WAIT_RHS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_wait_rhs_step_index_and_call_descend_only_on_ref_child() {
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_INDEX, false, true),
+            WAIT_RHS_DESCEND
+        );
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_INDEX, false, false),
+            WAIT_RHS_FALSE
+        );
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_CALL, false, true),
+            WAIT_RHS_DESCEND
+        );
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_CALL, false, false),
+            WAIT_RHS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_wait_rhs_step_other_kind_is_false() {
+        assert_eq!(
+            classify_should_wait_rhs_step(KIND_OTHER, false, false),
+            WAIT_RHS_FALSE
+        );
+        assert_eq!(
+            classify_should_wait_rhs_step(9, false, false),
+            WAIT_RHS_FALSE
+        );
+    }
+
+    #[test]
+    fn test_wait_rhs_placeholder_waits_unless_typeinfo() {
+        // PlaceholderNode that never becomes typeinfo: wait.
+        assert!(placeholder_waits(true, false));
+        // PlaceholderNode that becomes typeinfo: no wait.
+        assert!(!placeholder_waits(true, true));
+        // Not a placeholder: no wait.
+        assert!(!placeholder_waits(false, false));
+        assert!(!placeholder_waits(false, true));
+    }
+
+    #[test]
+    fn test_wait_rhs_member_fullname_join() {
+        assert_eq!(
+            member_fullname_join(Some("a"), "b"),
+            Some("a.b".to_string())
+        );
+        assert_eq!(member_fullname_join(None, "b"), None);
+        assert_eq!(member_fullname_join(None, ""), None);
     }
 }

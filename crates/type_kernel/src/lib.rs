@@ -1527,6 +1527,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_check_decorated_function_is_method,
         module
     )?)?;
+    // semanal_checks: should_wait_rhs assignment-rvalue wait predicate.
+    // Rust walks the rvalue node chain; lookups ride the real lookup
+    // methods and the pure-Python body is the fallback on None.
+    module.add_function(wrap_pyfunction!(
+        semanal_checks::rust_should_wait_rhs,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         semanal_bases::rust_classify_lvalue_validity,
         module

@@ -35221,3 +35221,214 @@ class NativeTruthyTypeSuite(Suite):
 
         call = CallExpr(NameExpr("f"), [], [ARG_POS], [None])
         self._assert_par(self.fx.callable(self.fx.o, self.fx.nonet), call)
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeShouldWaitRhsSuite(Suite):
+    """Parity for the Rust `should_wait_rhs` predicate port.
+
+    `SemanticAnalyzer.should_wait_rhs` (semanal.py:4179) decides whether an
+    assignment rvalue must be deferred (placeholder not yet a typeinfo). It
+    dispatches on the rvalue node kind with a bounded descent through
+    `IndexExpr.base` and `CallExpr.callee`. The Rust seam
+    (`semanal_checks.rs`) reads `final_iteration` and the node-kind
+    isinstance tags via PyO3, performs the symbol lookups through the real
+    `lookup` / `lookup_qualified` methods (resolver-seam pattern), and
+    returns the bool; `None` defers to the pure-Python body.
+
+    Direct seam calls assert the exact decision for every branch; the
+    gate-off vs gate-on differential drives the real method through a stub
+    analyzer with recording lookups and asserts identical results and
+    identical lookup traffic.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_active
+
+        self._set_active = _set_native_semanal_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _sym(self, becomes_typeinfo: bool = False) -> SymbolTableNode:
+        ph = PlaceholderNode("m.ph", IntExpr(0), 1, becomes_typeinfo=becomes_typeinfo)
+        return SymbolTableNode(MDEF, ph)
+
+    def _analyzer(
+        self,
+        *,
+        final_iteration: bool = False,
+        sym: SymbolTableNode | None = None,
+        qual_sym: SymbolTableNode | None = None,
+    ) -> Any:
+        from mypy.semanal import SemanticAnalyzer
+
+        ns = SimpleNamespace()
+        ns.final_iteration = final_iteration
+        calls: list[tuple[str, Any, bool]] = []
+        ns.calls = calls
+
+        def lookup(name: str, ctx: Any) -> SymbolTableNode | None:
+            calls.append(("lookup", name, False))
+            return sym
+
+        def lookup_qualified(
+            name: str, ctx: Any, suppress_errors: bool = False
+        ) -> SymbolTableNode | None:
+            calls.append(("lookup_qualified", name, suppress_errors))
+            return qual_sym
+
+        ns.lookup = lookup
+        ns.lookup_qualified = lookup_qualified
+        # The pure-Python body recurses through self.should_wait_rhs on
+        # IndexExpr.base / CallExpr.callee; bind it so the unbound-method
+        # differential works on the stub.
+        ns.should_wait_rhs = lambda rv: SemanticAnalyzer.should_wait_rhs(ns, rv)  # type: ignore[arg-type]
+        return ns
+
+    def _rv(self, kind: str) -> Any:
+        if kind == "name":
+            return NameExpr("x")
+        if kind == "member":
+            return MemberExpr(NameExpr("x"), "y")
+        if kind == "member_deep":
+            return MemberExpr(MemberExpr(NameExpr("a"), "b"), "c")
+        if kind == "member_unchainable":
+            return MemberExpr(IntExpr(0), "y")
+        if kind == "index":
+            return IndexExpr(NameExpr("x"), IntExpr(0))
+        if kind == "index_nonref":
+            return IndexExpr(IntExpr(0), IntExpr(0))
+        if kind == "call":
+            return CallExpr(NameExpr("x"), [], [], [])
+        if kind == "call_nonref":
+            return CallExpr(IntExpr(0), [], [], [])
+        assert kind == "other"
+        return IntExpr(3)
+
+    def _seam(self, rv: Any, **kwargs: Any) -> bool | None:
+        ns = self._analyzer(**kwargs)
+        return _type_kernel.rust_should_wait_rhs(ns, rv)
+
+    def _run(self, kind: str, **kwargs: Any) -> list[Any]:
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> list[Any]:
+            rv = self._rv(kind)
+            ns = self._analyzer(**kwargs)
+            result = SemanticAnalyzer.should_wait_rhs(ns, rv)
+            return [result, ns.calls]
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return [off, on]
+
+    def _assert_par(self, kind: str, expected: bool, **kwargs: Any) -> None:
+        off, on = self._run(kind, **kwargs)
+        assert_equal(on, off, f"should_wait_rhs parity (rv={kind}, args={kwargs})")
+        assert on[0] == expected, f"should_wait_rhs (rv={kind}) == {on[0]}, want {expected}"
+
+    # Direct seam calls: every branch.
+
+    def test_seam_name_placeholder_waits(self) -> None:
+        assert self._seam(self._rv("name"), sym=self._sym(False)) is True
+
+    def test_seam_name_placeholder_typeinfo_no_wait(self) -> None:
+        assert self._seam(self._rv("name"), sym=self._sym(True)) is False
+
+    def test_seam_name_missing_symbol_no_wait(self) -> None:
+        assert self._seam(self._rv("name"), sym=None) is False
+
+    def test_seam_member_qualified_placeholder_waits(self) -> None:
+        assert self._seam(self._rv("member"), qual_sym=self._sym(False)) is True
+
+    def test_seam_member_deep_chain_waits(self) -> None:
+        assert self._seam(self._rv("member_deep"), qual_sym=self._sym(False)) is True
+
+    def test_seam_member_unchainable_no_wait(self) -> None:
+        # get_member_expr_fullname returns None for IntExpr.base: no lookup.
+        assert self._seam(self._rv("member_unchainable"), qual_sym=self._sym(False)) is False
+
+    def test_seam_index_descends_to_ref_base(self) -> None:
+        assert self._seam(self._rv("index"), sym=self._sym(False)) is True
+
+    def test_seam_index_nonref_base_no_wait(self) -> None:
+        assert self._seam(self._rv("index_nonref"), sym=self._sym(False)) is False
+
+    def test_seam_call_descends_to_ref_callee(self) -> None:
+        assert self._seam(self._rv("call"), sym=self._sym(False)) is True
+
+    def test_seam_call_nonref_callee_no_wait(self) -> None:
+        assert self._seam(self._rv("call_nonref"), sym=self._sym(False)) is False
+
+    def test_seam_other_kind_no_wait(self) -> None:
+        assert self._seam(self._rv("other"), sym=self._sym(False)) is False
+
+    def test_seam_final_iteration_always_false(self) -> None:
+        assert self._seam(self._rv("name"), sym=self._sym(False), final_iteration=True) is False
+        assert self._seam(self._rv("index"), sym=self._sym(False), final_iteration=True) is False
+
+    # Parity differential: gate-off vs gate-on, results + lookup traffic.
+
+    def test_parity_name_placeholder(self) -> None:
+        self._assert_par("name", True, sym=self._sym(False))
+
+    def test_parity_name_placeholder_typeinfo(self) -> None:
+        self._assert_par("name", False, sym=self._sym(True))
+
+    def test_parity_name_missing(self) -> None:
+        self._assert_par("name", False, sym=None)
+
+    def test_parity_member_placeholder(self) -> None:
+        self._assert_par("member", True, qual_sym=self._sym(False))
+
+    def test_parity_member_deep_placeholder(self) -> None:
+        self._assert_par("member_deep", True, qual_sym=self._sym(False))
+
+    def test_parity_member_unchainable(self) -> None:
+        self._assert_par("member_unchainable", False, qual_sym=self._sym(False))
+
+    def test_parity_index_ref_base(self) -> None:
+        self._assert_par("index", True, sym=self._sym(False))
+
+    def test_parity_index_nonref_base(self) -> None:
+        self._assert_par("index_nonref", False, sym=self._sym(False))
+
+    def test_parity_call_ref_callee(self) -> None:
+        self._assert_par("call", True, sym=self._sym(False))
+
+    def test_parity_call_nonref_callee(self) -> None:
+        self._assert_par("call_nonref", False, sym=self._sym(False))
+
+    def test_parity_other(self) -> None:
+        self._assert_par("other", False, sym=self._sym(False))
+
+    def test_parity_final_iteration(self) -> None:
+        self._assert_par("name", False, sym=self._sym(False), final_iteration=True)
+        self._assert_par("index", False, sym=self._sym(False), final_iteration=True)
+
+    # Lookup traffic: the Rust seam must ride the real lookup methods.
+
+    def test_lookup_traffic_name(self) -> None:
+        off, on = self._run("name", sym=None)
+        assert on[1] == [("lookup", "x", False)]
+
+    def test_lookup_traffic_member_qualified(self) -> None:
+        off, on = self._run("member_deep", qual_sym=None)
+        assert on[1] == [("lookup_qualified", "a.b.c", True)]
+
+    def test_lookup_traffic_member_unchainable_skips_lookup(self) -> None:
+        off, on = self._run("member_unchainable", qual_sym=self._sym(False))
+        assert on[1] == []
+
+    def test_lookup_traffic_index_descends_not_lookups(self) -> None:
+        # IndexExpr descends into the RefExpr base; the lookup happens one
+        # level down (short lookup, not qualified).
+        off, on = self._run("index", sym=None)
+        assert on[1] == [("lookup", "x", False)]
