@@ -1008,6 +1008,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(
+        checkpattern::rust_classify_class_pattern_ranges,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
         checkstrformat::rust_parse_conversion_specifiers,
         module
     )?)?;

@@ -1009,6 +1009,27 @@ including:
   `mypy/build.py`) and covered by `NativeIsRecursivePairSuite` in
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus 6 pure decision unit tests in `typeops.rs`.
+- `rust_classify_class_pattern_ranges` (issue #987) — mirrors the dispatch
+  of `PatternChecker.get_class_pattern_type_ranges`
+  (checkpattern.py:794-832): Rust decodes the wire `typ` and recurses over
+  `UnionType` items Rust-side, returning one branch tag per leaf in union
+  pre-order (FAIL / TYPE_OBJ / CALLABLE_VAR / TYPE_TYPE / ANY). The three
+  class-ref scalars (`isinstance(o.class_ref.node, Var)`, `node.type is
+  not None`, `node.fullname == "typing.Callable"`) are read via PyO3.
+  Python keeps all TypeRange construction from live nodes
+  (`fill_typevars_with_any` / `callable_with_ellipsis` / `named_type`) and
+  the `self.msg.fail` with `typ.str_with_options`. Defers (`None`) on any
+  `TypeAliasType` in the union (Python's `get_proper_type` would expand it
+  from live symbols), an undecodable wire blob, an unreadable class-ref
+  attribute, and any `CallableType`/`Overloaded` whose fallback is not
+  provably `builtins.type` (`is_type_obj` needs the live
+  `fallback.type.is_metaclass()`); an alias ret_type also defers. An
+  `UninhabitedType` ret_type decides `is_type_obj == False` so the scalar
+  class-ref arm still engages. Gated by `_native_checkpattern_active`
+  (already wired from `mypy/build.py`) and covered by
+  `NativeClassPatternRangesSuite` in `mypy/test/testtypes.py` (gate-off vs
+  gate-on differential plus direct seam calls), plus pure decision unit
+  tests in `checkpattern.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

@@ -32456,3 +32456,214 @@ class NativeTupleTypeImplicitSuite(Suite):
             assert ta._native_tuple_type_implicit_tag(t) is None
         finally:
             self._set_active(True)
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeClassPatternRangesSuite(Suite):
+    """Parity for the Rust class-pattern type-range dispatch (issue #987).
+
+    `PatternChecker.get_class_pattern_type_ranges` (checkpattern.py:794-832)
+    dispatches on the proper type: union recursion, FunctionLike type object,
+    the `typing.Callable` class-ref Var arm, TypeType, AnyType, and a fail
+    tail. The Rust classifier (`checkpattern.rs`) walks the union on the
+    wire and reads the class-ref facts via PyO3, returning one tag per leaf;
+    the Python shim builds the TypeRanges from live nodes and reports the
+    fail. Direct seam calls assert the tag lists; the gate-off vs gate-on
+    differential drives the real PatternChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkpattern import _set_native_checkpattern_active
+
+        self._set_active = _set_native_checkpattern_active
+        self.fx = TypeFixture()
+        self.options = Options()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        buf = _WriteBuffer()
+        t.write(buf)
+        return buf.getvalue()
+
+    def _type_obj(self) -> FunctionLike:
+        # A type-object callable: fallback builtins.type, ret Instance(A).
+        return CallableType(
+            [AnyType(TypeOfAny.unannotated)], [ARG_STAR], [None], self.fx.a, self.fx.type_type
+        )
+
+    def _callable_var(self) -> Var:
+        v = Var("Callable")
+        v._fullname = "typing.Callable"
+        v.type = self.fx.function
+        return v
+
+    def _plain_var(self) -> Var:
+        v = Var("x")
+        v._fullname = "mod.x"
+        v.type = self.fx.function
+        return v
+
+    def _pattern(self, node: Any) -> ClassPattern:
+        from mypy.patterns import ClassPattern
+
+        ref = NameExpr("Callable")
+        ref.node = node
+        return ClassPattern(ref, [], [], [])
+
+    def _pc(self, records: list[str]) -> Any:
+        from mypy.checkpattern import PatternChecker
+
+        pc = PatternChecker.__new__(PatternChecker)
+        pc.chk = SimpleNamespace(named_type=lambda name: self.fx.function)  # type: ignore[attr-defined]
+        pc.msg = SimpleNamespace(fail=lambda msg, ctx: records.append(msg))  # type: ignore[attr-defined]
+        pc.options = self.options  # type: ignore[attr-defined]
+        return pc
+
+    def _run(
+        self, typ: Type, node: Any
+    ) -> tuple[object, object, list[str], list[str]]:
+        records_off: list[str] = []
+        records_on: list[str] = []
+
+        def one(records: list[str]) -> object:
+            return self._pc(records).get_class_pattern_type_ranges(
+                typ, self._pattern(node)
+            )
+
+        off = self._with_gate(False, lambda: one(records_off))
+        on = self._with_gate(True, lambda: one(records_on))
+        return off, on, records_off, records_on
+
+    def _assert_par(self, typ: Type, node: Any = None) -> object:
+        off, on, off_rec, on_rec = self._run(typ, node)
+        assert_equal(
+            self._ranges(off), self._ranges(on), f"class pattern parity for {typ!r}"
+        )
+        assert_equal(on_rec, off_rec, f"class pattern fail parity for {typ!r}")
+        return on
+
+    def _ranges(self, ranges: Any) -> list[tuple[str, bool]]:
+        if ranges is None:
+            return []
+        return [(str(r.item), r.is_upper_bound) for r in ranges]
+
+    # ----- direct seam calls -----
+
+    def _seam(self, typ: Type, node: Any) -> Any:
+        return _type_kernel.rust_classify_class_pattern_ranges(
+            self._bytes_of(typ), node
+        )
+
+    def test_seam_union_preorder(self) -> None:
+        tags = self._seam(
+            UnionType.make_union([self._type_obj(), AnyType(TypeOfAny.unannotated)]),
+            None,
+        )
+        assert tags == [1, 4]
+
+    def test_seam_type_type(self) -> None:
+        assert self._seam(TypeType.make_normalized(self.fx.a), None) == [3]
+
+    def test_seam_any(self) -> None:
+        assert self._seam(AnyType(TypeOfAny.unannotated), None) == [4]
+
+    def test_seam_callable_var_arm(self) -> None:
+        assert self._seam(self.fx.a, self._callable_var()) == [2]
+
+    def test_seam_fail_arm(self) -> None:
+        assert self._seam(self.fx.a, None) == [0]
+
+    def test_seam_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        assert self._seam(typ, None) is None
+
+    def test_seam_non_metaclass_fallback_defers(self) -> None:
+        # fallback.type.is_metaclass() needs the live TypeInfo: defer.
+        call = CallableType(
+            [AnyType(TypeOfAny.unannotated)],
+            [ARG_STAR],
+            [None],
+            self.fx.a,
+            self.fx.function,
+        )
+        assert self._seam(call, None) is None
+
+    def test_seam_uninhabited_ret_not_type_obj(self) -> None:
+        call = CallableType(
+            [AnyType(TypeOfAny.unannotated)],
+            [ARG_STAR],
+            [None],
+            UninhabitedType(),
+            self.fx.type_type,
+        )
+        assert self._seam(call, self._callable_var()) == [2]
+
+    def test_seam_union_with_failing_leaf(self) -> None:
+        tags = self._seam(
+            UnionType.make_union([self.fx.a, AnyType(TypeOfAny.unannotated)]), None
+        )
+        assert tags == [0, 4]
+
+    # ----- gate-off vs gate-on differentials -----
+
+    def test_parity_type_obj(self) -> None:
+        on = self._assert_par(self._type_obj())
+        assert [(str(r.item), r.is_upper_bound) for r in on] == [("A", False)]
+
+    def test_parity_any(self) -> None:
+        on = self._assert_par(AnyType(TypeOfAny.unannotated))
+        assert self._ranges(on) == [("Any", False)]
+
+    def test_parity_type_type(self) -> None:
+        on = self._assert_par(TypeType.make_normalized(self.fx.a))
+        assert self._ranges(on) == [("A", True)]
+
+    def test_parity_union(self) -> None:
+        on = self._assert_par(
+            UnionType.make_union([self._type_obj(), AnyType(TypeOfAny.unannotated)])
+        )
+        assert self._ranges(on) == [("A", False), ("Any", False)]
+
+    def test_parity_callable_var_arm(self) -> None:
+        on = self._assert_par(self.fx.a, self._callable_var())
+        (rng,) = on
+        assert isinstance(rng.item, CallableType)
+        assert rng.item.fallback.type.fullname == "builtins.function"
+        assert rng.is_upper_bound is False
+
+    def test_parity_fail_arm(self) -> None:
+        on = self._assert_par(self.fx.a)
+        assert on is None
+        # The fail message names the offending type (checked via records).
+
+    def test_parity_union_with_failing_leaf(self) -> None:
+        on = self._assert_par(
+            UnionType.make_union([self.fx.a, AnyType(TypeOfAny.unannotated)])
+        )
+        assert self._ranges(on) == [("Any", False)]
+
+    def test_parity_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(self.fx.a, "mod.A", "mod", -1, -1)
+        typ = TypeAliasType(alias, [])
+        # The Rust seam defers on the alias; both gates run the Python body,
+        # which expands to Instance and reports CLASS_PATTERN_TYPE_REQUIRED.
+        on = self._assert_par(typ)
+        assert on is None
+
+    def _ranges(self, ranges: Any) -> list[tuple[str, bool]]:
+        if ranges is None:
+            return []
+        return [(str(r.item), r.is_upper_bound) for r in ranges]

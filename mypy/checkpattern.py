@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Final, NamedTuple, cast
+from typing import Final, Iterator, NamedTuple, cast
 
 from mypy import message_registry
 from mypy.checker_shared import TypeCheckerSharedApi, TypeRange
@@ -86,6 +86,13 @@ def _serialize_type(t: Type) -> bytes:
     buf = _WriteBuffer()
     t.write(buf)
     return buf.getvalue()
+
+# Branch tags returned by rust_classify_class_pattern_ranges (issue #987).
+_CLASS_PATTERN_FAIL: Final = 0
+_CLASS_PATTERN_TYPE_OBJ: Final = 1
+_CLASS_PATTERN_CALLABLE_VAR: Final = 2
+_CLASS_PATTERN_TYPE_TYPE: Final = 3
+_CLASS_PATTERN_ANY: Final = 4
 
 
 def _deserialize_type_list(result: list[bytes] | list[list[int]]) -> list[Type] | None:
@@ -792,6 +799,19 @@ class PatternChecker(PatternVisitor[PatternType]):
         return PatternType(new_type, rest_type, captures)
 
     def get_class_pattern_type_ranges(self, typ: Type, o: ClassPattern) -> list[TypeRange] | None:
+        # Native type_kernel seam (issue #987): Rust classifies each leaf
+        # item (union recursion on the wire) into a branch tag; the TypeRange
+        # construction and the fail below stay on live objects.
+        if _HAS_TYPE_KERNEL and _native_checkpattern_active:
+            tags = None
+            try:
+                tags = _type_kernel.rust_classify_class_pattern_ranges(
+                    _serialize_type(typ), o.class_ref.node
+                )
+            except (AssertionError, NotImplementedError):
+                tags = None
+            if tags is not None:
+                return self._class_pattern_ranges_from_tags(typ, o, tags)
         p_typ = get_proper_type(typ)
 
         if isinstance(p_typ, UnionType):
@@ -830,6 +850,57 @@ class PatternChecker(PatternVisitor[PatternType]):
             o,
         )
         return None
+
+    def _class_pattern_leaves(self, typ: Type) -> Iterator[Type]:
+        # Flatten union items in pre-order, mirroring the Rust classifier's
+        # recursion; the raw (pre-get_proper_type) item is kept so the fail
+        # message formats exactly what the Python body would format.
+        p_typ = get_proper_type(typ)
+        if isinstance(p_typ, UnionType):
+            for item in p_typ.items:
+                yield from self._class_pattern_leaves(item)
+        else:
+            yield typ
+
+    def _class_pattern_ranges_from_tags(
+        self, typ: Type, o: ClassPattern, tags: list[int]
+    ) -> list[TypeRange] | None:
+        out: list[TypeRange] = []
+        for item, tag in zip(self._class_pattern_leaves(typ), tags):
+            if tag == _CLASS_PATTERN_FAIL:
+                self.msg.fail(
+                    message_registry.CLASS_PATTERN_TYPE_REQUIRED.format(
+                        item.str_with_options(self.options)
+                    ),
+                    o,
+                )
+                continue
+            p_item = get_proper_type(item)
+            if tag == _CLASS_PATTERN_TYPE_OBJ:
+                out.append(
+                    TypeRange(
+                        fill_typevars_with_any(p_item.type_object()),
+                        is_upper_bound=False,
+                    )
+                )
+            elif tag == _CLASS_PATTERN_CALLABLE_VAR:
+                fallback = self.chk.named_type("builtins.function")
+                any_type = AnyType(TypeOfAny.unannotated)
+                out.append(
+                    TypeRange(
+                        callable_with_ellipsis(
+                            any_type, ret_type=any_type, fallback=fallback
+                        ),
+                        is_upper_bound=False,
+                    )
+                )
+            elif tag == _CLASS_PATTERN_TYPE_TYPE:
+                out.append(TypeRange(p_item.item, is_upper_bound=True))
+            else:
+                out.append(TypeRange(p_item, is_upper_bound=False))
+        if not out:
+            return None
+        return out
 
     def should_self_match(self, typ: Type) -> bool:
         typ = get_proper_type(typ)
