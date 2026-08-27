@@ -137,6 +137,38 @@ pub(crate) fn rust_classify_final_super(
     )))
 }
 
+/// Decision tags for `check___new___signature`; must match
+/// `NATIVE_NEW_SIGNATURE_*` in mypy/checker.py.
+const NEW_SIGNATURE_METACLASS: i64 = 0;
+const NEW_SIGNATURE_NON_INSTANCE: i64 = 1;
+const NEW_SIGNATURE_INSTANCE: i64 = 2;
+
+/// The pure 3-way decision of `TypeChecker.check___new___signature`
+/// (checker.py:2630-2664). `is_metaclass` is `fdef.info.is_metaclass()`;
+/// `is_instance_ret` is whether `get_proper_type(bound_type.ret_type)` is one
+/// of {AnyType, Instance, TupleType, UninhabitedType, LiteralType}. Every
+/// branch is classified; the subtype checks and message emission stay Python.
+fn classify_new_signature(is_metaclass: bool, is_instance_ret: bool) -> i64 {
+    if is_metaclass {
+        NEW_SIGNATURE_METACLASS
+    } else if !is_instance_ret {
+        NEW_SIGNATURE_NON_INSTANCE
+    } else {
+        NEW_SIGNATURE_INSTANCE
+    }
+}
+
+/// `#[pyfunction]` entry; the shim computes the two scalar facts and keeps the
+/// `check_subtype` calls + `INVALID_NEW_TYPE`/`NON_INSTANCE_NEW_TYPE`
+/// emission. Returns `Some(tag)` always (never defers).
+#[pyfunction]
+pub(crate) fn rust_classify_new_signature(
+    is_metaclass: bool,
+    is_instance_ret: bool,
+) -> PyResult<Option<i64>> {
+    Ok(Some(classify_new_signature(is_metaclass, is_instance_ret)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +274,29 @@ mod tests {
             classify(true, true, false, false, "attr", "mod.Base"),
             KIND_PASS_TAIL
         );
+    }
+
+    #[test]
+    fn test_classify_new_signature_metaclass() {
+        // Metaclass wins regardless of the ret-type kind (branch order).
+        assert_eq!(classify_new_signature(true, true), NEW_SIGNATURE_METACLASS);
+        assert_eq!(classify_new_signature(true, false), NEW_SIGNATURE_METACLASS);
+    }
+
+    #[test]
+    fn test_classify_new_signature_non_instance() {
+        // Non-metaclass + a ret type that is not one of the five
+        // instance-kinds (e.g. CallableType): NON_INSTANCE_NEW_TYPE.
+        assert_eq!(
+            classify_new_signature(false, false),
+            NEW_SIGNATURE_NON_INSTANCE
+        );
+    }
+
+    #[test]
+    fn test_classify_new_signature_instance() {
+        // Non-metaclass + Any/Instance/Tuple/Uninhabited/Literal: subtype
+        // of the class.
+        assert_eq!(classify_new_signature(false, true), NEW_SIGNATURE_INSTANCE);
     }
 }

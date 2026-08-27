@@ -198,6 +198,7 @@ __all__ = [
     "rust_check_overlapping_overloads",
     "rust_classify_except_handler_tests",
     "rust_classify_final_super",
+    "rust_classify_new_signature",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -777,6 +778,9 @@ def rust_classify_final_super(
     base_fullname: str,
     enum_bases: list[str],
     enum_special_props: list[str],
+) -> int | None: ...
+def rust_classify_new_signature(
+    is_metaclass: bool, is_instance_ret: bool
 ) -> int | None: ...
 def rust_is_type_type_context(
     resolver: NativeTypeResolver, type_bytes: bytes
