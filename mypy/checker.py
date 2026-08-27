@@ -339,7 +339,7 @@ try:
         rust_classify_classvar_super as _rust_classify_classvar_super,
         rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_func_def_override as _rust_classify_func_def_override,
-        rust_classify_match_args as _rust_classify_match_args,
+        rust_check_match_args as _rust_check_match_args,
         rust_classify_metaclass_compat as _rust_classify_metaclass_compat,
         rust_classify_new_signature as _rust_classify_new_signature,
         rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
@@ -416,7 +416,7 @@ except ImportError:
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_func_def_override = None  # type: ignore[assignment]
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
-    _rust_classify_match_args = None  # type: ignore[assignment]
+    _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_enum_new = None  # type: ignore[assignment]
     _rust_classify_enum_bases = None  # type: ignore[assignment]
     _rust_classify_enum = None  # type: ignore[assignment]
@@ -525,12 +525,6 @@ NATIVE_LVALUE_NAME = 4
 NATIVE_LVALUE_TUPLE_LIST = 5
 NATIVE_LVALUE_STAR = 6
 NATIVE_LVALUE_ELSE = 7
-
-# Decision tags returned by `_rust_classify_match_args`; must match
-# `KIND_MATCH_ARGS_*` in crates/type_kernel/src/checker_functions.rs.
-NATIVE_MATCH_ARGS_SKIP = 0
-NATIVE_MATCH_ARGS_OK = 1
-NATIVE_MATCH_ARGS_FAIL = 2
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -3142,32 +3136,29 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_match_args(self, var: Var, typ: Type, context: Context) -> None:
         """Check that __match_args__ contains literal strings"""
-        # Native type_kernel seam: classify the pure decision in Rust
-        # (checker_functions.rs); the note emission stays here. None falls
-        # through to the pure-Python body below.
+        if not self.scope.active_class():
+            return
+        # Native type_kernel seam: the type predicate is a pure bool over
+        # one wire Type; the note emission stays here. None falls through
+        # to the pure-Python body below.
         if (
             _CHECKER_HAS_TYPE_KERNEL
             and _native_checker_active
-            and _rust_classify_match_args is not None
+            and _rust_check_match_args is not None
         ):
             try:
-                tag = _rust_classify_match_args(
-                    self.scope.active_class() is not None,
-                    _serialize_type_for_checker(typ),
-                )
+                result = _rust_check_match_args(_serialize_type_for_checker(typ))
+                if result is not None:
+                    if not result:
+                        self.msg.note(
+                            "__match_args__ must be a tuple containing string literals for checking "
+                            "of match statements to work",
+                            context,
+                            code=codes.LITERAL_REQ,
+                        )
+                    return
             except (AssertionError, NotImplementedError, ValueError, TypeError):
-                tag = None
-            if tag is not None:
-                if tag == NATIVE_MATCH_ARGS_FAIL:
-                    self.msg.note(
-                        "__match_args__ must be a tuple containing string literals for checking "
-                        "of match statements to work",
-                        context,
-                        code=codes.LITERAL_REQ,
-                    )
-                return
-        if not self.scope.active_class():
-            return
+                pass
         typ = get_proper_type(typ)
         if not isinstance(typ, TupleType) or not all(
             is_string_literal(item) for item in typ.items

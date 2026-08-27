@@ -2943,11 +2943,11 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
-    // Issue #970: check_match_args predicate-head port. Rust classifies
-    // active_class / TupleType / per-item string-literal into a branch
-    // tag; the note emission stays in Python.
+    // Issue #986: check_match_args predicate port. Rust reads one wire
+    // Type and returns the TupleType + string-literal bool; the
+    // active_class gate and note emission stay in Python.
     module.add_function(wrap_pyfunction!(
-        checker_functions::rust_classify_match_args,
+        checker_functions::rust_check_match_args,
         module
     )?)?;
 

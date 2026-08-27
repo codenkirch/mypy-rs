@@ -31327,17 +31327,17 @@ class NativeTypeTypeMemberAccessSuite(Suite):
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeMatchArgsSuite(Suite):
-    """Parity for the Rust `check_match_args` predicate-head port.
+    """Parity for the Rust `check_match_args` predicate port (#986).
 
     `TypeChecker.check_match_args` (checker.py:3128) guards on
     `self.scope.active_class()`, then checks that `get_proper_type(typ)`
     is a `TupleType` whose every item is a string literal. If not, it emits
-    a `LITERAL_REQ` note. The Rust classifier (`checker_functions.rs`) turns
-    `active_class`, the wire-decoded proper type kind, and per-item
-    `is_string_literal` results into a branch tag (skip / ok / fail); the
-    Python shim emits the note.
+    a `LITERAL_REQ` note. The Rust seam (`checker_functions.rs`) reads one
+    wire Type and returns `isinstance(TupleType) and
+    all(is_string_literal(item))` as a bool; the active_class gate and the
+    note emission stay in Python.
 
-    Direct seam calls assert the exact tag for every branch; the gate-off
+    Direct seam calls assert the bool and the None deferrals; the gate-off
     vs gate-on differential drives the real TypeChecker method through a
     stub note recorder and asserts identical note lists.
     """
@@ -31360,8 +31360,8 @@ class NativeMatchArgsSuite(Suite):
         finally:
             self._set_active(True)
 
-    def _tag(self, active_class: bool, type_bytes: bytes) -> int | None:
-        return _type_kernel.rust_classify_match_args(active_class, type_bytes)
+    def _bool(self, type_bytes: bytes) -> bool | None:
+        return _type_kernel.rust_check_match_args(type_bytes)
 
     def _bytes_of(self, t: Type) -> bytes:
         from mypy.checker import _serialize_type_for_checker
@@ -31412,28 +31412,24 @@ class NativeMatchArgsSuite(Suite):
         off, on = self._run(scope, typ)
         assert_equal(on, off, f"check_match_args parity for typ={typ!r}")
 
-    def test_seam_skip_no_class(self) -> None:
-        fx = TypeFixture()
-        assert self._tag(False, self._bytes_of(fx.std_tuple)) == 0
-
     def test_seam_ok_all_string_literals(self) -> None:
         fx = TypeFixture()
         tup = TupleType([fx.lit_str1, fx.lit_str2], fx.std_tuple)
-        assert self._tag(True, self._bytes_of(tup)) == 1
+        assert self._bool(self._bytes_of(tup)) is True
 
     def test_seam_ok_empty_tuple(self) -> None:
         fx = TypeFixture()
         tup = TupleType([], fx.std_tuple)
-        assert self._tag(True, self._bytes_of(tup)) == 1
+        assert self._bool(self._bytes_of(tup)) is True
 
     def test_seam_fail_not_tuple(self) -> None:
         fx = TypeFixture()
-        assert self._tag(True, self._bytes_of(fx.str_type)) == 2
+        assert self._bool(self._bytes_of(fx.str_type)) is False
 
     def test_seam_fail_non_literal_item(self) -> None:
         fx = TypeFixture()
         tup = TupleType([fx.lit_str1, fx.a], fx.std_tuple)
-        assert self._tag(True, self._bytes_of(tup)) == 2
+        assert self._bool(self._bytes_of(tup)) is False
 
     def test_parity_skip_no_class(self) -> None:
         fx = TypeFixture()
@@ -31467,6 +31463,22 @@ class NativeMatchArgsSuite(Suite):
         # Instance with last_known_value of a string literal is a string
         # literal by is_string_literal.
         tup = TupleType([fx.lit_str1_inst], fx.std_tuple)
+        self._assert_par(self._class_scope(), tup)
+
+    def test_seam_defer_alias_item(self) -> None:
+        fx = TypeFixture()
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(fx.str_type, "mod.A", "mod", -1, -1)
+        tup = TupleType([TypeAliasType(alias, [])], fx.std_tuple)
+        assert self._bool(self._bytes_of(tup)) is None
+
+    def test_parity_alias_item_defers_to_python(self) -> None:
+        fx = TypeFixture()
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(fx.str_type, "mod.A", "mod", -1, -1)
+        tup = TupleType([TypeAliasType(alias, [])], fx.std_tuple)
         self._assert_par(self._class_scope(), tup)
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")

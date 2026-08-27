@@ -932,20 +932,22 @@ including:
   (direct seam tag tests for all 13 branches plus gate-off vs gate-on
   differential on the result / call-log through a mock
   MemberContext), and 13 pure decision unit tests in `checkmember.rs`.
-- `rust_classify_match_args` (issue #970) — mirrors the predicate head of
-  `TypeChecker.check_match_args` (checker.py:3128-3141): `not
-  self.scope.active_class()` -> skip (tag 0); `get_proper_type(typ)` not a
-  `TupleType` or any non-string-literal item -> fail (tag 2, emit the
-  `LITERAL_REQ` note); all items string literals -> ok (tag 1). Rust
-  decodes the wire `typ`, resolves the proper type (defers on an
-  unresolved `TypeAliasType`), checks the `TupleType` kind, and reuses
-  `is_string_literal_inner` per item. Defers (`None`) on decode failure
-  or an item the string-literal kernel cannot decide; the Python shim
-  emits the note and keeps the pure-Python body as the fallback. Gated
+- `rust_check_match_args` (issue #986, rework of the #970 tag-classifier
+  seam into the `rust_is_final_enum_value` pure-bool shape) — mirrors the
+  type predicate of `TypeChecker.check_match_args`
+  (checker.py:3128-3141): Rust reads one wire `typ`, resolves the proper
+  type (defers on an unresolved `TypeAliasType`), and returns
+  `isinstance(TupleType) and all(is_string_literal(item))` as a bool,
+  reusing `is_string_literal_inner` per item. The
+  `scope.active_class()` gate and the `LITERAL_REQ` note emission stay in
+  Python; the shim returns early on a decided bool and falls through to
+  the pure-Python body on `None`. Defers (`None`) on decode failure or an
+  item the string-literal kernel cannot decide (Python's
+  `try_getting_str_literals_from_type` fallback may still answer). Gated
   by `_native_checker_active` (wired from `mypy/build.py`) and covered by
   `NativeMatchArgsSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
-  differential plus direct seam calls), and 5 pure decision unit tests in
-  `checker_functions.rs`.
+  differential plus direct seam and alias-deferral calls), and 6 pure
+  unit tests in `checker_functions.rs`.
 - `rust_is_valid_constructor` (issue #967) — mirrors
   `mypy.typeops.is_valid_constructor` (typeops.py:445-455): a pure bool
   predicate, True for `OverloadedFuncDef`/`FuncDef`
