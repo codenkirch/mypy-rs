@@ -342,7 +342,10 @@ mod tests {
     #[test]
     fn dynamic_metaclass_tag() {
         // Not a Name/Member chain: `class C(metaclass=f(x))`.
-        assert_eq!(classify_declared(None, false, None, None, None, None, None, None), Some(META_DYNAMIC));
+        assert_eq!(
+            classify_declared(None, false, None, None, None, None, None, None),
+            Some(META_DYNAMIC)
+        );
     }
 
     #[test]
@@ -357,7 +360,16 @@ mod tests {
     fn any_var_tag_and_option_is_python_side() {
         // The option split lives in Python; the tag is the same either way.
         assert_eq!(
-            classify_declared(Some("M"), false, Some(true), Some(false), Some(true), None, None, None),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(true),
+                Some(false),
+                Some(true),
+                None,
+                None,
+                None
+            ),
             Some(META_ANY)
         );
     }
@@ -366,7 +378,16 @@ mod tests {
     fn var_without_any_falls_to_invalid() {
         // A Var metaclass whose type is not Any is not a TypeInfo -> INVALID.
         assert_eq!(
-            classify_declared(Some("M"), false, Some(true), Some(false), Some(false), Some(false), Some(false), None),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                None
+            ),
             Some(META_INVALID)
         );
     }
@@ -374,7 +395,16 @@ mod tests {
     #[test]
     fn var_without_type_is_not_any() {
         assert_eq!(
-            classify_declared(Some("M"), false, Some(true), Some(false), Some(false), Some(false), Some(false), None),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(false),
+                None
+            ),
             Some(META_INVALID)
         );
     }
@@ -382,7 +412,16 @@ mod tests {
     #[test]
     fn placeholder_defers() {
         assert_eq!(
-            classify_declared(Some("M"), false, Some(false), Some(true), None, None, None, None),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(false),
+                Some(true),
+                None,
+                None,
+                None,
+                None
+            ),
             Some(META_DEFER)
         );
     }
@@ -391,7 +430,16 @@ mod tests {
     fn non_typeinfo_symbol_is_invalid() {
         // An unwrapped TypeAlias or other node -> INVALID.
         assert_eq!(
-            classify_declared(Some("M"), false, Some(false), Some(false), None, Some(false), Some(false), None),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(false),
+                Some(false),
+                None,
+                Some(false),
+                Some(false),
+                None
+            ),
             Some(META_INVALID)
         );
     }
@@ -399,7 +447,16 @@ mod tests {
     #[test]
     fn tuple_named_class_is_invalid() {
         assert_eq!(
-            classify_declared(Some("M"), false, Some(false), Some(false), None, Some(true), Some(true), Some(true)),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(false),
+                Some(false),
+                None,
+                Some(true),
+                Some(true),
+                Some(true)
+            ),
             Some(META_INVALID)
         );
     }
@@ -407,7 +464,16 @@ mod tests {
     #[test]
     fn non_metaclass_class_tag() {
         assert_eq!(
-            classify_declared(Some("M"), false, Some(false), Some(false), None, Some(true), Some(false), Some(false)),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(false),
+                Some(false),
+                None,
+                Some(true),
+                Some(false),
+                Some(false)
+            ),
             Some(META_NOT_METACLASS)
         );
     }
@@ -415,17 +481,66 @@ mod tests {
     #[test]
     fn valid_metaclass_ok() {
         assert_eq!(
-            classify_declared(Some("M"), false, Some(false), Some(false), None, Some(true), Some(false), Some(true)),
+            classify_declared(
+                Some("M"),
+                false,
+                Some(false),
+                Some(false),
+                None,
+                Some(true),
+                Some(false),
+                Some(true)
+            ),
             Some(META_OK)
         );
     }
 
     #[test]
     fn unreadable_facts_defer() {
-        assert!(classify_declared(Some("M"), false, None, Some(false), None, Some(true), Some(false), Some(true)).is_none());
-        assert!(classify_declared(Some("M"), false, Some(true), Some(false), None, Some(true), Some(false), Some(true)).is_none());
-        assert!(classify_declared(Some("M"), false, Some(false), Some(false), None, Some(true), None, Some(true)).is_none());
-        assert!(classify_declared(Some("M"), false, Some(false), Some(false), None, Some(true), Some(false), None).is_none());
+        assert!(classify_declared(
+            Some("M"),
+            false,
+            None,
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            Some(true)
+        )
+        .is_none());
+        assert!(classify_declared(
+            Some("M"),
+            false,
+            Some(true),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            Some(true)
+        )
+        .is_none());
+        assert!(classify_declared(
+            Some("M"),
+            false,
+            Some(false),
+            Some(false),
+            None,
+            Some(true),
+            None,
+            Some(true)
+        )
+        .is_none());
+        assert!(classify_declared(
+            Some("M"),
+            false,
+            Some(false),
+            Some(false),
+            None,
+            Some(true),
+            Some(false),
+            None
+        )
+        .is_none());
     }
 
     fn classify_recalc(
@@ -446,7 +561,10 @@ mod tests {
 
     #[test]
     fn recalc_plain_class_ok() {
-        assert_eq!(classify_recalc(false, false, None, None, false), Some(RECALC_OK));
+        assert_eq!(
+            classify_recalc(false, false, None, None, false),
+            Some(RECALC_OK)
+        );
         assert_eq!(
             classify_recalc(false, true, Some(false), Some(false), false),
             Some(RECALC_OK)
@@ -455,7 +573,10 @@ mod tests {
 
     #[test]
     fn recalc_protocol_mro_sets_abcmeta() {
-        assert_eq!(classify_recalc(true, false, None, None, false), Some(RECALC_ABCMETA));
+        assert_eq!(
+            classify_recalc(true, false, None, None, false),
+            Some(RECALC_ABCMETA)
+        );
         assert_eq!(
             classify_recalc(true, true, Some(true), None, false),
             Some(RECALC_ABCMETA)
@@ -496,7 +617,10 @@ mod tests {
     #[test]
     fn recalc_unreadable_builtins_type_defers_only_on_protocol_mro() {
         // Without a protocol in the MRO the builtins.type fact is unused.
-        assert_eq!(classify_recalc(false, true, None, Some(false), false), Some(RECALC_OK));
+        assert_eq!(
+            classify_recalc(false, true, None, Some(false), false),
+            Some(RECALC_OK)
+        );
         assert!(classify_recalc(true, true, None, Some(false), false).is_none());
     }
 
@@ -511,7 +635,15 @@ mod tests {
 
     #[test]
     fn meta_constants_are_distinct() {
-        let tags = [META_OK, META_DYNAMIC, META_NAME_ERROR, META_ANY, META_DEFER, META_INVALID, META_NOT_METACLASS];
+        let tags = [
+            META_OK,
+            META_DYNAMIC,
+            META_NAME_ERROR,
+            META_ANY,
+            META_DEFER,
+            META_INVALID,
+            META_NOT_METACLASS,
+        ];
         for (i, a) in tags.iter().enumerate() {
             for b in &tags[i + 1..] {
                 assert_ne!(a, b);
