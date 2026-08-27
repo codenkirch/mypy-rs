@@ -323,6 +323,7 @@ __all__ = [
     "rust_dataclass_transform",
     "rust_dataclass_post_init_transform",
     "rust_classify_member_resolution",
+    "rust_classify_simple_literal_type",
     "rust_is_defined_type_param",
     "rust_var_is_typing_special_form",
     "rust_get_typevarlike_declaration",
@@ -2135,6 +2136,12 @@ def rust_classify_fixed_args(
     args_len: int,
     arg_kinds: list[int],
     numargs: int,
+) -> int | None: ...
+def rust_classify_simple_literal_type(
+    function_stack: bool,
+    value_kind: int,
+    cur_mod_id: str,
+    is_final: bool,
 ) -> int | None: ...
 def rust_create_errors(
     error_tuples: Any,

@@ -5333,6 +5333,111 @@ pub(crate) fn rust_visit_type_alias_stmt(
     result
 }
 
+// ---------------------------------------------------------------------------
+// analyze_simple_literal_type dispatch head (issue #984)
+// ---------------------------------------------------------------------------
+
+/// Value-kind tags for the folded constant; must match `NATIVE_SLT_VALUE_*`
+/// in mypy/semanal.py.
+const SLT_VALUE_NONE: i64 = 0;
+const SLT_VALUE_COMPLEX: i64 = 1;
+const SLT_VALUE_BOOL: i64 = 2;
+const SLT_VALUE_INT: i64 = 3;
+const SLT_VALUE_STR: i64 = 4;
+const SLT_VALUE_FLOAT: i64 = 5;
+
+/// Type-name tags; must match `NATIVE_SLT_TYPE_*` in mypy/semanal.py.
+const SLT_TYPE_NONE: i64 = 0; // return None
+const SLT_TYPE_BOOL: i64 = 1; // builtins.bool
+const SLT_TYPE_INT: i64 = 2; // builtins.int
+const SLT_TYPE_STR: i64 = 3; // builtins.str
+const SLT_TYPE_FLOAT: i64 = 4; // builtins.float
+
+/// Pure decision core of `SemanticAnalyzer.analyze_simple_literal_type`
+/// (semanal.py:4720-4749). Returns `None` (defer) only on an unknown value
+/// kind, which the Python shim can never produce.
+fn classify_simple_literal_type(function_stack: bool, value_kind: i64) -> Option<i64> {
+    if function_stack {
+        return Some(SLT_TYPE_NONE);
+    }
+    match value_kind {
+        SLT_VALUE_NONE | SLT_VALUE_COMPLEX => Some(SLT_TYPE_NONE),
+        SLT_VALUE_BOOL => Some(SLT_TYPE_BOOL),
+        SLT_VALUE_INT => Some(SLT_TYPE_INT),
+        SLT_VALUE_STR => Some(SLT_TYPE_STR),
+        SLT_VALUE_FLOAT => Some(SLT_TYPE_FLOAT),
+        _ => None,
+    }
+}
+
+/// `#[pyfunction]` entry for the 5-way dispatch head of
+/// `SemanticAnalyzer.analyze_simple_literal_type` (semanal.py:4720-4749).
+///
+/// The Python shim folds the rvalue via the already-native
+/// `constant_fold_expr` and passes the value kind; `cur_mod_id` (the fold
+/// binding module) and `is_final` (Python-side LiteralType construction)
+/// are carried for signature fidelity but do not affect the decision.
+#[pyfunction]
+#[pyo3(signature = (function_stack, value_kind, cur_mod_id, is_final))]
+pub(crate) fn rust_classify_simple_literal_type(
+    function_stack: bool,
+    value_kind: i64,
+    cur_mod_id: &str,
+    is_final: bool,
+) -> PyResult<Option<i64>> {
+    let _ = (cur_mod_id, is_final);
+    Ok(classify_simple_literal_type(function_stack, value_kind))
+}
+
+#[cfg(test)]
+mod simple_literal_tests {
+    use super::*;
+
+    #[test]
+    fn test_function_stack_returns_none() {
+        for kind in 0..=5 {
+            assert_eq!(
+                classify_simple_literal_type(true, kind),
+                Some(SLT_TYPE_NONE)
+            );
+        }
+    }
+
+    #[test]
+    fn test_kind_dispatch() {
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_NONE),
+            Some(SLT_TYPE_NONE)
+        );
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_COMPLEX),
+            Some(SLT_TYPE_NONE)
+        );
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_BOOL),
+            Some(SLT_TYPE_BOOL)
+        );
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_INT),
+            Some(SLT_TYPE_INT)
+        );
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_STR),
+            Some(SLT_TYPE_STR)
+        );
+        assert_eq!(
+            classify_simple_literal_type(false, SLT_VALUE_FLOAT),
+            Some(SLT_TYPE_FLOAT)
+        );
+    }
+
+    #[test]
+    fn test_unknown_kind_defers() {
+        assert_eq!(classify_simple_literal_type(false, 99), None);
+        assert_eq!(classify_simple_literal_type(false, -1), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
