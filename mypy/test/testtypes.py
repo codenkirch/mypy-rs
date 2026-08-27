@@ -32826,3 +32826,150 @@ class NativeRefersToTypedDictSuite(Suite):
             pass
         else:
             raise AssertionError("expected ValueError for missing alias bytes")
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSimpleLiteralTypeSuite(Suite):
+    """Parity for the Rust `analyze_simple_literal_type` dispatch port.
+
+    The 5-way dispatch head (semanal.py:4720-4749) decides the type-name
+    tag from function_stack truthiness and the constant-fold value kind;
+    the Python shim folds via the already-native constant_fold_expr, then
+    applies named_type_or_none and, when is_final, the LiteralType
+    last_known_value construction.
+
+    Direct seam calls assert the exact tag (and the unknown-kind deferral);
+    the gate-off vs gate-on differential drives the real SemanticAnalyzer
+    method through a stub named_type_or_none and asserts identical results.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, function_stack: bool, kind: int, is_final: bool = False) -> int | None:
+        from mypy.semanal import _rust_classify_simple_literal_type
+
+        return _rust_classify_simple_literal_type(function_stack, kind, "__main__", is_final)
+
+    def _analyzer(self, function_stack: list[object] | None = None) -> object:
+        from mypy.semanal import SemanticAnalyzer
+
+        fx = self.fx
+        infos = {
+            "builtins.bool": fx.bool_type_info,
+            "builtins.int": fx.make_type_info("builtins.int"),
+            "builtins.str": fx.str_type_info,
+            "builtins.float": fx.make_type_info("builtins.float"),
+        }
+
+        def named_type_or_none(name: str) -> Instance | None:
+            info = infos.get(name)
+            return Instance(info, []) if info is not None else None
+
+        sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+        sa.function_stack = function_stack if function_stack is not None else []
+        sa.cur_mod_id = "__main__"
+        sa.named_type_or_none = named_type_or_none  # type: ignore[method-assign]
+        return sa
+
+    def _call(self, sa: object, rvalue: Expression, is_final: bool) -> str:
+        result = sa.analyze_simple_literal_type(rvalue, is_final)  # type: ignore[attr-defined]
+        if result is None:
+            return "None"
+        return str(result)
+
+    def _assert_par(
+        self, rvalue: Expression, is_final: bool, expected: str | None = None
+    ) -> None:
+        off_sa = self._analyzer()
+        off = self._with_gate(False, lambda: self._call(off_sa, rvalue, is_final))
+        self._set_active(True)
+        on_sa = self._analyzer()
+        on = self._with_gate(True, lambda: self._call(on_sa, rvalue, is_final))
+        assert_equal(on, off, f"simple_literal_type parity {rvalue!r} final={is_final}")
+        if expected is not None:
+            assert_equal(on, expected, f"simple_literal_type result {rvalue!r}")
+
+    def _final_var_ref(self, fullname: str) -> NameExpr:
+        v = Var("X")
+        v.is_final = True
+        v._fullname = fullname
+        v.final_value = 5
+        e = NameExpr("X")
+        e.node = v
+        return e
+
+    def test_seam_tags(self) -> None:
+        assert self._tag(True, 0) == 0
+        assert self._tag(False, 0) == 0  # fold returned None
+        assert self._tag(False, 1) == 0  # complex
+        assert self._tag(False, 2) == 1  # builtins.bool
+        assert self._tag(False, 3) == 2  # builtins.int
+        assert self._tag(False, 4) == 3  # builtins.str
+        assert self._tag(False, 5) == 4  # builtins.float
+
+    def test_seam_unknown_kind_defers(self) -> None:
+        assert self._tag(False, 99) is None
+        assert self._tag(False, -1) is None
+
+    def test_parity_int(self) -> None:
+        self._assert_par(IntExpr(42), False, "builtins.int")
+
+    def test_parity_int_final(self) -> None:
+        self._assert_par(IntExpr(42), True)
+
+    def test_parity_str(self) -> None:
+        self._assert_par(StrExpr("x"), False, "builtins.str")
+
+    def test_parity_str_final(self) -> None:
+        self._assert_par(StrExpr("x"), True)
+
+    def test_parity_float(self) -> None:
+        from mypy.nodes import FloatExpr
+
+        self._assert_par(FloatExpr(1.5), False, "builtins.float")
+
+    def test_parity_complex_returns_none(self) -> None:
+        from mypy.nodes import ComplexExpr
+
+        self._assert_par(ComplexExpr(1j), False, "None")
+
+    def test_parity_bool(self) -> None:
+        self._assert_par(NameExpr("True"), False, "builtins.bool")
+
+    def test_parity_bool_final(self) -> None:
+        self._assert_par(NameExpr("True"), True)
+
+    def test_parity_fold_failure_returns_none(self) -> None:
+        self._assert_par(OpExpr("+", IntExpr(1), StrExpr("x")), False, "None")
+
+    def test_parity_folded_op_final(self) -> None:
+        self._assert_par(OpExpr("+", IntExpr(1), IntExpr(2)), True)
+
+    def test_parity_final_var_ref_current_module(self) -> None:
+        self._assert_par(self._final_var_ref("__main__.X"), False, "builtins.int")
+
+    def test_parity_final_var_ref_other_module(self) -> None:
+        self._assert_par(self._final_var_ref("other.X"), False, "None")
+
+    def test_parity_inside_function(self) -> None:
+        off_sa = self._analyzer(function_stack=[object()])
+        off = self._with_gate(False, lambda: self._call(off_sa, IntExpr(42), False))
+        self._set_active(True)
+        on_sa = self._analyzer(function_stack=[object()])
+        on = self._with_gate(True, lambda: self._call(on_sa, IntExpr(42), False))
+        assert_equal(on, off, "simple_literal_type parity inside function")
+        assert_equal(on, "None", "simple_literal_type inside function")

@@ -426,17 +426,18 @@ try:
         rust_can_be_type_alias as _rust_can_be_type_alias,
         rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
         rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
-        rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_check_decorated_function_is_method as _rust_check_decorated_function_is_method,
+        rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_add_metaclass as _rust_classify_add_metaclass,
-        rust_classify_fixed_args as _rust_classify_fixed_args,
         rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_decorators as _rust_classify_decorators,
+        rust_classify_fixed_args as _rust_classify_fixed_args,
         rust_classify_function_signature as _rust_classify_function_signature,
         rust_classify_imports as _rust_classify_imports,
         rust_classify_lvalue_validity as _rust_classify_lvalue_validity,
         rust_classify_member_resolution as _rust_classify_member_resolution,
         rust_classify_setup_type_vars as _rust_classify_setup_type_vars,
+        rust_classify_simple_literal_type as _rust_classify_simple_literal_type,
         rust_classify_type_expression as _rust_classify_type_expression,
         rust_classify_with_metaclass as _rust_classify_with_metaclass,
         rust_clean_up_bases as _rust_clean_up_bases,
@@ -552,6 +553,7 @@ except ImportError:
     _rust_classify_lvalue_validity = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
+    _rust_classify_simple_literal_type = None  # type: ignore[assignment]
     _rust_classify_setup_type_vars = None  # type: ignore[assignment]
     _rust_classify_type_expression = None  # type: ignore[assignment]
     _rust_lookup = None  # type: ignore[assignment]
@@ -677,6 +679,27 @@ _ACTION_ADD_METACLASS = 1
 _NATIVE_FUNC_SIG_OK = 0
 _NATIVE_FUNC_SIG_TOO_FEW = 1
 _NATIVE_FUNC_SIG_TOO_MANY = 2
+
+# analyze_simple_literal_type dispatch tags (see semanal_visitor.rs).
+# Value kinds classify the constant_fold_expr result; type-name tags select
+# the named_type_or_none argument (TYPE_NONE: return None).
+_NATIVE_SLT_VALUE_NONE = 0
+_NATIVE_SLT_VALUE_COMPLEX = 1
+_NATIVE_SLT_VALUE_BOOL = 2
+_NATIVE_SLT_VALUE_INT = 3
+_NATIVE_SLT_VALUE_STR = 4
+_NATIVE_SLT_VALUE_FLOAT = 5
+_NATIVE_SLT_TYPE_NONE = 0
+_NATIVE_SLT_TYPE_BOOL = 1
+_NATIVE_SLT_TYPE_INT = 2
+_NATIVE_SLT_TYPE_STR = 3
+_NATIVE_SLT_TYPE_FLOAT = 4
+_NATIVE_SLT_TYPE_NAMES = {
+    _NATIVE_SLT_TYPE_BOOL: "builtins.bool",
+    _NATIVE_SLT_TYPE_INT: "builtins.int",
+    _NATIVE_SLT_TYPE_STR: "builtins.str",
+    _NATIVE_SLT_TYPE_FLOAT: "builtins.float",
+}
 
 # check_lvalue_validity dispatch tags (see semanal_bases.rs). PASS: node
 # is neither TypeVarExpr nor TypeInfo; TYPEVAR: fail "Invalid assignment
@@ -4722,6 +4745,51 @@ class SemanticAnalyzer(
 
         If this is a 'Final' context, we return "Literal[...]" instead.
         """
+        # Native type_kernel seam: classify the value-kind dispatch in Rust
+        # (semanal_visitor.rs); named_type_or_none and the Final-context
+        # LiteralType construction stay here. None defers to Python below.
+        if (
+            _SEMANAL_VISITOR_HAS_KERNEL
+            and _native_semanal_visitor_active
+            and _rust_classify_simple_literal_type is not None
+        ):
+            try:
+                if self.function_stack:
+                    # Skip inside a function, to avoid confusing the
+                    # dead-code handling for value-restricted typevars.
+                    kind = _NATIVE_SLT_VALUE_NONE
+                    value = None
+                else:
+                    value = constant_fold_expr(rvalue, self.cur_mod_id)
+                    if isinstance(value, bool):
+                        kind = _NATIVE_SLT_VALUE_BOOL
+                    elif isinstance(value, complex):
+                        kind = _NATIVE_SLT_VALUE_COMPLEX
+                    elif isinstance(value, int):
+                        kind = _NATIVE_SLT_VALUE_INT
+                    elif isinstance(value, str):
+                        kind = _NATIVE_SLT_VALUE_STR
+                    elif isinstance(value, float):
+                        kind = _NATIVE_SLT_VALUE_FLOAT
+                    else:
+                        kind = _NATIVE_SLT_VALUE_NONE
+                tag = _rust_classify_simple_literal_type(
+                    bool(self.function_stack), kind, self.cur_mod_id, is_final
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == _NATIVE_SLT_TYPE_NONE:
+                    return None
+                typ = self.named_type_or_none(_NATIVE_SLT_TYPE_NAMES[tag])
+                if typ and is_final:
+                    # tag != TYPE_NONE implies a LiteralValue kind; complex
+                    # and fold-failure both map to TYPE_NONE above.
+                    assert isinstance(value, (bool, int, str, float))
+                    return typ.copy_modified(
+                        last_known_value=LiteralType(value=value, fallback=typ)
+                    )
+                return typ
         if self.function_stack:
             # Skip inside a function; this is to avoid confusing
             # the code that handles dead code due to isinstance()

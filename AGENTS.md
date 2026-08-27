@@ -1047,6 +1047,24 @@ including:
   `NativeClassPatternRangesSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus pure decision unit
   tests in `checkpattern.rs`.
+- `rust_classify_simple_literal_type` (issue #984) — mirrors the 5-way
+  dispatch head of `SemanticAnalyzer.analyze_simple_literal_type`
+  (semanal.py:4720-4749): function_stack truthiness (skip inside a
+  function) and the folded constant kind (None / complex / bool / int /
+  str / float) decide the type-name tag (builtins.bool/int/str/float or
+  None). The Python shim folds the rvalue via the already-native
+  `constant_fold_expr`, applies `named_type_or_none(type_name)`, and
+  when `is_final` wraps the result via
+  `copy_modified(last_known_value=LiteralType(...))`. `cur_mod_id` and
+  `is_final` are carried for signature fidelity but do not affect the
+  decision. Never defers in production: the shim only produces the six
+  known value kinds; an unknown kind (direct seam calls only) defers
+  (`None`) to the pure-Python body. Gated by
+  `_native_semanal_visitor_active` and covered by
+  `NativeSimpleLiteralTypeSuite` in `mypy/test/testtypes.py` (direct
+  seam tag tests + gate-off vs gate-on differential over int/str/float/
+  bool/complex/fold-failure/final-var-ref/inside-function), plus pure
+  decision unit tests in `semanal_visitor.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
