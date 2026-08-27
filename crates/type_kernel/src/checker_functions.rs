@@ -2208,3 +2208,210 @@ mod rvalue_count_tests {
         );
     }
 }
+
+/// Decision tags for `check_for_truthy_type`; must match `NATIVE_TRUTHY_*`
+/// in mypy/checker.py.
+const TRUTHY_SKIP: i64 = 0;
+const TRUTHY_FUNCTION: i64 = 1;
+const TRUTHY_UNION: i64 = 2;
+const TRUTHY_ITERABLE: i64 = 3;
+const TRUTHY_OTHER: i64 = 4;
+
+/// The Instance arm of `TypeChecker._is_truthy_type` (checker.py:7882-7896)
+/// as a pure decision over its scalar facts: `type_present` is
+/// `bool(t.type)`, `has_bool` / `has_len` are the `has_readable_member`
+/// results, and `fullname_is_object` is the `builtins.object` guard.
+fn instance_is_truthy(
+    type_present: bool,
+    has_bool: bool,
+    has_len: bool,
+    fullname_is_object: bool,
+) -> bool {
+    type_present && !has_bool && !has_len && !fullname_is_object
+}
+
+/// The `check_for_truthy_type` dispatch (checker.py:7928-7950) for an
+/// already-truthy type: FunctionLike first, then UnionType, then the
+/// `typing.Iterable` Instance special case, else the generic message.
+fn dispatch_truthy_tag(is_function_like: bool, is_union: bool, is_iterable_instance: bool) -> i64 {
+    if is_function_like {
+        TRUTHY_FUNCTION
+    } else if is_union {
+        TRUTHY_UNION
+    } else if is_iterable_instance {
+        TRUTHY_ITERABLE
+    } else {
+        TRUTHY_OTHER
+    }
+}
+
+/// The recursive truthiness predicate `_is_truthy_type`
+/// (checker.py:7882-7896) over live Python type objects. The shim passes
+/// the already-proper type; union items are resolved per-item through
+/// `mypy.types.get_proper_type` exactly like `get_proper_types`.
+/// Returns `None` to defer on any unreadable fact (the Python shim then
+/// falls back to the pure-Python body, which raises identically).
+fn is_truthy_type(
+    t: &PyAny,
+    instance_cls: &PyType,
+    fl_cls: &PyType,
+    union_cls: &PyType,
+    get_proper: &PyAny,
+) -> PyResult<Option<bool>> {
+    if t.is_instance(instance_cls)? {
+        let info = match t.getattr("type") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let type_present = match info.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        if !type_present {
+            return Ok(Some(false));
+        }
+        let mut ok = true;
+        for member in ["__bool__", "__len__"] {
+            let has = match info.call_method1("has_readable_member", (member,)) {
+                Ok(v) => match v.is_true() {
+                    Ok(b) => b,
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            };
+            if has {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            return Ok(Some(false));
+        }
+        let fullname: String = match info.getattr("fullname") {
+            Ok(v) => match v.extract() {
+                Ok(s) => s,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        Ok(Some(instance_is_truthy(
+            true,
+            false,
+            false,
+            fullname == "builtins.object",
+        )))
+    } else if t.is_instance(fl_cls)? {
+        Ok(Some(true))
+    } else if t.is_instance(union_cls)? {
+        let items = match t.getattr("items") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        for item in items.iter()? {
+            let item = item?;
+            let proper = get_proper.call1((item,))?;
+            match is_truthy_type(proper, instance_cls, fl_cls, union_cls, get_proper)? {
+                Some(true) => {}
+                Some(false) => return Ok(Some(false)),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(true))
+    } else {
+        Ok(Some(false))
+    }
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_for_truthy_type`
+/// (mypy/checker.py:7898-7956) plus its `_is_truthy_type` helper
+/// (checker.py:7882-7896). Rust classifies the strict-optional
+/// truthiness arbitration into a branch tag (SKIP / FUNCTION / UNION /
+/// ITERABLE / OTHER); the `format_type` message formatting and the
+/// `self.fail` emission stay in Python. The shim passes the
+/// already-proper type. Defers (`None`) only on an unreadable fact,
+/// mirroring the shim `try/except`.
+#[pyfunction]
+pub(crate) fn rust_classify_truthy_type(py: Python<'_>, t: &PyAny) -> PyResult<Option<i64>> {
+    let types_mod = py.import("mypy.types")?;
+    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+    let fl_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
+    let union_cls: &PyType = types_mod.getattr("UnionType")?.downcast()?;
+    let get_proper = types_mod.getattr("get_proper_type")?;
+
+    let truthy = match is_truthy_type(t, instance_cls, fl_cls, union_cls, get_proper)? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    if !truthy {
+        return Ok(Some(TRUTHY_SKIP));
+    }
+    let is_function_like = t.is_instance(fl_cls)?;
+    let is_union = t.is_instance(union_cls)?;
+    let is_iterable_instance = if t.is_instance(instance_cls)? {
+        t.getattr("type")
+            .and_then(|info| info.getattr("fullname"))
+            .and_then(|f| f.extract::<String>())
+            .map(|s| s == "typing.Iterable")
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    Ok(Some(dispatch_truthy_tag(
+        is_function_like,
+        is_union,
+        is_iterable_instance,
+    )))
+}
+
+#[cfg(test)]
+mod truthy_type_tests {
+    use super::*;
+
+    #[test]
+    fn test_instance_plain_truthy() {
+        assert!(instance_is_truthy(true, false, false, false));
+    }
+
+    #[test]
+    fn test_instance_no_type_falsy() {
+        // bool(t.type) is False (a None TypeInfo).
+        assert!(!instance_is_truthy(false, false, false, false));
+    }
+
+    #[test]
+    fn test_instance_bool_member_falsy() {
+        assert!(!instance_is_truthy(true, true, false, false));
+    }
+
+    #[test]
+    fn test_instance_len_member_falsy() {
+        assert!(!instance_is_truthy(true, false, true, false));
+    }
+
+    #[test]
+    fn test_instance_object_falsy() {
+        assert!(!instance_is_truthy(true, false, false, true));
+    }
+
+    #[test]
+    fn test_dispatch_function_like_first() {
+        // A FunctionLike wins even though the union / iterable tags are
+        // unreachable for it; order must mirror checker.py.
+        assert_eq!(dispatch_truthy_tag(true, true, true), TRUTHY_FUNCTION);
+    }
+
+    #[test]
+    fn test_dispatch_union() {
+        assert_eq!(dispatch_truthy_tag(false, true, true), TRUTHY_UNION);
+    }
+
+    #[test]
+    fn test_dispatch_iterable() {
+        assert_eq!(dispatch_truthy_tag(false, false, true), TRUTHY_ITERABLE);
+    }
+
+    #[test]
+    fn test_dispatch_other() {
+        assert_eq!(dispatch_truthy_tag(false, false, false), TRUTHY_OTHER);
+    }
+}

@@ -1321,3 +1321,20 @@ directly to `main`.
   and covered by `NativeHasNoAttrSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), plus pure
   decision unit tests in `messages.rs`.
+- `rust_classify_truthy_type` (issue #1010, mypy.checker) — mirrors the
+  strict-optional truthiness arbitration of
+  `TypeChecker.check_for_truthy_type` (checker.py:7898-7956) and its
+  `_is_truthy_type` helper (checker.py:7882-7896). Rust walks the live
+  proper type via PyO3 (isinstance against `Instance`/`FunctionLike`/
+  `UnionType`, `bool(t.type)`, `has_readable_member("__bool__"/"__len__")`,
+  `type.fullname`, and per-item `get_proper_type` for union items) and
+  returns a branch tag (SKIP / FUNCTION / UNION / ITERABLE / OTHER);
+  Python keeps the `state.strict_optional` gate, all `format_type`
+  message formatting, `make_fake_typeinfo`, and the `self.fail` emission,
+  with the pure-Python `_is_truthy_type` body as the fallback. Defers
+  (`None`) only on an unreadable fact (the fallback then raises
+  identically). Gated by `_native_checker_active` (wired from
+  `mypy/build.py`) and covered by `NativeTruthyTypeSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential on the
+  captured fail messages plus direct seam calls), plus 9 pure decision
+  unit tests in `checker_functions.rs`.
