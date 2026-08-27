@@ -1419,6 +1419,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         semanal_checks::rust_check_decorated_function_is_method,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        semanal_bases::rust_classify_lvalue_validity,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(semanal_visitor::rust_lookup, module)?)?;
     module.add_function(wrap_pyfunction!(
         semanal_lookup::rust_lookup_qualified,

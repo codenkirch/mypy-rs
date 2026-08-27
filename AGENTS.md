@@ -280,6 +280,19 @@ including:
   side effect (`add_meta_expr = args[0]`, break). Gated by the
   semanal_visitor gate and covered by `NativeCompatMetaclassHelperSuite`
   in `mypy/test/testtypes.py`.
+- `rust_classify_lvalue_validity` (issue #934) — mirrors the 2-way
+  dispatch head of `SemanticAnalyzer.check_lvalue_validity`
+  (semanal.py:5445-5449): Rust reads the live `node` via PyO3
+  `is_instance` against `mypy.nodes.TypeVarExpr` and
+  `mypy.nodes.TypeInfo` and returns a branch tag (PASS / TYPEVAR /
+  TYPEINFO); the Python shim applies the `self.fail("Invalid assignment
+  target", ctx)` and `self.fail(message_registry.CANNOT_ASSIGN_TO_TYPE,
+  ctx)` side effects. Never defers: every reachable branch is classified.
+  Gated by the semanal_visitor gate (`_native_semanal_visitor_active`,
+  wired from `mypy/build.py`) and covered by
+  `NativeLvalueValiditySuite` in `mypy/test/testtypes.py` (direct seam
+  tag tests + gate-off vs gate-on differential on the fail message
+  list), plus pure decision unit tests in `semanal_bases.rs`.
 - `rust_bind_self` (issue #492) — mirrors `mypy.typeops.bind_self`'s
   non-generic fast path (typeops.py:540-641): strips the first parameter
   and sets `is_bound=True` for non-variable-carrying `CallableType`s. Rust

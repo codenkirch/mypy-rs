@@ -20,6 +20,15 @@ use std::collections::HashSet;
 use pyo3::prelude::*;
 use pyo3::types::{PyList, PyString, PyTuple, PyType};
 
+/// Fetch a class from `mypy.nodes`. Mirrors the private helper in
+/// `checker_functions.rs` / `checker_visitor.rs`.
+fn nodes_class<'py>(py: Python<'py>, name: &str) -> PyResult<&'py PyType> {
+    py.import("mypy.nodes")?
+        .getattr(name)?
+        .downcast::<PyType>()
+        .map_err(Into::into)
+}
+
 /// Action tags handed to the Python shim, index-aligned with the base list:
 /// - `KEEP`: not a Generic/Protocol declaration; nothing to remove.
 /// - `GENERIC`: `typing.Generic` (with or without args); removed, its type
@@ -261,6 +270,34 @@ pub(crate) fn rust_classify_add_metaclass(
     ))
 }
 
+/// Decision tags for `check_lvalue_validity` (semanal.py:5445):
+/// - `LVALUE_KIND_PASS`: node is neither TypeVarExpr nor TypeInfo.
+/// - `LVALUE_KIND_TYPEVAR`: Python fails "Invalid assignment target".
+/// - `LVALUE_KIND_TYPEINFO`: Python fails CANNOT_ASSIGN_TO_TYPE.
+pub(crate) const LVALUE_KIND_PASS: i64 = 0;
+pub(crate) const LVALUE_KIND_TYPEVAR: i64 = 1;
+pub(crate) const LVALUE_KIND_TYPEINFO: i64 = 2;
+
+/// `SemanticAnalyzer.check_lvalue_validity` dispatch-head port
+/// (semanal.py:5445-5449). Rust reads the live `node` via PyO3
+/// `is_instance` against `mypy.nodes.TypeVarExpr` and
+/// `mypy.nodes.TypeInfo` and returns a branch tag. The Python shim
+/// applies the `self.fail(...)` side effects. Never defers: every
+/// reachable branch (including the implicit pass for any other node)
+/// is classified.
+#[pyfunction]
+pub(crate) fn rust_classify_lvalue_validity(py: Python<'_>, node: &PyAny) -> PyResult<i64> {
+    let typevar_expr_cls = nodes_class(py, "TypeVarExpr")?;
+    if node.is_instance(typevar_expr_cls)? {
+        return Ok(LVALUE_KIND_TYPEVAR);
+    }
+    let typeinfo_cls = nodes_class(py, "TypeInfo")?;
+    if node.is_instance(typeinfo_cls)? {
+        return Ok(LVALUE_KIND_TYPEINFO);
+    }
+    Ok(LVALUE_KIND_PASS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +470,15 @@ mod tests {
     #[test]
     fn test_classify_add_metaclass_none_fullname() {
         assert_eq!(classify_add_meta(None, 1, true), ACTION_NOT_ADD_METACLASS);
+    }
+
+    #[test]
+    fn lvalue_kind_constants_are_distinct() {
+        assert_eq!(LVALUE_KIND_PASS, 0);
+        assert_eq!(LVALUE_KIND_TYPEVAR, 1);
+        assert_eq!(LVALUE_KIND_TYPEINFO, 2);
+        assert_ne!(LVALUE_KIND_PASS, LVALUE_KIND_TYPEVAR);
+        assert_ne!(LVALUE_KIND_PASS, LVALUE_KIND_TYPEINFO);
+        assert_ne!(LVALUE_KIND_TYPEVAR, LVALUE_KIND_TYPEINFO);
     }
 }

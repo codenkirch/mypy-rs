@@ -30228,3 +30228,94 @@ class NativeDecoratedFunctionIsMethodSuite(Suite):
 
     def test_parity_both_fail(self) -> None:
         self._assert_par(has_type=False, func_scope=True)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeLvalueValiditySuite(Suite):
+    """Parity for the Rust `check_lvalue_validity` dispatch-head port.
+
+    `SemanticAnalyzer.check_lvalue_validity` (semanal.py:5445) is a 2-way
+    scalar dispatch on node kind: TypeVarExpr -> fail "Invalid assignment
+    target", TypeInfo -> fail CANNOT_ASSIGN_TO_TYPE, else pass. The Rust
+    classifier (`semanal_bases.rs`) reads the live `node` via PyO3
+    `is_instance` and returns a branch tag; the Python shim applies the
+    `self.fail(...)` side effects.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real SemanticAnalyzer method
+    through a stub fail recorder and asserts identical message lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, node: Any) -> int:
+        return _type_kernel.rust_classify_lvalue_validity(node)
+
+    def _typeinfo(self) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        class_def = ClassDef("C", Block([]), None, [])
+        class_def.fullname = "mod.C"
+        return TypeInfo(SymbolTable(), class_def, "mod")
+
+    def _run(self, node: Any) -> list[str]:
+        from mypy.nodes import TempNode
+        from mypy.semanal import SemanticAnalyzer
+
+        def check_one() -> list[str]:
+            sa = SemanticAnalyzer.__new__(SemanticAnalyzer)
+            fails: list[str] = []
+            sa.fail = lambda msg, ctx, **kw: fails.append(str(msg))  # type: ignore
+            sa.check_lvalue_validity(node, TempNode(AnyType(TypeOfAny.special_form)))
+            return fails
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, node: Any) -> None:
+        off, on = self._run(node)
+        assert_equal(on, off, f"check_lvalue_validity parity for node={node!r}")
+
+    def test_seam_typevar_expr(self) -> None:
+        from mypy.nodes import TypeVarExpr
+
+        tv = TypeVarExpr("T", "T", -1, [], None, AnyType(TypeOfAny.from_omitted_generics))
+        assert self._tag(tv) == 1
+
+    def test_seam_typeinfo(self) -> None:
+        assert self._tag(self._typeinfo()) == 2
+
+    def test_seam_pass(self) -> None:
+        v = Var("x")
+        assert self._tag(v) == 0
+        assert self._tag(None) == 0
+
+    def test_parity_typevar_expr(self) -> None:
+        from mypy.nodes import TypeVarExpr
+
+        tv = TypeVarExpr("T", "T", -1, [], None, AnyType(TypeOfAny.from_omitted_generics))
+        self._assert_par(tv)
+
+    def test_parity_typeinfo(self) -> None:
+        self._assert_par(self._typeinfo())
+
+    def test_parity_var(self) -> None:
+        self._assert_par(Var("x"))
+
+    def test_parity_none(self) -> None:
+        self._assert_par(None)
