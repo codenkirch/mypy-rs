@@ -2874,11 +2874,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
     def check___new___signature(self, fdef: FuncDef, typ: CallableType) -> None:
         self_type = fill_typevars_with_any(fdef.info)
         bound_type = bind_self(typ, self_type, is_classmethod=True)
-        # Check that __new__ (after binding cls) returns an instance
-        # type (or any).
-        # Native type_kernel seam: classify the 3-way return-type decision
-        # in Rust (checker_functions.rs); the two check_subtype calls and
-        # the INVALID_NEW_TYPE / NON_INSTANCE_NEW_TYPE emission stay here.
+        # Check that __new__ (after binding cls) returns an instance type
+        # (or any). Native seam: the 3-way return-type decision runs in
+        # Rust; the check_subtype calls and error emission stay here.
         if (
             _CHECKER_HAS_TYPE_KERNEL
             and _native_checker_active
@@ -5257,11 +5255,9 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         else:
             lvs = [s.lvalue]
         is_final_decl = s.is_final_def if isinstance(s, AssignmentStmt) else False
-        # Native type_kernel seam: classify the final_without_value gate and
-        # the per-lvalue final-assignment arbitration (MRO walk + is_final
-        # flags) in Rust (checker_functions.rs); the final_without_value and
-        # cant_assign_to_final emissions stay here. None falls through to the
-        # pure-Python body below.
+        # Native seam: the final_without_value gate and per-lvalue
+        # final-assignment arbitration run in Rust; the emissions stay
+        # here. None falls through to the pure-Python body below.
         if (
             _CHECKER_HAS_TYPE_KERNEL
             and _native_checker_active

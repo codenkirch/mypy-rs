@@ -1374,6 +1374,15 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls), plus 6 pure decision unit tests in `typeops.rs`.
 - `rust_make_inferred_type_note` (issue #982) — mirrors the pure bool
+  decision of `Messages.make_inferred_type_note` (messages.py:3770-3800):
+  Rust decodes the serialized subtype/supertype pair and runs the
+  `inferred_note_wire_decision` check plus the `inferred_note_context_fires`
+  context classifier (ReturnStmt + NameExpr), returning True when the
+  inferred-return-annotation note fires; the Python shim formats the
+  "Perhaps you need a type annotation" message. Defers (`Ok(false)`) on
+  undecodable wire bytes or a non-firing context. Gated by
+  `_native_messages_active` (wired from `mypy/build.py`) and covered by
+  `NativeInferredTypeNoteSuite` in `mypy/test/testtypes.py`.
 - `rust_classify_has_no_attr` (issue #1006) — mirrors the dispatch of
   `Messages.has_no_attr` (messages.py:364-601): the 11-arm special-case
   front (not-assignable member, `in`, binary-op methods via `op_methods`,
