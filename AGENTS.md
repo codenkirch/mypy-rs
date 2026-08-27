@@ -805,6 +805,18 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on
   (return, is_compat call count) plus direct seam calls proving
   engagement), and 12 pure decision unit tests in `subtypes.rs`.
+- `rust_classify_fixed_args` (issue #935) — mirrors the two gap checks of
+  `SemanticAnalyzer.check_fixed_args` (semanal.py:6962-6976):
+  `len(expr.args) != numargs` (wrong count) and
+  `expr.arg_kinds != [ARG_POS]*numargs` (wrong kinds). Rust classifies
+  the two gaps into a 3-way tag (OK / wrong-count / wrong-kinds) from
+  `args_len`, the integer `arg_kinds` list, and `numargs`; the Python
+  shim applies the `self.fail` message per the tag and keeps the
+  pure-Python body as the fallback. Never defers (`Some(tag)` always).
+  Gated by `_native_semanal_visitor_active` (wired from `mypy/build.py`)
+  and covered by `NativeFixedArgsSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), and pure
+  decision unit tests in `semanal_checks.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

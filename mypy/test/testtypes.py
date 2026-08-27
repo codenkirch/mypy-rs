@@ -25849,6 +25849,105 @@ class NativeIsFinalEnumValueSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeFixedArgsSuite(Suite):
+    """Parity for the Rust `check_fixed_args` arbitration port.
+
+    `SemanticAnalyzer.check_fixed_args` (semanal.py:6962) checks two gaps:
+    `len(expr.args) != numargs` (wrong count) and
+    `expr.arg_kinds != [ARG_POS]*numargs` (wrong kinds), returning bool.
+    The Rust classifier (`semanal_checks.rs`) turns those into a tag; the
+    Python shim applies the `self.fail` side effect per the tag.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real method through a stub message
+    recorder and asserts identical (return, messages) pairs.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        from mypy.semanal import _set_native_semanal_visitor_active
+
+        self._set_active = _set_native_semanal_visitor_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _call(self, n_args: int, kinds: list[int]) -> CallExpr:
+        from mypy.nodes import NameExpr
+
+        callee = NameExpr("f")
+        args = [NameExpr(f"a{i}") for i in range(n_args)]
+        return CallExpr(callee, args, kinds, [None] * n_args)
+
+    def _seam(self, n_args: int, kinds: list[int], numargs: int) -> int | None:
+        return self._tk.rust_classify_fixed_args(n_args, kinds, numargs)
+
+    def _run(
+        self, n_args: int, kinds: list[int], numargs: int, name: str = "f"
+    ) -> tuple[bool, list[str]]:
+        from mypy import semanal
+
+        def check_one() -> tuple[bool, list[str]]:
+            call = self._call(n_args, kinds)
+            failures: list[str] = []
+
+            class _Analyzer:
+                def fail(self, msg: str, ctx: object, *, code: object = None) -> None:
+                    failures.append(str(msg))
+
+            analyzer = _Analyzer()
+            ret = semanal.SemanticAnalyzer.check_fixed_args(analyzer, call, numargs, name)
+            return ret, failures
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(
+        self, n_args: int, kinds: list[int], numargs: int, name: str = "f"
+    ) -> None:
+        off, on = self._run(n_args, kinds, numargs, name)
+        assert_equal(on, off, f"check_fixed_args parity n_args={n_args} kinds={kinds}")
+
+    def test_seam_ok(self) -> None:
+        assert self._seam(2, [0, 0], 2) == 0
+        assert self._seam(0, [], 0) == 0
+        assert self._seam(1, [0], 1) == 0
+
+    def test_seam_wrong_count(self) -> None:
+        assert self._seam(1, [0], 2) == 1
+        assert self._seam(3, [0, 0, 0], 2) == 1
+
+    def test_seam_wrong_kinds(self) -> None:
+        assert self._seam(2, [0, 3], 2) == 2
+        assert self._seam(2, [3, 0], 2) == 2
+        assert self._seam(2, [3, 3], 2) == 2
+
+    def test_parity_ok(self) -> None:
+        self._assert_par(2, [ARG_POS, ARG_POS], 2)
+        self._assert_par(0, [], 0)
+        self._assert_par(1, [ARG_POS], 1, name="g")
+
+    def test_parity_wrong_count(self) -> None:
+        self._assert_par(1, [ARG_POS], 2)
+        self._assert_par(3, [ARG_POS, ARG_POS, ARG_POS], 2)
+
+    def test_parity_wrong_kinds(self) -> None:
+        self._assert_par(2, [ARG_POS, ARG_NAMED], 2)
+        self._assert_par(2, [ARG_STAR, ARG_POS], 2)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
 
