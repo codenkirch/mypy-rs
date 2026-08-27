@@ -137,6 +137,65 @@ pub(crate) fn rust_classify_final_super(
     )))
 }
 
+/// Decision tags for `check_compatibility_classvar_super`; must match
+/// `NATIVE_CLASSVAR_SUPER_*` in mypy/checker.py.
+const KIND_CLASSVAR_SUPER_NOT_VAR: i64 = 0;
+const KIND_CLASSVAR_SUPER_OK: i64 = 1;
+const KIND_CLASSVAR_SUPER_INSTANCE_VAR: i64 = 2;
+const KIND_CLASSVAR_SUPER_CLASS_VAR: i64 = 3;
+
+/// The pure 2x2 decision of `TypeChecker.check_compatibility_classvar_super`
+/// (checker.py:4796-4807). `is_var` means `base_node` is a `Var`;
+/// `node_is_classvar` / `base_is_classvar` are the two `is_classvar` flags.
+/// Branch order mirrors the Python body: not-a-Var passes first, then the
+/// instance-variable violation, then the class-variable violation, then the
+/// implicit trailing pass.
+fn classify_classvar_super(is_var: bool, node_is_classvar: bool, base_is_classvar: bool) -> i64 {
+    if !is_var {
+        return KIND_CLASSVAR_SUPER_NOT_VAR;
+    }
+    if node_is_classvar && !base_is_classvar {
+        return KIND_CLASSVAR_SUPER_INSTANCE_VAR;
+    }
+    if !node_is_classvar && base_is_classvar {
+        return KIND_CLASSVAR_SUPER_CLASS_VAR;
+    }
+    KIND_CLASSVAR_SUPER_OK
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_compatibility_classvar_super`
+/// (mypy/checker.py:4796-4807). Reads the live `base_node` shape (Var or not),
+/// the `node.is_classvar` flag computed by the shim, and the live
+/// `base_node.is_classvar` flag via PyO3. Returns `Some(tag)` for every
+/// reachable branch, or `None` to defer (an unreadable `base_node.is_classvar`).
+#[pyfunction]
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn rust_classify_classvar_super(
+    py: Python<'_>,
+    base_node: &PyAny,
+    node_is_classvar: bool,
+) -> PyResult<Option<i64>> {
+    let var_cls = nodes_class(py, "Var")?;
+    let is_var = base_node.is_instance(var_cls)?;
+
+    // checker.py:4801 reads `base_node.is_classvar` only after the branch-0
+    // isinstance gate, so a None base_node never reaches this read.
+    let base_is_classvar = if is_var {
+        match read_bool_attr(base_node, "is_classvar")? {
+            Some(b) => b,
+            None => return Ok(None),
+        }
+    } else {
+        false
+    };
+
+    Ok(Some(classify_classvar_super(
+        is_var,
+        node_is_classvar,
+        base_is_classvar,
+    )))
+}
+
 /// Decision tags for `check___new___signature`; must match
 /// `NATIVE_NEW_SIGNATURE_*` in mypy/checker.py.
 const NEW_SIGNATURE_METACLASS: i64 = 0;
@@ -855,5 +914,43 @@ mod metaclass_compat_tests {
             classify(false, false, false, false, false, true, true),
             KIND_METACLASS_PASS
         );
+    }
+}
+
+#[cfg(test)]
+mod classvar_super_tests {
+    use super::*;
+
+    fn classify(is_var: bool, node_is_classvar: bool, base_is_classvar: bool) -> i64 {
+        classify_classvar_super(is_var, node_is_classvar, base_is_classvar)
+    }
+
+    #[test]
+    fn test_not_var_passes() {
+        assert_eq!(classify(false, true, true), KIND_CLASSVAR_SUPER_NOT_VAR);
+        assert_eq!(classify(false, false, false), KIND_CLASSVAR_SUPER_NOT_VAR);
+    }
+
+    #[test]
+    fn test_both_classvar_ok() {
+        assert_eq!(classify(true, true, true), KIND_CLASSVAR_SUPER_OK);
+    }
+
+    #[test]
+    fn test_both_not_classvar_ok() {
+        assert_eq!(classify(true, false, false), KIND_CLASSVAR_SUPER_OK);
+    }
+
+    #[test]
+    fn test_node_classvar_base_not_instance_var_violation() {
+        assert_eq!(
+            classify(true, true, false),
+            KIND_CLASSVAR_SUPER_INSTANCE_VAR
+        );
+    }
+
+    #[test]
+    fn test_node_not_classvar_base_class_var_violation() {
+        assert_eq!(classify(true, false, true), KIND_CLASSVAR_SUPER_CLASS_VAR);
     }
 }

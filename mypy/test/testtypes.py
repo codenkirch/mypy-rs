@@ -24412,6 +24412,122 @@ class NativeFinalSuperSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCompatibilityClassvarSuperSuite(Suite):
+    """Parity for the Rust `check_compatibility_classvar_super` 2x2 predicate port.
+
+    `TypeChecker.check_compatibility_classvar_super` (checker.py:4796) is a
+    pure decision over whether `base_node` is a `Var` and the `is_classvar`
+    flags of the overriding `node` and the `base_node`. The Rust classifier
+    (`checker_functions.rs`) turns those facts into a branch tag; the Python
+    shim applies the side effects (CANNOT_OVERRIDE_INSTANCE_VAR /
+    CANNOT_OVERRIDE_CLASS_VAR message emission) and keeps the pure-Python
+    body as the fallback.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a
+    stub message recorder and asserts identical (return, messages) pairs.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _var(self, name: str, is_classvar: bool) -> Var:
+        v = Var(name)
+        v.is_classvar = is_classvar
+        return v
+
+    def _funcdef(self, name: str) -> FuncDef:
+        return FuncDef(name)
+
+    def _base(self, fullname: str, name: str = "Base") -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(name=name, fullname=fullname)
+
+    def _tag(self, base_node: Any, node_is_classvar: bool) -> int | None:
+        return _type_kernel.rust_classify_classvar_super(base_node, node_is_classvar)
+
+    def _run(
+        self, node: Any, base: Any, base_node: Any
+    ) -> tuple[bool, list[tuple[str, str]]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[bool, list[tuple[str, str]]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            msgs: list[tuple[str, str]] = []
+            chk.fail = lambda msg, ctx: msgs.append(("fail", str(msg)))  # type: ignore[assignment]
+            ret = chk.check_compatibility_classvar_super(node, base, base_node)
+            return ret, msgs
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, node: Any, base: Any, base_node: Any) -> None:
+        off, on = self._run(node, base, base_node)
+        assert_equal(
+            on, off, f"check_compatibility_classvar_super parity for base_node={base_node!r}"
+        )
+
+    def test_seam_not_var(self) -> None:
+        base_node = self._funcdef("base_method")
+        assert self._tag(base_node, True) == 0
+        assert self._tag(base_node, False) == 0
+
+    def test_seam_none_base_node(self) -> None:
+        assert self._tag(None, True) == 0
+        assert self._tag(None, False) == 0
+
+    def test_seam_both_classvar_ok(self) -> None:
+        base_node = self._var("base_attr", True)
+        assert self._tag(base_node, True) == 1
+
+    def test_seam_both_not_classvar_ok(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, False) == 1
+
+    def test_seam_instance_var_violation(self) -> None:
+        base_node = self._var("base_attr", False)
+        assert self._tag(base_node, True) == 2
+
+    def test_seam_class_var_violation(self) -> None:
+        base_node = self._var("base_attr", True)
+        assert self._tag(base_node, False) == 3
+
+    def test_parity_every_branch(self) -> None:
+        node_cv = self._var("attr", True)
+        node_iv = self._var("attr", False)
+        base = self._base("mod.Base")
+        # None base node: pass.
+        self._assert_par(node_iv, base, None)
+        # Non-Var base node: pass.
+        self._assert_par(node_cv, base, self._funcdef("base_method"))
+        # Both classvar: pass, no message.
+        self._assert_par(node_cv, base, self._var("base_attr", True))
+        # Both instance var: pass, no message.
+        self._assert_par(node_iv, base, self._var("base_attr", False))
+        # node classvar, base instance var: instance-var violation.
+        self._assert_par(node_cv, base, self._var("base_attr", False))
+        # node instance var, base classvar: class-var violation.
+        self._assert_par(node_iv, base, self._var("base_attr", True))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeNewSignatureSuite(Suite):
     """Parity for the Rust `check___new___signature` 3-way dispatch port.
 
