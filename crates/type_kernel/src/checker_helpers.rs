@@ -1917,7 +1917,7 @@ mod tests {
             let r = make_native(TypeResolver::new());
             let left = make_instance("mymod.NotFound", vec![]);
             let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
-            assert!(matches!(res, None));
+            assert!(res.is_none());
         });
     }
 
@@ -1932,7 +1932,7 @@ mod tests {
                 missing_import_name: None,
             };
             let res = get_protocol_member_inner(py, &left, "__call__", false, false, &r);
-            assert!(matches!(res, None));
+            assert!(res.is_none());
         });
     }
 
@@ -2013,10 +2013,10 @@ mod tests {
         };
         r.insert("builtins.int".to_string(), snap);
         let inst = make_instance("builtins.int", vec![]);
-        assert_eq!(join_type_list_inner(&[inst.clone()], true, &r), Some(inst));
+        assert_eq!(join_type_list_inner(std::slice::from_ref(&inst), true, &r), Some(inst));
         let none_t = Type::NoneType;
         assert_eq!(
-            join_type_list_inner(&[none_t.clone()], true, &r),
+            join_type_list_inner(std::slice::from_ref(&none_t), true, &r),
             Some(none_t)
         );
     }

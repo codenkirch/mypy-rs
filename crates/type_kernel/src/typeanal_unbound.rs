@@ -100,6 +100,7 @@ pub(crate) fn rust_analyze_unbound_without_info(
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn classify(
         is_var_any: bool,
         allow_type_any: bool,

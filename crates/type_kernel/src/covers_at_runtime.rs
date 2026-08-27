@@ -251,10 +251,12 @@ mod tests {
     }
 
     fn snap(fullname: &str, name: &str) -> TypeInfoSnapshot {
-        let mut s = TypeInfoSnapshot::default();
-        s.fullname = fullname.to_string();
-        s.name = name.to_string();
-        s.mro = vec![fullname.to_string(), "builtins.object".to_string()];
+        let mut s = TypeInfoSnapshot {
+            fullname: fullname.to_string(),
+            name: name.to_string(),
+            mro: vec![fullname.to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
         s.has_base.insert(fullname.to_string());
         s.has_base.insert("builtins.object".to_string());
         s
@@ -275,10 +277,6 @@ mod tests {
             source_any: None,
             missing_import_name: None,
         }
-    }
-
-    fn ctx(strict_optional: bool) -> SubtypeContext {
-        SubtypeContext::new(false, false, false, true, true, strict_optional)
     }
 
     #[test]

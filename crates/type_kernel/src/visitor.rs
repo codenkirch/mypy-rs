@@ -913,7 +913,7 @@ mod tests {
     #[test]
     fn test_remove_dups_single() {
         let a = make_instance("A", vec![]);
-        let result = remove_dups_inner(&[a.clone()]);
+        let result = remove_dups_inner(std::slice::from_ref(&a));
         assert_eq!(result.len(), 1);
     }
 
@@ -950,7 +950,7 @@ mod tests {
     #[test]
     fn test_type_vars_as_args_passthrough() {
         let tv = make_typevar(1);
-        let result = type_vars_as_args_inner(&[tv.clone()]);
+        let result = type_vars_as_args_inner(std::slice::from_ref(&tv));
         assert!(matches!(result[0], Type::TypeVarType { .. }));
     }
 

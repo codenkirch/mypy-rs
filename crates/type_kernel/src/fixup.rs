@@ -1062,6 +1062,5 @@ mod tests {
         // The fixup functions operate on live mypy objects which require
         // the full mypy import chain. Parity is verified via the Python
         // test suite (testtypes.py, testcheck.py) with the gate on.
-        assert!(true);
     }
 }

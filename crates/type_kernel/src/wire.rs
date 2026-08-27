@@ -2352,7 +2352,7 @@ impl Type {
 #[cfg(test)]
 pub(crate) fn encode_short_int_for_test(value: i64) -> Vec<u8> {
     assert!(
-        value >= MIN_ONE_BYTE_INT && value <= 117,
+        (MIN_ONE_BYTE_INT..=117).contains(&value),
         "test helper only supports 1-byte short-int range"
     );
     vec![((value - MIN_ONE_BYTE_INT) << 1) as u8]
@@ -2387,8 +2387,8 @@ mod tests {
     #[test]
     fn read_bool_rejects_invalid() {
         let mut buf = ReadBuffer::new(&[0, 1, 2]);
-        assert_eq!(read_bool(&mut buf).unwrap(), false);
-        assert_eq!(read_bool(&mut buf).unwrap(), true);
+        assert!(!read_bool(&mut buf).unwrap());
+        assert!(read_bool(&mut buf).unwrap());
         assert!(matches!(read_bool(&mut buf), Err(WireError::Invalid(_))));
     }
 
@@ -2406,15 +2406,15 @@ mod tests {
     /// `_write_long_int` (librt_internal.c:459-810). For test use only —
     /// Stage 3a ships no production writer.
     fn encode_int_for_test(value: i64) -> Vec<u8> {
-        if value >= MIN_ONE_BYTE_INT && value <= 117 {
+        if (MIN_ONE_BYTE_INT..=117).contains(&value) {
             // 1-byte form.
             vec![((value - MIN_ONE_BYTE_INT) << 1) as u8]
-        } else if value >= MIN_TWO_BYTES_INT && value <= 16283 {
+        } else if (MIN_TWO_BYTES_INT..=16283).contains(&value) {
             // 2-byte form: low 2 bits = 01.
             let encoded = ((value - MIN_TWO_BYTES_INT) << 2) as u16 | TWO_BYTES_INT_BIT as u16;
             let le = encoded.to_le_bytes();
             vec![le[0], le[1]]
-        } else if value >= MIN_FOUR_BYTES_INT && value <= 536860911 {
+        } else if (MIN_FOUR_BYTES_INT..=536860911).contains(&value) {
             // 4-byte form: low 3 bits = 011.
             let encoded =
                 ((value - MIN_FOUR_BYTES_INT) << 3) as u32 | FOUR_BYTES_INT_TRAILER as u32;
@@ -2618,9 +2618,9 @@ mod tests {
     ///   LITERAL_STR(4) + bare str "foo.Bar",
     ///   LIST_GEN(20) + size=1 + ANY_TYPE(106) + LITERAL_NONE + LITERAL_INT+0
     ///   + LITERAL_NONE + END_TAG,
-    ///   LITERAL_NONE (no last_known_value),
-    ///   LITERAL_NONE (no extra_attrs),
-    ///   END_TAG(255).
+    ///     LITERAL_NONE (no last_known_value),
+    ///     LITERAL_NONE (no extra_attrs),
+    ///     END_TAG(255).
     #[test]
     fn read_generic_instance_end_to_end() {
         let any_bytes = [

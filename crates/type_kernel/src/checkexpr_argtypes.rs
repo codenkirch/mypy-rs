@@ -353,7 +353,7 @@ fn encode_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{read_int_bare, read_type_list, write_type};
+    use crate::wire::{read_int_bare, write_type};
 
     fn any_type() -> Type {
         Type::AnyType {

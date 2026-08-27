@@ -290,6 +290,11 @@ fn walk_mypyfile_chain(
     WalkOutcome::Defer
 }
 
+fn decode_type(bytes: &[u8]) -> Option<Type> {
+    let mut buf = ReadBuffer::new(bytes);
+    wire::read_type(&mut buf, None).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,9 +418,4 @@ mod tests {
             WalkOutcome::NotFound
         ));
     }
-}
-
-fn decode_type(bytes: &[u8]) -> Option<Type> {
-    let mut buf = ReadBuffer::new(bytes);
-    wire::read_type(&mut buf, None).ok()
 }

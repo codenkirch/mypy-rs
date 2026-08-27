@@ -1209,9 +1209,11 @@ mod tests {
     #[test]
     fn type_requires_usage_awaitable_mro() {
         // A class whose own names carry __await__: UNUSED_AWAITABLE (1).
-        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
-        snap.fullname = "mod.Await".to_string();
-        snap.mro = vec!["mod.Await".to_string(), "builtins.object".to_string()];
+        let mut snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.Await".to_string(),
+            mro: vec!["mod.Await".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
         snap.member_info
             .insert("__await__".to_string(), (false, true));
         let mut resolver = TypeResolver::new();
@@ -1227,9 +1229,11 @@ mod tests {
     fn type_requires_usage_awaitable_missing_class_defers() {
         // mro references a class not in the resolver: cannot distinguish
         // "no __await__" from "unknown", so defer to Python.
-        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
-        snap.fullname = "mod.Await".to_string();
-        snap.mro = vec!["mod.Await".to_string(), "builtins.object".to_string()];
+        let snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.Await".to_string(),
+            mro: vec!["mod.Await".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Await".to_string(), snap);
         let t = instance("mod.Await");
@@ -1242,9 +1246,11 @@ mod tests {
     #[test]
     fn type_requires_usage_awaitable_absent() {
         // No __await__ anywhere in the resolved mro: decided absent (2).
-        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
-        snap.fullname = "mod.Plain".to_string();
-        snap.mro = vec!["mod.Plain".to_string()];
+        let snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.Plain".to_string(),
+            mro: vec!["mod.Plain".to_string()],
+            ..Default::default()
+        };
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Plain".to_string(), snap);
         let t = instance("mod.Plain");
@@ -1257,14 +1263,18 @@ mod tests {
     #[test]
     fn type_requires_usage_awaitable_inherited() {
         // Subclass without __await__, base with it: mro walk finds it.
-        let mut base = crate::typeinfo::TypeInfoSnapshot::default();
-        base.fullname = "mod.Base".to_string();
-        base.mro = vec!["mod.Base".to_string(), "builtins.object".to_string()];
+        let mut base = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.Base".to_string(),
+            mro: vec!["mod.Base".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
         base.member_info
             .insert("__await__".to_string(), (false, true));
-        let mut sub = crate::typeinfo::TypeInfoSnapshot::default();
-        sub.fullname = "mod.Sub".to_string();
-        sub.mro = vec!["mod.Sub".to_string(), "mod.Base".to_string()];
+        let sub = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "mod.Sub".to_string(),
+            mro: vec!["mod.Sub".to_string(), "mod.Base".to_string()],
+            ..Default::default()
+        };
         let mut resolver = TypeResolver::new();
         resolver.insert("mod.Base".to_string(), base);
         resolver.insert("mod.Sub".to_string(), sub);
@@ -1883,8 +1893,10 @@ mod tests {
     /// base, so `is_type_obj` commits to `Some(true)`.
     fn meta_resolver() -> TypeResolver {
         let mut r = TypeResolver::new();
-        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
-        snap.fullname = "builtins.type".to_string();
+        let mut snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "builtins.type".to_string(),
+            ..Default::default()
+        };
         snap.has_base.insert("builtins.type".to_string());
         r.insert("builtins.type".to_string(), snap);
         r
@@ -1991,8 +2003,10 @@ mod tests {
         // is_type_obj -> false -> Invalid. The resolver knows the fallback
         // but it has no `builtins.type` base.
         let mut r = TypeResolver::new();
-        let mut snap = crate::typeinfo::TypeInfoSnapshot::default();
-        snap.fullname = "builtins.function".to_string();
+        let snap = crate::typeinfo::TypeInfoSnapshot {
+            fullname: "builtins.function".to_string(),
+            ..Default::default()
+        };
         r.insert("builtins.function".to_string(), snap);
         let type_obj = type_obj("builtins.function", instance("mod.Foo"), None);
         match classify_except_handler_test_inner(&type_obj, &r) {

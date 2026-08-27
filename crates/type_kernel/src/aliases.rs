@@ -123,14 +123,6 @@ mod tests {
         }
     }
 
-    fn tvar(name: &str, raw_id: i64) -> AliasTvar {
-        AliasTvar {
-            name: name.to_owned(),
-            raw_id,
-            ..Default::default()
-        }
-    }
-
     #[test]
     fn alias_snapshot_default_is_empty() {
         let s = TypeAliasSnapshot::default();

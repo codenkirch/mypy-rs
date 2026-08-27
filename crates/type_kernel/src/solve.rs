@@ -2181,7 +2181,7 @@ mod tests {
             source_any: None,
             missing_import_name: None,
         };
-        let out = solve_one_inner(&[lo], &[any.clone()], false, true, &r).unwrap();
+        let out = solve_one_inner(&[lo], std::slice::from_ref(&any), false, true, &r).unwrap();
         assert_eq!(out.0, 3);
         let bytes = out.1.unwrap();
         let decoded = decode_type(&bytes).unwrap();
@@ -2209,7 +2209,7 @@ mod tests {
             source_any: None,
             missing_import_name: None,
         };
-        let out = solve_one_inner(&[any.clone()], &[up], false, true, &r).unwrap();
+        let out = solve_one_inner(std::slice::from_ref(&any), &[up], false, true, &r).unwrap();
         assert_eq!(out.0, 3);
         let decoded = decode_type(&out.1.unwrap()).unwrap();
         let Type::AnyType { source_any, .. } = decoded else {
@@ -2229,7 +2229,7 @@ mod tests {
             source_any: None,
             missing_import_name: Some("mod.thing".to_string()),
         };
-        let out = solve_one_inner(&[any.clone()], &[any.clone()], false, true, &r).unwrap();
+        let out = solve_one_inner(std::slice::from_ref(&any), std::slice::from_ref(&any), false, true, &r).unwrap();
         assert_eq!(out.0, 3);
         let decoded = decode_type(&out.1.unwrap()).unwrap();
         let Type::AnyType {
@@ -2256,7 +2256,7 @@ mod tests {
             missing_import_name: None,
         };
         let up = instance("a.B", vec![]);
-        let out = solve_one_inner(&[any.clone()], &[up], false, true, &r).unwrap();
+        let out = solve_one_inner(std::slice::from_ref(&any), &[up], false, true, &r).unwrap();
         assert_eq!(out.0, 3);
         let decoded = decode_type(&out.1.unwrap()).unwrap();
         let Type::AnyType { source_any, .. } = decoded else {
@@ -2270,7 +2270,7 @@ mod tests {
         // Uppers = [A], no lowers -> candidate = A (kind=0 with bytes).
         let r = make_resolver(vec![snap("a.A")]);
         let up = instance("a.A", vec![]);
-        let out = solve_one_inner(&[], &[up.clone()], false, true, &r).unwrap();
+        let out = solve_one_inner(&[], std::slice::from_ref(&up), false, true, &r).unwrap();
         assert_eq!(out.0, 0);
         assert_eq!(decode_type(&out.1.unwrap()).unwrap(), up);
     }

@@ -3412,7 +3412,7 @@ mod tests {
         let itype = make_instance("builtins.int");
         let result = expand_without_binding_inner(&typ, &itype, false, 100, true, &resolver)
             .expect("simple type expands");
-        assert_eq!(result.1, false); // no freshening of non-generic type
+        assert!(!result.1); // no freshening of non-generic type
         match result.2 {
             Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
             other => panic!("expected Instance, got {other:?}"),

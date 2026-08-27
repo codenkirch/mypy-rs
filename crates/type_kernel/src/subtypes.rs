@@ -3253,7 +3253,7 @@ mod tests {
         };
         let base = instance("a.Gen", vec![tvar]);
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&base, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&base, "a.Sub", std::slice::from_ref(&left_arg));
         assert_eq!(expanded, Some(instance("a.Gen", vec![left_arg])));
     }
 
@@ -3297,7 +3297,7 @@ mod tests {
         let inner = instance("a.Gen", vec![tvar()]);
         let outer = instance("a.Gen", vec![inner]);
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&outer, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&outer, "a.Sub", std::slice::from_ref(&left_arg));
         let expected = instance("a.Gen", vec![instance("a.Gen", vec![left_arg])]);
         assert_eq!(expanded, Some(expected));
     }
@@ -3334,7 +3334,7 @@ mod tests {
             implicit: false,
         };
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
         let expected = Type::TupleType {
             partial_fallback: Box::new(instance("builtins.tuple", vec![left_arg.clone()])),
             items: vec![left_arg],
@@ -3376,7 +3376,7 @@ mod tests {
             None,
         );
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
         let expected = callable_type(
             vec![instance("a.Gen", vec![left_arg.clone()])],
             instance("a.Gen", vec![left_arg]),
@@ -3534,7 +3534,7 @@ mod tests {
             ],
         };
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
         let expected = Type::Overloaded {
             items: vec![
                 callable_type(vec![left_arg.clone()], any_type(), None),
@@ -3564,7 +3564,7 @@ mod tests {
             is_type_form: false,
         };
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
         assert_eq!(
             expanded,
             Some(Type::TypeType {
@@ -3610,7 +3610,7 @@ mod tests {
             typ: Box::new(instance("a.Gen", vec![tvar])),
         };
         let left_arg = instance("a.A", vec![]);
-        let expanded = expand_type_by_instance(&t, "a.Sub", &[left_arg.clone()]);
+        let expanded = expand_type_by_instance(&t, "a.Sub", std::slice::from_ref(&left_arg));
         assert_eq!(
             expanded,
             Some(Type::UnpackType {
@@ -4338,7 +4338,7 @@ mod tests {
     fn callable_subtype_of_non_protocol_instance_via_fallback() {
         // right is non-protocol Instance: is_subtype(left.fallback, right)
         // (subtypes.py:884). builtins.function <: builtins.object.
-        let r = make_resolver(vec![
+        let _r = make_resolver(vec![
             snap("builtins.function", "function"),
             snap("builtins.object", "object"),
         ]);
@@ -4562,7 +4562,7 @@ mod tests {
         let flat: Vec<&[u8]> = pairs.iter().map(|b| b.as_slice()).collect();
         let single = is_subtype(&left, &right, &ctx_nominal(), &r);
         let expect = match single {
-            Some(true) => 1 as i8,
+            Some(true) => 1_i8,
             Some(false) => 0,
             None => -1,
         };
@@ -4640,14 +4640,6 @@ mod tests {
             r.insert(s.fullname.clone(), s);
         }
         r
-    }
-
-    fn alias_snap(fullname: &str, target: Vec<u8>) -> TypeAliasSnapshot {
-        TypeAliasSnapshot {
-            fullname: fullname.to_string(),
-            target,
-            ..Default::default()
-        }
     }
 
     fn alias_type(args: Vec<Type>, type_ref: &str) -> Type {
