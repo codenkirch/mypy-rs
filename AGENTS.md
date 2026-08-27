@@ -738,6 +738,20 @@ including:
   (gate-off vs gate-on differential on fail records and sig length,
   plus direct seam calls), and 3 pure decision unit tests in
   `semanal_checks.rs`.
+- `rust_check_decorated_function_is_method` (issue #941) — mirrors the
+  single bool conjunction of
+  `SemanticAnalyzer.check_decorated_function_is_method`
+  (semanal.py:2256-2258): `not self.type or self.is_func_scope()`. Rust
+  reads live analyzer state via PyO3 (`self.type` attribute for the
+  None-check, `is_func_scope()` bound method) and returns the negation:
+  `Some(true)` = method (no-op), `Some(false)` = non-method context
+  (Python emits `self.fail`), `None` = defer on an unreadable attribute
+  or method call. The Python shim keeps the pure-Python body as the
+  fallback. Gated by `_native_semanal_active` (wired from
+  `mypy/build.py`) and covered by
+  `NativeDecoratedFunctionIsMethodSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential on the fail list plus direct seam
+  calls), and 4 pure decision unit tests in `semanal_checks.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

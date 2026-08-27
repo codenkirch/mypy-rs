@@ -427,6 +427,7 @@ try:
         rust_can_possibly_be_type_form as _rust_can_possibly_be_type_form,
         rust_can_possibly_be_typevarlike_declaration as _rust_can_possibly_be_typevarlike_declaration,
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
+        rust_check_decorated_function_is_method as _rust_check_decorated_function_is_method,
         rust_classify_add_metaclass as _rust_classify_add_metaclass,
         rust_classify_class_decorator as _rust_classify_class_decorator,
         rust_classify_decorators as _rust_classify_decorators,
@@ -571,6 +572,7 @@ except ImportError:
     _rust_is_type_ref = None  # type: ignore[assignment]
     _rust_can_be_type_alias = None  # type: ignore[assignment]
     _rust_check_typevarlike_name = None  # type: ignore[assignment]
+    _rust_check_decorated_function_is_method = None  # type: ignore[assignment]
     _rust_extract_typevarlike_name = None  # type: ignore[assignment]
     _rust_visit_dict_expr = None  # type: ignore[assignment]
     _rust_visit_list_set_expr = None  # type: ignore[assignment]
@@ -2288,6 +2290,23 @@ class SemanticAnalyzer(
             self.fail(message_registry.CLASS_PATTERN_CLASS_OR_STATIC_METHOD, dec)
 
     def check_decorated_function_is_method(self, decorator: str, context: Context) -> None:
+        # Native type_kernel seam: Rust reads self.type and
+        # is_func_scope() and returns Some(true)=method, Some(false)=
+        # non-method (emit fail), None=defer to the pure-Python body.
+        if (
+            _SEMANAL_HAS_KERNEL
+            and _native_semanal_active
+            and _rust_check_decorated_function_is_method is not None
+        ):
+            try:
+                is_method = _rust_check_decorated_function_is_method(self)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                is_method = None
+            if is_method is True:
+                return
+            if is_method is False:
+                self.fail(f'"{decorator}" used with a non-method', context)
+                return
         if not self.type or self.is_func_scope():
             self.fail(f'"{decorator}" used with a non-method', context)
 
