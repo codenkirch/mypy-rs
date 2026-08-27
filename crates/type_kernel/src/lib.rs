@@ -226,6 +226,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         callable_compat::rust_are_parameters_compatible,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        subtypes::rust_are_args_compatible,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(meet::rust_is_overlapping_types, module)?)?;
     module.add_function(wrap_pyfunction!(meet::rust_narrow_declared_type, module)?)?;
     // Issue #526: get_possible_variants alongside narrow_declared_type.
