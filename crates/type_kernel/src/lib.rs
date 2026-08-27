@@ -548,6 +548,10 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_typeddict_call,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_classify_reveal_imported,
+        module
+    )?)?;
     // Issue #489: overload-result family (combine_function_signatures body).
     module.add_function(wrap_pyfunction!(
         checkexpr_overload::rust_combine_function_signatures,

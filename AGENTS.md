@@ -538,6 +538,19 @@ including:
   `_native_checkexpr_active` (wired from `mypy/build.py`) and covered by
   `NativeHasAbstractTypeSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls).
+- `rust_classify_reveal_imported` (mypy.checkexpr) — mirrors the dispatch
+  head of `TypeChecker.check_reveal_imported` (checkexpr.py:6483-6497):
+  returns `None` when `UNIMPORTED_REVEAL` is not an enabled error code
+  (Python early-returns), `Some("reveal_locals")` when
+  `kind == REVEAL_LOCALS`, `Some("reveal_type")` when
+  `kind == REVEAL_TYPE and not is_imported`, and `None` for the else-arm
+  early return. `REVEAL_LOCALS`/`REVEAL_TYPE` are read from
+  `mypy.semanal` via PyO3 (same pattern as `rust_visit_reveal_expr`).
+  Python applies the `chk.fail` + note side effects with the returned
+  name. Gated by `_native_checkexpr_active` (wired from `mypy/build.py`)
+  and covered by `NativeRevealImportedSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls).
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

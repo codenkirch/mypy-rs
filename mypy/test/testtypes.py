@@ -58,6 +58,7 @@ from mypy.nodes import (
     OpExpr,
     OverloadedFuncDef,
     PlaceholderNode,
+    RevealExpr,
     SetExpr,
     SliceExpr,
     StarExpr,
@@ -6300,6 +6301,148 @@ class NativeTryGettingLiteralSuite(Suite):
     def test_uninhabited(self) -> None:
         self._assert_par(self.fx.uninhabited)
         self._assert_engages(self.fx.uninhabited)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeRevealImportedSuite(Suite):
+    """Parity for `rust_classify_reveal_imported` (issue #918).
+
+    `check_reveal_imported` (checkexpr.py:6485-6513) dispatches the
+    unimported-reveal error: disabled code -> nothing;
+    REVEAL_LOCALS -> "reveal_locals"; REVEAL_TYPE and not is_imported ->
+    "reveal_type"; else -> nothing. The Rust seam classifies the whole
+    dispatch head from scalar facts and returns the name (or None for
+    "do nothing"); Python applies the fail + note side effects. The
+    direct seam call must match the expected name/None, and toggling the
+    checkexpr gate off vs on must produce identical captured messages.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import _set_native_checkexpr_active
+
+        self._set_active = _set_native_checkexpr_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _make_checker(self, code_enabled: bool = True) -> ExpressionChecker:  # type: ignore[name-defined]
+        from mypy.checker import TypeChecker
+        from mypy.checkexpr import ExpressionChecker
+        from mypy.errors import Errors
+        from mypy.messages import MessageBuilder
+        from mypy.nodes import MypyFile, SymbolTable
+        from mypy.plugin import Plugin
+
+        options = Options()
+        from mypy import errorcodes as codes
+
+        if code_enabled:
+            options.enabled_error_codes = {codes.UNIMPORTED_REVEAL}
+        errors = Errors(options)
+        tree = MypyFile([], [])
+        tree.is_stub = True
+        tree.names = SymbolTable()
+        modules: dict[str, MypyFile] = {}
+        chk = TypeChecker(errors, modules, options, tree, "", Plugin(options), {})
+        msg = MessageBuilder(errors, modules)
+        return ExpressionChecker(chk, msg, Plugin(options), {})
+
+    def _reveal(self, kind: int, is_imported: bool) -> RevealExpr:
+        return RevealExpr(kind=kind, is_imported=is_imported)
+
+    def _run_and_capture(
+        self, expr: RevealExpr, active: bool, code_enabled: bool = True
+    ) -> list[tuple[str, str]]:
+        ec = self._make_checker(code_enabled)
+        captured: list[tuple[str, str]] = []
+        ec.chk.fail = lambda msg, ctx, code=None: captured.append(("fail", msg))  # type: ignore[assignment]
+        ec.chk.note = lambda msg, ctx, offset=0, code=None: captured.append(  # type: ignore[assignment]
+            ("note", msg)
+        )
+        self._with_gate(active, lambda: ec.check_reveal_imported(expr))
+        return captured
+
+    def _assert_seam(self, kind: int, is_imported: bool, enabled: bool, expected: str | None) -> None:
+        result = _type_kernel.rust_classify_reveal_imported(kind, is_imported, enabled)
+        assert result == expected, (
+            f"seam({kind}, {is_imported}, {enabled}) = {result!r}, want {expected!r}"
+        )
+
+    def test_seam_disabled(self) -> None:
+        from mypy.nodes import REVEAL_LOCALS, REVEAL_TYPE
+
+        self._assert_seam(REVEAL_LOCALS, False, False, None)
+        self._assert_seam(REVEAL_TYPE, False, False, None)
+        self._assert_seam(REVEAL_TYPE, True, False, None)
+
+    def test_seam_reveal_locals(self) -> None:
+        from mypy.nodes import REVEAL_LOCALS
+
+        self._assert_seam(REVEAL_LOCALS, False, True, "reveal_locals")
+        # is_imported is irrelevant for reveal_locals.
+        self._assert_seam(REVEAL_LOCALS, True, True, "reveal_locals")
+
+    def test_seam_reveal_type_not_imported(self) -> None:
+        from mypy.nodes import REVEAL_TYPE
+
+        self._assert_seam(REVEAL_TYPE, False, True, "reveal_type")
+
+    def test_seam_reveal_type_imported(self) -> None:
+        from mypy.nodes import REVEAL_TYPE
+
+        self._assert_seam(REVEAL_TYPE, True, True, None)
+
+    def test_seam_unknown_kind(self) -> None:
+        self._assert_seam(999, False, True, None)
+
+    def test_par_disabled_emits_nothing(self) -> None:
+        from mypy.nodes import REVEAL_LOCALS, REVEAL_TYPE
+
+        for kind, imp in [
+            (REVEAL_LOCALS, False),
+            (REVEAL_TYPE, False),
+            (REVEAL_TYPE, True),
+            (999, False),
+        ]:
+            expr = self._reveal(kind, imp)
+            off = self._run_and_capture(expr, False, code_enabled=False)
+            on = self._run_and_capture(expr, True, code_enabled=False)
+            assert off == on == [], f"disabled kind={kind} imp={imp}: {off}/{on}"
+
+    def test_par_reveal_locals(self) -> None:
+        from mypy.nodes import REVEAL_LOCALS
+
+        expr = self._reveal(REVEAL_LOCALS, False)
+        off = self._run_and_capture(expr, False)
+        on = self._run_and_capture(expr, True)
+        assert off == on, f"reveal_locals differential: off={off} on={on}"
+        assert off and off[0] == ("fail", 'Name "reveal_locals" is not defined'), off
+
+    def test_par_reveal_type_not_imported(self) -> None:
+        from mypy.nodes import REVEAL_TYPE
+
+        expr = self._reveal(REVEAL_TYPE, False)
+        off = self._run_and_capture(expr, False)
+        on = self._run_and_capture(expr, True)
+        assert off == on, f"reveal_type differential: off={off} on={on}"
+        assert off and off[0][0] == "fail" and "reveal_type" in off[0][1], off
+        assert any(tag == "note" and "typing" in msg for tag, msg in off), off
+
+    def test_par_reveal_type_imported_emits_nothing(self) -> None:
+        from mypy.nodes import REVEAL_TYPE
+
+        expr = self._reveal(REVEAL_TYPE, True)
+        off = self._run_and_capture(expr, False)
+        on = self._run_and_capture(expr, True)
+        assert off == on == [], f"imported reveal_type must emit nothing: {off}/{on}"
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
