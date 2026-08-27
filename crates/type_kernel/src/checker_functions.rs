@@ -2207,10 +2207,7 @@ fn classify_missing_annotations(
         ));
     }
     if type_tag == TYPE_TAG_CALLABLE {
-        let ret = match ret_type {
-            Some(t) => t,
-            None => return None,
-        };
+        let ret = ret_type?;
         // get_proper_type(fdef.type.ret_type): an alias expands on the
         // Python side (the wire carries no alias target), so defer.
         if matches!(ret, Type::TypeAliasType { .. }) {
@@ -2219,20 +2216,16 @@ fn classify_missing_annotations(
         let ret_fail = if crate::visitor::is_unannotated_any_inner(ret) {
             true
         } else if is_generator {
-            match crate::generators::get_generator_return_type_inner(
+            let g = crate::generators::get_generator_return_type_inner(
                 ret,
                 is_coroutine,
                 strict_optional,
                 res,
-            ) {
-                Some(g) => crate::visitor::is_unannotated_any_inner(&g),
-                None => return None,
-            }
+            )?;
+            crate::visitor::is_unannotated_any_inner(&g)
         } else if is_coroutine && matches!(ret, Type::Instance { .. }) {
-            match crate::generators::get_coroutine_return_type_inner(ret) {
-                Some(c) => crate::visitor::is_unannotated_any_inner(&c),
-                None => return None,
-            }
+            let c = crate::generators::get_coroutine_return_type_inner(ret)?;
+            crate::visitor::is_unannotated_any_inner(&c)
         } else {
             false
         };
