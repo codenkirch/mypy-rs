@@ -25097,6 +25097,132 @@ class NativeEnumBasesSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeIsFinalEnumValueSuite(Suite):
+    """Parity for the Rust `is_final_enum_value` pure-predicate port.
+
+    `TypeChecker.is_final_enum_value` (checker.py:3827-3851) is a pure bool
+    over a `SymbolTableNode`: FuncBase/Decorator -> False, non-Var -> True;
+    for a Var, private/dunder/sunder names or a `FunctionLike` proper type
+    -> False, else `is_stub or has_explicit_value`. The Rust port
+    (`checker_functions.rs`) reads the live node via PyO3 and returns the
+    bool directly, mirroring `rust_is_magic_base`. Direct seam calls assert
+    the exact bool; the gate-off vs gate-on differential drives the real
+    TypeChecker method.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+        self.fx = TypeFixture()
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _sym(self, node: Any) -> SymbolTableNode:
+        return SymbolTableNode(MDEF, node)
+
+    def _funcdef(self, name: str) -> FuncDef:
+        return FuncDef(name)
+
+    def _decorator(self, name: str) -> Decorator:
+        return Decorator(FuncDef(name), [], Var(name))
+
+    def _var(
+        self, name: str, typ: Any = None, has_explicit_value: bool = False
+    ) -> Var:
+        v = Var(name)
+        v.type = typ
+        v.has_explicit_value = has_explicit_value
+        return v
+
+    def _seam(self, node: Any, is_stub: bool) -> bool:
+        return _type_kernel.rust_is_final_enum_value(self._sym(node), is_stub)
+
+    def _run(self, node: Any, is_stub: bool) -> tuple[bool, bool]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        def check_one() -> bool:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.is_stub = is_stub  # type: ignore[attr-defined]
+            return chk.is_final_enum_value(self._sym(node))
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, node: Any, is_stub: bool) -> None:
+        off, on = self._run(node, is_stub)
+        assert_equal(on, off, f"is_final_enum_value parity for node={node!r}")
+
+    def _callable(self) -> CallableType:
+        return CallableType([], [], [], NoneType(), self.fx.function)
+
+    def test_seam_funcdef(self) -> None:
+        assert self._seam(self._funcdef("method"), False) is False
+
+    def test_seam_decorator(self) -> None:
+        assert self._seam(self._decorator("method"), False) is False
+
+    def test_seam_non_var(self) -> None:
+        assert self._seam(self.fx.oi, False) is True
+
+    def test_seam_private_name(self) -> None:
+        assert self._seam(self._var("__prop"), False) is False
+
+    def test_seam_dunder_name(self) -> None:
+        assert self._seam(self._var("__hash__"), False) is False
+
+    def test_seam_sunder_name(self) -> None:
+        assert self._seam(self._var("_order_"), False) is False
+
+    def test_seam_function_like_type(self) -> None:
+        assert self._seam(self._var("attr", self._callable()), False) is False
+
+    def test_seam_var_stub(self) -> None:
+        # is_stub True -> True even without explicit value.
+        assert self._seam(self._var("attr", self.fx.nonet), True) is True
+
+    def test_seam_var_has_explicit_value(self) -> None:
+        assert self._seam(self._var("attr", self.fx.nonet, True), False) is True
+
+    def test_seam_var_no_value_not_stub(self) -> None:
+        assert self._seam(self._var("attr", self.fx.nonet), False) is False
+
+    def test_parity_every_branch(self) -> None:
+        # FuncBase -> False.
+        self._assert_par(self._funcdef("method"), False)
+        # Decorator -> False.
+        self._assert_par(self._decorator("method"), False)
+        # Non-Var -> True.
+        self._assert_par(self.fx.oi, False)
+        # Private name -> False.
+        self._assert_par(self._var("__prop"), False)
+        # Dunder name -> False.
+        self._assert_par(self._var("__hash__"), False)
+        # Sunder name -> False.
+        self._assert_par(self._var("_order_"), False)
+        # FunctionLike type -> False.
+        self._assert_par(self._var("attr", self._callable()), False)
+        # is_stub True -> True.
+        self._assert_par(self._var("attr", self.fx.nonet), True)
+        # has_explicit_value True -> True.
+        self._assert_par(self._var("attr", self.fx.nonet, True), False)
+        # No value, not stub -> False.
+        self._assert_par(self._var("attr", self.fx.nonet), False)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
 

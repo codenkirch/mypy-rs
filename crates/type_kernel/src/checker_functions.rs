@@ -46,6 +46,16 @@ fn is_private(node_name: &str) -> bool {
     node_name.starts_with("__") && !node_name.ends_with("__")
 }
 
+/// `mypy.util.is_dunder` (util.py:125) with the default exclude_special.
+fn is_dunder(name: &str) -> bool {
+    name.starts_with("__") && name.ends_with("__")
+}
+
+/// `mypy.util.is_sunder` (util.py:139) mirrors the pure-Python predicate.
+fn is_sunder(name: &str) -> bool {
+    !is_dunder(name) && name.starts_with('_') && name.ends_with('_') && name != "_"
+}
+
 /// The pure decision over resolved facts. Kept separate from the PyO3
 /// entry so the branch algebra is unit-testable without a Python runtime.
 ///
@@ -898,6 +908,43 @@ pub(crate) fn rust_classify_metaclass_compat(
     )))
 }
 
+/// `TypeChecker.is_final_enum_value` (checker.py:3825-3848): a pure bool
+/// predicate over a `SymbolTableNode`. FuncBase/Decorator -> False (a
+/// method is fine); non-Var -> True (class or anything else); for a Var,
+/// private/dunder/sunder names or a `FunctionLike` proper type -> False,
+/// else `is_stub or has_explicit_value`. Reads live objects via PyO3,
+/// mirroring `rust_is_magic_base`; never defers (always returns bool).
+#[pyfunction]
+pub(crate) fn rust_is_final_enum_value(
+    py: Python<'_>,
+    sym: &PyAny,
+    is_stub: bool,
+) -> PyResult<bool> {
+    let node = sym.getattr("node")?;
+    let var_cls = nodes_class(py, "Var")?;
+    let func_base_cls = nodes_class(py, "FuncBase")?;
+    let decorator_cls = nodes_class(py, "Decorator")?;
+    if node.is_instance(func_base_cls)? || node.is_instance(decorator_cls)? {
+        return Ok(false);
+    }
+    if !node.is_instance(var_cls)? {
+        return Ok(true);
+    }
+    let name: String = node.getattr("name")?.extract()?;
+    if is_private(&name) || is_dunder(&name) || is_sunder(&name) {
+        return Ok(false);
+    }
+    let typ = node.getattr("type")?;
+    let types_mod = py.import("mypy.types")?;
+    let proper = types_mod.getattr("get_proper_type")?.call1((typ,))?;
+    let function_like_cls: &PyType = types_mod.getattr("FunctionLike")?.downcast()?;
+    if proper.is_instance(function_like_cls)? {
+        return Ok(false);
+    }
+    let has_explicit_value: bool = node.getattr("has_explicit_value")?.extract()?;
+    Ok(is_stub || has_explicit_value)
+}
+
 #[cfg(test)]
 mod metaclass_compat_tests {
     use super::*;
@@ -1039,5 +1086,40 @@ mod classvar_super_tests {
     #[test]
     fn test_node_not_classvar_base_class_var_violation() {
         assert_eq!(classify(true, false, true), KIND_CLASSVAR_SUPER_CLASS_VAR);
+    }
+}
+
+#[cfg(test)]
+mod final_enum_value_tests {
+    use super::*;
+
+    #[test]
+    fn test_is_dunder() {
+        assert!(is_dunder("__init__"));
+        assert!(is_dunder("__hash__"));
+        assert!(!is_dunder("_order_"));
+        assert!(!is_dunder("__private"));
+        assert!(!is_dunder("plain"));
+        assert!(!is_dunder("_"));
+    }
+
+    #[test]
+    fn test_is_sunder() {
+        assert!(is_sunder("_order_"));
+        assert!(is_sunder("_value_"));
+        assert!(!is_sunder("__init__"));
+        assert!(!is_sunder("__private"));
+        assert!(!is_sunder("plain"));
+        assert!(!is_sunder("_"));
+    }
+
+    #[test]
+    fn test_is_private_overlap() {
+        // A name like `__value_` is both private and sunder.
+        assert!(is_private("__value_"));
+        assert!(is_sunder("__value_"));
+        // `__prop` is private but not sunder (no trailing underscore).
+        assert!(is_private("__prop"));
+        assert!(!is_sunder("__prop"));
     }
 }
