@@ -33,6 +33,23 @@ pub(crate) const ACTION_GENERIC: i64 = 2;
 pub(crate) const ACTION_PROTOCOL_GENERIC: i64 = 3;
 pub(crate) const ACTION_BARE_PROTOCOL: i64 = 4;
 
+/// Action tags for the `six.with_metaclass` base-side classifier:
+/// - `ACTION_NOT_WITH_METACLASS`: the base is not a compat-helper call.
+/// - `ACTION_WITH_METACLASS`: the base is `six.with_metaclass(M, B1, ...)`
+///   with all positional args; Python sets `with_meta_expr` and rewrites
+///   `defn.base_type_exprs`.
+pub(crate) const ACTION_NOT_WITH_METACLASS: i64 = 0;
+pub(crate) const ACTION_WITH_METACLASS: i64 = 1;
+
+/// The three compat-helper fullnames matched by the
+/// `infer_metaclass_and_bases_from_compat_helpers` base-side block
+/// (semanal.py:3329-3333), single-sourced here.
+const WITH_METACLASS_FULLNAMES: [&str; 3] = [
+    "six.with_metaclass",
+    "future.utils.with_metaclass",
+    "past.utils.with_metaclass",
+];
+
 /// The special `Generic` name is a fixed constant, mirroring
 /// `sym.node.fullname == "typing.Generic"` in semanal.py:2824. The
 /// `PROTOCOL_NAMES` set travels from `mypy.types` so the names stay
@@ -148,6 +165,50 @@ pub(crate) fn rust_is_core_builtin_class(
     Ok(cur_mod_id == "builtins" && core_set.contains(class_name))
 }
 
+/// Pure decision core of the `six.with_metaclass` base-side classifier
+/// (semanal.py:3327-3336). PyO3-free so the decision table is unit-tested
+/// directly. The caller runs `analyze_type_expr` first (it populates
+/// `callee.fullname`), then passes the fullname plus the two scalar facts.
+/// Matches one of the three compat-helper names with `args_len >= 1` and
+/// all positional args -> `ACTION_WITH_METACLASS`, else
+/// `ACTION_NOT_WITH_METACLASS`. Always decidable.
+fn classify_with_metaclass_inner(
+    fullname: Option<&str>,
+    args_len: usize,
+    all_positional: bool,
+) -> i64 {
+    match fullname {
+        Some(f) if WITH_METACLASS_FULLNAMES.contains(&f) => {
+            if args_len >= 1 && all_positional {
+                ACTION_WITH_METACLASS
+            } else {
+                ACTION_NOT_WITH_METACLASS
+            }
+        }
+        _ => ACTION_NOT_WITH_METACLASS,
+    }
+}
+
+/// `infer_metaclass_and_bases_from_compat_helpers` base-side classifier
+/// (semanal.py:3321-3338). The Python shim runs `analyze_type_expr`
+/// unconditionally before calling this, then applies the two side effects
+/// (`with_meta_expr = args[0]`, `defn.base_type_exprs = args[1:]`) on
+/// `ACTION_WITH_METACLASS`. No `self` dependency, so this is a module-level
+/// function, unlike `_native_base_classification`.
+#[pyfunction]
+#[pyo3(signature = (fullname, args_len, all_positional))]
+pub(crate) fn rust_classify_with_metaclass(
+    fullname: Option<String>,
+    args_len: usize,
+    all_positional: bool,
+) -> PyResult<i64> {
+    Ok(classify_with_metaclass_inner(
+        fullname.as_deref(),
+        args_len,
+        all_positional,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,5 +271,62 @@ mod tests {
     #[test]
     fn unrelated_name_kept() {
         assert_eq!(classify(Some("mod.NotProtocol"), false, true), ACTION_KEEP);
+    }
+
+    fn classify_meta(fullname: Option<&str>, args_len: usize, all_positional: bool) -> i64 {
+        classify_with_metaclass_inner(fullname, args_len, all_positional)
+    }
+
+    #[test]
+    fn with_metaclass_all_three_names_match() {
+        assert_eq!(
+            classify_meta(Some("six.with_metaclass"), 2, true),
+            ACTION_WITH_METACLASS
+        );
+        assert_eq!(
+            classify_meta(Some("future.utils.with_metaclass"), 2, true),
+            ACTION_WITH_METACLASS
+        );
+        assert_eq!(
+            classify_meta(Some("past.utils.with_metaclass"), 2, true),
+            ACTION_WITH_METACLASS
+        );
+    }
+
+    #[test]
+    fn with_metaclass_zero_args_not_matched() {
+        assert_eq!(
+            classify_meta(Some("six.with_metaclass"), 0, true),
+            ACTION_NOT_WITH_METACLASS
+        );
+    }
+
+    #[test]
+    fn with_metaclass_non_positional_not_matched() {
+        assert_eq!(
+            classify_meta(Some("six.with_metaclass"), 2, false),
+            ACTION_NOT_WITH_METACLASS
+        );
+    }
+
+    #[test]
+    fn add_metaclass_not_matched() {
+        assert_eq!(
+            classify_meta(Some("six.add_metaclass"), 1, true),
+            ACTION_NOT_WITH_METACLASS
+        );
+    }
+
+    #[test]
+    fn unrelated_name_not_matched() {
+        assert_eq!(
+            classify_meta(Some("mod.NotWithMeta"), 2, true),
+            ACTION_NOT_WITH_METACLASS
+        );
+    }
+
+    #[test]
+    fn none_fullname_not_matched() {
+        assert_eq!(classify_meta(None, 2, true), ACTION_NOT_WITH_METACLASS);
     }
 }

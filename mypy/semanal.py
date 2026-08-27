@@ -429,6 +429,7 @@ try:
         rust_check_typevarlike_name as _rust_check_typevarlike_name,
         rust_classify_decorators as _rust_classify_decorators,
         rust_classify_class_decorator as _rust_classify_class_decorator,
+        rust_classify_with_metaclass as _rust_classify_with_metaclass,
         rust_classify_imports as _rust_classify_imports,
         rust_clean_up_bases as _rust_clean_up_bases,
         rust_classify_member_resolution as _rust_classify_member_resolution,
@@ -538,6 +539,7 @@ except ImportError:
     _rust_apply_semantic_analyzer_patches = None  # type: ignore[assignment]
     _rust_classify_decorators = None  # type: ignore[assignment]
     _rust_classify_class_decorator = None  # type: ignore[assignment]
+    _rust_classify_with_metaclass = None  # type: ignore[assignment]
     _rust_classify_imports = None  # type: ignore[assignment]
     _rust_clean_up_bases = None  # type: ignore[assignment]
     _rust_classify_member_resolution = None  # type: ignore[assignment]
@@ -646,6 +648,27 @@ _ACTION_KEEP = 1
 _ACTION_GENERIC = 2
 _ACTION_PROTOCOL_GENERIC = 3
 _ACTION_BARE_PROTOCOL = 4
+
+# six.with_metaclass base-side tags (see semanal_bases.rs). NOT_WITH_METACLASS:
+# base is not a compat-helper call; WITH_METACLASS: Python sets
+# with_meta_expr and rewrites defn.base_type_exprs.
+_ACTION_NOT_WITH_METACLASS = 0
+_ACTION_WITH_METACLASS = 1
+
+
+def _native_with_metaclass_classification(base_expr: CallExpr) -> int | None:
+    if not (_SEMANAL_VISITOR_HAS_KERNEL and _native_semanal_visitor_active):
+        return None
+    if not isinstance(base_expr.callee, RefExpr):
+        return None
+    try:
+        return _rust_classify_with_metaclass(
+            base_expr.callee.fullname,
+            len(base_expr.args),
+            all(kind == ARG_POS for kind in base_expr.arg_kinds),
+        )
+    except (AssertionError, NotImplementedError, ValueError):
+        return None
 
 
 def _serialize_semanal_type(t: Type) -> bytes:
@@ -3324,16 +3347,21 @@ class SemanticAnalyzer(
             base_expr = defn.base_type_exprs[0]
             if isinstance(base_expr, CallExpr) and isinstance(base_expr.callee, RefExpr):
                 self.analyze_type_expr(base_expr)
-                if (
-                    base_expr.callee.fullname
-                    in {
-                        "six.with_metaclass",
-                        "future.utils.with_metaclass",
-                        "past.utils.with_metaclass",
-                    }
-                    and len(base_expr.args) >= 1
-                    and all(kind == ARG_POS for kind in base_expr.arg_kinds)
-                ):
+                native_action = _native_with_metaclass_classification(base_expr)
+                if native_action is None:
+                    is_with_meta = (
+                        base_expr.callee.fullname
+                        in {
+                            "six.with_metaclass",
+                            "future.utils.with_metaclass",
+                            "past.utils.with_metaclass",
+                        }
+                        and len(base_expr.args) >= 1
+                        and all(kind == ARG_POS for kind in base_expr.arg_kinds)
+                    )
+                else:
+                    is_with_meta = native_action == _ACTION_WITH_METACLASS
+                if is_with_meta:
                     with_meta_expr = base_expr.args[0]
                     defn.base_type_exprs = base_expr.args[1:]
 

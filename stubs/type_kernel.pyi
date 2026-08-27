@@ -2044,6 +2044,11 @@ def rust_is_core_builtin_class(
     class_name: str,
     core_names: list[str],
 ) -> bool: ...
+def rust_classify_with_metaclass(
+    fullname: str | None,
+    args_len: int,
+    all_positional: bool,
+) -> int: ...
 def rust_create_errors(
     error_tuples: Any,
 ) -> Any: ...
