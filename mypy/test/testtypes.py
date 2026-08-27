@@ -28490,7 +28490,6 @@ class NativeSolveDependentNoopSuite(Suite):
         )
 
         tvars: dict[TypeVarId, TypeVarLikeType] = {tv.id: tv for tv in self._vars}
-        tvar_ids = list(tvars)
         result = _type_kernel.rust_solve_dependent(
             _serialize_type_list(list(tvars.values())),
             _serialize_constraint_list(constraints),
@@ -31241,8 +31240,8 @@ class NativeIsDescriptorSuite(Suite):
         from mypy.subtypes import _serialize_type
 
         typ = UnionType.make_union([Instance(self.desci, []), NoneType()])
-        off = self._with_gate(False, lambda: _serialize_type(typ))
-        on = self._with_gate(True, lambda: _serialize_type(typ))
+        self._with_gate(False, lambda: _serialize_type(typ))
+        self._with_gate(True, lambda: _serialize_type(typ))
         # Both serialize the same way; the gate toggle doesn't change
         # serialization. Just check parity of is_descriptor.
         self._assert_par(typ)
