@@ -332,6 +332,7 @@ try:
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_except_handler_tests as _rust_classify_except_handler_tests,
         rust_classify_final_super as _rust_classify_final_super,
+        rust_classify_new_signature as _rust_classify_new_signature,
         rust_conditional_types as _rust_conditional_types,
         rust_detach_callable as _rust_detach_callable,
         rust_equality_value_info as _rust_equality_value_info,
@@ -399,6 +400,7 @@ except ImportError:
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
+    _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_conditional_types = None  # type: ignore[assignment]
     _rust_detach_callable = None  # type: ignore[assignment]
     _rust_is_string_literal = None  # type: ignore[assignment]
@@ -456,6 +458,11 @@ NATIVE_FINAL_SUPER_CANT_OVERRIDE_FINAL = 2
 NATIVE_FINAL_SUPER_PASS_ENUM = 3
 NATIVE_FINAL_SUPER_CHECK_WRITABLE = 4
 NATIVE_FINAL_SUPER_PASS_TAIL = 5
+# Decision tags returned by `_rust_classify_new_signature`; must match
+# `NEW_SIGNATURE_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_NEW_SIGNATURE_METACLASS = 0
+NATIVE_NEW_SIGNATURE_NON_INSTANCE = 1
+NATIVE_NEW_SIGNATURE_INSTANCE = 2
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
 _native_checker_stmts_active: bool = False
@@ -2632,6 +2639,52 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         bound_type = bind_self(typ, self_type, is_classmethod=True)
         # Check that __new__ (after binding cls) returns an instance
         # type (or any).
+        # Native type_kernel seam: classify the 3-way return-type decision
+        # in Rust (checker_functions.rs); the two check_subtype calls and
+        # the INVALID_NEW_TYPE / NON_INSTANCE_NEW_TYPE emission stay here.
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_new_signature is not None
+        ):
+            is_metaclass = fdef.info.is_metaclass()
+            is_instance_ret = isinstance(
+                get_proper_type(bound_type.ret_type),
+                (AnyType, Instance, TupleType, UninhabitedType, LiteralType),
+            )
+            try:
+                tag = _rust_classify_new_signature(is_metaclass, is_instance_ret)
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_NEW_SIGNATURE_METACLASS:
+                    self.check_subtype(
+                        bound_type.ret_type,
+                        self.type_type(),
+                        fdef,
+                        message_registry.INVALID_NEW_TYPE,
+                        "returns",
+                        "but must return a subtype of",
+                    )
+                    return
+                if tag == NATIVE_NEW_SIGNATURE_NON_INSTANCE:
+                    self.fail(
+                        message_registry.NON_INSTANCE_NEW_TYPE.format(
+                            format_type(bound_type.ret_type, self.options)
+                        ),
+                        fdef,
+                    )
+                    return
+                if tag == NATIVE_NEW_SIGNATURE_INSTANCE:
+                    self.check_subtype(
+                        bound_type.ret_type,
+                        self_type,
+                        fdef,
+                        message_registry.INVALID_NEW_TYPE,
+                        "returns",
+                        "but must return a subtype of",
+                    )
+                    return
         if fdef.info.is_metaclass():
             # This is a metaclass, so it must return a new unrelated type.
             self.check_subtype(

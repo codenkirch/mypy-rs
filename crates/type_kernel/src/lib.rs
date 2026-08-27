@@ -2795,6 +2795,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check___new___signature 3-way return-type port.
+    // Rust classifies metaclass / non-instance / instance from two scalar
+    // facts; the check_subtype calls and message emission stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_new_signature,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

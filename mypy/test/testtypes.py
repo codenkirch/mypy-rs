@@ -24271,6 +24271,141 @@ class NativeFinalSuperSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeNewSignatureSuite(Suite):
+    """Parity for the Rust `check___new___signature` 3-way dispatch port.
+
+    `TypeChecker.check___new___signature` (checker.py:2630) picks one of
+    three branches from two scalar facts: `fdef.info.is_metaclass()` and
+    whether `get_proper_type(bound_type.ret_type)` is one of the five
+    instance-kinds (AnyType / Instance / TupleType / UninhabitedType /
+    LiteralType). The Rust classifier (`checker_functions.rs`) turns those
+    into a branch tag; the Python shim keeps the two `check_subtype` calls
+    and the `INVALID_NEW_TYPE` / `NON_INSTANCE_NEW_TYPE` emission.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a
+    stub message / subtype recorder and asserts identical records.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, is_metaclass: bool, is_instance_ret: bool) -> int | None:
+        return _type_kernel.rust_classify_new_signature(is_metaclass, is_instance_ret)
+
+    def _info(self, *, metaclass: bool = False) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef("A", Block([]), None, [])
+        defn.fullname = "abc.ABCMeta" if metaclass else "mod.A"
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        return info
+
+    def _fdef(self, info: TypeInfo) -> FuncDef:
+        fdef = FuncDef("__new__")
+        fdef.info = info
+        return fdef
+
+    def _run(self, metaclass: bool, ret_type: Type) -> tuple[object, object]:
+        from mypy.checker import TypeChecker
+        from mypy.options import Options
+
+        info = self._info(metaclass=metaclass)
+        fdef = self._fdef(info)
+        fx = TypeFixture()
+        typ = CallableType(
+            [AnyType(TypeOfAny.special_form)],
+            [ARG_POS],
+            ["cls"],
+            ret_type,
+            fx.function,
+        )
+
+        def check_one() -> list[tuple[str, str]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            chk.type_type = lambda: fx.type_type  # type: ignore[method-assign]
+            records: list[tuple[str, str]] = []
+
+            def record_subtype(
+                subtype: Type, supertype: Type, _ctx: Any, msg: Any, l1: Any = None, l2: Any = None
+            ) -> bool:
+                records.append(("check_subtype", msg.value, str(subtype), str(supertype)))
+                return True
+
+            def record_fail(msg: Any, _ctx: Any) -> None:
+                records.append(("fail", msg.value if hasattr(msg, "value") else msg))
+
+            chk.check_subtype = record_subtype  # type: ignore[method-assign]
+            chk.fail = record_fail  # type: ignore[method-assign]
+            chk.check___new___signature(fdef, typ)
+            return records
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, metaclass: bool, ret_type: Type) -> None:
+        off, on = self._run(metaclass, ret_type)
+        assert_equal(
+            on, off, f"check___new___signature parity metaclass={metaclass} ret={ret_type}"
+        )
+
+    def test_seam_metaclass(self) -> None:
+        assert self._tag(True, True) == 0
+        assert self._tag(True, False) == 0
+
+    def test_seam_non_instance(self) -> None:
+        assert self._tag(False, False) == 1
+
+    def test_seam_instance(self) -> None:
+        assert self._tag(False, True) == 2
+
+    def test_parity_metaclass(self) -> None:
+        info = self._info(metaclass=True)
+        self._assert_par(True, Instance(info, []))
+
+    def test_parity_non_instance(self) -> None:
+        fx = TypeFixture()
+        callable_ret = CallableType([], [], [], AnyType(TypeOfAny.special_form), fx.function)
+        self._assert_par(False, callable_ret)
+
+    def test_parity_instance(self) -> None:
+        info = self._info()
+        self._assert_par(False, Instance(info, []))
+
+    def test_parity_any(self) -> None:
+        self._assert_par(False, AnyType(TypeOfAny.special_form))
+
+    def test_parity_uninhabited(self) -> None:
+        self._assert_par(False, UninhabitedType())
+
+    def test_parity_tuple(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(False, fx.std_tuple)
+
+    def test_parity_literal(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(False, LiteralType("x", fx.str_type))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeTypedDictCallSuite(Suite):
     """Parity for the Rust `check_typeddict_call` dispatch classifier.
 

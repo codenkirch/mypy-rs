@@ -381,6 +381,20 @@ including:
   `_native_checker_active` and covered by `NativeFinalSuperSuite` in
   `mypy/test/testtypes.py` (direct seam tag tests + gate-off vs gate-on
   differential).
+- `rust_classify_new_signature` (mypy.checker, issue #920) — ports the
+  3-way `__new__` return-type decision head of
+  `TypeChecker.check___new___signature` (checker.py:2630-2664): Rust
+  classifies metaclass / non-instance / instance from two scalar facts
+  (`fdef.info.is_metaclass()` and whether
+  `get_proper_type(bound_type.ret_type)` is one of {AnyType, Instance,
+  TupleType, UninhabitedType, LiteralType}) and returns a branch tag. The
+  two `check_subtype` calls and the `INVALID_NEW_TYPE` /
+  `NON_INSTANCE_NEW_TYPE` emission (via `format_type`) stay in Python.
+  Every branch is classified; `None` is the exception-only deferral.
+  Gated by `_native_checker_active` and covered by
+  `NativeNewSignatureSuite` in `mypy/test/testtypes.py` (direct seam tag
+  tests + gate-off vs gate-on differential), plus 3 pure decision unit
+  tests in `checker_functions.rs`.
 - `rust_classify_unbound_front` (issue #714) — mirrors the decision
   front of `mypy.typeanal.TypeAnalyser.visit_unbound_type_nonoptional`
   (typeanal.py:310-549): Rust classifies the resolved-symbol dispatch hub
