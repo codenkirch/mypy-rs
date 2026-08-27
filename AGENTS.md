@@ -851,6 +851,20 @@ including:
   and covered by `NativeFixedArgsSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differential plus direct seam calls), and pure
   decision unit tests in `semanal_checks.rs`.
+- `rust_classify_visit_op_expr` (issue #959) — mirrors the 5-way dispatch
+  head of `ExpressionChecker.visit_op_expr` (checkexpr.py:5014-5044):
+  `e.analyzed` passthrough (tag 0), `and`/`or` boolean op (tag 1),
+  `*` with `ListExpr` list multiply (tag 2), `%` with `BytesExpr`/
+  `StrExpr` str interpolation (tag 3), else `check_op` (tag 4). Rust reads
+  `e.analyzed` (truthiness), `e.op` (string), and `e.left` isinstance tags
+  via PyO3; the Python shim delegates each tag to the original branch
+  body (`accept`/`check_boolean_op`/`check_list_multiply`/
+  `check_str_interpolation`/check-op fall-through). `None` defers only on
+  an unreadable attribute or isinstance error. Gated by
+  `_native_checkexpr_active` (wired from `mypy/build.py`) and covered by
+  `NativeVisitOpExprSuite` in `mypy/test/testtypes.py` (direct seam calls
+  for all 5 branches plus edge cases), and 11 pure decision unit tests in
+  `checkexpr_functions.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the

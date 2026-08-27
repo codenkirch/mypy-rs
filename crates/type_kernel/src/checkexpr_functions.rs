@@ -5569,6 +5569,183 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
+// classify_visit_op_expr
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `visit_op_expr`; must match `NATIVE_VISIT_OP_EXPR_*`
+/// in mypy/checkexpr.py.
+const VISIT_OP_EXPR_ANALYZED: i64 = 0;
+const VISIT_OP_EXPR_BOOLEAN: i64 = 1;
+const VISIT_OP_EXPR_LIST_MULTIPLY: i64 = 2;
+const VISIT_OP_EXPR_STR_INTERP: i64 = 3;
+const VISIT_OP_EXPR_CHECK_OP: i64 = 4;
+
+/// Pure 5-way dispatch of `ExpressionChecker.visit_op_expr`
+/// (checkexpr.py:5004-5018). `has_analyzed` mirrors `if e.analyzed:`,
+/// the isinstance flags mirror `isinstance(e.left, ListExpr/BytesExpr/
+/// StrExpr)`. Order matches the Python body exactly: analyzed-passthrough,
+/// then boolean op, then list multiply, then str interpolation, then
+/// the trailing check-op fall-through.
+fn classify_visit_op_expr(
+    has_analyzed: bool,
+    op: &str,
+    left_is_list: bool,
+    left_is_bytes: bool,
+    left_is_str: bool,
+) -> i64 {
+    if has_analyzed {
+        return VISIT_OP_EXPR_ANALYZED;
+    }
+    if op == "and" || op == "or" {
+        return VISIT_OP_EXPR_BOOLEAN;
+    }
+    if op == "*" && left_is_list {
+        return VISIT_OP_EXPR_LIST_MULTIPLY;
+    }
+    if op == "%" && (left_is_bytes || left_is_str) {
+        return VISIT_OP_EXPR_STR_INTERP;
+    }
+    VISIT_OP_EXPR_CHECK_OP
+}
+
+/// `#[pyfunction]` entry for `ExpressionChecker.visit_op_expr`
+/// (checkexpr.py:5004-5018). Reads `e.analyzed` (truthiness), `e.op`
+/// (string), and `e.left` isinstance tags via PyO3, returning a branch
+/// tag. Defers (`None`) on any unreadable attribute or isinstance error.
+#[pyfunction]
+pub(crate) fn rust_classify_visit_op_expr(py: Python<'_>, expr: &PyAny) -> PyResult<Option<i64>> {
+    let analyzed = match expr.getattr("analyzed") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let has_analyzed = match analyzed.is_true() {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let op: String = match expr.getattr("op") {
+        Ok(v) => match v.extract() {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let left = match expr.getattr("left") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let nodes_mod = match py.import("mypy.nodes") {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let list_cls: &PyType = match nodes_mod.getattr("ListExpr") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let bytes_cls: &PyType = match nodes_mod.getattr("BytesExpr") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let str_cls: &PyType = match nodes_mod.getattr("StrExpr") {
+        Ok(c) => match c.downcast() {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        },
+        Err(_) => return Ok(None),
+    };
+    let left_is_list = match left.is_instance(list_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let left_is_bytes = match left.is_instance(bytes_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    let left_is_str = match left.is_instance(str_cls) {
+        Ok(b) => b,
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(classify_visit_op_expr(
+        has_analyzed,
+        &op,
+        left_is_list,
+        left_is_bytes,
+        left_is_str,
+    )))
+}
+
+#[cfg(test)]
+mod classify_visit_op_expr_tests {
+    fn classify(
+        has_analyzed: bool,
+        op: &str,
+        left_is_list: bool,
+        left_is_bytes: bool,
+        left_is_str: bool,
+    ) -> i64 {
+        super::classify_visit_op_expr(has_analyzed, op, left_is_list, left_is_bytes, left_is_str)
+    }
+
+    #[test]
+    fn test_analyzed_passthrough() {
+        assert_eq!(classify(true, "|", false, false, false), 0);
+        assert_eq!(classify(true, "and", false, false, false), 0);
+        assert_eq!(classify(true, "*", true, false, false), 0);
+    }
+
+    #[test]
+    fn test_no_analyzed_boolean() {
+        assert_eq!(classify(false, "and", false, false, false), 1);
+        assert_eq!(classify(false, "or", false, false, false), 1);
+    }
+
+    #[test]
+    fn test_list_multiply() {
+        assert_eq!(classify(false, "*", true, false, false), 2);
+    }
+
+    #[test]
+    fn test_list_multiply_not_list() {
+        assert_eq!(classify(false, "*", false, false, false), 4);
+    }
+
+    #[test]
+    fn test_str_interp_bytes() {
+        assert_eq!(classify(false, "%", false, true, false), 3);
+    }
+
+    #[test]
+    fn test_str_interp_str() {
+        assert_eq!(classify(false, "%", false, false, true), 3);
+    }
+
+    #[test]
+    fn test_str_interp_not_bytes_str() {
+        assert_eq!(classify(false, "%", false, false, false), 4);
+    }
+
+    #[test]
+    fn test_check_op_default() {
+        assert_eq!(classify(false, "+", false, false, false), 4);
+        assert_eq!(classify(false, "|", false, false, false), 4);
+        assert_eq!(classify(false, "-", false, false, false), 4);
+    }
+
+    #[test]
+    fn test_op_precedence_over_isinstance() {
+        // "and" takes precedence over list check even if left is a ListExpr.
+        assert_eq!(classify(false, "and", true, false, false), 1);
+        // "*" with BytesExpr left is NOT list multiply (goes to check_op).
+        assert_eq!(classify(false, "*", false, true, false), 4);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // classify_reveal_imported
 // ---------------------------------------------------------------------------
 
