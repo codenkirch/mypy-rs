@@ -31323,3 +31323,148 @@ class NativeTypeTypeMemberAccessSuite(Suite):
 
     def test_par_none(self) -> None:
         self._assert_par(TypeType(NoneType()))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeMatchArgsSuite(Suite):
+    """Parity for the Rust `check_match_args` predicate-head port.
+
+    `TypeChecker.check_match_args` (checker.py:3128) guards on
+    `self.scope.active_class()`, then checks that `get_proper_type(typ)`
+    is a `TupleType` whose every item is a string literal. If not, it emits
+    a `LITERAL_REQ` note. The Rust classifier (`checker_functions.rs`) turns
+    `active_class`, the wire-decoded proper type kind, and per-item
+    `is_string_literal` results into a branch tag (skip / ok / fail); the
+    Python shim emits the note.
+
+    Direct seam calls assert the exact tag for every branch; the gate-off
+    vs gate-on differential drives the real TypeChecker method through a
+    stub note recorder and asserts identical note lists.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], object]) -> object:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _tag(self, active_class: bool, type_bytes: bytes) -> int | None:
+        return _type_kernel.rust_classify_match_args(active_class, type_bytes)
+
+    def _bytes_of(self, t: Type) -> bytes:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(t)
+
+    def _class_scope(self) -> Any:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+        from mypy.checker_shared import CheckerScope
+
+        info = TypeInfo(SymbolTable(), ClassDef("C", Block([]), None, []), "mod")
+        scope = CheckerScope.__new__(CheckerScope)
+        scope.stack = [info]
+        return scope
+
+    def _module_scope(self) -> Any:
+        from mypy.nodes import MypyFile
+        from mypy.checker_shared import CheckerScope
+
+        mod = MypyFile([], [], False, {})
+        scope = CheckerScope.__new__(CheckerScope)
+        scope.stack = [mod]
+        return scope
+
+    def _run(self, scope: Any, typ: Type) -> tuple[list[str], list[str]]:
+        from mypy.checker import TypeChecker
+        from mypy.options import Options
+
+        def check_one() -> list[str]:
+            chk = TypeChecker.__new__(TypeChecker)
+            chk.options = Options()
+            chk.scope = scope
+            notes: list[str] = []
+
+            class _Msg:
+                def note(self, msg: str, _ctx: Any, **_kw: Any) -> None:
+                    notes.append(str(msg))
+
+            chk.msg = _Msg()  # type: ignore[method-assign]
+            chk.check_match_args(Var("__match_args__"), typ, Var("__match_args__"))
+            return notes
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on  # type: ignore[return-value]
+
+    def _assert_par(self, scope: Any, typ: Type) -> None:
+        off, on = self._run(scope, typ)
+        assert_equal(on, off, f"check_match_args parity for typ={typ!r}")
+
+    def test_seam_skip_no_class(self) -> None:
+        fx = TypeFixture()
+        assert self._tag(False, self._bytes_of(fx.std_tuple)) == 0
+
+    def test_seam_ok_all_string_literals(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([fx.lit_str1, fx.lit_str2], fx.std_tuple)
+        assert self._tag(True, self._bytes_of(tup)) == 1
+
+    def test_seam_ok_empty_tuple(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([], fx.std_tuple)
+        assert self._tag(True, self._bytes_of(tup)) == 1
+
+    def test_seam_fail_not_tuple(self) -> None:
+        fx = TypeFixture()
+        assert self._tag(True, self._bytes_of(fx.str_type)) == 2
+
+    def test_seam_fail_non_literal_item(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([fx.lit_str1, fx.a], fx.std_tuple)
+        assert self._tag(True, self._bytes_of(tup)) == 2
+
+    def test_parity_skip_no_class(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(self._module_scope(), TupleType([fx.lit_str1], fx.std_tuple))
+
+    def test_parity_ok_all_string_literals(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([fx.lit_str1, fx.lit_str2], fx.std_tuple)
+        self._assert_par(self._class_scope(), tup)
+
+    def test_parity_ok_empty_tuple(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(self._class_scope(), TupleType([], fx.std_tuple))
+
+    def test_parity_fail_not_tuple(self) -> None:
+        fx = TypeFixture()
+        self._assert_par(self._class_scope(), fx.str_type)
+
+    def test_parity_fail_non_literal_item(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([fx.lit_str1, fx.a], fx.std_tuple)
+        self._assert_par(self._class_scope(), tup)
+
+    def test_parity_fail_any_item(self) -> None:
+        fx = TypeFixture()
+        tup = TupleType([AnyType(TypeOfAny.special_form)], fx.std_tuple)
+        self._assert_par(self._class_scope(), tup)
+
+    def test_parity_fail_lkv_string(self) -> None:
+        fx = TypeFixture()
+        # Instance with last_known_value of a string literal is a string
+        # literal by is_string_literal.
+        tup = TupleType([fx.lit_str1_inst], fx.std_tuple)
+        self._assert_par(self._class_scope(), tup)

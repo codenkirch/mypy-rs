@@ -885,6 +885,20 @@ including:
   (direct seam tag tests for all 13 branches plus gate-off vs gate-on
   differential on the result / call-log through a mock
   MemberContext), and 13 pure decision unit tests in `checkmember.rs`.
+- `rust_classify_match_args` (issue #970) — mirrors the predicate head of
+  `TypeChecker.check_match_args` (checker.py:3128-3141): `not
+  self.scope.active_class()` -> skip (tag 0); `get_proper_type(typ)` not a
+  `TupleType` or any non-string-literal item -> fail (tag 2, emit the
+  `LITERAL_REQ` note); all items string literals -> ok (tag 1). Rust
+  decodes the wire `typ`, resolves the proper type (defers on an
+  unresolved `TypeAliasType`), checks the `TupleType` kind, and reuses
+  `is_string_literal_inner` per item. Defers (`None`) on decode failure
+  or an item the string-literal kernel cannot decide; the Python shim
+  emits the note and keeps the pure-Python body as the fallback. Gated
+  by `_native_checker_active` (wired from `mypy/build.py`) and covered by
+  `NativeMatchArgsSuite` in `mypy/test/testtypes.py` (gate-off vs gate-on
+  differential plus direct seam calls), and 5 pure decision unit tests in
+  `checker_functions.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
