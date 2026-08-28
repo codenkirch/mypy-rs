@@ -762,24 +762,21 @@ fn tuple_special_map(
 /// unification variables in the receiver args) stay untouched, exactly like
 /// Python.
 fn collect_freeze_ids(typ: &mut Type, ids: &mut Vec<(i64, i64, String)>) {
-    match typ {
-        Type::CallableType { variables, .. } => {
-            for v in variables.iter_mut() {
-                if let Type::TypeVarType {
-                    raw_id,
-                    namespace,
-                    meta_level,
-                    ..
-                } = v
-                {
-                    let key = (*raw_id, *meta_level, namespace.clone());
-                    if !ids.contains(&key) {
-                        ids.push(key);
-                    }
+    if let Type::CallableType { variables, .. } = typ {
+        for v in variables.iter_mut() {
+            if let Type::TypeVarType {
+                raw_id,
+                namespace,
+                meta_level,
+                ..
+            } = v
+            {
+                let key = (*raw_id, *meta_level, namespace.clone());
+                if !ids.contains(&key) {
+                    ids.push(key);
                 }
             }
         }
-        _ => {}
     }
     freeze_children(typ, &mut |c| collect_freeze_ids(c, ids));
 }
