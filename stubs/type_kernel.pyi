@@ -244,6 +244,7 @@ __all__ = [
     "rust_classify_simple_assignment",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
+    "rust_classify_find_isinstance_head",
     "rust_conditional_types",
     "rust_is_true_literal",
     "rust_is_false_literal",
@@ -901,6 +902,9 @@ def rust_check_explicit_override_decorator(
     defn: Any, found_method_base_classes: Any
 ) -> bool: ...
 def rust_check_match_args(type_bytes: bytes) -> bool | None: ...
+def rust_classify_find_isinstance_head(
+    callee: Any, args_len: int, literal_ok: bool
+) -> int | None: ...
 def rust_classify_type_check_raise(
     type_bytes: bytes, callee_fullname: str | None
 ) -> int | None: ...

@@ -1879,3 +1879,20 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls for every tag), plus pure decision unit tests in
   `applytype.rs`.
+- `rust_classify_find_isinstance_head` (issue #1086) — mirrors the
+  builtin-callee dispatch head of
+  `TypeChecker.find_isinstance_check_helper` (checker.py:8418-8464): Rust
+  reads the live callee via PyO3 (RefExpr isinstance, `fullname`, a
+  TypeAlias deferral mirroring `refers_to_fullname`) plus the shim-computed
+  `literal(expr)` scalar and returns an arm tag per builtin (BAD_ARGS /
+  NARROW / TAIL, hasattr keeps the attr gate shim-side) or TYPEGUARD for
+  the non-builtin callee. The Python shim applies the arm bodies
+  (`conditional_types_to_typemaps`, `infer_issubclass_maps`,
+  `conditional_callable_type_map`, `hasattr_type_maps`, and the extracted
+  `_typeguard_call_maps` block) and falls back to the pure-Python head on
+  `None`; the shared boolean-context tail moved to
+  `_boolean_context_type_maps`. Gated by `_native_checker_active` (wired
+  from `mypy/build.py`) and covered by `NativeFindIsinstanceHeadSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
+  seam calls per arm), plus pure decision unit tests in
+  `checker_functions.rs`.
