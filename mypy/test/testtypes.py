@@ -32417,6 +32417,229 @@ class NativeIsDescriptorSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDescriptorHeadSuite(Suite):
+    """Parity for the Rust `analyze_descriptor_access` head (mypy.checkmember).
+
+    The seam decides the pure guards of `analyze_descriptor_access`
+    (checkmember.py:1376-1421): a non-Instance proper type and an
+    Instance with no readable `__get__`/`__set__` for the access kind
+    return `orig_descriptor_type` (tag 0, the live object is returned by
+    the shim); a UnionType maps item-wise through the same decision and
+    joins via `make_simplified_union` (tag 1). A `__get__`-bearing
+    Instance (the checker-state tail: bound `__get__` lookup, expand,
+    `transform_callee_type`, `check_call`, `warn_deprecated`) and the
+    lvalue `__set__` assign path defer (`None`). The decided branches
+    never touch `mx.chk`, so the gate-off vs gate-on differential runs
+    through the real `analyze_descriptor_access` with a stub MemberContext.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture()
+        # A descriptor class with a readable __get__.
+        self.desci = self.fx.make_type_info("mod.Desc", mro=[self.fx.oi])
+        self.desci.names["__get__"] = SymbolTableNode(MDEF, Var("__get__"))
+        # A settable-only descriptor class (readable __set__).
+        self.setteri = self.fx.make_type_info("mod.Setter", mro=[self.fx.oi])
+        self.setteri.names["__set__"] = SymbolTableNode(MDEF, Var("__set__"))
+        # A get+set descriptor class.
+        self.getseti = self.fx.make_type_info("mod.GetSet", mro=[self.fx.oi])
+        self.getseti.names["__get__"] = SymbolTableNode(MDEF, Var("__get__"))
+        self.getseti.names["__set__"] = SymbolTableNode(MDEF, Var("__set__"))
+        # A plain class without __get__/__set__.
+        self.plaini = self.fx.make_type_info("mod.Plain", mro=[self.fx.oi])
+        type_infos = []
+        for name in dir(self.fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(self.fx, name)
+            if _is_type_info(value):
+                type_infos.append(value)
+        type_infos.extend([self.desci, self.setteri, self.getseti, self.plaini])
+        self.typeinfo_map = {info.fullname: info for info in type_infos}
+        set_wire_typeinfo_map(self.typeinfo_map)
+        self.resolver = _type_kernel.build_native_resolver(type_infos, [])
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        set_wire_typeinfo_map(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        self._set_resolver(self.resolver if active else None)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+            self._set_resolver(self.resolver)
+
+    def _seam(
+        self, typ: ProperType, is_lvalue: bool
+    ) -> tuple[int, bytes] | None:
+        from mypy.checkmember import _serialize_type_for_checkmember
+
+        result = _type_kernel.rust_analyze_descriptor_access(
+            self.resolver, _serialize_type_for_checkmember(typ), is_lvalue, True
+        )
+        if result is None:
+            return None
+        tag, wire = result
+        return tag, bytes(wire)
+
+    def _make_mx(self, is_lvalue: bool) -> Any:
+        from types import SimpleNamespace
+
+        from mypy.checkmember import MemberContext
+        from mypy.options import Options
+
+        chk = SimpleNamespace(
+            msg=SimpleNamespace(fail=lambda *a, **kw: None, options=Options()),
+        )
+        return MemberContext(
+            is_lvalue=is_lvalue,
+            is_super=False,
+            is_operator=False,
+            original_type=self.fx.o,
+            context=NameExpr("x"),
+            chk=cast(Any, chk),
+        )
+
+    def _assert_par(self, typ: Type, is_lvalue: bool = False) -> None:
+        from mypy.checkmember import analyze_descriptor_access
+
+        def run() -> str:
+            mx = self._make_mx(is_lvalue)
+            return str(analyze_descriptor_access(typ, mx))
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert off == on, f"descriptor head({typ}, lv={is_lvalue}): off={off}, on={on}"
+
+    # --- direct seam tag tests ---
+
+    def test_seam_non_descriptor_instance_orig(self) -> None:
+        typ = Instance(self.plaini, [])
+        assert self._seam(typ, False) == (0, b"")
+        assert self._seam(typ, True) == (0, b"")
+
+    def test_seam_get_descriptor_defers(self) -> None:
+        typ = Instance(self.desci, [])
+        assert self._seam(typ, False) is None
+
+    def test_seam_get_descriptor_lvalue_defers(self) -> None:
+        # Lvalue + readable __get__ (no __set__) needs the heavy tail.
+        typ = Instance(self.desci, [])
+        assert self._seam(typ, True) is None
+
+    def test_seam_set_descriptor_lvalue_defers(self) -> None:
+        # Lvalue + readable __set__ routes to analyze_descriptor_assign.
+        typ = Instance(self.setteri, [])
+        assert self._seam(typ, True) is None
+
+    def test_seam_set_descriptor_non_lvalue_orig(self) -> None:
+        # Non-lvalue access only checks __get__; a __set__-only class
+        # passes through.
+        typ = Instance(self.setteri, [])
+        assert self._seam(typ, False) == (0, b"")
+
+    def test_seam_getset_descriptor_defers(self) -> None:
+        typ = Instance(self.getseti, [])
+        assert self._seam(typ, False) is None
+        assert self._seam(typ, True) is None
+
+    def test_seam_non_instance_orig(self) -> None:
+        # CallableType / NoneType / TupleType are all answered by the
+        # checkmember.py:1416 non-Instance guard, both access kinds.
+        sig = CallableType([], [], [], self.fx.a, self.fx.function)
+        for typ in (sig, NoneType()):
+            assert self._seam(typ, False) == (0, b"")
+            assert self._seam(typ, True) == (0, b"")
+
+    def test_seam_missing_snapshot_defers(self) -> None:
+        # A class with no resolver snapshot defers (member presence is
+        # unreadable).
+        from mypy.checkmember import _serialize_type_for_checkmember
+
+        result = _type_kernel.rust_analyze_descriptor_access(
+            _type_kernel.build_native_resolver([], []),
+            _serialize_type_for_checkmember(Instance(self.plaini, [])),
+            False,
+            True,
+        )
+        assert result is None
+
+    # --- gate-off vs gate-on differentials through the real function ---
+
+    def test_parity_non_instance_callable(self) -> None:
+        self._assert_par(self.fx.callable(self.fx.a, self.fx.b))
+
+    def test_parity_non_instance_callable_lvalue(self) -> None:
+        self._assert_par(self.fx.callable(self.fx.a, self.fx.b), is_lvalue=True)
+
+    def test_parity_non_instance_none(self) -> None:
+        self._assert_par(NoneType())
+
+    def test_parity_plain_instance(self) -> None:
+        self._assert_par(Instance(self.plaini, []))
+
+    def test_parity_plain_instance_lvalue(self) -> None:
+        self._assert_par(Instance(self.plaini, []), is_lvalue=True)
+
+    def test_parity_setter_instance_non_lvalue(self) -> None:
+        self._assert_par(Instance(self.setteri, []))
+
+    def test_parity_union_plain_items(self) -> None:
+        typ = UnionType.make_union([Instance(self.plaini, []), NoneType()])
+        self._assert_par(typ)
+
+    def test_parity_union_plain_items_lvalue(self) -> None:
+        typ = UnionType.make_union([Instance(self.plaini, []), self.fx.a])
+        self._assert_par(typ, is_lvalue=True)
+
+    def test_parity_union_with_descriptor_item(self) -> None:
+        # One __get__-bearing item defers the whole union; Python's
+        # per-item recursion runs unchanged (its item-level gate also
+        # defers there), so both gates agree.
+        typ = UnionType.make_union([Instance(self.plaini, []), Instance(self.desci, [])])
+        self._assert_par(typ)
+
+    def test_parity_union_with_setter_item_lvalue(self) -> None:
+        typ = UnionType.make_union([Instance(self.plaini, []), Instance(self.setteri, [])])
+        self._assert_par(typ, is_lvalue=True)
+
+    def test_parity_nested_union(self) -> None:
+        inner = UnionType.make_union([Instance(self.plaini, []), self.fx.a])
+        typ = UnionType.make_union([inner, NoneType()])
+        self._assert_par(typ)
+
+    def test_parity_result_is_original_object(self) -> None:
+        # Tag 0 returns the live orig_descriptor_type object, not a
+        # round-tripped copy.
+        from mypy.checkmember import analyze_descriptor_access
+
+        typ = Instance(self.plaini, [])
+
+        def run() -> bool:
+            mx = self._make_mx(False)
+            return analyze_descriptor_access(typ, mx) is typ
+
+        assert self._with_gate(False, run)
+        assert self._with_gate(True, run)
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsInstanceVarSuite(Suite):
     """Parity for the Rust `is_instance_var` port (mypy.checkmember).
 

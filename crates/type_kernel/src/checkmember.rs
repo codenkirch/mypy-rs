@@ -1782,40 +1782,64 @@ fn analyze_enum_class_attribute_access_inner(
 }
 
 // ---------------------------------------------------------------------------
-// analyze_descriptor_access (Union-map + non-Instance guard only)
+// analyze_descriptor_access (guards + union map; __get__ tail stays Python)
 // ---------------------------------------------------------------------------
 
+/// Wire tags for the seam result. Tag 0 (ORIG) carries no bytes: Python
+/// returns its live `orig_descriptor_type`. Tag 1 (VALUE) carries the
+/// computed result type (union simplification).
+const DA_ORIG: u8 = 0;
+const DA_VALUE: u8 = 1;
+
+/// Decision of the pure head of `analyze_descriptor_access`
+/// (checkmember.py:1120-1162).
+enum DescriptorDecision {
+    /// Python returns `orig_descriptor_type` unchanged; the live object
+    /// is authoritative, so the seam only carries the decision.
+    Orig,
+    /// Return this type (the simplified-union result of the union map).
+    Value(Type),
+}
+
 /// `mypy.checkmember.analyze_descriptor_access` (checkmember.py:1120-1162),
-/// the pure-type-transform head only.
+/// the pure-type-transform head.
 ///
-/// Ports three early-return guards:
-///   * `UnionType` → map each item through `analyze_descriptor_access`
-///     and `make_simplified_union`.
-///   * Not an `Instance` → return the original descriptor type unchanged
-///     (deferred here; the identity round-trip of a non-Instance alias is
-///     not parity-proven, so Python keeps the guard).
-///   * `Instance` + lvalue=false + no readable `__get__` → return the
-///     descriptor unchanged (checkmember.py:1189-1190).
+/// Ports the early-return guards:
+///   * Not an `Instance` → `Orig` (checkmember.py:1416-1417: every
+///     non-Instance proper type — CallableType, NoneType, TupleType,
+///     Overloaded, AnyType, LiteralType, TypeType, ... — returns
+///     `orig_descriptor_type` unconditionally). This is the dominant
+///     shape: `analyze_var` routes every non-descriptor attribute
+///     result through here.
+///   * `Instance` + no readable `__get__` (non-lvalue, :1189-1190) or
+///     neither `__get__` nor `__set__` (lvalue, :1204-1206) → `Orig`.
+///   * `UnionType` → map each item through the same decision and
+///     `make_simplified_union` → `Value`; a `__get__`/`__set__`-bearing
+///     Instance item defers the whole union.
 ///
-/// Everything else needs `mx.chk` (checker state), `map_instance_to_supertype`,
-/// `expand_type_by_instance`, `check_call`, or `warn_deprecated` — all
-/// deferred. The `is_lvalue` flag gates the `__set__`/`__get__` split which
-/// needs checker state, so even with `is_lvalue` we defer past the guards
-/// above.
+/// The `__get__`-bearing Instance tail (bound `__get__` lookup,
+/// `map_instance_to_supertype` + expand, `transform_callee_type`,
+/// `check_call`, `warn_deprecated`) needs `mx.chk` checker state, so it
+/// defers (`None`), as does the lvalue `__set__` assign path.
 #[pyfunction]
 pub(crate) fn rust_analyze_descriptor_access(
     resolver: &NativeTypeResolver,
     descriptor_bytes: &[u8],
     is_lvalue: bool,
     strict_optional: bool,
-) -> PyResult<Option<Vec<u8>>> {
+) -> PyResult<Option<(u8, Vec<u8>)>> {
     let typ = match decode_type(descriptor_bytes) {
         Some(t) => t,
         None => return Ok(None),
     };
     Ok(
         analyze_descriptor_access_inner(&typ, is_lvalue, strict_optional, resolver.resolver())
-            .and_then(|t| encode_type(&t)),
+            .and_then(|d| match d {
+                DescriptorDecision::Orig => Some((DA_ORIG, Vec::new())),
+                // An unencodable union defers the whole call so Python
+                // re-runs the original body.
+                DescriptorDecision::Value(t) => encode_type(&t).map(|b| (DA_VALUE, b)),
+            }),
     )
 }
 
@@ -1824,49 +1848,52 @@ fn analyze_descriptor_access_inner(
     is_lvalue: bool,
     strict_optional: bool,
     resolver: &TypeResolver,
-) -> Option<Type> {
+) -> Option<DescriptorDecision> {
     let proper = get_proper_or_none(typ)?;
     match proper {
         Type::UnionType { items, .. } => {
             // Map the access over union types, then make_simplified_union.
             let mut results = Vec::with_capacity(items.len());
             for item in items {
-                let r =
-                    analyze_descriptor_access_inner(item, is_lvalue, strict_optional, resolver)?;
-                results.push(r);
+                match analyze_descriptor_access_inner(item, is_lvalue, strict_optional, resolver)? {
+                    DescriptorDecision::Orig => results.push(item.clone()),
+                    DescriptorDecision::Value(t) => results.push(t),
+                }
             }
             let ctx = SubtypeContext::new(false, false, false, true, true, strict_optional);
-            make_simplified_union(&results, &ctx, resolver, true)
+            let joined = make_simplified_union(&results, &ctx, resolver, true)?;
+            Some(DescriptorDecision::Value(joined))
         }
-        Type::TupleType {
-            partial_fallback, ..
-        } if !is_lvalue => {
-            // Tuple descriptor (e.g. property on a namedtuple): check the
-            // partial fallback's __get__ presence (matches the Python
-            // head recursing on the tuple fallback).
-            if !matches!(&**partial_fallback, Type::Instance { .. }) {
-                return None;
-            }
-            let Type::Instance { type_ref, .. } = &**partial_fallback else {
-                unreachable!()
-            };
+        Type::Instance { type_ref, .. } => {
+            // Member presence rides the resolver snapshots; a missing
+            // snapshot defers the whole call.
             let has_get = has_readable_member_by_ref(resolver, type_ref, "__get__")?;
-            if has_get {
-                return None;
+            if !is_lvalue {
+                // Non-lvalue __get__ short-circuit (checkmember.py:1189):
+                // no-readable-__get__ passes the descriptor through; a
+                // __get__-bearing descriptor defers (heavy-path analysis).
+                if has_get {
+                    return None;
+                }
+                Some(DescriptorDecision::Orig)
+            } else {
+                // Lvalue: a readable __set__ routes to analyze_descriptor_assign
+                // and a readable __get__ to the heavy tail (both checker
+                // state); a plain non-descriptor passes through (1204-1206).
+                if has_get {
+                    return None;
+                }
+                let has_set = has_readable_member_by_ref(resolver, type_ref, "__set__")?;
+                if has_set {
+                    return None;
+                }
+                Some(DescriptorDecision::Orig)
             }
-            Some(typ.clone())
         }
-        Type::Instance { type_ref, .. } if !is_lvalue => {
-            // Non-lvalue __get__ short-circuit (checkmember.py:1189):
-            // no-readable-__get__ passes the descriptor through; a
-            // __get__-bearing descriptor defers (heavy-path analysis).
-            let has_get = has_readable_member_by_ref(resolver, type_ref, "__get__")?;
-            if has_get {
-                return None;
-            }
-            Some(typ.clone())
-        }
-        _ => None,
+        // Every non-Instance proper type returns orig_descriptor_type
+        // unconditionally (checkmember.py:1416-1417), regardless of
+        // is_lvalue.
+        _ => Some(DescriptorDecision::Orig),
     }
 }
 
@@ -3653,11 +3680,75 @@ mod tests {
     // --- analyze_descriptor_access_inner ---
 
     #[test]
-    fn test_descriptor_access_lvalue_instance_defers() {
+    fn test_descriptor_access_lvalue_non_descriptor_returns_orig() {
+        // Lvalue access to a plain non-descriptor Instance passes through
+        // (checkmember.py:1204-1206: neither __get__ nor __set__).
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("desc.D".to_string());
+        resolver.insert("desc.D".to_string(), snap);
+        resolver.insert(
+            "builtins.object".to_string(),
+            TypeInfoSnapshot {
+                fullname: "builtins.object".to_string(),
+                name: "object".to_string(),
+                mro: vec!["builtins.object".to_string()],
+                ..Default::default()
+            },
+        );
+        let inst = make_instance("desc.D");
+        let r = analyze_descriptor_access_inner(&inst, true, true, &resolver);
+        assert!(matches!(r, Some(DescriptorDecision::Orig)));
+    }
+
+    #[test]
+    fn test_descriptor_access_lvalue_with_get_defers() {
+        // Lvalue + readable __get__ (no __set__) needs the heavy tail ->
+        // defer.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("desc.D".to_string());
+        snap.member_info.insert("__get__".to_string(), (true, true));
+        resolver.insert("desc.D".to_string(), snap);
+        let inst = make_instance("desc.D");
+        assert!(analyze_descriptor_access_inner(&inst, true, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_lvalue_with_set_defers() {
+        // Lvalue + readable __set__ routes to analyze_descriptor_assign
+        // (checker state) -> defer.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("desc.D".to_string());
+        snap.member_info.insert("__set__".to_string(), (true, true));
+        resolver.insert("desc.D".to_string(), snap);
+        let inst = make_instance("desc.D");
+        assert!(analyze_descriptor_access_inner(&inst, true, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_missing_snapshot_defers() {
+        // No class snapshot in an empty resolver -> the member-presence
+        // read defers.
         let resolver = TypeResolver::new();
         let inst = make_instance("builtins.int");
-        // lvalue Instance needs checker state -> defer.
-        assert!(analyze_descriptor_access_inner(&inst, true, true, &resolver).is_none());
+        assert!(analyze_descriptor_access_inner(&inst, false, true, &resolver).is_none());
     }
 
     #[test]
@@ -3674,14 +3765,56 @@ mod tests {
     fn test_descriptor_access_union_with_lvalue_instance_defers() {
         let resolver = TypeResolver::new();
         let union = make_union(vec![make_instance("builtins.int")]);
-        // lvalue Instance item defers -> union defers.
+        // lvalue Instance item defers (missing snapshot) -> union defers.
         assert!(analyze_descriptor_access_inner(&union, true, true, &resolver).is_none());
     }
 
     #[test]
-    fn test_descriptor_access_non_lvalue_no_get_returns_item() {
+    fn test_descriptor_access_union_all_orig_returns_value() {
+        // A union whose items all decide Orig maps to a simplified union
+        // Value (tag 1), not Orig.
+        let mut resolver = TypeResolver::new();
+        for name in ["desc.D", "builtins.object"] {
+            let mut snap = TypeInfoSnapshot {
+                fullname: name.to_string(),
+                name: name.rsplit('.').next().unwrap().to_string(),
+                mro: vec![name.to_string(), "builtins.object".to_string()],
+                ..Default::default()
+            };
+            snap.has_base.insert(name.to_string());
+            if name == "builtins.object" {
+                snap.mro = vec!["builtins.object".to_string()];
+            }
+            resolver.insert(name.to_string(), snap);
+        }
+        let union = make_union(vec![make_instance("desc.D"), make_instance("desc.D")]);
+        let r = analyze_descriptor_access_inner(&union, false, true, &resolver);
+        assert!(matches!(r, Some(DescriptorDecision::Value(_))));
+    }
+
+    #[test]
+    fn test_descriptor_access_union_with_get_item_defers() {
+        // One __get__-bearing item defers the whole union (the item needs
+        // the checker-state tail).
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot {
+            fullname: "desc.D".to_string(),
+            name: "D".to_string(),
+            mro: vec!["desc.D".to_string(), "builtins.object".to_string()],
+            ..Default::default()
+        };
+        snap.has_base.insert("desc.D".to_string());
+        snap.member_info.insert("__get__".to_string(), (true, true));
+        resolver.insert("desc.D".to_string(), snap);
+        let union = make_union(vec![make_instance("desc.D"), make_instance("desc.D")]);
+        assert!(analyze_descriptor_access_inner(&union, false, true, &resolver).is_none());
+    }
+
+    #[test]
+    fn test_descriptor_access_non_lvalue_no_get_returns_orig() {
         // Class with no readable __get__: non-lvalue access returns the
-        // descriptor unchanged (checkmember.py:1189-1190).
+        // descriptor unchanged (checkmember.py:1189-1190) — as an Orig
+        // decision, the live object stays Python-side.
         let mut resolver = TypeResolver::new();
         let mut snap = TypeInfoSnapshot {
             fullname: "desc.D".to_string(),
@@ -3704,7 +3837,7 @@ mod tests {
         );
         let inst = make_instance("desc.D");
         let r = analyze_descriptor_access_inner(&inst, false, true, &resolver);
-        assert!(r.is_some());
+        assert!(matches!(r, Some(DescriptorDecision::Orig)));
     }
 
     #[test]
@@ -3726,56 +3859,44 @@ mod tests {
     }
 
     #[test]
-    fn test_descriptor_access_tuple_no_get_returns_item() {
-        // TupleType descriptor (e.g. property on a namedtuple): non-lvalue
-        // access checks the partial fallback's __get__ presence.
-        let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot {
-            fullname: "builtins.tuple".to_string(),
-            name: "tuple".to_string(),
-            mro: vec!["builtins.tuple".to_string(), "builtins.object".to_string()],
-            ..Default::default()
+    fn test_descriptor_access_non_instance_returns_orig() {
+        // Every non-Instance proper type returns orig unconditionally
+        // (checkmember.py:1416-1417), both access kinds.
+        let resolver = TypeResolver::new();
+        let any_t = Type::AnyType {
+            type_of_any: 6,
+            source_any: None,
+            missing_import_name: None,
         };
-        snap.has_base.insert("builtins.tuple".to_string());
-        resolver.insert("builtins.tuple".to_string(), snap);
-        resolver.insert(
-            "builtins.object".to_string(),
-            TypeInfoSnapshot {
-                fullname: "builtins.object".to_string(),
-                name: "object".to_string(),
-                mro: vec!["builtins.object".to_string()],
-                ..Default::default()
-            },
-        );
-        let tup = Type::TupleType {
-            partial_fallback: Box::new(make_instance("builtins.tuple")),
-            items: vec![make_instance("builtins.str")],
-            implicit: false,
-        };
-        let r = analyze_descriptor_access_inner(&tup, false, true, &resolver);
-        assert!(r.is_some());
+        for typ in [Type::NoneType, any_t] {
+            assert!(matches!(
+                analyze_descriptor_access_inner(&typ, false, true, &resolver),
+                Some(DescriptorDecision::Orig)
+            ));
+            assert!(matches!(
+                analyze_descriptor_access_inner(&typ, true, true, &resolver),
+                Some(DescriptorDecision::Orig)
+            ));
+        }
     }
 
     #[test]
-    fn test_descriptor_access_tuple_with_get_defers() {
-        // TupleType descriptor whose fallback has a readable __get__ needs
-        // the heavy path -> defer.
-        let mut resolver = TypeResolver::new();
-        let mut snap = TypeInfoSnapshot {
-            fullname: "builtins.tuple".to_string(),
-            name: "tuple".to_string(),
-            mro: vec!["builtins.tuple".to_string(), "builtins.object".to_string()],
-            ..Default::default()
-        };
-        snap.has_base.insert("builtins.tuple".to_string());
-        snap.member_info.insert("__get__".to_string(), (true, true));
-        resolver.insert("builtins.tuple".to_string(), snap);
+    fn test_descriptor_access_tuple_returns_orig() {
+        // TupleType is a non-Instance proper type: Python returns
+        // orig_descriptor_type unconditionally (checkmember.py:1416),
+        // regardless of the fallback's __get__ presence or is_lvalue.
+        let resolver = TypeResolver::new();
         let tup = Type::TupleType {
             partial_fallback: Box::new(make_instance("builtins.tuple")),
             items: vec![make_instance("builtins.str")],
             implicit: false,
         };
-        assert!(analyze_descriptor_access_inner(&tup, false, true, &resolver).is_none());
+        for lvalue in [false, true] {
+            assert!(matches!(
+                analyze_descriptor_access_inner(&tup, lvalue, true, &resolver),
+                Some(DescriptorDecision::Orig)
+            ));
+        }
     }
 
     // --- check_self_arg_inner ---

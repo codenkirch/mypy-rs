@@ -770,18 +770,25 @@ including:
   deferral. Exercised by the gate-on/off parity differential of the
   checkexpr suites in `mypy/test/testtypes.py` plus 40 pure unit tests
   in `checkcall.rs`.
-- `rust_analyze_descriptor_access` — extends the checkmember
-  `analyze_descriptor_access` transform head (checkmember.py:1120-1162).
-  Rust short-circuits three pure-type branches on the wire Type: a
-  `UnionType` mapped item-wise and joined via make_simplified_union, and
-  a non-lvalue `TupleType`/`Instance` whose class/partial-fallback has
-  no readable `__get__` (the descriptor passes through unchanged). A
-  `__get__`-bearing Instance defers (`None`) so the heavy
-  `__get__`-analysis path (checker state, transform_callee_type,
-  check_call) stays in Python. The shim gate now covers `UnionType` and
-  non-`Instance` descriptor types, passing `mx.is_lvalue`. Exercised by
-  the native checkmember suites in `mypy/test/testtypes.py` plus Rust
-  unit tests (`test_descriptor_access_*` in `checkmember.rs`).
+- `rust_analyze_descriptor_access` (issue #1108) — reworked into a tag
+  protocol mirroring the pure guard head of
+  `analyze_descriptor_access` (checkmember.py:1376-1432). Rust returns
+  `Option<(tag, bytes)>`: tag 0 = ORIG (shim returns the live
+  `orig_descriptor_type`), tag 1 = VALUE (a UnionType mapped item-wise
+  through the same decision and joined via make_simplified_union; shim
+  decodes and restores line/column), `None` = defer. Non-Instance
+  proper types (CallableType/NoneType/TupleType — ~85% of measured
+  calls) and Instances with no readable `__get__`/`__set__` for the
+  access kind decide ORIG; a `__get__`-bearing Instance and the lvalue
+  `__set__` assign path defer (checker-state tail:
+  transform_callee_type, check_call, warn_deprecated stay Python-side).
+  The old TupleType arm wrongly checked the fallback and is fixed.
+  Measured: 29,922 calls @ 2% native → 25,516 @ 100% native; the count
+  drop is unions no longer re-entering the shim per item (the tail
+  never fires in the self-check corpus). Covered by
+  `NativeDescriptorHeadSuite` (direct seam tag tests + gate-off vs
+  gate-on differential through the real function) plus 12 Rust unit
+  tests in `checkmember.rs`.
 - `rust_analyze_instance_member_access` method path (checkmember.py:415-453)
   — ported for static and trivial-self methods (issue #631). The trivial-self
   path now maps *subclass* receivers natively too: `map_instance_to_supertype`
