@@ -1388,9 +1388,9 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
     descriptor_type = get_proper_type(descriptor_type)
 
     if isinstance(descriptor_type, UnionType) or not isinstance(descriptor_type, Instance):
-        # M20: gated descriptor head. Rust maps a UnionType item-wise
-        # and joins, and passes a non-lvalue, no-__get__ descriptor
-        # (Instance/TupleType) through; a __get__-bearing one defers.
+        # M20: gated descriptor head. Rust decides the pure guards:
+        # non-Instance proper types and non-descriptor Instances return
+        # orig (tag 0); a Union joins (tag 1); a descriptor defers below.
         if (
             _HAS_TYPE_KERNEL
             and _native_checkmember_active
@@ -1405,7 +1405,13 @@ def analyze_descriptor_access(descriptor_type: Type, mx: MemberContext) -> Type:
                     state.state.strict_optional,
                 )
                 if result is not None:
-                    decoded = _deserialize_type_for_checkmember(bytes(result))
+                    tag, wire_bytes = result
+                    if tag == 0:
+                        # Rust decided the pure guards answered
+                        # `return orig_descriptor_type`; the live original
+                        # object is authoritative.
+                        return orig_descriptor_type
+                    decoded = _deserialize_type_for_checkmember(bytes(wire_bytes))
                     if decoded is not None:
                         if isinstance(decoded, ProperType):
                             decoded.line = descriptor_type.line
