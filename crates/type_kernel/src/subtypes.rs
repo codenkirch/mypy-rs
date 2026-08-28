@@ -1806,6 +1806,23 @@ fn visit_instance_nominal(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // Same-ref fast path, hoisted above the snapshot reads (issue #1096):
+    // Python's nominal branch (subtypes.py:554-561) answers True for
+    // identical instances before the protocol path.
+
+    // ignore_declared_variance and alias-carrying args still defer: Rust
+    // skipping a deferred pair skips the Python visitor whose type_state
+    // bookkeeping later protocol checks consult (see the commit message).
+    if !ctx.proper_subtype
+        && !ctx.ignore_declared_variance
+        && left_ref == right_ref
+        && left_args == right_args
+        && !left_args
+            .iter()
+            .any(crate::expandtype::result_contains_typealias)
+    {
+        return Some(true);
+    }
     let left_snap = resolver.get(left_ref);
     let right_snap = resolver.get(right_ref);
 
@@ -1903,14 +1920,6 @@ fn visit_instance_nominal(
     }
 
     let right_snap = right_snap?;
-
-    // Same-ref fast path: identical args are always True regardless of
-    // variance or tvar kinds; proper-mode and protocol-right need the
-    // full walk (protocol/cache semantics), so only non-proper fires.
-    if !ctx.proper_subtype && !right_is_protocol && left_ref == right_ref && left_args == right_args
-    {
-        return Some(true);
-    }
 
     // Variadic right (subtypes.py:644-670): Python takes a special path
     // using split_with_prefix_and_suffix to splice the TypeVarTuple
@@ -3341,6 +3350,75 @@ mod tests {
         let left = instance("a.A", vec![]);
         let right = instance("a.A", vec![]);
         assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn same_ref_equal_args_fast_path_needs_no_snapshot() {
+        // Issue #1096: the same-ref fast path fires above the
+        // snapshot-miss defer. typing.Iterator has no snapshot, and
+        // Python's nominal branch answers True for the identical pair.
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.int", vec![]);
+        let left = instance("typing.Iterator", vec![arg.clone()]);
+        let right = instance("typing.Iterator", vec![arg]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), Some(true));
+    }
+
+    #[test]
+    fn same_ref_alias_arg_defers_without_snapshot() {
+        // Alias-carrying args keep the hoisted fast path out of the way:
+        // a deferred same-ref pair lets Python run its full visitor whose
+        // type_state bookkeeping later protocol checks consult, so defer.
+        let r = make_resolver(vec![]);
+        let alias = alias_type(vec![], "mod.Iter");
+        let left = instance("typing.Iterator", vec![alias.clone()]);
+        let right = instance("typing.Iterator", vec![alias]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn same_ref_nested_alias_arg_defers_without_snapshot() {
+        // The alias check is recursive: an alias three levels deep
+        // (arg -> Instance args -> TypeAliasType) also defers.
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.list", vec![alias_type(vec![], "mod.Iter")]);
+        let left = instance("typing.Iterator", vec![arg.clone()]);
+        let right = instance("typing.Iterator", vec![arg]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn same_ref_args_differ_defers_without_snapshot() {
+        // Different args keep the fast path out of the way: without a
+        // snapshot the variance walk cannot decide, so defer.
+        let r = make_resolver(vec![]);
+        let left = instance("typing.Iterator", vec![instance("builtins.int", vec![])]);
+        let right = instance("typing.Iterator", vec![instance("builtins.str", vec![])]);
+        assert_eq!(is_subtype(&left, &right, &ctx_nominal(), &r), None);
+    }
+
+    #[test]
+    fn same_ref_fast_path_skipped_under_ignore_declared_variance() {
+        // Python skips the nominal branch under ignore_declared_variance
+        // and can then answer False, so the fast path must not fire.
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.int", vec![]);
+        let left = instance("typing.Iterator", vec![arg.clone()]);
+        let right = instance("typing.Iterator", vec![arg]);
+        let ctx = SubtypeContext::new(false, true, false, false, false, true);
+        assert_eq!(is_subtype(&left, &right, &ctx, &r), None);
+    }
+
+    #[test]
+    fn same_ref_fast_path_skipped_in_proper_mode() {
+        // proper-subtype checks keep the full walk (protocol/cache
+        // semantics), matching the old post-snapshot fast path guard.
+        let r = make_resolver(vec![]);
+        let arg = instance("builtins.int", vec![]);
+        let left = instance("typing.Iterator", vec![arg.clone()]);
+        let right = instance("typing.Iterator", vec![arg]);
+        let ctx = SubtypeContext::new(false, false, false, false, true, true);
+        assert_eq!(is_subtype(&left, &right, &ctx, &r), None);
     }
 
     #[test]
