@@ -1842,14 +1842,14 @@ class NativeTypeWireSuite(Suite):
         self.assert_wire_par(declared)
         self.assert_wire_par(meta)
         # Assert id equality is preserved across the wire, not just str().
-        from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+        from librt.internal import ReadBuffer, WriteBuffer
 
         from mypy.types import read_type
 
         for t in (declared, meta):
-            buf = _WB()
+            buf = WriteBuffer()
             t.write(buf)
-            rt = read_type(_RB(buf.getvalue()))
+            rt = read_type(ReadBuffer(buf.getvalue()))
             assert rt.id == t.id, f"{rt.id} != {t.id} after round-trip"  # type: ignore[attr-defined]
 
     def test_union(self) -> None:
@@ -1912,9 +1912,9 @@ class NativeFreshenSuite(Suite):
         )
         # The real freshen signal: fresh meta-level-1 variables with a
         # bumped raw_id (str() prints only the name, which is unchanged).
-        from librt.internal import ReadBuffer as _RB
+        from librt.internal import ReadBuffer
 
-        rt = _read_type(_RB(bytes(serialized)))
+        rt = _read_type(ReadBuffer(bytes(serialized)))
         assert isinstance(rt, ProperType) and isinstance(rt, CallableType), str(rt)
         for v in rt.variables:
             assert v.id.meta_level == 1, f"var {v!r} not meta_level 1"
@@ -2074,12 +2074,12 @@ class NativeBindSelfSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from librt.internal import ReadBuffer as _RB
+        from librt.internal import ReadBuffer
 
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
-        self._RB = _RB
+        self.ReadBuffer = ReadBuffer
         type_infos = [
             self.fx.ai,
             self.fx.bi,
@@ -2108,7 +2108,7 @@ class NativeBindSelfSuite(Suite):
         from mypy.types import instance_cache, read_type as _read_type
         from mypy.wirefixup import fixup_wire_type
 
-        decoded = _read_type(self._RB(bytes(result)))
+        decoded = _read_type(self.ReadBuffer(bytes(result)))
         # Clear instance_cache primitives after read_type so NOT_READY
         # singletons cannot leak into later tests (mirrors typeops.py).
         instance_cache.int_type = None
@@ -2188,14 +2188,14 @@ class NativeFillTypevarsSuite(Suite):
     """
 
     def setUp(self) -> None:
-        from librt.internal import ReadBuffer as _RB
+        from librt.internal import ReadBuffer
 
         from mypy.typevars import _set_native_typevars_active
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
         self._set_native_typevars_active = _set_native_typevars_active
-        self._RB = _RB
+        self.ReadBuffer = ReadBuffer
         self._type_infos = [
             self.fx.oi,
             self.fx.ai,
@@ -2227,7 +2227,7 @@ class NativeFillTypevarsSuite(Suite):
         from mypy.types import instance_cache, read_type as _read_type
         from mypy.wirefixup import fixup_wire_type
 
-        decoded = _read_type(self._RB(bytes(result)))
+        decoded = _read_type(self.ReadBuffer(bytes(result)))
         # Clear instance_cache primitives so NOT_READY singletons cannot
         # leak into later tests (mirrors typeops.py).
         instance_cache.int_type = None
@@ -2348,14 +2348,14 @@ class NativeFillTypevarsWithAnySuite(Suite):
     """
 
     def setUp(self) -> None:
-        from librt.internal import ReadBuffer as _RB
+        from librt.internal import ReadBuffer
 
         from mypy.typevars import _set_native_typevars_active
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self.fx = TypeFixture()
         self._set_native_typevars_active = _set_native_typevars_active
-        self._RB = _RB
+        self.ReadBuffer = ReadBuffer
         self._type_infos = [
             self.fx.oi,
             self.fx.ai,
@@ -2385,7 +2385,7 @@ class NativeFillTypevarsWithAnySuite(Suite):
         from mypy.types import instance_cache, read_type as _read_type
         from mypy.wirefixup import fixup_wire_type
 
-        decoded = _read_type(self._RB(bytes(result)))
+        decoded = _read_type(self.ReadBuffer(bytes(result)))
         instance_cache.int_type = None
         instance_cache.str_type = None
         instance_cache.bool_type = None
@@ -8458,14 +8458,14 @@ class NativeTypeImplTruthinessSuite(Suite):
     _VISITOR_SEAM_RESOLVER_NAMES = ("can_be_true_default_live", "can_be_false_default_live")
 
     def setUp(self) -> None:
-        from librt.internal import ReadBuffer as _RB, WriteBuffer as _WB
+        from librt.internal import ReadBuffer, WriteBuffer
 
         import mypy.types as _types_mod
 
         self._types_mod = _types_mod
         # Bind the seam names the module-level try would have bound.
-        _types_mod._VisitorWriteBuffer = _WB  # type: ignore[attr-defined]
-        _types_mod._ReadBuffer = _RB  # type: ignore[attr-defined]
+        _types_mod._VisitorWriteBuffer = WriteBuffer  # type: ignore[attr-defined]
+        _types_mod._ReadBuffer = ReadBuffer  # type: ignore[attr-defined]
         for n in self._VISITOR_SEAM_NAMES:
             _types_mod.__dict__["_rust_" + n] = getattr(_type_kernel, "rust_" + n)
         _types_mod._VISITOR_HAS_TYPE_KERNEL = True
@@ -17355,7 +17355,7 @@ class NativeCheckMemberSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
-        from librt.internal import WriteBuffer as _WB
+        from librt.internal import WriteBuffer
 
         from mypy.checkmember import (
             _set_native_checkmember_active,
@@ -17364,7 +17364,7 @@ class NativeCheckMemberSuite(Suite):
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._tk = _tk
-        self._WB = _WB
+        self.WriteBuffer = WriteBuffer
         self._set_active = _set_native_checkmember_active
         self._set_resolver = _set_native_checkmember_resolver
         self.fx = TypeFixture()
@@ -17408,7 +17408,7 @@ class NativeCheckMemberSuite(Suite):
         self._set_active(False)
 
     def _bytes_of(self, t: Type) -> bytes:
-        buf = self._WB()
+        buf = self.WriteBuffer()
         t.write(buf)
         return buf.getvalue()
 
@@ -18107,7 +18107,7 @@ class NativeMemberAccessDispatchSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
-        from librt.internal import WriteBuffer as _WB
+        from librt.internal import WriteBuffer
 
         from mypy.checkmember import (
             _set_native_checkmember_active,
@@ -18116,7 +18116,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._tk = _tk
-        self._WB = _WB
+        self.WriteBuffer = WriteBuffer
         self._set_active = _set_native_checkmember_active
         self._set_resolver = _set_native_checkmember_resolver
         self.fx = TypeFixture()
@@ -18160,7 +18160,7 @@ class NativeMemberAccessDispatchSuite(Suite):
         self._set_active(False)
 
     def _bytes_of(self, t: Type) -> bytes:
-        buf = self._WB()
+        buf = self.WriteBuffer()
         t.write(buf)
         return buf.getvalue()
 
@@ -18438,7 +18438,7 @@ class NativeCheckmemberDeferralSuite(Suite):
 
     def setUp(self) -> None:
         import type_kernel as _tk
-        from librt.internal import WriteBuffer as _WB
+        from librt.internal import WriteBuffer
 
         from mypy.checkmember import (
             _set_native_checkmember_active,
@@ -18447,7 +18447,7 @@ class NativeCheckmemberDeferralSuite(Suite):
         from mypy.wirefixup import set_wire_typeinfo_map
 
         self._tk = _tk
-        self._WB = _WB
+        self.WriteBuffer = WriteBuffer
         self.fx = TypeFixture()
         type_infos = [
             self.fx.oi,
@@ -18476,7 +18476,7 @@ class NativeCheckmemberDeferralSuite(Suite):
         _set_native_checkmember_active(False)
 
     def _bytes_of(self, t: Type) -> bytes:
-        buf = self._WB()
+        buf = self.WriteBuffer()
         t.write(buf)
         return buf.getvalue()
 
@@ -20004,14 +20004,14 @@ class NativeTypeAnalSuite(Suite):
         return _from(a1)
 
     def _collect_type_infos(self) -> list[TypeInfo]:
-        from mypy.nodes import TypeInfo as _TI
+        from mypy.nodes import TypeInfo
 
         return [
             value
             for name in dir(self.fx)
             if name.endswith("i")
             for value in [getattr(self.fx, name)]
-            if isinstance(value, _TI)
+            if isinstance(value, TypeInfo)
         ]
 
     def _assert_par(self, t: Type) -> Type:
@@ -27730,21 +27730,21 @@ class NativeIsSubtypeBatchSuite(Suite):
 
         # Drives the batch primitive directly; 512 is a `Final` threshold,
         # so the accumulator is exercised at the flush edge.
-        import mypy.subtypes as S
+        import mypy.subtypes as subtypes
 
-        S._clear_subtype_batch()
-        left_b = S._serialize_type(self.fx.a)
-        right_b = S._serialize_type(self.fx.o)
+        subtypes._clear_subtype_batch()
+        left_b = subtypes._serialize_type(self.fx.a)
+        right_b = subtypes._serialize_type(self.fx.o)
         ctx_key = (False, False, False, False, False, False, False, False)
-        S._subtype_batch.append((left_b, right_b, ctx_key))
+        subtypes._subtype_batch.append((left_b, right_b, ctx_key))
         proto_inst = Instance(self.proto_info, [])
-        S._subtype_batch.append((S._serialize_type(self.fx.a), S._serialize_type(proto_inst), ctx_key))
-        answers = S._flush_subtype_batch()
+        subtypes._subtype_batch.append((subtypes._serialize_type(self.fx.a), subtypes._serialize_type(proto_inst), ctx_key))
+        answers = subtypes._flush_subtype_batch()
         # Decided pair present; deferred pair absent from both dicts.
         assert answers[(left_b, right_b, ctx_key)] is True
-        assert S._subtype_answers[(left_b, right_b, ctx_key)] is True
+        assert subtypes._subtype_answers[(left_b, right_b, ctx_key)] is True
         assert len(answers) == 1
-        assert S._subtype_batch == []
+        assert subtypes._subtype_batch == []
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
@@ -29051,11 +29051,11 @@ class NativeRemoveTrivialSuite(Suite):
         write_type_list(buf, [Instance(self.fx.ai, []), Instance(self.fx.ai, [])])
         result = _type_kernel.rust_remove_trivial(buf.getvalue(), True)
         assert result is not None, "rust_remove_trivial returned None"
-        from librt.internal import ReadBuffer as _RB
+        from librt.internal import ReadBuffer
 
         from mypy.types import read_type_list
 
-        decoded = read_type_list(_RB(bytes(result)))
+        decoded = read_type_list(ReadBuffer(bytes(result)))
         assert_equal(len(decoded), 1)
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeEraseReturnSelfSuite(Suite):
@@ -40141,8 +40141,8 @@ class NativeCheckArgCountSuite(Suite):
     ) -> tuple[bool, list[tuple[int, int, int]], bool] | None:
         from mypy.checkexpr import (
             NATIVE_ARG_SHAPE_ALIAS,
-            NATIVE_ARG_SHAPE_PLAIN,
             NATIVE_ARG_SHAPE_PARAM_SPEC,
+            NATIVE_ARG_SHAPE_PLAIN,
             NATIVE_ARG_SHAPE_TUPLE,
             NATIVE_ARG_SHAPE_TYPEDDICT,
         )
@@ -44580,8 +44580,8 @@ class NativeSolveGenericCallSuite(Suite):
     ) -> CallableType:
         from mypy.applytype import apply_generic_arguments
         from mypy.constraints import _set_native_constraints_active
-        from mypy.nodes import TempNode
         from mypy.infer import ArgumentInferContext, infer_function_type_arguments
+        from mypy.nodes import TempNode
         from mypy.solve import _set_native_solve_active
         from mypy.types import TypeOfAny
 
