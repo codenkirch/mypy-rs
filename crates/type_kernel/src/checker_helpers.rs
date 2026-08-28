@@ -1186,7 +1186,7 @@ pub(crate) fn get_protocol_member_inner(
                     return Some(GetProtocolMemberResult::Defer);
                 }
             };
-            let method_fullname = match get_opt_str_attr(&var_info, "fullname") {
+            let method_fullname = match get_opt_str_attr(var_info, "fullname") {
                 Some(f) => f,
                 None => {
                     return Some(GetProtocolMemberResult::Defer);
