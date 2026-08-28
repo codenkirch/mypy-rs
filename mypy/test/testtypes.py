@@ -92,7 +92,6 @@ from mypy.subtypes import (
     is_subtype,
 )
 from mypy.test.helpers import Suite, assert_equal, assert_type, skip
-from contextlib import contextmanager
 from mypy.test.typefixture import InterfaceTypeFixture, TypeFixture
 from mypy.traverser import (
     all_name_and_member_expressions,
@@ -40642,7 +40641,7 @@ class NativeAllSupersGateSuite(Suite):
         var = cast(Var, lvalue.node)
         lvalue.node = None
         off, on = self._run(lvalue, var=var)
-        assert_equal(on, off, f"check_compatibility_all_supers parity for node=None")
+        assert_equal(on, off, "check_compatibility_all_supers parity for node=None")
 
     def test_parity_annotated_var_line_match(self) -> None:
         # Explicit annotation: not inferred, gate passes via line equality,
@@ -41777,3 +41776,248 @@ class NativeGetTargetTypeSuite(Suite):
         alias = TypeAlias(Instance(self.fx.ai, []), "mod.AAlias", "mod", -1, -1)
         tvar = self._tvar()
         assert self._seam(tvar, TypeAliasType(alias, []), bound_ok=True) is None
+
+
+class NativeComparisonNarrowingSuite(Suite):
+    """Parity for the Rust comparison_type_narrowing operand front (#1087).
+
+    `TypeChecker.comparison_type_narrowing_helper` (checker.py:8579) Step 1
+    classifies each operand as narrowable or not: the `literal(expr) ==
+    LITERAL_TYPE` gate, the None / NotImplemented / True / False / enum
+    literal suppressions, and the two non-narrowable proper-type tests
+    (`FunctionLike.is_type_obj()` and `TypeType` over a `TypeVarType`).
+    Rust decides from wire types plus shim-side literal flags; the
+    literal-hash bookkeeping, chain grouping (already native via
+    `rust_group_comparison_operands`), and the narrowing arm bodies stay
+    Python-side.
+
+    Direct seam calls assert the per-operand bools and the None deferrals;
+    the gate-off vs gate-on differential drives the real helper with
+    `narrow_type_by_identity_equality` stubbed to capture
+    (operator, chain indices, narrowable indices) and asserts identical
+    captures and returns.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active, _set_native_checker_resolver
+
+        self.fx = TypeFixture()
+        self._infos = [
+            self.fx.oi,
+            self.fx.ai,
+            self.fx.bi,
+            self.fx.str_type_info,
+            self.fx.type_typei,
+            self.fx.functioni,
+            self.fx.std_tuplei,
+            self.fx.std_listi,
+        ]
+        self._resolver = _type_kernel.build_native_resolver(self._infos, [])
+        _set_native_checker_resolver(self._resolver)
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.checker import _set_native_checker_resolver
+
+        self._set_active(False)
+        _set_native_checker_resolver(None)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _no_flags(self) -> tuple[bool, bool, bool, bool, bool]:
+        return (False, False, False, False, False)
+
+    def _seam(
+        self, kinds: list[int], flags: list[tuple[bool, bool, bool, bool, bool]], types: list[Type]
+    ) -> Any:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _type_kernel.rust_classify_comparison_operands(
+            kinds, flags, [_serialize_type_for_checker(t) for t in types], self._resolver
+        )
+
+    def _var_expr(self, name: str) -> NameExpr:
+        from mypy.nodes import NameExpr, Var
+
+        expr = NameExpr(name)
+        expr.node = Var(name)
+        return expr
+
+    def _comparison(self, operators: list[str], operands: list[Any]) -> Any:
+        from mypy.nodes import ComparisonExpr
+
+        return ComparisonExpr(operators, operands)
+
+    def _tvar(self) -> TypeVarType:
+        return TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            [],
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _checker(self, expr_types: dict[Any, Type]) -> Any:
+        chk = TypeChecker.__new__(TypeChecker)
+        chk.options = Options()
+        chk._type_maps = [dict(expr_types)]
+        return chk
+
+    def _run_front(self, chk: Any, node: Any) -> Any:
+        calls: list[Any] = []
+
+        def fake_narrow(
+            operator: str,
+            operands: Any = None,
+            operand_types: Any = None,
+            expr_indices: Any = None,
+            narrowable_indices: Any = (),
+        ) -> tuple[TypeMap, TypeMap]:
+            calls.append(
+                (operator, tuple(expr_indices or []), tuple(sorted(narrowable_indices or ())))
+            )
+            return ({}, {})
+
+        chk.narrow_type_by_identity_equality = fake_narrow
+        chk.find_tuple_len_narrowing = lambda _node: []
+        result = chk.comparison_type_narrowing_helper(node)
+        return calls, result
+
+    def _assert_par(self, node: Any, expr_types: dict[Any, Any], note: str) -> None:
+        def run(active: bool) -> Any:
+            chk = self._checker(expr_types)
+            return self._with_gate(active, lambda: self._run_front(chk, node))
+
+        off = run(False)
+        on = run(True)
+        assert_equal(on, off, f"comparison_type_narrowing parity: {note}")
+
+    # --- direct seam calls ---
+
+    def test_seam_plain_instances_narrowable(self) -> None:
+        fx = self.fx
+        assert self._seam([1, 1], [self._no_flags()] * 2, [fx.str_type, fx.o]) == [True, True]
+
+    def test_seam_kind_gate_suppresses(self) -> None:
+        fx = self.fx
+        # kind != LITERAL_TYPE: not narrowable, other facts never consulted.
+        assert self._seam([0, 2], [self._no_flags()] * 2, [fx.str_type, fx.str_type]) == [
+            False,
+            False,
+        ]
+
+    def test_seam_literal_flags_suppress(self) -> None:
+        fx = self.fx
+        for flags in [
+            (True, False, False, False, False),
+            (False, True, False, False, False),
+            (False, False, True, False, False),
+            (False, False, False, True, False),
+            (False, False, False, False, True),
+        ]:
+            assert self._seam([1], [flags], [fx.str_type]) == [False], flags
+
+    def test_seam_type_object_not_narrowable(self) -> None:
+        fx = self.fx
+        assert self._seam([1], [self._no_flags()], [fx.callable_type(fx.a)]) == [False]
+
+    def test_seam_plain_callable_narrowable(self) -> None:
+        fx = self.fx
+        assert self._seam([1], [self._no_flags()], [fx.callable(fx.a)]) == [True]
+
+    def test_seam_overloaded_type_object_not_narrowable(self) -> None:
+        fx = self.fx
+        assert self._seam([1], [self._no_flags()], [Overloaded([fx.callable_type(fx.a)])]) == [
+            False
+        ]
+
+    def test_seam_type_type_over_typevar_not_narrowable(self) -> None:
+        assert self._seam([1], [self._no_flags()], [TypeType(self._tvar())]) == [False]
+
+    def test_seam_type_type_over_instance_narrowable(self) -> None:
+        fx = self.fx
+        assert self._seam([1], [self._no_flags()], [TypeType(fx.str_type)]) == [True]
+
+    def test_seam_alias_operand_defers(self) -> None:
+        fx = self.fx
+        alias_type = TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.AAlias", "mod", -1, -1), [])
+        assert self._seam([1], [self._no_flags()], [alias_type]) is None
+
+    def test_seam_length_mismatch_defers(self) -> None:
+        fx = self.fx
+        assert self._seam([1, 1], [self._no_flags()], [fx.str_type]) is None
+        assert self._seam([1], [self._no_flags()] * 2, [fx.str_type]) is None
+
+    def test_seam_empty_operands(self) -> None:
+        assert self._seam([], [], []) == []
+
+    # --- gate-off vs gate-on differential through the real helper ---
+
+    def test_parity_narrowable_chain(self) -> None:
+        fx = self.fx
+        e0, e1, e2 = self._var_expr("x0"), self._var_expr("x1"), self._var_expr("x2")
+        node = self._comparison(["==", "<"], [e0, e1, e2])
+        types = {e0: fx.str_type, e1: fx.o, e2: fx.a}
+        self._assert_par(node, types, "narrowable chain")
+
+    def test_parity_coalescing_chain(self) -> None:
+        # same == x < y == same: the repeated operand groups the == chains.
+        fx = self.fx
+        e0, e1, e2 = self._var_expr("x0"), self._var_expr("x1"), self._var_expr("x2")
+        node = self._comparison(["==", "<", "=="], [e0, e1, e2, e0])
+        types = {e0: fx.str_type, e1: fx.o, e2: fx.a}
+        self._assert_par(node, types, "coalescing chain")
+
+    def test_parity_non_narrowable_literals(self) -> None:
+        fx = self.fx
+        from mypy.nodes import NameExpr
+
+        e_true = NameExpr("True")
+        e_true.fullname = "builtins.True"
+        e_none = NameExpr("None")
+        e_none.fullname = "builtins.None"
+        e0 = self._var_expr("x0")
+        node = self._comparison(["==", "==", "=="], [e_true, e0, e_none, e_true])
+        types = {e_true: fx.o, e0: fx.str_type, e_none: fx.nonet}
+        self._assert_par(node, types, "literal operands")
+
+    def test_parity_type_object_operand(self) -> None:
+        fx = self.fx
+        e0, e_obj = self._var_expr("x0"), self._var_expr("C")
+        node = self._comparison(["==", "=="], [e0, e_obj, e0])
+        types = {e0: fx.str_type, e_obj: fx.callable_type(fx.a)}
+        self._assert_par(node, types, "type-object operand")
+
+    def test_parity_type_type_typevar_operand(self) -> None:
+        fx = self.fx
+        e0, e1 = self._var_expr("x0"), self._var_expr("x1")
+        node = self._comparison(["==", "=="], [e0, e1, e0])
+        types = {e0: fx.str_type, e1: TypeType(self._tvar())}
+        self._assert_par(node, types, "TypeType over TypeVar operand")
+
+    def test_parity_mixed_narrowable_and_not(self) -> None:
+        fx = self.fx
+        from mypy.nodes import NameExpr
+
+        e0, e1, e_true = self._var_expr("x0"), self._var_expr("x1"), NameExpr("True")
+        e_true.fullname = "builtins.True"
+        node = self._comparison(["==", "<", "!="], [e0, e1, e_true, e0])
+        types = {e0: fx.str_type, e1: fx.a, e_true: fx.o}
+        self._assert_par(node, types, "mixed operands")
+
+    def test_parity_alias_operand_defers(self) -> None:
+        fx = self.fx
+        e0, e1 = self._var_expr("x0"), self._var_expr("x1")
+        node = self._comparison(["==", "=="], [e0, e1, e0])
+        types = {
+            e0: fx.str_type,
+            e1: TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.BAlias", "mod", -1, -1), []),
+        }
+        self._assert_par(node, types, "alias operand")

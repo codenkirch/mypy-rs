@@ -1,0 +1,404 @@
+//! Native port of the operand-classification front of
+//! `mypy.checker.TypeChecker.comparison_type_narrowing_helper`
+//! (checker.py:8579-8613), the Step-1 loop deciding which comparison
+//! operands are narrowable.
+//!
+//! The Python shim computes the cheap AST literal facts (`literal(expr)`
+//! kind, `is_literal_none` / `is_literal_not_implemented` /
+//! `is_false_literal` / `is_true_literal` / `is_literal_enum`) and
+//! serializes each operand type to the wire format; Rust owns the rest of
+//! the conjunction: the `LITERAL_TYPE` gate, the five literal-kind
+//! suppressions, and the two non-narrowable proper-type tests
+//! (`FunctionLike.is_type_obj()`, `TypeType` over a `TypeVarType`).
+//!
+//! Returns one narrowability bool per operand, or `None` (defer) when any
+//! operand cannot be classified: an undecodable wire blob, a
+//! `TypeAliasType` operand (`get_proper_type` would expand it from the
+//! live alias node), a length mismatch, or a type-object fact the
+//! resolver snapshot cannot decide. The Python shim then re-runs the
+//! original pure-Python loop. Everything downstream (literal-hash
+//! bookkeeping, chain grouping via `rust_group_comparison_operands`, the
+//! narrowing arm bodies, TypeMap returns) stays Python-side.
+
+use pyo3::prelude::*;
+
+use crate::checker_helpers::get_proper_or_none;
+use crate::checkmember::decode_type;
+use crate::typeinfo::{NativeTypeResolver, TypeResolver};
+use crate::wire::Type;
+
+/// `mypy.nodes.LITERAL_TYPE` (nodes.py:207): the `literal(expr)` value
+/// marking an operand whose type can be narrowed.
+const LITERAL_TYPE_KIND: i64 = 1;
+
+/// Pure decision core over already-decoded operand types. `operand_flags`
+/// is one `(is_none, is_not_impl, is_false, is_true, is_enum)` tuple per
+/// operand, precomputed by the Python shim; flags for operands whose kind
+/// is not `LITERAL_TYPE` are placeholders (Rust never reads them, mirroring
+/// the Python short-circuit).
+pub(crate) fn classify_comparison_operands_inner(
+    literal_kinds: &[i64],
+    operand_flags: &[(bool, bool, bool, bool, bool)],
+    operand_types: &[Type],
+    resolver: &TypeResolver,
+) -> Option<Vec<bool>> {
+    if literal_kinds.len() != operand_flags.len() || literal_kinds.len() != operand_types.len() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(literal_kinds.len());
+    for i in 0..literal_kinds.len() {
+        // literal(expr) == LITERAL_TYPE gate: everything else is a no-op.
+        if literal_kinds[i] != LITERAL_TYPE_KIND {
+            out.push(false);
+            continue;
+        }
+        let (is_none, is_not_impl, is_false, is_true, is_enum) = operand_flags[i];
+        if is_none || is_not_impl || is_false || is_true || is_enum {
+            out.push(false);
+            continue;
+        }
+        let proper = get_proper_or_none(&operand_types[i])?;
+        match proper {
+            // CallableType type objects are usually already maximally
+            // specific, so they are not narrowable.
+            Type::CallableType { .. } | Type::Overloaded { .. } => {
+                match function_like_is_type_obj(proper, resolver) {
+                    Some(false) => out.push(true),
+                    Some(true) => out.push(false),
+                    None => return None,
+                }
+            }
+            // TypeType over a TypeVar is not narrowable without
+            // intersection types (checker.py:8607-8608).
+            Type::TypeType { item, .. } => {
+                out.push(!matches!(&**item, Type::TypeVarType { .. }));
+            }
+            _ => out.push(true),
+        }
+    }
+    Some(out)
+}
+
+/// `FunctionLike.is_type_obj()`: `CallableType` via
+/// `callable_compat::is_type_obj` (fallback.type.is_metaclass() and the
+/// ret-type not uninhabited); `Overloaded` via `items[0]`. Defers (`None`)
+/// when the resolver has no snapshot for the fallback class, when the
+/// ret-type is a `TypeAliasType` (Python's `get_proper_type` would expand
+/// it from the live alias), or on a malformed shape.
+fn function_like_is_type_obj(t: &Type, resolver: &TypeResolver) -> Option<bool> {
+    match t {
+        Type::CallableType { ret_type, .. } => {
+            if matches!(&**ret_type, Type::TypeAliasType { .. }) {
+                return None;
+            }
+            crate::callable_compat::is_type_obj(t, resolver)
+        }
+        Type::Overloaded { items } => {
+            let first = items.first()?;
+            crate::callable_compat::is_type_obj(first, resolver)
+        }
+        _ => None,
+    }
+}
+
+/// `#[pyfunction]` entry for the shim in `mypy/checker.py`. Decodes each
+/// operand type from the wire format; any undecodable blob defers the whole
+/// call (`None`), mirroring the Python `try/except` shim fallback.
+#[pyfunction]
+pub(crate) fn rust_classify_comparison_operands(
+    literal_kinds: Vec<i64>,
+    operand_flags: Vec<(bool, bool, bool, bool, bool)>,
+    operand_wires: Vec<Vec<u8>>,
+    resolver: &mut NativeTypeResolver,
+) -> Option<Vec<bool>> {
+    if literal_kinds.len() != operand_wires.len() {
+        return None;
+    }
+    let mut operand_types = Vec::with_capacity(operand_wires.len());
+    for bytes in &operand_wires {
+        operand_types.push(decode_type(bytes)?);
+    }
+    classify_comparison_operands_inner(
+        &literal_kinds,
+        &operand_flags,
+        &operand_types,
+        resolver.resolver(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::typeinfo::TypeInfoSnapshot;
+
+    fn instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: Vec::new(),
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn tvar() -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "mod.T".to_string(),
+            raw_id: 0,
+            namespace: "".to_string(),
+            values: Vec::new(),
+            upper_bound: Box::new(instance("builtins.object")),
+            default: Box::new(instance("builtins.object")),
+            variance: 0,
+            meta_level: 0,
+        }
+    }
+
+    fn callable(ret: Type, fallback_ref: &str) -> Type {
+        Type::CallableType {
+            fallback: Box::new(instance(fallback_ref)),
+            instance_type: None,
+            is_ellipsis_args: false,
+            implicit: false,
+            is_bound: false,
+            from_concatenate: false,
+            imprecise_arg_kinds: false,
+            unpack_kwargs: false,
+            from_type_type: false,
+            arg_types: Vec::new(),
+            arg_kinds: Vec::new(),
+            arg_names: Vec::new(),
+            ret_type: Box::new(ret),
+            name: None,
+            variables: Vec::new(),
+            type_guard: None,
+            type_is: None,
+        }
+    }
+
+    fn flags(lit: bool) -> (bool, bool, bool, bool, bool) {
+        if lit {
+            (false, false, false, false, false)
+        } else {
+            (false, false, false, false, true)
+        }
+    }
+
+    fn run(
+        kinds: &[i64],
+        flags: &[(bool, bool, bool, bool, bool)],
+        types: &[Type],
+        resolver: &TypeResolver,
+    ) -> Option<Vec<bool>> {
+        classify_comparison_operands_inner(kinds, flags, types, resolver)
+    }
+
+    #[test]
+    fn test_plain_instance_narrowable() {
+        let types = vec![instance("builtins.int"), instance("builtins.str")];
+        assert_eq!(
+            run(
+                &[1, 1],
+                &[flags(true), flags(true)],
+                &types,
+                &TypeResolver::new()
+            ),
+            Some(vec![true, true])
+        );
+    }
+
+    #[test]
+    fn test_kind_gate_suppresses() {
+        // literal(expr) != LITERAL_TYPE: not narrowable, other facts never
+        // consulted (flags are placeholders).
+        let types = vec![instance("builtins.int"), instance("builtins.str")];
+        assert_eq!(
+            run(
+                &[0, 2],
+                &[flags(true), flags(true)],
+                &types,
+                &TypeResolver::new()
+            ),
+            Some(vec![false, false])
+        );
+    }
+
+    #[test]
+    fn test_literal_kind_flags_suppress() {
+        let types = vec![instance("builtins.int")];
+        for f in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            assert_eq!(
+                run(&[1], &[f], &types, &TypeResolver::new()),
+                Some(vec![false]),
+                "flags {f:?} must suppress narrowing"
+            );
+        }
+    }
+
+    #[test]
+    fn test_type_object_not_narrowable() {
+        // callable with a builtins.type fallback = a type object.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot::default();
+        snap.fullname = "builtins.type".to_string();
+        snap.name = "type".to_string();
+        snap.has_base.insert("builtins.type".to_string());
+        resolver.insert("builtins.type".to_string(), snap);
+        let types = vec![callable(instance("builtins.object"), "builtins.type")];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &resolver),
+            Some(vec![false])
+        );
+    }
+
+    #[test]
+    fn test_non_typeobj_callable_narrowable() {
+        // A plain function (fallback builtins.function) is not a type
+        // object, so the operand stays narrowable.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot::default();
+        snap.fullname = "builtins.function".to_string();
+        snap.name = "function".to_string();
+        resolver.insert("builtins.function".to_string(), snap);
+        let types = vec![callable(instance("builtins.object"), "builtins.function")];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &resolver),
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn test_typeobj_uninhabited_ret_narrowable() {
+        // is_type_obj() is False when ret_type is UninhabitedType.
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot::default();
+        snap.fullname = "builtins.type".to_string();
+        snap.name = "type".to_string();
+        snap.has_base.insert("builtins.type".to_string());
+        resolver.insert("builtins.type".to_string(), snap);
+        let types = vec![callable(
+            Type::UninhabitedType { ambiguous: false },
+            "builtins.type",
+        )];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &resolver),
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn test_typeobj_unresolved_fallback_defers() {
+        // No snapshot for the fallback class: Python's is_type_obj cannot
+        // decide either; the whole call defers.
+        let types = vec![callable(instance("builtins.object"), "builtins.type")];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_overloaded_typeobj_not_narrowable() {
+        // Overloaded.is_type_obj() = items[0].is_type_obj().
+        let mut resolver = TypeResolver::new();
+        let mut snap = TypeInfoSnapshot::default();
+        snap.fullname = "builtins.type".to_string();
+        snap.name = "type".to_string();
+        snap.has_base.insert("builtins.type".to_string());
+        resolver.insert("builtins.type".to_string(), snap);
+        let types = vec![Type::Overloaded {
+            items: vec![callable(instance("builtins.object"), "builtins.type")],
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &resolver),
+            Some(vec![false])
+        );
+    }
+
+    #[test]
+    fn test_type_type_over_typevar_not_narrowable() {
+        let types = vec![Type::TypeType {
+            item: Box::new(tvar()),
+            is_type_form: false,
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            Some(vec![false])
+        );
+    }
+
+    #[test]
+    fn test_type_type_over_instance_narrowable() {
+        let types = vec![Type::TypeType {
+            item: Box::new(instance("builtins.int")),
+            is_type_form: false,
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            Some(vec![true])
+        );
+    }
+
+    #[test]
+    fn test_alias_operand_defers() {
+        // get_proper_type would expand the alias from the live node; defer.
+        let types = vec![Type::TypeAliasType {
+            args: Vec::new(),
+            type_ref: "mod.Alias".to_string(),
+        }];
+        assert_eq!(
+            run(&[1], &[flags(true)], &types, &TypeResolver::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn test_length_mismatch_defers() {
+        let types = vec![instance("builtins.int")];
+        assert_eq!(
+            run(&[1, 1], &[flags(true)], &types, &TypeResolver::new()),
+            None
+        );
+        assert_eq!(
+            run(
+                &[1],
+                &[flags(true), flags(true)],
+                &types,
+                &TypeResolver::new()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn test_empty_operands() {
+        assert_eq!(run(&[], &[], &[], &TypeResolver::new()), Some(vec![]));
+    }
+
+    #[test]
+    fn test_wire_round_trip() {
+        // The #[pyfunction] path decodes wire bytes before classifying.
+        let types = vec![instance("builtins.int"), instance("builtins.str")];
+        let wires: Vec<Vec<u8>> = types
+            .iter()
+            .map(|t| crate::checkmember::encode_type(t).unwrap())
+            .collect();
+        let mut resolver = NativeTypeResolver::from_resolver(TypeResolver::new());
+        assert_eq!(
+            rust_classify_comparison_operands(
+                vec![1, 1],
+                vec![flags(true), flags(true)],
+                wires,
+                &mut resolver
+            ),
+            Some(vec![true, true])
+        );
+    }
+}

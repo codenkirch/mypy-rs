@@ -67,6 +67,7 @@ mod checkpattern;
 mod checkstrformat;
 mod classmethod_static;
 mod comparison_group;
+mod comparison_narrowing;
 mod cond_types;
 mod condmaps;
 mod constant_fold;
@@ -3258,6 +3259,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
     // #566: checker.group_comparison_operands (pure-data union-find port).
     module.add_function(wrap_pyfunction!(
         comparison_group::rust_group_comparison_operands,
+        module
+    )?)?;
+
+    // #1087: checker.comparison_type_narrowing_helper operand front
+    // (per-operand narrowability classification from wire types).
+    module.add_function(wrap_pyfunction!(
+        comparison_narrowing::rust_classify_comparison_operands,
         module
     )?)?;
 

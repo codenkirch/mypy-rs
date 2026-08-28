@@ -1896,3 +1896,25 @@ directly to `main`.
   `mypy/test/testtypes.py` (gate-off vs gate-on differential plus direct
   seam calls per arm), plus pure decision unit tests in
   `checker_functions.rs`.
+
+- `rust_classify_comparison_operands` (issue #1087, crates/type_kernel/src/
+  comparison_narrowing.rs) — mirrors the Step-1 operand-classification front
+  of `TypeChecker.comparison_type_narrowing_helper` (checker.py:8579): the
+  `literal(expr) == LITERAL_TYPE` gate, the None / NotImplemented /
+  True / False / enum literal suppressions, and the two non-narrowable
+  proper-type tests (`FunctionLike.is_type_obj()` via the existing
+  `callable_compat::is_type_obj` port, and `TypeType` over a `TypeVarType`).
+  Python computes the cheap AST literal facts (`literal` kind + five flags,
+  placeholders for non-LITERAL_TYPE operands so the short-circuit order is
+  preserved) and serializes each operand type; Rust returns one
+  narrowability bool per operand. `None` defers the whole call on a length
+  mismatch, an undecodable wire blob, a `TypeAliasType` operand
+  (`get_proper_type` needs the live alias), or an unresolved type-object
+  fallback snapshot; the shim re-runs the original pure-Python loop. The
+  literal-hash bookkeeping, the grouping (`rust_group_comparison_operands`
+  unchanged), and the narrowing arm bodies stay Python-side. Gated by
+  `_native_checker_active` + `_native_checker_resolver` (existing wiring,
+  no build.py change) and covered by `NativeComparisonNarrowingSuite` in
+  `mypy/test/testtypes.py` (direct seam calls per branch plus gate-off vs
+  gate-on differential through the real helper), plus pure decision unit
+  tests in `comparison_narrowing.rs`.
