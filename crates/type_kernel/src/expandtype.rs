@@ -931,7 +931,7 @@ pub(crate) fn result_has_typevar(typ: &Type) -> bool {
 /// TypeAliasType with alias=None, which Python asserts against on access
 /// (`TypeAliasType.is_recursive`, types.py:397), so such results must defer
 /// to the Python visitor which preserves the original alias object.
-fn result_contains_typealias(typ: &Type) -> bool {
+pub(crate) fn result_contains_typealias(typ: &Type) -> bool {
     let mut stack = vec![typ];
     while let Some(cur) = stack.pop() {
         match cur {

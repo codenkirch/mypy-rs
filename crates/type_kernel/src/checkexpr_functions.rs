@@ -5148,17 +5148,15 @@ mod tests {
     }
 
     #[test]
-    fn test_conditional_join_equal_instances_union_fallback() {
-        // Equal Instances with an empty resolver: is_subtype(int,int) is
-        // None (no TypeInfo snapshot), so trivial_join defers and the union
-        // of both branches is returned. Python's join would return int;
-
-        // the Rust kernel conservatively defers via the union fallback.
+    fn test_conditional_join_equal_instances_returns_joined() {
+        // Equal Instances with an empty resolver: the hoisted same-ref
+        // fast path (issue #1096) decides int <: int without a snapshot,
+        // so the join is int itself, matching Python's join_types.
         let t = make_instance("builtins.int", vec![]);
         let out = conditional_join_inner(&t, &t, &empty_resolver()).unwrap();
         match decode_type(&out).unwrap() {
-            Type::UnionType { items, .. } => assert_eq!(items.len(), 2),
-            other => panic!("expected union fallback, got {other:?}"),
+            Type::Instance { type_ref, .. } => assert_eq!(type_ref, "builtins.int"),
+            other => panic!("expected the joined instance, got {other:?}"),
         }
     }
 
