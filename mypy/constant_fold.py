@@ -24,11 +24,12 @@ ConstantValue = int | bool | float | complex | str
 CONST_TYPES: Final = (int, bool, float, complex, str)
 
 # Native type-kernel seam: when the `type_kernel` Rust extension is
-# importable and the build manager has enabled it, `constant_fold_expr`
-# dispatches through Rust. The Rust path returns None for any node it
+# importable and enabled, `constant_fold_expr` dispatches through Rust,
+# returning a (decided, value) wire answer (Issue #1101).
 
-# does not handle, so Python falls back to the pure-Python walk. Same
-# strangler-fig per-call gate as the eraser/kernel ports.
+# A decided answer (including a decided None for an un-foldable
+# expression) skips the pure-Python walk below; the walk only re-runs
+# when the gate is off or Rust raises (strangler-fig per-call gate).
 try:
     from type_kernel import rust_constant_fold_expr as _rust_constant_fold_expr
 
@@ -65,8 +66,8 @@ def constant_fold_expr(expr: Expression, cur_mod_id: str) -> ConstantValue | Non
     Return None if unsuccessful.
     """
     if _HAS_TYPE_KERNEL and _native_constant_fold_active:
-        result = _rust_constant_fold_expr(expr, cur_mod_id)
-        if result is not None:
+        decided, result = _rust_constant_fold_expr(expr, cur_mod_id)
+        if decided:
             return result
     if isinstance(expr, IntExpr):
         return expr.value

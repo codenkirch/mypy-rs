@@ -13,8 +13,14 @@
 //! moving the *dispatch* (which node kinds fold, which ops apply, the
 //! `cur_mod_id` final-var binding) into Rust.
 //!
-//! Entry point: `rust_constant_fold_expr(expr, cur_mod_id) -> Option<PyObject>`
-//! returns the folded scalar (an int/bool/float/complex/str) or None.
+//! Entry point:
+//! `rust_constant_fold_expr(expr, cur_mod_id) -> (bool, PyObject)`
+//! returns a `(decided, value)` wire answer (Issue #1101): the port
+//! mirrors the whole Python walk, so every call is decided — a foldable
+//! expression yields `(true, scalar)` and an un-foldable one yields
+//! `(true, None)` so the Python caller skips its chain. `(false, None)`
+//! (defer) is currently unreachable; an exception propagates and the
+//! caller falls through as before.
 //!
 //! Target: PyO3 0.20.x (`&PyAny`, not `Bound`).
 
@@ -389,13 +395,15 @@ fn fold_expr(
 // ---------------------------------------------------------------------------
 
 /// `mypy.constant_fold.constant_fold_expr` — fold a constant expression
-/// AST node into its scalar value, or None.
+/// AST node into its scalar value, or None (as a `(decided, value)`
+/// wire answer; see the module doc).
 #[pyfunction]
 pub(crate) fn rust_constant_fold_expr(
     py: Python<'_>,
     expr: &PyAny,
     cur_mod_id: &str,
-) -> PyResult<Option<PyObject>> {
+) -> PyResult<(bool, PyObject)> {
     let nodes_mod = py.import("mypy.nodes")?;
-    fold_expr(py, expr, cur_mod_id, nodes_mod)
+    let value = fold_expr(py, expr, cur_mod_id, nodes_mod)?;
+    Ok((true, value.unwrap_or_else(|| py.None())))
 }

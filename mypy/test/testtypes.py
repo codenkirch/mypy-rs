@@ -22156,7 +22156,8 @@ class NativeBinderSuite(Suite):
 
     def _check(self, expr: Expression, label: str) -> None:
         py = self._ref(expr)  # type: ignore[arg-type]
-        rust = self._tk.rust_get_declaration(expr)
+        decided, rust = self._tk.rust_get_declaration(expr)
+        assert decided is True, f"{label}: Rust did not decide ({decided!r})"
         if py is None:
             assert rust is None, f"{label}: Rust returned {rust!r}, Python None"
         else:
@@ -42726,3 +42727,171 @@ class NativeProtocolMemberMissSuite(Suite):
         result = self._loop_call(Instance(i, []), Instance(p, []))
         assert result is False, f"missing member must be False, got {result!r}"
         self._restore()
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeDecidedNoneSuite(Suite):
+    """Issue #1101: the binder/constant_fold seams return a (decided, value)
+    wire answer so a genuine no-result answer skips the Python walk.
+
+    Direct seam calls prove the decided marker (including decided-None);
+    gate-off vs gate-on differentials prove the public functions
+    (`mypy.binder.get_declaration`, `mypy.constant_fold.constant_fold_expr`)
+    answer identically either way.
+    """
+
+    def setUp(self) -> None:
+        import type_kernel as _tk
+
+        self._tk = _tk
+        import mypy.binder as _binder_mod
+        import mypy.constant_fold as _fold_mod
+
+        self._binder_mod = _binder_mod
+        self._fold_mod = _fold_mod
+        self.fx = TypeFixture()
+
+    # --- binder.get_declaration decided-None ---
+
+    def _decided_none_exprs(self) -> list[tuple[str, Expression]]:
+        """Live expressions whose get_declaration answer is None."""
+        from mypy.types import PartialType
+
+        exprs: list[tuple[str, Expression]] = []
+        # Non-RefExpr.
+        exprs.append(("IntExpr", IntExpr(42)))
+        # RefExpr with no node.
+        exprs.append(("NameExpr no node", NameExpr("x")))
+        # Var with no type yet (the common decided-None).
+        v = Var("y")
+        e = NameExpr("y")
+        e.node = v
+        exprs.append(("Var without type", e))
+        # Var with a PartialType.
+        pv = Var("p")
+        pv.type = PartialType(None, pv)
+        e = NameExpr("p")
+        e.node = pv
+        exprs.append(("Var with PartialType", e))
+        # Node neither Var nor TypeInfo.
+        fn = FuncDef("f")
+        e = NameExpr("f")
+        e.node = fn
+        exprs.append(("FuncDef node", e))
+        return exprs
+
+    def test_binder_seam_signals_decided_none(self) -> None:
+        for label, e in self._decided_none_exprs():
+            decided, rust = self._tk.rust_get_declaration(e)
+            assert decided is True, f"{label}: Rust did not decide ({decided!r})"
+            assert rust is None, f"{label}: expected decided-None, got {rust!r}"
+
+    def test_binder_gate_off_on_parity(self) -> None:
+        from mypy.binder import get_declaration
+
+        # Decided-None cases.
+        for label, e in self._decided_none_exprs():
+            old = self._binder_mod._HAS_RUST_BINDER
+            try:
+                self._binder_mod._HAS_RUST_BINDER = False
+                py = get_declaration(e)  # type: ignore[arg-type]
+                self._binder_mod._HAS_RUST_BINDER = True
+                native = get_declaration(e)  # type: ignore[arg-type]
+            finally:
+                self._binder_mod._HAS_RUST_BINDER = old
+            assert py is None and native is None, f"{label}: {py!r} vs {native!r}"
+
+    def test_binder_gate_off_on_parity_decided_value(self) -> None:
+        from mypy.binder import get_declaration
+
+        # Var with a declared type.
+        v = Var("x", self.fx.a)
+        e = NameExpr("x")
+        e.node = v
+        # TypeInfo node.
+        e2 = NameExpr("A")
+        e2.node = self.fx.ai
+        for expr in (e, e2):
+            old = self._binder_mod._HAS_RUST_BINDER
+            try:
+                self._binder_mod._HAS_RUST_BINDER = False
+                py = get_declaration(expr)
+                self._binder_mod._HAS_RUST_BINDER = True
+                native = get_declaration(expr)
+            finally:
+                self._binder_mod._HAS_RUST_BINDER = old
+            assert py is not None and native is not None
+            assert_equal(str(native), str(py), "gate-on must match gate-off")
+        decided, rust = self._tk.rust_get_declaration(e2)
+        assert decided is True
+        assert_equal(str(rust), str(TypeType(self.fx.a)), "TypeInfo -> TypeType")
+
+    # --- constant_fold decided-None ---
+
+    def test_fold_seam_signals_decided_none(self) -> None:
+        # Un-foldable expressions: a name that is not True/False with no
+        # final Var node, an OpExpr with un-foldable operands, a unary op on
+        # an un-foldable operand, and a node kind the fold never handles.
+        name = NameExpr("unknown")
+        op = OpExpr("+", NameExpr("a"), IntExpr(3))
+        un = UnaryExpr("-", NameExpr("b"))
+        # A Var is not an Expression, but the seam accepts it at runtime;
+        # the entry is off the stub's declared type on purpose.
+        cases: list[tuple[str, Expression]] = [
+            ("NameExpr", name),
+            ("OpExpr", op),
+            ("UnaryExpr", un),
+            ("Var", Var("v")),  # type: ignore[list-item]
+        ]
+        for label, expr in cases:
+            decided, rust = self._tk.rust_constant_fold_expr(expr, "mod")
+            assert decided is True, f"{label}: Rust did not decide ({decided!r})"
+            assert rust is None, f"{label}: expected decided-None, got {rust!r}"
+
+    def test_fold_gate_off_on_parity(self) -> None:
+        from mypy.constant_fold import constant_fold_expr
+
+        # A final Var bound in the current module.
+        kv = Var("K")
+        kv.is_final = True
+        kv._fullname = "mod.K"
+        kv.final_value = 42
+        final_name = NameExpr("K")
+        final_name.node = kv
+        # A final Var in another module (not bound).
+        ov = Var("K")
+        ov.is_final = True
+        ov._fullname = "other.K"
+        ov.final_value = 42
+        other_name = NameExpr("K")
+        other_name.node = ov
+
+        cases: list[Expression] = [
+            IntExpr(7),
+            StrExpr("s"),
+            NameExpr("True"),
+            NameExpr("False"),
+            final_name,
+            other_name,
+            NameExpr("no_node"),
+            OpExpr("+", IntExpr(1), IntExpr(2)),
+            OpExpr("+", NameExpr("a"), IntExpr(3)),
+            UnaryExpr("-", IntExpr(4)),
+            UnaryExpr("-", NameExpr("b")),
+        ]
+        for expr in cases:
+            old = self._fold_mod._native_constant_fold_active
+            try:
+                self._fold_mod._set_native_constant_fold_active(False)
+                py = constant_fold_expr(expr, "mod")
+                self._fold_mod._set_native_constant_fold_active(True)
+                native = constant_fold_expr(expr, "mod")
+            finally:
+                self._fold_mod._set_native_constant_fold_active(old)
+            assert py == native, f"{expr!r}: gate-off {py!r} vs gate-on {native!r}"
+
+        # Direct seam decided answers for the foldable leaves.
+        decided, val = self._tk.rust_constant_fold_expr(IntExpr(7), "mod")
+        assert decided is True and val == 7
+        decided, val = self._tk.rust_constant_fold_expr(NameExpr("True"), "mod")
+        assert decided is True and val is True

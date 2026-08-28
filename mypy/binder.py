@@ -658,7 +658,12 @@ def get_declaration(expr: BindableExpression) -> Type | None:
     """
     if _HAS_RUST_BINDER:
         try:
-            return _rust_get_declaration(expr)
+            # (decided, value) wire answer (Issue #1101): a decided answer
+            # (including a decided None) skips the walk below; only an
+            # exception (unreadable fact / stale extension) falls through.
+            decided, value = _rust_get_declaration(expr)
+            if decided:
+                return value
         except Exception:
             pass
     if isinstance(expr, RefExpr):
