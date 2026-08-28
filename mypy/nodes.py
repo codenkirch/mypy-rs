@@ -117,6 +117,36 @@ def _set_native_nodes_active(active: bool) -> None:
     """Called by the build manager to enable/disable the Rust path."""
     global _native_nodes_active
     _native_nodes_active = active
+    # Issue #1137: a build boundary invalidates memoized Rust metaclass
+    # verdicts, so the memo below never outlives the build that produced it.
+    _metaclass_memo.clear()
+
+
+# Issue #1137: per-build memo of Rust `is_metaclass` verdicts, keyed by the
+# MRO list identity + the `precise` flag; see
+# `_clear_native_metaclass_memo` for the invalidation contract.
+_metaclass_memo: dict[tuple[int, bool], tuple[TypeInfo, list[TypeInfo], bool]] = {}
+
+
+def _clear_native_metaclass_memo() -> None:
+    """Drop memoized Rust metaclass verdicts (issue #1137).
+
+    Called on every build boundary (`_set_native_nodes_active` from the
+    build manager, plus `_clear_native_resolvers` before each daemon
+    recheck). `rust_typeinfo_is_metaclass` is a pure per-call fixed cost
+    (#1135: 957k calls, ~0.6s, zero wire bytes), so the verdict for a
+    (MRO list identity, precise) key is memoized for one build: the key
+    holds the info's current MRO list, and entries hold strong refs to
+    (info, mro), so an id cannot be recycled for a different live object
+    and a rebound MRO (re-run semanal, dummy/any/seed MRO, fixup
+    `_mro_refs` rebinding) just misses and recomputes. `fallback_to_any`
+    is frozen before the MRO binds (all writes happen in base-class
+    analysis before `calculate_class_mro`). In-place MRO edits happen
+    only in server/astmerge before any checking in a fine-grained
+    update, so per-build granularity is sufficient. Classes with an
+    empty MRO (placeholder/pre-analysis) compute fresh every time.
+    """
+    _metaclass_memo.clear()
 
 
 if TYPE_CHECKING:
@@ -4247,10 +4277,22 @@ class TypeInfo(SymbolNode):
 
     def is_metaclass(self, *, precise: bool = False) -> bool:
         if _NODES_HAS_TYPE_KERNEL and _native_nodes_active:
+            # Issue #1137: memoize the Rust verdict per (MRO identity,
+            # precise); empty-MRO placeholders compute fresh (their MRO
+            # can still be bound later in this build).
+            mro = self.mro
+            if mro:
+                entry = _metaclass_memo.get((id(mro), precise))
+                if entry is not None:
+                    return entry[2]
             try:
-                return _rust_typeinfo_is_metaclass(self, precise)
+                result = _rust_typeinfo_is_metaclass(self, precise)
             except (AssertionError, NotImplementedError):
                 pass
+            else:
+                if mro:
+                    _metaclass_memo[(id(mro), precise)] = (self, mro, result)
+                return result
         return (
             self.has_base("builtins.type")
             or self.fullname == "abc.ABCMeta"

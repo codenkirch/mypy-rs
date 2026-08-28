@@ -1623,6 +1623,18 @@ including:
   `mypy/test/testtypes.py` (direct seam calls over every `ERR_*` record
   shape plus gate-off vs gate-on parity through the real method), and
   pure decision unit tests in `checkexpr_argcount.rs`.
+- `rust_typeinfo_is_metaclass` per-build memo (issue #1137) —
+  `TypeInfo.is_metaclass` (nodes.py) memoizes the Rust verdict per
+  (MRO list identity, precise) key in `_metaclass_memo`, collapsing the
+  #1135 measured 957k cold-check seam calls (~0.63µs fixed FFI cost,
+  zero wire bytes) to one crossing per distinct MRO state. Invalidated
+  at build boundaries via `_set_native_nodes_active` and per daemon
+  recheck via `_clear_native_metaclass_memo` in
+  `BuildManager._clear_native_resolvers`. Empty-MRO placeholders are
+  never memoized (their MRO can bind later in the same build); entries
+  hold strong refs to (info, mro) so a key id cannot be recycled.
+  Covered by `NativeTypeinfoMetaclassMemoSuite` in
+  `mypy/test/testtypes.py`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
