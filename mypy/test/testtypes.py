@@ -42021,3 +42021,327 @@ class NativeComparisonNarrowingSuite(Suite):
             e1: TypeAliasType(TypeAlias(Instance(fx.ai, []), "mod.BAlias", "mod", -1, -1), []),
         }
         self._assert_par(node, types, "alias operand")
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckAssignmentHeadSuite(Suite):
+    """Parity for `rust_classify_check_assignment` (issue #1090).
+
+    `TypeChecker.check_assignment` (checker.py:4681) classifies a
+    special-name front (NameExpr `__setattr__`/`__getattribute__`/
+    `__getattr__` signature check, `__slots__` in a class body,
+    `__match_args__` with an inferred Var, `__post_init__`, and the
+    MemberExpr `__match_args__` fail) plus the `lvalue_type` branch
+    (partial-None inference, member assignment when `kind is None`,
+    check_simple_assignment tail, no-type fallthrough). The Rust seam
+    reads live-object facts via PyO3 and returns `(special_tag,
+    branch_tag)`; Python applies every arm body. Direct seam calls assert
+    the exact tags; the gate-off vs gate-on differential drives the real
+    `check_assignment` through stubbed helpers and asserts identical
+    captured observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    # ---- direct seam tests ----
+
+    def _name(self, name: str = "x", node: object | None = None) -> NameExpr:
+        ne = NameExpr(name)
+        ne.node = Var(name) if node is None else node  # type: ignore[assignment]
+        return ne
+
+    def _seam(
+        self, lvalue: object, lvalue_type: Type | None, has_inferred: bool, active_class: bool
+    ) -> tuple[int, int] | None:
+        return _type_kernel.rust_classify_check_assignment(
+            lvalue, lvalue_type, has_inferred, active_class
+        )
+
+    def test_seam_setattr_family(self) -> None:
+        from mypy.checker import NATIVE_CA_BRANCH_NO_TYPE, NATIVE_CA_SPECIAL_SETATTR_SIG
+
+        for name in ("__setattr__", "__getattribute__", "__getattr__"):
+            tags = self._seam(self._name(name), None, False, False)
+            assert tags == (NATIVE_CA_SPECIAL_SETATTR_SIG, NATIVE_CA_BRANCH_NO_TYPE), (
+                f"{name}: {tags}"
+            )
+
+    def test_seam_slots(self) -> None:
+        from mypy.checker import (
+            NATIVE_CA_BRANCH_NO_TYPE,
+            NATIVE_CA_SPECIAL_NONE,
+            NATIVE_CA_SPECIAL_SLOTS,
+        )
+
+        tags = self._seam(self._name("__slots__"), None, False, True)
+        assert tags == (NATIVE_CA_SPECIAL_SLOTS, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+        # Without an active class no special check fires.
+        tags = self._seam(self._name("__slots__"), None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+
+    def test_seam_match_args(self) -> None:
+        from mypy.checker import (
+            NATIVE_CA_BRANCH_NO_TYPE,
+            NATIVE_CA_SPECIAL_MATCH_ARGS,
+            NATIVE_CA_SPECIAL_NONE,
+        )
+
+        tags = self._seam(self._name("__match_args__"), None, True, False)
+        assert tags == (NATIVE_CA_SPECIAL_MATCH_ARGS, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+        # Without an inferred Var no special check fires.
+        tags = self._seam(self._name("__match_args__"), None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+
+    def test_seam_post_init(self) -> None:
+        from mypy.checker import NATIVE_CA_BRANCH_NO_TYPE, NATIVE_CA_SPECIAL_POST_INIT
+
+        tags = self._seam(self._name("__post_init__"), None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_POST_INIT, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+
+    def test_seam_plain_name(self) -> None:
+        from mypy.checker import NATIVE_CA_BRANCH_NO_TYPE, NATIVE_CA_SPECIAL_NONE
+
+        tags = self._seam(self._name("x"), None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+        # A NameExpr with a falsy node never enters the special block.
+        ne = self._name("x", node=None)
+        tags = self._seam(ne, None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+
+    def test_seam_member_match_args(self) -> None:
+        from mypy.checker import NATIVE_CA_BRANCH_NO_TYPE, NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS
+
+        me = MemberExpr(NameExpr("b"), "__match_args__")
+        tags = self._seam(me, None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+
+    def test_seam_branches(self) -> None:
+        from mypy.checker import (
+            NATIVE_CA_BRANCH_MEMBER,
+            NATIVE_CA_BRANCH_NO_TYPE,
+            NATIVE_CA_BRANCH_PARTIAL_NONE,
+            NATIVE_CA_BRANCH_SIMPLE,
+            NATIVE_CA_SPECIAL_NONE,
+        )
+        from mypy.nodes import GDEF
+        from mypy.types import PartialType
+
+        # No lvalue type -> NO_TYPE.
+        tags = self._seam(self._name("x"), None, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_NO_TYPE), f"{tags}"
+        # Partial-None lvalue type -> PARTIAL_NONE.
+        pt = PartialType(None, Var("x"), None)
+        tags = self._seam(self._name("x"), pt, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_PARTIAL_NONE), f"{tags}"
+        # Partial with a non-None class is not the partial-None arm.
+        pt2 = PartialType(self.fx.std_tuplei, Var("x"), None)
+        tags = self._seam(self._name("x"), pt2, False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_SIMPLE), f"{tags}"
+        # Member with kind None -> MEMBER.
+        me = MemberExpr(NameExpr("b"), "attr")
+        tags = self._seam(me, Instance(self.fx.ai, []), False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_MEMBER), f"{tags}"
+        # Member with a resolved kind -> SIMPLE.
+        me2 = MemberExpr(NameExpr("b"), "attr")
+        me2.kind = GDEF
+        tags = self._seam(me2, Instance(self.fx.ai, []), False, False)
+        assert tags == (NATIVE_CA_SPECIAL_NONE, NATIVE_CA_BRANCH_SIMPLE), f"{tags}"
+
+    def test_seam_defers_on_unreadable_node_name(self) -> None:
+        # A NameExpr whose node lacks `.name` defers (None) so the
+        # pure-Python body re-runs.
+        ne = self._name("x", node=SimpleNamespace())
+        assert self._seam(ne, None, False, False) is None
+
+    # ---- gate-off vs gate-on differential ----
+
+    def _run(
+        self,
+        lvalue: Lvalue,
+        lvalue_type: Type | None,
+        index_lvalue: Lvalue | None,
+        inferred: Var | None,
+        *,
+        rvalue_type: Type | None = None,
+        active_class: object | None = None,
+        is_stub: bool = False,
+    ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+        from mypy.checker import TypeChecker
+
+        rvalue: Expression = StrExpr("v")
+        rt = rvalue_type if rvalue_type is not None else Instance(self.fx.ai, [])
+
+        def check_one() -> tuple[object, ...]:
+            obs: list[object] = []
+            # The mock surface below intentionally diverges from the real
+            # TypeChecker signatures, so the instance is typed as Any.
+            chk = cast(Any, TypeChecker.__new__(TypeChecker))
+            chk.options = Options()
+            chk.is_stub = is_stub
+            chk.current_node_deferred = False
+            chk.can_skip_diagnostics = True
+            chk.var_decl_frames = {}
+            chk._expr_checker = SimpleNamespace(
+                accept=lambda expr, type_context=None, always_allow_any=False: rt
+            )
+            chk.scope = SimpleNamespace(active_class=lambda: active_class)
+            chk.binder = SimpleNamespace(
+                assign_type=lambda lv, rvt, lvt: obs.append(("assign",)),
+                frames=[],
+                put=lambda lv, t: obs.append(("put",)),
+            )
+            chk.msg = SimpleNamespace(
+                concrete_only_assign=lambda lt, rv: obs.append(("concrete_only",))
+            )
+            chk.try_infer_partial_generic_type_from_assignment = lambda lv, rv, op: obs.append(
+                ("partial_generic",)
+            )
+            chk.check_lvalue = lambda lv, rv=None: (
+                lvalue_type,
+                index_lvalue,
+                inferred,
+            )
+            chk.fail = lambda msg, ctx: obs.append(("fail", str(msg)))
+            chk.check_setattr_method = lambda sig, lv: obs.append(("setattr",))
+            chk.check_getattr_method = lambda sig, lv, name: obs.append(("getattr", name))
+            chk.check_slots_definition = lambda typ, lv: obs.append(("slots_def",))
+            chk.check_match_args = lambda typ, t, lv: obs.append(("match_args",))
+
+            def _mock_member_assignment(
+                lv: Any, it: Any, lt: Any, rv: Any, context: Any = None
+            ) -> tuple[Any, Any, bool]:
+                obs.append(("member",))
+                return rt, lt, True
+
+            def _mock_simple_assignment(
+                lt: Any, rv: Any, context: Any = None, inferred: Any = None, lvalue: Any = None
+            ) -> tuple[Any, Any]:
+                obs.append(("simple",))
+                return rt, lt
+
+            chk.check_member_assignment = _mock_member_assignment
+            chk.check_simple_assignment = _mock_simple_assignment
+            chk.check_indexed_assignment = lambda il, rv, lv: obs.append(("indexed",))
+            chk.get_variable_type_context = lambda inf, rv: None
+            chk.infer_variable_type = lambda inf, lv, rvt, rv: obs.append(("infer_var",))
+            chk.check_assignment_to_slots = lambda lv: obs.append(("slots",))
+            chk.find_partial_types = lambda var: {var: None}
+            chk.set_inferred_type = lambda var, lv, t: obs.append(("set_type", str(t)))
+            chk.infer_partial_type = lambda var, lv, rvt: False
+            chk.inference_error_fallback_type = lambda rvt: rvt
+            chk.check_assignment_to_multiple_lvalues = lambda items, rv, ctx, ilt: obs.append(
+                ("multiple",)
+            )
+            chk.check_assignment(lvalue, rvalue)
+            return tuple(obs)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        lvalue: Lvalue,
+        lvalue_type: Type | None,
+        index_lvalue: Lvalue | None,
+        inferred: Var | None,
+        *,
+        rvalue_type: Type | None = None,
+        active_class: object | None = None,
+    ) -> None:
+        off, on = self._run(
+            lvalue,
+            lvalue_type,
+            index_lvalue,
+            inferred,
+            rvalue_type=rvalue_type,
+            active_class=active_class,
+        )
+        assert_equal(on, off, f"check_assignment parity for lvalue={lvalue!r}")
+        assert off, "differential produced no observations"
+
+    def test_parity_name_simple(self) -> None:
+        self._assert_par(self._name("x"), Instance(self.fx.ai, []), None, None)
+
+    def test_parity_name_no_type(self) -> None:
+        self._assert_par(self._name("x"), None, None, None)
+
+    def test_parity_member(self) -> None:
+        self._assert_par(MemberExpr(NameExpr("b"), "attr"), Instance(self.fx.ai, []), None, None)
+
+    def test_parity_index(self) -> None:
+        self._assert_par(
+            IndexExpr(NameExpr("a"), NameExpr("b")),
+            None,
+            IndexExpr(NameExpr("a"), NameExpr("c")),
+            None,
+        )
+
+    def test_parity_inferred_tail(self) -> None:
+        self._assert_par(self._name("x"), None, None, Var("x"))
+
+    def test_parity_setattr(self) -> None:
+        self._assert_par(self._name("__setattr__"), Instance(self.fx.ai, []), None, None)
+
+    def test_parity_getattr_family(self) -> None:
+        self._assert_par(self._name("__getattribute__"), None, None, None)
+
+    def test_parity_slots(self) -> None:
+        self._assert_par(
+            self._name("__slots__"),
+            None,
+            None,
+            None,
+            active_class=SimpleNamespace(metadata={}),
+        )
+
+    def test_parity_match_args_name(self) -> None:
+        self._assert_par(self._name("__match_args__"), None, None, Var("__match_args__"))
+
+    def test_parity_post_init(self) -> None:
+        self._assert_par(
+            self._name("__post_init__"),
+            None,
+            None,
+            None,
+            active_class=SimpleNamespace(metadata={"dataclass"}),
+        )
+
+    def test_parity_member_match_args(self) -> None:
+        self._assert_par(
+            MemberExpr(NameExpr("b"), "__match_args__"), Instance(self.fx.ai, []), None, None
+        )
+
+    def test_parity_partial_none_return(self) -> None:
+        from mypy.types import PartialType
+
+        self._assert_par(
+            self._name("x"),
+            PartialType(None, Var("x"), None),
+            None,
+            None,
+            rvalue_type=NoneType(),
+        )
+
+    def test_parity_partial_none_infer(self) -> None:
+        from mypy.types import PartialType
+
+        self._assert_par(self._name("x"), PartialType(None, Var("x"), None), None, None)
+
+    def test_parity_tuple(self) -> None:
+        self._assert_par(TupleExpr([NameExpr("a")]), None, None, None)

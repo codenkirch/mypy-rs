@@ -4717,6 +4717,187 @@ pub(crate) fn rust_classify_simple_assignment(
     ))
 }
 
+/// Decision tags for the `check_assignment` special-name front
+/// (checker.py:4692-4720):
+/// - `CA_SPECIAL_NONE`: no special-name check applies.
+/// - `CA_SPECIAL_SETATTR_SIG`: NameExpr bound to `__setattr__` /
+///   `__getattribute__` / `__getattr__`; Python validates the signature.
+/// - `CA_SPECIAL_SLOTS`: NameExpr `__slots__` inside a class body.
+/// - `CA_SPECIAL_MATCH_ARGS`: NameExpr `__match_args__` with an inferred Var.
+/// - `CA_SPECIAL_POST_INIT`: NameExpr `__post_init__`.
+/// - `CA_SPECIAL_MEMBER_MATCH_ARGS`: MemberExpr `__match_args__` fail.
+pub(crate) const CA_SPECIAL_NONE: i64 = 0;
+pub(crate) const CA_SPECIAL_SETATTR_SIG: i64 = 1;
+pub(crate) const CA_SPECIAL_SLOTS: i64 = 2;
+pub(crate) const CA_SPECIAL_MATCH_ARGS: i64 = 3;
+pub(crate) const CA_SPECIAL_POST_INIT: i64 = 4;
+pub(crate) const CA_SPECIAL_MEMBER_MATCH_ARGS: i64 = 5;
+
+/// Branch tags for the `lvalue_type` dispatch (checker.py:4722-4851):
+/// - `CA_BRANCH_NO_TYPE`: no lvalue type; Python falls to the indexed arm
+///   or the inferred-Var tail.
+/// - `CA_BRANCH_PARTIAL_NONE`: partial `None` inference arm.
+/// - `CA_BRANCH_MEMBER`: member assignment (module-access kind is None).
+/// - `CA_BRANCH_SIMPLE`: routes to check_simple_assignment.
+pub(crate) const CA_BRANCH_NO_TYPE: i64 = 0;
+pub(crate) const CA_BRANCH_PARTIAL_NONE: i64 = 1;
+pub(crate) const CA_BRANCH_MEMBER: i64 = 2;
+pub(crate) const CA_BRANCH_SIMPLE: i64 = 3;
+
+/// Pure special-name decision of `check_assignment`. Kept separate from
+/// the PyO3 entry so the branch algebra is unit-tested without a Python
+/// runtime. `node_name` / `lvalue_name` are `None` when the fact is not
+/// needed (or the node is falsy for a NameExpr).
+fn classify_check_assignment_special(
+    is_name_expr: bool,
+    node_truthy: bool,
+    node_name: Option<&str>,
+    lvalue_name: Option<&str>,
+    is_member_expr: bool,
+    active_class: bool,
+    has_inferred: bool,
+) -> i64 {
+    if is_name_expr {
+        if !node_truthy {
+            return CA_SPECIAL_NONE;
+        }
+        return match node_name {
+            Some("__setattr__") | Some("__getattribute__") | Some("__getattr__") => {
+                CA_SPECIAL_SETATTR_SIG
+            }
+            Some("__slots__") if active_class => CA_SPECIAL_SLOTS,
+            Some("__match_args__") if has_inferred => CA_SPECIAL_MATCH_ARGS,
+            Some("__post_init__") => CA_SPECIAL_POST_INIT,
+            _ => CA_SPECIAL_NONE,
+        };
+    }
+    if is_member_expr && lvalue_name == Some("__match_args__") {
+        return CA_SPECIAL_MEMBER_MATCH_ARGS;
+    }
+    CA_SPECIAL_NONE
+}
+
+/// Pure branch decision of `check_assignment`: the `lvalue_type` dispatch
+/// (partial-None vs member vs simple vs no-type). Kept separate from the
+/// PyO3 entry for unit tests.
+fn classify_check_assignment_branch(
+    lvalue_type_present: bool,
+    partial_none: bool,
+    is_member_expr: bool,
+    member_kind_none: bool,
+) -> i64 {
+    if !lvalue_type_present {
+        return CA_BRANCH_NO_TYPE;
+    }
+    if partial_none {
+        return CA_BRANCH_PARTIAL_NONE;
+    }
+    if is_member_expr && member_kind_none {
+        return CA_BRANCH_MEMBER;
+    }
+    CA_BRANCH_SIMPLE
+}
+
+/// `TypeChecker.check_assignment` decision-front port (checker.py:4681).
+/// Rust reads the live lvalue node kind, the special-name set, the
+/// partial-None shape of `lvalue_type`, and the member `kind is None` fact
+/// via PyO3, and returns `(special_tag, branch_tag)`. The Python shim
+/// applies every arm body (signature/slots/match-args checks, partial-None
+/// inference, check_member_assignment / check_simple_assignment /
+/// check_indexed_assignment, binder writes, message emission). Defers
+/// (`None`) on any unreadable attribute so the pure-Python body re-runs.
+#[pyfunction]
+#[pyo3(signature = (lvalue, lvalue_type, has_inferred, active_class))]
+pub(crate) fn rust_classify_check_assignment(
+    py: Python<'_>,
+    lvalue: &PyAny,
+    lvalue_type: Option<&PyAny>,
+    has_inferred: bool,
+    active_class: bool,
+) -> PyResult<Option<(i64, i64)>> {
+    let is_name = lvalue.is_instance(nodes_class(py, "NameExpr")?)?;
+    let is_member = lvalue.is_instance(nodes_class(py, "MemberExpr")?)?;
+
+    let (node_truthy, node_name) = if is_name {
+        let node = match lvalue.getattr("node") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let truthy = match node.is_true() {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let nm = if truthy {
+            match node.getattr("name") {
+                Ok(v) => match v.extract::<String>() {
+                    Ok(s) => Some(s),
+                    Err(_) => return Ok(None),
+                },
+                Err(_) => return Ok(None),
+            }
+        } else {
+            None
+        };
+        (truthy, nm)
+    } else {
+        (false, None)
+    };
+
+    let lvalue_name = if is_member {
+        match lvalue.getattr("name") {
+            Ok(v) => match v.extract::<String>() {
+                Ok(s) => Some(s),
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        }
+    } else {
+        None
+    };
+
+    let (lt_present, partial_none) = match lvalue_type {
+        None => (false, false),
+        Some(t) => {
+            let partial_cls: &PyType = py
+                .import("mypy.types")?
+                .getattr("PartialType")?
+                .downcast()?;
+            let is_partial = t.is_instance(partial_cls)?;
+            let pnone = if is_partial {
+                match t.getattr("type") {
+                    Ok(v) => v.is_none(),
+                    Err(_) => return Ok(None),
+                }
+            } else {
+                false
+            };
+            (true, pnone)
+        }
+    };
+
+    let member_kind_none = if is_member {
+        match lvalue.getattr("kind") {
+            Ok(v) => v.is_none(),
+            Err(_) => return Ok(None),
+        }
+    } else {
+        false
+    };
+
+    Ok(Some((
+        classify_check_assignment_special(
+            is_name,
+            node_truthy,
+            node_name.as_deref(),
+            lvalue_name.as_deref(),
+            is_member,
+            active_class,
+            has_inferred,
+        ),
+        classify_check_assignment_branch(lt_present, partial_none, is_member, member_kind_none),
+    )))
+}
+
 /// The `"__i" + method[2:]` name computation of `_find_inplace_method`
 /// (checker.py:11514). Every `operators.op_methods` value is a dunder
 /// name, so `chars().skip(2)` matches the Python slice exactly.
@@ -4958,6 +5139,172 @@ mod classify_simple_assignment_tests {
         assert_eq!(
             classify_simple_assignment(Some(&alias), false, false, true, false, false),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod classify_check_assignment_tests {
+    use super::*;
+
+    fn special_name(node_name: Option<&str>, active_class: bool, has_inferred: bool) -> i64 {
+        classify_check_assignment_special(
+            true,
+            true,
+            node_name,
+            None,
+            false,
+            active_class,
+            has_inferred,
+        )
+    }
+
+    #[test]
+    fn test_setattr_family() {
+        assert_eq!(
+            special_name(Some("__setattr__"), false, false),
+            CA_SPECIAL_SETATTR_SIG
+        );
+        assert_eq!(
+            special_name(Some("__getattribute__"), false, false),
+            CA_SPECIAL_SETATTR_SIG
+        );
+        assert_eq!(
+            special_name(Some("__getattr__"), false, false),
+            CA_SPECIAL_SETATTR_SIG
+        );
+    }
+
+    #[test]
+    fn test_slots_needs_active_class() {
+        assert_eq!(
+            special_name(Some("__slots__"), true, false),
+            CA_SPECIAL_SLOTS
+        );
+        // Without an active class no special check fires.
+        assert_eq!(
+            special_name(Some("__slots__"), false, false),
+            CA_SPECIAL_NONE
+        );
+    }
+
+    #[test]
+    fn test_match_args_needs_inferred() {
+        assert_eq!(
+            special_name(Some("__match_args__"), false, true),
+            CA_SPECIAL_MATCH_ARGS
+        );
+        assert_eq!(
+            special_name(Some("__match_args__"), false, false),
+            CA_SPECIAL_NONE
+        );
+    }
+
+    #[test]
+    fn test_post_init() {
+        assert_eq!(
+            special_name(Some("__post_init__"), false, false),
+            CA_SPECIAL_POST_INIT
+        );
+    }
+
+    #[test]
+    fn test_plain_name_is_none() {
+        assert_eq!(special_name(Some("x"), false, false), CA_SPECIAL_NONE);
+        assert_eq!(special_name(None, false, false), CA_SPECIAL_NONE);
+    }
+
+    #[test]
+    fn test_falsy_node_is_none() {
+        // A NameExpr with a falsy node never enters the special block.
+        assert_eq!(
+            classify_check_assignment_special(
+                true,
+                false,
+                Some("__setattr__"),
+                None,
+                false,
+                true,
+                true
+            ),
+            CA_SPECIAL_NONE
+        );
+    }
+
+    #[test]
+    fn test_member_match_args_fails() {
+        assert_eq!(
+            classify_check_assignment_special(
+                false,
+                false,
+                None,
+                Some("__match_args__"),
+                true,
+                false,
+                true
+            ),
+            CA_SPECIAL_MEMBER_MATCH_ARGS
+        );
+        // A plain member access is not a special name.
+        assert_eq!(
+            classify_check_assignment_special(false, false, None, Some("attr"), true, false, false),
+            CA_SPECIAL_NONE
+        );
+        // A NameExpr never takes the member arm.
+        assert_eq!(
+            classify_check_assignment_special(
+                true,
+                true,
+                Some("__match_args__"),
+                Some("__match_args__"),
+                true,
+                false,
+                false
+            ),
+            CA_SPECIAL_NONE
+        );
+    }
+
+    #[test]
+    fn test_branch_no_type() {
+        assert_eq!(
+            classify_check_assignment_branch(false, false, false, false),
+            CA_BRANCH_NO_TYPE
+        );
+        // A member with kind None and no lvalue type still lands in NO_TYPE;
+        // the indexed arm decides Python-side from index_lvalue.
+        assert_eq!(
+            classify_check_assignment_branch(false, false, true, true),
+            CA_BRANCH_NO_TYPE
+        );
+    }
+
+    #[test]
+    fn test_branch_partial_none() {
+        assert_eq!(
+            classify_check_assignment_branch(true, true, false, false),
+            CA_BRANCH_PARTIAL_NONE
+        );
+        // Partial with a non-None .type is not the partial-None arm.
+        assert_eq!(
+            classify_check_assignment_branch(true, false, false, false),
+            CA_BRANCH_SIMPLE
+        );
+    }
+
+    #[test]
+    fn test_branch_member_vs_simple() {
+        assert_eq!(
+            classify_check_assignment_branch(true, false, true, true),
+            CA_BRANCH_MEMBER
+        );
+        assert_eq!(
+            classify_check_assignment_branch(true, false, true, false),
+            CA_BRANCH_SIMPLE
+        );
+        assert_eq!(
+            classify_check_assignment_branch(true, false, false, false),
+            CA_BRANCH_SIMPLE
         );
     }
 }

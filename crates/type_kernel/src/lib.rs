@@ -3250,6 +3250,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1090: check_assignment decision-front port. Rust arbitrates
+    // the special-name front and the lvalue_type branch; arm bodies stay
+    // in Python (see checker_functions.rs).
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_check_assignment,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

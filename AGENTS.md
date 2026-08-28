@@ -1918,3 +1918,27 @@ directly to `main`.
   `mypy/test/testtypes.py` (direct seam calls per branch plus gate-off vs
   gate-on differential through the real helper), plus pure decision unit
   tests in `comparison_narrowing.rs`.
+- `rust_classify_check_assignment` (issue #1090, crates/type_kernel/src/
+  checker_functions.rs) — mirrors the decision front of
+  `TypeChecker.check_assignment` (checker.py:4681): the special-name front
+  (NameExpr `__setattr__`/`__getattribute__`/`__getattr__` signature check,
+  `__slots__` in a class body, `__match_args__` with an inferred Var,
+  `__post_init__`, and the MemberExpr `__match_args__` fail) and the
+  `lvalue_type` branch (partial-None inference, member assignment when
+  `kind is None`, check_simple_assignment tail, no-type fallthrough).
+  Rust reads the live lvalue node kind, the node/name scalars, the
+  partial-None shape of `lvalue_type`, and the member `kind is None` fact
+  via PyO3 and returns `(special_tag, branch_tag)`; the Python shim
+  applies every arm body: the signature/slots/match-args/post-init checks,
+  the partial-None inference with its binder `put` and
+  `set_inferred_type` writes, `check_member_assignment` /
+  `check_simple_assignment` / `check_indexed_assignment`, the abstract
+  `Type[A]` concrete-only tail, and all binder (`assign_type`) and msg
+  side effects. The tuple-vs-single dispatch and
+  `try_infer_partial_generic_type_from_assignment` prelude stay Python-side.
+  Defers (`None`) on any unreadable attribute so the pure-Python
+  classification re-runs. Gated by `_native_checker_active` (existing
+  wiring, no build.py change) and covered by
+  `NativeCheckAssignmentHeadSuite` in `mypy/test/testtypes.py` (direct
+  seam calls per arm tag plus gate-off vs gate-on differential), plus
+  pure decision unit tests in `checker_functions.rs`.

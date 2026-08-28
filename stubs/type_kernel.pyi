@@ -243,6 +243,7 @@ __all__ = [
     "rust_classify_return_stmt_pre",
     "rust_classify_return_stmt_post",
     "rust_classify_simple_assignment",
+    "rust_classify_check_assignment",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_classify_find_isinstance_head",
@@ -1089,6 +1090,14 @@ def rust_classify_simple_assignment(
     inferred_is_argument: bool,
     simple_rvalue: bool,
 ) -> int | None: ...
+# Issue #1090: check_assignment decision front. Returns
+# (special_tag, branch_tag) or None.
+def rust_classify_check_assignment(
+    lvalue: Any,
+    lvalue_type: Any | None,
+    has_inferred: bool,
+    active_class: bool,
+) -> tuple[int, int] | None: ...
 # Issue #1049: check_boolean_op decision head. Returns
 # (map_tag, left_unreachable, right_unreachable, result_tag) or None.
 def rust_classify_check_boolean_op(

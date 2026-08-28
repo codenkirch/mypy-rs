@@ -335,6 +335,7 @@ try:
         rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
         rust_classify_all_supers_gate as _rust_classify_all_supers_gate,
+        rust_classify_check_assignment as _rust_classify_check_assignment,
         rust_classify_check_final as _rust_classify_check_final,
         rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_classvar_super as _rust_classify_classvar_super,
@@ -433,6 +434,7 @@ except ImportError:
     _rust_classify_classvar_super = None  # type: ignore[assignment]
     _rust_classify_all_supers_gate = None  # type: ignore[assignment]
     _rust_classify_check_final = None  # type: ignore[assignment]
+    _rust_classify_check_assignment = None  # type: ignore[assignment]
     _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
     _rust_classify_return_stmt_post = None  # type: ignore[assignment]
@@ -635,6 +637,19 @@ NATIVE_ISINSTANCE_HEAD_CALLABLE_TAIL = 9
 NATIVE_ISINSTANCE_HEAD_HASATTR_BAD_ARGS = 10
 NATIVE_ISINSTANCE_HEAD_HASATTR = 11
 NATIVE_ISINSTANCE_HEAD_TYPEGUARD = 12
+
+# Decision tags returned by `_rust_classify_check_assignment`; must match
+# `CA_SPECIAL_*` / `CA_BRANCH_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_CA_SPECIAL_NONE = 0
+NATIVE_CA_SPECIAL_SETATTR_SIG = 1
+NATIVE_CA_SPECIAL_SLOTS = 2
+NATIVE_CA_SPECIAL_MATCH_ARGS = 3
+NATIVE_CA_SPECIAL_POST_INIT = 4
+NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS = 5
+NATIVE_CA_BRANCH_NO_TYPE = 0
+NATIVE_CA_BRANCH_PARTIAL_NONE = 1
+NATIVE_CA_BRANCH_MEMBER = 2
+NATIVE_CA_BRANCH_SIMPLE = 3
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -4689,120 +4704,165 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         else:
             self.try_infer_partial_generic_type_from_assignment(lvalue, rvalue, "=")
             lvalue_type, index_lvalue, inferred = self.check_lvalue(lvalue, rvalue)
-            # If we're assigning to __getattr__ or similar methods, check that the signature is
-            # valid.
-            if isinstance(lvalue, NameExpr) and lvalue.node:
-                name = lvalue.node.name
-                if name in ("__setattr__", "__getattribute__", "__getattr__"):
-                    # If an explicit type is given, use that.
+
+            # Native type_kernel seam: classify the special-name front and
+            # the lvalue_type branch in Rust (checker_functions.rs); None
+            # falls through to the pure-Python classification below.
+            special: int | None = None
+            branch: int | None = None
+            if (
+                _CHECKER_HAS_TYPE_KERNEL
+                and _native_checker_active
+                and _rust_classify_check_assignment is not None
+            ):
+                try:
+                    tags = _rust_classify_check_assignment(
+                        lvalue,
+                        lvalue_type if lvalue_type else None,
+                        inferred is not None,
+                        self.scope.active_class() is not None,
+                    )
+                except (AssertionError, NotImplementedError, ValueError, TypeError):
+                    tags = None
+                if tags is not None:
+                    special, branch = tags
+            if special is None or branch is None:
+                # Pure-Python classification (gate off or seam deferral).
+                if special is None:
+                    if isinstance(lvalue, NameExpr) and lvalue.node:
+                        name = lvalue.node.name
+                        if name in ("__setattr__", "__getattribute__", "__getattr__"):
+                            special = NATIVE_CA_SPECIAL_SETATTR_SIG
+                        elif name == "__slots__" and self.scope.active_class() is not None:
+                            special = NATIVE_CA_SPECIAL_SLOTS
+                        elif name == "__match_args__" and inferred is not None:
+                            special = NATIVE_CA_SPECIAL_MATCH_ARGS
+                        elif name == "__post_init__":
+                            special = NATIVE_CA_SPECIAL_POST_INIT
+                    elif isinstance(lvalue, MemberExpr) and lvalue.name == "__match_args__":
+                        special = NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS
+                if branch is None:
                     if lvalue_type:
-                        signature = lvalue_type
-                    else:
-                        signature = self.expr_checker.accept(rvalue)
-                    if signature:
-                        if name == "__setattr__":
-                            self.check_setattr_method(signature, lvalue)
+                        if isinstance(lvalue_type, PartialType) and lvalue_type.type is None:
+                            branch = NATIVE_CA_BRANCH_PARTIAL_NONE
+                        elif isinstance(lvalue, MemberExpr) and lvalue.kind is None:
+                            branch = NATIVE_CA_BRANCH_MEMBER
                         else:
-                            self.check_getattr_method(signature, lvalue, name)
+                            branch = NATIVE_CA_BRANCH_SIMPLE
+                    else:
+                        branch = NATIVE_CA_BRANCH_NO_TYPE
 
-                if name == "__slots__" and self.scope.active_class() is not None:
-                    typ = lvalue_type or self.expr_checker.accept(rvalue)
-                    self.check_slots_definition(typ, lvalue)
-                if name == "__match_args__" and inferred is not None:
-                    typ = self.expr_checker.accept(rvalue)
-                    self.check_match_args(inferred, typ, lvalue)
-                if name == "__post_init__":
-                    active_class = self.scope.active_class()
-                    if active_class and dataclasses_plugin.is_processed_dataclass(active_class):
-                        self.fail(message_registry.DATACLASS_POST_INIT_MUST_BE_A_FUNCTION, rvalue)
-
-            if isinstance(lvalue, MemberExpr) and lvalue.name == "__match_args__":
+            if special == NATIVE_CA_SPECIAL_SETATTR_SIG:
+                # If we're assigning to __getattr__ or similar methods, check that the signature is
+                # valid. If an explicit type is given, use that.
+                name = lvalue.node.name  # type: ignore[attr-defined]
+                if lvalue_type:
+                    signature = lvalue_type
+                else:
+                    signature = self.expr_checker.accept(rvalue)
+                if signature:
+                    if name == "__setattr__":
+                        self.check_setattr_method(signature, lvalue)
+                    else:
+                        self.check_getattr_method(signature, lvalue, name)
+            elif special == NATIVE_CA_SPECIAL_SLOTS:
+                typ = lvalue_type or self.expr_checker.accept(rvalue)
+                self.check_slots_definition(typ, lvalue)
+            elif special == NATIVE_CA_SPECIAL_MATCH_ARGS:
+                typ = self.expr_checker.accept(rvalue)
+                self.check_match_args(inferred, typ, lvalue)  # type: ignore[arg-type]
+            elif special == NATIVE_CA_SPECIAL_POST_INIT:
+                active_class = self.scope.active_class()
+                if active_class and dataclasses_plugin.is_processed_dataclass(active_class):
+                    self.fail(message_registry.DATACLASS_POST_INIT_MUST_BE_A_FUNCTION, rvalue)
+            elif special == NATIVE_CA_SPECIAL_MEMBER_MATCH_ARGS:
                 self.fail(message_registry.CANNOT_MODIFY_MATCH_ARGS, lvalue)
 
-            if lvalue_type:
-                if isinstance(lvalue_type, PartialType) and lvalue_type.type is None:
-                    # Try to infer a proper type for a variable with a partial None type.
-                    rvalue_type = self.expr_checker.accept(rvalue)
-                    if isinstance(get_proper_type(rvalue_type), NoneType):
-                        # This doesn't actually provide any additional information -- multiple
-                        # None initializers preserve the partial None type.
-                        return
+            if branch == NATIVE_CA_BRANCH_PARTIAL_NONE:
+                # Try to infer a proper type for a variable with a partial None type.
+                rvalue_type = self.expr_checker.accept(rvalue)
+                if isinstance(get_proper_type(rvalue_type), NoneType):
+                    # This doesn't actually provide any additional information -- multiple
+                    # None initializers preserve the partial None type.
+                    return
 
-                    var = lvalue_type.var
-                    if is_valid_inferred_type(
-                        rvalue_type, self.options, is_lvalue_final=var.is_final
-                    ):
-                        partial_types = self.find_partial_types(var)
-                        if partial_types is not None:
-                            if not self.current_node_deferred:
-                                # Partial type can't be final, so strip any literal values.
-                                rvalue_type = remove_instance_last_known_values(rvalue_type)
-                                inferred_type = make_simplified_union([rvalue_type, NoneType()])
-                                self.set_inferred_type(var, lvalue, inferred_type)
-                            else:
-                                var.type = None
-                            del partial_types[var]
-                            lvalue_type = var.type
-                    else:
-                        # Try to infer a partial type.
-                        if not self.infer_partial_type(var, lvalue, rvalue_type):
-                            # If that also failed, give up and let the caller know that we
-                            # cannot read their mind. The definition site will be reported later.
-
-                            # Calling .put() directly because the newly inferred type is
-                            # not a subtype of None - we are not looking for narrowing
-                            fallback = self.inference_error_fallback_type(rvalue_type)
-                            self.binder.put(lvalue, fallback)
-                            # Same as self.set_inference_error_fallback_type but inlined
-                            # to avoid computing fallback twice.
-
-                            # We are replacing partial<None> now, so the variable type
-                            # should remain optional.
-                            self.set_inferred_type(var, lvalue, make_optional_type(fallback))
-                elif (
-                    isinstance(lvalue, MemberExpr) and lvalue.kind is None
-                ):  # Ignore member access to modules
-                    instance_type = self.expr_checker.accept(lvalue.expr)
-                    rvalue_type, lvalue_type, infer_lvalue_type = self.check_member_assignment(
-                        lvalue, instance_type, lvalue_type, rvalue, context=rvalue
-                    )
+                var = lvalue_type.var  # type: ignore[union-attr]
+                if is_valid_inferred_type(rvalue_type, self.options, is_lvalue_final=var.is_final):
+                    partial_types = self.find_partial_types(var)
+                    if partial_types is not None:
+                        if not self.current_node_deferred:
+                            # Partial type can't be final, so strip any literal values.
+                            rvalue_type = remove_instance_last_known_values(rvalue_type)
+                            inferred_type = make_simplified_union([rvalue_type, NoneType()])
+                            self.set_inferred_type(var, lvalue, inferred_type)
+                        else:
+                            var.type = None
+                        del partial_types[var]
+                        lvalue_type = var.type
                 else:
-                    # Hacky special case for assigning a literal None
-                    # to a variable defined in a previous if
-                    # branch. When we detect this, we'll go back and
+                    # Try to infer a partial type.
+                    if not self.infer_partial_type(var, lvalue, rvalue_type):
+                        # If that also failed, give up and let the caller know that we
+                        # cannot read their mind. The definition site will be reported later.
 
-                    # make the type optional. This is somewhat
-                    # unpleasant, and a generalization of this would
-                    # be an improvement!
-                    if (
-                        not self.options.allow_redefinition
-                        and is_literal_none(rvalue)
-                        and isinstance(lvalue, NameExpr)
-                        and lvalue.kind == LDEF
-                        and isinstance(lvalue.node, Var)
-                        and lvalue.node.type
-                        and lvalue.node in self.var_decl_frames
-                        and not isinstance(get_proper_type(lvalue_type), AnyType)
-                    ):
-                        decl_frame_map = self.var_decl_frames[lvalue.node]
-                        # Check if the nearest common ancestor frame for the definition site
-                        # and the current site is the enclosing frame of an if/elif/else block.
-                        has_if_ancestor = False
-                        for frame in reversed(self.binder.frames):
-                            if frame.id in decl_frame_map:
-                                has_if_ancestor = frame.conditional_frame
-                                break
-                        if has_if_ancestor:
-                            lvalue_type = make_optional_type(lvalue_type)
-                            self.set_inferred_type(lvalue.node, lvalue, lvalue_type)
+                        # Calling .put() directly because the newly inferred type is
+                        # not a subtype of None - we are not looking for narrowing
+                        fallback = self.inference_error_fallback_type(rvalue_type)
+                        self.binder.put(lvalue, fallback)
+                        # Same as self.set_inference_error_fallback_type but inlined
+                        # to avoid computing fallback twice.
 
-                    rvalue_type, lvalue_type = self.check_simple_assignment(
-                        lvalue_type, rvalue, context=rvalue, inferred=inferred, lvalue=lvalue
-                    )
-                    # The above call may update inferred variable type. Prevent further
-                    # inference.
-                    inferred = None
+                        # We are replacing partial<None> now, so the variable type
+                        # should remain optional.
+                        self.set_inferred_type(var, lvalue, make_optional_type(fallback))
+            elif branch == NATIVE_CA_BRANCH_MEMBER:
+                # Ignore member access to modules
+                instance_type = self.expr_checker.accept(lvalue.expr)  # type: ignore[attr-defined]
+                rvalue_type, lvalue_type, infer_lvalue_type = self.check_member_assignment(
+                    lvalue,  # type: ignore[arg-type]
+                    instance_type,
+                    lvalue_type,  # type: ignore[arg-type]
+                    rvalue,
+                    context=rvalue,
+                )
+            elif branch == NATIVE_CA_BRANCH_SIMPLE:
+                # Hacky special case for assigning a literal None
+                # to a variable defined in a previous if
+                # branch. When we detect this, we'll go back and
 
+                # make the type optional. This is somewhat
+                # unpleasant, and a generalization of this would
+                # be an improvement!
+                if (
+                    not self.options.allow_redefinition
+                    and is_literal_none(rvalue)
+                    and isinstance(lvalue, NameExpr)
+                    and lvalue.kind == LDEF
+                    and isinstance(lvalue.node, Var)
+                    and lvalue.node.type
+                    and lvalue.node in self.var_decl_frames
+                    and not isinstance(get_proper_type(lvalue_type), AnyType)
+                ):
+                    decl_frame_map = self.var_decl_frames[lvalue.node]
+                    # Check if the nearest common ancestor frame for the definition site
+                    # and the current site is the enclosing frame of an if/elif/else block.
+                    has_if_ancestor = False
+                    for frame in reversed(self.binder.frames):
+                        if frame.id in decl_frame_map:
+                            has_if_ancestor = frame.conditional_frame
+                            break
+                    if has_if_ancestor:
+                        lvalue_type = make_optional_type(lvalue_type)  # type: ignore[arg-type]
+                        self.set_inferred_type(lvalue.node, lvalue, lvalue_type)
+
+                rvalue_type, lvalue_type = self.check_simple_assignment(
+                    lvalue_type, rvalue, context=rvalue, inferred=inferred, lvalue=lvalue
+                )
+                # The above call may update inferred variable type. Prevent further
+                # inference.
+                inferred = None
+
+            if branch != NATIVE_CA_BRANCH_NO_TYPE:
                 # Special case: only non-abstract non-protocol classes can be assigned to
                 # variables with explicit type `Type[A]`, where A is protocol or abstract.
                 p_rvalue_type = get_proper_type(rvalue_type)
@@ -4846,7 +4906,6 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                 ):
                     # TODO: Can we use put() here?
                     self.binder.assign_type(lvalue, lvalue_type, lvalue_type)
-
             elif index_lvalue:
                 self.check_indexed_assignment(index_lvalue, rvalue, lvalue)
 
