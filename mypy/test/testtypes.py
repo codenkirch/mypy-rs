@@ -142,6 +142,7 @@ from mypy.types import (
     Instance,
     LiteralType,
     NoneType,
+    NormalizedCallableType,
     Overloaded,
     Parameters,
     ParamSpecFlavor,
@@ -21728,6 +21729,249 @@ class NativeAreParametersCompatibleSuite(Suite):
         left = self._parameters([self.fx.a], [ARG_POS], [None])
         right = self._parameters([self.fx.a, self.fx.b], [ARG_POS, ARG_OPT], [None, None])
         self._assert_overlap_par(left, right)
+
+    # --- standalone are_parameters_compatible shim (#1066) ---
+
+    def _callable(
+        self,
+        arg_types: list[Type],
+        arg_kinds: list[ArgKind],
+        arg_names: list[str | None] | None = None,
+        variables: list[TypeVarLikeType] | None = None,
+        is_ellipsis_args: bool = False,
+    ) -> NormalizedCallableType:
+        call = CallableType(
+            arg_types,
+            arg_kinds,
+            arg_names if arg_names is not None else [None] * len(arg_types),
+            self.fx.a,
+            self.fx.function,
+            variables=variables,
+            is_ellipsis_args=is_ellipsis_args,
+        )
+        return cast(NormalizedCallableType, call)
+
+    def _assert_standalone_par(
+        self,
+        left: NormalizedCallableType | Parameters,
+        right: NormalizedCallableType | Parameters,
+        is_compat: Callable[[Type, Type], bool],
+        **flags: bool,
+    ) -> None:
+        """Differential: standalone are_parameters_compatible, gate-on vs off."""
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+            are_parameters_compatible,
+        )
+
+        flags.setdefault("is_proper_subtype", False)
+
+        def run() -> bool:
+            return are_parameters_compatible(left, right, is_compat=is_compat, **flags)
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        python = run()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        native = run()
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def _standalone_seam(
+        self,
+        left: NormalizedCallableType | Parameters,
+        right: NormalizedCallableType | Parameters,
+        *,
+        is_proper_subtype: bool = False,
+        ignore_pos_arg_names: bool = False,
+        allow_partial_overlap: bool = False,
+        strict_concatenate_check: bool = False,
+        nested_proper_subtype: bool = False,
+    ) -> bool | None:
+        from mypy.subtypes import _serialize_type
+
+        return _type_kernel.rust_are_parameters_compatible(
+            _serialize_type(left),
+            _serialize_type(right),
+            is_proper_subtype,
+            ignore_pos_arg_names,
+            allow_partial_overlap,
+            strict_concatenate_check,
+            state.strict_optional,
+            nested_proper_subtype,
+            self.resolver,
+        )
+
+    def test_standalone_resolver_callback(self) -> None:
+        # Module-level is_compat callbacks (checker / constraints callers)
+        # engage the kernel; gate-on vs gate-off must agree.
+        left = self._callable([self.fx.a], [ARG_POS])
+        right = self._callable([self.fx.b], [ARG_POS])
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_arg_count_mismatch(self) -> None:
+        left = self._callable([self.fx.a], [ARG_POS])
+        right = self._callable([self.fx.a, self.fx.b], [ARG_POS, ARG_POS])
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_name_mismatch(self) -> None:
+        left = self._callable([self.fx.a], [ARG_POS], ["x"])
+        right = self._callable([self.fx.b], [ARG_POS], ["y"])
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_name_mismatch_ignored_visitor_callback(self) -> None:
+        # Module-level is_subtype builds a default SubtypeContext, so a
+        # non-default ignore_pos_arg_names defers; the visitor callback with
+        # the matching flag engages the kernel instead.
+        from mypy.subtypes import SubtypeContext, SubtypeVisitor
+
+        left = self._callable([self.fx.a], [ARG_POS], ["x"])
+        right = self._callable([self.fx.b], [ARG_POS], ["y"])
+        visitor = SubtypeVisitor(
+            right=right,
+            subtype_context=SubtypeContext(ignore_pos_arg_names=True),
+            proper_subtype=False,
+        )
+        self._assert_standalone_par(
+            left, right, visitor._is_subtype, ignore_pos_arg_names=True
+        )
+
+    def test_standalone_required_arity(self) -> None:
+        left = self._callable([self.fx.a], [ARG_POS])
+        right = self._callable([self.fx.a], [ARG_OPT])
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_partial_overlap(self) -> None:
+        left = self._callable([self.fx.a], [ARG_OPT])
+        right = self._callable([self.fx.a], [ARG_OPT])
+        self._assert_standalone_par(left, right, is_subtype, allow_partial_overlap=True)
+
+    def test_standalone_trivial_right_suffix(self) -> None:
+        # right = (B, *Any, **Any): only the non-star right arg is checked.
+        left = self._callable([self.fx.a, self.fx.a], [ARG_POS, ARG_POS])
+        right = self._callable(
+            [self.fx.b, self.fx.anyt, self.fx.anyt],
+            [ARG_POS, ARG_STAR, ARG_STAR2],
+        )
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_proper_subtype_flag(self) -> None:
+        left = self._callable([self.fx.anyt, self.fx.anyt], [ARG_STAR, ARG_STAR2])
+        right = self._callable([self.fx.b], [ARG_POS])
+        self._assert_standalone_par(left, right, is_proper_subtype, is_proper_subtype=True)
+
+    def test_standalone_tvar_deferral(self) -> None:
+        # Generic callables defer (needs unify_generic_callable); gate-on
+        # must fall through to the pure-Python body and agree.
+        left = self._callable([self.fx.t], [ARG_POS], variables=[self.fx.t])
+        right = self._callable([self.fx.a], [ARG_POS])
+        self._assert_standalone_par(left, right, is_subtype)
+
+    def test_standalone_foreign_callback_defers(self) -> None:
+        # A non-resolver compat callback (TypeChecker erasure predicates, a
+        # test stub) must defer: gate-on runs the same pure-Python body with
+        # the same is_compat call count.
+        from mypy.subtypes import (
+            _set_native_subtype_active,
+            _set_native_subtype_resolver,
+            are_parameters_compatible,
+        )
+
+        left = self._callable([self.fx.a], [ARG_POS])
+        right = self._callable([self.fx.b], [ARG_POS])
+
+        def run() -> tuple[bool, int]:
+            calls = 0
+
+            def stub_is_compat(l: Type, r: Type) -> bool:
+                nonlocal calls
+                calls += 1
+                return True
+
+            ret = are_parameters_compatible(
+                left, right, is_compat=stub_is_compat, is_proper_subtype=False
+            )
+            return ret, calls
+
+        _set_native_subtype_active(False)
+        _set_native_subtype_resolver(None)
+        python = run()
+        _set_native_subtype_active(True)
+        _set_native_subtype_resolver(self.resolver)
+        native = run()
+        assert_equal(native, python, f"native={native!r} python={python!r}")
+
+    def test_standalone_seam_direct_calls(self) -> None:
+        # Direct kernel calls over serialized callables: exact decisions.
+        # Arg comparison is contravariant (is_compat(right.typ, left.typ)).
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS]),
+                self._callable([self.fx.a, self.fx.b], [ARG_POS, ARG_POS]),
+            )
+            is False
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.b], [ARG_POS]),
+                self._callable([self.fx.a], [ARG_POS]),
+            )
+            is False
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS]),
+                self._callable([self.fx.b], [ARG_POS]),
+            )
+            is True
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS], ["x"]),
+                self._callable([self.fx.b], [ARG_POS], ["y"]),
+            )
+            is False
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS], ["x"]),
+                self._callable([self.fx.b], [ARG_POS], ["y"]),
+                ignore_pos_arg_names=True,
+            )
+            is True
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_OPT]),
+                self._callable([self.fx.a], [ARG_OPT]),
+                allow_partial_overlap=True,
+            )
+            is True
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS]),
+                self._callable([], [], is_ellipsis_args=True),
+            )
+            is True
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.a], [ARG_POS]),
+                self._callable(
+                    [self.fx.anyt, self.fx.anyt], [ARG_STAR, ARG_STAR2]
+                ),
+            )
+            is True
+        )
+        assert (
+            self._standalone_seam(
+                self._callable([self.fx.t], [ARG_POS], variables=[self.fx.t]),
+                self._callable([self.fx.a], [ARG_POS]),
+            )
+            is None
+        )
 
 
 class _FakeNode:

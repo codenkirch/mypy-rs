@@ -1013,3 +1013,189 @@ pub(crate) fn is_callable_compatible(
         strict_concatenate_check,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn any_type() -> Type {
+        Type::AnyType {
+            type_of_any: 0,
+            source_any: None,
+            missing_import_name: None,
+        }
+    }
+
+    fn class_type(name: &str) -> Type {
+        Type::Instance {
+            type_ref: format!("builtins.{name}"),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn compat_ok(l: &Type, r: &Type) -> Option<bool> {
+        let _ = (l, r);
+        Some(true)
+    }
+
+    #[test]
+    fn trivial_right_parameters_accept_any_left() {
+        // right = (*Any, **Any) stands in for Callable[..., Any]: a left with
+        // a required positional arg is compatible without touching is_compat.
+        let left_types = vec![class_type("int")];
+        let left_kinds = [ARG_POS];
+        let right_types = vec![any_type(), any_type()];
+        let right_kinds = [ARG_STAR, ARG_STAR2];
+        let names: Vec<Option<String>> = vec![None, None];
+        let ok = are_parameters_compatible(
+            &left_types,
+            &left_kinds,
+            &[],
+            false,
+            &right_types,
+            &right_kinds,
+            &names,
+            false,
+            false,
+            &compat_ok,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(ok, Some(true));
+    }
+
+    #[test]
+    fn trivial_right_parameters_off_under_proper_subtype() {
+        // With is_proper_subtype the trivial-right shortcut is off, and left
+        // has no match for right's star args.
+        let left_types = vec![class_type("int")];
+        let left_kinds = [ARG_POS];
+        let right_types = vec![any_type(), any_type()];
+        let right_kinds = [ARG_STAR, ARG_STAR2];
+        let names: Vec<Option<String>> = vec![None, None];
+        let left_names: Vec<Option<String>> = vec![None];
+        let ok = are_parameters_compatible(
+            &left_types,
+            &left_kinds,
+            &left_names,
+            false,
+            &right_types,
+            &right_kinds,
+            &names,
+            false,
+            false,
+            &compat_ok,
+            true,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(ok, Some(false));
+    }
+
+    #[test]
+    fn trivial_suffix_only_checks_non_star_args() {
+        // right = (int, *Any, **Any): the trivial suffix means only the
+        // non-star right arg must match; left's extra str arg is unchecked.
+        let left_types = vec![class_type("int"), class_type("str")];
+        let left_kinds = [ARG_POS, ARG_POS];
+        let right_types = vec![class_type("int"), any_type(), any_type()];
+        let right_kinds = [ARG_POS, ARG_STAR, ARG_STAR2];
+        let names: Vec<Option<String>> = vec![None, None, None];
+        let left_names: Vec<Option<String>> = vec![None, None];
+        let ok = are_parameters_compatible(
+            &left_types,
+            &left_kinds,
+            &left_names,
+            false,
+            &right_types,
+            &right_kinds,
+            &names,
+            false,
+            false,
+            &compat_ok,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(ok, Some(true));
+    }
+
+    #[test]
+    fn trivial_vararg_suffix_covers_star_pair_mismatch() {
+        // right = (*Any) with an all-positional left: (*Any) is a supertype
+        // of positional callables, so the star-pair mismatch is waived.
+        let left_types = vec![class_type("int")];
+        let left_kinds = [ARG_POS];
+        let right_types = vec![any_type()];
+        let right_kinds = [ARG_STAR];
+        let names: Vec<Option<String>> = vec![None];
+        let left_names: Vec<Option<String>> = vec![None];
+        let ok = are_parameters_compatible(
+            &left_types,
+            &left_kinds,
+            &left_names,
+            false,
+            &right_types,
+            &right_kinds,
+            &names,
+            false,
+            false,
+            &compat_ok,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(ok, Some(true));
+    }
+
+    #[test]
+    fn trivial_vararg_suffix_needs_positional_left() {
+        // The (*Any) waiver requires every left kind to be positional; a
+        // kw-only left arg falls through to the star-pair check and fails.
+        let left_types = vec![class_type("int")];
+        let left_kinds = [ARG_NAMED];
+        let left_names = vec![Some("x".to_string())];
+        let right_types = vec![any_type()];
+        let right_kinds = [ARG_STAR];
+        let right_names: Vec<Option<String>> = vec![None];
+        let ok = are_parameters_compatible(
+            &left_types,
+            &left_kinds,
+            &left_names,
+            false,
+            &right_types,
+            &right_kinds,
+            &right_names,
+            false,
+            false,
+            &compat_ok,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(ok, Some(false));
+    }
+
+    #[test]
+    fn trivial_helpers_reject_non_any_star() {
+        let int = class_type("int");
+        assert!(!are_trivial_parameters(
+            &[int.clone(), int.clone()],
+            &[ARG_STAR, ARG_STAR2]
+        ));
+        assert!(!is_trivial_suffix(&[int.clone()], &[ARG_STAR]));
+        assert!(!is_trivial_suffix(&[], &[]));
+        assert!(is_trivial_suffix(
+            &[int.clone(), any_type(), any_type()],
+            &[ARG_POS, ARG_STAR, ARG_STAR2]
+        ));
+    }
+}
