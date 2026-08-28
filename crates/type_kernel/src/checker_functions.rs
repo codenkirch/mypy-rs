@@ -209,6 +209,175 @@ pub(crate) fn rust_classify_classvar_super(
     )))
 }
 
+/// Decision tags for `check_compatibility_all_supers`; must match
+/// `NATIVE_ALL_SUPERS_*` in mypy/checker.py.
+const ALL_SUPERS_GATE_SKIP: i64 = 0;
+const ALL_SUPERS_GATE_PROCEED: i64 = 1;
+const ALL_SUPERS_BASE_SKIP: i64 = 0;
+const ALL_SUPERS_BASE_RUN: i64 = 1;
+
+/// The pure entry-gate conjunction of
+/// `TypeChecker.check_compatibility_all_supers` (checker.py:4915-4925):
+/// the lvalue node is a `Var` whose declaration line matches the assignment
+/// (or the var is inferred without an explicit self annotation), the
+/// lvalue's symbol kind is MDEF or None, and the var's class has at least
+/// one base. Kept separate from the PyO3 entry so the branch algebra is
+/// unit-testable without a Python runtime.
+fn classify_all_supers_gate(
+    is_var: bool,
+    line_matches: bool,
+    is_inferred: bool,
+    explicit_self_type: bool,
+    kind_ok: bool,
+    has_bases: bool,
+) -> i64 {
+    if !is_var {
+        return ALL_SUPERS_GATE_SKIP;
+    }
+    if !(line_matches || (is_inferred && !explicit_self_type)) {
+        return ALL_SUPERS_GATE_SKIP;
+    }
+    if !kind_ok {
+        return ALL_SUPERS_GATE_SKIP;
+    }
+    if !has_bases {
+        return ALL_SUPERS_GATE_SKIP;
+    }
+    ALL_SUPERS_GATE_PROCEED
+}
+
+/// The per-base skip decision of the MRO loop tail
+/// (checker.py:4992-4999): a base is skipped when the var allows
+/// incompatible overrides (except `__slots__` against `builtins.object`)
+/// or when the name is private. Mirrors the ported `mypy.checker.is_private`
+/// predicate via the shared `is_private` helper.
+fn classify_all_supers_base(
+    allow_incompatible_override: bool,
+    name_is_slots: bool,
+    base_fullname_is_object: bool,
+    name_is_private: bool,
+) -> i64 {
+    if allow_incompatible_override && !(name_is_slots && base_fullname_is_object) {
+        return ALL_SUPERS_BASE_SKIP;
+    }
+    if name_is_private {
+        return ALL_SUPERS_BASE_SKIP;
+    }
+    ALL_SUPERS_BASE_RUN
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_compatibility_all_supers`
+/// (mypy/checker.py:4915-5008). Single-call classifier head per the
+/// HANDOFF-perf606 wire-toll note: one PyO3 walk over the live
+/// `lvalue.node` decides the entry gate and the per-base skip list for the
+/// MRO loop tail. The per-base `check_compatibility_super` bodies (message
+/// emission, is_writable_attribute), the `node_type_from_base` lookups, and
+/// the inferred-var type stash/restore stay in Python. Returns `None` to
+/// defer on an unreadable live-object attribute.
+#[pyfunction]
+#[pyo3(signature = (lvalue_node, lvalue_line, lvalue_kind, mdef))]
+pub(crate) fn rust_classify_all_supers_gate(
+    py: Python<'_>,
+    lvalue_node: &PyAny,
+    lvalue_line: i64,
+    lvalue_kind: Option<i64>,
+    mdef: i64,
+) -> PyResult<Option<(i64, Vec<i64>)>> {
+    let var_cls = nodes_class(py, "Var")?;
+    let is_var = lvalue_node.is_instance(var_cls)?;
+
+    // checker.py:4917 reads the Var-only attributes after the isinstance
+    // gate, so a non-Var node (including None) never reaches those reads.
+    if !is_var {
+        return Ok(Some((ALL_SUPERS_GATE_SKIP, Vec::new())));
+    }
+
+    let node_line = match lvalue_node.getattr("line")?.extract::<i64>() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let is_inferred = match read_bool_attr(lvalue_node, "is_inferred")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let explicit_self_type = match read_bool_attr(lvalue_node, "explicit_self_type")? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    // checker.py:4923: `lvalue.kind in (MDEF, None)`; None for Vars
+    // defined via self.
+    let kind_ok = match lvalue_kind {
+        None => true,
+        Some(k) => k == mdef,
+    };
+
+    let info = match lvalue_node.getattr("info") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let bases = match info.getattr("bases") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let bases_len = match bases.len() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let gate = classify_all_supers_gate(
+        is_var,
+        node_line == lvalue_line,
+        is_inferred,
+        explicit_self_type,
+        kind_ok,
+        bases_len > 0,
+    );
+    if gate == ALL_SUPERS_GATE_SKIP {
+        return Ok(Some((ALL_SUPERS_GATE_SKIP, Vec::new())));
+    }
+
+    let name = match lvalue_node.getattr("name")?.extract::<String>() {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let allow_incompatible_override =
+        match read_bool_attr(lvalue_node, "allow_incompatible_override")? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+    let name_is_private = is_private(&name);
+    let name_is_slots = name == "__slots__";
+
+    let mro = match info.getattr("mro") {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let mro_len = match mro.len() {
+        Ok(n) => n,
+        Err(_) => return Ok(None),
+    };
+    let mut base_tags = Vec::new();
+    for i in 1..mro_len {
+        let base = match mro.get_item(i) {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let base_fullname_is_object = match base.getattr("fullname") {
+            Ok(v) => match v.extract::<String>() {
+                Ok(f) => f == "builtins.object",
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        };
+        base_tags.push(classify_all_supers_base(
+            allow_incompatible_override,
+            name_is_slots,
+            base_fullname_is_object,
+            name_is_private,
+        ));
+    }
+    Ok(Some((ALL_SUPERS_GATE_PROCEED, base_tags)))
+}
+
 /// Decision tags for `check___new___signature`; must match
 /// `NATIVE_NEW_SIGNATURE_*` in mypy/checker.py.
 const NEW_SIGNATURE_METACLASS: i64 = 0;
@@ -4650,6 +4819,115 @@ mod classify_simple_assignment_tests {
         assert_eq!(
             classify_simple_assignment(Some(&alias), false, false, true, false, false),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod all_supers_gate_tests {
+    use super::*;
+
+    #[test]
+    fn test_gate_not_var_skips() {
+        assert_eq!(
+            classify_all_supers_gate(false, true, true, false, true, true),
+            ALL_SUPERS_GATE_SKIP
+        );
+        assert_eq!(
+            classify_all_supers_gate(false, false, false, false, false, false),
+            ALL_SUPERS_GATE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_gate_line_match_or_inferred() {
+        // Line equality alone proceeds; inferred without explicit self
+        // annotation also proceeds even when lines differ.
+        assert_eq!(
+            classify_all_supers_gate(true, true, false, true, true, true),
+            ALL_SUPERS_GATE_PROCEED
+        );
+        assert_eq!(
+            classify_all_supers_gate(true, false, true, false, true, true),
+            ALL_SUPERS_GATE_PROCEED
+        );
+    }
+
+    #[test]
+    fn test_gate_inferred_with_explicit_self_type_skips() {
+        // is_inferred and not explicit_self_type; an explicit self
+        // annotation breaks the conjunction when lines differ.
+        assert_eq!(
+            classify_all_supers_gate(true, false, true, true, true, true),
+            ALL_SUPERS_GATE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_gate_not_inferred_and_lines_differ_skips() {
+        assert_eq!(
+            classify_all_supers_gate(true, false, false, false, true, true),
+            ALL_SUPERS_GATE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_gate_kind_mdef_or_none() {
+        // kind in (MDEF, None); any other kind skips.
+        assert_eq!(
+            classify_all_supers_gate(true, true, false, false, true, true),
+            ALL_SUPERS_GATE_PROCEED
+        );
+        assert_eq!(
+            classify_all_supers_gate(true, true, false, false, false, true),
+            ALL_SUPERS_GATE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_gate_no_bases_skips() {
+        assert_eq!(
+            classify_all_supers_gate(true, true, false, false, true, false),
+            ALL_SUPERS_GATE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_base_run() {
+        assert_eq!(
+            classify_all_supers_base(false, false, false, false),
+            ALL_SUPERS_BASE_RUN
+        );
+    }
+
+    #[test]
+    fn test_base_allow_incompatible_override_skips() {
+        assert_eq!(
+            classify_all_supers_base(true, false, false, false),
+            ALL_SUPERS_BASE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_base_slots_against_object_passes() {
+        // __slots__ against builtins.object is still checked even when
+        // allow_incompatible_override is set.
+        assert_eq!(
+            classify_all_supers_base(true, true, true, false),
+            ALL_SUPERS_BASE_RUN
+        );
+        // __slots__ against any other base still skips.
+        assert_eq!(
+            classify_all_supers_base(true, true, false, false),
+            ALL_SUPERS_BASE_SKIP
+        );
+    }
+
+    #[test]
+    fn test_base_private_name_skips() {
+        assert_eq!(
+            classify_all_supers_base(false, false, false, true),
+            ALL_SUPERS_BASE_SKIP
         );
     }
 }
