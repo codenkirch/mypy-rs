@@ -2793,7 +2793,12 @@ fn live_bool(obj: &PyAny, attr: &str) -> Option<bool> {
 /// Read the `Var` scalars the decision core consumes. Any unreadable
 /// attribute (including a `FakeInfo` `info`, whose `__getattribute__`
 /// raises) defers, mirroring `rust_is_instance_var`'s deferral story.
-fn gather_analyze_var_facts(py: Python<'_>, var: &PyAny, name: &str) -> Option<AnalyzeVarFacts> {
+fn gather_analyze_var_facts(
+    py: Python<'_>,
+    var: &PyAny,
+    name: &str,
+    is_lvalue: bool,
+) -> Option<AnalyzeVarFacts> {
     let info = var.getattr("info").ok()?;
     let info_fullname: String = info.getattr("fullname").ok()?.extract().ok()?;
     let is_settable_property = live_bool(var, "is_settable_property")?;
@@ -2815,13 +2820,19 @@ fn gather_analyze_var_facts(py: Python<'_>, var: &PyAny, name: &str) -> Option<A
     let var_type_is_partial = var_type_present && var_type.is_instance(partial_cls).ok()?;
     let is_instance_var = is_instance_var_inner(var).ok();
     let is_enum = live_bool(info, "is_enum")?;
-    let enum_has_name = info
-        .getattr("enum_members")
-        .ok()?
-        .call_method1("__contains__", (name,))
-        .ok()?
-        .extract::<bool>()
-        .ok()?;
+    // Python short-circuits `var.info.is_enum and not mx.is_lvalue` before
+    // touching `enum_members` (checkmember.py:1704); the property rebuilds
+    // the member list from scratch, so mirror the guard exactly.
+    let enum_has_name = if is_enum && !is_lvalue {
+        info.getattr("enum_members")
+            .ok()?
+            .call_method1("__contains__", (name,))
+            .ok()?
+            .extract::<bool>()
+            .ok()?
+    } else {
+        false
+    };
     Some(AnalyzeVarFacts {
         is_settable_property,
         setter_type_present,
@@ -2935,7 +2946,7 @@ pub(crate) fn rust_classify_analyze_var(
         Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
         _ => return Ok(None),
     };
-    let facts = match gather_analyze_var_facts(py, var, name) {
+    let facts = match gather_analyze_var_facts(py, var, name, is_lvalue) {
         Some(f) => f,
         None => return Ok(None),
     };
