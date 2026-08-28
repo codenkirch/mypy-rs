@@ -31381,6 +31381,324 @@ class NativeIsInstanceVarSuite(Suite):
 
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAnalyzeVarSuite(Suite):
+    """Parity tests for `rust_classify_analyze_var` (mypy.checkmember.analyze_var).
+
+    `analyze_var`'s decision head (checkmember.py:1771) reduces to a
+    single outcome tag: SETTER / GETTER / PARTIAL / NOT_READY /
+    ENUM_LITERAL / UNBOUND_ANY. Rust reads the live Var scalars via PyO3
+    (settable-property flag, setter/getter type None-ness + PartialType
+    kind, is_ready, is_initialized_in_class, is_instance_var,
+    info.fullname, info.is_enum, info.enum_members) and gates on the
+    resolver handling the receiver's map_instance_to_supertype. Python
+    applies the tagged branch's side effects in `_apply_analyze_var_tag`;
+    a None tag (fake info, undecodable wire, snapshot miss) falls back
+    to the pure-Python body.
+
+    Direct seam calls assert the exact tag per branch; the gate-off vs
+    gate-on differential drives the real `analyze_var` through a mock
+    checker and asserts identical results and recorded side effects.
+    """
+
+    _UNSET: object = object()
+
+    def setUp(self) -> None:
+        from mypy.checkmember import (
+            _set_native_checkmember_active,
+            _set_native_checkmember_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active = _set_native_checkmember_active
+        self._set_resolver = _set_native_checkmember_resolver
+        self._set_active(True)
+        self.info = self._typeinfo("mod.A")
+        self.enum_info = self._typeinfo("mod.E")
+        self.enum_info.is_enum = True
+        self._live_map = {"mod.A": self.info, "mod.E": self.enum_info}
+        self.resolver = _type_kernel.build_native_resolver(list(self._live_map.values()), [])
+        self.resolver.set_live_typeinfo_map(dict(self._live_map))
+        set_wire_typeinfo_map(dict(self._live_map))
+        self._set_resolver(self.resolver)
+
+    def tearDown(self) -> None:
+        self._set_resolver(None)
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _make_var(
+        self,
+        name: str = "x",
+        *,
+        typ: Any = _UNSET,
+        setter_type: CallableType | None = None,
+        is_ready: bool = True,
+        is_property: bool = False,
+        is_settable_property: bool = False,
+        is_initialized_in_class: bool = False,
+        has_explicit_value: bool = False,
+        info: TypeInfo | None = None,
+    ) -> Var:
+        var = Var(name)
+        if typ is not self._UNSET:
+            var.type = typ
+        if info is None:
+            info = self.info
+        var.info = info
+        var.is_ready = is_ready
+        var.setter_type = setter_type
+        var.is_property = is_property
+        var.is_settable_property = is_settable_property
+        var.is_initialized_in_class = is_initialized_in_class
+        var.has_explicit_value = has_explicit_value
+        info.names[name] = SymbolTableNode(MDEF, var)
+        return var
+
+    def _seam(
+        self,
+        var: Var,
+        itype: Instance,
+        *,
+        is_lvalue: bool = False,
+        no_deferral: bool = False,
+        is_operator: bool = False,
+        resolver: Any = _UNSET,
+    ) -> int | None:
+        from mypy.checkmember import _serialize_type_for_checkmember
+
+        return _type_kernel.rust_classify_analyze_var(
+            var.name,
+            var,
+            _serialize_type_for_checkmember(itype),
+            is_lvalue,
+            no_deferral,
+            is_operator,
+            self.resolver if resolver is self._UNSET else resolver,
+        )
+
+    def _mx_and_calls(self, itype: Instance, is_lvalue: bool = False) -> tuple[Any, list[tuple[Any, ...]]]:
+        from types import SimpleNamespace
+
+        from mypy.checkmember import MemberContext
+
+        calls: list[tuple[Any, ...]] = []
+        msg = SimpleNamespace(
+            read_only_property=lambda *a: calls.append(("read_only_property",)),
+            cant_assign_to_classvar=lambda *a: calls.append(("cant_assign_to_classvar",)),
+            cant_assign_to_method=lambda *a: calls.append(("cant_assign_to_method",)),
+        )
+
+        def _partial(typ: object, lv: bool, var: Var, ctx: object) -> Any:
+            calls.append(("partial", str(typ)))
+            return AnyType(TypeOfAny.special_form)
+
+        chk = SimpleNamespace(
+            msg=msg,
+            plugin=SimpleNamespace(get_attribute_hook=lambda fullname: None),
+            handle_cannot_determine_type=lambda name, ctx: calls.append(("not_ready", name)),
+            handle_partial_var_type=_partial,
+        )
+        mx = MemberContext(
+            is_lvalue=is_lvalue,
+            is_super=False,
+            is_operator=False,
+            original_type=itype,
+            context=NameExpr("A"),
+            chk=cast(Any, chk),
+        )
+        return mx, calls
+
+    def _assert_differential(
+        self,
+        name: str,
+        var: Var,
+        itype: Instance,
+        *,
+        is_lvalue: bool = False,
+    ) -> None:
+        from mypy.checkmember import analyze_var
+
+        def run() -> tuple[str, list[tuple[Any, ...]]]:
+            mx, calls = self._mx_and_calls(itype, is_lvalue)
+            result = analyze_var(name, var, itype, mx)
+            return str(result), calls
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert off == on, f"gate mismatch: off={off!r} on={on!r}"
+
+    # --- direct seam tag tests ---
+
+    def test_seam_getter_plain(self) -> None:
+        var = self._make_var("x", typ=Instance(self.info, []))
+        assert self._seam(var, Instance(self.info, [])) == 1
+        assert self._seam(var, Instance(self.info, []), is_lvalue=True) == 1
+
+    def test_seam_setter_lvalue(self) -> None:
+        setter = CallableType(
+            [], [], [], AnyType(TypeOfAny.special_form), Instance(self.info, [])
+        )
+        var = self._make_var(
+            "prop",
+            typ=Instance(self.info, []),
+            setter_type=setter,
+            is_settable_property=True,
+        )
+        assert self._seam(var, Instance(self.info, []), is_lvalue=True) == 0
+        assert self._seam(var, Instance(self.info, []), is_lvalue=False) == 1
+
+    def test_seam_setter_falls_back_to_getter_type(self) -> None:
+        # A settable property read as an lvalue with no setter type and
+        # a ready var falls back to var.type: the tag is still SETTER
+        # (the setter path was taken; the typ fallback is the shim's job).
+        var = self._make_var("x", typ=Instance(self.info, []), is_settable_property=True)
+        assert self._seam(var, Instance(self.info, []), is_lvalue=True) == 0
+
+    def test_seam_partial(self) -> None:
+        from mypy.types import PartialType
+
+        inner = Var("x")
+        var = self._make_var("x", typ=PartialType(None, inner))
+        assert self._seam(var, Instance(self.info, [])) == 2
+
+    def test_seam_partial_beats_enum(self) -> None:
+        from mypy.types import PartialType
+
+        inner = Var("RED")
+        var = Var("RED", PartialType(None, inner))
+        var.info = self.enum_info
+        var.is_ready = True
+        var.has_explicit_value = True
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
+        assert self._seam(var, Instance(self.enum_info, [])) == 2
+
+    def test_seam_not_ready(self) -> None:
+        var = self._make_var("x", typ=None, is_ready=False)
+        assert self._seam(var, Instance(self.info, [])) == 3
+        assert self._seam(var, Instance(self.info, []), no_deferral=True) == 5
+
+    def test_seam_unbound_any_ready_no_type(self) -> None:
+        var = self._make_var("x", typ=None, is_ready=True)
+        assert self._seam(var, Instance(self.info, [])) == 5
+
+    def test_seam_enum_literal(self) -> None:
+        var = Var("RED", Instance(self.enum_info, []))
+        var.info = self.enum_info
+        var.is_ready = True
+        var.has_explicit_value = True
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
+        assert self._seam(var, Instance(self.enum_info, []), is_lvalue=False) == 4
+        # An lvalue enum access keeps the getter path (the literal arm
+        # discards the head result, which the lvalue body computed).
+        assert self._seam(var, Instance(self.enum_info, []), is_lvalue=True) == 1
+
+    def test_seam_enum_name_value_excluded(self) -> None:
+        for name in ("name", "value"):
+            var = Var(name, Instance(self.enum_info, []))
+            var.info = self.enum_info
+            var.is_ready = True
+            var.has_explicit_value = True
+            self.enum_info.names[name] = SymbolTableNode(MDEF, var)
+            assert self._seam(var, Instance(self.enum_info, []), is_lvalue=False) == 1
+
+    def test_seam_not_ready_beats_enum(self) -> None:
+        # The not-ready callback is a head-body side effect, so an
+        # unready enum member must not collapse into ENUM_LITERAL.
+        var = Var("RED")
+        var.info = self.enum_info
+        var.is_ready = False
+        var.has_explicit_value = True
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
+        assert self._seam(var, Instance(self.enum_info, [])) == 3
+
+    def test_seam_defers_on_snapshot_miss(self) -> None:
+        var = self._make_var("x", typ=Instance(self.info, []))
+        empty_resolver = _type_kernel.build_native_resolver([], [])
+        assert self._seam(var, Instance(self.info, []), resolver=empty_resolver) is None
+
+    def test_seam_defers_on_fake_info(self) -> None:
+        var = Var("x")
+        assert self._seam(var, Instance(self.info, [])) is None
+
+    # --- gate-off vs gate-on differentials through real analyze_var ---
+
+    def test_differential_getter(self) -> None:
+        var = self._make_var("x", typ=Instance(self.info, []))
+        self._assert_differential("x", var, Instance(self.info, []))
+
+    def test_differential_read_only_property_lvalue(self) -> None:
+        var = self._make_var("x", typ=Instance(self.info, []), is_property=True)
+        self._assert_differential("x", var, Instance(self.info, []), is_lvalue=True)
+
+    def test_differential_setter_lvalue(self) -> None:
+        setter = CallableType(
+            [], [], [], AnyType(TypeOfAny.special_form), Instance(self.info, [])
+        )
+        var = self._make_var(
+            "x",
+            typ=Instance(self.info, []),
+            setter_type=setter,
+            is_settable_property=True,
+        )
+        self._assert_differential("x", var, Instance(self.info, []), is_lvalue=True)
+
+    def test_differential_partial(self) -> None:
+        from mypy.types import PartialType
+
+        inner = Var("x")
+        var = Var("x", PartialType(None, inner))
+        var.info = self.info
+        var.is_ready = True
+        self.info.names["x"] = SymbolTableNode(MDEF, var)
+        self._assert_differential("x", var, Instance(self.info, []))
+
+    def test_differential_not_ready(self) -> None:
+        var = self._make_var("x", typ=None, is_ready=False)
+        self._assert_differential("x", var, Instance(self.info, []))
+
+    def test_differential_unbound_any(self) -> None:
+        var = self._make_var("x", typ=None, is_ready=True)
+        self._assert_differential("x", var, Instance(self.info, []))
+
+    def test_differential_enum_literal(self) -> None:
+        var = Var("RED", Instance(self.enum_info, []))
+        var.info = self.enum_info
+        var.is_ready = True
+        var.has_explicit_value = True
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
+        self._assert_differential("RED", var, Instance(self.enum_info, []))
+
+    def test_differential_enum_member_bind_tail_engages(self) -> None:
+        # Real enum members are class-body assignments: is_inferred=True
+        # (so is_instance_var is False) and is_initialized_in_class=True.
+        # Rust returns GETTER; the enum-literal wrap happens in the tail.
+        var = Var("RED", Instance(self.enum_info, []))
+        var.info = self.enum_info
+        var.is_ready = True
+        var.is_inferred = True
+        var.is_initialized_in_class = True
+        var.has_explicit_value = True
+        self.enum_info.names["RED"] = SymbolTableNode(MDEF, var)
+        self._assert_differential("RED", var, Instance(self.enum_info, []))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeIsDisjointBaseSuite(Suite):
     """Parity tests for `rust_is_disjoint_base` (mypy.typeops._is_disjoint_base).
 
