@@ -77,6 +77,26 @@ jobs:
           echo "SCRATCH=$SCRATCH" >> "$GITHUB_ENV"
           echo "EXT_SUFFIX=$EXT_SUFFIX" >> "$GITHUB_ENV"
 
+      - name: Build ast_serialize + module_resolver extensions
+        # Self-check (num_workers=4) forces native_parser/native_resolver
+        # on, so those extensions must be importable for the local gate to
+        # be reproduced.
+        run: |
+          for crate in mypy-ast-serialize mypy-module-resolver; do
+            cargo rustc -p "$crate" --features extension-module \
+              --lib --crate-type cdylib --release
+            NAME="${crate#mypy-}"
+            NAME="${NAME//-/_}"
+            EXT_SUFFIX=$(uv run python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+            cp "target/release/lib${NAME}.so" "$SCRATCH/${NAME}${EXT_SUFFIX}" 2>/dev/null || cp "target/release/lib${NAME}.dylib" "$SCRATCH/${NAME}${EXT_SUFFIX}"
+          done
+
+      - name: Self-check (mypy_self_check.ini)
+        env:
+          PYTHONPATH: ${{ env.SCRATCH }}
+          TEST_NATIVE_TYPE_KERNEL: "1"
+        run: uv run python -m mypy --config-file mypy_self_check.ini -p mypy -p mypyc
+
       - name: Python parity (NativeTypeWire + Resolver suites)
         env:
           PYTHONPATH: ${{ env.SCRATCH }}
