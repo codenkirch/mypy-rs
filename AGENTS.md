@@ -1956,3 +1956,23 @@ directly to `main`.
   Covered by `NativeArgVarianceWalkSuite` in `mypy/test/testtypes.py`
   (gate-off vs gate-on differentials for covariant/contravariant/
   invariant, ParamSpec same-ref/differing-args, NOT_READY defer proof).
+
+- `rust_get_protocol_member` miss path (issue #1099) — extends
+  `get_protocol_member_inner` (checker_helpers.rs) with
+  `member_miss_decision`, the find_member missing-attribute front of
+  `mypy.subtypes.find_member` / `find_member_simple`
+  (subtypes.py:2072-2089): the `__getattribute__` / `__getattr__`
+  accessor scan (`get_method_definer` mirrors `TypeInfo.get_method`,
+  including the `{name}-redefinition` keys), the `fallback_to_any` ->
+  `AnyType(TypeOfAny.special_form)` arm, and the plain miss ->
+  `NoneVal`; a non-object accessor defers. `mro_get` /
+  `mro_has` look up with `names.get(name)` semantics (a dict subscript
+  raises `KeyError` on the first MRO base lacking the name and would
+  truncate the walk, flipping base-defined members into wrong misses).
+  Consumed both by the Python shim (`get_protocol_member`) and the
+  Rust `is_protocol_implementation` member loop (`protocols.rs`).
+  Gated by `_native_subtype_active` + `_native_subtype_resolver`
+  (existing wiring) and covered by `NativeProtocolMemberMissSuite` in
+  `mypy/test/testtypes.py` (gate-off vs gate-on differential plus
+  direct seam calls for the miss / accessor / fallback arms and the
+  loop-level pre-check regression).
