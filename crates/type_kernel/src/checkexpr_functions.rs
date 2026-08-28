@@ -7594,3 +7594,133 @@ mod classify_check_boolean_op_tests {
         assert!(r.is_none());
     }
 }
+
+// ---------------------------------------------------------------------------
+// compute_arg_context_indices
+// ---------------------------------------------------------------------------
+
+/// Pure index-decision core of `infer_arg_types_in_context` (issue #1064):
+/// maps each actual-arg index to its formal index (`-1` = no context), skips
+/// star args, later formals win. Returns `None` on malformed input.
+pub(crate) fn compute_arg_context_indices_inner(
+    arg_kinds: &[i64],
+    formal_to_actual: &[Vec<i64>],
+    args_len: i64,
+    callee_arg_types_len: i64,
+) -> Option<Vec<i64>> {
+    if args_len < 0 || callee_arg_types_len < 0 {
+        return None;
+    }
+    if arg_kinds.len() as i64 != args_len {
+        return None;
+    }
+    let n_args = args_len as usize;
+    let formal_len = callee_arg_types_len as usize;
+    let mut out = vec![-1i64; n_args];
+    for (fi, actuals) in formal_to_actual.iter().enumerate() {
+        if fi >= formal_len {
+            return None;
+        }
+        for &ai in actuals {
+            if ai < 0 {
+                return None;
+            }
+            let ai = ai as usize;
+            if ai >= n_args {
+                return None;
+            }
+            let kind = arg_kinds[ai];
+            if kind == ARG_STAR || kind == ARG_STAR2 {
+                continue;
+            }
+            out[ai] = fi as i64;
+        }
+    }
+    Some(out)
+}
+
+/// Python seam: see `compute_arg_context_indices_inner`. Args arrive as
+/// plain scalars (`arg_kinds` as the integer `ArgKind.value`s), so no wire
+/// serializer is involved. Never defers on well-formed input.
+#[pyfunction]
+#[pyo3(signature = (arg_kinds, formal_to_actual, args_len, callee_arg_types_len))]
+pub(crate) fn rust_compute_arg_context_indices(
+    arg_kinds: Vec<i64>,
+    formal_to_actual: Vec<Vec<i64>>,
+    args_len: i64,
+    callee_arg_types_len: i64,
+) -> PyResult<Option<Vec<i64>>> {
+    Ok(compute_arg_context_indices_inner(
+        &arg_kinds,
+        &formal_to_actual,
+        args_len,
+        callee_arg_types_len,
+    ))
+}
+
+#[cfg(test)]
+mod compute_arg_context_indices_tests {
+    use super::compute_arg_context_indices_inner;
+
+    #[test]
+    fn positional_one_to_one() {
+        let out = compute_arg_context_indices_inner(&[0, 0], &[vec![0], vec![1]], 2, 2);
+        assert_eq!(out, Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn star_args_skipped() {
+        // ARG_STAR (2) and ARG_STAR2 (4) actuals get no context.
+        let out = compute_arg_context_indices_inner(&[0, 2, 4, 0], &[vec![0, 1, 2, 3]], 4, 1);
+        assert_eq!(out, Some(vec![0, -1, -1, 0]));
+    }
+
+    #[test]
+    fn empty_formal_to_actual() {
+        let out = compute_arg_context_indices_inner(&[0, 0], &[], 2, 3);
+        assert_eq!(out, Some(vec![-1, -1]));
+    }
+
+    #[test]
+    fn no_context_tail() {
+        // Actuals not covered by any formal stay -1.
+        let out = compute_arg_context_indices_inner(&[0, 0, 0], &[vec![1]], 3, 1);
+        assert_eq!(out, Some(vec![-1, 0, -1]));
+    }
+
+    #[test]
+    fn later_formal_wins() {
+        // Python assigns in formal order, so a later formal overwrites.
+        let out = compute_arg_context_indices_inner(&[0, 0], &[vec![0], vec![0]], 2, 2);
+        assert_eq!(out, Some(vec![1, -1]));
+    }
+
+    #[test]
+    fn actual_index_out_of_bounds_defers() {
+        let out = compute_arg_context_indices_inner(&[0, 0], &[vec![2]], 2, 1);
+        assert_eq!(out, None);
+        let out = compute_arg_context_indices_inner(&[0, 0], &[vec![-1]], 2, 1);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn formal_index_out_of_bounds_defers() {
+        // formal_to_actual longer than callee.arg_types -> malformed.
+        let out = compute_arg_context_indices_inner(&[0, 0], &[vec![0], vec![1]], 2, 1);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn kinds_len_mismatch_defers() {
+        let out = compute_arg_context_indices_inner(&[0], &[vec![0]], 2, 1);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn negative_lengths_defer() {
+        let out = compute_arg_context_indices_inner(&[0], &[vec![0]], -1, 1);
+        assert_eq!(out, None);
+        let out = compute_arg_context_indices_inner(&[0], &[vec![0]], 1, -1);
+        assert_eq!(out, None);
+    }
+}

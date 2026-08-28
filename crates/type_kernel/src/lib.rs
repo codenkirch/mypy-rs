@@ -615,6 +615,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkexpr_functions::rust_classify_super_arg_types,
         module
     )?)?;
+    // Issue #1064: infer_arg_types_in_context index decision. Rust returns
+    // the formal-index-per-actual map (star args skipped); the accept
+    // recursion and the infer_unions toggle stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checkexpr_functions::rust_compute_arg_context_indices,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkexpr_functions::rust_classify_visit_op_expr,
         module
