@@ -1532,6 +1532,26 @@ directly to `main`.
   `NativeMissingAnnotationsSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus 12 pure decision
   unit tests in `checker_functions.rs`.
+- `rust_classify_simple_assignment` (issue #1055, mypy.checker) — mirrors
+  the decision head of `TypeChecker.check_simple_assignment`
+  (checker.py:6334): the stub `...` early return, the direct-accept path,
+  and the try_fallback gate (`inferred is not None or` union lvalue) with
+  the `simple_rvalue` short-circuit and the preferred/fallback context
+  selector. Rust reads the proper lvalue type as wire bytes plus five
+  scalar flags (`is_stub`, `rvalue_is_ellipsis`, `has_inferred`,
+  `inferred_is_argument`, `simple_rvalue`) and returns a tag (STUB /
+  DIRECT / FALLBACK_NO_PREFERRED / FALLBACK_LVALUE_PREFERRED). The Python
+  shim applies the branch bodies (`expr_checker.accept` /
+  `infer_rvalue_with_fallback_context`); the shared assignment tail and
+  the NEED-ANNOTATION bit stay Python-side (the bit depends on the
+  post-accept rvalue_type; both of its predicates are already native via
+  #445 and the subtype resolver). The shim keeps its pure-Python stub
+  early-return ahead of the seam, so the STUB arm is defensive-only.
+  Defers (`None`) on an undecodable wire blob or a `TypeAliasType`
+  lvalue. Gated by `_native_checker_active` (wired from `mypy/build.py`)
+  and covered by `NativeSimpleAssignmentSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus 9 pure
+  decision unit tests in `checker_functions.rs`.
 - `rust_classify_return_stmt` (issue #1004) — two-phase port of
   `TypeChecker.check_return_stmt` (checker.py:6546). Rust owns the pure
   decisions: `rust_classify_return_stmt_variant` picks the variant tag

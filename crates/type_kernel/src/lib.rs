@@ -3183,6 +3183,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1055: check_simple_assignment decision-head port. Rust
+    // arbitrates the stub / direct / fallback-context dispatch; the accept
+    // recursion and the Python-side blocks stay in Python (see checker_functions.rs).
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_simple_assignment,
+        module
+    )?)?;
+
     // Stage 3e: typeops.supported_self_type (explicit self-type predicate).
     module.add_function(wrap_pyfunction!(
         supported_self_type::rust_supported_self_type,

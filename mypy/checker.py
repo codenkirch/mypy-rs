@@ -350,6 +350,7 @@ try:
         rust_classify_return_stmt_pre as _rust_classify_return_stmt_pre,
         rust_classify_return_stmt_variant as _rust_classify_return_stmt_variant,
         rust_classify_rvalue_count as _rust_classify_rvalue_count,
+        rust_classify_simple_assignment as _rust_classify_simple_assignment,
         rust_classify_truthy_type as _rust_classify_truthy_type,
         rust_classify_type_check_raise as _rust_classify_type_check_raise,
         rust_conditional_types as _rust_conditional_types,
@@ -431,6 +432,7 @@ except ImportError:
     _rust_classify_metaclass_compat = None  # type: ignore[assignment]
     _rust_check_match_args = None  # type: ignore[assignment]
     _rust_classify_rvalue_count = None  # type: ignore[assignment]
+    _rust_classify_simple_assignment = None  # type: ignore[assignment]
     _rust_classify_truthy_type = None  # type: ignore[assignment]
     _rust_classify_type_check_raise = None  # type: ignore[assignment]
     _rust_classify_missing_annotations = None  # type: ignore[assignment]
@@ -592,6 +594,13 @@ NATIVE_MISSING_ANN_RETURN_EXPECTED = 3
 NATIVE_MISSING_ANN_TYPE_NONE = 0
 NATIVE_MISSING_ANN_TYPE_CALLABLE = 1
 NATIVE_MISSING_ANN_TYPE_OTHER = 2
+
+# Decision tags returned by `_rust_classify_simple_assignment`; must match
+# `SIMPLE_ASSIGNMENT_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_SA_STUB = 0
+NATIVE_SA_DIRECT = 1
+NATIVE_SA_FALLBACK_NO_PREFERRED = 2
+NATIVE_SA_FALLBACK_LVALUE_PREFERRED = 3
 
 _native_checker_active: bool = False
 _native_checker_types_active: bool = False
@@ -6338,16 +6347,63 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         if self.is_stub and isinstance(rvalue, EllipsisExpr):
             # '...' is always a valid initializer in a stub.
             return AnyType(TypeOfAny.special_form), lvalue_type
-        else:
-            always_allow_any = lvalue_type is not None and not isinstance(
-                get_proper_type(lvalue_type), AnyType
+
+        always_allow_any = lvalue_type is not None and not isinstance(
+            get_proper_type(lvalue_type), AnyType
+        )
+
+        # Native type_kernel seam: classify the try_fallback gate and the
+        # preferred/fallback selector in Rust (checker_functions.rs); None
+        # falls through to the pure-Python head.
+        rvalue_type: Type | None = None
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_simple_assignment is not None
+        ):
+            proper_lvalue = (
+                get_proper_type(lvalue_type) if lvalue_type is not None else None
             )
+            try:
+                tag = _rust_classify_simple_assignment(
+                    _serialize_type_for_checker(proper_lvalue)
+                    if proper_lvalue is not None
+                    else None,
+                    self.is_stub,
+                    isinstance(rvalue, EllipsisExpr),
+                    inferred is not None,
+                    inferred is not None and inferred.is_argument,
+                    # simple_rvalue only feeds try_fallback, which is
+                    # short-circuited off without an inferred Var or a
+                    # union lvalue; passing False there preserves the value.
+                    (inferred is not None or isinstance(proper_lvalue, UnionType))
+                    and self.simple_rvalue(rvalue),
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                tag = None
+            if tag is not None:
+                if tag == NATIVE_SA_STUB:
+                    # '...' is always a valid initializer in a stub. The
+                    # shim's early return above already handles this case,
+                    # so the branch is defensive only.
+                    return AnyType(TypeOfAny.special_form), lvalue_type
+                if tag == NATIVE_SA_DIRECT:
+                    rvalue_type = self.expr_checker.accept(
+                        rvalue, type_context=lvalue_type, always_allow_any=always_allow_any
+                    )
+                elif tag == NATIVE_SA_FALLBACK_NO_PREFERRED:
+                    rvalue_type = self.infer_rvalue_with_fallback_context(
+                        lvalue_type, rvalue, None, lvalue_type, inferred, always_allow_any
+                    )
+                else:
+                    rvalue_type = self.infer_rvalue_with_fallback_context(
+                        lvalue_type, rvalue, lvalue_type, None, inferred, always_allow_any
+                    )
 
-            # If redefinitions are allowed (i.e. we have --allow-redefinition
-            # and a variable without annotation) or if a variable has union type we
-            # try inferring r.h.s. twice with a fallback type context. The only exception
-
-            # is TypedDicts, they are often useless without context.
+        if rvalue_type is None:
+            # Pure-Python head (gate off or seam deferral). With
+            # --allow-redefinition or a union lvalue the rvalue is inferred
+            # twice with a fallback context (TypedDicts excepted).
             try_fallback = (
                 inferred is not None or isinstance(get_proper_type(lvalue_type), UnionType)
             ) and not self.simple_rvalue(rvalue)
@@ -6370,70 +6426,70 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
                     lvalue_type, rvalue, preferred, fallback, inferred, always_allow_any
                 )
 
-            if (
-                inferred is not None
-                and not is_valid_inferred_type(rvalue_type, self.options)
-                and (
-                    not inferred.type
-                    or isinstance(inferred.type, PartialType)
-                    # This additional check is to give an error instead of inferring
-                    # a useless type like None | list[Never] in case of "double-partial"
-                    # types that are not supported yet, see issue #20257.
-                    or not is_subtype(rvalue_type, inferred.type)
-                )
-            ):
-                self.msg.need_annotation_for_var(inferred, inferred, self.options)
-                rvalue_type = rvalue_type.accept(SetNothingToAny())
+        if (
+            inferred is not None
+            and not is_valid_inferred_type(rvalue_type, self.options)
+            and (
+                not inferred.type
+                or isinstance(inferred.type, PartialType)
+                # This additional check is to give an error instead of inferring
+                # a useless type like None | list[Never] in case of "double-partial"
+                # types that are not supported yet, see issue #20257.
+                or not is_subtype(rvalue_type, inferred.type)
+            )
+        ):
+            self.msg.need_annotation_for_var(inferred, inferred, self.options)
+            rvalue_type = rvalue_type.accept(SetNothingToAny())
 
+        if (
+            isinstance(lvalue, NameExpr)
+            and inferred is not None
+            and inferred.type is not None
+            and not inferred.is_final
+        ):
+            new_inferred = remove_instance_last_known_values(rvalue_type)
+            # Should we widen the inferred type or the lvalue? Variables defined
+            # at module level or class bodies can't be widened in functions, or
+            # in another module.
             if (
-                isinstance(lvalue, NameExpr)
-                and inferred is not None
-                and inferred.type is not None
-                and not inferred.is_final
+                not self.refers_to_different_scope(lvalue)
+                and not isinstance(inferred.type, PartialType)
+                and not is_proper_subtype(new_inferred, inferred.type)
+                and self.can_widen_in_scope(lvalue, inferred.type)
             ):
-                new_inferred = remove_instance_last_known_values(rvalue_type)
-                # Should we widen the inferred type or the lvalue? Variables defined
-                # at module level or class bodies can't be widened in functions, or
-                # in another module.
-                if (
-                    not self.refers_to_different_scope(lvalue)
-                    and not isinstance(inferred.type, PartialType)
-                    and not is_proper_subtype(new_inferred, inferred.type)
-                    and self.can_widen_in_scope(lvalue, inferred.type)
-                ):
-                    lvalue_type = make_simplified_union([inferred.type, new_inferred])
-                    # Widen the type to the union of original and new type.
-                    if not inferred.is_index_var:
-                        # Skip index variables as they are reset on each loop.
-                        self.widened_vars.append(inferred.name)
-                    self.set_inferred_type(inferred, lvalue, lvalue_type)
-                    if lvalue.kind == GDEF and self.scope.top_level_function() is not None:
-                        # Widening a global inside a function -- record for
-                        # propagation to the module-level binder afterwards.
-                        self._globals_widened_in_func.append((lvalue, lvalue_type))
-                    self.binder.put(lvalue, rvalue_type)
-                    # TODO: A bit hacky, maybe add a binder method that does put and
-                    #       updates declaration?
-                    lit = literal_hash(lvalue)
-                    if lit is not None:
-                        self.binder.declarations[lit] = lvalue_type
+                lvalue_type = make_simplified_union([inferred.type, new_inferred])
+                # Widen the type to the union of original and new type.
+                if not inferred.is_index_var:
+                    # Skip index variables as they are reset on each loop.
+                    self.widened_vars.append(inferred.name)
+                self.set_inferred_type(inferred, lvalue, lvalue_type)
+                if lvalue.kind == GDEF and self.scope.top_level_function() is not None:
+                    # Widening a global inside a function -- record for
+                    # propagation to the module-level binder afterwards.
+                    self._globals_widened_in_func.append((lvalue, lvalue_type))
+                self.binder.put(lvalue, rvalue_type)
+                # TODO: A bit hacky, maybe add a binder method that does put and
+                #       updates declaration?
+                lit = literal_hash(lvalue)
+                if lit is not None:
+                    self.binder.declarations[lit] = lvalue_type
 
-            if isinstance(rvalue_type, DeletedType):
-                self.msg.deleted_as_rvalue(rvalue_type, context)
-            if isinstance(lvalue_type, DeletedType):
-                self.msg.deleted_as_lvalue(lvalue_type, context)
-            elif lvalue_type:
-                self.check_subtype(
-                    # Preserve original aliases for error messages when possible.
-                    rvalue_type,
-                    lvalue_type,
-                    context,
-                    msg,
-                    f"{rvalue_name} has type",
-                    f"{lvalue_name} has type",
-                    notes=notes,
-                )
-            return rvalue_type, lvalue_type
+        if isinstance(rvalue_type, DeletedType):
+            self.msg.deleted_as_rvalue(rvalue_type, context)
+        if isinstance(lvalue_type, DeletedType):
+            self.msg.deleted_as_lvalue(lvalue_type, context)
+        elif lvalue_type:
+            self.check_subtype(
+                # Preserve original aliases for error messages when possible.
+                rvalue_type,
+                lvalue_type,
+                context,
+                msg,
+                f"{rvalue_name} has type",
+                f"{lvalue_name} has type",
+                notes=notes,
+            )
+        return rvalue_type, lvalue_type
 
     def refers_to_different_scope(self, name: NameExpr) -> bool:
         if name.kind == LDEF:
