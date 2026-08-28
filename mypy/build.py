@@ -1490,6 +1490,22 @@ class BuildManager:
         from mypy.subtypes import _set_native_subtype_resolver
 
         type_infos, aliases = self._collect_incremental(scc)
+        # PEP 695 classes leave VARIANCE_NOT_READY after semanal: lazy
+        # inference normally happens in the checker. Run it here (idempotent)
+        # so the snapshot carries it; failures (unannotated attr Vars) defer.
+        from mypy.nodes import VARIANCE_NOT_READY
+        from mypy.subtypes import infer_class_variances
+        from mypy.types import TypeVarType
+
+        for info in type_infos:
+            try:
+                if any(
+                    isinstance(tv, TypeVarType) and tv.variance == VARIANCE_NOT_READY
+                    for tv in info.defn.type_vars
+                ):
+                    infer_class_variances(info)
+            except (AssertionError, NotImplementedError):
+                pass
         if self._native_resolver is None:
             resolver = _type_kernel.build_native_resolver(type_infos, aliases, self.modules)
             # Grow the accumulated fullname -> TypeInfo map with this

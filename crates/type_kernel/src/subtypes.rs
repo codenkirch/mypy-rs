@@ -1973,16 +1973,12 @@ fn visit_instance_nominal(
         if i >= n {
             break;
         }
-        // ParamSpec (kind=1) / TypeVarTuple (kind=2): Python's else branch
-        // (subtypes.py:691-696) treats them as COVARIANT, but the arg shapes
-        // hit unsupported variants in the recursive is_subtype. Defer.
-
-        if *kind != 0 {
-            return None;
-        }
         let lefta = &mapped_args[i];
         let righta = &right_args[i];
-        let effective_variance = if ctx.always_covariant && *variance == INVARIANT {
+        // Non-TypeVarType tvars (ParamSpec, kind=1): Python's else branch
+        // (subtypes.py:1198-1203) passes COVARIANT. TypeVarTuple (kind=2)
+        // is unreachable: those classes defer earlier (has_type_var_tuple_type).
+        let effective_variance = if *kind != 0 || (ctx.always_covariant && *variance == INVARIANT) {
             COVARIANT
         } else {
             *variance
@@ -2029,6 +2025,12 @@ fn check_type_parameter(
     ctx: &SubtypeContext,
     resolver: &TypeResolver,
 ) -> Option<bool> {
+    // Reflexive fast path: all Python variance checks are reflexive, so
+    // wire-equal args are a subtype under every variance. Without this the
+    // recursive calls defer on identical ParamSpec / variadic args (C[P] <: C[P]).
+    if left == right {
+        return Some(true);
+    }
     // subtypes.py:522-526: an `ambiguous` UninhabitedType (empty
     // collection literal / partial state) is safe to treat as COVARIANT
     // even under INVARIANT, since such a type can't be stored in a
