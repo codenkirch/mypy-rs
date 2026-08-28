@@ -226,6 +226,7 @@ __all__ = [
     "rust_classify_return_stmt_variant",
     "rust_classify_return_stmt_pre",
     "rust_classify_return_stmt_post",
+    "rust_classify_simple_assignment",
     "rust_classify_lvalue_validity",
     "rust_classify_fixed_args",
     "rust_conditional_types",
@@ -1016,6 +1017,16 @@ def rust_classify_super_arg_types(chk: Any, super_expr: Any) -> int | None: ...
 def rust_classify_visit_op_expr(expr: Any) -> int | None: ...
 def rust_classify_check_arg(
     caller_type_bytes: bytes, is_subtype: bool, has_abstract_type_part: bool
+) -> int | None: ...
+# Issue #1055: check_simple_assignment decision head. Returns
+# (STUB / DIRECT / FALLBACK + preferred/fallback selector tag) or None.
+def rust_classify_simple_assignment(
+    lvalue_type_bytes: bytes | None,
+    is_stub: bool,
+    rvalue_is_ellipsis: bool,
+    has_inferred: bool,
+    inferred_is_argument: bool,
+    simple_rvalue: bool,
 ) -> int | None: ...
 # Issue #1049: check_boolean_op decision head. Returns
 # (map_tag, left_unreachable, right_unreachable, result_tag) or None.

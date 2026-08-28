@@ -38505,3 +38505,319 @@ class NativeCheckBooleanOpSuite(Suite):
         off = self._run(False, e, make)
         on = self._run(True, e, make)
         assert off == on, f"defer-union: off={off} on={on}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSimpleAssignmentSuite(Suite):
+    """Parity for `rust_classify_simple_assignment` (issue #1055).
+
+    `TypeChecker.check_simple_assignment` (checker.py:6325-6436) dispatches
+    the stub '...' initializer, the try_fallback gate (inferred Var or a
+    union lvalue, and not simple_rvalue), the direct accept arm (no
+    fallback / no lvalue type / TypedDict context), and the
+    preferred/fallback selector for the two-context re-inference. The Rust
+    seam decides only the tag from the wire proper lvalue type plus live
+    scalar facts; Python applies the stub return, the accept /
+    infer_rvalue_with_fallback_context branch bodies, and the shared
+    need-annotation / widening / check_subtype tail. Direct seam calls
+    assert the exact tag for every branch; toggling the checker gate off
+    vs on must produce identical captured observations.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _wire(self, t: Type) -> bytes:
+        from mypy.checker import _serialize_type_for_checker
+
+        return _serialize_type_for_checker(t)
+
+    # ---- direct seam tag tests ----
+
+    def test_seam_stub(self) -> None:
+        from mypy.checker import NATIVE_SA_STUB
+
+        tag = _type_kernel.rust_classify_simple_assignment(
+            None, True, True, True, True, False
+        )
+        assert tag == NATIVE_SA_STUB, f"{tag}"
+
+    def test_seam_direct_no_lvalue(self) -> None:
+        from mypy.checker import NATIVE_SA_DIRECT
+
+        tag = _type_kernel.rust_classify_simple_assignment(
+            None, False, False, False, False, False
+        )
+        assert tag == NATIVE_SA_DIRECT, f"{tag}"
+
+    def test_seam_direct_via_simple_rvalue(self) -> None:
+        from mypy.checker import NATIVE_SA_DIRECT
+
+        fx = TypeFixture()
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(Instance(fx.ai, [])), False, False, True, False, True
+        )
+        assert tag == NATIVE_SA_DIRECT, f"{tag}"
+
+    def test_seam_direct_via_typeddict_context(self) -> None:
+        from mypy.checker import NATIVE_SA_DIRECT
+
+        fx = TypeFixture()
+        td = TypedDictType({}, set(), set(), fx.a)
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(td), False, False, True, False, False
+        )
+        assert tag == NATIVE_SA_DIRECT, f"{tag}"
+        # A union with a TypedDictType item is also a TypedDict context.
+        un = UnionType([Instance(fx.ai, []), td])
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(un), False, False, True, False, False
+        )
+        assert tag == NATIVE_SA_DIRECT, f"{tag}"
+
+    def test_seam_direct_union_simple_rvalue(self) -> None:
+        from mypy.checker import NATIVE_SA_DIRECT
+
+        fx = TypeFixture()
+        un = UnionType([Instance(fx.ai, []), Instance(fx.bi, [])])
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(un), False, False, False, False, True
+        )
+        assert tag == NATIVE_SA_DIRECT, f"{tag}"
+
+    def test_seam_fallback_no_preferred(self) -> None:
+        from mypy.checker import NATIVE_SA_FALLBACK_NO_PREFERRED
+
+        fx = TypeFixture()
+        # inferred Var that is not a function argument.
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(Instance(fx.ai, [])), False, False, True, False, False
+        )
+        assert tag == NATIVE_SA_FALLBACK_NO_PREFERRED, f"{tag}"
+
+    def test_seam_fallback_lvalue_preferred(self) -> None:
+        from mypy.checker import NATIVE_SA_FALLBACK_LVALUE_PREFERRED
+
+        fx = TypeFixture()
+        # Union lvalue without an inferred Var.
+        un = UnionType([Instance(fx.ai, []), Instance(fx.bi, [])])
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(un), False, False, False, False, False
+        )
+        assert tag == NATIVE_SA_FALLBACK_LVALUE_PREFERRED, f"{tag}"
+        # Function-argument inferred Var (is_argument).
+        tag = _type_kernel.rust_classify_simple_assignment(
+            self._wire(Instance(fx.ai, [])), False, False, True, True, False
+        )
+        assert tag == NATIVE_SA_FALLBACK_LVALUE_PREFERRED, f"{tag}"
+
+    def test_seam_defers_on_bad_wire(self) -> None:
+        assert (
+            _type_kernel.rust_classify_simple_assignment(
+                b"\xff\xff\xff", False, False, True, False, False
+            )
+            is None
+        )
+
+    # ---- gate-off vs gate-on differential tests ----
+
+    def _run(
+        self,
+        lvalue_type: Type | None,
+        rvalue: Expression,
+        rvalue_type: Type,
+        inferred: Var | None = None,
+        is_stub: bool = False,
+        lvalue: Expression | None = None,
+    ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+        from mypy.checker import TypeChecker
+
+        def check_one() -> tuple[object, ...]:
+            obs: list[object] = []
+            # `expr_checker` is a read-only property on TypeChecker, so the
+            # mock runs on a dynamic subclass whose plain class attribute
+            # shadows the property.
+            chk_cls = cast(
+                "type[TypeChecker]",
+                type("_Chk", (TypeChecker,), {"expr_checker": None}),
+            )
+            chk = chk_cls.__new__(chk_cls)
+            chk.is_stub = is_stub
+            chk.options = Options()
+
+            def accept(
+                rv: Expression,
+                type_context: Type | None = None,
+                always_allow_any: bool = False,
+            ) -> Type:
+                obs.append(("accept", str(type_context), always_allow_any))
+                return rvalue_type
+
+            def fallback(
+                lt: Type | None,
+                rv: Expression,
+                preferred: Type | None,
+                fallback_context: Type | None,
+                inf: Var | None,
+                aaa: bool,
+            ) -> Type:
+                obs.append(("fallback", str(preferred), str(fallback_context)))
+                return rvalue_type
+
+            chk.expr_checker = SimpleNamespace(accept=accept)  # type: ignore[misc, assignment]
+            chk.infer_rvalue_with_fallback_context = fallback  # type: ignore[method-assign, assignment]
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                need_annotation_for_var=lambda v, ctx, options: obs.append(
+                    ("need_ann",)
+                ),
+                deleted_as_rvalue=lambda t, ctx: obs.append(("del_rvalue",)),
+                deleted_as_lvalue=lambda t, ctx: obs.append(("del_lvalue",)),
+            )
+            chk.check_subtype = lambda nt, lt, ctx, msg, d1, d2, notes=None: obs.append(  # type: ignore[method-assign, assignment]
+                ("subtype", str(lt))
+            )
+            chk.widened_vars = []
+            chk._globals_widened_in_func = []
+            chk.binder = SimpleNamespace(  # type: ignore[assignment]
+                put=lambda e, t: obs.append(("binder_put",)),
+                declarations={},
+            )
+            # The widening block is only reached via a NameExpr lvalue.
+            chk.refers_to_different_scope = lambda name: False  # type: ignore[method-assign]
+            chk.can_widen_in_scope = lambda name, orig_type: True  # type: ignore[method-assign]
+            chk.set_inferred_type = lambda inf, lv, t: obs.append(("set_inferred", str(t)))  # type: ignore[method-assign, assignment]
+            chk.scope = SimpleNamespace(top_level_function=lambda: None)  # type: ignore[assignment]
+            ret = chk.check_simple_assignment(
+                lvalue_type, rvalue, NameExpr("ctx"), lvalue=lvalue, inferred=inferred
+            )
+            obs.append(("ret", str(ret[0]), str(ret[1])))
+            return tuple(obs)
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(
+        self,
+        lvalue_type: Type | None,
+        rvalue: Expression,
+        rvalue_type: Type,
+        inferred: Var | None = None,
+        is_stub: bool = False,
+        lvalue: Expression | None = None,
+    ) -> tuple[tuple[object, ...], tuple[object, ...]]:
+        off = self._run(lvalue_type, rvalue, rvalue_type, inferred, is_stub, lvalue)[0]
+        on = self._run(lvalue_type, rvalue, rvalue_type, inferred, is_stub, lvalue)[1]
+        assert off == on, f"off={off} on={on}"
+        return off, on
+
+    def _nonsimple_call(self) -> CallExpr:
+        # simple_rvalue() is False for a CallExpr whose callee node is not
+        # a function definition.
+        return CallExpr(NameExpr("f"), [], [], [])
+
+    def test_par_stub_ellipsis(self) -> None:
+        off, on = self._assert_par(
+            Instance(TypeFixture().ai, []),
+            EllipsisExpr(),
+            AnyType(TypeOfAny.special_form),
+            is_stub=True,
+        )
+        # Both gates short-circuit to the stub Any before any inference.
+        assert off == (("ret", "Any", "A"),), off
+
+    def test_par_direct_no_lvalue(self) -> None:
+        fx = TypeFixture()
+        off, on = self._assert_par(None, IntExpr(1), fx.anyt)
+        assert ("accept", "None", False) in off, off
+
+    def test_par_direct_any_lvalue(self) -> None:
+        # An Any lvalue type disables always_allow_any on the accept call.
+        fx = TypeFixture()
+        off, on = self._assert_par(fx.anyt, IntExpr(1), fx.anyt)
+        assert ("accept", "Any", False) in off, off
+        assert ("subtype", "Any") in off, off
+
+    def test_par_direct_simple_rvalue(self) -> None:
+        fx = TypeFixture()
+        lvalue = Instance(fx.ai, [])
+        off, on = self._assert_par(lvalue, IntExpr(1), lvalue)
+        assert ("accept", str(lvalue), True) in off, off
+        assert not any(isinstance(o, tuple) and o[0] == "fallback" for o in off), off
+
+    def test_par_direct_typeddict_context(self) -> None:
+        fx = TypeFixture()
+        td = TypedDictType({}, set(), set(), fx.a)
+        off, on = self._assert_par(td, self._nonsimple_call(), fx.a, inferred=Var("v"))
+        assert ("accept", str(td), True) in off, off
+        assert not any(isinstance(o, tuple) and o[0] == "fallback" for o in off), off
+
+    def test_par_fallback_no_preferred(self) -> None:
+        fx = TypeFixture()
+        lvalue = Instance(fx.ai, [])
+        var = Var("v")
+        var.type = None
+        off, on = self._assert_par(lvalue, self._nonsimple_call(), lvalue, inferred=var)
+        assert ("fallback", "None", str(lvalue)) in off, off
+
+    def test_par_fallback_lvalue_preferred_argument(self) -> None:
+        fx = TypeFixture()
+        lvalue = Instance(fx.ai, [])
+        var = Var("v")
+        var.is_argument = True
+        off, on = self._assert_par(lvalue, self._nonsimple_call(), lvalue, inferred=var)
+        assert ("fallback", str(lvalue), "None") in off, off
+
+    def test_par_fallback_union_lvalue(self) -> None:
+        fx = TypeFixture()
+        un = UnionType([Instance(fx.ai, []), Instance(fx.bi, [])])
+        off, on = self._assert_par(un, self._nonsimple_call(), Instance(fx.ai, []))
+        assert ("fallback", str(un), "None") in off, off
+        assert ("subtype", str(un)) in off, off
+
+    def test_par_need_annotation(self) -> None:
+        fx = TypeFixture()
+        lvalue = Instance(fx.ai, [])
+        var = Var("v")
+        var.type = None
+        # An uninhabited inferred rvalue type fires need_annotation_for_var
+        # and the SetNothingToAny fixup rewrites it to Any.
+        off, on = self._assert_par(
+            lvalue, self._nonsimple_call(), UninhabitedType(ambiguous=True), inferred=var
+        )
+        assert ("need_ann",) in off, off
+        assert ("ret", "Any", str(lvalue)) in off, off
+
+    def test_par_deleted_rvalue(self) -> None:
+        fx = TypeFixture()
+        lvalue = Instance(fx.ai, [])
+        off, on = self._assert_par(lvalue, IntExpr(1), DeletedType("x"))
+        assert ("del_rvalue",) in off, off
+
+    def test_par_widen(self) -> None:
+        fx = TypeFixture()
+        int_inst = Instance(fx.ai, [])
+        unrel_inst = Instance(fx.di, [])  # D is unrelated to A: not a proper subtype
+        var = Var("x")
+        var.type = int_inst
+        lvalue = NameExpr("x")
+        # The widened lvalue type becomes the union of the original and the
+        # newly inferred type; the binder and set_inferred_type observe it.
+        off, on = self._assert_par(
+            int_inst, self._nonsimple_call(), unrel_inst, inferred=var, lvalue=lvalue
+        )
+        assert ("set_inferred", str(UnionType([int_inst, unrel_inst]))) in off, off
+        assert ("subtype", str(UnionType([int_inst, unrel_inst]))) in off, off

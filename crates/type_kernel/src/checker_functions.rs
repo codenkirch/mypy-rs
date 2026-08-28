@@ -4383,3 +4383,273 @@ mod classify_type_check_raise_tests {
         assert_eq!(classify_type_check_raise(&any, None), RAISE_PLAIN);
     }
 }
+
+// ---------------------------------------------------------------------------
+// classify_simple_assignment (#1055)
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `check_simple_assignment`; must match
+/// `NATIVE_SA_*` in mypy/checker.py.
+const SIMPLE_ASSIGNMENT_STUB: i64 = 0;
+const SIMPLE_ASSIGNMENT_DIRECT: i64 = 1;
+const SIMPLE_ASSIGNMENT_FALLBACK_NO_PREFERRED: i64 = 2;
+const SIMPLE_ASSIGNMENT_FALLBACK_LVALUE_PREFERRED: i64 = 3;
+
+/// Pure 4-way dispatch of the `TypeChecker.check_simple_assignment`
+/// (checker.py:6325-6436) head. `lvalue` is the decoded wire form of the
+/// proper lvalue type (`None` when the caller passes no declared/inferred
+/// lvalue type); the remaining inputs are live scalar facts computed by
+/// the Python shim (`self.is_stub`, `isinstance(rvalue, EllipsisExpr)`,
+/// `inferred is not None`, `inferred.is_argument`, and
+/// `simple_rvalue(rvalue)` pre-short-circuited by the shim -- Python only
+/// calls `simple_rvalue` when the try_fallback precondition
+/// (`inferred is not None or lvalue is a union`) holds, so the shim passes
+/// `False` when that precondition is false). Branch order mirrors the
+/// Python body: the stub `...` initializer first, then the try_fallback
+/// gate, then the direct arm (`not try_fallback or lvalue_type is None or
+/// is_typeddict_type_context`), then the preferred/fallback selector.
+/// The TypedDict-context probe reuses the ported
+/// `is_typeddict_type_context_inner`; an alias-carrying lvalue defers.
+/// The need-annotation block and the widening/check_subtype tail stay in
+/// Python: they consume the post-accept rvalue_type, which the shim only
+/// has after running the classified branch body.
+fn classify_simple_assignment(
+    lvalue: Option<&Type>,
+    is_stub: bool,
+    rvalue_is_ellipsis: bool,
+    has_inferred: bool,
+    inferred_is_argument: bool,
+    simple_rvalue: bool,
+) -> Option<i64> {
+    if is_stub && rvalue_is_ellipsis {
+        return Some(SIMPLE_ASSIGNMENT_STUB);
+    }
+    let lvalue_is_union = match lvalue {
+        None => false,
+        Some(t) => matches!(
+            crate::checker_helpers::get_proper_or_none(t)?,
+            Type::UnionType { .. }
+        ),
+    };
+    let try_fallback = (has_inferred || lvalue_is_union) && !simple_rvalue;
+    if !try_fallback || lvalue.is_none() {
+        return Some(SIMPLE_ASSIGNMENT_DIRECT);
+    }
+    // Python evaluates is_typeddict_type_context(lvalue_type) only when
+    // try_fallback holds and the lvalue type is present; an alias target
+    // the resolver cannot expand defers the whole classification.
+    if !crate::checkexpr_functions::is_typeddict_type_context_inner(lvalue.unwrap())? {
+        if has_inferred && !inferred_is_argument {
+            return Some(SIMPLE_ASSIGNMENT_FALLBACK_NO_PREFERRED);
+        }
+        return Some(SIMPLE_ASSIGNMENT_FALLBACK_LVALUE_PREFERRED);
+    }
+    Some(SIMPLE_ASSIGNMENT_DIRECT)
+}
+
+/// `#[pyfunction]` entry for `TypeChecker.check_simple_assignment`
+/// (checker.py:6325-6436). Rust decides ONLY the head tag from the wire
+/// proper lvalue type plus live scalar facts; the shim applies the stub
+/// early return, the accept / fallback-context re-inference branch
+/// bodies, and the shared need-annotation / widening / check_subtype
+/// tail. Defers (`None`) on undecodable wire bytes or an alias-carrying
+/// lvalue type.
+#[pyfunction]
+#[pyo3(signature = (
+    lvalue_type_bytes,
+    is_stub,
+    rvalue_is_ellipsis,
+    has_inferred,
+    inferred_is_argument,
+    simple_rvalue
+))]
+pub(crate) fn rust_classify_simple_assignment(
+    lvalue_type_bytes: Option<&[u8]>,
+    is_stub: bool,
+    rvalue_is_ellipsis: bool,
+    has_inferred: bool,
+    inferred_is_argument: bool,
+    simple_rvalue: bool,
+) -> PyResult<Option<i64>> {
+    let lvalue = match lvalue_type_bytes {
+        None => None,
+        Some(bytes) => match crate::checkmember::decode_type(bytes) {
+            Some(t) => Some(t),
+            None => return Ok(None),
+        },
+    };
+    Ok(classify_simple_assignment(
+        lvalue.as_ref(),
+        is_stub,
+        rvalue_is_ellipsis,
+        has_inferred,
+        inferred_is_argument,
+        simple_rvalue,
+    ))
+}
+
+#[cfg(test)]
+mod classify_simple_assignment_tests {
+    use super::*;
+
+    fn make_instance(type_ref: &str) -> Type {
+        Type::Instance {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+            last_known_value: None,
+            extra_attrs: None,
+        }
+    }
+
+    fn make_union(items: Vec<Type>) -> Type {
+        Type::UnionType {
+            items,
+            uses_pep604_syntax: false,
+            can_be_true: true,
+            can_be_false: true,
+        }
+    }
+
+    fn make_typeddict() -> Type {
+        Type::TypedDictType {
+            fallback: Box::new(make_instance("TD")),
+            items: vec![],
+            required_keys: Default::default(),
+            readonly_keys: Default::default(),
+            is_closed: false,
+        }
+    }
+
+    fn make_type_alias(type_ref: &str) -> Type {
+        Type::TypeAliasType {
+            type_ref: type_ref.to_string(),
+            args: vec![],
+        }
+    }
+
+    #[test]
+    fn test_stub_ellipsis_wins() {
+        // The stub '...' initializer is checked first: every other fact
+        // is irrelevant.
+        assert_eq!(
+            classify_simple_assignment(None, true, true, true, true, false),
+            Some(SIMPLE_ASSIGNMENT_STUB)
+        );
+        let inst = make_instance("builtins.int");
+        assert_eq!(
+            classify_simple_assignment(Some(&inst), true, true, false, false, true),
+            Some(SIMPLE_ASSIGNMENT_STUB)
+        );
+    }
+
+    #[test]
+    fn test_not_stub_with_ellipsis_continues() {
+        // is_stub=False defeats the stub arm even for an EllipsisExpr.
+        assert_eq!(
+            classify_simple_assignment(None, false, true, false, false, false),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+    }
+
+    #[test]
+    fn test_direct_no_inferred_no_union() {
+        assert_eq!(
+            classify_simple_assignment(None, false, false, false, false, false),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+        let inst = make_instance("builtins.int");
+        assert_eq!(
+            classify_simple_assignment(Some(&inst), false, false, false, false, false),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+    }
+
+    #[test]
+    fn test_direct_via_simple_rvalue() {
+        // try_fallback short-circuits on simple_rvalue even with an
+        // inferred Var or a union lvalue.
+        let inst = make_instance("builtins.int");
+        assert_eq!(
+            classify_simple_assignment(Some(&inst), false, false, true, false, true),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+        let un = make_union(vec![
+            make_instance("builtins.int"),
+            make_instance("builtins.str"),
+        ]);
+        assert_eq!(
+            classify_simple_assignment(Some(&un), false, false, false, false, true),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+    }
+
+    #[test]
+    fn test_direct_via_typeddict_context() {
+        // TypedDictType lvalue with fallback re-inference available: the
+        // TypedDict exception keeps the direct arm.
+        let td = make_typeddict();
+        assert_eq!(
+            classify_simple_assignment(Some(&td), false, false, true, false, false),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+        // A union with a TypedDictType item is also a TypedDict context.
+        let un = make_union(vec![make_instance("builtins.int"), make_typeddict()]);
+        assert_eq!(
+            classify_simple_assignment(Some(&un), false, false, true, false, false),
+            Some(SIMPLE_ASSIGNMENT_DIRECT)
+        );
+    }
+
+    #[test]
+    fn test_fallback_no_preferred_for_non_argument_inferred() {
+        // inferred is not None and not is_argument: full lvalue context is
+        // the fallback, no preferred context.
+        let inst = make_instance("builtins.int");
+        assert_eq!(
+            classify_simple_assignment(Some(&inst), false, false, true, false, false),
+            Some(SIMPLE_ASSIGNMENT_FALLBACK_NO_PREFERRED)
+        );
+    }
+
+    #[test]
+    fn test_fallback_lvalue_preferred() {
+        let inst = make_instance("builtins.int");
+        // Function-argument inferred Var: lvalue context is preferred.
+        assert_eq!(
+            classify_simple_assignment(Some(&inst), false, false, true, true, false),
+            Some(SIMPLE_ASSIGNMENT_FALLBACK_LVALUE_PREFERRED)
+        );
+        // Union lvalue without an inferred Var: lvalue context preferred.
+        let un = make_union(vec![
+            make_instance("builtins.int"),
+            make_instance("builtins.str"),
+        ]);
+        assert_eq!(
+            classify_simple_assignment(Some(&un), false, false, false, false, false),
+            Some(SIMPLE_ASSIGNMENT_FALLBACK_LVALUE_PREFERRED)
+        );
+    }
+
+    #[test]
+    fn test_union_with_inferred_argument() {
+        let un = make_union(vec![
+            make_instance("builtins.int"),
+            make_instance("builtins.str"),
+        ]);
+        assert_eq!(
+            classify_simple_assignment(Some(&un), false, false, true, true, false),
+            Some(SIMPLE_ASSIGNMENT_FALLBACK_LVALUE_PREFERRED)
+        );
+    }
+
+    #[test]
+    fn test_alias_lvalue_defers() {
+        // get_proper_or_none defers on TypeAliasType, so the union probe
+        // and the TypedDict probe cannot decide.
+        let alias = make_type_alias("mod.A");
+        assert_eq!(
+            classify_simple_assignment(Some(&alias), false, false, true, false, false),
+            None
+        );
+    }
+}
