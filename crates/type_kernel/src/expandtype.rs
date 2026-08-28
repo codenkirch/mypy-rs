@@ -598,6 +598,7 @@ pub(crate) fn expand_type_inner(
                 arg_names: params.arg_names.clone(),
                 variables: params.variables.clone(),
                 imprecise_arg_kinds: params.imprecise_arg_kinds,
+                is_ellipsis_args: params.is_ellipsis_args,
             }))
         }
 

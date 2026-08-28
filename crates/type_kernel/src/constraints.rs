@@ -1290,6 +1290,7 @@ fn visit_callable_native(
             arg_names: vec![None, None],
             variables: Vec::new(),
             imprecise_arg_kinds: true,
+            is_ellipsis_args: false,
         });
         res.push(Constraint {
             origin_type_var: ps,
@@ -1340,6 +1341,7 @@ fn detect_param_spec(arg_types: &[Type], arg_kinds: &[i64]) -> Option<Type> {
                     arg_names: Vec::new(),
                     variables: Vec::new(),
                     imprecise_arg_kinds: false,
+                    is_ellipsis_args: false,
                 }),
                 name: name.clone(),
                 fullname: fullname.clone(),
@@ -1790,6 +1792,7 @@ mod tests {
                 arg_names: Vec::new(),
                 variables: Vec::new(),
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             }),
             name: "P".to_string(),
             fullname: "mod.P".to_string(),
@@ -1918,6 +1921,7 @@ mod tests {
                     arg_names: Vec::new(),
                     variables: Vec::new(),
                     imprecise_arg_kinds: false,
+                    is_ellipsis_args: false,
                 }),
                 name: "P".to_string(),
                 fullname: "mod.P".to_string(),

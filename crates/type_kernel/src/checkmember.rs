@@ -3757,6 +3757,7 @@ mod tests {
                 arg_names: vec![],
                 variables: vec![],
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             })],
         };
         let mut next_raw_id = 5;

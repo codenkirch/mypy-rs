@@ -500,6 +500,7 @@ fn erase_typevars_parameters(
         arg_kinds: params.arg_kinds.clone(),
         arg_names: params.arg_names.clone(),
         imprecise_arg_kinds: params.imprecise_arg_kinds,
+        is_ellipsis_args: params.is_ellipsis_args,
         variables: new_variables,
     })
 }
@@ -524,6 +525,7 @@ fn replace_meta_vars_parameters(
         arg_kinds: params.arg_kinds.clone(),
         arg_names: params.arg_names.clone(),
         imprecise_arg_kinds: params.imprecise_arg_kinds,
+        is_ellipsis_args: params.is_ellipsis_args,
         variables: new_variables,
     })
 }

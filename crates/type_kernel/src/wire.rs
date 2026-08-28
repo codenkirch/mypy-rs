@@ -464,6 +464,7 @@ pub(crate) struct Parameters {
     pub arg_names: Vec<Option<String>>,
     pub variables: Vec<Type>,
     pub imprecise_arg_kinds: bool,
+    pub is_ellipsis_args: bool,
 }
 
 /// `mypy.types.Type` — one variant per serialized subclass. `Instance.type_ref`
@@ -865,6 +866,7 @@ fn read_parameters(buf: &mut ReadBuffer<'_>) -> Result<Parameters, WireError> {
     let arg_names = read_str_opt_list(buf)?;
     let variables = read_type_var_likes(buf)?;
     let imprecise_arg_kinds = read_bool(buf)?;
+    let is_ellipsis_args = read_bool(buf)?;
     expect_end_tag(buf)?;
     Ok(Parameters {
         arg_types,
@@ -872,6 +874,7 @@ fn read_parameters(buf: &mut ReadBuffer<'_>) -> Result<Parameters, WireError> {
         arg_names,
         variables,
         imprecise_arg_kinds,
+        is_ellipsis_args,
     })
 }
 
@@ -2012,6 +2015,7 @@ fn write_parameters(buf: &mut WriteBuffer, p: &Parameters) -> Result<(), WireErr
     write_str_opt_list(buf, &p.arg_names)?;
     write_type_var_likes(buf, &p.variables)?;
     write_bool(buf, p.imprecise_arg_kinds);
+    write_bool(buf, p.is_ellipsis_args);
     write_tag(buf, END_TAG);
     Ok(())
 }
@@ -2864,6 +2868,7 @@ mod tests {
             arg_names: vec![],
             variables: vec![],
             imprecise_arg_kinds: false,
+            is_ellipsis_args: true,
         };
         let t = Type::ParamSpecType {
             prefix: Box::new(prefix),

@@ -882,6 +882,10 @@ class BuildManager:
         self._native_walked_modules: set[str] = set()
         # Persistent alias map, grown incrementally per SCC.
         self._native_alias_map: dict[str, TypeAlias] = {}
+        # Fullnames already fed to the Rust resolver snapshot. Tracked
+        # separately from `_native_typeinfo_map`: the semanal hook
+        # (`_install_semal_wirefixup`) adds map entries before it runs.
+        self._native_snapshotted: set[str] = set()
         # Share same modules dictionary with the global fixer state.
         # We need to set allow_missing when doing a fine-grained cache
         # load because we need to gracefully handle missing modules.
@@ -1027,9 +1031,9 @@ class BuildManager:
         # Stage 15 semanal helpers. Wirefixup protection in place; enabled
         # once typeops parity confirmed (typeops/semanal truthiness parity
         # reached via #224, residual recursive-alias gap fixed via #225/#231).
-        from mypy.semanal import _set_native_semanal_active
-
         import os as _os_semanal
+
+        from mypy.semanal import _set_native_semanal_active
         _set_native_semanal_active(
             self.options.native_type_kernel
             and bool(_os_semanal.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
@@ -1130,9 +1134,9 @@ class BuildManager:
         from mypy.checkpattern import _set_native_checkpattern_active
 
         _set_native_checkpattern_active(self.options.native_type_kernel)
-        from mypy.semanal import _set_native_semanal_visitor_active
-
         import os as _os
+
+        from mypy.semanal import _set_native_semanal_visitor_active
         _set_native_semanal_visitor_active(
             self.options.native_type_kernel
             and bool(_os.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
@@ -1512,18 +1516,20 @@ class BuildManager:
             # call's infos. First call: everything is new.
             for info in type_infos:
                 self._native_typeinfo_map[info.fullname] = info
+                self._native_snapshotted.add(info.fullname)
         else:
             resolver = self._native_resolver
             # Feed `update` only fullnames not yet snapshotted, plus
-            # `builtins.*` (re-snapshotted every call: promotion lists
-            # grow). The Rust `update` skips seen fullnames.
+            # `builtins.*` (promotion lists grow). The wirefixup hook
+            # may add map entries early; Rust `update` skips seen ones.
             new_infos: list[TypeInfo] = []
             pending: list[TypeInfo] = []
             for info in type_infos:
-                if info.fullname not in self._native_typeinfo_map:
+                if info.fullname not in self._native_snapshotted:
                     new_infos.append(info)
                     pending.append(info)
                     self._native_typeinfo_map[info.fullname] = info
+                    self._native_snapshotted.add(info.fullname)
                 elif info.fullname.startswith("builtins."):
                     pending.append(info)
             resolver.update(pending, aliases, self.modules)
@@ -1637,6 +1643,7 @@ class BuildManager:
         self._native_typeinfo_map = {}
         self._native_walked_modules = set()
         self._native_alias_map = {}
+        self._native_snapshotted = set()
         # The accumulated typeinfo map is re-created for the new build;
         # wire decodes resolved against the old map must not survive.
         # Cleared here (per-manager reset), not by the per-SCC None reset.
@@ -1700,6 +1707,55 @@ class BuildManager:
         from mypy.semanal import _set_native_semanal_resolver
 
         _set_native_semanal_resolver(None)
+
+    def _install_semal_wirefixup(self, module_id: str) -> None:
+        """Merge one module's just-analyzed TypeInfos/aliases into the wirefixup maps.
+
+        Called from `process_top_levels` when a module's top-level pass
+        completes, so wire decodes during the remaining semanal of the
+        SCC can resolve cross-module references (issue #1115: the
+        post-semanal `_build_native_resolvers` install came too late,
+        and parallel workers never run it at all). This only grows the
+        fullname -> TypeInfo / -> TypeAlias decode maps; the Rust
+        resolver snapshot stays post-semanal in `_build_native_resolvers`.
+        """
+        if not self.options.native_type_kernel:
+            return
+        try:
+            import type_kernel  # noqa: F401
+        except ImportError:
+            # Optional accelerator: same contract as
+            # `_build_native_resolvers` (required-env builds raise).
+            if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
+                raise CompileError([
+                    "native_type_kernel is enabled but the type_kernel "
+                    "extension failed to import (required by "
+                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                ]) from None
+            return
+        module = self.modules.get(module_id)
+        if module is None:
+            return
+        from mypy.nodes import TypeAlias, TypeInfo
+        from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
+
+        # Mirror `_collect_incremental`'s per-module walk: TypeInfos
+        # including nested classes, top-level aliases only.
+        infos: list[TypeInfo] = []
+        for sym in module.names.values():
+            node = sym.node
+            if isinstance(node, TypeInfo):
+                infos.append(node)
+                self._collect_nested_type_infos(node, infos)
+            elif isinstance(node, TypeAlias):
+                self._native_alias_map[node.fullname] = node
+        for info in infos:
+            self._native_typeinfo_map[info.fullname] = info
+        # Same-identity installs are no-ops for the deser caches; the
+        # first install (or the post-clear fresh map) triggers the
+        # invalidation `set_wire_typeinfo_map` owns.
+        set_wire_typeinfo_map(self._native_typeinfo_map)
+        set_wire_alias_map(self._native_alias_map)
 
     def _build_plugin_hook_registry(self) -> None:
         """Build the Stage 4 plugin-hook snapshot and install it.
@@ -4238,9 +4294,9 @@ class State:
     def type_check_first_pass(self, recurse_into_functions: bool = True) -> None:
         if self.options.semantic_analysis_only:
             return
-        from mypy.types import _set_type_wire_cache_enabled
-
         import os as _os
+
+        from mypy.types import _set_type_wire_cache_enabled
         _set_type_wire_cache_enabled(not _os.environ.get("MYPY_NO_WIRE_CACHE"))
         t0 = time_ref()
         with self.wrap_context():

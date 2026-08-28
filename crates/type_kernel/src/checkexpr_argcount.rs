@@ -1000,6 +1000,7 @@ mod tests {
                 arg_names: vec![],
                 variables: vec![],
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             }),
             name: "P".to_string(),
             fullname: "P".to_string(),

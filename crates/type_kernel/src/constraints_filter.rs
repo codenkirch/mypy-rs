@@ -577,6 +577,7 @@ mod tests {
                 arg_names: Vec::new(),
                 variables: Vec::new(),
                 imprecise_arg_kinds: false,
+                is_ellipsis_args: false,
             }),
             name: name.to_string(),
             fullname: format!("mod.{name}"),
@@ -595,6 +596,7 @@ mod tests {
             arg_names: vec![None],
             variables: Vec::new(),
             imprecise_arg_kinds: imprecise,
+            is_ellipsis_args: false,
         })
     }
 

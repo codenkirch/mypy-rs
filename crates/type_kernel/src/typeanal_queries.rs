@@ -2428,6 +2428,7 @@ fn analyze_type_inner(
                     allow_unpack,
                 )?,
                 imprecise_arg_kinds: prefix.imprecise_arg_kinds,
+                is_ellipsis_args: prefix.is_ellipsis_args,
             });
             let upper_bound = Box::new(analyze_type_inner(
                 upper_bound,
@@ -2524,6 +2525,7 @@ fn analyze_type_inner(
                 allow_unpack,
             )?,
             imprecise_arg_kinds: p.imprecise_arg_kinds,
+            is_ellipsis_args: p.is_ellipsis_args,
         })),
 
         Type::UnboundType { .. } => {
