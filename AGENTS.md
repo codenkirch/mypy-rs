@@ -800,6 +800,17 @@ including:
   empty-args or TVT-class mapped instances, ParamSpec/Unpack signatures, and
   un-frozen TypeVar-carrying results still defer to Python. Exercised by the
   native checkmember suites and Rust unit tests in `checkmember.rs`.
+  Issue #1129 ports the tail's `freeze_all_type_vars` (typeops.py:2102): the
+  static tail free-expands via `expand_type_by_instance_free`, then
+  `collect_freeze_ids` / `survivors_freezable` / `apply_freeze` set
+  `meta_level = 0` on every typevar listed in a `variables` entry (wire
+  round-trip broke Python's shared-object mutation), deferring when a
+  surviving typevar is outside every `variables` list (env miss: wire env
+  keys by receiver fullname, Python substitutes via live binder ids, e.g.
+  a PEP695 function-local class) or is ParamSpec/TypeVarTuple. Measured
+  (#1129): seam calls 4,983 → 2,763, global python fallbacks 88,985 →
+  79,986; remaining seam defers are TypeAliasType in the signature (~55%),
+  alias surviving expansion (~20%), and env miss (~19%).
 - `rust_analyze_instance_member_dispatch` defer closures (issue #1112) —
   ports two IAMA dispatch defers into the kernel: (a) the
   `rust_freshen_function_type_vars` `TypeAliasType` arm (freshen walks alias

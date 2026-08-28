@@ -90,19 +90,32 @@ pub(crate) fn expand_type_with_env(
     env: &HashMap<EnvKey, Type>,
     strict_optional: bool,
 ) -> Option<Type> {
+    expand_type_with_env_inner(typ, env, strict_optional, false)
+}
+
+/// Free-result variant: leftover TypeVars are returned instead of deferring
+/// (the IAMA member tail freezes them, mirroring `freeze_all_type_vars`,
+/// typeops.py:2102). The surviving-alias check still applies: a
+/// wire-decoded alias node carries `alias=None` and Python asserts against
+/// it (types.py:397).
+fn expand_type_with_env_inner(
+    typ: &Type,
+    env: &HashMap<EnvKey, Type>,
+    strict_optional: bool,
+    allow_free: bool,
+) -> Option<Type> {
     // Leaf types carry no TypeVars; Python returns the original object
     // (identity). We return a cloned copy — structurally identical, wire-safe.
     if is_leaf_type(typ) {
         return Some(typ.clone());
     }
     let expanded = expand_type_inner(typ, env, strict_optional)?;
-    if result_has_typevar(&expanded) {
+    if !allow_free && result_has_typevar(&expanded) {
         return None;
     }
     // A surviving TypeAliasType decodes from the wire with alias=None, and
     // Python's TypeAliasType.is_recursive asserts alias is not None
     // (types.py:397), so an unfixed alias crashes the caller. Defer any
-
     // expansion whose result still contains a TypeAliasType node.
     if result_contains_typealias(&expanded) {
         return None;
@@ -159,6 +172,30 @@ pub(crate) fn expand_type_by_instance_core(
     instance: &Type,
     resolver: &TypeResolver,
     strict_optional: bool,
+) -> Option<Type> {
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, false)
+}
+
+/// Free-result variant of `expand_type_by_instance_core`: leftover TypeVars
+/// in the expansion are returned instead of deferring, mirroring Python's
+/// `expand_type_by_instance` (which never defers on leftover method type
+/// vars — `freeze_all_type_vars` reifies them afterwards, typeops.py:2102).
+/// Used by the IAMA member tail, which freezes before returning.
+pub(crate) fn expand_type_by_instance_free(
+    typ: &Type,
+    instance: &Type,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+) -> Option<Type> {
+    expand_type_by_instance_inner(typ, instance, resolver, strict_optional, true)
+}
+
+fn expand_type_by_instance_inner(
+    typ: &Type,
+    instance: &Type,
+    resolver: &TypeResolver,
+    strict_optional: bool,
+    allow_free: bool,
 ) -> Option<Type> {
     let Type::Instance { type_ref, args, .. } = instance else {
         return None;
@@ -241,14 +278,14 @@ pub(crate) fn expand_type_by_instance_core(
                 env.insert((raw_id, 0, env_ns.clone()), arg.clone());
             }
         }
-        return expand_type_with_env(typ, &env, strict_optional);
+        return expand_type_with_env_inner(typ, &env, strict_optional, allow_free);
     }
     // Non-variadic: fast path + binding (expandtype.py:407-409).
     let raw_ids = &snap.type_var_raw_ids;
     for (raw_id, arg) in raw_ids.iter().zip(args) {
         env.insert((*raw_id, 0, env_ns.clone()), arg.clone());
     }
-    expand_type_with_env(typ, &env, strict_optional)
+    expand_type_with_env_inner(typ, &env, strict_optional, allow_free)
 }
 
 /// Decode a wire-format `Type` blob. Returns `None` on any read failure.

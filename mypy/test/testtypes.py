@@ -18338,7 +18338,10 @@ class NativeMemberAccessDispatchSuite(Suite):
             rt = get_proper_type(decoded.ret_type)
             assert isinstance(rt, TypeVarType)
             assert rt.id.raw_id == old
-            assert rt.id.meta_level == 1
+            # Python's freeze_all_type_vars (checkmember.py:933) reifies the
+            # freshened variable to meta_level 0 before the return; the Rust
+            # tail ports that freeze, so parity expects 0 here.
+            assert rt.id.meta_level == 0
         finally:
             TypeVarId.next_raw_id = old
 
