@@ -329,6 +329,7 @@ try:
         rust_and_conditional_maps as _rust_and_conditional_maps,
         rust_are_argument_counts_overlapping as _rust_are_argument_counts_overlapping,
         rust_builtin_item_type as _rust_builtin_item_type,
+        rust_can_be_narrowed_with_len as _rust_can_be_narrowed_with_len,
         rust_check_explicit_override_decorator as _rust_check_explicit_override_decorator,
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_match_args as _rust_check_match_args,
@@ -418,6 +419,7 @@ except ImportError:
     _rust_is_private = None  # type: ignore[assignment]
     _rust_are_argument_counts_overlapping = None  # type: ignore[assignment]
     _rust_builtin_item_type = None  # type: ignore[assignment]
+    _rust_can_be_narrowed_with_len = None  # type: ignore[assignment]
     _rust_check_for_untyped_decorator = None  # type: ignore[assignment]
     _rust_check_overlapping_overloads = None  # type: ignore[assignment]
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
@@ -9270,6 +9272,23 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
         Currently supported types are TupleTypes, Instances of builtins.tuple, and
         unions involving such types.
         """
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _native_checker_resolver is not None
+            and _rust_can_be_narrowed_with_len is not None
+        ):
+            # Issue #1065: the len-narrowing gate predicate. Returns None
+            # (defer) on undecodable wire bytes or an unresolved MRO /
+            # alias snapshot; fall through to the pure-Python body then.
+            try:
+                result = _rust_can_be_narrowed_with_len(
+                    _serialize_type_for_checker(typ), _native_checker_resolver
+                )
+            except (AssertionError, NotImplementedError):
+                result = None
+            if result is not None:
+                return result
         if custom_special_method(typ, "__len__"):
             # If user overrides builtin behavior, we can't do anything.
             return False

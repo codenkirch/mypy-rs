@@ -1470,6 +1470,21 @@ including:
   `NativeArgInferPassesSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), and 14 pure decision
   unit tests in `checkcall.rs`.
+- `rust_can_be_narrowed_with_len` (issue #1065) — exports the
+  `can_be_narrowed_with_len` predicate port that shipped with #493
+  (`crates/type_kernel/src/lennarrow.rs`): True for fixed `TupleType`
+  (or unpack with `builtins.tuple` fallback), `Instance` with
+  `builtins.tuple` base, and unions of those; False when a custom
+  `__len__` overrides builtin behavior. Python shim at
+  `TypeChecker.can_be_narrowed_with_len` (checker.py:9267), the hot
+  gate consulted at the leaf of every `find_isinstance_check`
+  conditional. Defers (`None`) on undecodable wire bytes, a missing
+  resolver snapshot, or an unresolved alias target; the shim falls
+  through to the pure-Python body. Gated by `_native_checker_active`
+  (existing wiring, no build.py change) and covered by
+  `NativeCanBeNarrowedWithLenSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differential plus direct seam calls), plus pure
+  decision unit tests in `lennarrow.rs`.
 
 Stages 1/2 return `None` for any type class Rust does not handle, and
 the Python caller falls back to the pure-Python visitor. This is the
