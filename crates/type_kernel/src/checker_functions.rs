@@ -4717,6 +4717,85 @@ pub(crate) fn rust_classify_simple_assignment(
     ))
 }
 
+/// The `"__i" + method[2:]` name computation of `_find_inplace_method`
+/// (checker.py:11514). Every `operators.op_methods` value is a dunder
+/// name, so `chars().skip(2)` matches the Python slice exactly.
+fn inplace_method_name(method: &str) -> String {
+    format!("__i{}", method.chars().skip(2).collect::<String>())
+}
+
+/// Pure decision core of `infer_operator_assignment_method`
+/// (checker.py:11498-11520): in-place iff the operator admits an inplace
+/// method and the type's class has a readable `__i<rest>` member.
+fn infer_operator_assignment_method_inner(
+    in_ops: bool,
+    has_inplace: bool,
+    method: &str,
+) -> (bool, String) {
+    if in_ops && has_inplace {
+        return (true, inplace_method_name(method));
+    }
+    (false, method.to_string())
+}
+
+/// `TypeChecker.infer_operator_assignment_method` (checker.py:11498) plus
+/// its helper `_find_inplace_method` (checker.py:11514): the pure
+/// `(True, "__i<rest>")` vs `(False, method)` decision for augmented
+/// assignments. Live-PyO3 seam in the `rust_is_magic_base` shape: Rust
+/// reads the already-proper `typ` (an `Instance`, or a `TypedDictType`
+/// via its `fallback`), `typ.type.has_readable_member(...)`, the
+/// `method` string, and the `in_ops` membership flag the shim computes
+/// from `operators.ops_with_inplace_method`. Returns the 2-tuple; never
+/// defers for well-formed input (`None` only on an unreadable
+/// attribute). `get_proper_type` stays shim-side.
+#[pyfunction]
+pub(crate) fn rust_infer_operator_assignment_method(
+    py: Python<'_>,
+    typ: &PyAny,
+    method: &str,
+    in_ops: bool,
+) -> PyResult<Option<(bool, String)>> {
+    let types_mod = py.import("mypy.types")?;
+    let instance_cls: &PyType = types_mod.getattr("Instance")?.downcast()?;
+    let inst = if typ.is_instance(instance_cls)? {
+        typ
+    } else {
+        let typeddict_cls: &PyType = types_mod.getattr("TypedDictType")?.downcast()?;
+        if typ.is_instance(typeddict_cls)? {
+            match typ.getattr("fallback") {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            }
+        } else {
+            // AnyType, CallableType, ...: (False, method), no member scan.
+            return Ok(Some(infer_operator_assignment_method_inner(
+                in_ops, false, method,
+            )));
+        }
+    };
+    let has_inplace = if !in_ops {
+        false
+    } else {
+        let info = match inst.getattr("type") {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let inplace = inplace_method_name(method);
+        match info.call_method1("has_readable_member", (inplace.as_str(),)) {
+            Ok(v) => match v.is_true() {
+                Ok(b) => b,
+                Err(_) => return Ok(None),
+            },
+            Err(_) => return Ok(None),
+        }
+    };
+    Ok(Some(infer_operator_assignment_method_inner(
+        in_ops,
+        has_inplace,
+        method,
+    )))
+}
+
 #[cfg(test)]
 mod classify_simple_assignment_tests {
     use super::*;
@@ -5035,5 +5114,56 @@ mod all_supers_gate_tests {
     fn test_var_flags_ignored_for_non_var() {
         // Non-var nodes never consult the property flags.
         assert!(!writable(false, true, true, None));
+    }
+}
+
+#[cfg(test)]
+mod opassign_tests {
+    use super::*;
+
+    #[test]
+    fn test_inplace_name_strips_dunder() {
+        assert_eq!(inplace_method_name("__add__"), "__iadd__");
+        assert_eq!(inplace_method_name("__mul__"), "__imul__");
+        assert_eq!(inplace_method_name("__lshift__"), "__ilshift__");
+    }
+
+    #[test]
+    fn test_inplace_name_short_method() {
+        // Python `method[2:]` on a shorter name yields ""; match exactly.
+        assert_eq!(inplace_method_name("__"), "__i");
+    }
+
+    #[test]
+    fn test_inplace_when_member_present_and_in_ops() {
+        assert_eq!(
+            infer_operator_assignment_method_inner(true, true, "__add__"),
+            (true, "__iadd__".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plain_when_member_absent() {
+        assert_eq!(
+            infer_operator_assignment_method_inner(true, false, "__add__"),
+            (false, "__add__".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plain_when_operator_not_in_inplace_set() {
+        // e.g. "in": ops_with_inplace_method membership is False.
+        assert_eq!(
+            infer_operator_assignment_method_inner(false, true, "__contains__"),
+            (false, "__contains__".to_string())
+        );
+    }
+
+    #[test]
+    fn test_plain_when_neither() {
+        assert_eq!(
+            infer_operator_assignment_method_inner(false, false, "__add__"),
+            (false, "__add__".to_string())
+        );
     }
 }

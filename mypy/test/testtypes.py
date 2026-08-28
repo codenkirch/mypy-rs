@@ -40990,3 +40990,135 @@ class NativeFindMemberPreludeSuite(Suite):
         info = self._info("mod.C")
         self._add_method(info, "__getattr__")
         self._assert_par("__setattr__", self._instance(info))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeInferOperatorAssignmentSuite(Suite):
+    """Parity for the Rust `infer_operator_assignment_method` port (#1079).
+
+    `TypeChecker.infer_operator_assignment_method` (checker.py:11498) plus
+    its helper `_find_inplace_method` decide `(True, "__i<rest>")` vs
+    `(False, method)` for augmented assignments: an Instance (or a
+    TypedDictType via its fallback) whose class has a readable inplace
+    member, gated by `operators.ops_with_inplace_method`. The Rust port
+    (`checker_functions.rs`) reads the live proper type via PyO3 and
+    returns the 2-tuple; `get_proper_type` and the operator-set membership
+    stay shim-side. Direct seam calls assert the exact tuple; the
+    gate-off vs gate-on differential drives the real module function.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, name: str, members: tuple[str, ...] = ()) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        defn = ClassDef(name, Block([]), None, [])
+        defn.fullname = "mod." + name
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        for member in members:
+            fn = FuncDef(
+                member, [], None, CallableType([], [], [], self.fx.anyt, self.fx.function)
+            )
+            fn.info = info
+            info.names[member] = SymbolTableNode(MDEF, fn)
+        return info
+
+    def _td(self, info: TypeInfo) -> TypedDictType:
+        return TypedDictType({}, set(), set(), Instance(info, []))
+
+    def _facts(self, operator: str) -> tuple[str, bool]:
+        from mypy import operators
+
+        return (
+            operators.op_methods[operator],
+            operator in operators.ops_with_inplace_method,
+        )
+
+    def _seam(self, typ: Any, operator: str) -> Any:
+        method, in_ops = self._facts(operator)
+        return _type_kernel.rust_infer_operator_assignment_method(typ, method, in_ops)
+
+    def _run(self, typ: Type, operator: str) -> tuple[tuple[bool, str], tuple[bool, str]]:
+        from mypy.checker import infer_operator_assignment_method
+
+        def call() -> tuple[bool, str]:
+            return infer_operator_assignment_method(typ, operator)
+
+        off = self._with_gate(False, call)
+        on = self._with_gate(True, call)
+        return off, on
+
+    def _assert_par(self, typ: Type, operator: str, expected: tuple[bool, str]) -> None:
+        off, on = self._run(typ, operator)
+        assert_equal(on, off, f"opassign parity for {typ!r} operator={operator!r}")
+        assert_equal(on, expected, f"opassign value for {typ!r} operator={operator!r}")
+
+    def test_seam_instance_with_inplace(self) -> None:
+        itype = Instance(self._info("C", ("__iadd__",)), [])
+        assert self._seam(itype, "+") == (True, "__iadd__")
+
+    def test_seam_instance_without_inplace(self) -> None:
+        itype = Instance(self._info("C"), [])
+        assert self._seam(itype, "+") == (False, "__add__")
+
+    def test_seam_typeddict_fallback_with_inplace(self) -> None:
+        td = self._td(self._info("TD", ("__imul__",)))
+        assert self._seam(td, "*") == (True, "__imul__")
+
+    def test_seam_typeddict_fallback_without_inplace(self) -> None:
+        td = self._td(self._info("TD"))
+        assert self._seam(td, "*") == (False, "__mul__")
+
+    def test_seam_non_instance(self) -> None:
+        assert self._seam(self.fx.anyt, "+") == (False, "__add__")
+        assert self._seam(NoneType(), "+") == (False, "__add__")
+
+    def test_seam_operator_not_in_inplace_set(self) -> None:
+        # "in" has no inplace method even when a member is present.
+        itype = Instance(self._info("C", ("__icontains__",)), [])
+        assert self._seam(itype, "in") == (False, "__contains__")
+
+    def test_parity_instance_with_inplace(self) -> None:
+        self._assert_par(
+            Instance(self._info("C", ("__iadd__",)), []), "+", (True, "__iadd__")
+        )
+
+    def test_parity_instance_without_inplace(self) -> None:
+        self._assert_par(Instance(self._info("C"), []), "+", (False, "__add__"))
+
+    def test_parity_typeddict_fallback_with_inplace(self) -> None:
+        self._assert_par(
+            self._td(self._info("TD", ("__imul__",))), "*", (True, "__imul__")
+        )
+
+    def test_parity_typeddict_fallback_without_inplace(self) -> None:
+        self._assert_par(self._td(self._info("TD")), "*", (False, "__mul__"))
+
+    def test_parity_non_instance_types(self) -> None:
+        self._assert_par(self.fx.anyt, "+", (False, "__add__"))
+        self._assert_par(NoneType(), "+", (False, "__add__"))
+        self._assert_par(self.fx.nonet, "+", (False, "__add__"))
+
+    def test_parity_operator_not_in_inplace_set(self) -> None:
+        # Member present but the operator admits no inplace method.
+        self._assert_par(
+            Instance(self._info("C", ("__icontains__",)), []), "in", (False, "__contains__")
+        )
+        self._assert_par(Instance(self._info("C"), []), "==", (False, "__eq__"))

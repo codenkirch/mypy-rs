@@ -3148,6 +3148,15 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // Issue #1079: infer_operator_assignment_method decision. Rust reads
+    // the live proper type via PyO3 and returns the (is_inplace, method)
+    // pair; get_proper_type and the ops_with_inplace_method membership
+    // stay shim-side.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_infer_operator_assignment_method,
+        module
+    )?)?;
+
     // Issue #942: check_for_untyped_decorator conjunction port. Rust folds
     // the disallow/typed-callback/untyped-decorator/not-deferred bool gate on
     // the wire format; the message emission stays in Python.

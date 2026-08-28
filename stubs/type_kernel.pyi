@@ -450,6 +450,7 @@ __all__ = [
     "rust_check_vec_type_args",
     "rust_check_unpacks_in_list",
     "rust_find_matching_overload_items",
+    "rust_infer_operator_assignment_method",
     "IdMapper",
 ]
 
@@ -2710,3 +2711,8 @@ def rust_classify_enum(
 ) -> tuple[int, list[str]] | None: ...
 def rust_always_returns_none(node: Expression, info: TypeInfo | None) -> bool | None: ...
 def rust_lookup_definer(typ: Instance, attr_name: str) -> str | None: ...
+# Issue #1079: infer_operator_assignment_method decision. Returns the
+# (is_inplace, method_name) pair, or None on an unreadable attribute.
+def rust_infer_operator_assignment_method(
+    typ: Any, method: str, in_ops: bool
+) -> tuple[bool, str] | None: ...
