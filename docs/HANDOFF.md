@@ -1,91 +1,119 @@
-# Handoff: deferral-reduction swarms (13 PRs merged; census exhausted)
+# Handoff: strangler-fig Rust migration loop (seam-deferral reduction)
 
-## Summary
+*Written 2026-08-28. Goal: "migrate all python code to rust, really all" —
+pursued as the established measure → file → dispatch-2-agents → process-PRs
+→ gate loop. This file is the resume point.*
 
-Agent swarms shipped the entire type_kernel deferral-reduction audit queue in
-three waves. 13 PRs merged onto `main` (now `5b11c2100`). The deferral census
-(`rg 'return None'`) is now **exhausted**: every wire-portable defer in the
-type_kernel crate was ported, and each agent confirmed the remaining `return
-None` sites are the non-wire-portable set (error emission / plugin hooks /
-analyzer side effects / live-object state that the binary wire cannot carry).
-The strategic next step is the migration's Phase E1 (`is_subtype`) on the
-`wire::read_type_to_str` foundation, not more deferral shaving.
+## Where main stands
 
-## Merged this turn (main `5b11c2100`) — 13 PRs
+- `main` = `f90ed2a77` (`perf(checkmember): skip type-obj callables,
+  partials in M20 gate (#1120)`), local ff'd to origin.
+- Gates on clean main: parity `10850 passed, 72 skipped, 7 xfailed`
+  (`TEST_NATIVE_TYPE_KERNEL=1 TEST_NATIVE_PARSER=1 TEST_NATIVE_RESOLVER=1
+  .venv/bin/python -m pytest mypy/test/testtypes.py mypy/test/testcheck.py
+  -n4 -q`), self-check `Success: no issues found in 344 source files`.
+- Shared `.so` in `/private/tmp/mypy-rs-local-typekernel/` was rebuilt and
+  codesigned at `43c3e2644`; **rebuild + codesign from `f90ed2a77` before
+  the next survey** (procedure under "The loop", step 4).
+- Last full survey (`cd9abd4e5`): **6,381,797 seam calls, 97.6% native**.
+  Since then: IAMA dispatch 88% → 92% (#1119), member_access 68% → 89%
+  (#1120), is_subtype defers 22,419 → 20,680 (#1118).
 
-| PR | Issue | File / seam | SHA |
-|----|-------|-------------|-----|
-| #859 | #816 | join_type_list re-enable | 81e29ec32 |
-| #875 | #868 | subtypes.rs alias defers | e021cea2a |
-| #876 | #870 | typeops.rs alias defers | 55e367844 |
-| #877 | #869 | constraints.rs get_proper_or_expand threading | 8464ba827 |
-| #878 | #867 | setops.rs diff-args Instance join (26%->83% native) | 71a06dd8a |
-| #879 | #873 | checkcall.rs real_union / none_overlap aliases | a384b7777 |
-| #880 | #874 | meet.rs is_overlapping / narrow_declared aliases | fe38e36c8 |
-| #881 | #871 | checkexpr_functions.rs has_bytes / allow_fast aliases | b5b49ab33 |
-| #882 | #872 | checkmember.rs member-access fallback instances (~1211) | c4848754f |
-| #887 | #886 | messages.rs format_type_distinctly verbosity decision | 74dcc772c |
-| #888 | #883 | checkpattern.rs 5 coarse alias rejects (+ latency fix) | 5bacad1d3 |
-| #889 | #885 | checker_helpers.rs erase_instances 2nd-check gap | 2320bccfc |
-| #890 | #884 | expandtype.rs empty-env eager bail (46.9%->55.1%) | 5b11c2100 |
+## This session's merges (in order)
 
-All squashed, CI green (pr-gate + parity + parity-typeops), zero review
-comments on all 13 (copilot at quota; OCR posted nothing actionable). Every PR
-carried a gate-on/off parity differential suite + `Fixes #NNN`.
+| PR | Issue | What | Numbers |
+|----|-------|------|---------|
+| #1110 | — | survey script: protocol-test-callee → CLASSIFIER_NEGATIVE_SEAMS | chore |
+| #1116 | #1108 | descriptor-head guards decided in Rust | biggest bucket (29.9k @ 2%) |
+| #1118 | #1111 | protocol-right Instance arm natively (assuming guard, dep record, member-flag arbitration) | is_subtype defers 22,419 → 20,680; fixed mro_has miss pre-check + dropped IS_CLASSVAR |
+| #1119 | #1112 | IAMA dispatch: freshen TypeAliasType arm + builtins.tuple map case; TupleType arm now recurses on tuple_fallback | 12,126 → 7,919 fallbacks (88% → 92%) |
+| #1120 | #1117 | M20 gate skips type-obj callables and PartialTypes | member_access 16,079 @ 68% → 12,295 @ 89%; ~1,230 defers left (documented: CallableType/Overloaded tail belongs to #342 mega-port, TupleType = IAMA handoffs) |
 
-## Wildy-exhausted census; honest limits found
-Several agents measured that a "port" can be deferral-neutral in outcome
-(messages #887: the decision moves native but the trailing Python format step
-is non-portable) or corpus-zero (#889: the prod path is real but rarely hit in
-tests; #883: `return None` count even unchanged because expansion adds `?`
-short-circuits but coarse alias rejects became decisions). The dominant
-remaining defers are: subtype/plugin/descriptor/error paths, ParamSpec /
-TypeVarTuple / vararg-Unpack interpolation, and leftover-TypeVar object
-identity in expansion. None are wire-portable under the current kernel
-contract. See docs/rust-migration-strangler.md Phase E1 for the next step.
+Closed not-planned with evidence (negative results, the loop working):
 
-## Critical environment facts (hit multiple agents)
-- **Venves default to Python 3.14.5**: `uv sync` in these worktrees creates a
-  3.14.5 venv which CANNOT load a `.cpython-313-darwin.so`. type_kernel is
-  `pyo3 abi3-py37` (one build loads under any python), but the module filename
-  tag must match the interpreter. Two working fixes: (a) `uv sync --python
-  3.13` for a 3.13.14 venv (used for waves 2-3); (b) test with the shared
-  `/private/tmp/upmypy-venv` (3.13.14, `test` group installed). Prebuilt deps
-  in `/private/tmp/mypy-rs-local-{ast,resolver}` carry both `-313`/`-314` .so.
-- **Stale `.so`**: after ANY rebase that absorbs main commits touching the
-  crate, rebuild — a stale `.so` gives false parity failures (e.g. the 5/7
-  `NativeJoinTypeListSuite` seam-engagement failures that vanished on rebuild).
-- **Bash cwd REFUSES /private/tmp**: every worktree command starts `cd
-  <wt> && ...`.
-- Build: `cargo rustc -p mypy-type-kernel --features extension-module --lib
-  --crate-type cdylib --release -- -C link-arg=-undefined
-  -C link-arg=dynamic_lookup`, copy dylib to scratch as
-  `.cpython-313-darwin.so`. NEVER `maturin develop`. Test: `PYTHONPATH=<scratch>:
-  <resolver>:<ast> TEST_NATIVE_TYPE_KERNEL=1 <py> -m pytest -n0
-  mypy/test/testtypes.py -q -p no:cacheprovider`. NEVER `-n auto` (OOM).
-- Rust gates: `cargo test -p mypy-type-kernel` (3 `treetransform` failures are
-  pre-existing env `ModuleNotFoundError: mypy`), `cargo clippy --all-targets --
-  -D warnings` (~55 pre-existing `doc_lazy_continuation` errors under rustc
-  1.98 — a change must add ZERO new), `cargo fmt --check`.
-- Pre-commit git-template hook rejects >3 consecutive comment lines and any
-  comment line >88 chars; ruff `--fix` can auto-pollute unrelated suite files
-  in testtypes.py on commit — agents must commit with `--no-verify` only when
-  verified pollution-free, and watch the comment-block guard.
+- **#1109** (type_analyze defers): the 78% share was kernel-boundary;
+  end-to-end the seam wins 0 calls — the wirefixup map only gains an SCC's
+  TypeInfos after that SCC's semanal completes, and parallel workers never
+  build native resolvers. Follow-up filed as **#1115** (decode lifecycle in
+  `process_stale_scc`, plus worker-side resolver wiring).
+- **#1113** (expand_type defers): buckets structural — leftover-typevar
+  3,020 (solver identity contract), input/result-alias 2,597 (wire
+  `TypeAliasType` has `alias=None`), encode-fail 28, callable-unpack 3. The
+  92% share is real end-to-end. Side finding: `rust_expand_type_by_instance`
+  wins only 465 of 108,797 Python-side calls (0.4%).
 
-## Rebase workflow (proven across waves 2-3)
-When merging N PRs that all edit `mypy/test/testtypes.py` (new `Native*Suite`
-classes) and occasional shared Python seams (e.g. #879/#881 both touched
-`mypy/checkexpr.py`), each squash merge advances main; the next PR (based on
-the pre-merge head) must be rebased (`git rebase origin/main`) before it will
-merge. So far every such rebase was conflict-free because suites anchor at
-distinct testtypes.py locations and python-edits landed in different functions.
-If a real testtypes.py suite conflict occurs, splice both classes in by class-
-name anchor (see the setops #878 rebase resolution this session).
+All session worktrees/branches cleaned up by the agents; remaining
+worktrees (`swarm-checkexpr`, `swarm-seam1`, `mypy-rs-callable-name-1100`)
+and stashes are pre-existing — leave them.
 
-## Repo / workflow
-Repo codenkirch/mypy-rs, PRs target `main`. CI gate: pr-gate + native-kernel
-parity (parity + parity-typeops) + parity. Agents push a branch, open a PR with
-an audit table + `Fixes #NNN`, do NOT merge. Orchestrator: `agent-wait until
-github.pr <N> -R codenkirch/mypy-rs -i 30 -t 2400`, check pull comments, merge
-`--squash --admin`. Leftover staged worktrees from this session (wave 1-3,
-branches now merged) can be removed via `git worktree remove` when convenient.
+## Open backlog (next waves; dispatch max ~2 port agents)
+
+1. **is_subtype tail (~20.7k defers)** — the largest remaining bucket.
+   Remaining protoR defers (~13.1k) are dominated by
+   `get_protocol_member_inner` deferrals (extra_attrs, base-class members
+   behind the same-class guard, descriptors). Unfiled — file an issue with
+   these numbers before dispatching.
+2. **#1114** — rust_find_self_type 35,210 @ 93% (~2.5k defers).
+3. **#1115** — build-side decode lifecycle; bigger slice crossing
+   semanal/worker build paths; needs careful daemon/cache parity assessment.
+4. **#342** — analyze_class_attribute_access mega-port (now owns the
+   member_access CallableType/Overloaded tail).
+5. After the above, re-survey; remaining >90% seams (coerce_to_literal 97%,
+   find_self_type 93%, infer_constraints_full 84% — verify end-to-end) are
+   the next candidates.
+
+## The loop (how to continue)
+
+1. Rebuild + codesign shared `.so` from current main:
+   `cargo rustc -p mypy-type-kernel --features extension-module --lib
+   --crate-type cdylib --release -- -C link-arg=-undefined -C
+   link-arg=dynamic_lookup`, cp to
+   `/private/tmp/mypy-rs-local-typekernel/type_kernel.cpython-31{3,4}-darwin.so`,
+   `codesign -f -s - /private/tmp/mypy-rs-local-typekernel/*.so`.
+2. Survey: `PYTHONPATH=/private/tmp/mypy-rs-local-typekernel:/private/tmp/mypy-rs-local-resolver:/private/tmp/mypy-rs-local-ast
+   uv run --no-sync python scripts/measure_native_share.py > /tmp/survey.txt
+   2>&1`; rank non-100% lines by absolute fallbacks
+   (`calls * (1 - native%)`).
+3. Dup-check (`gh issue list --state open --search ...`), file a
+   conventional issue with the numbers + audit-first method + the
+   #1091/#1109/#1113 precedent.
+4. Dispatch max ~2 coder agents per wave with the full workflow briefing
+   (own worktree, private scratch dir, gates, PR flow, cross-file
+   exclusions, cleanup duty).
+5. Agents usually self-merge end-to-end; if one ends right after opening its
+   PR, you own: `agent-wait until github.pr <N> -R codenkirch/mypy-rs -t
+   900`, then `gh pr merge <N> -R codenkirch/mypy-rs --squash --admin`.
+6. After merges: `git checkout main && git pull --ff-only`, rebuild +
+   codesign the shared `.so`, re-run both gates, next survey.
+
+## Hard rules (each learned at real cost — do not rediscover)
+
+- Every Bash call starts `cd <dir> && ` (no persistent cwd; the Bash cwd
+  parameter is rejected for worktree paths).
+- pytest `-n 4` max, never `-n auto` (64GB machine OOMs the full suite).
+- Codesign `-f -s -` any copied `.so` or the interpreter SIGKILLs.
+- Rebuild the `.so` after any Rust edit; use PRIVATE scratch dirs
+  (`/private/tmp/mypy-rs-local-tk-<issue>/`) when agents run in parallel.
+- Worktree venvs lack pytest — use the main checkout's `.venv/bin/python`
+  with PYTHONPATH pointing at the private scratch dir plus the shared
+  resolver/ast dirs; put the WORKTREE root first on PYTHONPATH when
+  surveying from a worktree (venv import otherwise shadows it — #1120's
+  agent hit this).
+- Self-check: same PYTHONPATH + `TEST_NATIVE_TYPE_KERNEL=1 .venv/bin/python
+  -m mypy --config-file mypy_self_check.ini -p mypy -p mypyc`.
+- Known CI flake:
+  `NativeCompatibilityClassvarSuperSuite::test_parity_every_branch` — one
+  rerun = green.
+- Rebase protocol when sibling PRs conflict: testtypes.py → origin/main's
+  file + only my suite appended; AGENTS.md → keep both bullets; lib.rs →
+  keep both registration lines; `grep -rn "<<<<<<< HEAD" crates/ mypy/
+  AGENTS.md` before `push --force-with-lease`.
+- Comment blocks: max 3 consecutive lines, ≤88 chars (pre-commit hook
+  enforces).
+- Never maturin develop for these crates (repo-root pyproject shadowing).
+- Audit instrumentation is env-gated and REMOVED before commit; a negative
+  audit closes the issue not-planned with the bucket table (precedent
+  #1091/#1109/#1113). Verify end-to-end wins, not just kernel-boundary
+  share (#1109/#1115 trap). Survey caveat: `rust_type_analyze`'s share line
+  is a kernel-boundary artifact; discount it when ranking.
+- OCR is disabled on this repo; CI-green is the operative merge gate.
