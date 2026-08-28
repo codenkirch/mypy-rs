@@ -40,19 +40,35 @@ def _make_module(prefix: str) -> MypyFile:
     info = _make_class(f"{prefix}.C", prefix)
     inner = _make_class(f"{prefix}.C.Inner", prefix)
     info.names["Inner"] = SymbolTableNode(GDEF, inner)
-    alias = TypeAlias(
-        AnyType(TypeOfAny.implementation_artifact),
-        f"{prefix}.A",
-        prefix,
-        1,
-        0,
-    )
+    alias = TypeAlias(AnyType(TypeOfAny.implementation_artifact), f"{prefix}.A", prefix, 1, 0)
     mod = MypyFile(defs=[], imports=[])
     mod._fullname = prefix
-    mod.names = SymbolTable(
-        {"C": SymbolTableNode(GDEF, info), "A": SymbolTableNode(GDEF, alias)}
-    )
+    mod.names = SymbolTable({"C": SymbolTableNode(GDEF, info), "A": SymbolTableNode(GDEF, alias)})
     return mod
+
+
+def _add_reachable_only_aliases(prefix: str, mod: MypyFile) -> None:
+    """Attach the info-reachable aliases of issue #1133 to `mod`.
+
+    A TypedDict/NamedTuple special alias on `C`, a class-level alias in
+    `C.names`, and an alias on the nested class `C.Inner`: none of these
+    is reachable from the module top-level `names` walk.
+    """
+    target = AnyType(TypeOfAny.implementation_artifact)
+    cls = mod.names["C"].node
+    assert isinstance(cls, TypeInfo)
+    cls.special_alias = TypeAlias(
+        AnyType(TypeOfAny.implementation_artifact), f"{prefix}.C.Named", prefix, 1, 0
+    )
+    cls.names["Alias"] = SymbolTableNode(
+        GDEF, TypeAlias(target, f"{prefix}.C.Alias", prefix, 1, 0)
+    )
+    inner = cls.names["Inner"].node
+    assert isinstance(inner, TypeInfo)
+    inner.names["Alias"] = SymbolTableNode(
+        GDEF,
+        TypeAlias(AnyType(TypeOfAny.implementation_artifact), f"{prefix}.C.Inner.A", prefix, 1, 0),
+    )
 
 
 class WirefixupInstallSuite(Suite):
@@ -112,6 +128,34 @@ class WirefixupInstallSuite(Suite):
         assert id(self.mgr._native_typeinfo_map) == map_id
         assert "mod2.C" in self.mgr._native_typeinfo_map
         assert "mod1.C" in self.mgr._native_typeinfo_map
+
+    def test_info_reachable_aliases_are_collected(self) -> None:
+        # issue #1133: the alias snapshot must cover `info.special_alias`
+        # and class-level aliases, not only module top-level ones.
+        self.mgr.modules["mod"] = _make_module("mod")
+        _add_reachable_only_aliases("mod", self.mgr.modules["mod"])
+        self.mgr._install_semal_wirefixup("mod")
+        assert set(self.mgr._native_alias_map) == {
+            "mod.A",
+            "mod.C.Named",
+            "mod.C.Alias",
+            "mod.C.Inner.A",
+        }
+
+    def test_collect_incremental_covers_info_reachable_aliases(self) -> None:
+        # issue #1133: the per-SCC collection feeding the Rust resolver
+        # must see the same info-reachable aliases.
+        self.mgr._native_walked_modules = set()
+        self.mgr.modules["mod"] = _make_module("mod")
+        _add_reachable_only_aliases("mod", self.mgr.modules["mod"])
+        infos, aliases = self.mgr._collect_incremental(["mod"])
+        assert {info.fullname for info in infos} == {"mod.C", "mod.C.Inner"}
+        assert {alias.fullname for alias in aliases} == {
+            "mod.A",
+            "mod.C.Named",
+            "mod.C.Alias",
+            "mod.C.Inner.A",
+        }
 
 
 if __name__ == "__main__":

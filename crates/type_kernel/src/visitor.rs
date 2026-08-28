@@ -182,6 +182,18 @@ pub(crate) fn has_recursive_types_inner(typ: &Type) -> Option<bool> {
     Some(false)
 }
 
+/// True if `typ` contains any `TypeAliasType` node. On the wire a
+/// self-recursive alias is only expressible as a lazy `TypeAliasType` ref,
+/// so "contains an alias" is the conservative recursive-shape test used by
+/// the constraints cycle guard (issue #1133), where
+/// `has_recursive_types_inner`'s defer is too coarse to branch on.
+pub(crate) fn type_contains_alias(typ: &Type) -> bool {
+    if matches!(typ, Type::TypeAliasType { .. }) {
+        return true;
+    }
+    children(typ).into_iter().any(type_contains_alias)
+}
+
 /// Yield the direct child types of `typ` (for ANY_STRATEGY / ALL_STRATEGY
 /// traversal). Mirrors the `query_types` calls in `BoolTypeQuery.visit_*`.
 fn children(typ: &Type) -> Vec<&Type> {

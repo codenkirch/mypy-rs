@@ -1034,6 +1034,7 @@ class BuildManager:
         import os as _os_semanal
 
         from mypy.semanal import _set_native_semanal_active
+
         _set_native_semanal_active(
             self.options.native_type_kernel
             and bool(_os_semanal.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
@@ -1072,10 +1073,7 @@ class BuildManager:
         # Stage 7: gate visitor scalar-returning and type-returning
         # functions. Parity verified 8198/0 with the type-returning gate
         # on since the truthiness wire fix (#201).
-        from mypy.types import (
-            _set_native_visitor_active,
-            _set_native_visitor_types_active,
-        )
+        from mypy.types import _set_native_visitor_active, _set_native_visitor_types_active
 
         _set_native_visitor_active(self.options.native_type_kernel)
         _set_native_visitor_types_active(self.options.native_type_kernel)
@@ -1137,9 +1135,9 @@ class BuildManager:
         import os as _os
 
         from mypy.semanal import _set_native_semanal_visitor_active
+
         _set_native_semanal_visitor_active(
-            self.options.native_type_kernel
-            and bool(_os.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
+            self.options.native_type_kernel and bool(_os.environ.get("MYPY_ENABLE_NATIVE_SEMANAL"))
         )
         from mypy.semanal_shared import _set_native_semanal_shared_active
 
@@ -1358,15 +1356,33 @@ class BuildManager:
                     self._collect_nested_type_infos(node, infos)
         return infos
 
-    def _collect_nested_type_infos(
-        self, info: TypeInfo, infos: list[TypeInfo]
-    ) -> None:
+    def _collect_nested_type_infos(self, info: TypeInfo, infos: list[TypeInfo]) -> None:
         """Recursively collect TypeInfos nested inside `info.names`."""
         for sym in info.names.values():
             node = sym.node
             if isinstance(node, TypeInfo):
                 infos.append(node)
                 self._collect_nested_type_infos(node, infos)
+
+    def _collect_nested_aliases(self, info: TypeInfo, aliases: list[TypeAlias]) -> None:
+        """Collect TypeAlias nodes reachable only through `info` (issue #1133).
+
+        Class-level `X = ...` aliases live in `info.names` (recursively,
+        for nested classes), and TypedDict/NamedTuple special aliases live
+        only in `info.special_alias` — neither is reachable from the
+        module top-level `names` walk, so the alias snapshot missed them
+        and every seam that hit their `TypeAliasType` on the wire deferred
+        to Python.
+        """
+        special = info.special_alias
+        if special is not None:
+            aliases.append(special)
+        for sym in info.names.values():
+            node = sym.node
+            if isinstance(node, TypeAlias):
+                aliases.append(node)
+            elif isinstance(node, TypeInfo):
+                self._collect_nested_aliases(node, aliases)
 
     def _collect_aliases(self) -> list[TypeAlias]:
         """Walk all loaded modules and collect every `TypeAlias` node.
@@ -1386,6 +1402,8 @@ class BuildManager:
                 node = sym.node
                 if isinstance(node, TypeAlias):
                     aliases.append(node)
+                elif isinstance(node, TypeInfo):
+                    self._collect_nested_aliases(node, aliases)
         return aliases
 
     def _collect_alias_map(self) -> dict[str, TypeAlias]:
@@ -1433,6 +1451,7 @@ class BuildManager:
                 if isinstance(node, TypeInfo):
                     infos.append(node)
                     self._collect_nested_type_infos(node, infos)
+                    self._collect_nested_aliases(node, aliases)
                 elif isinstance(node, TypeAlias):
                     aliases.append(node)
         return infos, aliases
@@ -1483,11 +1502,13 @@ class BuildManager:
             # unless parity CI required the native path
             # (MYPY_NATIVE_TYPE_KERNEL_REQUIRED=1).
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
-                raise CompileError([
-                    "native_type_kernel is enabled but the type_kernel "
-                    "extension failed to import (required by "
-                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
-                ]) from None
+                raise CompileError(
+                    [
+                        "native_type_kernel is enabled but the type_kernel "
+                        "extension failed to import (required by "
+                        "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                    ]
+                ) from None
             return
         from mypy.join import _set_native_join_resolver, _set_native_join_typeinfo_map
         from mypy.mro import _set_native_mro_resolver
@@ -1727,11 +1748,13 @@ class BuildManager:
             # Optional accelerator: same contract as
             # `_build_native_resolvers` (required-env builds raise).
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
-                raise CompileError([
-                    "native_type_kernel is enabled but the type_kernel "
-                    "extension failed to import (required by "
-                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
-                ]) from None
+                raise CompileError(
+                    [
+                        "native_type_kernel is enabled but the type_kernel "
+                        "extension failed to import (required by "
+                        "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                    ]
+                ) from None
             return
         module = self.modules.get(module_id)
         if module is None:
@@ -1740,15 +1763,21 @@ class BuildManager:
         from mypy.wirefixup import set_wire_alias_map, set_wire_typeinfo_map
 
         # Mirror `_collect_incremental`'s per-module walk: TypeInfos
-        # including nested classes, top-level aliases only.
+        # including nested classes, top-level aliases plus info-reachable
+        # ones (`info.special_alias`, class-level aliases; #1133).
         infos: list[TypeInfo] = []
+        aliases: list[TypeAlias] = []
         for sym in module.names.values():
             node = sym.node
             if isinstance(node, TypeInfo):
                 infos.append(node)
                 self._collect_nested_type_infos(node, infos)
             elif isinstance(node, TypeAlias):
-                self._native_alias_map[node.fullname] = node
+                aliases.append(node)
+        for info in infos:
+            self._collect_nested_aliases(info, aliases)
+        for alias in aliases:
+            self._native_alias_map[alias.fullname] = alias
         for info in infos:
             self._native_typeinfo_map[info.fullname] = info
         # Same-identity installs are no-ops for the deser caches; the
@@ -1779,11 +1808,13 @@ class BuildManager:
             import type_kernel as _type_kernel
         except ImportError:
             if os.environ.get("MYPY_NATIVE_TYPE_KERNEL_REQUIRED"):
-                raise CompileError([
-                    "native_type_kernel is enabled but the type_kernel "
-                    "extension failed to import (required by "
-                    "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
-                ]) from None
+                raise CompileError(
+                    [
+                        "native_type_kernel is enabled but the type_kernel "
+                        "extension failed to import (required by "
+                        "MYPY_NATIVE_TYPE_KERNEL_REQUIRED)"
+                    ]
+                ) from None
             return
         from mypy.checkexpr import _set_native_plugin_hook_registry
         from mypy.plugins.default import DEFAULT_HOOK_FULLNAMES_BY_KIND
@@ -1801,10 +1832,7 @@ class BuildManager:
     def dump_stats(self) -> None:
         if self.stats_enabled:
             from mypy.checker import _checker_decode_count
-            from mypy.checkmember import (
-                _deser_cache_hits,
-                _deser_cache_misses,
-            )
+            from mypy.checkmember import _deser_cache_hits, _deser_cache_misses
 
             for freeze, hits in _deser_cache_hits.items():
                 self.stats[f"deser_cache_hits_{freeze}"] = hits[0]
@@ -2229,11 +2257,9 @@ class BuildManager:
         batch: list[SCC] = []
         size_in_batch = 0
         while self.scc_queue and (
-            # Three notes keep in mind here:
-            #   * Heap key is *negative* size (so that larger SCCs appear first).
-            #   * Each batch must have at least one item.
-
-            #   * Adding another SCC to batch should not exceed maximum allowed size.
+            # Three notes: heap key is *negative* size (larger SCCs appear
+            # first), each batch must have at least one item, and adding
+            # another SCC to batch should not exceed maximum allowed size.
             size_in_batch - self.scc_queue[0][0] <= max_size_in_batch
             or not batch
         ):
@@ -3538,11 +3564,9 @@ class State:
         caller_line: int = 0,
         ancestor_for: State | None = None,
         root_source: bool = False,
-        # If `temporary` is True, this State is being created to just
-        # quickly parse/load the tree, without an intention to further
-        # process it. With this flag, any changes to external state as well
-
-        # as error reporting should be avoided.
+        # If `temporary` is True, this State is being created to just quickly
+        # parse/load the tree without intending to further process it; any
+        # changes to external state and error reporting should be avoided.
         temporary: bool = False,
     ) -> State:
         if not temporary:
@@ -4297,6 +4321,7 @@ class State:
         import os as _os
 
         from mypy.types import _set_type_wire_cache_enabled
+
         _set_type_wire_cache_enabled(not _os.environ.get("MYPY_NO_WIRE_CACHE"))
         t0 = time_ref()
         with self.wrap_context():
@@ -4375,12 +4400,9 @@ class State:
             # We should always patch indirect dependencies, even in full (non-incremental) builds,
             # because the cache still may be written, and it must be correct.
             self.patch_indirect_dependencies(
-                # Two possible sources of indirect dependencies:
-                # * Symbols not directly imported in this module but accessed via an attribute
-                #   or via a re-export (vast majority of these recorded in semantic analysis).
-
-                # * For each expression type we need to record definitions of type components
-                #   since "meaning" of the type may be updated when definitions are updated.
+                # Two sources of indirect dependencies: symbols not directly
+                # imported here but reached via an attribute or re-export, and
+                # type components (a type's "meaning" changes with its definition).
                 self.tree.module_refs | self.type_checker().module_refs,
                 set(self.type_map().values()),
             )
