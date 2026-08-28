@@ -42895,3 +42895,133 @@ class NativeDecidedNoneSuite(Suite):
         assert decided is True and val == 7
         decided, val = self._tk.rust_constant_fold_expr(NameExpr("True"), "mod")
         assert decided is True and val is True
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeSetCallableNameSuite(Suite):
+    """Parity for `rust_set_callable_name` (issue #1100).
+
+    `mypy.semanal_shared.set_callable_name` (semanal_shared.py:290-310)
+    resolves a callable's display name from the defining `FuncDef`. The
+    Rust seam is a live-PyO3-object port. Its class-context test mirrors
+    Python's `if fdef.info:` truthiness: non-method FuncDefs carry a
+    FakeInfo placeholder (FUNC_NO_INFO) whose `__getattribute__` raises,
+    and `TypeInfo.__bool__` returns False for it. Direct seam calls assert
+    the composed name (and the non-FunctionLike passthrough); toggling the
+    semanal_shared gate off vs on drives the real `set_callable_name` and
+    must agree on both.
+    """
+
+    def setUp(self) -> None:
+        from mypy.semanal_shared import _set_native_semanal_shared_active, set_callable_name
+
+        self.fx = TypeFixture()
+        self._set_callable_name = set_callable_name
+        self._set_active = _set_native_semanal_shared_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], Any]) -> Any:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _info(self, fullname: str) -> Any:
+        from mypy.nodes import Block, ClassDef, SymbolTable, TypeInfo
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        info.mro = [info]
+        return info
+
+    def _fdef(self, name: str, info: Any = None) -> Any:
+        from mypy.nodes import Block, FuncDef
+
+        fdef = FuncDef(name, [], Block([]))
+        # FuncBase.__init__ sets info = FUNC_NO_INFO (a FakeInfo); replace
+        # it only when a real class context is requested.
+        if info is not None:
+            fdef.info = info
+        return fdef
+
+    def _callable(self) -> Any:
+        return CallableType(
+            [self.fx.anyt], [ARG_POS], [None], self.fx.anyt, self.fx.function
+        )
+
+    def _assert_seam(self, sig: Any, fdef: Any, expected_name: str | None) -> None:
+        result = _type_kernel.rust_set_callable_name(sig, fdef)
+        if expected_name is None:
+            # Non-FunctionLike passthrough: the proper type comes back.
+            assert result is sig, f"seam passthrough: {result!r} is not {sig!r}"
+            return
+        assert result is not None, "seam deferred; expected a renamed callable"
+        renamed = cast(Any, result)
+        assert renamed.name == expected_name, f"seam: {renamed.name!r} != {expected_name!r}"
+
+    def _assert_par(self, sig: Any, fdef: Any) -> Any:
+        off = self._with_gate(False, lambda: self._set_callable_name(sig, fdef))
+        on = self._with_gate(True, lambda: self._set_callable_name(sig, fdef))
+        assert str(off) == str(on), f"gate mismatch: {off!r} != {on!r}"
+        return on
+
+    def test_seam_method_class_name(self) -> None:
+        info = self._info("mod.C")
+        fdef = self._fdef("m", info)
+        self._assert_seam(self._callable(), fdef, "m of C")
+
+    def test_seam_typeddict_fallback_name(self) -> None:
+        info = self._info("typing._TypedDict")
+        fdef = self._fdef("m", info)
+        self._assert_seam(self._callable(), fdef, "m of TypedDict")
+
+    def test_seam_fakeinfo_uses_bare_name(self) -> None:
+        # The closed shape (issue #1100): a fresh FuncDef carries
+        # FUNC_NO_INFO; the seam must name it "m", not defer.
+        fdef = self._fdef("m")
+        from mypy.nodes import FakeInfo
+
+        assert isinstance(fdef.info, FakeInfo)
+        self._assert_seam(self._callable(), fdef, "m")
+
+    def test_seam_none_info_uses_bare_name(self) -> None:
+        fdef = self._fdef("m", info=None)
+        fdef.info = None
+        self._assert_seam(self._callable(), fdef, "m")
+
+    def test_seam_non_functionlike_passthrough(self) -> None:
+        fdef = self._fdef("m")
+        self._assert_seam(self.fx.anyt, fdef, None)
+
+    def test_parity_method_class_name(self) -> None:
+        info = self._info("mod.C")
+        fdef = self._fdef("m", info)
+        result = self._assert_par(self._callable(), fdef)
+        assert result.name == "m of C"
+
+    def test_parity_fakeinfo_uses_bare_name(self) -> None:
+        fdef = self._fdef("m")
+        result = self._assert_par(self._callable(), fdef)
+        assert result.name == "m"
+
+    def test_parity_typeddict_fallback_name(self) -> None:
+        info = self._info("typing._TypedDict")
+        fdef = self._fdef("m", info)
+        result = self._assert_par(self._callable(), fdef)
+        assert result.name == "m of TypedDict"
+
+    def test_parity_overloaded_sig(self) -> None:
+        from mypy.types import Overloaded
+
+        info = self._info("mod.C")
+        fdef = self._fdef("m", info)
+        sig = Overloaded([self._callable(), self._callable()])
+        assert isinstance(sig, Overloaded)
+        result = self._assert_par(sig, fdef)
+        assert result.get_name() == "m of C"
