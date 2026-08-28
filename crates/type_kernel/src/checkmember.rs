@@ -49,7 +49,7 @@ use crate::freshen::freshen_type;
 use crate::setops::make_simplified_union;
 use crate::subtypes::SubtypeContext;
 use crate::typeinfo::{serialize_type_to_bytes, NativeTypeResolver, TypeResolver};
-use crate::wire::{read_type, write_type, ReadBuffer, Type, WriteBuffer};
+use crate::wire::{read_type, write_type, Parameters, ReadBuffer, Type, WriteBuffer};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -635,6 +635,10 @@ pub(crate) fn rust_defined_in_superclass(
 // analyze_instance_member_access (method path)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// TEMPORARY audit instrumentation (issue #1129) — removed before commit.
+// ---------------------------------------------------------------------------
+
 /// The `maptype.py:326-345` `builtins.tuple` special case inside
 /// `map_instance_to_direct_supertypes`, decided from the live receiver
 /// `TypeInfo`. Returns `Some(Some(inst))` when the special case produces
@@ -746,6 +750,219 @@ fn tuple_special_map(
     }
 }
 
+/// Value-level port of `FreezeTypeVarsVisitor` (typeops.py:2107-2113),
+/// in three steps: `collect_freeze_ids` gathers the ids of every callable's
+/// `variables`, `survivors_freezable` verifies that every surviving typevar
+/// is one of them, and `apply_freeze` sets `meta_level = 0` on matching
+/// typevars anywhere in the tree. Python freezes by shared-object mutation
+/// (`freshen_function_type_vars` shares one typevar object per variable
+/// between `variables` and every occurrence, expandtype.py:550); the wire
+/// round-trip breaks object sharing, so we rewrite by id instead. Meta
+/// typevars that appear only outside `variables` (the caller's own
+/// unification variables in the receiver args) stay untouched, exactly like
+/// Python.
+fn collect_freeze_ids(typ: &mut Type, ids: &mut Vec<(i64, i64, String)>) {
+    if let Type::CallableType { variables, .. } = typ {
+        for v in variables.iter_mut() {
+            if let Type::TypeVarType {
+                raw_id,
+                namespace,
+                meta_level,
+                ..
+            } = v
+            {
+                let key = (*raw_id, *meta_level, namespace.clone());
+                if !ids.contains(&key) {
+                    ids.push(key);
+                }
+            }
+        }
+    }
+    freeze_children(typ, &mut |c| collect_freeze_ids(c, ids));
+}
+
+/// Verify every surviving typevar is a `variables` entry collected by
+/// `collect_freeze_ids`, i.e. a freshened method type var Python's freeze
+/// would reify. Anything else defers: a leftover outside any `variables`
+/// list is an env miss the wire expand could not key (Python substitutes it
+/// via live binder ids), and ParamSpec/TypeVarTuple entries carry no
+/// `meta_level` on the wire, so their ids cannot be frozen here.
+fn survivors_freezable(typ: &mut Type, ids: &[(i64, i64, String)]) -> bool {
+    if !typevar_freezable(typ, ids) {
+        return false;
+    }
+    let mut ok = true;
+    freeze_children(typ, &mut |c| {
+        if !survivors_freezable(c, ids) {
+            ok = false;
+        }
+    });
+    ok
+}
+
+fn typevar_freezable(typ: &Type, ids: &[(i64, i64, String)]) -> bool {
+    match typ {
+        Type::TypeVarType {
+            raw_id,
+            namespace,
+            meta_level,
+            ..
+        } => ids
+            .iter()
+            .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace),
+        Type::ParamSpecType { .. } | Type::TypeVarTupleType { .. } => false,
+        _ => true,
+    }
+}
+
+fn apply_freeze(typ: &mut Type, ids: &[(i64, i64, String)]) {
+    if let Type::TypeVarType {
+        raw_id,
+        namespace,
+        meta_level,
+        ..
+    } = typ
+    {
+        if ids
+            .iter()
+            .any(|(r, m, ns)| *r == *raw_id && *m == *meta_level && ns == namespace)
+        {
+            *meta_level = 0;
+        }
+    }
+    freeze_children(typ, &mut |c| apply_freeze(c, ids));
+}
+
+fn freeze_children<F: FnMut(&mut Type)>(typ: &mut Type, f: &mut F) {
+    match typ {
+        Type::TypeVarType {
+            values,
+            upper_bound,
+            default,
+            ..
+        } => {
+            for v in values.iter_mut() {
+                f(v);
+            }
+            f(upper_bound);
+            f(default);
+        }
+        Type::Instance { args, .. }
+        | Type::TypeAliasType { args, .. }
+        | Type::UnboundType { args, .. } => {
+            for a in args.iter_mut() {
+                f(a);
+            }
+        }
+        Type::AnyType { source_any, .. } => {
+            if let Some(src) = source_any {
+                f(src);
+            }
+        }
+        Type::ParamSpecType {
+            prefix,
+            upper_bound,
+            default,
+            ..
+        } => {
+            let Parameters {
+                arg_types,
+                variables,
+                ..
+            } = prefix.as_mut();
+            for a in arg_types.iter_mut() {
+                f(a);
+            }
+            for v in variables.iter_mut() {
+                f(v);
+            }
+            f(upper_bound);
+            f(default);
+        }
+        Type::TypeVarTupleType {
+            tuple_fallback,
+            upper_bound,
+            default,
+            ..
+        } => {
+            f(tuple_fallback);
+            f(upper_bound);
+            f(default);
+        }
+        Type::UnpackType { typ } => f(typ),
+        Type::CallableType {
+            fallback,
+            instance_type,
+            arg_types,
+            ret_type,
+            variables,
+            type_guard,
+            type_is,
+            ..
+        } => {
+            f(fallback);
+            if let Some(it) = instance_type {
+                f(it);
+            }
+            for a in arg_types.iter_mut() {
+                f(a);
+            }
+            f(ret_type);
+            for v in variables.iter_mut() {
+                f(v);
+            }
+            if let Some(g) = type_guard {
+                f(g);
+            }
+            if let Some(i) = type_is {
+                f(i);
+            }
+        }
+        Type::Overloaded { items } => {
+            for it in items.iter_mut() {
+                f(it);
+            }
+        }
+        Type::TupleType {
+            partial_fallback,
+            items,
+            ..
+        } => {
+            f(partial_fallback);
+            for it in items.iter_mut() {
+                f(it);
+            }
+        }
+        Type::TypedDictType {
+            fallback, items, ..
+        } => {
+            f(fallback);
+            for (_, it) in items.iter_mut() {
+                f(it);
+            }
+        }
+        Type::LiteralType { fallback, .. } => f(fallback),
+        Type::UnionType { items, .. } => {
+            for it in items.iter_mut() {
+                f(it);
+            }
+        }
+        Type::TypeType { item, .. } => f(item),
+        Type::Parameters(params) => {
+            for a in params.arg_types.iter_mut() {
+                f(a);
+            }
+            for v in params.variables.iter_mut() {
+                f(v);
+            }
+        }
+        Type::NoneType
+        | Type::ErasedType
+        | Type::UninhabitedType { .. }
+        | Type::DeletedType { .. } => {}
+    }
+}
+
 /// Shared map-then-expand tail of `analyze_instance_member_access`
 /// (checkmember.py:773-775) for static and trivial-self methods, and the
 /// member-access dispatch: `map_instance_to_supertype` +
@@ -765,15 +982,25 @@ fn tuple_special_map(
 ///   * a missing resolver snapshot / unresolvable derivation path
 ///   * a mapped instance with empty args or a TVT class (expand defers)
 ///   * a ParamSpec/Unpack signature (expand defers)
-///   * an expanded result that still carries a TypeVar (trivial self only)
+///   * an expansion whose result still carries a TypeAliasType (wire
+///     round-trip decodes it with `alias=None`, types.py:397)
 ///   * a non-Callable trivial-self signature (bind_self_fast_inner's None:
 ///     Overloaded with zero items); a zero-arg or *args/**kwargs callable is
 ///     returned unchanged by bind_self_fast, and Rust mirrors that as the
 ///     unchanged callable, not a deferral
+///   * an expansion whose result still carries a typevar that is not a
+///     `variables` entry of some callable in the tree (an env miss, see
+///     below), or a ParamSpec/TypeVarTuple survivor the wire cannot freeze
 ///
-/// Python's `freeze_all_type_vars` is unported: the signature is already
-/// frozen by this seam (expand produces only bound class vars), so nothing
-/// remains to freeze when the Rust path fully succeeds.
+/// Python's `freeze_all_type_vars` (typeops.py:2102) sets `meta_level = 0`
+/// on the `variables` entries of every callable in the result; shared-object
+/// mutation freezes all occurrences. The wire round-trip breaks sharing, so
+/// the tail rewrites by id: collect the ids of every callable's `variables`,
+/// verify every surviving typevar is one of them (a leftover outside any
+/// `variables` list is an env miss the wire expand could not key; Python
+/// substitutes it via live binder ids, e.g. a function-local PEP695 class
+/// whose declared typevar namespace differs from the receiver fullname), and
+/// only then set `meta_level = 0` on the survivors.
 #[allow(clippy::too_many_arguments)]
 fn static_member_tail(
     instance: &Type,
@@ -832,23 +1059,29 @@ fn static_member_tail(
         }
     };
     // checkmember.py:451 `expand_type_by_instance(signature, typ)`. Expand
-    // the unbound callable first (binding would defer the expand).
-    let expanded = crate::expandtype::expand_type_by_instance_core(
+    // the unbound callable first (binding would defer the expand). The
+    // free-result variant mirrors Python: `freeze_all_type_vars`
+    // (checkmember.py:504) reifies leftover method type vars on return.
+    let expanded = crate::expandtype::expand_type_by_instance_free(
         signature,
         &mapped_instance,
         resolver,
         strict_optional,
     );
-    let expanded = match expanded {
+    let mut expanded = match expanded {
         Some(e) => e,
         None => {
             return None;
         }
     };
+    // checkmember.py:503 `freeze_all_type_vars(member_type)`.
+    let mut ids: Vec<(i64, i64, String)> = Vec::new();
+    collect_freeze_ids(&mut expanded, &mut ids);
+    if !survivors_freezable(&mut expanded, &ids) {
+        return None;
+    }
+    apply_freeze(&mut expanded, &ids);
     if is_trivial {
-        if crate::expandtype::result_has_typevar(&expanded) {
-            return None;
-        }
         bind_self_fast_inner(&expanded)
     } else {
         Some(expanded)
@@ -1405,7 +1638,8 @@ pub(crate) fn rust_analyze_instance_member_dispatch(
         &mut next_raw_id,
         &mut changed,
         strict_optional,
-    )?;
+    );
+    let result = result?;
     Some((next_raw_id, changed, encode_type(&result)?))
 }
 
@@ -3795,6 +4029,116 @@ mod tests {
         let sig = make_callable(vec![ARG_POS], false);
         assert!(static_member_tail(
             &Type::NoneType,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None
+        )
+        .is_none());
+    }
+
+    fn make_meta_tvar(raw_id: i64, namespace: &str, meta_level: i64) -> Type {
+        Type::TypeVarType {
+            name: "T".to_string(),
+            fullname: "T".to_string(),
+            raw_id,
+            namespace: namespace.to_string(),
+            values: vec![],
+            upper_bound: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            default: Box::new(Type::AnyType {
+                type_of_any: 1,
+                source_any: None,
+                missing_import_name: None,
+            }),
+            variance: 0,
+            meta_level,
+        }
+    }
+
+    #[test]
+    fn test_static_member_tail_freezes_meta_type_vars() {
+        // Python's tail runs freeze_all_type_vars after the expand: empty-args
+        // expand returns the signature unchanged, so the freeze is the only
+        // rewrite; it must hit ret type and variables (wire broke sharing).
+        let resolver = snap_resolver();
+        let tvar = make_meta_tvar(50, "", 1);
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType {
+            ret_type,
+            variables,
+            ..
+        } = &mut sig
+        {
+            *ret_type = Box::new(tvar.clone());
+            variables.push(tvar);
+        }
+        let inst = make_instance("builtins.int");
+        let result = static_member_tail(
+            &inst,
+            &sig,
+            "builtins.int",
+            false,
+            &resolver,
+            false,
+            false,
+            None,
+        )
+        .expect("expected Some result");
+        match result {
+            Type::CallableType {
+                ret_type,
+                variables,
+                ..
+            } => {
+                match *ret_type {
+                    Type::TypeVarType {
+                        raw_id, meta_level, ..
+                    } => {
+                        assert_eq!(raw_id, 50);
+                        assert_eq!(meta_level, 0);
+                    }
+                    other => panic!("expected TypeVarType ret, got {other:?}"),
+                }
+                assert_eq!(variables.len(), 1);
+                match &variables[0] {
+                    Type::TypeVarType {
+                        raw_id, meta_level, ..
+                    } => {
+                        assert_eq!(*raw_id, 50);
+                        assert_eq!(*meta_level, 0);
+                    }
+                    other => panic!("expected TypeVarType variable, got {other:?}"),
+                }
+            }
+            other => panic!("expected CallableType result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_static_member_tail_env_miss_typevar_defers() {
+        // A leftover typevar outside any `variables` list is an env miss:
+        // wire env keys by receiver fullname, Python substitutes via live
+        // binder ids (PEP695 function-local class); defer to Python.
+        let resolver = snap_resolver();
+        let mut sig = make_callable(vec![], false);
+        if let Type::CallableType { ret_type, .. } = &mut sig {
+            *ret_type = Box::new(make_meta_tvar(7, "__main__.B@3", 0));
+        }
+        let inst = Type::Instance {
+            type_ref: "builtins.int".to_string(),
+            args: vec![make_instance("builtins.str")],
+            last_known_value: None,
+            extra_attrs: None,
+        };
+        assert!(static_member_tail(
+            &inst,
             &sig,
             "builtins.int",
             false,
