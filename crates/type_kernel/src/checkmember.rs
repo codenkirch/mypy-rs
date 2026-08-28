@@ -43,7 +43,7 @@
 //!     return None rather than risk a wrong boolean.
 
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyType};
 
 use crate::freshen::freshen_type;
 use crate::setops::make_simplified_union;
@@ -2757,6 +2757,211 @@ fn is_instance_var_inner(var: &PyAny) -> PyResult<bool> {
     Ok(!is_inferred)
 }
 
+// ---------------------------------------------------------------------------
+// classify_analyze_var (issue #1056)
+// ---------------------------------------------------------------------------
+
+/// Decision tags for `analyze_var`; must match `NATIVE_AV_*` in
+/// mypy/checkmember.py.
+pub(crate) const ANALYZE_VAR_SETTER: i64 = 0;
+pub(crate) const ANALYZE_VAR_GETTER: i64 = 1;
+pub(crate) const ANALYZE_VAR_PARTIAL: i64 = 2;
+pub(crate) const ANALYZE_VAR_NOT_READY: i64 = 3;
+pub(crate) const ANALYZE_VAR_ENUM_LITERAL: i64 = 4;
+pub(crate) const ANALYZE_VAR_UNBOUND_ANY: i64 = 5;
+
+/// Live `Var` facts gathered via PyO3; pure scalars so the decision core
+/// is unit-testable without an interpreter.
+struct AnalyzeVarFacts {
+    is_settable_property: bool,
+    setter_type_present: bool,
+    setter_type_is_partial: bool,
+    var_type_present: bool,
+    var_type_is_partial: bool,
+    is_ready: bool,
+    is_initialized_in_class: bool,
+    is_instance_var: bool,
+    info_fullname: String,
+    is_enum: bool,
+    enum_has_name: bool,
+}
+
+fn live_bool(obj: &PyAny, attr: &str) -> Option<bool> {
+    obj.getattr(attr).ok()?.extract::<bool>().ok()
+}
+
+/// Read the `Var` scalars the decision core consumes. Any unreadable
+/// attribute (including a `FakeInfo` `info`, whose `__getattribute__`
+/// raises) defers, mirroring `rust_is_instance_var`'s deferral story.
+fn gather_analyze_var_facts(py: Python<'_>, var: &PyAny, name: &str) -> Option<AnalyzeVarFacts> {
+    let info = var.getattr("info").ok()?;
+    let info_fullname: String = info.getattr("fullname").ok()?.extract().ok()?;
+    let is_settable_property = live_bool(var, "is_settable_property")?;
+    let is_ready = live_bool(var, "is_ready")?;
+    let is_initialized_in_class = live_bool(var, "is_initialized_in_class")?;
+    let setter_type = var.getattr("setter_type").ok()?;
+    let var_type = var.getattr("type").ok()?;
+    let partial_cls: &PyType = py
+        .import("mypy.types")
+        .ok()?
+        .getattr("PartialType")
+        .ok()?
+        .downcast()
+        .ok()?;
+    let setter_type_present = !setter_type.is_none();
+    let setter_type_is_partial =
+        setter_type_present && setter_type.is_instance(partial_cls).ok()?;
+    let var_type_present = !var_type.is_none();
+    let var_type_is_partial = var_type_present && var_type.is_instance(partial_cls).ok()?;
+    let is_instance_var = is_instance_var_inner(var).ok();
+    let is_enum = live_bool(info, "is_enum")?;
+    let enum_has_name = info
+        .getattr("enum_members")
+        .ok()?
+        .call_method1("__contains__", (name,))
+        .ok()?
+        .extract::<bool>()
+        .ok()?;
+    Some(AnalyzeVarFacts {
+        is_settable_property,
+        setter_type_present,
+        setter_type_is_partial,
+        var_type_present,
+        var_type_is_partial,
+        is_ready,
+        is_initialized_in_class,
+        is_instance_var: is_instance_var?,
+        info_fullname,
+        is_enum,
+        enum_has_name,
+    })
+}
+
+/// Pure decision core of `analyze_var` (checkmember.py:1599-1700): the
+/// typ-selection head, the PartialType / not-ready / unbound-Any dispatch,
+/// and the enum-literal tail arm, reduced to a single outcome tag.
+///
+/// * typ selection (checkmember.py:1622-1628): a settable property read as
+///   an lvalue takes `setter_type`, falling back to `var.type` when the
+///   synthetic setter type is missing and the var is ready; everything
+///   else takes `var.type`.
+/// * PARTIAL wins: `handle_partial_var_type` returns before the tail can
+///   run, so it beats the enum-literal arm.
+/// * NOT_READY beats the enum-literal arm: the not-ready callback is a
+///   head-body side effect the shim must apply.
+/// * ENUM_LITERAL collapses the head body only when that body is
+///   side-effect free under a non-lvalue access: the lvalue-only msg
+///   gates cannot fire, and the bind tail (whose property `__call__`
+///   re-analysis can emit errors) must not engage. The nonmember unwrap
+///   arm consumes the computed result, so those accesses stay GETTER and
+///   the shim re-runs the tail check.
+fn classify_analyze_var_inner(
+    name: &str,
+    facts: &AnalyzeVarFacts,
+    is_lvalue: bool,
+    no_deferral: bool,
+    is_operator: bool,
+) -> i64 {
+    let setter_path = facts.is_settable_property && is_lvalue;
+    let (typ_present, selected_is_partial) = if setter_path {
+        if facts.setter_type_present {
+            (true, facts.setter_type_is_partial)
+        } else {
+            (
+                facts.is_ready && facts.var_type_present,
+                facts.var_type_is_partial,
+            )
+        }
+    } else {
+        (facts.var_type_present, facts.var_type_is_partial)
+    };
+
+    if typ_present && selected_is_partial {
+        return ANALYZE_VAR_PARTIAL;
+    }
+    // Not-ready callback fires before the enum tail can overwrite the
+    // result, so NOT_READY cannot collapse into ENUM_LITERAL.
+    if !typ_present && !facts.is_ready && !no_deferral {
+        return ANALYZE_VAR_NOT_READY;
+    }
+    let bind_tail_engages =
+        facts.is_initialized_in_class && (!facts.is_instance_var || is_operator);
+    if facts.is_enum
+        && !is_lvalue
+        && facts.enum_has_name
+        && name != "name"
+        && name != "value"
+        && !bind_tail_engages
+    {
+        return ANALYZE_VAR_ENUM_LITERAL;
+    }
+    if typ_present {
+        if setter_path {
+            ANALYZE_VAR_SETTER
+        } else {
+            ANALYZE_VAR_GETTER
+        }
+    } else {
+        ANALYZE_VAR_UNBOUND_ANY
+    }
+}
+
+/// `#[pyfunction]` entry for the `analyze_var` decision head (issue
+/// #1056). Reads the live `Var` scalars via PyO3 (rust_is_magic_base
+/// pattern) and maps the wire receiver instance through the
+/// resolver-backed `map_instance_to_supertype` to prove the native tail
+/// will engage (a snapshot miss defers, so Python's total
+/// `map_instance_to_supertype` handles the access). Returns a single
+/// outcome tag (`ANALYZE_VAR_*`); Python applies the branch's side
+/// effects.
+#[pyfunction]
+#[pyo3(signature = (name, var, itype_bytes, is_lvalue, no_deferral, is_operator, resolver))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rust_classify_analyze_var(
+    py: Python<'_>,
+    name: &str,
+    var: &PyAny,
+    itype_bytes: &[u8],
+    is_lvalue: bool,
+    no_deferral: bool,
+    is_operator: bool,
+    resolver: &NativeTypeResolver,
+) -> PyResult<Option<i64>> {
+    let itype = match decode_type(itype_bytes) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let (type_ref, args) = match &itype {
+        Type::Instance { type_ref, args, .. } => (type_ref.as_str(), args.as_slice()),
+        _ => return Ok(None),
+    };
+    let facts = match gather_analyze_var_facts(py, var, name) {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+    // checkmember.py:1621 `itype = map_instance_to_supertype(itype,
+    // var.info)`: the mapped instance feeds every non-partial tail. Rust
+    // mirrors it to gate the seam on resolver coverage; the shim still
+    // maps its own live instance.
+    if crate::subtypes::map_instance_to_supertype(
+        type_ref,
+        args,
+        &facts.info_fullname,
+        resolver.resolver(),
+    )
+    .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Some(classify_analyze_var_inner(
+        name,
+        &facts,
+        is_lvalue,
+        no_deferral,
+        is_operator,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4181,5 +4386,288 @@ mod tests {
             let result = rust_is_instance_var(obj).unwrap();
             assert_eq!(result, None);
         });
+    }
+}
+
+/// Pure decision-table tests for `classify_analyze_var_inner` (issue
+/// #1056). Live-Var coverage (gate differential, deferral) lives in
+/// `NativeAnalyzeVarSuite` in mypy/test/testtypes.py.
+#[cfg(test)]
+mod classify_analyze_var_tests {
+    use super::*;
+
+    /// Plain data var: `x: int` on a non-enum class, accessed non-lvalue.
+    fn plain_var_facts() -> AnalyzeVarFacts {
+        AnalyzeVarFacts {
+            is_settable_property: false,
+            setter_type_present: false,
+            setter_type_is_partial: false,
+            var_type_present: true,
+            var_type_is_partial: false,
+            is_ready: true,
+            is_initialized_in_class: true,
+            is_instance_var: true,
+            info_fullname: "mod.A".to_string(),
+            is_enum: false,
+            enum_has_name: false,
+        }
+    }
+
+    fn facts_with(f: impl FnOnce(&mut AnalyzeVarFacts)) -> AnalyzeVarFacts {
+        let mut facts = plain_var_facts();
+        f(&mut facts);
+        facts
+    }
+
+    #[test]
+    fn plain_data_var_is_getter() {
+        let facts = plain_var_facts();
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn lvalue_plain_var_is_still_getter() {
+        let facts = plain_var_facts();
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, true, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn settable_property_lvalue_is_setter() {
+        let facts = facts_with(|f| {
+            f.is_settable_property = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, true, false, false),
+            ANALYZE_VAR_SETTER
+        );
+    }
+
+    #[test]
+    fn settable_property_non_lvalue_is_getter() {
+        let facts = facts_with(|f| {
+            f.is_settable_property = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn setter_falls_back_to_ready_var_type() {
+        // Synthetic property with no setter type: the ready var.type
+        // fallback keeps the SETTER head (checkmember.py:1624-1625).
+        let facts = facts_with(|f| {
+            f.is_settable_property = true;
+            f.var_type_present = true;
+            f.is_ready = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, true, false, false),
+            ANALYZE_VAR_SETTER
+        );
+    }
+
+    #[test]
+    fn setter_unready_without_setter_type_is_not_ready() {
+        // setter_type missing and the var not ready: the fallback picks
+        // nothing, and the not-ready callback must fire.
+        let facts = facts_with(|f| {
+            f.is_settable_property = true;
+            f.is_initialized_in_class = false;
+            f.is_instance_var = true;
+            f.var_type_present = true;
+            f.is_ready = false;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, true, false, false),
+            ANALYZE_VAR_NOT_READY
+        );
+    }
+
+    #[test]
+    fn partial_var_type_is_partial() {
+        let facts = facts_with(|f| {
+            f.var_type_is_partial = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, false, false),
+            ANALYZE_VAR_PARTIAL
+        );
+    }
+
+    #[test]
+    fn setter_fallback_partial_var_type_is_partial() {
+        let facts = facts_with(|f| {
+            f.is_settable_property = true;
+            f.var_type_is_partial = true;
+            f.is_ready = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, true, false, false),
+            ANALYZE_VAR_PARTIAL
+        );
+    }
+
+    #[test]
+    fn unbound_var_not_ready() {
+        let mut facts = plain_var_facts();
+        facts.var_type_present = false;
+        facts.is_ready = false;
+        facts.is_initialized_in_class = false;
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, false, false),
+            ANALYZE_VAR_NOT_READY
+        );
+    }
+
+    #[test]
+    fn unbound_var_ready_is_unbound_any() {
+        let mut facts = plain_var_facts();
+        facts.var_type_present = false;
+        facts.is_initialized_in_class = false;
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, false, false),
+            ANALYZE_VAR_UNBOUND_ANY
+        );
+    }
+
+    #[test]
+    fn unbound_var_no_deferral_is_unbound_any() {
+        // no_deferral suppresses the not-ready callback, so the head
+        // reduces to the implicit Any.
+        let mut facts = plain_var_facts();
+        facts.var_type_present = false;
+        facts.is_ready = false;
+        facts.is_initialized_in_class = false;
+        assert_eq!(
+            classify_analyze_var_inner("x", &facts, false, true, false),
+            ANALYZE_VAR_UNBOUND_ANY
+        );
+    }
+
+    #[test]
+    fn enum_member_is_enum_literal() {
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+            f.enum_has_name = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_ENUM_LITERAL
+        );
+    }
+
+    #[test]
+    fn enum_name_value_excluded() {
+        // `name`/`value` are real attributes, not enum literals; the
+        // plain GETTER body must run.
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+            f.enum_has_name = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("name", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+        assert_eq!(
+            classify_analyze_var_inner("value", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn enum_lvalue_not_literal() {
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+            f.enum_has_name = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, true, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn enum_not_in_members_not_literal() {
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn partial_beats_enum_literal() {
+        // handle_partial_var_type returns before the enum tail runs.
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+            f.enum_has_name = true;
+            f.var_type_is_partial = true;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_PARTIAL
+        );
+    }
+
+    #[test]
+    fn not_ready_beats_enum_literal() {
+        // The not-ready callback is a head side effect; the tail
+        // overwrite happens after it, so the tag must stay NOT_READY.
+        let mut facts = plain_var_facts();
+        facts.is_enum = true;
+        facts.enum_has_name = true;
+        facts.var_type_present = false;
+        facts.is_ready = false;
+        facts.is_initialized_in_class = false;
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_NOT_READY
+        );
+    }
+
+    #[test]
+    fn enum_literal_requires_no_bind_tail() {
+        // A class-level non-instance var (method alias-like) with a
+        // callable type engages the bind tail; the property `__call__`
+        // re-analysis can emit errors, so the head body must run.
+        let facts = facts_with(|f| {
+            f.is_enum = true;
+            f.enum_has_name = true;
+            f.is_instance_var = false;
+        });
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_GETTER
+        );
+        // mx.is_operator widens the bind-tail gate the same way.
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, true),
+            ANALYZE_VAR_GETTER
+        );
+    }
+
+    #[test]
+    fn enum_literal_allows_ready_unbound() {
+        // An enum member without a declared type: the implicit Any head
+        // has no side effects once ready, so the literal still collapses.
+        let mut facts = plain_var_facts();
+        facts.is_enum = true;
+        facts.enum_has_name = true;
+        facts.var_type_present = false;
+        facts.is_initialized_in_class = false;
+        assert_eq!(
+            classify_analyze_var_inner("RED", &facts, false, false, false),
+            ANALYZE_VAR_ENUM_LITERAL
+        );
     }
 }

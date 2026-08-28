@@ -1102,6 +1102,30 @@ including:
   by `NativeIsInstanceVarSuite` in `mypy/test/testtypes.py` (gate-off vs
   gate-on differential plus direct seam calls), plus a Rust unit test
   proving the deferral path in `checkmember.rs`.
+- `rust_classify_analyze_var` (issue #1056) — mirrors the decision head of
+  `mypy.checkmember.analyze_var` (checkmember.py:1771-1824 plus the
+  enum-literal tail arm at 1835-1838), reduced to a single outcome tag:
+  SETTER (settable property read as lvalue) / GETTER / PARTIAL /
+  NOT_READY / ENUM_LITERAL / UNBOUND_ANY. Rust reads the live Var
+  scalars via PyO3 (is_settable_property, setter_type/type None-ness +
+  PartialType kind, is_ready, is_initialized_in_class, is_instance_var,
+  info.fullname, info.is_enum, info.enum_members via `__contains__`),
+  decodes the wire receiver instance, and gates on the resolver handling
+  the receiver's `map_instance_to_supertype` (snapshot miss → defer, so
+  Python's total mapping handles the access). Python applies the tagged
+  branch's side effects in `_apply_analyze_var_tag` (handle_partial_var_type,
+  the not-ready callback, the msg gates, expand/bind tail, enum-literal
+  wrap); a None tag (undecodable wire, unreadable attr, FakeInfo,
+  snapshot miss) falls back to the pure-Python body. PARTIAL and
+  NOT_READY beat ENUM_LITERAL (the partial return and the callback are
+  head-body side effects); ENUM_LITERAL engages only when the head body
+  is side-effect free under a non-lvalue access, so `name`/`value` and
+  the method-alias bind tail stay GETTER. Gated by
+  `_native_checkmember_active` (wired from `mypy/build.py`) and covered
+  by `NativeAnalyzeVarSuite` in `mypy/test/testtypes.py` (direct seam
+  tag tests per branch plus gate-off vs gate-on differentials through
+  real `analyze_var`), plus pure decision unit tests in
+  `classify_analyze_var_tests` in `checkmember.rs`.
 - `rust_is_disjoint_base` (issue #969) — mirrors the pure bool predicate
   `_is_disjoint_base` (typeops.py:2110-2124): returns `True` when
   `info.is_disjoint_base` is set, or when `info.slots` is non-empty and at

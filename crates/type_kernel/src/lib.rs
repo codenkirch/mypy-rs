@@ -1924,6 +1924,12 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         checkmember::rust_classify_type_type_member_access,
         module
     )?)?;
+    // Issue #1056: analyze_var decision head. Rust classifies the
+    // dispatch from live Var scalars; the shim applies side effects.
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_classify_analyze_var,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkoperator::rust_check_operator,
         module

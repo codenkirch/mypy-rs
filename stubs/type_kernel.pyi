@@ -1825,6 +1825,17 @@ def rust_descriptor_has_get_set(
 ) -> tuple[bool, bool] | None: ...
 def rust_classify_type_type_member_access(typ: Any) -> int | None: ...
 def rust_is_instance_var(var: Var) -> bool | None: ...
+# Issue #1056: analyze_var decision head. Returns one ANALYZE_VAR tag
+# (SETTER/GETTER/PARTIAL/NOT_READY/ENUM_LITERAL/UNBOUND_ANY) or None.
+def rust_classify_analyze_var(
+    name: str,
+    var: Var,
+    itype_bytes: bytes,
+    is_lvalue: bool,
+    no_deferral: bool,
+    is_operator: bool,
+    resolver: NativeTypeResolver,
+) -> int | None: ...
 def rust_check_self_arg(
     resolver: NativeTypeResolver,
     functype_bytes: bytes,
