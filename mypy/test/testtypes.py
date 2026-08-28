@@ -43826,3 +43826,246 @@ class NativeFindSelfTypeSuite(Suite):
     def test_parity_callable_ret_plain(self) -> None:
         t = CallableType([], [], [], UnboundType("int"), self.fx.function)
         self._assert_par(t, {}, False)
+
+
+class NativeSolveGenericCallSuite(Suite):
+    """Parity for the rust_solve_generic_call port (issue #1128).
+
+    The Rust seam (checkcall.rs `rust_solve_generic_call`: normalize +
+    infer constraints + solve + apply) previously deferred four shapes
+    that are parity-identically decidable:
+
+    - Empty constraints: the solver fills every unconstrained var with
+      strict Never / lax Any (solve.py:277-289), the exact path the
+      Stage-20 seam (#382) already relies on; the check_call shim skips
+      the vacuous polymorphic retry and applies Never.
+    - Multi-lower joins: the solver joins lowers via solve_one_inner; an
+      invariant conflict defers later in apply. Only a joined solution
+      that is itself a FunctionLike still defers (nested FuncDef
+      definitions do not survive the wire; Python's pretty_callable
+      renders them with the def name, e.g. list-literal item messages).
+    - Positional TupleType actuals: star actuals are gated Python-side
+      (checkexpr.py `any(k.is_star() ...)`), so a tuple actual reaches
+      the kernel only as a positional argument that ArgTypeExpander
+      passes through 1:1.
+    - Unsolvable vars: when solve_one returns no solution Python emits
+      "Cannot infer value of type parameter" and substitutes Any
+      (checkexpr.apply_inferred_arguments); Rust has no side channel for
+      that diagnostic, so the seam defers.
+
+    Direct seam calls prove each shape engages or defers as documented,
+    and the resolved structure is compared against a pure-Python
+    infer + apply reference (constraints/solve native gates disabled).
+    """
+
+    def setUp(self) -> None:
+        from mypy.checkexpr import (
+            _set_native_checkcall_active,
+            _set_native_checkexpr_active,
+            _set_native_checkexpr_resolver,
+        )
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self.fx = TypeFixture(INVARIANT)
+        self._set_active = _set_native_checkexpr_active
+        self._set_resolver = _set_native_checkexpr_resolver
+        self._set_active(True)
+        self._set_resolver(self.resolver_for(self.fx))
+        typeinfo_map = {info.fullname: info for info in self._type_infos(self.fx)}
+        set_wire_typeinfo_map(typeinfo_map)
+        self._callcall_active = _set_native_checkcall_active
+        self._callcall_active(True)
+
+    def tearDown(self) -> None:
+        from mypy.wirefixup import set_wire_typeinfo_map
+
+        self._set_active(False)
+        self._set_resolver(None)
+        self._callcall_active(False)
+        set_wire_typeinfo_map(None)
+
+    def _type_infos(self, fx: TypeFixture) -> list[TypeInfo]:
+        infos = []
+        for name in dir(fx):
+            if not name.endswith("i"):
+                continue
+            value = getattr(fx, name)
+            if _is_type_info(value):
+                infos.append(value)
+        return infos
+
+    def _resolver_for(self, fx: TypeFixture) -> Any:
+        return _type_kernel.build_native_resolver(self._type_infos(fx), [])
+
+    def resolver_for(self, fx: TypeFixture) -> Any:
+        return self._resolver_for(fx)
+
+    def _generic_t(self) -> Any:
+        from mypy.types import TypeVarType
+
+        return TypeVarType(
+            "T",
+            "mod.T",
+            TypeVarId(1),
+            values=[],
+            upper_bound=self.fx.o,
+            default=AnyType(TypeOfAny.special_form),
+        )
+
+    def _callee_of(self, formals: list[Type], ret_type: Type, t: Any) -> CallableType:
+        return CallableType(
+            formals,
+            [ARG_POS] * len(formals),
+            [None] * len(formals),
+            ret_type,
+            self.fx.function,
+            variables=[t],
+        )
+
+    def _seam(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+    ) -> Any:
+        from mypy.checkexpr import _serialize_type_for_checkexpr
+
+        blobs = [_serialize_type_for_checkexpr(t) for t in arg_types]
+        result = _type_kernel.rust_solve_generic_call(
+            self.resolver_for(self.fx),
+            _serialize_type_for_checkexpr(callee),
+            blobs,
+            formal_to_actual,
+            True,
+            False,
+            True,
+        )
+        if result is None:
+            return None
+        from mypy.checkexpr import _deserialize_type_from_checkexpr
+
+        return _deserialize_type_from_checkexpr(bytes(result))
+
+    def _python_reference(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        arg_kinds: list[Any],
+        arg_names: Sequence[str | None] | None,
+        formal_to_actual: list[list[int]],
+    ) -> CallableType:
+        from mypy.applytype import apply_generic_arguments
+        from mypy.constraints import _set_native_constraints_active
+        from mypy.nodes import TempNode
+        from mypy.infer import ArgumentInferContext, infer_function_type_arguments
+        from mypy.solve import _set_native_solve_active
+        from mypy.types import TypeOfAny
+
+        _set_native_constraints_active(False)
+        _set_native_solve_active(False)
+        try:
+            ctx = ArgumentInferContext(
+                Instance(self.fx.hi, []), Instance(self.fx.std_tuplei, [])
+            )
+            inferred, _ = infer_function_type_arguments(
+                callee,
+                arg_types,
+                arg_kinds,
+                arg_names,
+                formal_to_actual,
+                ctx,
+                strict=True,
+            )
+            return apply_generic_arguments(
+                callee,
+                inferred,
+                lambda *a: None,
+                TempNode(AnyType(TypeOfAny.special_form)),
+                skip_unsatisfied=False,
+            )
+        finally:
+            _set_native_constraints_active(True)
+            _set_native_solve_active(True)
+
+    def _assert_seam_parity(
+        self,
+        callee: CallableType,
+        arg_types: list[Type],
+        formal_to_actual: list[list[int]],
+    ) -> None:
+        arg_kinds = [ARG_POS] * len(arg_types)
+        native = self._seam(callee, arg_types, formal_to_actual)
+        assert native is not None, f"Rust deferred on {callee!r} {arg_types!r}"
+        py = self._python_reference(callee, arg_types, arg_kinds, None, formal_to_actual)
+        assert isinstance(native, CallableType)  # type: ignore[misc]
+        assert str(native) == str(py), (
+            f"solve parity: native={native} python={py}"
+        )
+
+    def test_empty_constraints_solves(self) -> None:
+        # def [T] (x: T) -> T with no actuals: no constraints, T fills
+        # with its default (Any) via the ambiguous-Never path.
+        t = self._generic_t()
+        callee = self._callee_of([t], t, t)
+        native = self._seam(callee, [], [])
+        assert native is not None, "empty constraints should solve natively"
+        assert isinstance(native, CallableType) and not native.variables  # type: ignore[misc]
+
+    def test_empty_constraints_parity(self) -> None:
+        t = self._generic_t()
+        callee = self._callee_of([t], t, t)
+        self._assert_seam_parity(callee, [], [])
+
+    def test_multilower_join_parity(self) -> None:
+        # def [T] (a: T, b: T) -> T with A + D: two lowers joined by the
+        # solver (join of disjoint siblings -> object).
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t, t)
+        self._assert_seam_parity(
+            callee, [self.fx.a, self.fx.d], [[0], [1]]
+        )
+
+    def test_single_lower_parity(self) -> None:
+        t = self._generic_t()
+        callee = self._callee_of([t], t, t)
+        self._assert_seam_parity(callee, [self.fx.a], [[0]])
+
+    def test_tuple_actual_parity(self) -> None:
+        # A positional TupleType actual is passed 1:1 by ArgTypeExpander
+        # (star actuals are gated Python-side): T :> tuple[A, D].
+        t = self._generic_t()
+        callee = self._callee_of([t], t, t)
+        actual = TupleType(
+            [self.fx.a, self.fx.d], self.fx.std_tuple
+        )
+        self._assert_seam_parity(callee, [actual], [[0]])
+
+    def test_multilower_callable_defers(self) -> None:
+        # Two callable lowers join to a FunctionLike, which loses its
+        # nested FuncDef over the wire: defer to Python.
+        t = self._generic_t()
+        callee = self._callee_of([t, t], t, t)
+        f = CallableType(
+            [self.fx.str_type], [ARG_POS], ["x"],
+            self.fx.str_type, self.fx.function, name="f",
+        )
+        g = CallableType(
+            [self.fx.str_type], [ARG_POS], ["y"],
+            self.fx.str_type, self.fx.function, name="g",
+        )
+        assert self._seam(callee, [f, g], [[0], [1]]) is None, (
+            "multi-lower callable join must defer (definition loss)"
+        )
+
+    def test_unsolvable_var_defers(self) -> None:
+        # def [T] (a: G[T], b: G[T]) -> T with G-invariant args A and D
+        # (disjoint): T :> A/D, T <: A/D — solve_one returns no solution,
+        # Python emits "Cannot infer" + Any, so the seam defers.
+        t = self._generic_t()
+        g = Instance(self.fx.gi, [t])
+        callee = self._callee_of([g, g], t, t)
+        ga = Instance(self.fx.gi, [self.fx.a])
+        gd = Instance(self.fx.gi, [self.fx.d])
+        assert self._seam(callee, [ga, gd], [[0], [1]]) is None, (
+            "unsolvable invariant conflict must defer"
+        )

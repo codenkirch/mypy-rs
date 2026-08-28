@@ -84,7 +84,12 @@ fn classify_call(callee: &Type) -> Result<i64, WireError> {
 pub(crate) fn rust_normalize_callable(callee_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut buf = ReadBuffer::new(callee_bytes);
     let callee = read_type(&mut buf, None).ok()?;
-    let normalized = normalize_callable(&callee).ok()?;
+    let normalized = match normalize_callable(&callee) {
+        Ok(t) => t,
+        Err(_) => {
+            return None;
+        }
+    };
     let mut out = WriteBuffer::new();
     write_type(&mut out, &normalized).ok()?;
     Some(out.into_bytes())
@@ -820,36 +825,32 @@ pub fn rust_solve_generic_call(
             let actual_type = arg_types_vec.get(ai as usize)?;
             // Skip None actuals (argument was in a deferred pass).
             let actual_proper = get_proper_or_none(actual_type)?;
-            // Python expands star actuals (TupleType against `*args`) element-wise
-            // via ArgTypeExpander; the wire has no arg-kind mapping here, so defer.
-            if matches!(actual_proper, Type::TupleType { .. }) {
-                return None;
-            }
-            // TypeVar templates resolve in _infer_constraints before the
-            // visitor (constraints.py:496-505), so Never yields `T :> Never`;
-            // uninhabited templates return [] and solve to Any. Defer.
+            // Star actuals (TupleType against `*args`) are gated Python-side
+            // (checkexpr.py `any(k.is_star() ...)`), so a TupleType actual
+            // here is positional; ArgTypeExpander passes it 1:1.
             if matches!(actual_proper, Type::UninhabitedType { .. }) {
                 return None;
             }
             let formal_proper = get_proper_or_none(formal_type)?;
-            let constraints = crate::constraints::infer_constraints_full_inner(
+            let constraints = match crate::constraints::infer_constraints_full_inner(
                 formal_proper,
                 actual_proper,
                 crate::constraints::SUPERTYPE_OF, // mirrors constraints.py:641
                 resolver.resolver(),
                 resolver.alias_resolver(),
-            )?;
+            ) {
+                Some(c) => c,
+                None => {
+                    return None;
+                }
+            };
             all_constraints.extend(constraints);
         }
     }
 
-    if all_constraints.is_empty() {
-        return None; // Nothing to solve.
-    }
-
-    // Multiple lowers for one typevar make Python report "Cannot infer"
-    // when the joined solution cannot satisfy an invariant parameter.
-    // The Rust solve picks the first lower; defer for the diagnostic.
+    // Empty constraints are still solvable: the solver fills every
+    // unconstrained var with strict Never / lax Any (solve.py:277-289),
+    // matching Python's empty-cmap fill (#382 path). No deferral needed.
     let tv_key = |t: &Type| -> Option<(i64, String)> {
         match t {
             Type::TypeVarType {
@@ -864,17 +865,23 @@ pub fn rust_solve_generic_call(
             _ => None,
         }
     };
+    // A var with multiple lowers is joined by the solver. When the joined
+    // solution nests a FunctionLike, the nested FuncDef definitions do not
+    // survive the wire (pretty_callable needs them): defer those joins.
     let mut lowers_by_var: std::collections::HashMap<(i64, String), usize> =
         std::collections::HashMap::new();
     for c in &all_constraints {
         if c.op == crate::constraints::SUPERTYPE_OF {
-            let key = tv_key(&c.origin_type_var)?;
-            *lowers_by_var.entry(key).or_insert(0) += 1;
+            if let Some(key) = tv_key(&c.origin_type_var) {
+                *lowers_by_var.entry(key).or_insert(0) += 1;
+            }
         }
     }
-    if lowers_by_var.values().any(|&n| n >= 2) {
-        return None;
-    }
+    let multi_lower_vars: std::collections::HashSet<(i64, String)> = lowers_by_var
+        .iter()
+        .filter(|(_, &n)| n >= 2)
+        .map(|(k, _)| k.clone())
+        .collect();
 
     // Step 3: Solve constraints for the callable's type vars.
     let tvar_types: Vec<Type> = variables.to_vec();
@@ -924,6 +931,30 @@ pub fn rust_solve_generic_call(
                 .and_then(|(_, t)| t.clone())
         })
         .collect();
+    // A var the solver could not pin (solve_one returned no solution,
+    // e.g. an invariant conflict like T :> str, T <: Never) makes Python
+    // emit "Cannot infer value of type parameter" + substitute Any: defer.
+    if orig_types.iter().any(|t| t.is_none()) {
+        return None;
+    }
+    // Multi-lower joins whose solution is a FunctionLike (or nests one)
+    // lose nested FuncDef definitions over the wire (see comment above
+    // where multi_lower_vars is built): defer to Python.
+    if !multi_lower_vars.is_empty() {
+        let nested_fnlike = orig_types.iter().zip(variables.iter()).any(|(s, tv)| {
+            let Some(sol) = s else { return false };
+            if !contains_function_like(sol) {
+                return false;
+            }
+            match solve_typevar_key(tv) {
+                Some((raw, _meta, ns)) => multi_lower_vars.contains(&(raw, ns)),
+                None => false,
+            }
+        });
+        if nested_fnlike {
+            return None;
+        }
+    }
 
     // Serialize orig_types in the wire format expected by apply_generic_arguments.
     let orig_types_blob = serialize_optional_types(&orig_types)?;
@@ -938,150 +969,36 @@ pub fn rust_solve_generic_call(
         false, // skip_unsatisfied: mirror the Python inference path
         strict_optional,
     )?;
-    // The wire cannot carry `from_type_type`: serializing back would drop
-    // the abstract-error suppression. Defer when the result carries a
-    // type-object callable (directly or nested, e.g. dict[str, def() -> C]).
-    let mut dbuf = crate::wire::ReadBuffer::new(&applied);
-    if let Ok(t) = read_type(&mut dbuf, None) {
-        if contains_type_obj_callable(&t, resolver.resolver()) {
-            return None;
-        }
-    }
     Some(applied)
 }
 
-/// Whether a type (recursively) contains a type-object `CallableType`.
-///
-/// `is_type_obj_callable` recognizes a bare type-obj callable; this walks
-/// the type tree so a callable nested inside an `Instance` arg, union,
-/// tuple, etc. is also detected. Conservative recursion: any unknown or
-/// undecidable branch is assumed to contain one (defers back to Python).
-fn contains_type_obj_callable(t: &Type, resolver: &crate::typeinfo::TypeResolver) -> bool {
+/// Whether a type (recursively) contains a FunctionLike (CallableType or
+/// Overloaded). Conservative recursion over the wire shape; used to decide
+/// whether a joined multi-lower solution would lose nested FuncDef
+/// definitions in the round-trip.
+fn contains_function_like(t: &Type) -> bool {
     match t {
-        Type::Instance {
-            args,
-            last_known_value,
-            extra_attrs,
-            ..
-        } => {
-            args.iter().any(|a| contains_type_obj_callable(a, resolver))
-                || last_known_value
-                    .as_deref()
-                    .is_some_and(|v| contains_type_obj_callable(v, resolver))
-                || extra_attrs.as_ref().is_some_and(|e| {
-                    e.attrs
-                        .values()
-                        .any(|a| contains_type_obj_callable(a, resolver))
-                })
-        }
-        Type::TypeAliasType { args, .. } => {
-            args.iter().any(|a| contains_type_obj_callable(a, resolver))
-        }
-        Type::TypeVarType {
-            values,
-            upper_bound,
-            default,
-            ..
-        } => {
-            values
-                .iter()
-                .any(|a| contains_type_obj_callable(a, resolver))
-                || contains_type_obj_callable(upper_bound, resolver)
-                || contains_type_obj_callable(default, resolver)
-        }
-        Type::ParamSpecType {
-            prefix,
-            upper_bound,
-            default,
-            ..
-        } => {
-            contains_type_obj_callable(&Type::Parameters(prefix.as_ref().clone()), resolver)
-                || contains_type_obj_callable(upper_bound, resolver)
-                || contains_type_obj_callable(default, resolver)
-        }
-        Type::TypeVarTupleType {
-            tuple_fallback,
-            upper_bound,
-            default,
-            ..
-        } => {
-            contains_type_obj_callable(tuple_fallback, resolver)
-                || contains_type_obj_callable(upper_bound, resolver)
-                || contains_type_obj_callable(default, resolver)
-        }
-        Type::UnboundType { args, .. } => {
-            args.iter().any(|a| contains_type_obj_callable(a, resolver))
-        }
-        Type::UnpackType { typ } => contains_type_obj_callable(typ, resolver),
-        Type::AnyType { source_any, .. } => source_any
-            .as_deref()
-            .is_some_and(|a| contains_type_obj_callable(a, resolver)),
-        Type::CallableType {
-            fallback,
-            instance_type,
-            arg_types,
-            ret_type,
-            type_guard,
-            type_is,
-            variables,
-            ..
-        } => {
-            crate::setops::is_type_obj_callable(t, resolver)
-                || contains_type_obj_callable(fallback, resolver)
-                || instance_type
-                    .as_deref()
-                    .is_some_and(|i| contains_type_obj_callable(i, resolver))
-                || arg_types
-                    .iter()
-                    .any(|a| contains_type_obj_callable(a, resolver))
-                || contains_type_obj_callable(ret_type, resolver)
-                || type_guard
-                    .as_deref()
-                    .is_some_and(|t| contains_type_obj_callable(t, resolver))
-                || type_is
-                    .as_deref()
-                    .is_some_and(|t| contains_type_obj_callable(t, resolver))
-                || variables
-                    .iter()
-                    .any(|v| contains_type_obj_callable(v, resolver))
-        }
-        Type::Overloaded { items } => items
-            .iter()
-            .any(|i| contains_type_obj_callable(i, resolver)),
-        Type::TupleType {
-            partial_fallback,
-            items,
-            ..
-        } => {
-            contains_type_obj_callable(partial_fallback, resolver)
-                || items
-                    .iter()
-                    .any(|i| contains_type_obj_callable(i, resolver))
-        }
-        Type::TypedDictType {
-            fallback, items, ..
-        } => {
-            contains_type_obj_callable(fallback, resolver)
-                || items
-                    .iter()
-                    .any(|(_, v)| contains_type_obj_callable(v, resolver))
-        }
-        Type::LiteralType { fallback, .. } => contains_type_obj_callable(fallback, resolver),
-        Type::UnionType { items, .. } => items
-            .iter()
-            .any(|i| contains_type_obj_callable(i, resolver)),
-        Type::TypeType { item, .. } => contains_type_obj_callable(item, resolver),
-        Type::Parameters(params) => params
-            .arg_types
-            .iter()
-            .any(|a| contains_type_obj_callable(a, resolver)),
+        Type::CallableType { .. } | Type::Overloaded { .. } => true,
+        Type::Instance { args, .. } => args.iter().any(contains_function_like),
+        Type::UnionType { items, .. } => items.iter().any(contains_function_like),
+        Type::TupleType { items, .. } => items.iter().any(contains_function_like),
+        Type::TypeAliasType { args, .. } => args.iter().any(contains_function_like),
+        Type::UnpackType { typ } => contains_function_like(typ),
+        Type::TypeType { item, .. } => contains_function_like(item),
+        Type::Parameters(params) => params.arg_types.iter().any(contains_function_like),
         Type::NoneType
-        | Type::ErasedType
+        | Type::AnyType { .. }
+        | Type::TypeVarType { .. }
+        | Type::ParamSpecType { .. }
+        | Type::TypeVarTupleType { .. }
+        | Type::UnboundType { .. }
+        | Type::TypedDictType { .. }
+        | Type::LiteralType { .. }
         | Type::UninhabitedType { .. }
+        | Type::ErasedType
         | Type::DeletedType { .. } => false,
     }
 }
-
 /// A solved type-var entry: `(raw_id, meta_level, namespace)` key plus the
 /// substituted type (None when the solver left it unsolved).
 type SolveEntry = ((i64, i64, String), Option<Type>);
@@ -2195,6 +2112,15 @@ mod tests {
         if fullname != "builtins.object" && !s.has_base.contains("builtins.object") {
             s.mro.push("builtins.object".to_string());
             s.has_base.insert("builtins.object".to_string());
+            // The join_instances_via_supertype walk recurses over
+            // `bases` (not `mro`), so direct-object subclasses need the
+            // base blob populated or unrelated-nominal joins defer.
+            s.bases.push(encode(&Type::Instance {
+                type_ref: "builtins.object".to_string(),
+                args: Vec::new(),
+                last_known_value: None,
+                extra_attrs: None,
+            }));
         }
         s
     }
@@ -2286,13 +2212,85 @@ mod tests {
     }
 
     #[test]
-    fn solve_generic_empty_constraints_defers() {
-        // No actuals -> no constraints -> nothing to solve. Python has no
-        // basis for inference either, so the seam defers (caller runs
-        // Python's infer pass); the old num_solved==0 path.
+    fn solve_generic_empty_constraints_solves() {
+        // No actuals -> no constraints. The solver fills the unconstrained
+        // var with strict Never (lax Any for strict=False), and
+        // get_target_type expands the var's default over it (solve.py:277).
         let callee = generic_identity();
         let out = solve_generic_bytes(&callee, &[], vec![]);
-        assert!(out.is_none(), "expected deferral on empty constraints");
+        assert!(out.is_some(), "expected solve on empty constraints");
+        let bytes = out.unwrap();
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(
+            solved_typevar(&resolved),
+            "expected fully-resolved callable with T=default"
+        );
+    }
+
+    #[test]
+    fn solve_generic_multilower_joins() {
+        // def [T] (a: T, b: T) -> T with int + str: two lowers are joined
+        // by solve_one_inner instead of the old deferral for the
+        // diagnostic; a satisfiable join solves natively.
+        let callee = generic_identity();
+        let mut two = generic_identity();
+        if let Type::CallableType {
+            arg_types,
+            variables,
+            ..
+        } = &mut two
+        {
+            let tv = variables[0].clone();
+            arg_types.push(tv.clone());
+            variables.push(tv);
+        }
+        let out = solve_generic_bytes(
+            &two,
+            &[int_instance(), str_instance()],
+            vec![vec![0], vec![1]],
+        );
+        assert!(out.is_some(), "expected multi-lower join to solve");
+        let bytes = out.unwrap();
+        let mut rb = ReadBuffer::new(&bytes);
+        let resolved = read_type(&mut rb, None).unwrap();
+        assert!(solved_typevar(&resolved), "expected resolved callable");
+    }
+
+    #[test]
+    fn solve_generic_multilower_callable_defers() {
+        // Two callable lowers join to a FunctionLike; the live FuncDef
+        // definitions nested callables carry do not survive the wire and
+        // Python's pretty_callable needs them (def NAME(...) rendering).
+        let mut two = generic_identity();
+        if let Type::CallableType {
+            arg_types,
+            variables,
+            ..
+        } = &mut two
+        {
+            let tv = variables[0].clone();
+            arg_types.push(tv.clone());
+            variables.push(tv);
+        }
+        let f = callable(0);
+        let g = callable(0);
+        let out = solve_generic_bytes(&two, &[f, g], vec![vec![0], vec![1]]);
+        assert!(out.is_none(), "expected deferral on callable join");
+    }
+
+    #[test]
+    fn solve_generic_tuple_actual_solves() {
+        // A positional TupleType actual is passed 1:1 by ArgTypeExpander
+        // (star actuals are gated Python-side): T :> tuple[int, str].
+        let callee = generic_identity();
+        let tup = Type::TupleType {
+            partial_fallback: Box::new(instance()),
+            items: vec![int_instance(), str_instance()],
+            implicit: false,
+        };
+        let out = solve_generic_bytes(&callee, &[tup], vec![vec![0]]);
+        assert!(out.is_some(), "expected tuple actual to solve");
     }
 
     #[test]
