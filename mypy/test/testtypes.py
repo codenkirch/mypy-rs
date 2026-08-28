@@ -39489,3 +39489,253 @@ class NativeSimpleAssignmentSuite(Suite):
         )
         assert ("set_inferred", str(UnionType([int_inst, unrel_inst]))) in off, off
         assert ("subtype", str(UnionType([int_inst, unrel_inst]))) in off, off
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeAllSupersGateSuite(Suite):
+    """Parity for the Rust `check_compatibility_all_supers` gate-head port.
+
+    `TypeChecker.check_compatibility_all_supers` (checker.py:4915-5008) opens
+    with a pure scalar gate (isinstance(lvalue_node, Var), line equality or
+    inferred-without-explicit-self-type, kind in (MDEF, None), non-empty
+    bases) and its MRO tail skips bases under allow_incompatible_override
+    (with the __slots__/builtins.object exception) or is_private. The Rust
+    classifier (`checker_functions.rs`) decides the gate and the per-base
+    skip list in one call; the per-base check bodies (message emission,
+    is_writable_attribute), the node_type_from_base lookups, and the
+    inferred-var type stash/restore stay in Python, and the pure-Python body
+    remains the fallback.
+
+    Direct seam calls assert the gate tag and the per-base skip list; the
+    gate-off vs gate-on differential drives the real TypeChecker method
+    through stubbed sub-checks and asserts identical event sequences.
+    """
+
+    def setUp(self) -> None:
+        from mypy.checker import _set_native_checker_active
+
+        self._set_active = _set_native_checker_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _class_info(self, fullname: str, name: str) -> TypeInfo:
+        from mypy.nodes import Block, ClassDef
+
+        cdef = ClassDef(name=name, defs=Block([]))
+        cdef.fullname = fullname
+        return TypeInfo(SymbolTable(), cdef, fullname)
+
+    def _lvalue(
+        self,
+        *,
+        var_name: str = "attr",
+        var_line: int = 1,
+        lvalue_line: int = 1,
+        is_inferred: bool = True,
+        explicit_self_type: bool = False,
+        lvalue_kind: int | None = MDEF,
+        allow_incompatible_override: bool = False,
+        base_fullnames: tuple[str, ...] = ("mod.Base",),
+        base_has_name: bool = True,
+    ) -> NameExpr:
+        bases = [self._class_info(fn, fn.rsplit(".", 1)[-1]) for fn in base_fullnames]
+        for base in bases:
+            if base_has_name:
+                base.names[var_name] = SymbolTableNode(MDEF, Var(var_name))
+        cls = self._class_info("mod.C", "C")
+        # TypeInfo.bases holds Instances; direct_base_classes() reads
+        # Instance.type to recover the TypeInfo of each direct base.
+        cls.bases = [Instance(base, []) for base in bases]
+        cls.mro = [cls, *bases]
+        var = Var(var_name)
+        var.line = var_line
+        var.is_inferred = is_inferred
+        var.explicit_self_type = explicit_self_type
+        var.allow_incompatible_override = allow_incompatible_override
+        var.info = cls
+        var.type = NoneType()
+        lvalue = NameExpr(var_name)
+        lvalue.line = lvalue_line
+        lvalue.kind = lvalue_kind
+        lvalue.node = var
+        return lvalue
+
+    def _tag(self, lvalue_node: Any, lvalue_line: int, lvalue_kind: int | None) -> Any:
+        return _type_kernel.rust_classify_all_supers_gate(
+            lvalue_node, lvalue_line, lvalue_kind, MDEF
+        )
+
+    def _run(
+        self, lvalue: NameExpr, *, super_ok: bool = True, var: Var | None = None
+    ) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+        from types import SimpleNamespace
+
+        from mypy.checker import TypeChecker
+
+        if var is None:
+            var = cast(Var, lvalue.node)
+        cls = var.info
+        attr_type = NoneType()
+
+        def check_one() -> list[tuple[Any, ...]]:
+            chk = TypeChecker.__new__(TypeChecker)
+            events: list[tuple[Any, ...]] = []
+
+            def classvar_super(node: Any, base: Any, base_node: Any) -> bool:
+                events.append(("classvar", base.fullname))
+                return True
+
+            def final_super(node: Any, base: Any, base_node: Any) -> bool:
+                events.append(("final", base.fullname))
+                return True
+
+            def super_check(
+                compare_type: Any,
+                rvalue: Any,
+                base: Any,
+                base_type: Any,
+                base_node: Any,
+                *,
+                always_allow_covariant: bool,
+            ) -> bool:
+                events.append(("super", base.fullname, always_allow_covariant))
+                return super_ok
+
+            def node_type_from_base(
+                name: str,
+                base: Any,
+                context: Any,
+                *,
+                setter_type: bool = False,
+                is_class: bool = False,
+                current_class: Any = None,
+            ) -> tuple[Any, Any]:
+                if setter_type:
+                    return None, None
+                if base is cls:
+                    return attr_type, var
+                tnode = base.names.get(name)
+                return (attr_type, tnode.node) if tnode else (None, None)
+
+            chk.msg = SimpleNamespace(  # type: ignore[assignment]
+                incompatible_setter_override=lambda *a, **k: events.append(("setter",))
+            )
+            chk.check_compatibility_classvar_super = classvar_super  # type: ignore[method-assign]
+            chk.check_compatibility_final_super = final_super  # type: ignore[method-assign]
+            chk.check_compatibility_super = super_check  # type: ignore[method-assign,assignment]
+            chk.node_type_from_base = node_type_from_base  # type: ignore[method-assign]
+            chk._expr_checker = SimpleNamespace(  # type: ignore[assignment]
+                accept=lambda rv, ctx=None: attr_type
+            )
+            chk.check_compatibility_all_supers(lvalue, IntExpr(1))
+            return events
+
+        off = self._with_gate(False, check_one)
+        on = self._with_gate(True, check_one)
+        return off, on
+
+    def _assert_par(self, lvalue: NameExpr, *, super_ok: bool = True) -> None:
+        off, on = self._run(lvalue, super_ok=super_ok)
+        assert_equal(on, off, f"check_compatibility_all_supers parity for {lvalue.node!r}")
+
+    def test_seam_not_var(self) -> None:
+        assert self._tag(None, 1, MDEF) == (0, [])
+
+    def test_seam_gate_proceeds(self) -> None:
+        lvalue = self._lvalue()
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (1, [1])
+
+    def test_seam_line_mismatch_skips(self) -> None:
+        lvalue = self._lvalue(var_line=2, lvalue_line=1, is_inferred=False)
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (0, [])
+
+    def test_seam_inferred_without_self_type_proceeds(self) -> None:
+        # Line mismatch but inferred without an explicit self annotation.
+        lvalue = self._lvalue(var_line=2, lvalue_line=1, is_inferred=True)
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (1, [1])
+
+    def test_seam_inferred_with_self_type_skips(self) -> None:
+        lvalue = self._lvalue(var_line=2, lvalue_line=1, is_inferred=True,
+                              explicit_self_type=True)
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (0, [])
+
+    def test_seam_kind_none_proceeds(self) -> None:
+        # None for Vars defined via self.
+        lvalue = self._lvalue(lvalue_kind=None)
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (1, [1])
+
+    def test_seam_kind_gdef_skips(self) -> None:
+        lvalue = self._lvalue(lvalue_kind=GDEF)
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (0, [])
+
+    def test_seam_no_bases_skips(self) -> None:
+        lvalue = self._lvalue(base_fullnames=())
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (0, [])
+
+    def test_seam_per_base_skip_list(self) -> None:
+        # allow_incompatible_override skips every base except the
+        # __slots__/builtins.object exception.
+        lvalue = self._lvalue(
+            var_name="__slots__",
+            allow_incompatible_override=True,
+            base_fullnames=("builtins.object", "mod.Base"),
+        )
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (1, [1, 0])
+
+    def test_seam_private_name_all_skipped(self) -> None:
+        lvalue = self._lvalue(var_name="__priv",
+                              base_fullnames=("mod.Base", "mod.Base2"))
+        assert self._tag(lvalue.node, lvalue.line, lvalue.kind) == (1, [0, 0])
+
+    def test_seam_defers_on_none_info(self) -> None:
+        # An unreadable info attribute defers to the pure-Python body.
+        var = Var("attr")
+        var.line = 1
+        var.is_inferred = True
+        var.info = None  # type: ignore[assignment]
+        assert self._tag(var, 1, MDEF) is None
+
+    def test_parity_gate_pass(self) -> None:
+        self._assert_par(self._lvalue())
+
+    def test_parity_gate_line_mismatch_skips(self) -> None:
+        self._assert_par(self._lvalue(var_line=2, lvalue_line=1, is_inferred=False))
+
+    def test_parity_not_var(self) -> None:
+        lvalue = self._lvalue()
+        var = cast(Var, lvalue.node)
+        lvalue.node = None
+        off, on = self._run(lvalue, var=var)
+        assert_equal(on, off, f"check_compatibility_all_supers parity for node=None")
+
+    def test_parity_annotated_var_line_match(self) -> None:
+        # Explicit annotation: not inferred, gate passes via line equality,
+        # and the inferred-var stash/restore is skipped.
+        self._assert_par(self._lvalue(is_inferred=False))
+
+    def test_parity_allow_incompatible_override(self) -> None:
+        self._assert_par(self._lvalue(allow_incompatible_override=True))
+
+    def test_parity_slots_object_exception(self) -> None:
+        self._assert_par(
+            self._lvalue(
+                var_name="__slots__",
+                allow_incompatible_override=True,
+                base_fullnames=("builtins.object", "mod.Base"),
+            )
+        )
+
+    def test_parity_private_name(self) -> None:
+        self._assert_par(self._lvalue(var_name="__priv"))
+
+    def test_parity_super_incompatible_breaks(self) -> None:
+        self._assert_par(self._lvalue(), super_ok=False)

@@ -210,6 +210,7 @@ __all__ = [
     "rust_classify_final_super",
     "rust_classify_check_final",
     "rust_classify_classvar_super",
+    "rust_classify_all_supers_gate",
     "rust_classify_check_lvalue",
     "rust_classify_new_signature",
     "rust_classify_func_def_override",
@@ -836,6 +837,12 @@ def rust_classify_classvar_super(
     base_node: Any,
     node_is_classvar: bool,
 ) -> int | None: ...
+def rust_classify_all_supers_gate(
+    lvalue_node: Any,
+    lvalue_line: int,
+    lvalue_kind: int | None,
+    mdef: int,
+) -> tuple[int, list[int]] | None: ...
 def rust_classify_check_lvalue(
     lvalue: Any, allow_redefinition: bool, is_definition: bool
 ) -> int | None: ...

@@ -427,6 +427,25 @@ including:
   (wired from `mypy/build.py`) and covered by
   `NativeOverloadingOverloadsSuite` in `mypy/test/testtypes.py` (gate-off
   vs gate-on differential on the decision lists).
+- `rust_classify_all_supers_gate` (mypy.checker, issue #1060): the Rust
+  classifier in `checker_functions.rs` ports the entry gate and per-base
+  skip decisions of `TypeChecker.check_compatibility_all_supers`
+  (checker.py): the Var/annotated-line/`lvalue.kind`/has-bases gate that
+  decides whether the classvar + final super checks run at all, and for
+  each `mro[1:]` base the `allow_incompatible_override` + `is_private`
+  skip pair. Rust reads the live `lvalue_node` scalars via PyO3
+  (`lvalue.line`, `lvalue.kind`, `lvalue_node.name`, `info.bases`,
+  `info.mro`, `allow_incompatible_override`, per-base `base.fullname`)
+  and returns `(gate_tag, base_skip_tags)`; the Python shim applies the
+  early return, drives the per-base loop with the skip list, and keeps
+  the check bodies (`check_compatibility_classvar_super` /
+  `check_compatibility_final_super` / `check_compatibility_super`),
+  `node_type_from_base`, and the inferred-var stash/restore in Python.
+  Defers (`None`) on an unreadable fact so the pure-Python body runs
+  unchanged. Consumes no wire types. Gated by `_native_checker_active`
+  and covered by `NativeAllSupersGateSuite` in `mypy/test/testtypes.py`
+  (direct seam tag tests + gate-off vs gate-on differential), plus 10
+  pure decision unit tests in `checker_functions.rs`.
 - `rust_classify_final_super` (mypy.checker): the Rust classifier in
   `checker_functions.rs` ports the pure decision of
   `TypeChecker.check_compatibility_final_super` (checker.py:4608-4636):

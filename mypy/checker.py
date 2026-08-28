@@ -333,6 +333,7 @@ try:
         rust_check_for_untyped_decorator as _rust_check_for_untyped_decorator,
         rust_check_match_args as _rust_check_match_args,
         rust_check_overlapping_overloads as _rust_check_overlapping_overloads,
+        rust_classify_all_supers_gate as _rust_classify_all_supers_gate,
         rust_classify_check_final as _rust_classify_check_final,
         rust_classify_check_lvalue as _rust_classify_check_lvalue,
         rust_classify_classvar_super as _rust_classify_classvar_super,
@@ -422,6 +423,7 @@ except ImportError:
     _rust_classify_except_handler_tests = None  # type: ignore[assignment]
     _rust_classify_final_super = None  # type: ignore[assignment]
     _rust_classify_classvar_super = None  # type: ignore[assignment]
+    _rust_classify_all_supers_gate = None  # type: ignore[assignment]
     _rust_classify_check_final = None  # type: ignore[assignment]
     _rust_classify_check_lvalue = None  # type: ignore[assignment]
     _rust_classify_new_signature = None  # type: ignore[assignment]
@@ -506,6 +508,13 @@ NATIVE_CLASSVAR_SUPER_NOT_VAR = 0
 NATIVE_CLASSVAR_SUPER_OK = 1
 NATIVE_CLASSVAR_SUPER_INSTANCE_VAR = 2
 NATIVE_CLASSVAR_SUPER_CLASS_VAR = 3
+
+# Decision tags returned by `_rust_classify_all_supers_gate`; must match
+# `ALL_SUPERS_*` in crates/type_kernel/src/checker_functions.rs.
+NATIVE_ALL_SUPERS_GATE_SKIP = 0
+NATIVE_ALL_SUPERS_GATE_PROCEED = 1
+NATIVE_ALL_SUPERS_BASE_SKIP = 0
+NATIVE_ALL_SUPERS_BASE_RUN = 1
 
 # Decision tags returned by `_rust_classify_new_signature`; must match
 # `NEW_SIGNATURE_*` in crates/type_kernel/src/checker_functions.rs.
@@ -4931,6 +4940,27 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
 
     def check_compatibility_all_supers(self, lvalue: RefExpr, rvalue: Expression) -> None:
         lvalue_node = lvalue.node
+        # Native seam: one Rust call classifies the entry gate and per-base
+        # skip decisions; check bodies, node_type_from_base, and the
+        # inferred-var stash/restore stay Python. None -> pure-Python body.
+        base_skips: list[bool] | None = None
+        if (
+            _CHECKER_HAS_TYPE_KERNEL
+            and _native_checker_active
+            and _rust_classify_all_supers_gate is not None
+        ):
+            try:
+                gate_tags = _rust_classify_all_supers_gate(
+                    lvalue_node, lvalue.line, lvalue.kind, MDEF
+                )
+            except (AssertionError, NotImplementedError, ValueError, TypeError):
+                gate_tags = None
+            if gate_tags is not None:
+                if gate_tags[0] == NATIVE_ALL_SUPERS_GATE_SKIP:
+                    return
+                base_skips = [
+                    tag == NATIVE_ALL_SUPERS_BASE_SKIP for tag in gate_tags[1]
+                ]
         # Check if we are a class variable with at least one base class
         if (
             isinstance(lvalue_node, Var)
@@ -4976,17 +5006,22 @@ class TypeChecker(NodeVisitor[None], TypeCheckerSharedApi, SplittingVisitor):
             if not lvalue_type:
                 return
 
-            for base in lvalue_node.info.mro[1:]:
+            for i, base in enumerate(lvalue_node.info.mro[1:]):
                 # The type of "__slots__" and some other attributes usually doesn't need to
                 # be compatible with a base class. We'll still check the type of "__slots__"
                 # against "object" as an exception.
-                if lvalue_node.allow_incompatible_override and not (
-                    lvalue_node.name == "__slots__" and base.fullname == "builtins.object"
-                ):
-                    continue
+                if base_skips is not None:
+                    # The Rust classifier already decided this base's skip.
+                    if base_skips[i]:
+                        continue
+                else:
+                    if lvalue_node.allow_incompatible_override and not (
+                        lvalue_node.name == "__slots__" and base.fullname == "builtins.object"
+                    ):
+                        continue
 
-                if is_private(lvalue_node.name):
-                    continue
+                    if is_private(lvalue_node.name):
+                        continue
 
                 base_type, base_node = self.node_type_from_base(lvalue_node.name, base, lvalue)
                 # TODO: if the r.h.s. is a descriptor, we should check setter override as well.

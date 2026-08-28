@@ -3057,6 +3057,14 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
 
+    // checker_functions: check_compatibility_all_supers gate-head port.
+    // Rust classifies the entry gate + per-base MRO skip decisions into
+    // tags; the check bodies and message emission stay in Python.
+    module.add_function(wrap_pyfunction!(
+        checker_functions::rust_classify_all_supers_gate,
+        module
+    )?)?;
+
     // checker_functions: check___new___signature 3-way return-type port.
     // Rust classifies metaclass / non-instance / instance from two scalar
     // facts; the check_subtype calls and message emission stay in Python.
