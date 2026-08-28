@@ -720,10 +720,9 @@ pub(crate) fn is_subtype(
             // (is_protocol_implementation, skip=["__call__"]).
 
             // Both need live machinery; defer so Python decides.
-            if resolver
-                .get(right_ref)
-                .is_some_and(|s| s.is_protocol && s.protocol_members.iter().any(|m| m == "__call__"))
-            {
+            if resolver.get(right_ref).is_some_and(|s| {
+                s.is_protocol && s.protocol_members.iter().any(|m| m == "__call__")
+            }) {
                 return None;
             }
             // subtypes.py:1118: a plain Instance right recurses on the

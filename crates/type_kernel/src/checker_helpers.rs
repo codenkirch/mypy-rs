@@ -1119,12 +1119,8 @@ pub(crate) fn get_protocol_member_inner(
                 true,  // allow_subclass_receiver
             );
             match result {
-                Some(t) => {
-                    Some(GetProtocolMemberResult::Found(t))
-                }
-                None => {
-                    Some(GetProtocolMemberResult::Defer)
-                }
+                Some(t) => Some(GetProtocolMemberResult::Found(t)),
+                None => Some(GetProtocolMemberResult::Defer),
             }
         }
         "Decorator" => {
@@ -1248,9 +1244,7 @@ pub(crate) fn get_protocol_member_inner(
                     };
                     Some(GetProtocolMemberResult::Found(result))
                 }
-                None => {
-                    Some(GetProtocolMemberResult::Defer)
-                }
+                None => Some(GetProtocolMemberResult::Defer),
             }
         }
         "Var" => {
@@ -1301,9 +1295,7 @@ pub(crate) fn get_protocol_member_inner(
                     }
                     Some(GetProtocolMemberResult::Found(t))
                 }
-                None => {
-                    Some(GetProtocolMemberResult::Defer)
-                }
+                None => Some(GetProtocolMemberResult::Defer),
             }
         }
         _ => {

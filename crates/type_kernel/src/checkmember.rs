@@ -4760,7 +4760,7 @@ mod tests {
             "foo",
             &resolver,
             true,
-            true, // is_class
+            true,  // is_class
             false, // allow_subclass_receiver (unit tests)
         );
         assert!(result.is_none(), "classmethod must defer");
