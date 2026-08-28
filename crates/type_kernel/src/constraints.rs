@@ -9,6 +9,8 @@
 
 use pyo3::prelude::*;
 
+use std::cell::RefCell;
+
 use crate::checkexpr_functions::get_proper_or_expand;
 use crate::subtypes::{map_instance_to_supertype, CONTRAVARIANT, COVARIANT};
 use crate::typeinfo::{NativeTypeResolver, TypeResolver};
@@ -164,19 +166,67 @@ pub(crate) fn rust_infer_constraints_full(
 }
 
 /// Recursive core of the ported `ConstraintBuilderVisitor`. Mirrors
-/// `_infer_constraints`'s dispatch (constraints.py:470) minus the wrapper's
-/// `type_state.inferring` bookkeeping, plus the visitor's per-shape
+/// `_infer_constraints`'s dispatch (constraints.py:470) plus the wrapper's
+/// `type_state.inferring` cycle guard, plus the visitor's per-shape
 /// `visit_*` methods for the grabbable cases. Every unsupported shape
 /// defers with `None` so Python runs its full visitor.
 ///
 /// Guard order matches the Python source:
-/// 1. Union/alias deferral on either side (Python normalizes via
+/// 1. Repeated (template, actual) pair -> no constraints (the
+///    `type_state.inferring` mirror, constraints.py:729-731; without it a
+///    self-recursive alias template never terminates, issue #1133).
+/// 2. Union/alias deferral on either side (Python normalizes via
 ///    make_simplified_union; Rust cannot, so it must run before the TypeVar
 ///    and visitor dispatch).
-/// 2. TypeVar template -> single constraint.
-/// 3. Any-suggestion empty result, actual-TypeVar rebinding.
-/// 4. Per-shape visitor dispatch.
+/// 3. TypeVar template -> single constraint.
+/// 4. Any-suggestion empty result, actual-TypeVar rebinding.
+/// 5. Per-shape visitor dispatch.
 pub(crate) fn infer_constraints_full_inner(
+    template: &Type,
+    actual: &Type,
+    direction: i64,
+    resolver: &TypeResolver,
+    aliases: &crate::aliases::TypeAliasResolver,
+) -> Option<Vec<Constraint>> {
+    // Mirror of constraints.py:729-753 (type_state.inferring, #1133): a
+    // repeated (template, actual) pair yields no constraints; alias-bearing
+    // templates are the ones that can regenerate their own shape on the wire.
+    if INFERRING.with(|s| {
+        s.borrow()
+            .iter()
+            .rev()
+            .any(|(t, a)| t == template && a == actual)
+    }) {
+        return Some(vec![]);
+    }
+    let _guard = if crate::visitor::type_contains_alias(template) {
+        INFERRING.with(|s| s.borrow_mut().push((template.clone(), actual.clone())));
+        Some(InferringGuard)
+    } else {
+        None
+    };
+    infer_constraints_dispatch(template, actual, direction, resolver, aliases)
+}
+
+thread_local! {
+    /// Mirror of `constraints.py` `type_state.inferring`: in-progress
+    /// (template, actual) pairs for alias-bearing templates.
+    static INFERRING: RefCell<Vec<(Type, Type)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII pop for [`INFERRING`] (panic-safe, mirrors the wrapper's
+/// push/pop bracket around `_infer_constraints`).
+struct InferringGuard;
+
+impl Drop for InferringGuard {
+    fn drop(&mut self) {
+        INFERRING.with(|s| {
+            s.borrow_mut().pop();
+        });
+    }
+}
+
+fn infer_constraints_dispatch(
     template: &Type,
     actual: &Type,
     direction: i64,
@@ -197,6 +247,7 @@ pub(crate) fn infer_constraints_full_inner(
     // Otherwise Rust would emit constraints against an unsimplified target
     // (`T <: bool | int | float` instead of `T <: int | float`) and change
     // solver results.
+
     // Ignore suggestion-engine Any types before any constraint is emitted:
     // constraints.py:546 runs before the TypeVar branch, so a recursive
     // `(T, Any_suggestion)` pair yields `[]`, never `T <: Any` (the #337 fix).
@@ -702,9 +753,8 @@ fn visit_tuple_native(
         );
     }
     // The actual-unpack middle only constrains when the unpacked is a
-    // homogenous `*tuple[X, ...]` instance; get_proper_type(a_unpack.type)
-    // may expand a TypeAliasType through the resolver. An alias resolving to
-    // a non-tuple target still runs the tail, matching Python.
+    // homogeneous `*tuple[X, ...]` instance and get_proper_type may expand
+    // an alias through the resolver; a non-tuple target still runs the tail.
     let a_unpacked: Option<Vec<Type>> = match a_unpacked {
         Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => Some(args.clone()),
         Type::TypeAliasType { .. } => match get_proper_or_expand(a_unpacked, aliases)? {
@@ -1021,10 +1071,9 @@ fn simple_unpack_native(
             Type::UnpackType { typ } => typ.as_ref(),
             _ => return None,
         };
-        // Only an *tuple[A, ...] actual unpack produces constraints. A
-        // TypeVarTuple actual unpack yields nothing (constraints.py:2137).
-        // get_proper_type(a_unpack_type.type) expands an alias through the
-        // resolver; a non-tuple target yields nothing.
+        // Only a *tuple[A, ...] actual unpack produces constraints.
+        // TypeVarTuple actual unpack yields nothing (constraints.py:2137)
+        // unless get_proper_type expands the alias to a tuple target.
         let a_inner_args: Option<Vec<Type>> = match a_unpacked {
             Type::Instance { type_ref, args, .. } if type_ref == "builtins.tuple" => {
                 Some(args.clone())
@@ -2142,5 +2191,69 @@ mod tests {
         };
         let res = visit_instance_tail_native(&template, &actual, SUPERTYPE_OF, &resolver, &aliases);
         assert!(res.is_some());
+    }
+
+    // -- type_state.inferring cycle guard (issue #1133) --
+
+    fn insert_recursive_tree_alias(aliases: &mut crate::aliases::TypeAliasResolver) {
+        // `Tree = TypedDict('Tree', {'left': 'Tree[T]'})` — the snapshot
+        // target carries a lazy self-reference, so both operands
+        // regenerate their own shape on expansion.
+        let target = Type::TypedDictType {
+            fallback: Box::new(instance_builtins_object()),
+            items: vec![(
+                "left".to_string(),
+                Type::TypeAliasType {
+                    args: vec![type_var(1, "T")],
+                    type_ref: "mod.Tree".to_string(),
+                },
+            )],
+            required_keys: std::collections::HashSet::new(),
+            readonly_keys: std::collections::HashSet::new(),
+            is_closed: false,
+        };
+        aliases.insert("mod.Tree".to_string(), alias_snap("mod.Tree", &target));
+    }
+
+    #[test]
+    fn test_recursive_alias_pair_returns_no_constraints() {
+        // Without the INFERRING mirror this pair recursed to stack overflow
+        // once the alias snapshot made it reachable (#1133); the guard must
+        // catch the repeat and mirror constraints.py:729-731 (empty list).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        insert_recursive_tree_alias(&mut aliases);
+        let template = Type::TypeAliasType {
+            args: vec![type_var(1, "T")],
+            type_ref: "mod.Tree".to_string(),
+        };
+        let actual = Type::TypeAliasType {
+            args: vec![instance_int()],
+            type_ref: "mod.Tree".to_string(),
+        };
+        let res =
+            infer_constraints_full_inner(&template, &actual, SUPERTYPE_OF, &resolver, &aliases);
+        assert!(res.is_some_and(|c| c.is_empty()));
+    }
+
+    #[test]
+    fn test_alias_guard_stack_is_popped_between_calls() {
+        // A second identical call must not see the first call's pushed
+        // pair; a leaked INFERRING entry would turn the second call into
+        // a spurious repeat (empty result).
+        let resolver = crate::typeinfo::TypeResolver::new();
+        let mut aliases = crate::aliases::TypeAliasResolver::new();
+        aliases.insert(
+            "mod.Alias".to_string(),
+            alias_snap("mod.Alias", &type_var(1, "T")),
+        );
+        let template = alias_type("mod.Alias");
+        let actual = instance_int();
+        for _ in 0..2 {
+            let res =
+                infer_constraints_full_inner(&template, &actual, SUPERTYPE_OF, &resolver, &aliases);
+            let constraints = res.expect("non-recursive call must compute natively");
+            assert_eq!(constraints.len(), 1);
+        }
     }
 }
