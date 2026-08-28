@@ -1940,6 +1940,13 @@ fn type_kernel(_py: Python<'_>, module: &PyModule) -> PyResult<()> {
         module
     )?)?;
     module.add_function(wrap_pyfunction!(checkmember::rust_is_instance_var, module)?)?;
+    // Issue #1078: check_final_member MRO fold. Rust walks the live
+    // `info.mro` and answers "any base declares `name` final"; the
+    // `cant_assign_to_final` message stays in Python.
+    module.add_function(wrap_pyfunction!(
+        checkmember::rust_check_final_member,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(
         checkmember::rust_classify_type_type_member_access,
         module

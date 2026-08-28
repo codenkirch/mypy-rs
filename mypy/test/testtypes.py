@@ -67,6 +67,7 @@ from mypy.nodes import (
     SliceExpr,
     StarExpr,
     StrExpr,
+    SymbolNode,
     SymbolTable,
     SymbolTableNode,
     TemplateStrExpr,
@@ -32293,6 +32294,151 @@ class NativeIsInstanceVarSuite(Suite):
         # The Python predicate would raise too, so seam-only here.
         var = Var("x")
         result = _type_kernel.rust_is_instance_var(var)
+        assert result is None, f"expected defer, got {result}"
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeCheckFinalMemberSuite(Suite):
+    """Parity for the Rust `check_final_member` MRO fold (mypy.checkmember).
+
+    `check_final_member` (checkmember.py:1360) walks `info.mro` looking
+    for a final Var/FuncDef/OverloadedFuncDef/Decorator under `name`
+    and emits `cant_assign_to_final` for each final entry. The Rust
+    seam reads the live TypeInfo via PyO3 (zero wire bytes) and folds
+    the whole MRO into one bool (True = some entry is final); the
+    Python shim keeps the emission. Gate-off vs gate-on runs must
+    record identical emissions and the direct seam call must engage
+    (non-None) on every well-formed MRO.
+    """
+
+    class _RecordingMsg:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def cant_assign_to_final(self, name: str, attr_assign: bool, ctx: object) -> None:
+            self.calls.append(name)
+
+    def setUp(self) -> None:
+        from mypy.checkmember import _set_native_checkmember_active
+
+        self._set_active = _set_native_checkmember_active
+        self._set_active(True)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _typeinfo(self, fullname: str = "mod.A") -> TypeInfo:
+        from mypy.nodes import Block, ClassDef, SymbolTable
+
+        defn = ClassDef(fullname.rsplit(".", 1)[-1], Block([]), None, [])
+        defn.fullname = fullname
+        info = TypeInfo(SymbolTable(), defn, "mod")
+        defn.info = info
+        return info
+
+    def _chain(self, *fullnames: str) -> list[TypeInfo]:
+        infos = [self._typeinfo(fn) for fn in fullnames]
+        infos[0].mro = list(infos)
+        return infos
+
+    def _install(self, info: TypeInfo, name: str, node: SymbolNode | None) -> None:
+        info.names[name] = SymbolTableNode(MDEF, node)
+
+    def _assert_par(self, info: TypeInfo, name: str, expected: list[str]) -> None:
+        from mypy.checkmember import check_final_member
+
+        def run() -> list[str]:
+            msg = self._RecordingMsg()
+            check_final_member(name, info, cast(Any, msg), cast(Context, None))
+            return msg.calls
+
+        off = self._with_gate(False, run)
+        on = self._with_gate(True, run)
+        assert off == expected, f"gate-off: {off} != {expected}"
+        assert on == expected, f"gate-on: {on} != {expected}"
+
+    def _assert_seam(self, info: TypeInfo, name: str, expected: bool) -> None:
+        result = _type_kernel.rust_check_final_member(info, name)
+        assert result is not None, f"Rust deferred on {info.fullname}.{name}"
+        assert result == expected, f"Rust seam: {result} != {expected}"
+
+    def test_final_var_in_base(self) -> None:
+        a, b = self._chain("mod.A", "mod.B")
+        final_var = Var("x")
+        final_var.is_final = True
+        self._install(b, "x", final_var)
+        self._assert_par(a, "x", ["x"])
+        self._assert_seam(a, "x", True)
+
+    def test_non_final_var_in_base(self) -> None:
+        a, b = self._chain("mod.A", "mod.B")
+        self._install(b, "x", Var("x"))
+        self._assert_par(a, "x", [])
+        self._assert_seam(a, "x", False)
+
+    def test_final_in_own_names(self) -> None:
+        a, _b = self._chain("mod.A", "mod.B")
+        final_var = Var("x")
+        final_var.is_final = True
+        self._install(a, "x", final_var)
+        self._assert_par(a, "x", ["x"])
+        self._assert_seam(a, "x", True)
+
+    def test_final_in_later_base(self) -> None:
+        a, _b, c = self._chain("mod.A", "mod.B", "mod.C")
+        final_var = Var("x")
+        final_var.is_final = True
+        self._install(c, "x", final_var)
+        self._assert_par(a, "x", ["x"])
+        self._assert_seam(a, "x", True)
+
+    def test_overridden_by_non_final_still_final(self) -> None:
+        a, b, c = self._chain("mod.A", "mod.B", "mod.C")
+        self._install(b, "x", Var("x"))
+        final_var = Var("x")
+        final_var.is_final = True
+        self._install(c, "x", final_var)
+        self._assert_par(a, "x", ["x"])
+        self._assert_seam(a, "x", True)
+
+    def test_name_not_in_mro(self) -> None:
+        a, b = self._chain("mod.A", "mod.B")
+        self._assert_par(a, "x", [])
+        self._assert_seam(a, "x", False)
+
+    def test_final_method_emits(self) -> None:
+        from mypy.nodes import Block
+
+        a, b = self._chain("mod.A", "mod.B")
+        fd = FuncDef("m", [], Block([]))
+        fd.is_final = True
+        self._install(b, "m", fd)
+        self._assert_par(a, "m", ["m"])
+        self._assert_seam(a, "m", True)
+
+    def test_non_final_node_kind_skipped(self) -> None:
+        a, b = self._chain("mod.A", "mod.B")
+        self._install(b, "x", self._typeinfo("mod.Other"))
+        self._assert_par(a, "x", [])
+        self._assert_seam(a, "x", False)
+
+    def test_none_node_skipped(self) -> None:
+        a, b = self._chain("mod.A", "mod.B")
+        self._install(b, "x", None)
+        self._assert_par(a, "x", [])
+        self._assert_seam(a, "x", False)
+
+    def test_seam_defers_on_non_typeinfo(self) -> None:
+        # A non-TypeInfo first arg has no `mro`, so the Rust seam
+        # defers (None) instead of answering.
+        result = _type_kernel.rust_check_final_member(cast(TypeInfo, Var("x")), "x")
         assert result is None, f"expected defer, got {result}"
 
 

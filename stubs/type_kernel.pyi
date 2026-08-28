@@ -223,6 +223,7 @@ __all__ = [
     "rust_classify_classvar_super",
     "rust_classify_all_supers_gate",
     "rust_classify_check_lvalue",
+    "rust_check_final_member",
     "rust_classify_new_signature",
     "rust_classify_func_def_override",
     "rust_classify_enum_new",
@@ -1864,6 +1865,9 @@ def rust_descriptor_has_get_set(
 ) -> tuple[bool, bool] | None: ...
 def rust_classify_type_type_member_access(typ: Any) -> int | None: ...
 def rust_is_instance_var(var: Var) -> bool | None: ...
+# Issue #1078: check_final_member MRO fold. True when any base of the
+# live `info` declares `name` final; None defers to the pure body.
+def rust_check_final_member(info: TypeInfo, name: str) -> bool | None: ...
 # Issue #1056: analyze_var decision head. Returns one ANALYZE_VAR tag
 # (SETTER/GETTER/PARTIAL/NOT_READY/ENUM_LITERAL/UNBOUND_ANY) or None.
 def rust_classify_analyze_var(
