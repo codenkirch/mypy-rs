@@ -241,6 +241,78 @@ class _TypeVarMetaFixer(mypy.type_visitor.TypeQuery[list[Any]]):
         return result
 
 
+def _native_get_target_type(
+    tvar: TypeVarLikeType,
+    type: Type,
+    p_type: ProperType,
+    skip_unsatisfied: bool,
+) -> tuple[int, int] | None:
+    """Rust decision head for get_target_type (applytype.py:244-296).
+
+    Returns (tag, match_index) when Rust decided the branch, or None to
+    fall back to the pure-Python body. The resolver-backed subtype and
+    same-type booleans are computed here (already native) and passed in;
+    Rust never re-derives them. The report callback, expand_type, and
+    erase_typevars stay Python-side, and the result Type never crosses
+    the seam.
+    """
+    from mypy.subtypes import is_same_type, is_subtype
+
+    same_type_ok: bool | None = None
+    bound_ok: bool | None = None
+    value_subtypes: list[bool] | None = None
+    narrow_matrix: list[bool] | None = None
+    if isinstance(tvar, TypeVarType) and tvar.values:
+        values = tvar.values
+        if isinstance(p_type, AnyType):
+            pass
+        elif isinstance(p_type, TypeVarType) and p_type.values:
+            same_type_ok = all(any(is_same_type(v, v1) for v in values) for v1 in p_type.values)
+            if not same_type_ok:
+                value_subtypes, narrow_matrix = _target_type_subtype_facts(type, values)
+        else:
+            value_subtypes, narrow_matrix = _target_type_subtype_facts(type, values)
+    elif isinstance(tvar, TypeVarType):
+        upper_bound = tvar.upper_bound
+        if tvar.name == "Self":
+            # Internally constructed Self-types contain class type variables
+            # in upper bound, so we need to erase them to avoid false
+            # positives. Mirrors the pure-Python body's erase_typevars call.
+            upper_bound = erase_typevars(upper_bound)
+        bound_ok = is_subtype(type, upper_bound)
+    try:
+        return _type_kernel.rust_get_target_type(
+            _serialize_type(tvar),
+            _serialize_type(type),
+            skip_unsatisfied,
+            same_type_ok,
+            bound_ok,
+            value_subtypes,
+            narrow_matrix,
+        )
+    except (NotImplementedError, AssertionError, ValueError):
+        return None
+
+
+def _target_type_subtype_facts(
+    type: Type, values: list[Type]
+) -> tuple[list[bool], list[bool] | None]:
+    """Subtype facts for the value-matching fold: per-value plus matrix.
+
+    The narrow matrix (value_i <: value_j, flattened row-major) is only
+    computed when more than one value matches, mirroring the lazy
+    narrowest-match loop of the pure-Python body.
+    """
+    from mypy.subtypes import is_subtype
+
+    subs = [is_subtype(type, value) for value in values]
+    narrow: list[bool] | None = None
+    if sum(subs) > 1:
+        n = len(values)
+        narrow = [is_subtype(values[i], values[j]) for i in range(n) for j in range(n)]
+    return subs, narrow
+
+
 def get_target_type(
     tvar: TypeVarLikeType,
     type: Type,
@@ -251,6 +323,22 @@ def get_target_type(
     id_to_type: dict[TypeVarId, Type],
 ) -> Type | None:
     p_type = get_proper_type(type)
+    if _HAS_TYPE_KERNEL and _native_applytype_active:
+        rust = _native_get_target_type(tvar, type, p_type, skip_unsatisfied)
+        if rust is not None:
+            tag, idx = rust
+            if tag == 0:  # TAG_EXPAND_DEFAULT
+                # Gradually expand defaults, as they may depend on previous type variables.
+                return expand_type(tvar.default, id_to_type)
+            if tag == 1:  # TAG_PASSTHROUGH
+                return type
+            if tag == 2:  # TAG_MATCH
+                return cast(TypeVarType, tvar).values[idx]
+            if tag == 3:  # TAG_SKIP
+                return None
+            # TAG_REPORT
+            report_incompatible_typevar_value(callable, type, tvar.name, context)
+            return type
     if isinstance(p_type, UninhabitedType) and p_type.ambiguous and tvar.has_default():
         # Gradually expand defaults, as they may depend on previous type variables.
         return expand_type(tvar.default, id_to_type)

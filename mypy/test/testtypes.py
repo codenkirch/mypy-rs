@@ -41268,3 +41268,297 @@ class NativeInferOperatorAssignmentSuite(Suite):
             Instance(self._info("C", ("__icontains__",)), []), "in", (False, "__contains__")
         )
         self._assert_par(Instance(self._info("C"), []), "==", (False, "__eq__"))
+
+
+@skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
+class NativeGetTargetTypeSuite(Suite):
+    """Parity for the Rust `get_target_type` decision head (applytype.py, #1081).
+
+    The Python shim in mypy.applytype.get_target_type computes the
+    resolver-backed subtype/same-type booleans (already native) and lets
+    Rust pick the branch tag; Python applies expand_type, the
+    report_incompatible_typevar_value callback, and returns live types.
+    Toggling the applytype gate off (pure-Python body) and on (Rust seam)
+    must produce identical results and identical callback traffic. Direct
+    seam calls prove each tag engages rather than silently deferring.
+    """
+
+    def setUp(self) -> None:
+        from mypy.applytype import _set_native_applytype_active
+
+        self.fx = TypeFixture()
+        self._set_active = _set_native_applytype_active
+        self._set_active(False)
+
+    def tearDown(self) -> None:
+        self._set_active(False)
+
+    def _tvar(
+        self,
+        name: str = "T",
+        raw_id: int = 1,
+        upper_bound: Type | None = None,
+        values: list[Type] | None = None,
+        default: Type | None = None,
+    ) -> TypeVarType:
+        return TypeVarType(
+            name,
+            "mod." + name,
+            TypeVarId(raw_id),
+            values if values is not None else [],
+            upper_bound if upper_bound is not None else self.fx.o,
+            default if default is not None else AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _pspec(self) -> ParamSpecType:
+        return ParamSpecType(
+            "P",
+            "mod.P",
+            TypeVarId(1),
+            ParamSpecFlavor.BARE,
+            self.fx.o,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _tvt(self) -> TypeVarTupleType:
+        return TypeVarTupleType(
+            "Ts",
+            "mod.Ts",
+            TypeVarId(1),
+            self.fx.o,
+            self.fx.std_tuple,
+            AnyType(TypeOfAny.from_omitted_generics),
+        )
+
+    def _callable(self, tvar: TypeVarLikeType) -> CallableType:
+        return CallableType([], [], [], self.fx.anyt, self.fx.function, name="f", variables=[tvar])
+
+    def _report(self) -> tuple[Any, list[tuple[str, Type]]]:
+        calls: list[tuple[str, Type]] = []
+
+        def report(callable: CallableType, type: Type, name: str, context: Any) -> None:
+            calls.append((name, type))
+
+        return report, calls
+
+    def _with_gate(self, active: bool, fn: Callable[[], T]) -> T:
+        self._set_active(active)
+        try:
+            return fn()
+        finally:
+            self._set_active(True)
+
+    def _assert_par(
+        self,
+        tvar: TypeVarLikeType,
+        type_arg: Type,
+        skip_unsatisfied: bool = False,
+    ) -> tuple[Type | None, list[tuple[str, Type]]]:
+        from mypy.applytype import get_target_type
+
+        report, calls = self._report()
+        context = self._callable(tvar)
+        off = self._with_gate(
+            False,
+            lambda: get_target_type(
+                tvar, type_arg, context, report, context, skip_unsatisfied, {}
+            ),
+        )
+        report2, calls2 = self._report()
+        on = self._with_gate(
+            True,
+            lambda: get_target_type(
+                tvar, type_arg, context, report2, context, skip_unsatisfied, {}
+            ),
+        )
+        assert_equal(on, off, f"get_target_type parity {type_arg}")
+        assert_equal(calls2, calls, f"report parity {type_arg}")
+        return on, calls2
+
+    # --- gate-off vs gate-on differentials ---
+
+    def test_baseline_gate_off(self) -> None:
+        tvar = self._tvar()
+        result, calls = self._assert_par(tvar, self.fx.a)
+        assert result is self.fx.a
+        assert calls == []
+
+    def test_parity_unconstrained_bound_ok(self) -> None:
+        tvar = self._tvar(upper_bound=self.fx.o)
+        result, calls = self._assert_par(tvar, self.fx.a)
+        assert result is self.fx.a
+        assert calls == []
+
+    def test_parity_unconstrained_bound_fail_report(self) -> None:
+        # A is not a subtype of B: both gates report and return the type.
+        tvar = self._tvar(upper_bound=self.fx.b)
+        result, calls = self._assert_par(tvar, self.fx.a)
+        assert result is self.fx.a
+        assert calls == [("T", self.fx.a)]
+
+    def test_parity_unconstrained_bound_fail_skip(self) -> None:
+        tvar = self._tvar(upper_bound=self.fx.b)
+        result, calls = self._assert_par(tvar, self.fx.a, skip_unsatisfied=True)
+        assert result is None
+        assert calls == []
+
+    def test_parity_self_erase(self) -> None:
+        # Self upper bound G[T]: the shim erases typevars before the bound
+        # check, so G[A] passes; without the erase the check would fail.
+        upper = Instance(self.fx.gi, [self.fx.t])
+        tvar = self._tvar(name="Self", raw_id=1, upper_bound=upper)
+        result, calls = self._assert_par(tvar, Instance(self.fx.gi, [self.fx.a]))
+        assert result is not None
+        assert calls == []
+
+    def test_parity_paramspec_passthrough(self) -> None:
+        result, calls = self._assert_par(self._pspec(), self.fx.a)
+        assert result is self.fx.a
+        assert calls == []
+
+    def test_parity_tvt_passthrough(self) -> None:
+        result, calls = self._assert_par(self._tvt(), self.fx.a)
+        assert result is self.fx.a
+        assert calls == []
+
+    def test_parity_expand_default(self) -> None:
+        # Ambiguous UninhabitedType with a real tvar default: the default
+        # is expanded (empty env leaves it unchanged) and returned.
+        tvar = self._tvar(default=self.fx.a)
+        amb = UninhabitedType(ambiguous=True)
+        result, calls = self._assert_par(tvar, amb)
+        assert_equal(result, self.fx.a)
+        assert calls == []
+
+    def test_parity_constrained_any_passthrough(self) -> None:
+        tvar = self._tvar(values=[self.fx.a, self.fx.b])
+        anyt = AnyType(TypeOfAny.special_form)
+        result, calls = self._assert_par(tvar, anyt)
+        assert result is anyt
+        assert calls == []
+
+    def test_parity_constrained_best_match(self) -> None:
+        tvar = self._tvar(values=[self.fx.a, self.fx.b])
+        result, calls = self._assert_par(tvar, self.fx.b)
+        assert result is tvar.values[1]
+        assert calls == []
+
+    def test_parity_constrained_narrowest_match(self) -> None:
+        # Both values match A (object and A); the narrowest (A) wins.
+        tvar = self._tvar(values=[self.fx.o, self.fx.a])
+        result, calls = self._assert_par(tvar, self.fx.a)
+        assert result is tvar.values[1]
+        assert calls == []
+
+    def test_parity_constrained_no_match_report(self) -> None:
+        tvar = self._tvar(values=[self.fx.b])
+        result, calls = self._assert_par(tvar, self.fx.a)
+        assert result is self.fx.a
+        assert calls == [("T", self.fx.a)]
+
+    def test_parity_constrained_no_match_skip(self) -> None:
+        tvar = self._tvar(values=[self.fx.b])
+        result, calls = self._assert_par(tvar, self.fx.a, skip_unsatisfied=True)
+        assert result is None
+        assert calls == []
+
+    def test_parity_cross_product_allow(self) -> None:
+        # A TypeVarType arg whose every value is a legal tvar value passes.
+        tvar = self._tvar(raw_id=1, values=[self.fx.a, self.fx.b])
+        t1 = self._tvar(name="T1", raw_id=2, values=[self.fx.a])
+        result, calls = self._assert_par(tvar, t1)
+        assert result is t1
+        assert calls == []
+
+    def test_parity_cross_product_mismatch(self) -> None:
+        # T1's values are not a subset of the tvar's: falls through to the
+        # matching fold, which finds no match and reports.
+        tvar = self._tvar(raw_id=1, values=[self.fx.a, self.fx.b])
+        t1 = self._tvar(name="T1", raw_id=2, values=[Instance(self.fx.di, [])])
+        result, calls = self._assert_par(tvar, t1)
+        assert result is t1
+        assert calls == [("T", t1)]
+
+    # --- direct seam calls ---
+
+    def _seam(self, tvar: Type, type_arg: Type, **facts: Any) -> Any:
+        from mypy.applytype import _serialize_type
+
+        return _type_kernel.rust_get_target_type(
+            _serialize_type(tvar),
+            _serialize_type(type_arg),
+            facts.get("skip_unsatisfied", False),
+            facts.get("same_type_ok"),
+            facts.get("bound_ok"),
+            facts.get("value_subtypes"),
+            facts.get("narrow_matrix"),
+        )
+
+    def test_seam_expand_default_tag(self) -> None:
+        tvar = self._tvar(default=self.fx.a)
+        assert self._seam(tvar, UninhabitedType(ambiguous=True)) == (0, -1)
+
+    def test_seam_paramspec_tag(self) -> None:
+        assert self._seam(self._pspec(), self.fx.a) == (1, -1)
+
+    def test_seam_tvt_tag(self) -> None:
+        assert self._seam(self._tvt(), self.fx.a) == (1, -1)
+
+    def test_seam_any_passthrough_tag(self) -> None:
+        tvar = self._tvar(values=[self.fx.a, self.fx.b])
+        assert self._seam(tvar, AnyType(TypeOfAny.special_form)) == (1, -1)
+
+    def test_seam_cross_product_tag(self) -> None:
+        tvar = self._tvar(values=[self.fx.a, self.fx.b])
+        t1 = self._tvar(name="T1", raw_id=2, values=[self.fx.a])
+        assert self._seam(t1, tvar, same_type_ok=True) == (1, -1)
+
+    def test_seam_best_match_tag(self) -> None:
+        tvar = self._tvar(values=[self.fx.a, self.fx.b])
+        assert self._seam(tvar, self.fx.b, value_subtypes=[False, True]) == (2, 1)
+
+    def test_seam_narrowest_match_tag(self) -> None:
+        # Both values match; is_subtype(values[1], values[0]) picks index 1.
+        import mypy.subtypes
+
+        tvar = self._tvar(values=[self.fx.o, self.fx.a])
+        matrix = [
+            mypy.subtypes.is_subtype(tvar.values[i], tvar.values[j])
+            for i in range(2)
+            for j in range(2)
+        ]
+        assert self._seam(tvar, self.fx.a, value_subtypes=[True, True], narrow_matrix=matrix) == (
+            2,
+            1,
+        )
+
+    def test_seam_skip_and_report_tags(self) -> None:
+        tvar = self._tvar(values=[self.fx.b])
+        assert self._seam(tvar, self.fx.a, skip_unsatisfied=True, value_subtypes=[False]) == (
+            3,
+            -1,
+        )
+        assert self._seam(tvar, self.fx.a, skip_unsatisfied=False, value_subtypes=[False]) == (
+            4,
+            -1,
+        )
+
+    def test_seam_unconstrained_tags(self) -> None:
+        tvar = self._tvar()
+        assert self._seam(tvar, self.fx.a, bound_ok=True) == (1, -1)
+        assert self._seam(tvar, self.fx.a, bound_ok=False, skip_unsatisfied=True) == (3, -1)
+        assert self._seam(tvar, self.fx.a, bound_ok=False, skip_unsatisfied=False) == (4, -1)
+
+    def test_seam_self_bound_tag(self) -> None:
+        # The shim erases the Self upper bound before the subtype check;
+        # the seam only arbitrates on the resulting boolean.
+        upper = Instance(self.fx.gi, [self.fx.t])
+        tvar = self._tvar(name="Self", raw_id=1, upper_bound=upper)
+        assert self._seam(tvar, Instance(self.fx.gi, [self.fx.a]), bound_ok=True) == (1, -1)
+
+    def test_seam_alias_defers(self) -> None:
+        from mypy.nodes import TypeAlias
+
+        alias = TypeAlias(Instance(self.fx.ai, []), "mod.AAlias", "mod", -1, -1)
+        tvar = self._tvar()
+        assert self._seam(tvar, TypeAliasType(alias, []), bound_ok=True) is None
