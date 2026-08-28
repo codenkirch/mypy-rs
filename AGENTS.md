@@ -972,6 +972,29 @@ including:
   `mypy/test/testtypes.py` (gate-off vs gate-on differential on
   (return, is_compat call count) plus direct seam calls proving
   engagement), and 12 pure decision unit tests in `subtypes.rs`.
+- `are_parameters_compatible` standalone shim (issue #1066) — wires the
+  standalone `mypy.subtypes.are_parameters_compatible`
+  (subtypes.py:2530, the `is_callable_compatible` tail and the
+  `constraints.py` / `checker.py` overload paths) to the already-exported
+  `rust_are_parameters_compatible` pyfunction (previously reachable only
+  via `SubtypeVisitor.visit_parameters` and the meet overlap branch).
+  The shim engages only when the caller's nested `is_compat` callback
+  provably matches the kernel's fixed nested subtype semantics: the
+  module-level `is_subtype` / `is_proper_subtype` (default context, and
+  only when `ignore_pos_arg_names` is default so the flag cannot leak
+  into nested callable comparisons the Python default context keeps
+  off), or `SubtypeVisitor._is_subtype` over a context whose other flags
+  (`ignore_type_params`, `ignore_declared_variance`, `always_covariant`,
+  `ignore_promotions`, `erase_instances`, `keep_erased_types`) are all
+  default. Everything else — `is_more_precise`, `is_same_type`, overlap
+  predicates, `flip_compat_check` closures, test stubs — defers (None)
+  to the pure-Python body, as do the kernel's own shapes (generic
+  callables, unpack/alias types, resolver misses, undecidable nested
+  pairs). No new kernel logic. Covered by standalone-shim tests in
+  `NativeAreParametersCompatibleSuite` in `mypy/test/testtypes.py`
+  (gate-off vs gate-on differentials incl. tvar and foreign-callback
+  deferrals, plus direct seam calls) and trivial-arm unit tests in
+  `callable_compat.rs`.
 - `rust_is_descriptor` (issue #968) — mirrors `mypy.subtypes.is_descriptor`
   (subtypes.py:2177-2183), a recursive bool predicate. Rust walks the wire
   `Type`: an `Instance` is a descriptor when its class (via MRO) has a

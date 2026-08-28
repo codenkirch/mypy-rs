@@ -171,6 +171,49 @@ def _native_are_args_compatible_active() -> bool:
     )
 
 
+def _native_params_compat_nested_proper(
+    is_compat: Callable[[Type, Type], bool], ignore_pos_arg_names: bool
+) -> bool | None:
+    """Nested proper-subtype flag when `is_compat` matches the kernel's fixed
+    nested subtype semantics, or None to defer to the pure-Python body.
+
+    The kernel's `are_parameters_compatible` re-enters subtype checks through
+    `crate::subtypes::is_subtype` with a fixed SubtypeContext (only
+    ignore_pos_arg_names / strict flags / the proper flag carried), so only
+    resolver-backed callbacks with exactly those semantics may engage:
+    module-level `is_subtype` / `is_proper_subtype` (default context), or
+    `SubtypeVisitor._is_subtype` over a context whose other flags are all
+    default. Everything else (erasure predicates, overlap checks, flipped
+    compat closures, TypeChecker callbacks, test stubs) defers.
+    """
+    fn = getattr(is_compat, "__func__", is_compat)
+    slf = getattr(is_compat, "__self__", None)
+    if slf is None:
+        # Module-level callbacks build a default SubtypeContext per call, so a
+        # non-default top-level ignore_pos_arg_names would leak into nested
+        # callable comparisons on the Rust side but not the Python side.
+        if not ignore_pos_arg_names:
+            if fn is is_subtype:
+                return False
+            if fn is is_proper_subtype:
+                return True
+        return None
+    if fn is SubtypeVisitor._is_subtype and isinstance(slf, SubtypeVisitor):
+        ctx = slf.subtype_context
+        if (
+            ctx.ignore_type_params
+            or ctx.ignore_pos_arg_names != ignore_pos_arg_names
+            or ctx.ignore_declared_variance
+            or ctx.always_covariant
+            or ctx.ignore_promotions
+            or ctx.erase_instances
+            or ctx.keep_erased_types
+        ):
+            return None
+        return slf.proper_subtype
+    return None
+
+
 # Decision tags returned by `_rust_classify_type_parameter`; must match
 # the `KIND_TYPEPARAM_*` constants in crates/type_kernel/src/subtypes.rs.
 NATIVE_TYPEPARAM_SUBTYPE = 0
@@ -2471,6 +2514,33 @@ def are_parameters_compatible(
     strict_concatenate_check: bool = False,
 ) -> bool:
     """Helper function for is_callable_compatible, used for Parameter compatibility"""
+    # Native type_kernel seam (#1066): same kernel decision as the
+    # visit_parameters / meet-overlap shims; see the nested-is_compat
+    # classifier below. None (defer) falls through to the body.
+    nested_proper = _native_params_compat_nested_proper(is_compat, ignore_pos_arg_names)
+    if (
+        nested_proper is not None
+        and _HAS_TYPE_KERNEL
+        and _native_subtype_active
+        and _native_subtype_resolver is not None
+    ):
+        try:
+            result = _type_kernel.rust_are_parameters_compatible(
+                _serialize_type(left),
+                _serialize_type(right),
+                is_proper_subtype,
+                ignore_pos_arg_names,
+                allow_partial_overlap,
+                strict_concatenate_check,
+                state.strict_optional,
+                nested_proper,
+                _native_subtype_resolver,
+            )
+        except (AssertionError, NotImplementedError):
+            result = None
+        if result is not None:
+            return result
+
     if right.is_ellipsis_args and not is_proper_subtype:
         return True
 
