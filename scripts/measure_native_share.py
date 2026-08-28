@@ -41,6 +41,9 @@ CLASSIFIER_NEGATIVE_SEAMS: tuple[str, ...] = (
     "rust_get_typevarlike_declaration",
     "rust_find_dataclass_transform_spec",
     "rust_find_duplicate",
+    # visit_call_expr callee classifier: None = "not a protocol test"
+    # (arity != 2, non-RefExpr, or wrong fullname); all arms decided.
+    "rust_classify_protocol_test_callee",
 )
 
 # Batch seam returning a per-pair list: 1/0 = native, -1 = deferral.
