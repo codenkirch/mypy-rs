@@ -29323,6 +29323,18 @@ class NativeSolveOneSuite(Suite):
     def test_subtype_bottom_top(self) -> None:
         self._assert_par([self.fx.a], [self.fx.a, self.fx.b])
 
+    def test_alias_arg_bound_falls_back(self) -> None:
+        # Bounds carrying an unexpanded alias argument solve fine in
+        # Rust, but fixup_wire_type cannot resolve the decoded alias.
+        # The shim must fall back, not report "no solution" (#1093).
+        from mypy.nodes import TypeAlias
+        from mypy.types import Instance, TypeAliasType
+
+        alias_node = TypeAlias(self.fx.a, "repro.Key", "repro", 1, 0)
+        alias = TypeAliasType(alias_node, [])
+        bound = Instance(self.fx.ai, [alias])
+        self._assert_par([bound], [bound])
+
 
 @skipUnless(_NATIVE_WIRE_ENABLED, "requires TEST_NATIVE_TYPE_KERNEL=1 and type_kernel ext")
 class NativeSolveDependentNoopSuite(Suite):
